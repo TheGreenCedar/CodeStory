@@ -156,6 +156,7 @@ impl SidecarProfile {
 pub enum EmbeddingServerLaunchMode {
     DockerComposeEmbed,
     NativeSpawned,
+    ExternalEndpoint,
 }
 
 impl EmbeddingServerLaunchMode {
@@ -163,6 +164,7 @@ impl EmbeddingServerLaunchMode {
         match self {
             Self::DockerComposeEmbed => "docker_compose_embed",
             Self::NativeSpawned => "native_spawned",
+            Self::ExternalEndpoint => "external_endpoint",
         }
     }
 }
@@ -178,6 +180,8 @@ pub struct SidecarPorts {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SidecarOwnership {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
     pub owner: String,
     pub profile: String,
     pub namespace: String,
@@ -190,6 +194,7 @@ pub struct SidecarOwnership {
 
 #[derive(Debug, Clone)]
 pub struct SidecarRuntimeConfig {
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
     pub layout: SidecarLayout,
     pub profile: SidecarProfile,
     pub run_id: Option<String>,
@@ -331,11 +336,43 @@ impl SidecarRuntimeConfig {
         let cleanup_command = project_root
             .map(|path| retrieval_command("down", path, profile, run_id.as_deref(), None))
             .unwrap_or_else(|| "codestory-cli retrieval down".to_string());
+        let project_identity = project_root.map(codestory_workspace::cached_project_identity_v2);
         let mut labels = BTreeMap::new();
         labels.insert("dev.codestory.owner".into(), "codestory".into());
         labels.insert("dev.codestory.profile".into(), profile.as_str().into());
         labels.insert("dev.codestory.namespace".into(), namespace.clone());
+        if let Some(project_root) = project_root {
+            let hash = project_hash(project_root);
+            labels.insert("dev.codestory.project_hash".into(), hash.clone());
+            if let Some(identity) = project_identity.as_ref() {
+                labels.insert(
+                    "dev.codestory.project_id".into(),
+                    identity.project_id.clone(),
+                );
+                labels.insert(
+                    "dev.codestory.workspace_id".into(),
+                    identity.workspace_id.clone(),
+                );
+                labels.insert(
+                    "dev.codestory.artifact_scope_id".into(),
+                    identity.artifact_scope_id.clone(),
+                );
+                labels.insert(
+                    "dev.codestory.project_identity_schema_version".into(),
+                    identity.project_identity_schema_version.to_string(),
+                );
+            }
+            labels.insert(
+                "dev.codestory.workspace_root".into(),
+                project_root.to_string_lossy().to_string(),
+            );
+        }
+        if let Some(run_id) = run_id.as_deref() {
+            labels.insert("dev.codestory.run_id".into(), run_id.to_string());
+            labels.insert("dev.codestory.agent_id".into(), run_id.to_string());
+        }
         Self {
+            project_identity,
             layout,
             profile,
             run_id,
@@ -349,6 +386,7 @@ impl SidecarRuntimeConfig {
 
     pub fn ownership(&self) -> SidecarOwnership {
         SidecarOwnership {
+            project_identity: self.project_identity.clone(),
             owner: "codestory".into(),
             profile: self.profile.as_str().into(),
             namespace: self.namespace.clone(),
@@ -367,13 +405,19 @@ impl SidecarRuntimeConfig {
     }
 
     pub fn activate_embed_url_default(&self) {
-        if std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err() {
+        let url_missing_or_blank = std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
+            .ok()
+            .is_none_or(|value| value.trim().is_empty());
+        let managed_url = std::env::var(MANAGED_LLAMACPP_URL_ENV).is_ok();
+
+        if url_missing_or_blank || managed_url {
             // SAFETY: this is command-local setup before sidecar probes/query embedding calls.
             unsafe {
                 std::env::set_var(
                     "CODESTORY_EMBED_LLAMACPP_URL",
                     SidecarLayout::embed_base_url(self.embed_http_port),
                 );
+                std::env::set_var(MANAGED_LLAMACPP_URL_ENV, "1");
             }
         }
     }
@@ -385,6 +429,7 @@ impl SidecarRuntimeConfig {
                 "CODESTORY_EMBED_LLAMACPP_URL",
                 SidecarLayout::embed_base_url(self.embed_http_port),
             );
+            std::env::set_var(MANAGED_LLAMACPP_URL_ENV, "1");
         }
     }
 }
@@ -785,6 +830,15 @@ pub fn retrieval_compose_profile() -> String {
     "real".to_string()
 }
 
+const MANAGED_LLAMACPP_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL_MANAGED";
+
+fn operator_explicit_llamacpp_endpoint_configured() -> bool {
+    std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        && std::env::var(MANAGED_LLAMACPP_URL_ENV).is_err()
+}
+
 pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
     if let Some(mode) = std::env::var("CODESTORY_EMBED_SERVER_LAUNCH")
         .ok()
@@ -794,6 +848,14 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
             "docker_compose_embed" | "docker" | "compose" => {
                 Some(EmbeddingServerLaunchMode::DockerComposeEmbed)
             }
+            "external_endpoint" | "external" | "endpoint"
+                if !std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty() =>
+            {
+                Some(EmbeddingServerLaunchMode::ExternalEndpoint)
+            }
             _ => None,
         })
     {
@@ -801,8 +863,11 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
     }
     if std::env::var("CODESTORY_EMBED_SERVER_LAUNCH").is_ok() {
         anyhow::bail!(
-            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed or native_spawned"
+            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed, native_spawned, or external_endpoint"
         );
+    }
+    if operator_explicit_llamacpp_endpoint_configured() {
+        return Ok(EmbeddingServerLaunchMode::ExternalEndpoint);
     }
     let request = crate::embeddings::embedding_accelerator_request();
     let host = embedding_host_platform();
@@ -815,11 +880,13 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
 }
 
 fn env_port(name: &str, default: u16) -> Option<u16> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|port| *port != 0)
-        .or(Some(default).filter(|_| std::env::var(name).is_ok()))
+    std::env::var(name).ok().map(|value| {
+        value
+            .parse()
+            .ok()
+            .filter(|port| *port != 0)
+            .unwrap_or(default)
+    })
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -882,6 +949,43 @@ mod tests {
         );
         assert_eq!(first.embed_http_port, second.embed_http_port);
         assert!(first.cleanup_command.contains("--run-id shared-agent"));
+    }
+
+    #[test]
+    fn project_runtime_exposes_v2_identity_without_changing_namespace_contract() {
+        let _lock = crate::test_support::env_lock();
+        let project = tempdir().expect("project");
+        let _cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            project.path().join("cache").to_str().expect("utf8 cache"),
+        );
+        let runtime =
+            SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
+        let identity = runtime.project_identity.as_ref().expect("project identity");
+
+        assert_eq!(
+            runtime.labels.get("dev.codestory.project_id"),
+            Some(&identity.project_id)
+        );
+        assert_eq!(
+            runtime.labels.get("dev.codestory.workspace_id"),
+            Some(&identity.workspace_id)
+        );
+        assert_eq!(
+            runtime.labels.get("dev.codestory.artifact_scope_id"),
+            Some(&identity.artifact_scope_id)
+        );
+        assert!(
+            runtime.namespace.starts_with(&format!(
+                "codestory-agent-{}-",
+                project_hash(project.path())
+            )),
+            "0.14 identity metadata must not rename existing sidecar namespaces"
+        );
+        assert_eq!(
+            runtime.ownership().project_identity.as_ref(),
+            Some(identity)
+        );
     }
 
     #[test]
@@ -1007,6 +1111,7 @@ mod tests {
     fn explicit_embedding_launch_modes_parse() {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
 
         assert_eq!(
             embedding_server_launch_mode().expect("launch mode"),
@@ -1015,15 +1120,104 @@ mod tests {
     }
 
     #[test]
+    fn explicit_llamacpp_url_selects_external_endpoint_launch() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
+        let _url = EnvGuard::set(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            "http://127.0.0.1:37040/v1/embeddings",
+        );
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::ExternalEndpoint
+        );
+    }
+
+    #[test]
+    fn blank_llamacpp_url_does_not_select_external_endpoint_launch() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
+        let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", " ");
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/x86_64");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::DockerComposeEmbed
+        );
+    }
+
+    #[test]
+    fn explicit_external_launch_requires_non_empty_llamacpp_url() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "external_endpoint");
+        let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", " ");
+
+        let error = embedding_server_launch_mode().expect_err("blank external url");
+
+        assert!(
+            error
+                .to_string()
+                .contains("CODESTORY_EMBED_SERVER_LAUNCH must be"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn managed_llamacpp_url_after_activation_keeps_native_launch() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
+        let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "windows/x86_64");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+
+        runtime.activate_embed_url_default();
+
+        assert_eq!(
+            embedding_server_launch_mode().expect("launch mode"),
+            EmbeddingServerLaunchMode::NativeSpawned
+        );
+    }
+
+    #[test]
+    fn managed_llamacpp_url_after_activation_retargets_runtime_url() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::set(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            "http://127.0.0.1:11111/v1/embeddings",
+        );
+        let _managed = EnvGuard::set(MANAGED_LLAMACPP_URL_ENV, "1");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+
+        runtime.activate_embed_url_default();
+
+        assert_eq!(
+            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").expect("managed embed url"),
+            SidecarLayout::embed_base_url(runtime.embed_http_port)
+        );
+    }
+
+    #[test]
     fn invalid_embedding_launch_mode_fails_closed() {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "llama-server.exe");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
 
         let error = embedding_server_launch_mode().expect_err("invalid mode");
 
-        assert!(error.to_string().contains(
-            "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed or native_spawned"
-        ));
+        assert!(
+            error
+                .to_string()
+                .contains("CODESTORY_EMBED_SERVER_LAUNCH must be")
+        );
     }
 
     #[test]
@@ -1031,6 +1225,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "macos/aarch64");
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
 
@@ -1045,6 +1240,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/x86_64");
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
 

@@ -51,7 +51,7 @@ surfaces were not visible.
 | Trace: "Who calls this?" | `callers`, `callees`, `trace`, or `trail --story --hide-speculative`. |
 | Impact: "What might this change touch?" | `affected` with changed files from git; planning hints only, not proof. |
 | Broad question | `packet`, `search`, or `context` only when allowed and `retrieval_mode=full`. |
-| Blocked surface | Follow `recommended_next_calls` from status; normally call MCP `repair_all`, then reread `codestory://status`. |
+| Blocked surface | Follow `recommended_next_calls` from status; normally call MCP `sidecar_setup` with `action=repair`, then reread `codestory://status`. |
 
 ## Evidence Rules
 
@@ -63,8 +63,11 @@ surfaces were not visible.
   anything weaker is navigation hints only.
 - On macOS arm64, expected accelerated sidecar intent is
   `launch_mode=native_spawned` with request provider `metal`. Requested provider
-  and device are intent; observed device state and observation source are proof.
-  If status still reports `vulkan`/`Vulkan0` or
+  and device are intent; observed device state and source are proof inputs, not
+  sufficient proof. When acceleration is required, require
+  `gpu_proof.proof_status=verified`, `meaningful_accelerator_work_proven=true`,
+  and `embed_smoke_ok=true`; manual assertions and device inventory remain
+  diagnostic. If status still reports `vulkan`/`Vulkan0` or
   `accelerator_request_unobserved` on Apple Silicon, report a stale/pre-release
   runtime or failed repair and follow the MCP repair loop.
 - CPU-backed retrieval is an explicit degraded policy. It does not make
@@ -76,18 +79,18 @@ surfaces were not visible.
 Supported agent repair is MCP-only:
 
 1. Read `codestory://status`.
-2. If `status_resource_auto_repair.result.status` is `started` or
-   `already_running`, wait briefly and reread `codestory://status`.
-3. If `recommended_next_calls` says so and the `mcp__codestory__repair_all`
-   tool is visible, call MCP `repair_all` for
+2. Inspect `readiness_broker` and `sidecar_setup`; status reads report state
+   but do not start repairs.
+3. If `recommended_next_calls` says so and the `mcp__codestory__sidecar_setup`
+   tool is visible, call MCP `sidecar_setup` with `action=repair` for
    `<target-workspace>`.
 4. Reread `codestory://status`.
 5. Use only the surfaces allowed by the refreshed status.
 
 If Codex exposes CodeStory resources but hides server-specific tools, keep using
-the read-only resource path. If status did not start auto-repair and tool
-actions such as `repair_all` are hidden, report the host tool-visibility
-blocker. Do not synthesize repair context or run CLI repair in the agent path.
+the read-only resource path. If tool actions such as `sidecar_setup` are hidden,
+report the host tool-visibility blocker. Do not synthesize repair context or
+run CLI repair in the agent path.
 
 CLI commands such as `fix`, `doctor`, `ready`, and `retrieval status` are
 maintainer/debug transcript tools. They do not prove plugin MCP is live in the

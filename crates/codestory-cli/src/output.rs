@@ -192,7 +192,82 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
             }
         }
     }
+    if let Some(broker) = output.readiness_broker.as_ref() {
+        append_readiness_broker(&mut markdown, broker);
+    }
     markdown
+}
+
+fn append_readiness_broker(
+    markdown: &mut String,
+    broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
+) {
+    let _ = writeln!(
+        markdown,
+        "readiness_broker: project_id={} persistence={} operations={} gpu_proof={}",
+        broker.project_id,
+        broker.persistence_status,
+        broker.operations.len(),
+        broker
+            .gpu_proof
+            .as_ref()
+            .map(|proof| proof.proof_status.as_str())
+            .unwrap_or("unknown")
+    );
+    if broker.persistence_status == "failed" {
+        let _ = writeln!(
+            markdown,
+            "readiness_broker_persistence_error: {}",
+            broker.persistence_error.as_deref().unwrap_or("unknown")
+        );
+    }
+    for operation in &broker.operations {
+        let _ = writeln!(
+            markdown,
+            "readiness_broker_operation: kind={} status={} phase={} pid={} run_id={}",
+            operation.operation_kind,
+            operation.status,
+            operation.phase.as_deref().unwrap_or("unknown"),
+            operation
+                .pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            operation.run_id.as_deref().unwrap_or("none")
+        );
+    }
+    if let Some(resource) = broker.resources.get("native_embedding_runtime")
+        && resource.status != "available"
+    {
+        let next = match resource.status.as_str() {
+            "stale" => "retry repair to reclaim stale native embedding lock",
+            "busy" => "wait for owner or retry after current repair completes",
+            _ => "inspect broker snapshot",
+        };
+        let _ = writeln!(
+            markdown,
+            "readiness_broker_resource: native_embedding_runtime status={} owner_project={} owner_pid={} next={}",
+            resource.status,
+            resource.owner_project_id.as_deref().unwrap_or("unknown"),
+            resource
+                .owner_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            next
+        );
+    }
+    if let Some(proof) = broker.gpu_proof.as_ref()
+        && proof.proof_status != "unknown"
+    {
+        let _ = writeln!(
+            markdown,
+            "readiness_broker_gpu: status={} requested_provider={} requested_device={} observed={} cpu_allowed={}",
+            proof.proof_status,
+            proof.requested_provider.as_deref().unwrap_or("none"),
+            proof.requested_device.as_deref().unwrap_or("none"),
+            proof.observed_state.as_deref().unwrap_or("unknown"),
+            proof.cpu_allowed
+        );
+    }
 }
 
 pub(crate) fn render_fix_markdown(output: &FixOutput) -> String {
@@ -2251,6 +2326,9 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         doctor_agent_packet_search_readiness(output)
     );
     append_readiness_verdicts(&mut markdown, &output.readiness, true);
+    if let Some(broker) = output.readiness_broker.as_ref() {
+        append_readiness_broker(&mut markdown, broker);
+    }
     if let Some(retrieval) = output.retrieval.as_ref() {
         let _ = writeln!(
             markdown,
@@ -3908,6 +3986,7 @@ mod tests {
             freshness: None,
             readiness: Vec::new(),
             readiness_lanes: std::collections::BTreeMap::new(),
+            readiness_broker: None,
             checks: Vec::new(),
             next_commands: Vec::new(),
             environment: Vec::new(),

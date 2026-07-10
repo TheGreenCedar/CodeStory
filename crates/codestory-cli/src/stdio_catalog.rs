@@ -1293,16 +1293,13 @@ static SIDECAR_SETUP_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 );
 
-static REPAIR_ALL_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Run the single supported CodeStory readiness repair action.",
-    &[],
-    &[],
-);
+static REPAIR_ALL_INPUT_SCHEMA: SchemaObject =
+    SchemaObject::object("Compatibility alias for sidecar_setup repair.", &[], &[]);
 
 static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "repair_all",
-        description: "Run the single supported readiness repair action, then read codestory://status again.",
+        description: "Deprecated compatibility alias for sidecar_setup action=repair; agents should follow codestory://status recommended_next_calls.",
         input_schema: REPAIR_ALL_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
         safety: SafetyMetadata::local_config_write(),

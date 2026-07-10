@@ -4,6 +4,7 @@
 //! uses **BAAI/bge-base-en-v1.5** (768-dim) via llama.cpp `/v1/embeddings` for query vectors and
 //! semantic smoke checks.
 
+use crate::outbound_http::read_text;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -53,6 +54,7 @@ const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 6;
 pub struct EmbeddingRuntimeProbe {
     pub reachable: bool,
     pub detail: String,
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,16 +409,24 @@ fn observed_embedding_device_state(
 
 fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     let mut saw_cpu = false;
+    let mut saw_accelerated = false;
+    let mut saw_metal = false;
     let text = text.to_ascii_lowercase();
     let log_markers = selected_backend_log_markers();
+    let metal_requested = log_markers.iter().any(|marker| marker == "metal");
     for line in text.lines() {
-        if line_reports_gpu_offload(line) == Some(true)
-            || (line.contains("using device")
-                && ["vulkan", "cuda", "hip", "metal", "sycl", "openvino"]
-                    .iter()
-                    .any(|needle| line.contains(needle)))
+        if line_reports_gpu_offload(line) == Some(true) {
+            saw_accelerated = true;
+        }
+        if line.contains("using device")
+            && ["vulkan", "cuda", "hip", "metal", "sycl", "openvino"]
+                .iter()
+                .any(|needle| line.contains(needle))
         {
-            return "accelerated";
+            saw_accelerated = true;
+        }
+        if metal_requested && line_reports_metal_evidence(line) {
+            saw_metal = true;
         }
         saw_cpu |= line_reports_gpu_offload(line) == Some(false)
             || line.contains("n_gpu_layers = 0")
@@ -424,17 +434,27 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
             || line.contains("no gpu")
             || line.contains("no vulkan device");
     }
-    if saw_cpu {
+    if saw_accelerated {
+        "accelerated"
+    } else if saw_cpu {
         "cpu"
-    } else if !log_markers.is_empty()
-        && log_markers
-            .iter()
-            .all(|marker| text.contains(&marker.to_ascii_lowercase()))
+    } else if saw_metal
+        || (!log_markers.is_empty()
+            && log_markers
+                .iter()
+                .all(|marker| text.contains(&marker.to_ascii_lowercase())))
     {
         "accelerated"
     } else {
         "unknown"
     }
+}
+
+fn line_reports_metal_evidence(line: &str) -> bool {
+    line.contains("ggml_metal_init")
+        || line.contains("metal backend")
+        || line.trim_start().starts_with("mtl0")
+        || line.trim_start().starts_with("mtl :")
 }
 
 fn selected_backend_log_markers() -> Vec<String> {
@@ -447,10 +467,9 @@ fn selected_backend_log_markers() -> Vec<String> {
 fn line_reports_gpu_offload(line: &str) -> Option<bool> {
     let keyword = if let Some(offset) = line.find("offloaded ") {
         offset + "offloaded ".len()
-    } else if let Some(offset) = line.find("offloading ") {
-        offset + "offloading ".len()
     } else {
-        return None;
+        let offset = line.find("offloading ")?;
+        offset + "offloading ".len()
     };
     let digits = line[keyword..]
         .chars()
@@ -702,6 +721,7 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 }
 
 pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
+    let started = Instant::now();
     let result = llamacpp_url().and_then(|url| {
         llamacpp_embed_with_timeout(
             &["codestory health probe".to_string()],
@@ -709,6 +729,7 @@ pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
             HEALTH_TIMEOUT,
         )
     });
+    let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
     match result {
         Ok(vectors) => EmbeddingRuntimeProbe {
             reachable: true,
@@ -716,10 +737,12 @@ pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
                 "llama.cpp embeddings reachable dim={}",
                 vectors.first().map(|vector| vector.len()).unwrap_or(0)
             ),
+            elapsed_ms,
         },
         Err(error) => EmbeddingRuntimeProbe {
             reachable: false,
             detail: format!("llama.cpp embeddings unavailable: {error}"),
+            elapsed_ms,
         },
     }
 }
@@ -783,17 +806,18 @@ fn llamacpp_embed_with_timeout(
         "model": "bge-base-en-v1.5",
     });
     let payload = serde_json::to_string(&body).context("serialize embeddings request")?;
-    let response = ureq::post(url)
-        .timeout(timeout)
-        .set("Content-Type", "application/json")
-        .send_string(&payload)
-        .map_err(|error| anyhow!("llama.cpp embeddings request failed: {error}"))?;
-    let status = response.status();
+    let response = read_text(
+        ureq::post(url)
+            .timeout(timeout)
+            .set("Content-Type", "application/json")
+            .send_string(&payload),
+    )
+    .map_err(|error| anyhow!("llama.cpp embeddings request failed: {error}"))?;
+    let status = response.status;
     if !(200..300).contains(&status) {
         bail!("llama.cpp embeddings http {status}");
     }
-    let response_body = response.into_string().unwrap_or_default();
-    parse_openai_embeddings(&response_body, true)
+    parse_openai_embeddings(&response.body, true)
 }
 
 #[derive(Deserialize)]
@@ -1122,7 +1146,13 @@ mod tests {
         );
         assert_eq!(
             observed_embedding_device_state_from_text("ggml_metal_init: metal backend ready\n"),
-            "unknown"
+            "accelerated"
+        );
+        assert_eq!(
+            observed_embedding_device_state_from_text(
+                "MTL0 : Apple M4 Pro\nMTL : EMBED_LIBRARY = 1\n"
+            ),
+            "accelerated"
         );
         assert_eq!(
             observed_embedding_device_state_from_text(
@@ -1361,6 +1391,33 @@ mod tests {
     }
 
     #[test]
+    fn native_log_current_launch_accepts_spawn_log_prefix() {
+        let _lock = crate::test_support::env_lock();
+        let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
+        let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
+        let _device = EnvGuard::remove(DEVICE_STATE_ENV);
+        let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let text = concat!(
+            "starting native llama.cpp embedding server: old --device Vulkan0\n",
+            "using device Vulkan0\n",
+            "offloaded 33/33 layers to GPU\n",
+            "starting native llama.cpp embedding server: after probe failed (unreachable) /cache/llama-server --port 18080\n",
+            "MTL0 : Apple M4 Pro\n",
+            "MTL : EMBED_LIBRARY = 1\n",
+        );
+
+        let current = native_embedding_log_current_launch(text);
+
+        assert!(current.contains("after probe failed"));
+        assert!(!current.contains("old --device Vulkan0"));
+        assert_eq!(
+            observed_embedding_device_state_from_text(current),
+            "accelerated"
+        );
+    }
+
+    #[test]
     fn explicit_unknown_device_still_fails_closed_on_amd_host() {
         let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
@@ -1442,6 +1499,7 @@ mod tests {
         let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
@@ -1491,6 +1549,7 @@ mod tests {
         let _host_detect = EnvGuard::set(DISABLE_HOST_GPU_DETECT_ENV, "1");
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,

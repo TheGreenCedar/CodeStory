@@ -15,8 +15,8 @@ CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#
 
 | Symptom | Supported action | Check in output |
 | --- | --- | --- |
-| Repo map stale or blocked | Agent reads `codestory://status`, calls MCP `repair_all` if recommended, then rereads status | Local graph surfaces are allowed after the reread |
-| Broad search blocked | Same MCP `repair_all` loop | `packet`, `search`, or `context` allowed and `retrieval_mode` is `full` |
+| Repo map stale or blocked | Agent reads `codestory://status`, follows `recommended_next_calls`, then rereads status | Local graph surfaces are allowed after the reread |
+| Broad search blocked | Same MCP `sidecar_setup repair` loop | `packet`, `search`, or `context` allowed and `retrieval_mode` is `full` |
 | MCP down, need handoff | Reload/fix host MCP; CLI can collect a debug transcript only | `codestory://status` becomes visible in the agent host |
 | Sidecar health | MCP status first; CLI `retrieval status` only for maintainer evidence | `retrieval_mode` is `full` before trusting packet/search |
 
@@ -26,7 +26,9 @@ CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#
 flowchart TD
   start([Session feels wrong]) --> q1{Can the agent read<br/>CodeStory status?}
   q1 -->|No| mcp[MCP not connected]
-  q1 -->|Yes| q2{Is the repo map ready?}
+  q1 -->|Yes| qTools{Are mcp__codestory<br/>tools visible?}
+  qTools -->|No| toolsHidden[Resources only]
+  qTools -->|Yes| q2{Is the repo map ready?}
   q2 -->|No| local[Local navigation lane]
   q2 -->|Yes| q3{Need packet or search?}
   q3 -->|No| ok[Local tools should work]
@@ -34,11 +36,18 @@ flowchart TD
   q4 -->|No| sidecar[Packet/search lane]
   q4 -->|Yes| ok2[Broad search should work]
   mcp --> fix_mcp[MCP registration]
+  toolsHidden --> hostBlocker[Report host tool visibility]
   local --> fix_local[Refresh or repair local index]
-  sidecar --> fix_sidecar[Sidecar setup or repair]
+  sidecar --> nativeBusy{Native embedding busy?}
+  nativeBusy -->|stale| fix_sidecar[Sidecar setup or repair]
+  nativeBusy -->|same project reusable| fix_sidecar
+  nativeBusy -->|foreign or unverifiable| waitBusy[Wait and reread status]
+  nativeBusy -->|no| fix_sidecar
   fix_mcp --> host[Host guide]
-  fix_local --> mcp_repair["MCP: repair_all"]
+  hostBlocker --> host
+  fix_local --> reread
   fix_sidecar --> mcp_repair
+  waitBusy --> reread
   mcp_repair --> reread["Reread codestory://status"]
   host --> codex[Codex guide]
   host --> cursor[Cursor guide]
@@ -52,7 +61,7 @@ flowchart TD
 | --- | --- | --- | --- | --- |
 | MCP missing | Fresh thread after `/plugins` install | Check `.cursor/mcp.json`; reload MCP server | MCP configured separately from hooks | MCP not auto-started; configure or use CLI |
 | Stale index / wrong symbols | New thread; hooks refresh on session start | Reload MCP; run local repair | New session; run local repair | New session; run [local repair](cli-reference.md#readiness-and-repair) |
-| Packet/search blocked | Agent calls MCP `repair_all` when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
+| Packet/search blocked | Agent calls MCP `sidecar_setup repair` when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
 | Version drift after update | Refresh marketplace, refresh plugin package, restart host, fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
 
 Host-specific steps: [Codex](codex.md#troubleshooting), [Cursor](cursor.md#troubleshooting), [Claude Code](claude-code.md#troubleshooting), [Copilot](copilot.md).
@@ -94,8 +103,8 @@ Ask the agent:
 Read codestory://status, report allowed_surfaces, and tell me what is blocked and the next repair action.
 ```
 
-The agent uses MCP status, `codestory://agent-guide`, and `repair_all` when
-status recommends repair. Re-read status after any repair.
+The agent uses MCP status, `codestory://agent-guide`, and `sidecar_setup repair`
+when status recommends repair. Re-read status after any repair.
 
 </details>
 
@@ -145,8 +154,12 @@ node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <repo> -
 Symptoms: `packet`, `search`, or `context` not allowed; retrieval mode not
 `full`.
 
-**Agent:** Call MCP `repair_all` when status says so, then reread
-`codestory://status`. Do not treat degraded output as proof. See
+**Agent:** Call MCP `sidecar_setup repair` when status says so, then reread
+`codestory://status`. Before repairing, classify
+`readiness_broker.resources.native_embedding_runtime`: `stale` or same-project
+reusable `busy` can proceed; foreign/unverifiable `busy` means wait. If status
+resources are visible but tools are hidden, do not loop on `tools/call`
+recommendations. Do not treat degraded output as proof. See
 [Trust and readiness](trust-and-readiness.md#proof-vs-hint).
 
 **You:** Sidecar model download and lifecycle:
@@ -166,10 +179,12 @@ Command table: [CLI reference - readiness and repair](cli-reference.md#readiness
 
 On macOS arm64, the supported accelerated embedding path is the native Metal
 sidecar. A healthy repaired status should report the embedding launch as
-`native_spawned`, request provider `metal`, and then prove the observed device
-state from sidecar logs or an explicit operator assertion. The request fields
-show intent; `embedding_device_state`, `embedding_device_observation_source`,
-and `retrieval_mode` decide readiness.
+`native_spawned`, request provider `metal`, runtime observation from native
+sidecar logs, and a successful live timed embed smoke. Request fields, device
+inventory, and operator assertions are diagnostic only. Require
+`readiness_broker.gpu_proof.proof_status=verified`,
+`meaningful_accelerator_work_proven=true`, allowed packet/search surfaces, and
+`retrieval_mode=full` before trusting acceleration-backed readiness.
 
 The old failure pattern is `accelerator_request_provider=vulkan`,
 `accelerator_request_device=Vulkan0`, Docker/Colima embed launch, and
@@ -178,7 +193,7 @@ Apple Silicon, not a Colima tuning problem: the Linux Docker sidecar cannot
 observe macOS Metal and normally has no usable `/dev/dri`.
 
 **Agent:** Read `codestory://status`, follow `recommended_next_calls`, call MCP
-`repair_all` when recommended, and reread status. Keep local navigation separate
+`sidecar_setup repair` when recommended, and reread status. Keep local navigation separate
 from packet/search: a ready local graph can answer source-navigation questions
 while packet/search remains blocked until `retrieval_mode` is `full`.
 
@@ -202,7 +217,7 @@ Symptoms: skill or rule loads but no `codestory://status` or `mcp__codestory` to
 
 | Host | Check |
 | --- | --- |
-| Codex | Read `codestory://status` through live MCP resources. If `status_resource_auto_repair` starts, reread status until the repair finishes. If resources are visible but `mcp__codestory` tools are hidden and status did not start repair, report the host tool-visibility blocker; reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
+| Codex | Read `codestory://status` through live MCP resources. Inspect `readiness_broker` and follow `recommended_next_calls`; status reads do not start repair. If resources are visible but `mcp__codestory` tools are hidden, report the host tool-visibility blocker; reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
 | Cursor | MCP config path to `plugins/codestory/scripts/codestory-mcp.cjs`; reload server |
 | Claude Code | MCP configured separately; hooks alone do not expose tools |
 | Copilot | MCP not auto-started; configure manually or use CLI |
@@ -221,11 +236,13 @@ install. Confirm with a fresh `codestory://status` read.
 
 ### Codex marketplace refresh vs runtime reload
 
-For Codex, marketplace refresh, package refresh, and runtime reload are separate:
+For Codex, marketplace refresh, package refresh, and runtime reload are separate.
+These are Windows terminal commands; in Unix shells, use `codex` instead of
+`codex.cmd`:
 
-```sh
-codex plugin marketplace upgrade TheGreenCedar
-codex plugin add codestory@TheGreenCedar
+```powershell
+codex.cmd plugin marketplace upgrade TheGreenCedar
+codex.cmd plugin add codestory@TheGreenCedar
 ```
 
 The first command only updates Codex's marketplace snapshot. The second refreshes
@@ -234,12 +251,12 @@ management. A running Codex host can still keep the old MCP adapter and managed
 CLI alive until you start a fresh host session.
 
 On Windows, older running CodeStory MCP processes can make
-`codex plugin add codestory@TheGreenCedar` fail with `Access is denied` while
+`codex.cmd plugin add codestory@TheGreenCedar` fail with `Access is denied` while
 backing up the plugin cache. Current MCP adapters move their long-lived working
 directory out of the plugin cache, but stale hosts from older packages can still
 hold files open. Quit stale Codex windows, start a fresh host session, and retry
-the `/plugins` refresh or terminal install. After refresh, confirm the active
-runtime through `codestory://status`, not only `codex plugin list`.
+the `/plugins` refresh or Windows terminal install. After refresh, confirm the
+active runtime through `codestory://status`, not only `codex.cmd plugin list`.
 
 ## Still stuck?
 

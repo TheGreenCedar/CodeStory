@@ -1,5 +1,6 @@
 use crate::config::{QDRANT_HEALTH_BUDGET, SidecarLayout};
 use crate::embeddings::{self, qdrant_vector_dim as active_vector_dim};
+use crate::outbound_http::{OutboundHttpError, read_text, truncate_http_body};
 use anyhow::{Context, Result, bail};
 use codestory_store::FileRole;
 use std::path::Path;
@@ -61,25 +62,25 @@ impl QdrantClient {
     /// List collection names from `GET /collections`.
     pub fn list_collection_names(&self) -> Result<Vec<String>> {
         let url = format!("{}/collections", self.base_url);
-        let response = ureq::get(&url)
-            .timeout(self.timeout)
-            .call()
+        let response = read_text(ureq::get(&url).timeout(self.timeout).call())
             .context("list qdrant collections")?;
-        let status = response.status();
-        if !(200..300).contains(&status) {
-            bail!("list collections http {status}");
+        if !(200..300).contains(&response.status) {
+            bail!(
+                "list collections http {}: {}",
+                response.status,
+                truncate_http_body(&response.body)
+            );
         }
-        let body = response.into_string().unwrap_or_default();
-        parse_collection_names(&body)
+        parse_collection_names(&response.body)
     }
 
     /// Reachability probe that does not require a project collection.
     pub fn list_collections_probe(&self) -> QdrantHealthProbe {
         let started = Instant::now();
         let url = format!("{}/collections", self.base_url);
-        match ureq::get(&url).timeout(self.timeout).call() {
+        match read_text(ureq::get(&url).timeout(self.timeout).call()) {
             Ok(response) => {
-                let status = response.status();
+                let status = response.status;
                 QdrantHealthProbe {
                     reachable: (200..500).contains(&status),
                     latency_ms: started.elapsed().as_millis() as u64,
@@ -102,11 +103,10 @@ impl QdrantClient {
         let started = Instant::now();
         let url = format!("{}/collections/{collection}", self.base_url);
         let latency_ms = || started.elapsed().as_millis() as u64;
-        match ureq::get(&url).timeout(self.timeout).call() {
+        match read_text(ureq::get(&url).timeout(self.timeout).call()) {
             Ok(response) => {
-                let status = response.status();
-                let body = response.into_string().unwrap_or_default();
-                let point_count = parse_collection_point_count(&body);
+                let status = response.status;
+                let point_count = parse_collection_point_count(&response.body);
                 let detail = match point_count {
                     Some(count) => format!("http {status} points_count={count}"),
                     None => format!("http {status}"),
@@ -143,18 +143,18 @@ impl QdrantClient {
         let url = format!("{}/collections/{collection}/points/count", self.base_url);
         let body = serde_json::json!({ "exact": true });
         let payload = serde_json::to_string(&body).context("serialize qdrant count body")?;
-        match ureq::post(&url)
-            .timeout(self.timeout)
-            .set("Content-Type", "application/json")
-            .send_string(&payload)
-        {
+        match read_text(
+            ureq::post(&url)
+                .timeout(self.timeout)
+                .set("Content-Type", "application/json")
+                .send_string(&payload),
+        ) {
             Ok(response) => {
-                let status = response.status();
+                let status = response.status;
                 if !(200..300).contains(&status) {
                     bail!("qdrant count http {status}");
                 }
-                let response_body = response.into_string().unwrap_or_default();
-                parse_count_points_response(&response_body)
+                parse_count_points_response(&response.body)
             }
             Err(error) => Err(anyhow::anyhow!("qdrant count request failed: {error}")),
         }
@@ -204,16 +204,16 @@ impl QdrantClient {
             "with_payload": true,
         });
         let payload = serde_json::to_string(&body).context("serialize qdrant search body")?;
-        match ureq::post(&url)
-            .timeout(self.timeout)
-            .set("Content-Type", "application/json")
-            .send_string(&payload)
-        {
+        match read_text(
+            ureq::post(&url)
+                .timeout(self.timeout)
+                .set("Content-Type", "application/json")
+                .send_string(&payload),
+        ) {
             Ok(response) => {
-                let status = response.status();
+                let status = response.status;
                 if (200..300).contains(&status) {
-                    let response_body = response.into_string().unwrap_or_default();
-                    return parse_search_response(&response_body, limit);
+                    return parse_search_response(&response.body, limit);
                 }
                 bail!("qdrant search http {status}")
             }
@@ -224,9 +224,9 @@ impl QdrantClient {
     /// Drop collection when embedding backend/dim changes (idempotent).
     pub fn delete_collection(&self, collection: &str) -> Result<()> {
         let url = format!("{}/collections/{collection}", self.base_url);
-        match ureq::delete(&url).timeout(QDRANT_MUTATION_BUDGET).call() {
+        match read_text(ureq::delete(&url).timeout(QDRANT_MUTATION_BUDGET).call()) {
             Ok(response) => {
-                let status = response.status();
+                let status = response.status;
                 if status == 200 || status == 404 {
                     self.clear_collection_stub_marker(collection);
                     return Ok(());
@@ -234,7 +234,7 @@ impl QdrantClient {
                 bail!("delete collection http {status}");
             }
             Err(error) => {
-                if matches!(error, ureq::Error::Status(404, _)) {
+                if error.is_status(404) {
                     self.clear_collection_stub_marker(collection);
                     return Ok(());
                 }
@@ -260,16 +260,19 @@ impl QdrantClient {
             }
         });
         let payload = serde_json::to_string(&body).context("serialize create collection body")?;
-        match ureq::put(&url)
-            .timeout(QDRANT_MUTATION_BUDGET)
-            .set("Content-Type", "application/json")
-            .send_string(&payload)
-        {
+        match read_text(
+            ureq::put(&url)
+                .timeout(QDRANT_MUTATION_BUDGET)
+                .set("Content-Type", "application/json")
+                .send_string(&payload),
+        ) {
             Ok(response) => {
-                create_collection_status_result(response.status())?;
+                create_collection_status_result(response.status)?;
                 Ok(())
             }
-            Err(ureq::Error::Status(status, _)) => create_collection_status_result(status),
+            Err(error) if error.status().is_some() => {
+                create_collection_status_result(error.status().expect("checked status"))
+            }
             Err(error) => wait_for_collection_create_postcondition(
                 collection,
                 &error.to_string(),
@@ -329,23 +332,27 @@ impl QdrantClient {
             }
             let body = serde_json::json!({ "points": qdrant_points });
             let payload = serde_json::to_string(&body).context("serialize upsert body")?;
-            match ureq::put(&url)
-                .timeout(QDRANT_UPSERT_BUDGET)
-                .set("Content-Type", "application/json")
-                .send_string(&payload)
-            {
+            match read_text(
+                ureq::put(&url)
+                    .timeout(QDRANT_UPSERT_BUDGET)
+                    .set("Content-Type", "application/json")
+                    .send_string(&payload),
+            ) {
                 Ok(response) => {
-                    let status = response.status();
+                    let status = response.status;
                     if (200..300).contains(&status) {
                         written += chunk.len();
                     } else {
-                        let body = response.into_string().unwrap_or_default();
-                        bail!("upsert points http {status}: {}", truncate_http_body(&body));
+                        bail!(
+                            "upsert points http {status}: {}",
+                            truncate_http_body(&response.body)
+                        );
                     }
                 }
-                Err(ureq::Error::Status(status, response)) => {
-                    let body = response.into_string().unwrap_or_default();
-                    bail!("upsert points http {status}: {}", truncate_http_body(&body));
+                Err(error) if error.status().is_some() => {
+                    let status = error.status().expect("checked status");
+                    let body = error.body().unwrap_or_default();
+                    bail!("upsert points http {status}: {}", truncate_http_body(body));
                 }
                 Err(error) => bail!("upsert points request failed: {error}"),
             }
@@ -460,15 +467,13 @@ fn parse_count_points_response(body: &str) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("qdrant count response missing result.count"))
 }
 
-/// ureq treats 4xx as `Error::Status`; map collection GET 404 to reachable + missing.
-fn collection_probe_from_http_error(error: &ureq::Error) -> Option<(bool, bool, String)> {
-    let ureq::Error::Status(code, _) = error else {
-        return None;
-    };
-    if *code == 404 {
+/// ureq treats 4xx as status errors; map collection GET 404 to reachable + missing.
+fn collection_probe_from_http_error(error: &OutboundHttpError) -> Option<(bool, bool, String)> {
+    let code = error.status()?;
+    if code == 404 {
         return Some((true, false, "http 404".into()));
     }
-    if *code < 500 {
+    if code < 500 {
         return Some((true, false, format!("http {code}")));
     }
     None
@@ -630,15 +635,6 @@ fn vectors_for_points(points: &[QdrantUpsertPoint]) -> Result<Vec<Vec<f32>>> {
             labels.first().map(String::as_str).unwrap_or("<empty>")
         )
     })
-}
-
-fn truncate_http_body(body: &str) -> String {
-    const MAX: usize = 512;
-    let trimmed = body.trim();
-    if trimmed.len() <= MAX {
-        return trimmed.to_string();
-    }
-    format!("{}...", &trimmed[..MAX])
 }
 
 #[cfg(test)]

@@ -23,8 +23,10 @@ use uuid::Uuid;
 
 mod repository_identity;
 pub use repository_identity::{
-    REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentity, SidecarProjectIdentity,
-    inspect_repository_identity, sidecar_project_identity,
+    PROJECT_IDENTITY_SCHEMA_VERSION, ProjectIdentityV2, REPOSITORY_IDENTITY_SCHEMA_VERSION,
+    RepositoryIdentity, SidecarProjectIdentity, cached_project_identity_v2,
+    inspect_repository_identity, project_identity_v2, sidecar_project_identity,
+    workspace_id_for_root,
 };
 
 /// Source-group language selector used during workspace discovery.

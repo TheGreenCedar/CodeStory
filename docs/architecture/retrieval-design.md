@@ -58,7 +58,14 @@ Runtime rules:
 
 ## Generation And Reuse
 
-Sidecar generation is content-addressed by project id and sidecar input hash.
+Sidecar generation is content-addressed by `artifact_scope_id` and sidecar input
+hash. Identity is intentionally split: logical `project_id` is repository-wide,
+`workspace_id` owns local processes and state, and `artifact_scope_id` uses the
+logical repository only when portable reuse is eligible. Dirty workspaces fall
+back to `workspace_id`; `canonical_root_hash` is only a local broker snapshot
+locator. The 0.14 migration records these identities without renaming existing
+namespace or artifact paths.
+
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
 dense-anchor rows, semantic file-role metadata, sidecar schema version, Zoekt
 version pin, embedding backend, embedding dimension, semantic policy version,

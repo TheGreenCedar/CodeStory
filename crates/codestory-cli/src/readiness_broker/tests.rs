@@ -1,0 +1,1522 @@
+use super::machine_lock::*;
+use super::native_lease::*;
+use super::paths::*;
+use super::scope::*;
+use super::snapshot::*;
+use super::types::*;
+use super::*;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, SystemTime};
+use tempfile::tempdir;
+
+fn unique_resource(prefix: &str) -> String {
+    format!("{prefix}-{}-{}", std::process::id(), now_epoch_ms())
+}
+
+fn cleanup_machine_resource(resource: &str) {
+    let _ = fs::remove_file(machine_resource_lock_path(resource));
+    let _ = fs::remove_file(machine_resource_reaper_lock_path(resource));
+    let _ = fs::remove_file(machine_resource_reaper_takeover_lock_path(resource));
+}
+
+fn test_scope(project: &Path, run_id: &str) -> BrokerScope {
+    agent_repair_scope(project, Some(run_id), "9.9.9")
+}
+
+fn write_machine_lock(resource: &str, scope: &BrokerScope, pid: u32) -> PathBuf {
+    write_machine_lock_at(resource, scope, pid, now_epoch_ms())
+}
+
+fn write_machine_lock_at(
+    resource: &str,
+    scope: &BrokerScope,
+    pid: u32,
+    started_at_epoch_ms: i64,
+) -> PathBuf {
+    let path = machine_resource_lock_path(resource);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create lock parent");
+    }
+    let lock = BrokerMachineResourceLockFile {
+        schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+        resource: resource.to_string(),
+        scope: scope.clone(),
+        pid,
+        started_at_epoch_ms,
+        token: format!("test:{pid}:{started_at_epoch_ms}"),
+        operation_id: broker_operation_id(scope),
+        native_embedding_launch: None,
+    };
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&lock).expect("serialize lock"),
+    )
+    .expect("write lock");
+    path
+}
+
+fn write_stale_reaper_lock(resource: &str) -> PathBuf {
+    let path = machine_resource_reaper_lock_path(resource);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create reaper lock parent");
+    }
+    let started_at_epoch_ms =
+        now_epoch_ms() - MACHINE_REAPER_LOCK_STALE_TTL.as_millis() as i64 - 10_000;
+    let lock = BrokerMachineResourceReaperLockFile {
+        schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+        resource: resource.to_string(),
+        pid: u32::MAX,
+        started_at_epoch_ms,
+        token: format!("stale-reaper:{started_at_epoch_ms}"),
+    };
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&lock).expect("serialize reaper lock"),
+    )
+    .expect("write reaper lock");
+    path
+}
+
+fn write_malformed_machine_lock(resource: &str) -> PathBuf {
+    let path = machine_resource_lock_path(resource);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create lock parent");
+    }
+    fs::write(&path, b"{not-json").expect("write malformed lock");
+    path
+}
+
+fn set_file_age(path: &Path, age: Duration) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open file for mtime")
+        .set_modified(SystemTime::now() - age)
+        .expect("set file mtime");
+}
+
+fn sample_snapshot(project: &Path) -> ReadinessBrokerSnapshot {
+    let canonical_root = clean_path_text(project);
+    let canonical_root_hash = hash_text(&canonical_root);
+    ReadinessBrokerSnapshot {
+        schema_version: BROKER_SCHEMA_VERSION,
+        identity: Some(codestory_workspace::project_identity_v2(project)),
+        install_id: "test-install".to_string(),
+        project_id: codestory_workspace::project_identity_v2(project).project_id,
+        canonical_root_hash,
+        workspace_root: clean_path(project),
+        cli_version: "9.9.9".to_string(),
+        updated_at_epoch_ms: now_epoch_ms(),
+        snapshot_path: None,
+        persistence_status: "pending".to_string(),
+        persistence_error: None,
+        operations: Vec::new(),
+        resources: BTreeMap::new(),
+        reconciliation: BrokerReconciliationSnapshot {
+            status: "observed".to_string(),
+            cleanup_performed: false,
+            stale_status_paths_removed: Vec::new(),
+            stale_lock_paths_removed: Vec::new(),
+            abandoned_repairs: Vec::new(),
+            local_refresh_cleanups: Vec::new(),
+            active_repair: None,
+            unresolved_orphan_reason: None,
+        },
+        gpu_proof: None,
+    }
+}
+
+fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval::SidecarStateFile {
+    codestory_retrieval::SidecarStateFile {
+        project_identity: None,
+        owner: "codestory".to_string(),
+        profile: "agent".to_string(),
+        namespace: "codestory-test".to_string(),
+        compose_project: "codestory-test".to_string(),
+        run_id: Some("shared-agent".to_string()),
+        zoekt_http_port: 37031,
+        qdrant_http_port: 37032,
+        qdrant_grpc_port: 37033,
+        embed_http_port: 37040,
+        embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+        embedding_device_policy: "accelerator_required".to_string(),
+        embedding_device_state: "gpu_verified".to_string(),
+        embedding_device_observation_source: "test".to_string(),
+        embedding_detected_provider: Some("vulkan".to_string()),
+        embedding_detected_gpu: Some("Vulkan0".to_string()),
+        embedding_accelerator_requested: true,
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: false,
+        embedding_launch: Some(codestory_retrieval::EmbeddingLaunchMetadata {
+            provider: "llamacpp".to_string(),
+            launch_mode: codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned
+                .as_str()
+                .to_string(),
+            endpoint: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+            pid: Some(1234),
+            spawned_at_epoch_ms,
+            launch_args: vec!["--port".to_string(), "37040".to_string()],
+            launch_fingerprint_sha256: Some("fingerprint".to_string()),
+            executable_source: Some("test".to_string()),
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
+            requested_device: Some("Vulkan0".to_string()),
+        }),
+        sidecar_images: codestory_retrieval::default_sidecar_image_pins(),
+        zoekt_data_dir: "C:/cache/zoekt".to_string(),
+        qdrant_data_dir: "C:/cache/qdrant".to_string(),
+        scip_artifacts_root: "C:/cache/scip".to_string(),
+        compose_file: None,
+        cleanup_command: "codestory-cli retrieval down".to_string(),
+        started_at_epoch_ms: 100,
+    }
+}
+
+fn verified_gpu_proof_input(embed_smoke_ok: Option<bool>) -> BrokerGpuProofInput {
+    BrokerGpuProofInput {
+        embedding_device_policy: Some("accelerator_required".to_string()),
+        embedding_device_state: Some("accelerated".to_string()),
+        embedding_device_observation_source: Some("sidecar_log".to_string()),
+        embedding_detected_provider: Some("vulkan".to_string()),
+        embedding_detected_gpu: Some("Vulkan0".to_string()),
+        embedding_accelerator_requested: Some(true),
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: Some(false),
+        embed_smoke_ok,
+        embed_smoke_ms: embed_smoke_ok.map(|_| 12),
+        degraded_reason: None,
+    }
+}
+
+fn gpu_runtime_identity(project: &Path, started_at_epoch_ms: i64) -> BrokerGpuRuntimeIdentity {
+    BrokerGpuRuntimeIdentity {
+        workspace_id: codestory_workspace::workspace_id_for_root(project),
+        profile: "agent".to_string(),
+        run_id: Some("shared-agent".to_string()),
+        namespace: "codestory-test".to_string(),
+        compose_project: "codestory-test".to_string(),
+        embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+        started_at_epoch_ms,
+        embedding_launch: None,
+    }
+}
+
+fn write_matching_native_sidecar_state(
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    pid: u32,
+) {
+    let mut state = native_sidecar_state(Some(now_epoch_ms()));
+    state.profile = sidecar.profile.as_str().to_string();
+    state.namespace = sidecar.namespace.clone();
+    state.compose_project = sidecar.compose_project.clone();
+    state.run_id = sidecar.run_id.clone();
+    state.embed_http_port = sidecar.embed_http_port;
+    state.embed_url = codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
+    if let Some(launch) = state.embedding_launch.as_mut() {
+        launch.endpoint = state.embed_url.clone();
+        launch.pid = Some(pid);
+    }
+    if let Some(parent) = sidecar.layout.state_file.parent() {
+        fs::create_dir_all(parent).expect("create state parent");
+    }
+    fs::write(
+        &sidecar.layout.state_file,
+        serde_json::to_vec_pretty(&state).expect("serialize state"),
+    )
+    .expect("write state");
+}
+
+#[test]
+fn gpu_proof_requires_observed_acceleration_when_requested() {
+    let proof = gpu_proof(BrokerGpuProofInput {
+        embedding_device_policy: Some("accelerator_required".to_string()),
+        embedding_device_state: Some("unknown".to_string()),
+        embedding_device_observation_source: Some("native_device_list".to_string()),
+        embedding_detected_provider: None,
+        embedding_detected_gpu: None,
+        embedding_accelerator_requested: Some(true),
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: Some(false),
+        embed_smoke_ok: None,
+        embed_smoke_ms: None,
+        degraded_reason: Some("embedding_device_unverified".to_string()),
+    });
+    assert_eq!(proof.proof_status, "gpu_unverified");
+    assert!(!proof.meaningful_accelerator_work_proven);
+    assert_eq!(proof.degraded_reason.as_deref(), Some("gpu_unverified"));
+}
+
+#[test]
+fn gpu_proof_requires_live_embed_smoke_for_verified() {
+    let without_smoke = gpu_proof(BrokerGpuProofInput {
+        embedding_device_policy: Some("accelerator_required".to_string()),
+        embedding_device_state: Some("accelerated".to_string()),
+        embedding_device_observation_source: Some("native_log".to_string()),
+        embedding_detected_provider: Some("vulkan".to_string()),
+        embedding_detected_gpu: Some("Vulkan0".to_string()),
+        embedding_accelerator_requested: Some(true),
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: Some(false),
+        embed_smoke_ok: None,
+        embed_smoke_ms: None,
+        degraded_reason: None,
+    });
+    assert_eq!(without_smoke.proof_status, "gpu_unverified");
+    assert!(!without_smoke.meaningful_accelerator_work_proven);
+
+    let with_smoke = gpu_proof(BrokerGpuProofInput {
+        embedding_device_policy: Some("accelerator_required".to_string()),
+        embedding_device_state: Some("accelerated".to_string()),
+        embedding_device_observation_source: Some("native_log".to_string()),
+        embedding_detected_provider: Some("vulkan".to_string()),
+        embedding_detected_gpu: Some("Vulkan0".to_string()),
+        embedding_accelerator_requested: Some(true),
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: Some(false),
+        embed_smoke_ok: Some(true),
+        embed_smoke_ms: Some(42),
+        degraded_reason: None,
+    });
+    assert_eq!(with_smoke.proof_status, "verified");
+    assert!(with_smoke.meaningful_accelerator_work_proven);
+    assert_eq!(with_smoke.embed_smoke_ok, Some(true));
+    assert_eq!(with_smoke.embed_smoke_ms, Some(42));
+
+    let with_smoke_json = serde_json::to_value(&with_smoke).expect("serialize gpu proof");
+    assert!(
+        with_smoke_json.get("embed_smoke_ok").is_some(),
+        "gpu_proof JSON shape must include embed_smoke_ok when set: {with_smoke_json}"
+    );
+    assert!(
+        with_smoke_json.get("embed_smoke_ms").is_some(),
+        "gpu_proof JSON shape must include embed_smoke_ms when set: {with_smoke_json}"
+    );
+}
+
+#[test]
+fn gpu_proof_does_not_verify_from_device_inventory() {
+    let proof = gpu_proof(BrokerGpuProofInput {
+        embedding_device_policy: Some("accelerator_required".to_string()),
+        embedding_device_state: Some("accelerated".to_string()),
+        embedding_device_observation_source: Some("native_device_list".to_string()),
+        embedding_detected_provider: Some("vulkan".to_string()),
+        embedding_detected_gpu: Some("Vulkan0".to_string()),
+        embedding_accelerator_requested: Some(true),
+        embedding_accelerator_request_provider: Some("vulkan".to_string()),
+        embedding_accelerator_request_device: Some("Vulkan0".to_string()),
+        embedding_cpu_allowed: Some(false),
+        embed_smoke_ok: Some(true),
+        embed_smoke_ms: Some(42),
+        degraded_reason: None,
+    });
+    assert_eq!(proof.proof_status, "gpu_unverified");
+    assert!(!proof.meaningful_accelerator_work_proven);
+    assert_eq!(proof.degraded_reason.as_deref(), Some("gpu_unverified"));
+}
+
+#[test]
+fn broker_scope_carries_project_and_run_identity() {
+    let project = tempdir().expect("temp project");
+    let scope = agent_repair_scope(project.path(), Some("agent-1"), "9.9.9");
+    assert_eq!(scope.schema_version, BROKER_SCHEMA_VERSION);
+    assert_eq!(scope.profile, "agent");
+    assert_eq!(scope.run_id.as_deref(), Some("agent-1"));
+    assert_eq!(scope.agent_id.as_deref(), Some("agent-1"));
+    let identity = scope.identity.as_ref().expect("broker identity");
+    assert_eq!(scope.project_id, identity.project_id);
+    assert_eq!(
+        identity.workspace_id,
+        codestory_workspace::workspace_id_for_root(project.path())
+    );
+    assert_eq!(scope.cli_version, "9.9.9");
+}
+
+#[test]
+fn native_embedding_reuse_does_not_cross_workspace_roots() {
+    let project = tempdir().expect("project");
+    let other_worktree = tempdir().expect("other worktree");
+    let scope = test_scope(project.path(), "shared-agent");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some("shared-agent"),
+    );
+    let busy = BrokerMachineResourceBusy {
+        snapshot: BrokerResourceSnapshot {
+            resource: NATIVE_EMBEDDING_RESOURCE.to_string(),
+            scope: "machine".to_string(),
+            status: "busy".to_string(),
+            owner_pid: Some(std::process::id()),
+            owner_operation_id: Some("other-worktree".to_string()),
+            owner_project_id: Some(scope.project_id.clone()),
+            owner_workspace_root: Some(clean_path(other_worktree.path())),
+            started_at_epoch_ms: Some(now_epoch_ms()),
+            lock_path: "other-worktree.lock".to_string(),
+            queued_reason: Some("machine_resource_busy".to_string()),
+        },
+    };
+    let mut validate = |_launch: &codestory_retrieval::EmbeddingLaunchMetadata| {
+        panic!("different workspace must not reach launch validation")
+    };
+
+    assert_eq!(
+        reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut validate)
+            .expect("workspace comparison"),
+        None
+    );
+}
+
+#[test]
+fn native_embedding_busy_lock_reuses_matching_sidecar_owner() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("native-reuse");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "shared-agent");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some("shared-agent"),
+    );
+    let owner_pid = std::process::id();
+    write_machine_lock(&resource, &scope, owner_pid);
+    write_matching_native_sidecar_state(&sidecar, owner_pid);
+    let busy = BrokerMachineResourceBusy {
+        snapshot: machine_resource_snapshot(&resource),
+    };
+    let mut validator_called = false;
+
+    let reused = reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut |launch| {
+        validator_called = true;
+        assert_eq!(launch.pid, Some(owner_pid));
+        Ok(owner_pid)
+    })
+    .expect("reuse check");
+
+    assert_eq!(reused, Some(owner_pid));
+    assert!(validator_called);
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_embedding_busy_lock_rejects_mismatched_state_pid() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("native-mismatch");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "shared-agent");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some("shared-agent"),
+    );
+    let owner_pid = std::process::id();
+    write_machine_lock(&resource, &scope, owner_pid);
+    write_matching_native_sidecar_state(&sidecar, owner_pid.saturating_add(1));
+    let busy = BrokerMachineResourceBusy {
+        snapshot: machine_resource_snapshot(&resource),
+    };
+
+    let reused = reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut |_| {
+        panic!("mismatched pid must not reach live identity validation")
+    })
+    .expect("reuse check");
+
+    assert_eq!(reused, None);
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_embedding_reused_lease_revalidates_handoff_identity() {
+    let owner_pid = 4321;
+    let mut lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: owner_pid });
+    let mut state = native_sidecar_state(Some(now_epoch_ms()));
+    if let Some(launch) = state.embedding_launch.as_mut() {
+        launch.pid = Some(owner_pid);
+    }
+    let mut validator_called = false;
+
+    let error =
+        transfer_native_embedding_resource_lease_with_validator(&mut lease, &state, |launch| {
+            validator_called = true;
+            assert_eq!(launch.pid, Some(owner_pid));
+            Err(anyhow::anyhow!("identity_unverified"))
+        })
+        .expect_err("reused handoff must fail closed when identity validation fails");
+
+    assert!(validator_called);
+    assert!(
+        format!("{error:?}").contains("identity_unverified"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn native_embedding_acquired_lease_releases_without_handoff_on_error() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("native-error-release");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "shared-agent");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some("shared-agent"),
+    );
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+    let path = machine_resource_lock_path(&resource);
+    let mut lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+
+    cleanup_native_embedding_resource_lease_after_bootstrap_error(&mut lease, &sidecar)
+        .expect("cleanup after bootstrap error");
+    drop(lease);
+
+    assert!(!path.exists(), "untransferred lease should release on drop");
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_embedding_cleanup_failure_preserves_acquired_lock_for_recorded_launch() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("native-cleanup-failure-preserve");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "shared-agent");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some("shared-agent"),
+    );
+    let owner_pid = 4321;
+    write_matching_native_sidecar_state(&sidecar, owner_pid);
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+    let path = machine_resource_lock_path(&resource);
+    let mut lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+
+    let error = cleanup_native_embedding_resource_lease_after_bootstrap_error_with_cleanup(
+        &mut lease,
+        &sidecar,
+        || Err(anyhow::anyhow!("cleanup_failed")),
+        |launch| {
+            assert_eq!(launch.pid, Some(owner_pid));
+            Ok(owner_pid)
+        },
+    )
+    .expect_err("cleanup failure should be reported");
+    drop(lease);
+
+    assert!(format!("{error:?}").contains("cleanup_failed"));
+    let preserved = read_machine_resource_lock_file(&path).expect("lock remains");
+    assert_eq!(preserved.pid, owner_pid);
+    assert!(preserved.native_embedding_launch.is_some());
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_embedding_reused_transfer_error_cleanup_is_noop() {
+    let lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: 4321 });
+
+    cleanup_native_embedding_resource_lease_after_transfer_error_with_cleanup(&lease, || {
+        panic!("reused lease must not stop the shared sidecar on transfer failure")
+    })
+    .expect("reused transfer cleanup is a no-op");
+}
+
+#[test]
+fn native_embedding_acquired_transfer_error_runs_cleanup() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("native-transfer-cleanup");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "shared-agent");
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+    let lease = Some(BrokerNativeEmbeddingResourceLease::Acquired(lock));
+    let mut cleanup_called = false;
+
+    cleanup_native_embedding_resource_lease_after_transfer_error_with_cleanup(&lease, || {
+        cleanup_called = true;
+        Ok(())
+    })
+    .expect("acquired transfer cleanup");
+
+    assert!(cleanup_called);
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_embedding_reused_post_transfer_cleanup_is_noop() {
+    let lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: 4321 });
+    let launch = native_sidecar_state(Some(now_epoch_ms()))
+        .embedding_launch
+        .expect("native launch");
+
+    cleanup_transferred_native_embedding_resource_after_error_with_cleanup(
+        &lease,
+        Some(&launch),
+        || panic!("reused lease must not stop the shared sidecar"),
+        |_| panic!("reused lease must not release the shared machine lock"),
+    )
+    .expect("reused cleanup is a no-op");
+}
+
+#[test]
+fn native_embedding_reused_post_transfer_cleanup_skips_state_read() {
+    let project = tempdir().expect("temp project");
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some("shared-agent"),
+    );
+    if let Some(parent) = sidecar.layout.state_file.parent() {
+        fs::create_dir_all(parent).expect("create state parent");
+    }
+    fs::write(&sidecar.layout.state_file, b"{not-json").expect("write corrupt state");
+    let lease = Some(BrokerNativeEmbeddingResourceLease::Reused { pid: 4321 });
+
+    cleanup_transferred_native_embedding_resource_after_error(&lease, &sidecar)
+        .expect("reused post-transfer cleanup should skip state reads");
+}
+
+#[test]
+fn machine_resource_lock_reports_busy_until_owner_drops() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("single-owner");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "owner");
+
+    let lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+    let busy = match try_acquire_machine_resource_lock(&resource, &scope).expect("second acquire") {
+        BrokerMachineResourceLockAttempt::Acquired(_) => {
+            panic!("second lock should be busy")
+        }
+        BrokerMachineResourceLockAttempt::Busy(busy) => busy,
+    };
+    assert_eq!(busy.snapshot.status, "busy");
+    assert_eq!(busy.snapshot.owner_pid, Some(std::process::id()));
+
+    drop(lock);
+    let reacquired =
+        try_acquire_machine_resource_lock(&resource, &scope).expect("reacquire after drop");
+    assert!(matches!(
+        reacquired,
+        BrokerMachineResourceLockAttempt::Acquired(_)
+    ));
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_lock_reclaims_dead_owner() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("dead-owner");
+    cleanup_machine_resource(&resource);
+    let old_scope = test_scope(project.path(), "dead");
+    let new_scope = test_scope(project.path(), "new");
+    write_machine_lock(&resource, &old_scope, u32::MAX);
+
+    let acquired =
+        try_acquire_machine_resource_lock(&resource, &new_scope).expect("reclaim dead owner");
+    assert!(matches!(
+        acquired,
+        BrokerMachineResourceLockAttempt::Acquired(_)
+    ));
+    let snapshot = machine_resource_snapshot(&resource);
+    assert_eq!(snapshot.status, "busy");
+    assert_eq!(
+        snapshot.owner_operation_id,
+        Some(broker_operation_id(&new_scope))
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_lock_reclaims_stale_malformed_file() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("malformed-stale");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "new");
+    let path = write_malformed_machine_lock(&resource);
+    set_file_age(&path, MACHINE_LOCK_STALE_TTL + Duration::from_secs(1));
+
+    let acquired =
+        try_acquire_machine_resource_lock(&resource, &scope).expect("reclaim malformed lock");
+    assert!(matches!(
+        acquired,
+        BrokerMachineResourceLockAttempt::Acquired(_)
+    ));
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_lock_keeps_fresh_malformed_file_busy() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("malformed-fresh");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "new");
+    write_malformed_machine_lock(&resource);
+
+    let acquired =
+        try_acquire_machine_resource_lock(&resource, &scope).expect("probe malformed lock");
+    assert!(
+        matches!(acquired, BrokerMachineResourceLockAttempt::Busy(_)),
+        "fresh malformed lock should stay busy until it ages out"
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_lock_keeps_live_pre_handoff_owner_past_ttl() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("old-pre-handoff-owner");
+    cleanup_machine_resource(&resource);
+    let old_scope = test_scope(project.path(), "live-old");
+    let new_scope = test_scope(project.path(), "new");
+    write_machine_lock_at(
+        &resource,
+        &old_scope,
+        std::process::id(),
+        now_epoch_ms() - MACHINE_LOCK_STALE_TTL.as_millis() as i64 - 10_000,
+    );
+
+    let acquired =
+        try_acquire_machine_resource_lock(&resource, &new_scope).expect("probe live owner");
+
+    assert!(
+        matches!(acquired, BrokerMachineResourceLockAttempt::Busy(_)),
+        "live pre-handoff owners must not age out while the pid is still running"
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_embedding_lock_is_not_stale_when_identity_is_unverified() {
+    let project = tempdir().expect("temp project");
+    let scope = test_scope(project.path(), "native-unverified");
+    let mut state = native_sidecar_state(Some(now_epoch_ms()));
+    if let Some(launch) = state.embedding_launch.as_mut() {
+        launch.pid = Some(std::process::id());
+    }
+    let lock = BrokerMachineResourceLockFile {
+        schema_version: MACHINE_LOCK_SCHEMA_VERSION,
+        resource: NATIVE_EMBEDDING_RESOURCE.to_string(),
+        scope,
+        pid: std::process::id(),
+        started_at_epoch_ms: now_epoch_ms() - MACHINE_LOCK_STALE_TTL.as_millis() as i64 - 1,
+        token: "native-unverified".to_string(),
+        operation_id: "native-unverified".to_string(),
+        native_embedding_launch: state.embedding_launch,
+    };
+
+    assert!(
+        !machine_lock_is_stale(&lock),
+        "native locks should stay held when identity inspection is unverified"
+    );
+}
+
+#[test]
+fn machine_resource_reaper_stale_takeover_has_single_winner() {
+    let resource = unique_resource("stale-reaper-single-winner");
+    cleanup_machine_resource(&resource);
+    write_stale_reaper_lock(&resource);
+    let contender_count = 8;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(contender_count));
+    let mut handles = Vec::new();
+
+    for _ in 0..contender_count {
+        let resource = resource.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            try_acquire_machine_resource_reaper_lock(&resource).expect("try reaper")
+        }));
+    }
+
+    let locks: Vec<Option<BrokerMachineResourceReaperLock>> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("reaper contender thread"))
+        .collect();
+
+    assert_eq!(
+        locks.iter().filter(|lock| lock.is_some()).count(),
+        1,
+        "stale reaper takeover must have exactly one winner"
+    );
+    drop(locks);
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_cache_fingerprint_tracks_lock_and_reaper_changes() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("cache-fingerprint");
+    cleanup_machine_resource(&resource);
+    let before = machine_resource_cache_fingerprint(&resource);
+    let scope = test_scope(project.path(), "owner");
+
+    write_machine_lock(&resource, &scope, std::process::id());
+    let after_lock = machine_resource_cache_fingerprint(&resource);
+    assert_ne!(before, after_lock);
+
+    write_stale_reaper_lock(&resource);
+    let after_reaper = machine_resource_cache_fingerprint(&resource);
+    assert_ne!(after_lock, after_reaper);
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn path_fingerprint_tracks_same_length_content_changes() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("lock.json");
+    fs::write(&path, b"aaaa").expect("write first");
+    let first = path_fingerprint(&path);
+
+    fs::write(&path, b"bbbb").expect("write second");
+    let second = path_fingerprint(&path);
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn machine_resource_lock_transfers_to_native_launch_until_launch_release() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("pid-transfer");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "owner");
+
+    let mut lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+
+    let mut state = native_sidecar_state(Some(now_epoch_ms()));
+    let launch = state.embedding_launch.as_mut().expect("launch");
+    launch.pid = Some(std::process::id());
+    assert!(
+        transfer_machine_resource_lock_to_native_launch(&mut lock, launch).expect("transfer lock")
+    );
+    drop(lock);
+    let path = machine_resource_lock_path(&resource);
+    assert!(
+        path.exists(),
+        "transferred lock should outlive launcher lock drop"
+    );
+    assert!(
+        release_machine_resource_lock_for_native_launch(&resource, launch)
+            .expect("release pid lock")
+    );
+    assert!(!path.exists(), "pid release should remove lock file");
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_launch_handoff_publish_failure_keeps_drop_cleanup_enabled() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("pid-transfer-fail");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "owner");
+
+    let mut lock =
+        match try_acquire_machine_resource_lock(&resource, &scope).expect("acquire machine lock") {
+            BrokerMachineResourceLockAttempt::Acquired(lock) => lock,
+            BrokerMachineResourceLockAttempt::Busy(busy) => {
+                panic!("first lock should acquire, got {busy:?}")
+            }
+        };
+
+    let mut state = native_sidecar_state(Some(now_epoch_ms()));
+    let launch = state.embedding_launch.as_mut().expect("launch");
+    launch.pid = Some(std::process::id());
+    let error = transfer_machine_resource_lock_to_native_launch_with_publisher(
+        &mut lock,
+        launch,
+        |_path, _content| Err(anyhow::anyhow!("simulated publish failure")),
+    )
+    .expect_err("publish failure should be reported");
+    assert!(error.to_string().contains("simulated publish failure"));
+    assert!(
+        lock.release_on_drop,
+        "failed handoff must leave launcher cleanup enabled"
+    );
+
+    let path = machine_resource_lock_path(&resource);
+    drop(lock);
+    assert!(
+        !path.exists(),
+        "failed handoff should remove the original pre-handoff lock on drop"
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn native_launch_release_does_not_remove_pre_handoff_lock() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("native-release-pre-handoff");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "owner");
+    let mut state = native_sidecar_state(Some(now_epoch_ms()));
+    let launch = state.embedding_launch.as_mut().expect("launch");
+    launch.pid = Some(4321);
+    let path = write_machine_lock(&resource, &scope, 4321);
+
+    assert!(
+        !release_machine_resource_lock_for_native_launch(&resource, launch)
+            .expect("release pre-handoff")
+    );
+    assert!(
+        path.exists(),
+        "native launch release must not remove a lock before launch handoff"
+    );
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn machine_resource_reaper_leaves_fresh_lock_owned() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("fresh-recheck");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "fresh");
+    let path = write_machine_lock(&resource, &scope, std::process::id());
+
+    assert!(
+        !reap_stale_machine_resource_lock(&resource, &path).expect("reap check"),
+        "fresh lock should not be reaped"
+    );
+    let lock = read_machine_resource_lock_file(&path).expect("fresh lock remains");
+    assert_eq!(lock.operation_id, broker_operation_id(&scope));
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn snapshot_file_round_trips_json() {
+    let dir = tempdir().expect("temp dir");
+    let snapshot = sample_snapshot(dir.path());
+    let path = dir.path().join("snapshot.json");
+
+    write_snapshot_file(&path, &snapshot).expect("write snapshot");
+
+    let parsed: ReadinessBrokerSnapshot =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read snapshot"))
+            .expect("parse snapshot");
+    assert_eq!(parsed.schema_version, BROKER_SCHEMA_VERSION);
+    assert_eq!(parsed.project_id, snapshot.project_id);
+}
+
+#[test]
+fn snapshot_file_uses_unique_temp_names_for_same_process_writers() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("snapshot.json");
+    let snapshot = sample_snapshot(dir.path());
+    let mut handles = Vec::new();
+
+    for index in 0..4 {
+        let path = path.clone();
+        let mut snapshot = snapshot.clone();
+        snapshot.cli_version = format!("9.9.{index}");
+        handles.push(thread::spawn(move || {
+            for _ in 0..10 {
+                write_snapshot_file(&path, &snapshot).expect("write snapshot");
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("snapshot writer thread");
+    }
+    let parsed: ReadinessBrokerSnapshot =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read final snapshot"))
+            .expect("parse final snapshot");
+    assert_eq!(parsed.schema_version, BROKER_SCHEMA_VERSION);
+    assert!(parsed.cli_version.starts_with("9.9."));
+}
+
+fn write_ready_repair_status_file(
+    project: &Path,
+    run_id: &str,
+    pid: u32,
+    updated_at_epoch_ms: i64,
+    phase: &str,
+) -> PathBuf {
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project,
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(run_id),
+    );
+    let path = sidecar
+        .layout
+        .state_file
+        .with_file_name("ready-repair-status.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create repair status parent");
+    }
+    let status = serde_json::json!({
+        "schema_version": 1,
+        "status": "repairing",
+        "project_root": clean_path_text(project),
+        "profile": "agent",
+        "run_id": run_id,
+        "namespace": sidecar.namespace,
+        "compose_project": sidecar.compose_project,
+        "phase": phase,
+        "pid": pid,
+        "started_at_epoch_ms": updated_at_epoch_ms,
+        "updated_at_epoch_ms": updated_at_epoch_ms,
+    });
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&status).expect("status json"),
+    )
+    .expect("write repair status");
+    path
+}
+
+fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
+    let status_path = cache_root.join("local-refresh-status.json");
+    let lock_path = cache_root.join("local-refresh.lock");
+    let old_started = now_epoch_ms() - 180_000;
+    fs::write(
+        &status_path,
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "status": "refreshing",
+            "project_root": clean_path_text(project),
+            "phase": "incremental_index",
+            "pid": u32::MAX,
+            "started_at_epoch_ms": old_started,
+            "updated_at_epoch_ms": old_started,
+            "last_failure_reason": null
+        }))
+        .expect("status json"),
+    )
+    .expect("write stale local refresh status");
+    fs::write(
+        &lock_path,
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "project_root": clean_path_text(project),
+            "pid": u32::MAX,
+            "started_at_epoch_ms": old_started,
+            "token": "stale"
+        }))
+        .expect("lock json"),
+    )
+    .expect("write stale local refresh lock");
+}
+
+#[test]
+fn reconcile_before_enqueue_returns_active_repair_when_live() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let run_id = "shared-agent";
+    write_ready_repair_status_file(
+        project.path(),
+        run_id,
+        std::process::id(),
+        now_epoch_ms(),
+        "Qdrant finalize",
+    );
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some(run_id), "9.9.9");
+
+    assert_eq!(reconciliation.status, "active_repair");
+    assert!(!reconciliation.cleanup_performed);
+    let active = reconciliation
+        .active_repair
+        .expect("active repair operation");
+    assert_eq!(active.status, "running");
+    assert_eq!(active.phase.as_deref(), Some("Qdrant finalize"));
+    assert!(reconciliation.abandoned_repairs.is_empty());
+}
+
+#[test]
+fn reconcile_before_enqueue_cleans_abandoned_repair_for_dead_pid() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let run_id = "shared-agent";
+    let status_path = write_ready_repair_status_file(
+        project.path(),
+        run_id,
+        u32::MAX,
+        now_epoch_ms(),
+        "graph artifact",
+    );
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some(run_id), "9.9.9");
+
+    assert_eq!(reconciliation.status, "stale_state_cleaned");
+    assert!(reconciliation.cleanup_performed);
+    assert!(reconciliation.active_repair.is_none());
+    assert_eq!(reconciliation.abandoned_repairs.len(), 1);
+    assert_eq!(
+        reconciliation.abandoned_repairs[0].status,
+        "abandoned_cleaned"
+    );
+    assert!(
+        !status_path.exists(),
+        "abandoned status file should be removed"
+    );
+}
+
+#[test]
+fn reconcile_before_enqueue_reports_clean_when_empty() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some("shared-agent"), "9.9.9");
+
+    assert_eq!(reconciliation.status, "clean");
+    assert!(!reconciliation.cleanup_performed);
+    assert!(reconciliation.active_repair.is_none());
+    assert!(reconciliation.abandoned_repairs.is_empty());
+    assert!(reconciliation.local_refresh_cleanups.is_empty());
+}
+
+#[test]
+fn reconcile_before_enqueue_cleans_stale_local_refresh() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    write_stale_local_refresh(cache.path(), project.path());
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some("shared-agent"), "9.9.9");
+
+    assert_eq!(reconciliation.status, "stale_state_cleaned");
+    assert!(reconciliation.cleanup_performed);
+    assert_eq!(reconciliation.local_refresh_cleanups.len(), 1);
+    assert_eq!(
+        reconciliation.local_refresh_cleanups[0].status,
+        "stale_cleaned"
+    );
+    assert!(!cache.path().join("local-refresh-status.json").exists());
+    assert!(!cache.path().join("local-refresh.lock").exists());
+}
+
+#[test]
+fn reconcile_before_enqueue_reports_live_stale_ready_repair_without_cleanup() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let run_id = "shared-agent";
+    let old = now_epoch_ms() - 180_000;
+    let status_path = write_ready_repair_status_file(
+        project.path(),
+        run_id,
+        std::process::id(),
+        old,
+        "Embedding documents",
+    );
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some(run_id), "9.9.9");
+
+    assert_eq!(reconciliation.status, "orphan_unresolved");
+    assert!(!reconciliation.cleanup_performed);
+    assert!(reconciliation.abandoned_repairs.is_empty());
+    assert!(
+        status_path.exists(),
+        "live stale repair status should remain for the owner to update or clear"
+    );
+    assert!(
+        reconciliation
+            .unresolved_orphan_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("live_ready_repair_heartbeat_stale")),
+        "{reconciliation:?}"
+    );
+}
+
+#[test]
+fn reconcile_before_enqueue_reports_live_stale_local_refresh_without_cleanup() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let old = now_epoch_ms() - 180_000;
+    fs::write(
+        cache.path().join("local-refresh-status.json"),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "status": "refreshing",
+            "project_root": clean_path_text(project.path()),
+            "phase": "incremental_index",
+            "pid": std::process::id(),
+            "started_at_epoch_ms": old,
+            "updated_at_epoch_ms": old,
+            "last_failure_reason": null
+        }))
+        .expect("status json"),
+    )
+    .expect("write live stale local refresh status");
+    fs::write(
+        cache.path().join("local-refresh.lock"),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "project_root": clean_path_text(project.path()),
+            "pid": std::process::id(),
+            "started_at_epoch_ms": old,
+            "token": "live-stale"
+        }))
+        .expect("lock json"),
+    )
+    .expect("write live stale local refresh lock");
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some("shared-agent"), "9.9.9");
+
+    assert_eq!(reconciliation.status, "orphan_unresolved");
+    assert!(!reconciliation.cleanup_performed);
+    assert_eq!(reconciliation.local_refresh_cleanups.len(), 1);
+    assert_eq!(
+        reconciliation.local_refresh_cleanups[0].status,
+        "stale_live"
+    );
+    assert!(cache.path().join("local-refresh-status.json").exists());
+    assert!(cache.path().join("local-refresh.lock").exists());
+    assert_eq!(
+        reconciliation.unresolved_orphan_reason.as_deref(),
+        Some("local_refresh_cleanup_blocked:live_status_heartbeat_stale")
+    );
+}
+
+#[test]
+fn machine_resource_lock_contention_has_single_winner_across_threads() {
+    let project = tempdir().expect("temp project");
+    let resource = unique_resource("lock-contention-single-winner");
+    cleanup_machine_resource(&resource);
+    let scope = test_scope(project.path(), "contender");
+    let contender_count = 8;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(contender_count));
+    let mut handles = Vec::new();
+
+    for _ in 0..contender_count {
+        let resource = resource.clone();
+        let scope = scope.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            try_acquire_machine_resource_lock(&resource, &scope).expect("try lock")
+        }));
+    }
+
+    let outcomes: Vec<BrokerMachineResourceLockAttempt> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("lock contender thread"))
+        .collect();
+    let winners = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, BrokerMachineResourceLockAttempt::Acquired(_)))
+        .count();
+    let busy = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, BrokerMachineResourceLockAttempt::Busy(_)))
+        .count();
+
+    assert_eq!(
+        winners, 1,
+        "machine lock contention must have exactly one winner"
+    );
+    assert_eq!(busy, contender_count - 1);
+    drop(outcomes);
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared() {
+    // Focused seam for "final success snapshot after lock/status release":
+    // while durable repair status exists, refresh reports a running op; after
+    // clear (as Drop of ReadyRepairProgress does before the outer final
+    // refresh), the success snapshot no longer carries running repair ops.
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let run_id = "shared-agent";
+    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        project.path(),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(run_id),
+    );
+    let started_at = now_epoch_ms();
+    let runtime_identity = gpu_runtime_identity(project.path(), started_at);
+    crate::ready_repair_status::write_ready_repair_status(
+        &sidecar,
+        project.path(),
+        "readiness check",
+        started_at,
+        std::process::id(),
+    )
+    .expect("write live repair status");
+
+    let during = refresh_broker_snapshot_with_runtime_identity(
+        BrokerSnapshotInput {
+            project_root: project.path().to_path_buf(),
+            cache_root: cache.path().to_path_buf(),
+            agent_run_id: Some(run_id.to_string()),
+            cli_version: "9.9.9".to_string(),
+            gpu_proof: Some(verified_gpu_proof_input(Some(true))),
+            reconciliation: None,
+        },
+        Some(&runtime_identity),
+    );
+    assert!(
+        during
+            .operations
+            .iter()
+            .any(|op| op.operation_kind == "agent_repair" && op.status == "running"),
+        "in-flight repair must appear before status clear: {during:?}"
+    );
+
+    crate::ready_repair_status::clear_ready_repair_status(&sidecar, started_at, std::process::id());
+
+    let after = refresh_broker_snapshot_with_runtime_identity(
+        BrokerSnapshotInput {
+            project_root: project.path().to_path_buf(),
+            cache_root: cache.path().to_path_buf(),
+            agent_run_id: Some(run_id.to_string()),
+            cli_version: "9.9.9".to_string(),
+            gpu_proof: Some(verified_gpu_proof_input(Some(true))),
+            reconciliation: None,
+        },
+        Some(&runtime_identity),
+    );
+    assert!(
+        after
+            .operations
+            .iter()
+            .all(|op| !(op.operation_kind == "agent_repair" && op.status == "running")),
+        "final success snapshot after repair clear must not keep running ops: {after:?}"
+    );
+    assert_eq!(after.persistence_status, "persisted");
+    let proof = after.gpu_proof.expect("gpu proof on final snapshot");
+    assert_eq!(proof.embed_smoke_ok, Some(true));
+    assert_eq!(proof.embed_smoke_ms, Some(12));
+}
+
+#[test]
+fn observe_broker_snapshot_is_stable_and_does_not_publish() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let canonical_root_hash = hash_text(&clean_path_text(project.path()));
+    let snapshot_path = broker_snapshot_path(&canonical_root_hash);
+    let _ = fs::remove_file(&snapshot_path);
+
+    let observe = || {
+        observe_broker_snapshot(BrokerSnapshotInput {
+            project_root: project.path().to_path_buf(),
+            cache_root: cache.path().to_path_buf(),
+            agent_run_id: Some("shared-agent".to_string()),
+            cli_version: "9.9.9".to_string(),
+            gpu_proof: None,
+            reconciliation: None,
+        })
+    };
+
+    let first = observe();
+    let second = observe();
+
+    assert_eq!(first, second);
+    assert_eq!(first.updated_at_epoch_ms, 0);
+    assert_eq!(first.persistence_status, "observed");
+    assert!(!snapshot_path.exists());
+}
+
+#[test]
+fn observe_broker_snapshot_reuses_matching_persisted_transition() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let input = || BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: None,
+        reconciliation: None,
+    };
+
+    let published = refresh_broker_snapshot(input());
+    let observed = observe_broker_snapshot(input());
+
+    assert_eq!(observed.updated_at_epoch_ms, published.updated_at_epoch_ms);
+    assert_eq!(observed.persistence_status, "persisted");
+    assert!(observed.persistence_error.is_none());
+}
+
+#[test]
+fn observe_broker_snapshot_preserves_verified_smoke_for_current_runtime() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let runtime_identity = gpu_runtime_identity(project.path(), now_epoch_ms());
+    let input = |embed_smoke_ok| BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: Some(verified_gpu_proof_input(embed_smoke_ok)),
+        reconciliation: None,
+    };
+
+    let refreshed =
+        refresh_broker_snapshot_with_runtime_identity(input(Some(true)), Some(&runtime_identity));
+    let observed =
+        observe_broker_snapshot_with_runtime_identity(input(None), Some(&runtime_identity));
+
+    assert_eq!(
+        refreshed.gpu_proof.as_ref().unwrap().proof_status,
+        "verified"
+    );
+    assert_eq!(
+        observed.gpu_proof.as_ref().unwrap().proof_status,
+        "verified"
+    );
+    assert_eq!(
+        observed.gpu_proof.as_ref().unwrap().embed_smoke_ok,
+        Some(true)
+    );
+    assert_eq!(
+        observed.gpu_proof.as_ref().unwrap().embed_smoke_ms,
+        Some(12)
+    );
+    assert_eq!(observed.updated_at_epoch_ms, refreshed.updated_at_epoch_ms);
+    assert_eq!(observed.persistence_status, "persisted");
+}
+
+#[test]
+fn observe_broker_snapshot_invalidates_verified_smoke_for_changed_runtime_identity() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let original_runtime = gpu_runtime_identity(project.path(), now_epoch_ms());
+    let mut changed_runtime = original_runtime.clone();
+    changed_runtime.started_at_epoch_ms += 1;
+    let input = |embed_smoke_ok| BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: Some(verified_gpu_proof_input(embed_smoke_ok)),
+        reconciliation: None,
+    };
+
+    let refreshed =
+        refresh_broker_snapshot_with_runtime_identity(input(Some(true)), Some(&original_runtime));
+    let observed =
+        observe_broker_snapshot_with_runtime_identity(input(None), Some(&changed_runtime));
+
+    assert_eq!(
+        refreshed.gpu_proof.as_ref().unwrap().proof_status,
+        "verified"
+    );
+    let proof = observed.gpu_proof.expect("observed gpu proof");
+    assert_eq!(proof.proof_status, "gpu_unverified");
+    assert!(!proof.meaningful_accelerator_work_proven);
+    assert_eq!(proof.embed_smoke_ok, None);
+    assert_eq!(proof.runtime_identity, None);
+    assert_eq!(observed.persistence_status, "observed");
+}
+
+#[test]
+fn legacy_snapshot_observation_is_read_only_and_refresh_migrates_to_v2() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let canonical_root_hash = hash_text(&clean_path_text(project.path()));
+    let snapshot_path = broker_snapshot_path(&canonical_root_hash);
+    fs::create_dir_all(snapshot_path.parent().expect("snapshot parent"))
+        .expect("create snapshot parent");
+    let mut legacy = sample_snapshot(project.path());
+    legacy.schema_version = LEGACY_BROKER_SCHEMA_VERSION;
+    legacy.identity = None;
+    legacy.project_id = format!("codestory-{}", &canonical_root_hash[..16]);
+    let legacy_json = serde_json::to_vec_pretty(&legacy).expect("serialize legacy snapshot");
+    fs::write(&snapshot_path, &legacy_json).expect("write legacy snapshot");
+    let input = || BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: None,
+        reconciliation: None,
+    };
+
+    let observed = observe_broker_snapshot(input());
+    assert_eq!(observed.schema_version, BROKER_SCHEMA_VERSION);
+    assert_eq!(observed.persistence_status, "observed");
+    assert_eq!(
+        fs::read(&snapshot_path).expect("legacy snapshot remains"),
+        legacy_json,
+        "observational reads must not migrate persisted state"
+    );
+
+    let refreshed = refresh_broker_snapshot(input());
+    assert_eq!(refreshed.schema_version, BROKER_SCHEMA_VERSION);
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snapshot_path).expect("read migrated snapshot"))
+            .expect("parse migrated snapshot");
+    assert_eq!(migrated["schema_version"], BROKER_SCHEMA_VERSION);
+    assert_eq!(
+        migrated["identity"]["workspace_id"],
+        codestory_workspace::workspace_id_for_root(project.path())
+    );
+    let _ = fs::remove_file(snapshot_path);
+}
+
+#[test]
+fn legacy_machine_lock_derives_identity_without_rewriting() {
+    let project = tempdir().expect("project");
+    let resource = unique_resource("legacy-identity");
+    cleanup_machine_resource(&resource);
+    let mut scope = test_scope(project.path(), "shared-agent");
+    scope.schema_version = LEGACY_BROKER_SCHEMA_VERSION;
+    scope.identity = None;
+    scope.project_id = format!(
+        "codestory-{}",
+        &hash_text(&clean_path_text(project.path()))[..16]
+    );
+    let lock = BrokerMachineResourceLockFile {
+        schema_version: LEGACY_BROKER_SCHEMA_VERSION,
+        resource: resource.clone(),
+        operation_id: "legacy-operation".to_string(),
+        scope,
+        pid: std::process::id(),
+        started_at_epoch_ms: now_epoch_ms(),
+        token: "legacy-token".to_string(),
+        native_embedding_launch: None,
+    };
+    let path = machine_resource_lock_path(&resource);
+    fs::create_dir_all(path.parent().expect("lock parent")).expect("create lock parent");
+    let legacy_json = serde_json::to_vec_pretty(&lock).expect("serialize legacy lock");
+    fs::write(&path, &legacy_json).expect("write legacy lock");
+
+    let parsed = read_machine_resource_lock_file(&path).expect("read legacy machine lock");
+    let identity = effective_scope_identity(&parsed.scope).expect("derive legacy identity");
+    assert_eq!(
+        identity.workspace_id,
+        codestory_workspace::workspace_id_for_root(project.path())
+    );
+    assert_eq!(fs::read(&path).expect("lock remains"), legacy_json);
+    cleanup_machine_resource(&resource);
+}

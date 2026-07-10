@@ -38,16 +38,15 @@ runtime does not launch them.
 Marketplace catalog: `TheGreenCedar/AgentPluginMarketplace` (display name
 `TheGreenCedar`). Plugin source: this repo at `plugins/codestory`.
 
-Refresh or uninstall from `/plugins` in the Codex UI. Terminal marketplace
-commands (`codex plugin marketplace add|upgrade|remove`) are optional when your
-Codex build exposes them.
+Refresh or uninstall from `/plugins` in the Codex UI. On Windows, terminal
+commands (`codex.cmd plugin marketplace add|upgrade|remove`) are optional when
+your Codex build exposes them. In Unix shells, use `codex` instead of
+`codex.cmd`.
 
-Marketplace refresh is not runtime reload: `codex plugin marketplace upgrade`
-only refreshes the catalog snapshot. Refresh the installed package from
-`/plugins` or `codex plugin add codestory@TheGreenCedar`, then start a fresh
-Codex host session before trusting the active MCP runtime. On Windows, an
-`Access is denied` cache-backup error usually means an old host still has the
-previous plugin files open; quit stale Codex windows and retry.
+Marketplace refresh is not runtime reload: the marketplace upgrade command only
+refreshes the catalog snapshot. Refresh the installed package from `/plugins` or
+the matching terminal plugin add command, then start a fresh Codex host session
+before trusting the active MCP runtime.
 
 ## Repair and CLI
 

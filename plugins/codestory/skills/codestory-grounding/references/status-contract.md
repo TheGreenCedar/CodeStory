@@ -15,10 +15,11 @@ the agent-facing field glossary alongside runtime `codestory://agent-guide`.
 | `sidecar_contract_version` | Sidecar schema contract compiled into the active CLI. | Use to diagnose sidecar/runtime contract drift. |
 | `plugin_runtime` | Plugin launch source and managed CLI metadata, including `plugin_runtime.plugin_root`, `plugin_cache_version`, `build_source`, and `repo_ref` when provisioned. | Treat `managed` as installed plugin runtime, `local_dev_override` as source/dev override, and `managed_unavailable` as blocked managed setup. |
 | `runtime_truth` | Grouped runtime source, plugin root, managed CLI path, launcher source, sidecar policy/status, and readiness lanes. | Use as the concise bounded runtime summary; fall back to the source fields when a nested value needs detail. |
-| `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Diagnostic sidecar policy detail. For agent repair, follow `recommended_next_calls` and prefer MCP `repair_all`. |
+| `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Diagnostic sidecar policy detail. For agent repair, follow `recommended_next_calls` and prefer MCP `sidecar_setup` with `action=repair`. |
+| `readiness_broker` | Durable repair, local refresh, native embedding resource ownership, stale-lock reconciliation, persistence status, and GPU proof (`proof_status`, `embed_smoke_ok`, `embed_smoke_ms`). | Inspect before retrying repair. A foreign or unverifiable `native_embedding_runtime` busy state blocks repair; a same-project reusable native owner should be followed through `recommended_next_calls`. `gpu_proof.proof_status == "verified"` and `gpu_proof.meaningful_accelerator_work_proven == true` require observed acceleration plus a live timed embed smoke when accelerator is required. |
 | `embedding_launch_metadata.launch_mode` | Embedding sidecar launch mode when available, such as `native_spawned` or Docker Compose embed. | On macOS arm64, expect `native_spawned` for accelerated Metal; Docker/Vulkan on Apple Silicon is stale or unrepaired. |
 | `embedding_accelerator_request_provider` / `embedding_accelerator_request_device` | Requested accelerator provider/device. These fields are intent, not proof. | Use them to diagnose mismatched requests, for example `metal` with no device on Apple Silicon versus `vulkan`/`Vulkan0` on Windows or Linux Vulkan paths. |
-| `embedding_device_state` / `embedding_device_observation_source` | Observed embedding device state and where the observation came from. | Treat `accelerated` as acceleration proof when paired with full retrieval status. Treat `accelerator_request_unobserved` as blocked unless CPU mode is explicitly allowed. |
+| `embedding_device_state` / `embedding_device_observation_source` | Observed embedding device state and where the observation came from. | Treat these as proof inputs. `manual_env` and device-inventory observations remain diagnostic; complete accelerator proof requires the verified broker GPU proof above. Treat `accelerator_request_unobserved` as blocked unless CPU mode is explicitly allowed. |
 | `allowed_surfaces.<surface>.allowed` | A concrete MCP surface is allowed. | Use local graph entries such as `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trail`, `trace`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph` only when their surface is allowed. |
 | `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Sidecar-backed agent surfaces are allowed. | Use `packet`, `search`, and `context` confidently when their own allowed bit is true and `retrieval_mode=full`. |
 
@@ -33,7 +34,7 @@ provisions from `github_release` when needed, and records the launch source in
 adapter stays up with `repair_setup` diagnostics instead of closing transport.
 
 If `codestory://status` reports a repairable state, run the MCP
-`recommended_next_calls` loop: call `repair_all` when recommended, then reread
-`codestory://status` before local navigation, packet, search, or context. Do not
-ask the human to install the binary unless network, permissions, host reload, or
-release assets block the repair.
+`recommended_next_calls` loop: call `sidecar_setup` with `action=repair` when
+recommended, then reread `codestory://status` before local navigation, packet,
+search, or context. Do not ask the human to install the binary unless network,
+permissions, host reload, or release assets block the repair.

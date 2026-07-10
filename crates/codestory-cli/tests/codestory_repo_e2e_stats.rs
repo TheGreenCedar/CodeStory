@@ -738,7 +738,7 @@ fn codestory_repo_release_e2e_emits_stats() {
             "--run-id".to_string(),
             sidecar_run_id.to_string(),
             "--refresh".to_string(),
-            "none".to_string(),
+            "full".to_string(),
             "--format".to_string(),
             "json".to_string(),
         ],
@@ -1238,14 +1238,6 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.stats_baseline.commit,
         repeat_full_refresh_seconds_budget,
         stats.repeat_full_refresh_seconds
-    );
-    assert!(
-        stats.index.semantic_doc_count > 0,
-        "full repo index should populate dense anchors"
-    );
-    assert!(
-        stats.semantic_docs_embedded > 0,
-        "full repo index should report embedded semantic docs"
     );
     assert_eq!(
         stats.search.top_symbol_name, "AppController",

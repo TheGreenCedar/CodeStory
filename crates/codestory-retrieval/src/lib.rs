@@ -21,6 +21,7 @@ mod health;
 mod index;
 mod inventory;
 mod mode;
+pub mod outbound_http;
 mod planner;
 mod qdrant_client;
 mod qdrant_storage;
@@ -42,23 +43,24 @@ pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
 pub use compose::{
-    BootstrapReport, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory, bootstrap_sidecars,
-    bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime,
+    BootstrapReport, BootstrapSidecarsOptions, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory,
+    bootstrap_sidecars, bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime,
     bootstrap_sidecars_with_runtime_progress, docker_available, embed_model_inventory,
     resolve_compose_file,
 };
 pub use config::{
     DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
-    DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, QDRANT_IMAGE_PIN, SidecarImagePins,
-    SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile, SidecarRuntimeConfig,
-    ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN, default_sidecar_image_pins,
-    sidecar_runtime_auto, sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id,
+    DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN,
+    SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile,
+    SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
+    default_sidecar_image_pins, embedding_server_launch_mode, sidecar_runtime_auto,
+    sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id,
 };
-pub use embeddings::qdrant_vector_dim;
 pub use embeddings::{
-    BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, RETRIEVAL_EMBEDDING_DIM,
-    embedding_backend_label, embedding_runtime_id, ensure_product_embedding_backend,
-    ensure_product_embedding_backend_for_runtime,
+    BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingRuntimeProbe,
+    RETRIEVAL_EMBEDDING_DIM, embedding_backend_label, embedding_runtime_id,
+    ensure_product_embedding_backend, ensure_product_embedding_backend_for_runtime,
+    probe_product_embedding_runtime, qdrant_vector_dim,
 };
 pub use executor::{QueryExecutor, QueryResult, QueryTrace, StageTrace, cancellation_flag};
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
@@ -97,8 +99,10 @@ pub use query_features::{QueryFeatures, QueryShape, classify_query};
 pub use ranker::rank_candidates;
 pub use scip_client::ScipClient;
 pub use sidecar::{
-    SidecarStateFile, sidecar_down, sidecar_down_for_project, sidecar_down_for_runtime,
-    sidecar_status, sidecar_up, sidecar_up_with_runtime, strict_sidecar_status,
+    NativeEmbeddingLaunchIdentityStatus, SidecarStateFile, ensure_native_embedding_launch_identity,
+    native_embedding_launch_identity_status, sidecar_down, sidecar_down_for_project,
+    sidecar_down_for_runtime, sidecar_state_matches_runtime, sidecar_status, sidecar_up,
+    sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch, strict_sidecar_status,
     strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};

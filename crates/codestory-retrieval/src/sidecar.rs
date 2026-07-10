@@ -11,14 +11,33 @@ use crate::health::{
     probe_sidecar_health_with_embedding_device, unavailable_status_report_with_embedding_device,
 };
 use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_root};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
 };
 use codestory_store::Store;
 use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::path::Path;
+use std::process::Command;
+#[cfg(not(windows))]
+use std::time::{Duration, Instant};
+
+const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+#[cfg(not(windows))]
+const NATIVE_EMBEDDING_STOP_WAIT: Duration = Duration::from_secs(5);
+#[cfg(not(windows))]
+const NATIVE_EMBEDDING_STOP_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeEmbeddingLaunchIdentityStatus {
+    Matched { pid: u32 },
+    NotRunning { pid: u32 },
+    Mismatched { pid: u32, reason: String },
+    Unverified { pid: Option<u32>, reason: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Runtime state file written by `sidecar_up`.
@@ -26,6 +45,8 @@ use std::path::Path;
 /// The file records local sidecar endpoints and data roots only. It is not a readiness manifest;
 /// callers must use `sidecar_status` or `strict_sidecar_status` before trusting retrieval output.
 pub struct SidecarStateFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
     #[serde(default = "default_sidecar_owner")]
     pub owner: String,
     #[serde(default = "default_sidecar_profile")]
@@ -86,6 +107,14 @@ pub fn sidecar_up_with_runtime(
     sidecar_up_with_runtime_and_launch_metadata(runtime, compose_file, None)
 }
 
+pub fn sidecar_up_with_runtime_preserving_launch(
+    runtime: &SidecarRuntimeConfig,
+    compose_file: Option<&Path>,
+) -> Result<SidecarStateFile> {
+    let embedding_launch = reusable_embedding_launch_from_state(runtime);
+    sidecar_up_with_runtime_and_launch_metadata(runtime, compose_file, embedding_launch)
+}
+
 pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     runtime: &SidecarRuntimeConfig,
     compose_file: Option<&Path>,
@@ -95,6 +124,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness();
     let state = SidecarStateFile {
+        project_identity: runtime.project_identity.clone(),
         owner: "codestory".into(),
         profile: runtime.profile.as_str().into(),
         namespace: runtime.namespace.clone(),
@@ -128,6 +158,41 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     Ok(state)
 }
 
+/// Returns true when a sidecar state file matches the runtime identity used for reuse/handoff.
+pub fn sidecar_state_matches_runtime(
+    state: &SidecarStateFile,
+    runtime: &SidecarRuntimeConfig,
+) -> bool {
+    state.owner == "codestory"
+        && state.namespace == runtime.namespace
+        && state.compose_project == runtime.compose_project
+        && state.profile == runtime.profile.as_str()
+        && state.run_id.as_deref() == runtime.run_id.as_deref()
+        && state.embed_http_port == runtime.embed_http_port
+        && state.embed_url == SidecarLayout::embed_base_url(runtime.embed_http_port)
+        && state
+            .project_identity
+            .as_ref()
+            .is_none_or(|state_identity| {
+                runtime
+                    .project_identity
+                    .as_ref()
+                    .is_some_and(|runtime_identity| {
+                        state_identity.workspace_id == runtime_identity.workspace_id
+                    })
+            })
+}
+
+fn reusable_embedding_launch_from_state(
+    runtime: &SidecarRuntimeConfig,
+) -> Option<EmbeddingLaunchMetadata> {
+    let state = read_sidecar_state(&runtime.layout.state_file)?;
+    if !sidecar_state_matches_runtime(&state, runtime) {
+        return None;
+    }
+    state.embedding_launch
+}
+
 pub fn sidecar_down() -> Result<()> {
     sidecar_down_for_runtime(&SidecarRuntimeConfig::local())
 }
@@ -139,18 +204,427 @@ pub fn sidecar_down_for_project(project_root: &Path, profile: SidecarProfile) ->
 pub fn sidecar_down_for_runtime(runtime: &SidecarRuntimeConfig) -> Result<()> {
     let layout = &runtime.layout;
     if layout.state_file.exists() {
-        if runtime.profile == SidecarProfile::Agent
-            && let Some(state) = std::fs::read_to_string(&layout.state_file)
-                .ok()
-                .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
+        if let Some(state) = std::fs::read_to_string(&layout.state_file)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
             && state.owner == "codestory"
             && state.namespace == runtime.namespace
         {
-            crate::compose::docker_compose_down_for_state(&state)?;
+            if runtime.profile == SidecarProfile::Agent {
+                crate::compose::docker_compose_down_for_state(&state)?;
+            }
+            stop_native_embedding_process_for_state(&state)?;
         }
         std::fs::remove_file(&layout.state_file).context("remove retrieval-sidecars.json")?;
     }
     Ok(())
+}
+
+fn stop_native_embedding_process_for_state(state: &SidecarStateFile) -> Result<()> {
+    let Some(launch) = state.embedding_launch.as_ref() else {
+        return Ok(());
+    };
+    stop_native_embedding_process_for_launch(launch)
+}
+
+pub(crate) fn stop_native_embedding_process_for_launch(
+    launch: &EmbeddingLaunchMetadata,
+) -> Result<()> {
+    if launch.launch_mode != crate::config::EmbeddingServerLaunchMode::NativeSpawned.as_str() {
+        return Ok(());
+    }
+    let Some(pid) = launch.pid else {
+        return Ok(());
+    };
+    stop_native_embedding_process(pid, launch)
+}
+
+pub fn ensure_native_embedding_launch_identity(launch: &EmbeddingLaunchMetadata) -> Result<u32> {
+    match native_embedding_launch_identity_status(launch) {
+        NativeEmbeddingLaunchIdentityStatus::Matched { pid } => Ok(pid),
+        NativeEmbeddingLaunchIdentityStatus::NotRunning { pid } => {
+            bail!("identity_not_running: native embedding pid {pid} is not running")
+        }
+        NativeEmbeddingLaunchIdentityStatus::Mismatched { pid, reason } => {
+            bail!("identity_mismatch: native embedding pid {pid}: {reason}")
+        }
+        NativeEmbeddingLaunchIdentityStatus::Unverified { pid, reason } => {
+            bail!("identity_unverified: native embedding pid {pid:?}: {reason}")
+        }
+    }
+}
+
+pub fn native_embedding_launch_identity_status(
+    launch: &EmbeddingLaunchMetadata,
+) -> NativeEmbeddingLaunchIdentityStatus {
+    if launch.launch_mode != crate::config::EmbeddingServerLaunchMode::NativeSpawned.as_str() {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: launch.pid,
+            reason: "native embedding launch mode is not native_spawned".to_string(),
+        };
+    }
+    let Some(pid) = launch.pid else {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: None,
+            reason: "recorded native embedding launch is missing pid".to_string(),
+        };
+    };
+    if pid == 0 {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: "native embedding pid is zero".to_string(),
+        };
+    }
+    if pid == std::process::id() {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: format!("native embedding pid {pid} is the current CodeStory process"),
+        };
+    }
+    let snapshot = match native_embedding_process_snapshot(pid) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return NativeEmbeddingLaunchIdentityStatus::NotRunning { pid },
+        Err(error) => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: error.to_string(),
+            };
+        }
+    };
+    native_embedding_process_match_status(launch, &snapshot, pid)
+}
+
+fn stop_native_embedding_process(pid: u32, launch: &EmbeddingLaunchMetadata) -> Result<()> {
+    if pid == 0 {
+        bail!("identity_unverified: native embedding pid is zero");
+    }
+    if pid == std::process::id() {
+        bail!("identity_unverified: native embedding pid {pid} is the current CodeStory process");
+    }
+    let Some(snapshot) = native_embedding_process_snapshot(pid)? else {
+        return Ok(());
+    };
+    ensure_native_embedding_process_matches(launch, &snapshot)
+        .with_context(|| format!("identity_unverified: native embedding pid {pid}"))?;
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .status()
+            .with_context(|| format!("run taskkill for native embedding pid {pid}"))?;
+        if !status.success() && native_embedding_process_snapshot(pid)?.is_some() {
+            bail!("failed to stop native embedding pid {pid}: taskkill exited with {status}");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .with_context(|| format!("run kill for native embedding pid {pid}"))?;
+        if !status.success() {
+            if native_embedding_process_snapshot(pid)?.is_some() {
+                bail!("failed to stop native embedding pid {pid}: kill exited with {status}");
+            }
+            return Ok(());
+        }
+        wait_for_native_embedding_process_exit(pid)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn wait_for_native_embedding_process_exit(pid: u32) -> Result<()> {
+    wait_for_native_embedding_process_exit_with(
+        pid,
+        NATIVE_EMBEDDING_STOP_WAIT,
+        NATIVE_EMBEDDING_STOP_POLL,
+        || native_embedding_process_snapshot(pid).map(|snapshot| snapshot.is_some()),
+    )
+}
+
+#[cfg(not(windows))]
+fn wait_for_native_embedding_process_exit_with<F>(
+    pid: u32,
+    timeout: Duration,
+    poll: Duration,
+    mut process_running: F,
+) -> Result<()>
+where
+    F: FnMut() -> Result<bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_running()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("native embedding pid {pid} did not exit after SIGTERM");
+        }
+        if !poll.is_zero() {
+            std::thread::sleep(poll);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeEmbeddingProcessSnapshot {
+    executable_path: Option<String>,
+    command_line: Option<String>,
+    started_at_epoch_ms: Option<i64>,
+}
+
+fn ensure_native_embedding_process_matches(
+    launch: &EmbeddingLaunchMetadata,
+    snapshot: &NativeEmbeddingProcessSnapshot,
+) -> Result<()> {
+    match native_embedding_process_match_status(launch, snapshot, 0) {
+        NativeEmbeddingLaunchIdentityStatus::Matched { .. } => Ok(()),
+        NativeEmbeddingLaunchIdentityStatus::Mismatched { reason, .. }
+        | NativeEmbeddingLaunchIdentityStatus::Unverified { reason, .. } => bail!("{reason}"),
+        NativeEmbeddingLaunchIdentityStatus::NotRunning { .. } => {
+            bail!("native embedding pid is not running")
+        }
+    }
+}
+
+fn native_embedding_process_match_status(
+    launch: &EmbeddingLaunchMetadata,
+    snapshot: &NativeEmbeddingProcessSnapshot,
+    pid: u32,
+) -> NativeEmbeddingLaunchIdentityStatus {
+    let expected_executable = match launch.executable_path.as_deref() {
+        Some(path) => path,
+        None => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: "recorded native embedding launch is missing executable_path".to_string(),
+            };
+        }
+    };
+    match snapshot.executable_path.as_deref() {
+        Some(actual) if same_identity_path(expected_executable, actual) => {}
+        Some(actual) => {
+            return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+                pid,
+                reason: format!(
+                    "live executable path does not match recorded native embedding launch: expected {expected_executable}, got {actual}"
+                ),
+            };
+        }
+        None => {
+            let Some(command_line) = snapshot.command_line.as_deref() else {
+                return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                    pid: Some(pid),
+                    reason: "live process has no executable path or command line".to_string(),
+                };
+            };
+            if !command_mentions_path(command_line, expected_executable) {
+                return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+                    pid,
+                    reason: format!(
+                        "live command line does not mention recorded executable path {expected_executable}"
+                    ),
+                };
+            }
+        }
+    }
+
+    let Some(command_line) = snapshot.command_line.as_deref() else {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: "live native embedding process has no command line for launch-arg validation"
+                .to_string(),
+        };
+    };
+    if launch.launch_args.is_empty() {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: "recorded native embedding launch is missing launch_args".to_string(),
+        };
+    }
+    for arg in &launch.launch_args {
+        if !arg.is_empty() && !command_line.contains(arg) {
+            return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+                pid,
+                reason: format!(
+                    "live native embedding command line is missing recorded launch arg {arg:?}"
+                ),
+            };
+        }
+    }
+    if let (Some(expected), Some(actual)) =
+        (launch.spawned_at_epoch_ms, snapshot.started_at_epoch_ms)
+        && expected.abs_diff(actual) > NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS as u64
+    {
+        return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+            pid,
+            reason: format!(
+                "live process start time does not match recorded native embedding launch: expected around {expected}, got {actual}"
+            ),
+        };
+    }
+    NativeEmbeddingLaunchIdentityStatus::Matched { pid }
+}
+
+fn command_mentions_path(command_line: &str, expected_path: &str) -> bool {
+    normalized_identity_path(command_line).contains(&normalized_identity_path(expected_path))
+}
+
+fn same_identity_path(left: &str, right: &str) -> bool {
+    normalized_identity_path(left) == normalized_identity_path(right)
+}
+
+fn normalized_identity_path(path: &str) -> String {
+    let normalized = path.trim_matches('"').replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+#[cfg(windows)]
+fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingProcessSnapshot>> {
+    #[derive(Deserialize)]
+    struct WindowsProcessInfo {
+        #[serde(rename = "ExecutablePath")]
+        executable_path: Option<String>,
+        #[serde(rename = "CommandLine")]
+        command_line: Option<String>,
+        #[serde(rename = "StartedAtEpochMs")]
+        started_at_epoch_ms: Option<i64>,
+    }
+
+    let script = format!(
+        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $p) {{ exit 2 }}; $started=[int64](([Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds); [pscustomobject]@{{ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine;StartedAtEpochMs=$started}} | ConvertTo-Json -Compress"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .with_context(|| format!("query native embedding pid {pid}"))?;
+    if output.status.code() == Some(2) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        bail!(
+            "query native embedding pid {pid} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let info: WindowsProcessInfo = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse native embedding process info for pid {pid}"))?;
+    Ok(Some(NativeEmbeddingProcessSnapshot {
+        executable_path: info.executable_path,
+        command_line: info.command_line,
+        started_at_epoch_ms: info.started_at_epoch_ms,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingProcessSnapshot>> {
+    let process_dir = Path::new("/proc").join(pid.to_string());
+    if !process_dir.exists() {
+        return Ok(None);
+    }
+    let Some(process_state) = native_embedding_linux_process_state(&process_dir)? else {
+        return Ok(None);
+    };
+    if process_state == 'Z' {
+        return Ok(None);
+    }
+    let executable_path = fs::read_link(process_dir.join("exe"))
+        .ok()
+        .map(|path| path.display().to_string());
+    let command_line = fs::read(process_dir.join("cmdline")).ok().map(|bytes| {
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    let started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
+    Ok(Some(NativeEmbeddingProcessSnapshot {
+        executable_path,
+        command_line,
+        started_at_epoch_ms,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn native_embedding_linux_process_state(process_dir: &Path) -> Result<Option<char>> {
+    let stat_path = process_dir.join("stat");
+    let stat = match fs::read_to_string(&stat_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", stat_path.display())),
+    };
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .and_then(|state| state.chars().next())
+        .with_context(|| format!("parse Linux process state from {}", stat_path.display()))?;
+    Ok(Some(state))
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingProcessSnapshot>> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "state=", "-o", "command="])
+        .output()
+        .with_context(|| format!("query native embedding pid {pid}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let mut snapshot =
+        native_embedding_non_linux_unix_process_snapshot_from_ps_output(&output.stdout);
+    if let Some(snapshot) = &mut snapshot {
+        snapshot.started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
+    }
+    Ok(snapshot)
+}
+
+#[cfg(any(test, all(not(windows), not(target_os = "linux"))))]
+fn native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+    output: &[u8],
+) -> Option<NativeEmbeddingProcessSnapshot> {
+    let row = String::from_utf8_lossy(output);
+    let row = row.trim();
+    let state_end = row.find(char::is_whitespace).unwrap_or(row.len());
+    let state = &row[..state_end];
+    if state.is_empty() || state.starts_with('Z') {
+        return None;
+    }
+    let command_line = row[state_end..].trim().to_string();
+    if command_line.is_empty() {
+        return None;
+    }
+    Some(NativeEmbeddingProcessSnapshot {
+        executable_path: None,
+        command_line: Some(command_line),
+        started_at_epoch_ms: None,
+    })
+}
+
+#[cfg(not(windows))]
+fn native_embedding_process_started_at_epoch_ms(pid: u32) -> Option<i64> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "etimes="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let elapsed_secs = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    Some(chrono::Utc::now().timestamp_millis() - elapsed_secs.saturating_mul(1000))
 }
 
 /// Probe sidecar health and attach the latest retrieval manifest when storage is available.
@@ -539,6 +1013,7 @@ mod tests {
 
     fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
+            project_identity: None,
             layout: SidecarLayout {
                 zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
@@ -589,11 +1064,16 @@ mod tests {
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let root = TempDir::new().expect("root");
-        let runtime = test_runtime(&root);
+        let mut runtime = test_runtime(&root);
+        runtime.project_identity = Some(codestory_workspace::project_identity_v2(root.path()));
         let launch = EmbeddingLaunchMetadata {
             provider: "llamacpp".to_string(),
             launch_mode: "native_spawned".to_string(),
             endpoint: "http://127.0.0.1:18080/v1/embeddings".to_string(),
+            pid: Some(1234),
+            spawned_at_epoch_ms: Some(123),
+            launch_args: vec!["--port".to_string(), "18080".to_string()],
+            launch_fingerprint_sha256: Some("fingerprint".to_string()),
             executable_source: Some("managed_cache".to_string()),
             executable_path: Some("C:/cache/llama-server".to_string()),
             model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
@@ -602,6 +1082,14 @@ mod tests {
         let state =
             sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch.clone()))
                 .expect("write state");
+        assert_eq!(state.project_identity, runtime.project_identity);
+        let mut foreign_runtime = runtime.clone();
+        foreign_runtime
+            .project_identity
+            .as_mut()
+            .expect("foreign identity")
+            .workspace_id = "foreign-workspace".to_string();
+        assert!(!sidecar_state_matches_runtime(&state, &foreign_runtime));
         assert_eq!(state.embedding_launch, Some(launch.clone()));
         assert_eq!(
             state.embedding_accelerator_request_provider.as_deref(),
@@ -617,6 +1105,244 @@ mod tests {
         let report = attach_status_ownership(report, &runtime);
 
         assert_eq!(report.embedding_launch, Some(launch));
+    }
+
+    #[test]
+    fn sidecar_up_preserving_launch_keeps_native_embedding_pid() {
+        let _lock = crate::test_support::env_lock();
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        let launch = native_embedding_launch_fixture();
+        let initial =
+            sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch.clone()))
+                .expect("write initial state");
+        assert_eq!(initial.embedding_launch, Some(launch.clone()));
+
+        let preserved = sidecar_up_with_runtime_preserving_launch(&runtime, None)
+            .expect("rewrite state preserving launch");
+
+        assert_eq!(preserved.embedding_launch, Some(launch));
+    }
+
+    fn native_embedding_launch_fixture() -> EmbeddingLaunchMetadata {
+        EmbeddingLaunchMetadata {
+            provider: "llamacpp".to_string(),
+            launch_mode: "native_spawned".to_string(),
+            endpoint: "http://127.0.0.1:18080/v1/embeddings".to_string(),
+            pid: Some(1234),
+            spawned_at_epoch_ms: Some(123),
+            launch_args: vec![
+                "--model".to_string(),
+                "C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string(),
+                "--port".to_string(),
+                "18080".to_string(),
+            ],
+            launch_fingerprint_sha256: Some("fingerprint".to_string()),
+            executable_source: Some("managed_cache".to_string()),
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
+            requested_device: None,
+        }
+    }
+
+    #[test]
+    fn native_embedding_identity_accepts_matching_process_snapshot() {
+        let launch = native_embedding_launch_fixture();
+        let snapshot = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:\\cache\\llama-server.exe".to_string()),
+            command_line: Some(
+                "\"C:\\cache\\llama-server.exe\" --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
+                    .to_string(),
+            ),
+            started_at_epoch_ms: Some(123),
+        };
+
+        ensure_native_embedding_process_matches(&launch, &snapshot).expect("matching snapshot");
+    }
+
+    #[test]
+    fn native_embedding_identity_rejects_reused_pid_with_wrong_executable() {
+        let launch = native_embedding_launch_fixture();
+        let snapshot = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/Windows/System32/notepad.exe".to_string()),
+            command_line: Some(
+                "C:/Windows/System32/notepad.exe --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
+                    .to_string(),
+            ),
+            started_at_epoch_ms: Some(123),
+        };
+
+        let error = ensure_native_embedding_process_matches(&launch, &snapshot)
+            .expect_err("mismatched executable should fail");
+        assert!(
+            error.to_string().contains("executable path"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn native_embedding_identity_rejects_missing_launch_args() {
+        let mut launch = native_embedding_launch_fixture();
+        launch.launch_args.clear();
+        let snapshot = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            command_line: Some("\"C:/cache/llama-server.exe\" --port 18080".to_string()),
+            started_at_epoch_ms: Some(123),
+        };
+
+        let error = ensure_native_embedding_process_matches(&launch, &snapshot)
+            .expect_err("missing launch args should fail closed");
+        assert!(
+            error.to_string().contains("missing launch_args"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn native_embedding_stop_refuses_current_process_pid() {
+        let mut launch = native_embedding_launch_fixture();
+        launch.pid = Some(std::process::id());
+
+        let error = stop_native_embedding_process_for_launch(&launch)
+            .expect_err("current process pid should fail closed");
+        assert!(
+            error.to_string().contains("current CodeStory process"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn native_embedding_stop_wait_retries_until_process_exits() {
+        let mut checks = 0;
+
+        wait_for_native_embedding_process_exit_with(
+            1234,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(0),
+            || {
+                checks += 1;
+                Ok(checks < 3)
+            },
+        )
+        .expect("process exits after retries");
+
+        assert_eq!(checks, 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_embedding_process_snapshot_treats_zombie_child_as_not_running() -> Result<()> {
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .context("spawn short-lived child")?;
+        let pid = child.id();
+        let process_dir = Path::new("/proc").join(pid.to_string());
+
+        let test_result = (|| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if matches!(
+                    native_embedding_linux_process_state(&process_dir)?,
+                    Some('Z')
+                ) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("child pid {pid} did not become zombie");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            assert_eq!(native_embedding_process_snapshot(pid)?, None);
+            Ok(())
+        })();
+
+        let reap_result = child.wait().context("reap zombie child");
+        test_result?;
+        reap_result?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_embedding_non_linux_unix_ps_parser_treats_zombie_as_not_running() {
+        assert_eq!(
+            native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+                b"Z    /tmp/llama-server --port 18080\n"
+            ),
+            None
+        );
+        assert_eq!(
+            native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+                b"Z+   /tmp/llama-server --port 18080\n"
+            ),
+            None
+        );
+        assert_eq!(
+            native_embedding_non_linux_unix_process_snapshot_from_ps_output(
+                b"S    /tmp/llama-server --port 18080\n"
+            ),
+            Some(NativeEmbeddingProcessSnapshot {
+                executable_path: None,
+                command_line: Some("/tmp/llama-server --port 18080".to_string()),
+                started_at_epoch_ms: None,
+            })
+        );
+    }
+
+    #[test]
+    fn native_embedding_identity_rejects_reused_pid_with_same_command() {
+        let launch = native_embedding_launch_fixture();
+        let snapshot = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            command_line: Some(
+                "\"C:/cache/llama-server.exe\" --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
+                    .to_string(),
+            ),
+            started_at_epoch_ms: Some(
+                launch.spawned_at_epoch_ms.unwrap()
+                    + NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS
+                    + 1,
+            ),
+        };
+
+        let error = ensure_native_embedding_process_matches(&launch, &snapshot)
+            .expect_err("same command with reused pid start time should fail");
+        assert!(
+            error.to_string().contains("start time"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn native_embedding_identity_status_distinguishes_mismatch_from_unverified() {
+        let launch = native_embedding_launch_fixture();
+        let mismatch = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/Windows/System32/notepad.exe".to_string()),
+            command_line: Some(
+                "C:/Windows/System32/notepad.exe --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
+                    .to_string(),
+            ),
+            started_at_epoch_ms: Some(123),
+        };
+        assert!(matches!(
+            native_embedding_process_match_status(&launch, &mismatch, 1234),
+            NativeEmbeddingLaunchIdentityStatus::Mismatched { .. }
+        ));
+
+        let unverified = NativeEmbeddingProcessSnapshot {
+            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            command_line: None,
+            started_at_epoch_ms: Some(123),
+        };
+        assert!(matches!(
+            native_embedding_process_match_status(&launch, &unverified, 1234),
+            NativeEmbeddingLaunchIdentityStatus::Unverified { .. }
+        ));
     }
 
     #[test]
