@@ -80,9 +80,10 @@ function contextFor(input, event) {
   const mcpInstructions = [
     'CodeStory MCP startup path:',
     '1. Use live CodeStory MCP before manual source reads for repository work.',
-    '2. If mcp__codestory tools are visible, read codestory://status first, then follow status recommended_next_calls.',
+    `2. If mcp__codestory tools are visible, call status with project=${JSON.stringify(input.cwd || process.cwd())}, then pass that same project to every CodeStory tool call.`,
     '3. If mcp__codestory is not visible and tool_search is available, query "codestory mcp ground status packet search", then use the loaded CodeStory MCP tools.',
-    '4. Do not treat hook text as grounding evidence; it only selects and locates the MCP path.',
+    '4. The MCP is multi-project and request-scoped. Never infer workspace from another thread or a global active-state file.',
+    '5. Do not treat hook text as grounding evidence; only live MCP results or verified source reads count.',
   ].join('\n');
 
   return truncate([header, mcpInstructions].filter(Boolean).join('\n\n'), capFor(event));

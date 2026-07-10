@@ -70,12 +70,14 @@ const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
 ///
 /// The server is local, stateful only for small packet/search caches, and keeps
 /// telemetry on stderr so stdout remains a newline-delimited JSON stream.
-pub(crate) async fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
+pub(crate) async fn run_stdio_server(
+    runtime: Option<RuntimeContext>,
+    refresh: args::RefreshMode,
+) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdin = BufReader::new(stdin);
     let mut stdout = tokio::io::stdout();
-    let mut runtime = Some(runtime);
-    let mut state = Some(StdioServerState::default());
+    let mut session = Some(StdioServerSession::new(runtime, refresh));
     let mut queued = VecDeque::new();
     let mut active: Option<ActiveStdioRequest> = None;
     let mut stdin_closed = false;
@@ -93,16 +95,14 @@ pub(crate) async fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
                     continue;
                 }
                 Some(StdioQueuedWork::Message(message)) => {
-                    let request_runtime = runtime.take().expect("stdio runtime available");
-                    let mut request_state = state.take().expect("stdio state available");
+                    let mut request_session = session.take().expect("stdio session available");
                     let line = message.line;
                     active = Some(ActiveStdioRequest {
                         id_key: message.id_key,
                         cancelled: message.cancelled,
                         task: tokio::task::spawn_blocking(move || {
-                            let response =
-                                handle_stdio_message(&request_runtime, &mut request_state, &line);
-                            (request_runtime, request_state, response)
+                            let response = handle_stdio_message(&mut request_session, &line);
+                            (request_session, response)
                         }),
                     });
                     continue;
@@ -124,8 +124,7 @@ pub(crate) async fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
         if stdin_closed {
             finish_active_stdio_request(
                 active.take().expect("active stdio request"),
-                &mut runtime,
-                &mut state,
+                &mut session,
                 &mut stdout,
             )
             .await?;
@@ -143,10 +142,9 @@ pub(crate) async fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
             completed = &mut active_request.task => {
                 let completed = completed.context("stdio request worker failed")?;
                 let active_request = active.take().expect("completed stdio request");
-                runtime = Some(completed.0);
-                state = Some(completed.1);
+                session = Some(completed.0);
                 if !active_request.cancelled.load(Ordering::Acquire)
-                    && let Some(response) = completed.2
+                    && let Some(response) = completed.1
                 {
                     write_stdio_response(&mut stdout, &response).await?;
                 }
@@ -159,7 +157,7 @@ pub(crate) async fn run_stdio_server(runtime: RuntimeContext) -> Result<()> {
 struct ActiveStdioRequest {
     id_key: Option<String>,
     cancelled: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<(RuntimeContext, StdioServerState, Option<serde_json::Value>)>,
+    task: tokio::task::JoinHandle<(StdioServerSession, Option<serde_json::Value>)>,
 }
 
 struct StdioQueuedMessage {
@@ -237,15 +235,13 @@ fn stdio_cancellation_target_key(line: &str) -> Option<String> {
 
 async fn finish_active_stdio_request<W: AsyncWrite + Unpin>(
     active: ActiveStdioRequest,
-    runtime: &mut Option<RuntimeContext>,
-    state: &mut Option<StdioServerState>,
+    session: &mut Option<StdioServerSession>,
     stdout: &mut W,
 ) -> Result<()> {
     let completed = active.task.await.context("stdio request worker failed")?;
-    *runtime = Some(completed.0);
-    *state = Some(completed.1);
+    *session = Some(completed.0);
     if !active.cancelled.load(Ordering::Acquire)
-        && let Some(response) = completed.2
+        && let Some(response) = completed.1
     {
         write_stdio_response(stdout, &response).await?;
     }
@@ -372,6 +368,77 @@ struct StdioServerState {
     recent_sidecar_repair: Option<StdioRecentSidecarRepair>,
 }
 
+struct StdioServerSession {
+    runtime: Option<RuntimeContext>,
+    state: StdioServerState,
+    refresh: args::RefreshMode,
+    project_required: bool,
+}
+
+impl StdioServerSession {
+    fn new(runtime: Option<RuntimeContext>, refresh: args::RefreshMode) -> Self {
+        Self {
+            project_required: runtime.is_none(),
+            runtime,
+            state: StdioServerState::default(),
+            refresh,
+        }
+    }
+
+    fn select_tool_project(&mut self, request: &serde_json::Value) -> Result<()> {
+        let project = request
+            .pointer("/params/arguments/project")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        self.select_project(project)
+    }
+
+    fn select_resource_project(&mut self, request: &serde_json::Value) -> Result<()> {
+        let project = request
+            .pointer("/params/project")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        self.select_project(project)
+    }
+
+    fn select_project(&mut self, project: Option<&str>) -> Result<()> {
+        let Some(project) = project else {
+            if self.project_required {
+                bail!(
+                    "project_required: pass the caller's repository root in the `project` argument"
+                );
+            }
+            return Ok(());
+        };
+        let project_root = crate::runtime::canonicalize_project_root(Path::new(project))?;
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.project_root == project_root)
+        {
+            return Ok(());
+        }
+
+        let cache_dir = std::env::var_os("CODESTORY_STDIO_CACHE_ROOT")
+            .map(PathBuf::from)
+            .map(|root| {
+                root.join(crate::runtime::fnv1a_hex(
+                    project_root.to_string_lossy().as_bytes(),
+                ))
+            });
+        let runtime = RuntimeContext::new_agent_sidecar(&args::ProjectArgs {
+            project: project_root,
+            cache_dir,
+        })?;
+        runtime.ensure_open(self.refresh)?;
+        self.runtime = Some(runtime);
+        // ponytail: stdio is serialized, so retain only the active project's small caches;
+        // add a bounded per-project LRU only if project switching becomes measurably hot.
+        self.state = StdioServerState::default();
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct StdioStatusCacheEntry {
     key: String,
@@ -422,11 +489,7 @@ struct StdioWorkspaceMismatch {
     active_root: PathBuf,
 }
 
-fn handle_stdio_message(
-    runtime: &RuntimeContext,
-    state: &mut StdioServerState,
-    line: &str,
-) -> Option<serde_json::Value> {
+fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<serde_json::Value> {
     let request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(error) => {
@@ -492,7 +555,11 @@ fn handle_stdio_message(
                     "Invalid params: missing resource uri",
                 ));
             };
-            read_stdio_resource(runtime, state, uri)
+            if let Err(error) = session.select_resource_project(&request) {
+                return Some(stdio_jsonrpc_error(id, -32602, error.to_string()));
+            }
+            let runtime = session.runtime.as_ref().expect("stdio project selected");
+            read_stdio_resource(runtime, &mut session.state, uri)
         }
         "tools/call" => {
             let Some(name) = request
@@ -522,7 +589,22 @@ fn handle_stdio_message(
                     "Invalid params: tool arguments must be an object",
                 ));
             }
-            match stdio_tool_blocked_error(runtime, state, name) {
+            if let Err(error) = session.select_tool_project(&request) {
+                let message = error.to_string();
+                let code = if message.starts_with("project_required:") {
+                    "project_required"
+                } else {
+                    "project_unavailable"
+                };
+                let error = serde_json::json!({
+                    "code": code,
+                    "message": message,
+                    "tool": name
+                });
+                return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+            }
+            let runtime = session.runtime.as_ref().expect("stdio project selected");
+            match stdio_tool_blocked_error(runtime, &mut session.state, name) {
                 Ok(Some(error)) => {
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
                 }
@@ -538,7 +620,7 @@ fn handle_stdio_message(
             }
             return Some(stdio_jsonrpc_tool_call_from_legacy(
                 id,
-                handle_stdio_tool_call(runtime, state, &request),
+                handle_stdio_tool_call(runtime, &mut session.state, &request),
             ));
         }
         _ => {
@@ -647,23 +729,29 @@ fn stdio_tool_blocked_error(
         "canonical_arguments": surface.get("canonical_arguments").cloned().unwrap_or(serde_json::Value::Null),
         "deprecated": surface.get("deprecated").cloned().unwrap_or(serde_json::Value::Null),
         "local_refresh": status.get("local_refresh").cloned().unwrap_or(serde_json::Value::Null),
-        "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next")),
-        "full_repair": stdio_repair_calls_from_value(surface.get("full_repair")),
+        "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next"), &runtime.project_root),
+        "full_repair": stdio_repair_calls_from_value(surface.get("full_repair"), &runtime.project_root),
         "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
         "sidecar": verdict.and_then(|verdict| verdict.get("sidecar")).cloned().unwrap_or(serde_json::Value::Null),
     })))
 }
 
-fn stdio_repair_calls_from_value(value: Option<&serde_json::Value>) -> serde_json::Value {
+fn stdio_repair_calls_from_value(
+    value: Option<&serde_json::Value>,
+    project_root: &Path,
+) -> serde_json::Value {
     let Some(commands) = value.and_then(serde_json::Value::as_array) else {
         return serde_json::json!([]);
     };
+    let project = serde_json::json!(crate::display::clean_path_string(
+        &project_root.to_string_lossy()
+    ));
     serde_json::Value::Array(
         commands
             .iter()
             .filter_map(|command| {
                 if let Some(command) = command.as_str() {
-                    Some(stdio_recommended_next_call(command))
+                    Some(stdio_recommended_next_call(command, &project))
                 } else if command.is_object() {
                     Some(command.clone())
                 } else {
@@ -1041,6 +1129,9 @@ fn handle_stdio_tool_call(
         .unwrap_or_default()
         .to_string();
     match name {
+        "status" => read_stdio_status_resource_cached(runtime, state)
+            .map(|status| serde_json::json!({"result": status}))
+            .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
         "packet" => handle_stdio_packet(runtime, state, request),
         "search" => handle_stdio_search(runtime, state, request, query),
         "ground" => handle_stdio_ground(runtime, request),
@@ -1076,14 +1167,20 @@ fn handle_stdio_tool_call(
         "context" => handle_stdio_context(runtime, request),
         "repair_all" => {
             state.status_cache = None;
-            stdio_deprecated_repair_all_response(handle_stdio_sidecar_repair(runtime, state))
+            stdio_deprecated_repair_all_response(
+                handle_stdio_sidecar_repair(runtime, state),
+                &runtime.project_root,
+            )
         }
         "sidecar_setup" => handle_stdio_sidecar_setup(runtime, state, request),
         _ => serde_json::json!({"error": "unknown tool"}),
     }
 }
 
-fn stdio_deprecated_repair_all_response(mut response: serde_json::Value) -> serde_json::Value {
+fn stdio_deprecated_repair_all_response(
+    mut response: serde_json::Value,
+    project_root: &Path,
+) -> serde_json::Value {
     if let Some(result) = response
         .get_mut("result")
         .and_then(serde_json::Value::as_object_mut)
@@ -1095,7 +1192,10 @@ fn stdio_deprecated_repair_all_response(mut response: serde_json::Value) -> serd
         );
         result.insert(
             "canonical_arguments".to_string(),
-            serde_json::json!({"action": "repair"}),
+            serde_json::json!({
+                "project": crate::display::clean_path_string(&project_root.to_string_lossy()),
+                "action": "repair"
+            }),
         );
     }
     response
@@ -2413,7 +2513,7 @@ fn read_stdio_resource(
 ) -> serde_json::Value {
     let result = match uri {
         "codestory://status" => read_stdio_status_resource_cached(runtime, state),
-        "codestory://agent-guide" => Ok(read_stdio_agent_guide_resource()),
+        "codestory://agent-guide" => Ok(read_stdio_agent_guide_resource(&runtime.project_root)),
         "codestory://project" => runtime
             .open_project_summary()
             .map(|summary| serde_json::json!(summary)),
@@ -2766,7 +2866,19 @@ fn stdio_source_fingerprint_skip_dir(path: &Path) -> bool {
 }
 
 fn stdio_dirty_marker_env_path(project_root: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("CODESTORY_PLUGIN_DIRTY_MARKER_PATH").map(PathBuf::from)?;
+    let path = std::env::var_os("CODESTORY_PLUGIN_DIRTY_MARKER_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let data = std::env::var_os("CODESTORY_PLUGIN_DATA").map(PathBuf::from)?;
+            let normalized_root =
+                fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+            let normalized = crate::display::clean_path_string(&normalized_root.to_string_lossy());
+            let key = format!("{:x}", Sha256::digest(normalized.as_bytes()));
+            Some(
+                data.join("dirty-markers")
+                    .join(format!("{}.json", &key[..32])),
+            )
+        })?;
     let env_root = std::env::var_os("CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| project_root.to_path_buf());
@@ -2888,6 +3000,9 @@ fn stdio_same_path_text(left: &Path, right: &Path) -> bool {
 }
 
 fn stdio_workspace_mismatch(runtime: &RuntimeContext) -> Option<StdioWorkspaceMismatch> {
+    if env_nonempty("CODESTORY_PLUGIN_MULTI_PROJECT").is_some() {
+        return None;
+    }
     let active_state_path =
         std::env::var_os("CODESTORY_PLUGIN_ACTIVE_STATE_PATH").map(PathBuf::from)?;
     let active_root = stdio_active_state_root(&active_state_path)?;
@@ -3015,7 +3130,7 @@ fn stdio_workspace_mismatch_sidecar_setup(mismatch: &StdioWorkspaceMismatch) -> 
             mismatch,
             &stdio_plugin_runtime_status(),
         ),
-        "mcp_control": stdio_sidecar_setup_mcp_control(),
+        "mcp_control": stdio_sidecar_setup_mcp_control(&mismatch.served_root),
         "enable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND"),
         "disable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND"),
         "next_repair_command": null,
@@ -3525,11 +3640,24 @@ fn build_stdio_status_surfaces(
         &selected_agent_runtime,
         Some(&broker.readiness_broker),
     );
-    let allowed_surfaces = stdio_allowed_surfaces_with_policy(
+    let mut allowed_surfaces = stdio_allowed_surfaces_with_policy(
         &readiness.readiness,
         Some(&readiness.sidecar_setup),
         native_embedding_hard_busy,
     );
+    if let Some(surfaces) = allowed_surfaces.as_object_mut() {
+        let project = serde_json::json!(crate::display::clean_path_string(
+            &runtime.project_root.to_string_lossy()
+        ));
+        for surface in surfaces.values_mut() {
+            if let Some(arguments) = surface
+                .get_mut("canonical_arguments")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                arguments.insert("project".to_string(), project.clone());
+            }
+        }
+    }
     let recommended_next_calls = stdio_status_recommended_next_calls(
         &readiness.readiness,
         &readiness.sidecar_setup,
@@ -3915,13 +4043,14 @@ fn stdio_status_recommended_next_calls(
     sidecar_setup: &serde_json::Value,
     native_embedding_hard_busy: Option<&crate::readiness_broker::BrokerResourceSnapshot>,
 ) -> serde_json::Value {
+    let project = sidecar_setup["project"].clone();
     if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
         if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
             if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
-                return stdio_status_repair_in_progress_next_calls();
+                return stdio_status_repair_in_progress_next_calls(&project);
             }
             if let Some(busy) = native_embedding_hard_busy {
-                return stdio_status_native_embedding_busy_next_calls(busy);
+                return stdio_status_native_embedding_busy_next_calls(busy, &project);
             }
             match sidecar_setup
                 .get("state")
@@ -3937,12 +4066,13 @@ fn stdio_status_recommended_next_calls(
                 {
                     "method": "tools/call",
                     "tool": "sidecar_setup",
-                    "arguments": {"action": "repair"},
+                    "arguments": {"project": project, "action": "repair"},
                     "debug_commands": non_ready.full_repair
                 },
                 {
-                    "method": "resources/read",
-                    "uri": "codestory://status"
+                    "method": "tools/call",
+                    "tool": "status",
+                    "arguments": {"project": project}
                 }
             ]);
         }
@@ -3953,10 +4083,11 @@ fn stdio_status_recommended_next_calls(
             .find(|command| command.starts_with("Restart/reload the Codex host/app"))
         {
             return serde_json::json!([
-                stdio_recommended_next_call(host_action),
+                stdio_recommended_next_call(host_action, &project),
                 {
-                    "method": "resources/read",
-                    "uri": "codestory://status"
+                    "method": "tools/call",
+                    "tool": "status",
+                    "arguments": {"project": project}
                 }
             ]);
         }
@@ -3967,24 +4098,23 @@ fn stdio_status_recommended_next_calls(
                     .first()
                     .or_else(|| non_ready.minimum_next.first())
                     .map(String::as_str)
-                    .unwrap_or("Read codestory://status and follow sidecar_setup guidance.")
+                    .unwrap_or("Call project-scoped status and follow sidecar_setup guidance."),
+                &project
             ),
             {
-                "method": "resources/read",
-                "uri": "codestory://status"
+                "method": "tools/call",
+                "tool": "status",
+                "arguments": {"project": project}
             }
         ]);
     }
 
     serde_json::json!([
         {
-            "method": "resources/read",
-            "uri": "codestory://agent-guide"
-        },
-        {
             "method": "tools/call",
             "tool": "ground",
             "arguments": {
+                "project": project,
                 "budget": "balanced"
             }
         },
@@ -3992,6 +4122,7 @@ fn stdio_status_recommended_next_calls(
             "method": "tools/call",
             "tool": "packet",
             "arguments": {
+                "project": project,
                 "question": "<broad-task-question>",
                 "budget": "compact"
             }
@@ -4000,6 +4131,7 @@ fn stdio_status_recommended_next_calls(
             "method": "tools/call",
             "tool": "search",
             "arguments": {
+                "project": project,
                 "query": "<symbol-or-concept>",
                 "limit": 10
             }
@@ -4008,12 +4140,14 @@ fn stdio_status_recommended_next_calls(
             "method": "tools/call",
             "tool": "definition",
             "arguments": {
+                "project": project,
                 "id": "<node_id-from-search>"
             }
         },
         {
-            "method": "resources/read",
-            "uri": "codestory://trail/<node_id-from-search>"
+            "method": "tools/call",
+            "tool": "trail",
+            "arguments": {"project": project, "id": "<node_id-from-search>"}
         }
     ])
 }
@@ -4064,6 +4198,7 @@ fn stdio_native_embedding_resource_hard_busy_with_classifier<'a>(
 
 fn stdio_status_native_embedding_busy_next_calls(
     busy: &crate::readiness_broker::BrokerResourceSnapshot,
+    project: &serde_json::Value,
 ) -> serde_json::Value {
     let owner_workspace = busy.owner_workspace_root.as_deref().unwrap_or("unknown");
     let owner_project = busy.owner_project_id.as_deref().unwrap_or("unknown");
@@ -4076,25 +4211,19 @@ fn stdio_status_native_embedding_busy_next_calls(
             )
         },
         {
-            "method": "resources/read",
-            "uri": "codestory://status"
-        },
-        {
-            "method": "resources/read",
-            "uri": "codestory://agent-guide"
+            "method": "tools/call",
+            "tool": "status",
+            "arguments": {"project": project}
         }
     ])
 }
 
-fn stdio_status_repair_in_progress_next_calls() -> serde_json::Value {
+fn stdio_status_repair_in_progress_next_calls(project: &serde_json::Value) -> serde_json::Value {
     serde_json::json!([
         {
-            "method": "resources/read",
-            "uri": "codestory://status"
-        },
-        {
-            "method": "resources/read",
-            "uri": "codestory://agent-guide"
+            "method": "tools/call",
+            "tool": "status",
+            "arguments": {"project": project}
         }
     ])
 }
@@ -4136,7 +4265,7 @@ fn stdio_repair_blocked_by_policy(
     }
 }
 
-fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
+fn stdio_recommended_next_call(command: &str, project: &serde_json::Value) -> serde_json::Value {
     if command.starts_with("Restart/reload the Codex host/app") {
         return serde_json::json!({
             "method": "host/restart",
@@ -4147,14 +4276,15 @@ fn stdio_recommended_next_call(command: &str) -> serde_json::Value {
         return serde_json::json!({
             "method": "tools/call",
             "tool": "sidecar_setup",
-            "arguments": {"action": "repair"},
+            "arguments": {"project": project, "action": "repair"},
             "debug_commands": [command]
         });
     }
     if command.contains("ready --goal local") || command.contains("codestory-cli doctor") {
         return serde_json::json!({
-            "method": "resources/read",
-            "uri": "codestory://status",
+            "method": "tools/call",
+            "tool": "status",
+            "arguments": {"project": project},
             "instruction": "Read status again after the MCP-managed local freshness check. Use the debug_command only for maintainer transcripts.",
             "debug_command": command
         });
@@ -4220,13 +4350,14 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
     })
 }
 
-fn stdio_sidecar_setup_mcp_control() -> serde_json::Value {
+fn stdio_sidecar_setup_mcp_control(project_root: &Path) -> serde_json::Value {
+    let project = crate::display::clean_path_string(&project_root.to_string_lossy());
     serde_json::json!({
-        "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "status"}},
-        "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "enable"}},
-        "disable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "disable"}},
-        "ask": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "ask"}},
-        "repair": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}
+        "status": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"project": project, "action": "status"}},
+        "enable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"project": project, "action": "enable"}},
+        "disable": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"project": project, "action": "disable"}},
+        "ask": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"project": project, "action": "ask"}},
+        "repair": {"method": "tools/call", "tool": "sidecar_setup", "arguments": {"project": project, "action": "repair"}}
     })
 }
 
@@ -4286,6 +4417,7 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         active_cli_path.as_deref(),
     );
     serde_json::json!({
+        "project": project,
         "state": state,
         "auto_repair": false,
         "status_triggered_repair": false,
@@ -4293,7 +4425,7 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         "repair_mode": repair_mode,
         "prompt_required": prompt_required,
         "prompt": if prompt_required { Some("CodeStory packet/search needs retrieval sidecars. MCP repair may start or download retrieval sidecars for this project. Enable MCP sidecar repair for this plugin install?") } else { None },
-        "mcp_control": stdio_sidecar_setup_mcp_control(),
+        "mcp_control": stdio_sidecar_setup_mcp_control(project_root),
         "enable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND"),
         "disable_command": env_nonempty("CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND"),
         "next_repair_command": next_repair_command,
@@ -4580,6 +4712,7 @@ fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
 ) -> serde_json::Value {
+    let project = crate::display::clean_path_string(&runtime.project_root.to_string_lossy());
     if let Some(error) = stdio_workspace_mismatch_error(runtime) {
         return serde_json::json!({"error": error});
     }
@@ -4611,8 +4744,9 @@ fn handle_stdio_sidecar_repair(
                     run_id
                 ),
                 "recommended_next_calls": [{
-                    "method": "resources/read",
-                    "uri": "codestory://status"
+                    "method": "tools/call",
+                    "tool": "status",
+                    "arguments": {"project": project}
                 }],
                 "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
             }
@@ -4755,8 +4889,9 @@ fn handle_stdio_sidecar_repair(
                         codestory_retrieval::DEFAULT_AGENT_RUN_ID
                     ),
                     "recommended_next_calls": [{
-                        "method": "resources/read",
-                        "uri": "codestory://status"
+                        "method": "tools/call",
+                        "tool": "status",
+                        "arguments": {"project": project}
                     }],
                     "sidecar_setup": stdio_sidecar_setup_status(&runtime.project_root)
                 }
@@ -4785,6 +4920,7 @@ fn stdio_sidecar_repair_machine_busy_result(
     busy: &crate::readiness_broker::BrokerResourceSnapshot,
     sidecar_setup: &serde_json::Value,
 ) -> serde_json::Value {
+    let project = &sidecar_setup["project"];
     serde_json::json!({
         "result": {
             "status": "native_embedding_runtime_busy",
@@ -4794,7 +4930,7 @@ fn stdio_sidecar_repair_machine_busy_result(
             "owner_project_id": busy.owner_project_id,
             "owner_workspace_root": busy.owner_workspace_root,
             "sidecar_setup": sidecar_setup,
-            "recommended_next_calls": stdio_status_native_embedding_busy_next_calls(busy)
+            "recommended_next_calls": stdio_status_native_embedding_busy_next_calls(busy, project)
         }
     })
 }
@@ -4804,6 +4940,7 @@ fn stdio_sidecar_repair_already_starting_result(
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
     sidecar_setup: &serde_json::Value,
 ) -> serde_json::Value {
+    let project = &sidecar_setup["project"];
     serde_json::json!({
         "result": {
             "status": "already_starting",
@@ -4823,8 +4960,9 @@ fn stdio_sidecar_repair_already_starting_result(
                 sidecar.run_id.as_deref().unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
             ),
             "recommended_next_calls": [{
-                "method": "resources/read",
-                "uri": "codestory://status"
+                "method": "tools/call",
+                "tool": "status",
+                "arguments": {"project": project}
             }],
             "sidecar_setup": sidecar_setup
         }
@@ -4838,6 +4976,7 @@ fn stdio_sidecar_repair_reconciliation_block_result(
     reconciliation: &crate::readiness_broker::BrokerReconciliationSnapshot,
     reconciliation_json: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    let project = &sidecar_setup["project"];
     let reason = reconciliation.enqueue_block_reason()?;
     let active = reconciliation.active_repair.as_ref();
     let status = if active.is_some() || reason.starts_with("live_ready_repair_heartbeat_stale") {
@@ -4867,8 +5006,9 @@ fn stdio_sidecar_repair_reconciliation_block_result(
                     .unwrap_or(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
             ),
             "recommended_next_calls": [{
-                "method": "resources/read",
-                "uri": "codestory://status"
+                "method": "tools/call",
+                "tool": "status",
+                "arguments": {"project": project}
             }],
             "sidecar_setup": sidecar_setup
         }
@@ -4876,6 +5016,7 @@ fn stdio_sidecar_repair_reconciliation_block_result(
 }
 
 fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_json::Value {
+    let project = sidecar_setup["project"].clone();
     match stdio_sidecar_policy_state(sidecar_setup) {
         "ask" => serde_json::json!([
             {
@@ -4885,36 +5026,34 @@ fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_js
                     {
                         "method": "tools/call",
                         "tool": "sidecar_setup",
-                        "arguments": {"action": "enable"},
+                        "arguments": {"project": project, "action": "enable"},
                         "debug_command": sidecar_setup["enable_command"]
                     },
                     {
                         "method": "tools/call",
                         "tool": "sidecar_setup",
-                        "arguments": {"action": "repair"},
+                        "arguments": {"project": project, "action": "repair"},
                         "debug_command": sidecar_setup["next_repair_command"]
                     },
                     {
-                        "method": "resources/read",
-                        "uri": "codestory://status"
+                        "method": "tools/call",
+                        "tool": "status",
+                        "arguments": {"project": project}
                     }
                 ],
                 "decline_next": [
                     {
                         "method": "tools/call",
                         "tool": "sidecar_setup",
-                        "arguments": {"action": "disable"},
+                        "arguments": {"project": project, "action": "disable"},
                         "debug_command": sidecar_setup["disable_command"]
                     },
                     {
-                        "method": "resources/read",
-                        "uri": "codestory://status"
+                        "method": "tools/call",
+                        "tool": "status",
+                        "arguments": {"project": project}
                     }
                 ]
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://agent-guide"
             }
         ]),
         "disabled" => serde_json::json!([
@@ -4925,38 +5064,33 @@ fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_js
                     {
                         "method": "tools/call",
                         "tool": "sidecar_setup",
-                        "arguments": {"action": "enable"},
+                        "arguments": {"project": project, "action": "enable"},
                         "debug_command": sidecar_setup["enable_command"]
                     },
                     {
-                        "method": "resources/read",
-                        "uri": "codestory://status"
+                        "method": "tools/call",
+                        "tool": "status",
+                        "arguments": {"project": project}
                     }
                 ]
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://agent-guide"
             }
         ]),
         "unmanaged" => serde_json::json!([
             {
                 "method": "host/instruction",
-                "instruction": "Sidecar setup policy is not persisted for this host, so MCP repair is blocked until the host/plugin provides CODESTORY_PLUGIN_SIDECAR_POLICY_PATH. Use codestory://status for current state or run CLI repair outside MCP."
+                "instruction": "Sidecar setup policy is not persisted for this host, so MCP repair is blocked until the host/plugin provides CODESTORY_PLUGIN_SIDECAR_POLICY_PATH. Use project-scoped status for current state or run CLI repair outside MCP."
             },
             {
-                "method": "resources/read",
-                "uri": "codestory://status"
-            },
-            {
-                "method": "resources/read",
-                "uri": "codestory://agent-guide"
+                "method": "tools/call",
+                "tool": "status",
+                "arguments": {"project": project}
             }
         ]),
         _ => serde_json::json!([
             {
-                "method": "resources/read",
-                "uri": "codestory://status"
+                "method": "tools/call",
+                "tool": "status",
+                "arguments": {"project": project}
             }
         ]),
     }
@@ -5208,25 +5342,28 @@ fn stdio_repair_reason(verdict: &ReadinessVerdictDto) -> Option<String> {
     None
 }
 
-fn read_stdio_agent_guide_resource() -> serde_json::Value {
+fn read_stdio_agent_guide_resource(project_root: &Path) -> serde_json::Value {
+    let project = crate::display::clean_path_string(&project_root.to_string_lossy());
     serde_json::json!({
         "purpose": "Default read-only CodeStory browser loop for local codebase grounding.",
         "recommended_call_sequence": [
             {
-                "method": "resources/read",
-                "uri": "codestory://status"
+                "method": "tools/call",
+                "tool": "status",
+                "arguments": {"project": project}
             }
         ],
         "readiness_lanes": [
             {
                 "readiness_goal": "local_navigation",
-                "condition": "Use only surfaces whose codestory://status allowed_surfaces.<surface>.allowed value is true.",
+                "condition": "Use only surfaces whose project-scoped status allowed_surfaces.<surface>.allowed value is true.",
                 "surfaces": ["ground", "files", "symbol", "definition", "get_node", "callers", "callees", "neighbors", "shortest_path", "query_subgraph", "symbols", "snippet", "references", "trace", "trail", "affected"],
                 "calls": [
                     {
                         "method": "tools/call",
                         "tool": "ground",
                         "arguments": {
+                            "project": project,
                             "budget": "balanced"
                         }
                     },
@@ -5234,6 +5371,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "method": "tools/call",
                         "tool": "files",
                         "arguments": {
+                            "project": project,
                             "limit": 50
                         }
                     },
@@ -5241,6 +5379,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "method": "tools/call",
                         "tool": "definition",
                         "arguments": {
+                            "project": project,
                             "id": "<best-node-id>"
                         }
                     },
@@ -5248,6 +5387,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "method": "tools/call",
                         "tool": "get_node",
                         "arguments": {
+                            "project": project,
                             "id": "<best-node-id>"
                         }
                     },
@@ -5255,6 +5395,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "method": "tools/call",
                         "tool": "neighbors",
                         "arguments": {
+                            "project": project,
                             "id": "<best-node-id>",
                             "depth": 1
                         }
@@ -5263,32 +5404,37 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "method": "tools/call",
                         "tool": "symbols",
                         "arguments": {
+                            "project": project,
                             "limit": 50
                         }
                     },
                     {
-                        "method": "resources/read",
-                        "uri": "codestory://snippet/<best-node-id>"
+                        "method": "tools/call",
+                        "tool": "snippet",
+                        "arguments": {"project": project, "id": "<best-node-id>"}
                     },
                     {
-                        "method": "resources/read",
-                        "uri": "codestory://references/<best-node-id>"
+                        "method": "tools/call",
+                        "tool": "references",
+                        "arguments": {"project": project, "id": "<best-node-id>"}
                     },
                     {
-                        "method": "resources/read",
-                        "uri": "codestory://trail/<best-node-id>"
+                        "method": "tools/call",
+                        "tool": "trail",
+                        "arguments": {"project": project, "id": "<best-node-id>"}
                     }
                 ]
             },
             {
                 "readiness_goal": "agent_packet_search",
-                "condition": "Use packet/search/context only when their codestory://status allowed_surfaces entries are true.",
+                "condition": "Use packet/search/context only when their project-scoped status allowed_surfaces entries are true.",
                 "surfaces": ["packet", "search", "context"],
                 "calls": [
                     {
                         "method": "tools/call",
                         "tool": "packet",
                         "arguments": {
+                            "project": project,
                             "question": "<broad-task-question>",
                             "budget": "compact"
                         }
@@ -5297,6 +5443,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "method": "tools/call",
                         "tool": "search",
                         "arguments": {
+                            "project": project,
                             "query": "<symbol-or-task>",
                             "limit": 10
                         }
@@ -5305,6 +5452,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
                         "method": "tools/call",
                         "tool": "context",
                         "arguments": {
+                            "project": project,
                             "id": "<best-node-id>"
                         }
                     }
@@ -5345,7 +5493,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
         ],
         "safety_notes": [
             "Browser stdio tools are read-only, non-destructive, idempotent, local-only, and closed-world; sidecar_setup is the local plugin-configuration exception.",
-            "Read codestory://status first and branch on allowed_surfaces before choosing tools.",
+            "Call status with this exact project first, then pass the same project to every tool call.",
             "Use ground for compact repository orientation after status when local_navigation is ready.",
             "Use packet for broad task questions only when packet/search status is allowed; use context only when allowed_surfaces.context.allowed is true.",
             "Treat packet status other than sufficient as unsafe to claim until gaps, open_next, and follow_up_commands are resolved.",

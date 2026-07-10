@@ -10695,10 +10695,13 @@ async fn run_serve(cmd: ServeCommand) -> Result<()> {
     if !cmd.stdio {
         ensure_http_serve_bind_allowed(&cmd.addr, cmd.allow_non_loopback)?;
     }
+    if cmd.multi_project {
+        return stdio_transport::run_stdio_server(None, cmd.refresh).await;
+    }
     let runtime = new_agent_surface_runtime(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
-        return stdio_transport::run_stdio_server(runtime).await;
+        return stdio_transport::run_stdio_server(Some(runtime), cmd.refresh).await;
     }
     ensure_index_ready(&opened, "serve")?;
     let listener = TcpListener::bind(&cmd.addr)

@@ -5,10 +5,10 @@ Serves the indexed project over either a small HTTP JSON API or an MCP-style JSO
 For direct MCP-style clients:
 
 ```text
-codestory-cli serve --stdio --refresh none
+codestory-cli serve --stdio --multi-project --refresh none
 ```
 
-The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap and `repair_setup` diagnostics when spawn fails). Once MCP is live, read `codestory://status` before any grounding, packet, or search call.
+The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap and `repair_setup` diagnostics when spawn fails). Once MCP is live, call `status` with the target repository's absolute path before any grounding, packet, or search call. Pass the same `project` to every tool.
 
 ## Usage
 
@@ -25,6 +25,7 @@ The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap a
 | `--addr <host:port>` | `127.0.0.1:3917` | HTTP bind address. |
 | `--allow-non-loopback` | off | Required before HTTP serve can bind or answer wildcard/remote-facing addresses. Use only behind an intentional network boundary; HTTP routes do not require request authentication. |
 | `--stdio` | off | Use JSON-lines stdio instead of HTTP. |
+| `--multi-project` | off | In stdio mode, require each tool request to carry its own `project` instead of binding the server to `--project`. |
 | `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
 
 ## HTTP Routes
@@ -45,7 +46,7 @@ The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap a
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> serve --project <target-workspace> --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
 | Failure path | If MCP status reports missing index, follow `recommended_next_calls`, normally `sidecar_setup repair` then a status reread. In CLI/debug transcripts, use `fix --project <target-workspace> --format json` or the specific command surfaced by `doctor`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
-| Integration edge | Use `serve --stdio` for MCP-style clients; it exposes tools for `ground`, `files`, `affected`, `packet`, `search`, `symbol`, `callers`, `callees`, `trail`, `trace`, `definition`, `references`, `symbols`, `snippet`, `context`, `get_node`, `neighbors`, `shortest_path`, and `query_subgraph`, plus project/grounding resources, warm graph primitives, and prompts. | Gives agents the same read-only packet and browser primitives without shelling each command. |
+| Integration edge | Use `serve --stdio --multi-project` for MCP-style clients; it exposes project-scoped `status`, `ground`, `files`, `affected`, `packet`, `search`, `symbol`, and graph/source tools. | One server safely routes interleaved requests from different repositories without mutable workspace state. |
 
 Stdio MCP status fields and allowed-surface rules: [status-contract.md](status-contract.md).
 

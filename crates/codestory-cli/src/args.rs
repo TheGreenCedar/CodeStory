@@ -1558,6 +1558,12 @@ pub(crate) struct ServeCommand {
     pub(crate) stdio: bool,
     #[arg(
         long,
+        requires = "stdio",
+        help = "Route each stdio tool request by its required project argument instead of binding the server to one repository."
+    )]
+    pub(crate) multi_project: bool,
+    #[arg(
+        long,
         value_enum,
         default_value_t = RefreshMode::None,
         long_help = READ_REFRESH_HELP

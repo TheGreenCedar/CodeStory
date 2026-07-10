@@ -1,7 +1,7 @@
 interface:
   display_name: "CodeStory Grounding"
   short_description: "Ground local repositories through CodeStory MCP before source claims, edits, reviews, or test planning."
-  default_prompt: "Read codestory://status first; if status recommends sidecar_setup repair and tools are visible, call it, reread status, then answer from allowed evidence."
+  default_prompt: "Call CodeStory status with the active repository's absolute path first; pass that same project to every tool call, repair only when recommended, then answer from allowed evidence."
 dependencies:
   tools:
     - type: "mcp"

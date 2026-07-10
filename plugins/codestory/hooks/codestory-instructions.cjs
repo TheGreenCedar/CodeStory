@@ -10,7 +10,7 @@ const FALLBACK = `CODESTORY BACKGROUND GROUNDING ACTIVE
 Before reading source files, making source claims, planning edits, choosing tests, or reviewing changes in a repository:
 
 1. Confirm the target is a repository workspace before grounding it. In huge or mixed folders, stop CodeStory grounding if status, ready, or ground reports no repo, no supported files, or zero indexed files; do not inject or summarize empty ground output.
-2. If the CodeStory MCP server is live, read codestory://status first. ${MCP_RESOURCE_TEXT} Report hidden tool actions truthfully; do not synthesize a hook substitute for live MCP tools.
+2. If the CodeStory MCP server is live, call status with the target repository's absolute path first and pass that same project to every CodeStory tool. ${MCP_RESOURCE_TEXT} Report hidden tool actions truthfully; do not synthesize a hook substitute for live MCP tools.
 3. Use server_version, server_executable, allowed_surfaces, and retrieval_mode from status as runtime truth.
 4. Use local graph surfaces only when their own allowed_surfaces entry allows them.
 5. Use packet, search, or context confidently when that surface is allowed and retrieval_mode=full.
@@ -62,11 +62,11 @@ function getCodeStoryInstructions(event = 'SessionStart', input = {}) {
   return `${eventHeader(event, input)}CODESTORY BACKGROUND GROUNDING RULES
 
 Use CodeStory proactively for repository grounding. Do not wait for the user to call it by name.
-Before manually opening source files, first read codestory://status when MCP is live. When CodeStory is not initially model-visible, use host deferred discovery/tool_search to load the registered CodeStory MCP. When MCP is unavailable, CodeStory grounding is unavailable in this host; use ordinary source inspection and report the MCP blocker.
+Before manually opening source files, first call status with the target repository's absolute path when MCP is live. Pass that same project to every CodeStory tool call; the server is multi-project and has no global workspace binding. When CodeStory is not initially model-visible, use host deferred discovery/tool_search to load the registered CodeStory MCP. When MCP is unavailable, CodeStory grounding is unavailable in this host; use ordinary source inspection and report the MCP blocker.
 For broad user requests, prefer a packet tied to the user's actual question. For concrete symbols, files, or routes, use search/context/trail/snippet. For no request context, use a compact ground snapshot only after confirming the target repo is indexable.
 Avoid no-op grounding context in huge or non-code folders.
 When retrieval sidecars are full and allowed, use packet, search, and context confidently.
-Use status recommended_next_calls as the setup path once a repository target is known: call MCP sidecar_setup with action=repair when recommended, then reread codestory://status.
+Use status recommended_next_calls as the setup path once a repository target is known: call MCP sidecar_setup with the same project and action=repair when recommended, then call project-scoped status again.
 
 ${body}`;
 }

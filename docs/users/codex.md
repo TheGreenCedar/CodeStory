@@ -9,8 +9,8 @@ the agent back to live MCP; they do not inject substitute grounding context.
 | You | Agent |
 | --- | --- |
 | Install the plugin once from `/plugins` | MCP starts via `scripts/codestory-mcp.cjs` |
-| Open your repo and start a fresh thread | Records the repo target, then reads live CodeStory MCP resources before source reads |
-| Ask repo questions with concrete terms | Reads `codestory://status`, uses allowed surfaces, cites sources |
+| Open your repo and start a fresh thread | Passes that repo's absolute path on every live CodeStory MCP tool call |
+| Ask repo questions with concrete terms | Calls project-scoped `status`, uses allowed surfaces, cites sources |
 
 Codex is the reference host for the managed MCP plugin path. See
 [capability matrix](README.md#capability-matrix).
@@ -50,14 +50,16 @@ There are three separate steps:
    `codex.cmd plugin add codestory@TheGreenCedar` updates the installed plugin
    package.
 3. A fresh Codex host session starts the new MCP adapter and lets it provision
-   the matching managed CLI.
+   the matching managed CLI. The adapter itself is projectless; tool requests
+   are routed by their required `project` argument, so other Codex tasks can use
+   other repositories at the same time.
 
 If terminal refresh fails on Windows with `Access is denied` while backing up
 the plugin cache, quit stale Codex windows that may still be running the old
 CodeStory MCP process, then retry the `/plugins` refresh or terminal install.
 The marketplace may already show the new version before the running host has
 reloaded the package; prove the active runtime with a fresh
-`codestory://status` read.
+project-scoped `status` call.
 
 ## Install verification
 
@@ -80,7 +82,7 @@ Run these three checks before your first real task:
 2. Ask a normal repository question. For an explicit readiness probe, ask:
 
 ```text
-Read codestory://status, ground this checkout if allowed, and tell me which CodeStory surfaces are ready before I edit.
+Call CodeStory status with this repository's absolute path, ground the same project if allowed, and tell me which surfaces are ready before I edit.
 ```
 
 **Expected wait:** On a large repository, the first index build can take several
@@ -96,7 +98,7 @@ The agent reports `allowed_surfaces`, [local navigation](../glossary.md#local-na
 **Readiness before editing**
 
 ```text
-Read codestory://status and check allowed_surfaces before I change [path/to/file].
+Call CodeStory status for this repository and check allowed_surfaces before I change [path/to/file].
 ```
 
 **Find ownership**
@@ -138,12 +140,12 @@ More pairs, anti-patterns, and language-flavored examples:
 
 | Symptom | What to try |
 | --- | --- |
-| No `codestory://status` resource is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
-| `codestory://status` is visible but `mcp__codestory` tools are hidden | Ground from resources only (`codestory://status`, `codestory://agent-guide`). Do not loop on `recommended_next_calls` entries that use `method: "tools/call"` until host tool visibility is fixed; report the host blocker |
+| No CodeStory `status` tool is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
+| CodeStory resources are visible but `mcp__codestory` tools are hidden | Report the host blocker. Unscoped resources cannot safely select a repository in multi-project mode |
 | Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
 | Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
 | Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
-| Status/grounding read times out | Restart stale CodeStory MCP processes, then read `codestory://status` in a fresh thread |
+| Status/grounding call times out | Restart stale CodeStory MCP processes, then call `status` with the target project in a fresh thread |
 
 ### Native embedding busy decision tree
 

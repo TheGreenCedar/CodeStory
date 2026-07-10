@@ -84,10 +84,32 @@ pub(crate) struct ToolSpec {
 
 impl ToolSpec {
     fn to_json(self) -> Value {
+        let mut input_schema = self.input_schema.to_json();
+        let input = input_schema
+            .as_object_mut()
+            .expect("stdio tool input schema must be an object");
+        input
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .expect("stdio tool properties must be an object")
+            .insert(
+                "project".to_string(),
+                SchemaProperty::string_required(
+                    "project",
+                    "Absolute repository root for this request. The MCP server is multi-project and does not retain a global workspace binding.",
+                )
+                .with_min_length(1)
+                .to_json(),
+            );
+        input
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+            .expect("stdio tool required list must be an array")
+            .push(json!("project"));
         let mut tool = Map::from_iter([
             ("name".to_string(), json!(self.name)),
             ("description".to_string(), json!(self.description)),
-            ("inputSchema".to_string(), self.input_schema.to_json()),
+            ("inputSchema".to_string(), input_schema),
             ("safety".to_string(), self.safety.to_json()),
             ("annotations".to_string(), self.safety.annotations_json()),
         ]);
@@ -1296,7 +1318,17 @@ static SIDECAR_SETUP_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
 static REPAIR_ALL_INPUT_SCHEMA: SchemaObject =
     SchemaObject::object("Compatibility alias for sidecar_setup repair.", &[], &[]);
 
+static STATUS_INPUT_SCHEMA: SchemaObject =
+    SchemaObject::object("Read readiness for one explicit repository.", &[], &[]);
+
 static TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "status",
+        description: "Read CodeStory readiness for the requested repository before using other tools.",
+        input_schema: STATUS_INPUT_SCHEMA,
+        output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
+        safety: SafetyMetadata::read_only(),
+    },
     ToolSpec {
         name: "repair_all",
         description: "Deprecated compatibility alias for sidecar_setup action=repair; agents should follow codestory://status recommended_next_calls.",
