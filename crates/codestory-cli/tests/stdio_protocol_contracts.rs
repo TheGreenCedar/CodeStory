@@ -19,6 +19,7 @@ struct StdioFixture {
     dirty_marker_path: Option<PathBuf>,
     dirty_marker_project_root: Option<PathBuf>,
     local_refresh_timeout_ms: Option<u64>,
+    ready_repair_worker_probe_exit_code: Option<i32>,
 }
 
 struct StdioServer {
@@ -181,6 +182,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
+        ready_repair_worker_probe_exit_code: None,
     }
 }
 
@@ -200,6 +202,7 @@ fn unindexed_fixture() -> StdioFixture {
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
+        ready_repair_worker_probe_exit_code: None,
     }
 }
 
@@ -324,6 +327,12 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
             timeout_ms.to_string(),
         );
     }
+    if let Some(exit_code) = fixture.ready_repair_worker_probe_exit_code {
+        command.env(
+            "CODESTORY_TEST_READY_REPAIR_WORKER_EXIT_CODE",
+            exit_code.to_string(),
+        );
+    }
     let mut child = command.spawn().expect("spawn stdio server");
 
     let stdin = child.stdin.take().expect("stdio stdin");
@@ -399,6 +408,36 @@ fn assert_tool_success(response: &Value, id: Value) -> &Value {
     result
         .get("structuredContent")
         .expect("tools/call success should include structuredContent")
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_sidecar_worker_result(server: &mut StdioServer, attempt_id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = send_json(
+            server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "sidecar-setup-terminal-status",
+                "method": "tools/call",
+                "params": {
+                    "name": "sidecar_setup",
+                    "arguments": {"action": "status"}
+                }
+            }),
+        );
+        let setup = assert_tool_success(&response, json!("sidecar-setup-terminal-status"));
+        if setup["last_worker_result"]["attempt_id"] == json!(attempt_id)
+            && setup["active_repair"].is_null()
+        {
+            return setup.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "repair worker did not reach a durable terminal state: {setup}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn assert_structured_citations_have_no_evidence(value: &Value) {
@@ -3134,11 +3173,27 @@ fn sidecar_setup_status_marks_old_last_repair_as_stale() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("ask".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(17);
     let policy_path = fixture.cache_dir.path().join("plugin-sidecar-policy.json");
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &canonical_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
+    let repair_state_dir = repair_sidecar
+        .layout
+        .state_file
+        .parent()
+        .expect("repair state dir")
+        .to_path_buf();
+    let _repair_state_cleanup = RemoveDirOnDrop(repair_state_dir);
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -3216,13 +3271,15 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         }),
     );
     let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair"));
-    assert!(
-        matches!(
-            repair["status"].as_str(),
-            Some("started" | "already_running" | "already_starting")
-        ),
-        "sidecar_setup repair should return a bounded repair state: {repair}"
+    assert_eq!(
+        repair["status"],
+        json!("started"),
+        "a unique fixture must start exactly one repair worker: {repair}"
     );
+    let attempt_id = repair["attempt_id"]
+        .as_str()
+        .expect("started repair attempt id")
+        .to_string();
     assert_eq!(
         repair["mode"],
         json!("background"),
@@ -3246,47 +3303,142 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
             })),
         "sidecar_setup repair should point agents back to project-scoped status: {repair}"
     );
-    if repair["status"] == json!("started") {
-        assert!(
-            repair["broker_reconciliation"]["status"]
-                .as_str()
-                .is_some_and(|status| matches!(status, "clean" | "abandoned_cleaned")),
-            "sidecar_setup repair should reconcile broker state before spawning: {repair}"
-        );
-    }
+    assert!(
+        repair["broker_reconciliation"]["status"]
+            .as_str()
+            .is_some_and(|status| matches!(status, "clean" | "abandoned_cleaned")),
+        "sidecar_setup repair should reconcile broker state before spawning: {repair}"
+    );
 
-    let status_response = send_json(
+    let terminal_setup = wait_for_sidecar_worker_result(&mut server, &attempt_id);
+    let terminal = &terminal_setup["last_worker_result"];
+    assert_eq!(terminal["outcome"], json!("failed"), "{terminal_setup}");
+    assert_eq!(terminal["exit_code"], json!(17), "{terminal_setup}");
+    assert!(terminal["wait_error"].is_null(), "{terminal_setup}");
+    assert_eq!(terminal["stdout_truncated"], json!(true));
+    assert_eq!(terminal["stderr_truncated"], json!(true));
+    assert_eq!(
+        terminal_setup["state"],
+        json!("enabled"),
+        "{terminal_setup}"
+    );
+    assert!(
+        terminal["stdout_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("worker probe stdout") && tail.contains(&attempt_id)),
+        "{terminal_setup}"
+    );
+    assert!(
+        terminal["stderr_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("worker probe stderr") && tail.contains(&attempt_id)),
+        "{terminal_setup}"
+    );
+
+    let result_path = repair_sidecar
+        .layout
+        .state_file
+        .with_file_name("ready-repair-result.json");
+    let durable: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("durable repair worker result"),
+    )
+    .expect("repair worker result json");
+    assert_eq!(durable["attempt_id"], json!(attempt_id));
+    assert_eq!(durable["exit_code"], json!(17));
+    assert_eq!(durable["outcome"], json!("failed"));
+    assert!(
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-enqueue.lock")
+            .exists(),
+        "terminal monitor should compare-and-clear the adopted reservation"
+    );
+    assert!(
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-status.json")
+            .exists(),
+        "terminal monitor should leave no active repair marker"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(0);
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        &canonical_root,
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+    );
+    let _repair_state_cleanup = RemoveDirOnDrop(
+        repair_sidecar
+            .layout
+            .state_file
+            .parent()
+            .expect("repair state dir")
+            .to_path_buf(),
+    );
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "sidecar-setup-status",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "id": "sidecar-setup-success-repair",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
         }),
     );
-    let result = assert_success_envelope(&status_response, json!("sidecar-setup-status"));
-    let status = json_resource_content(result, "codestory://status");
-    assert_eq!(
-        status["sidecar_setup"]["state"],
-        json!("enabled"),
-        "{status}"
-    );
-    let next_call_text = status["recommended_next_calls"].to_string();
-    assert_eq!(
-        status["status_resource_auto_repair"],
-        Value::Null,
-        "status should not start another repair after explicit repair: {status}"
+    let repair = assert_tool_success(&response, json!("sidecar-setup-success-repair"));
+    assert_eq!(repair["status"], json!("started"), "{repair}");
+    let attempt_id = repair["attempt_id"]
+        .as_str()
+        .expect("repair attempt id")
+        .to_string();
+
+    let setup = wait_for_sidecar_worker_result(&mut server, &attempt_id);
+    let terminal = &setup["last_worker_result"];
+
+    assert_eq!(terminal["outcome"], json!("succeeded"), "{setup}");
+    assert_eq!(terminal["exit_code"], json!(0), "{setup}");
+    assert!(terminal["wait_error"].is_null(), "{setup}");
+    assert_eq!(terminal["stdout_truncated"], json!(true));
+    assert_eq!(terminal["stderr_truncated"], json!(true));
+    assert!(
+        terminal["stdout_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains(&attempt_id)),
+        "{setup}"
     );
     assert!(
-        status["sidecar_setup"]["active_repair"]["status"] == json!("repairing")
-            || status["readiness_broker"]["operations"]
-                .as_array()
-                .is_some_and(|operations| !operations.is_empty()),
-        "status should report Rust-owned repair through setup or broker state after explicit repair: {status}"
+        terminal["stderr_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains(&attempt_id)),
+        "{setup}"
     );
     assert!(
-        next_call_text.contains("\"tool\":\"status\"") && next_call_text.contains("\"project\":"),
-        "status should recommend status readback after explicit repair: {status}"
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-enqueue.lock")
+            .exists()
+    );
+    assert!(
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-status.json")
+            .exists()
     );
 }
 

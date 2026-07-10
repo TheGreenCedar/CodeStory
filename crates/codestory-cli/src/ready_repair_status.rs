@@ -3,22 +3,34 @@ use codestory_retrieval::{
     DEFAULT_AGENT_RUN_ID, SidecarProfile, SidecarRuntimeConfig,
     sidecar_runtime_for_project_with_run_id,
 };
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const READY_REPAIR_STATUS_FILE: &str = "ready-repair-status.json";
+const READY_REPAIR_RESULT_FILE: &str = "ready-repair-result.json";
+const READY_REPAIR_ENQUEUE_LOCK_FILE: &str = "ready-repair-enqueue.lock";
+const READY_REPAIR_COORDINATION_LOCK_FILE: &str = "ready-repair-coordination.lock";
 const READY_REPAIR_LOCK_FILE: &str = "ready-repair.lock";
 const READY_REPAIR_PROJECT_LOCK_FILE: &str = "ready-repair-project.lock";
-const READY_REPAIR_STATUS_SCHEMA_VERSION: u32 = 1;
+pub(crate) const READY_REPAIR_STATUS_SCHEMA_VERSION: u32 = 1;
 const READY_REPAIR_STATUS_TTL: Duration = Duration::from_secs(30);
 const READY_REPAIR_LOCK_STALE_TTL: Duration = Duration::from_secs(120);
+const READY_REPAIR_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
+const READY_REPAIR_COORDINATION_POLL: Duration = Duration::from_millis(10);
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+const READY_REPAIR_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+const READY_REPAIR_PROCESS_PROBE_REAP_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const READY_REPAIR_ATTEMPT_ENV: &str = "CODESTORY_READY_REPAIR_ATTEMPT_ID";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReadyRepairStatus {
@@ -32,9 +44,95 @@ pub(crate) struct ReadyRepairStatus {
     pub(crate) phase: String,
     pub(crate) pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) process_start_identity: Option<String>,
     pub(crate) started_at_epoch_ms: i64,
     pub(crate) updated_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ReadyRepairReservationFile {
+    schema_version: u32,
+    pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_identity: Option<String>,
+    started_at_epoch_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at_epoch_ms: Option<i64>,
+    #[serde(rename = "token", alias = "attempt_id")]
+    attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<String>,
+    #[serde(default)]
+    adopted: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReadyRepairReservation {
+    path: PathBuf,
+    attempt_id: String,
+    started_at_epoch_ms: i64,
+    armed: bool,
+}
+
+#[derive(Debug)]
+struct ReadyRepairCoordinationGuard {
+    file: File,
+}
+
+impl Drop for ReadyRepairCoordinationGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+impl ReadyRepairReservation {
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    pub(crate) fn started_at_epoch_ms(&self) -> i64 {
+        self.started_at_epoch_ms
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReadyRepairReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_ready_repair_reservation_if_attempt_at(&self.path, &self.attempt_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReadyRepairWorkerResult {
+    pub(crate) schema_version: u32,
+    pub(crate) attempt_id: String,
+    pub(crate) project_root: String,
+    pub(crate) profile: String,
+    pub(crate) run_id: Option<String>,
+    pub(crate) namespace: String,
+    pub(crate) pid: u32,
+    pub(crate) started_at_epoch_ms: i64,
+    pub(crate) finished_at_epoch_ms: i64,
+    pub(crate) outcome: String,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) wait_error: Option<String>,
+    pub(crate) stdout_tail: String,
+    pub(crate) stderr_tail: String,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +206,271 @@ pub(crate) fn now_epoch_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or_default()
+}
+
+fn new_ready_repair_attempt_id() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}:{nonce}", std::process::id())
+}
+
+fn acquire_ready_repair_coordination(
+    sidecar: &SidecarRuntimeConfig,
+) -> Result<ReadyRepairCoordinationGuard> {
+    acquire_ready_repair_coordination_at(&ready_repair_reservation_path(sidecar))
+}
+
+fn acquire_ready_repair_coordination_at(
+    reservation_path: &Path,
+) -> Result<ReadyRepairCoordinationGuard> {
+    let path = reservation_path.with_file_name(READY_REPAIR_COORDINATION_LOCK_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    let deadline = Instant::now() + READY_REPAIR_COORDINATION_TIMEOUT;
+    loop {
+        if FileExt::try_lock_exclusive(&file)? {
+            return Ok(ReadyRepairCoordinationGuard { file });
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "timed out coordinating ready-repair state at {}",
+                path.display()
+            ));
+        }
+        thread::sleep(READY_REPAIR_COORDINATION_POLL);
+    }
+}
+
+pub(crate) fn try_reserve_ready_repair(
+    sidecar: &SidecarRuntimeConfig,
+    project_root: &Path,
+) -> Result<Option<ReadyRepairReservation>> {
+    let path = ready_repair_reservation_path(sidecar);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let attempt_id = new_ready_repair_attempt_id();
+    let pid = std::process::id();
+    let started_at_epoch_ms = now_epoch_ms();
+    let reservation = ReadyRepairReservationFile {
+        schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+        pid,
+        process_start_identity: recorded_process_start_identity(pid),
+        started_at_epoch_ms,
+        created_at_epoch_ms: Some(started_at_epoch_ms),
+        attempt_id: attempt_id.clone(),
+        project_root: Some(clean_path_text(project_root)),
+        profile: Some(sidecar.profile.as_str().to_string()),
+        run_id: sidecar.run_id.clone(),
+        namespace: Some(sidecar.namespace.clone()),
+        adopted: false,
+    };
+    let content = serde_json::to_vec_pretty(&reservation)?;
+    let _coordination = acquire_ready_repair_coordination(sidecar)?;
+    match create_ready_repair_lock_file(&path, &content) {
+        Ok(()) => {
+            return Ok(Some(ReadyRepairReservation {
+                path,
+                attempt_id,
+                started_at_epoch_ms,
+                armed: true,
+            }));
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    if !ready_repair_reservation_is_stale(&path) {
+        return Ok(None);
+    }
+    if let Some(stale) = read_ready_repair_reservation_file(&path)
+        && !ready_repair_terminal_result_matches(sidecar, &stale.attempt_id)
+    {
+        let abandoned = ReadyRepairWorkerResult {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: stale.attempt_id.clone(),
+            project_root: stale
+                .project_root
+                .unwrap_or_else(|| clean_path_text(project_root)),
+            profile: stale
+                .profile
+                .unwrap_or_else(|| sidecar.profile.as_str().to_string()),
+            run_id: stale.run_id,
+            namespace: stale.namespace.unwrap_or_else(|| sidecar.namespace.clone()),
+            pid: stale.pid,
+            started_at_epoch_ms: stale
+                .created_at_epoch_ms
+                .unwrap_or(stale.started_at_epoch_ms),
+            finished_at_epoch_ms: now_epoch_ms(),
+            outcome: "abandoned".to_string(),
+            exit_code: None,
+            wait_error: Some(
+                "repair worker reservation owner exited before recording a terminal result"
+                    .to_string(),
+            ),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        if write_ready_repair_worker_result_locked(sidecar, &abandoned).is_err() {
+            return Ok(None);
+        }
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match create_ready_repair_lock_file(&path, &content) {
+        Ok(()) => Ok(Some(ReadyRepairReservation {
+            path,
+            attempt_id,
+            started_at_epoch_ms,
+            armed: true,
+        })),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn adopt_ready_repair_reservation(
+    sidecar: &SidecarRuntimeConfig,
+    project_root: &Path,
+    attempt_id: &str,
+) -> Result<ReadyRepairReservation> {
+    let pid = std::process::id();
+    let process_start_identity = recorded_process_start_identity(pid);
+    let _coordination = acquire_ready_repair_coordination(sidecar)?;
+    let path = ready_repair_reservation_path(sidecar);
+    let mut reservation = read_ready_repair_reservation_file(&path)
+        .ok_or_else(|| anyhow::anyhow!("ready repair reservation is missing or unreadable"))?;
+    let project_root = clean_path_text(project_root);
+    if reservation.attempt_id != attempt_id
+        || reservation.project_root.as_deref() != Some(project_root.as_str())
+        || reservation.profile.as_deref() != Some(sidecar.profile.as_str())
+        || reservation.run_id != sidecar.run_id
+        || reservation.namespace.as_deref() != Some(sidecar.namespace.as_str())
+    {
+        anyhow::bail!("ready repair reservation does not match the requested attempt and scope");
+    }
+    if process_owner_state(
+        reservation.pid,
+        reservation.process_start_identity.as_deref(),
+    ) == ProcessOwnerState::GoneOrReused
+    {
+        anyhow::bail!("ready repair reservation parent is no longer the recorded process");
+    }
+    reservation.pid = pid;
+    reservation.process_start_identity = process_start_identity;
+    reservation.started_at_epoch_ms = now_epoch_ms();
+    reservation.adopted = true;
+    crate::file_state::write_json_atomic(&path, "ready-repair-reservation", &reservation)?;
+    Ok(ReadyRepairReservation {
+        path,
+        attempt_id: attempt_id.to_string(),
+        started_at_epoch_ms: reservation
+            .created_at_epoch_ms
+            .unwrap_or(reservation.started_at_epoch_ms),
+        armed: true,
+    })
+}
+
+pub(crate) fn remove_ready_repair_reservation_if_attempt(
+    sidecar: &SidecarRuntimeConfig,
+    attempt_id: &str,
+) {
+    remove_ready_repair_reservation_if_attempt_at(
+        &ready_repair_reservation_path(sidecar),
+        attempt_id,
+    );
+}
+
+fn remove_ready_repair_reservation_if_attempt_at(path: &Path, attempt_id: &str) {
+    let Ok(_coordination) = acquire_ready_repair_coordination_at(path) else {
+        return;
+    };
+    remove_ready_repair_reservation_if_attempt_locked(path, attempt_id);
+}
+
+fn remove_ready_repair_reservation_if_attempt_locked(path: &Path, attempt_id: &str) {
+    let Some(reservation) = read_ready_repair_reservation_file(path) else {
+        return;
+    };
+    if reservation.attempt_id == attempt_id {
+        let _ = fs::remove_file(path);
+    }
+}
+
+pub(crate) fn heartbeat_ready_repair_reservation(
+    sidecar: &SidecarRuntimeConfig,
+    attempt_id: &str,
+) -> Result<bool> {
+    let _coordination = acquire_ready_repair_coordination(sidecar)?;
+    let path = ready_repair_reservation_path(sidecar);
+    let Some(mut reservation) = read_ready_repair_reservation_file(&path) else {
+        return Ok(false);
+    };
+    if reservation.attempt_id != attempt_id {
+        return Ok(false);
+    }
+    reservation.started_at_epoch_ms = now_epoch_ms();
+    crate::file_state::write_json_atomic(&path, "ready-repair-reservation", &reservation)?;
+    Ok(true)
+}
+
+pub(crate) fn write_ready_repair_worker_result(
+    sidecar: &SidecarRuntimeConfig,
+    result: &ReadyRepairWorkerResult,
+) -> Result<()> {
+    let _coordination = acquire_ready_repair_coordination(sidecar)?;
+    write_ready_repair_worker_result_locked(sidecar, result)
+}
+
+fn write_ready_repair_worker_result_locked(
+    sidecar: &SidecarRuntimeConfig,
+    result: &ReadyRepairWorkerResult,
+) -> Result<()> {
+    crate::file_state::write_json_atomic(
+        &ready_repair_result_path(sidecar),
+        "ready-repair-result",
+        result,
+    )
+}
+
+pub(crate) fn read_ready_repair_worker_result(
+    project_root: &Path,
+    run_id: Option<&str>,
+) -> Option<ReadyRepairWorkerResult> {
+    let sidecar = sidecar_runtime_for_project_with_run_id(
+        project_root,
+        SidecarProfile::Agent,
+        run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
+    );
+    fs::read_to_string(ready_repair_result_path(&sidecar))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+fn ready_repair_terminal_result_matches(sidecar: &SidecarRuntimeConfig, attempt_id: &str) -> bool {
+    fs::read_to_string(ready_repair_result_path(sidecar))
+        .ok()
+        .and_then(|text| serde_json::from_str::<ReadyRepairWorkerResult>(&text).ok())
+        .is_some_and(|result| {
+            result.attempt_id == attempt_id
+                && matches!(
+                    result.outcome.as_str(),
+                    "succeeded" | "failed" | "abandoned"
+                )
+        })
 }
 
 pub(crate) fn try_acquire_ready_repair_lock(
@@ -206,12 +569,31 @@ fn try_acquire_ready_repair_lock_at(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn write_ready_repair_status(
     sidecar: &SidecarRuntimeConfig,
     project_root: &Path,
     phase: &str,
     started_at_epoch_ms: i64,
     pid: u32,
+) -> Result<()> {
+    write_ready_repair_status_for_attempt(
+        sidecar,
+        project_root,
+        phase,
+        started_at_epoch_ms,
+        pid,
+        None,
+    )
+}
+
+pub(crate) fn write_ready_repair_status_for_attempt(
+    sidecar: &SidecarRuntimeConfig,
+    project_root: &Path,
+    phase: &str,
+    started_at_epoch_ms: i64,
+    pid: u32,
+    attempt_id: Option<&str>,
 ) -> Result<()> {
     let path = ready_repair_status_path(sidecar);
     let status = ReadyRepairStatus {
@@ -224,23 +606,57 @@ pub(crate) fn write_ready_repair_status(
         compose_project: sidecar.compose_project.clone(),
         phase: phase.to_string(),
         pid,
+        attempt_id: attempt_id.map(str::to_string),
         process_start_identity: recorded_process_start_identity(pid),
         started_at_epoch_ms,
         updated_at_epoch_ms: now_epoch_ms(),
     };
+    let _coordination = acquire_ready_repair_coordination(sidecar)?;
     crate::file_state::write_json_atomic(&path, "ready-repair-status", &status)
 }
 
+#[cfg(test)]
 pub(crate) fn clear_ready_repair_status(
     sidecar: &SidecarRuntimeConfig,
     started_at_epoch_ms: i64,
     pid: u32,
 ) {
+    clear_ready_repair_status_for_attempt(sidecar, started_at_epoch_ms, pid, None);
+}
+
+pub(crate) fn clear_ready_repair_status_for_attempt(
+    sidecar: &SidecarRuntimeConfig,
+    started_at_epoch_ms: i64,
+    pid: u32,
+    attempt_id: Option<&str>,
+) {
+    let Ok(_coordination) = acquire_ready_repair_coordination(sidecar) else {
+        return;
+    };
     let path = ready_repair_status_path(sidecar);
     let Some(status) = read_ready_repair_status_file(&path) else {
         return;
     };
-    if status.pid == pid && status.started_at_epoch_ms == started_at_epoch_ms {
+    if status.pid == pid
+        && status.started_at_epoch_ms == started_at_epoch_ms
+        && attempt_id.is_none_or(|attempt_id| status.attempt_id.as_deref() == Some(attempt_id))
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+pub(crate) fn clear_ready_repair_status_by_attempt(
+    sidecar: &SidecarRuntimeConfig,
+    attempt_id: &str,
+) {
+    let Ok(_coordination) = acquire_ready_repair_coordination(sidecar) else {
+        return;
+    };
+    let path = ready_repair_status_path(sidecar);
+    let Some(status) = read_ready_repair_status_file(&path) else {
+        return;
+    };
+    if status.attempt_id.as_deref() == Some(attempt_id) {
         let _ = fs::remove_file(path);
     }
 }
@@ -286,11 +702,56 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
     ready_repair_status_paths(project_root, run_id)
         .into_iter()
         .filter_map(|path| {
-            let status = read_abandoned_ready_repair_status(&path, project_root, now)?;
+            let observed = read_abandoned_ready_repair_status(&path, project_root, now)?;
+            let run_id = observed.run_id.as_deref().unwrap_or(DEFAULT_AGENT_RUN_ID);
+            let sidecar = sidecar_runtime_for_project_with_run_id(
+                project_root,
+                SidecarProfile::Agent,
+                Some(run_id),
+            );
+            let observed_stale_locks = ready_repair_lock_paths_for_status(project_root, &observed)
+                .into_iter()
+                .filter_map(|lock_path| {
+                    let lock = read_ready_repair_lock_file(&lock_path)?;
+                    ready_repair_lock_file_is_stale(&lock_path).then_some((lock_path, lock))
+                })
+                .collect::<Vec<_>>();
+            let _coordination = acquire_ready_repair_coordination(&sidecar).ok()?;
+            let status = read_ready_repair_status_file(&path)?;
+            if status != observed {
+                return None;
+            }
+            let result = ReadyRepairWorkerResult {
+                schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+                attempt_id: status.attempt_id.clone().unwrap_or_else(|| {
+                    format!("legacy:{}:{}", status.pid, status.started_at_epoch_ms)
+                }),
+                project_root: status.project_root.clone(),
+                profile: status.profile.clone(),
+                run_id: status.run_id.clone(),
+                namespace: status.namespace.clone(),
+                pid: status.pid,
+                started_at_epoch_ms: status.started_at_epoch_ms,
+                finished_at_epoch_ms: now,
+                outcome: "abandoned".to_string(),
+                exit_code: None,
+                wait_error: Some(
+                    "repair worker process exited without recording a terminal result".to_string(),
+                ),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            };
+            if !ready_repair_terminal_result_matches(&sidecar, &result.attempt_id)
+                && write_ready_repair_worker_result_locked(&sidecar, &result).is_err()
+            {
+                return None;
+            }
             let removed_status_path = fs::remove_file(&path).is_ok();
             let mut removed_lock_paths = Vec::new();
-            for lock_path in ready_repair_lock_paths_for_status(project_root, &status) {
-                if ready_repair_lock_file_is_stale(&lock_path)
+            for (lock_path, observed_lock) in observed_stale_locks {
+                if read_ready_repair_lock_file(&lock_path).as_ref() == Some(&observed_lock)
                     && fs::remove_file(&lock_path).is_ok()
                 {
                     removed_lock_paths.push(lock_path);
@@ -309,7 +770,13 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
 pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> String {
     ready_repair_status_paths(project_root, None)
         .into_iter()
-        .map(|path| path_fingerprint(&path))
+        .flat_map(|path| {
+            [
+                path_fingerprint(&path),
+                path_fingerprint(&path.with_file_name(READY_REPAIR_RESULT_FILE)),
+                path_fingerprint(&path.with_file_name(READY_REPAIR_ENQUEUE_LOCK_FILE)),
+            ]
+        })
         .collect::<Vec<_>>()
         .join(";")
 }
@@ -348,6 +815,42 @@ fn ready_repair_status_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
         .layout
         .state_file
         .with_file_name(READY_REPAIR_STATUS_FILE)
+}
+
+fn ready_repair_result_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
+    sidecar
+        .layout
+        .state_file
+        .with_file_name(READY_REPAIR_RESULT_FILE)
+}
+
+fn ready_repair_reservation_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
+    sidecar
+        .layout
+        .state_file
+        .with_file_name(READY_REPAIR_ENQUEUE_LOCK_FILE)
+}
+
+fn read_ready_repair_reservation_file(path: &Path) -> Option<ReadyRepairReservationFile> {
+    crate::file_state::read_json(path)
+}
+
+fn ready_repair_reservation_is_stale(path: &Path) -> bool {
+    if let Some(reservation) = read_ready_repair_reservation_file(path) {
+        return match process_owner_state(
+            reservation.pid,
+            reservation.process_start_identity.as_deref(),
+        ) {
+            ProcessOwnerState::Matching => false,
+            ProcessOwnerState::GoneOrReused => true,
+            ProcessOwnerState::Unknown => crate::file_state::file_modified_age_exceeds(
+                path,
+                READY_REPAIR_LOCK_STALE_TTL,
+                now_epoch_ms(),
+            ),
+        };
+    }
+    crate::file_state::file_modified_age_exceeds(path, READY_REPAIR_LOCK_STALE_TTL, now_epoch_ms())
 }
 
 fn ready_repair_lock_file_is_stale(path: &Path) -> bool {
@@ -489,15 +992,45 @@ fn probe_process(pid: u32) -> ProcessProbe {
     probe
 }
 
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+fn bounded_process_probe_output(command: &mut Command) -> Option<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + READY_REPAIR_PROCESS_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(READY_REPAIR_COORDINATION_POLL);
+            }
+            Ok(None) | Err(_) => {
+                if child.kill().is_ok() {
+                    let reap_deadline = Instant::now() + READY_REPAIR_PROCESS_PROBE_REAP_TIMEOUT;
+                    while Instant::now() < reap_deadline {
+                        if child.try_wait().ok().flatten().is_some() {
+                            break;
+                        }
+                        thread::sleep(READY_REPAIR_COORDINATION_POLL);
+                    }
+                }
+                return None;
+            }
+        }
+    }
+}
+
 #[cfg(windows)]
 fn probe_process_platform(pid: u32) -> ProcessProbe {
     let script = format!(
         "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\" -ErrorAction Stop; if ($null -eq $p) {{ exit 2 }}; $p.CreationDate.ToUniversalTime().Ticks"
     );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output();
-    let Ok(output) = output else {
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let Some(output) = bounded_process_probe_output(&mut command) else {
         return ProcessProbe::Unknown;
     };
     if output.status.code() == Some(2) {
@@ -536,10 +1069,9 @@ fn probe_process_platform(pid: u32) -> ProcessProbe {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn probe_process_platform(pid: u32) -> ProcessProbe {
-    let output = Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output();
-    let Ok(output) = output else {
+    let mut command = Command::new("ps");
+    command.args(["-o", "lstart=", "-p", &pid.to_string()]);
+    let Some(output) = bounded_process_probe_output(&mut command) else {
         return ProcessProbe::Unknown;
     };
     if !output.status.success() {
@@ -665,8 +1197,8 @@ fn path_fingerprint(path: &Path) -> String {
 mod tests {
     use super::*;
     use codestory_retrieval::SidecarLayout;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     fn test_sidecar(root: &Path) -> SidecarRuntimeConfig {
@@ -735,6 +1267,344 @@ mod tests {
         assert_eq!(failed_probe, ProcessOwnerState::Unknown);
         assert_eq!(missing_identity, ProcessOwnerState::Unknown);
         assert_eq!(legacy_live, ProcessOwnerState::Matching);
+    }
+
+    #[test]
+    fn ready_repair_reservation_transfers_exact_attempt_and_scope() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let mut parent = try_reserve_ready_repair(&sidecar, project.path())
+            .expect("reserve")
+            .expect("reservation acquired");
+        let attempt_id = parent.attempt_id().to_string();
+        let serialized = fs::read_to_string(ready_repair_reservation_path(&sidecar))
+            .expect("serialized reservation");
+        assert!(serialized.contains("\"token\""));
+        assert!(!serialized.contains("\"attempt_id\""));
+        parent.disarm();
+
+        let adopted = adopt_ready_repair_reservation(&sidecar, project.path(), &attempt_id)
+            .expect("adopt exact reservation");
+        let stored = read_ready_repair_reservation_file(&ready_repair_reservation_path(&sidecar))
+            .expect("stored adopted reservation");
+
+        assert_eq!(stored.attempt_id, attempt_id);
+        assert!(stored.adopted);
+        assert_eq!(stored.pid, std::process::id());
+        drop(adopted);
+        assert!(!ready_repair_reservation_path(&sidecar).exists());
+    }
+
+    #[test]
+    fn ready_repair_reservation_rejects_scope_mismatch() {
+        let project = tempfile::tempdir().expect("project");
+        let other = tempfile::tempdir().expect("other project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let reservation = try_reserve_ready_repair(&sidecar, project.path())
+            .expect("reserve")
+            .expect("reservation acquired");
+
+        let error =
+            adopt_ready_repair_reservation(&sidecar, other.path(), reservation.attempt_id())
+                .expect_err("scope mismatch must fail");
+
+        assert!(error.to_string().contains("does not match"));
+        assert!(ready_repair_reservation_path(&sidecar).exists());
+    }
+
+    #[test]
+    fn aged_malformed_reservation_is_recoverable() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_reservation_path(&sidecar);
+        fs::create_dir_all(path.parent().expect("reservation parent")).expect("state dir");
+        fs::write(&path, "{not-json").expect("malformed reservation");
+        let old = SystemTime::now()
+            .checked_sub(READY_REPAIR_LOCK_STALE_TTL + Duration::from_secs(1))
+            .expect("old file time");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open reservation")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("age reservation");
+
+        let replacement = try_reserve_ready_repair(&sidecar, project.path())
+            .expect("replace malformed reservation")
+            .expect("replacement acquired");
+
+        assert_ne!(replacement.attempt_id(), "");
+        assert!(read_ready_repair_reservation_file(&path).is_some());
+    }
+
+    #[test]
+    fn stale_reservation_does_not_overwrite_matching_terminal_result() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_reservation_path(&sidecar);
+        fs::create_dir_all(path.parent().expect("reservation parent")).expect("state dir");
+        let attempt_id = "finished-attempt";
+        crate::file_state::write_json_atomic(
+            &path,
+            "stale-reservation",
+            &ReadyRepairReservationFile {
+                schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+                pid: u32::MAX,
+                process_start_identity: None,
+                started_at_epoch_ms: 100,
+                created_at_epoch_ms: Some(100),
+                attempt_id: attempt_id.to_string(),
+                project_root: Some(clean_path_text(project.path())),
+                profile: Some("agent".to_string()),
+                run_id: sidecar.run_id.clone(),
+                namespace: Some(sidecar.namespace.clone()),
+                adopted: true,
+            },
+        )
+        .expect("stale reservation");
+        let terminal = ReadyRepairWorkerResult {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: attempt_id.to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: sidecar.run_id.clone(),
+            namespace: sidecar.namespace.clone(),
+            pid: u32::MAX,
+            started_at_epoch_ms: 100,
+            finished_at_epoch_ms: 200,
+            outcome: "succeeded".to_string(),
+            exit_code: Some(0),
+            wait_error: None,
+            stdout_tail: "done".to_string(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        write_ready_repair_worker_result(&sidecar, &terminal).expect("terminal result");
+
+        let _replacement = try_reserve_ready_repair(&sidecar, project.path())
+            .expect("replace stale reservation")
+            .expect("replacement acquired");
+        let preserved: ReadyRepairWorkerResult =
+            crate::file_state::read_json(&ready_repair_result_path(&sidecar))
+                .expect("preserved terminal result");
+
+        assert_eq!(preserved, terminal);
+    }
+
+    #[test]
+    fn concurrent_stale_reservation_reclaim_has_one_winner() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let path = ready_repair_reservation_path(&sidecar);
+        fs::create_dir_all(path.parent().expect("reservation parent")).expect("state dir");
+        crate::file_state::write_json_atomic(
+            &path,
+            "stale-reservation",
+            &ReadyRepairReservationFile {
+                schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+                pid: u32::MAX,
+                process_start_identity: None,
+                started_at_epoch_ms: 100,
+                created_at_epoch_ms: Some(100),
+                attempt_id: "stale-attempt".to_string(),
+                project_root: Some(clean_path_text(project.path())),
+                profile: Some("agent".to_string()),
+                run_id: sidecar.run_id.clone(),
+                namespace: Some(sidecar.namespace.clone()),
+                adopted: true,
+            },
+        )
+        .expect("stale reservation");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let sidecar = sidecar.clone();
+            let project_root = project.path().to_path_buf();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                try_reserve_ready_repair(&sidecar, &project_root).expect("reclaim attempt")
+            }));
+        }
+        barrier.wait();
+
+        let reservations = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("reclaimer"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            reservations
+                .iter()
+                .filter(|reservation| reservation.is_some())
+                .count(),
+            1,
+            "coordination must allow exactly one replacement attempt"
+        );
+        let stored = read_ready_repair_reservation_file(&path).expect("winning reservation");
+        assert_ne!(stored.attempt_id, "stale-attempt");
+    }
+
+    #[test]
+    fn reservation_heartbeat_preserves_original_start_time() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar(state.path());
+        let reservation = try_reserve_ready_repair(&sidecar, project.path())
+            .expect("reserve")
+            .expect("reservation acquired");
+        let before = read_ready_repair_reservation_file(&ready_repair_reservation_path(&sidecar))
+            .expect("reservation before heartbeat");
+        thread::sleep(Duration::from_millis(2));
+
+        assert!(
+            heartbeat_ready_repair_reservation(&sidecar, reservation.attempt_id())
+                .expect("heartbeat")
+        );
+        let after = read_ready_repair_reservation_file(&ready_repair_reservation_path(&sidecar))
+            .expect("reservation after heartbeat");
+
+        assert_eq!(after.created_at_epoch_ms, before.created_at_epoch_ms);
+        assert!(after.started_at_epoch_ms >= before.started_at_epoch_ms);
+    }
+
+    #[test]
+    fn ready_repair_worker_result_round_trips() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            SidecarProfile::Agent,
+            Some(DEFAULT_AGENT_RUN_ID),
+        );
+        let result = ReadyRepairWorkerResult {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: "test-attempt".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some(DEFAULT_AGENT_RUN_ID.to_string()),
+            namespace: sidecar.namespace.clone(),
+            pid: 42,
+            started_at_epoch_ms: 100,
+            finished_at_epoch_ms: 200,
+            outcome: "failed".to_string(),
+            exit_code: Some(17),
+            wait_error: None,
+            stdout_tail: "stdout".to_string(),
+            stderr_tail: "stderr".to_string(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let fingerprint_before = ready_repair_status_cache_fingerprint(project.path());
+
+        write_ready_repair_worker_result(&sidecar, &result).expect("write worker result");
+
+        assert_ne!(
+            ready_repair_status_cache_fingerprint(project.path()),
+            fingerprint_before,
+            "terminal result should invalidate cached MCP status"
+        );
+        assert_eq!(
+            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            Some(result)
+        );
+        let _ = fs::remove_dir_all(
+            sidecar
+                .layout
+                .state_file
+                .parent()
+                .expect("sidecar state parent"),
+        );
+    }
+
+    #[test]
+    fn concurrent_terminal_write_and_abandoned_cleanup_preserve_terminal_result() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = sidecar_runtime_for_project_with_run_id(
+            project.path(),
+            SidecarProfile::Agent,
+            Some(DEFAULT_AGENT_RUN_ID),
+        );
+        let status_path = ready_repair_status_path(&sidecar);
+        fs::create_dir_all(status_path.parent().expect("status parent")).expect("state dir");
+        let attempt_id = "terminal-race";
+        let status = ReadyRepairStatus {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            status: "repairing".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some(DEFAULT_AGENT_RUN_ID.to_string()),
+            namespace: sidecar.namespace.clone(),
+            compose_project: sidecar.compose_project.clone(),
+            phase: "starting".to_string(),
+            pid: u32::MAX,
+            attempt_id: Some(attempt_id.to_string()),
+            process_start_identity: None,
+            started_at_epoch_ms: 100,
+            updated_at_epoch_ms: 100,
+        };
+        fs::write(
+            &status_path,
+            serde_json::to_string(&status).expect("status json"),
+        )
+        .expect("abandoned status");
+        let terminal = ReadyRepairWorkerResult {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: attempt_id.to_string(),
+            project_root: status.project_root.clone(),
+            profile: status.profile.clone(),
+            run_id: status.run_id.clone(),
+            namespace: status.namespace.clone(),
+            pid: status.pid,
+            started_at_epoch_ms: status.started_at_epoch_ms,
+            finished_at_epoch_ms: 200,
+            outcome: "succeeded".to_string(),
+            exit_code: Some(0),
+            wait_error: None,
+            stdout_tail: "success".to_string(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let barrier = Arc::new(Barrier::new(3));
+        let writer = {
+            let barrier = Arc::clone(&barrier);
+            let sidecar = sidecar.clone();
+            let terminal = terminal.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                write_ready_repair_worker_result(&sidecar, &terminal).expect("terminal write");
+            })
+        };
+        let cleaner = {
+            let barrier = Arc::clone(&barrier);
+            let project_root = project.path().to_path_buf();
+            thread::spawn(move || {
+                barrier.wait();
+                cleanup_abandoned_ready_repair_status(&project_root, Some(DEFAULT_AGENT_RUN_ID));
+            })
+        };
+        barrier.wait();
+        writer.join().expect("terminal writer");
+        cleaner.join().expect("abandoned cleaner");
+
+        assert_eq!(
+            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            Some(terminal),
+            "terminal success must win regardless of cleanup ordering"
+        );
+        let _ = fs::remove_dir_all(
+            sidecar
+                .layout
+                .state_file
+                .parent()
+                .expect("sidecar state parent"),
+        );
     }
 
     #[test]
@@ -954,6 +1824,7 @@ mod tests {
             compose_project: "codestory-agent-test-proof".to_string(),
             phase: "embeddings".to_string(),
             pid: 4242,
+            attempt_id: None,
             process_start_identity: None,
             started_at_epoch_ms: now - 60_000,
             updated_at_epoch_ms: now - READY_REPAIR_STATUS_TTL.as_millis() as i64 - 1,
@@ -987,6 +1858,7 @@ mod tests {
             compose_project: "codestory-agent-test-proof".to_string(),
             phase: "graph artifact".to_string(),
             pid: dead_pid,
+            attempt_id: None,
             process_start_identity: None,
             started_at_epoch_ms: now,
             updated_at_epoch_ms: now,
@@ -1030,6 +1902,7 @@ mod tests {
             compose_project: "codestory-agent-test-proof".to_string(),
             phase: "Embedding documents".to_string(),
             pid,
+            attempt_id: None,
             process_start_identity: None,
             started_at_epoch_ms: old,
             updated_at_epoch_ms: old,
@@ -1163,6 +2036,7 @@ mod tests {
             compose_project: sidecar.compose_project.clone(),
             phase: "graph artifact".to_string(),
             pid: u32::MAX,
+            attempt_id: Some("abandoned-test".to_string()),
             process_start_identity: None,
             started_at_epoch_ms: now,
             updated_at_epoch_ms: now,
@@ -1211,6 +2085,44 @@ mod tests {
         assert!(
             active_ready_repair_status(project.path(), Some("shared-agent")).is_none(),
             "abandoned cleanup must leave no active repair"
+        );
+        let result = read_ready_repair_worker_result(project.path(), Some("shared-agent"))
+            .expect("abandoned cleanup terminal result");
+        assert_eq!(result.attempt_id, "abandoned-test");
+        assert_eq!(result.outcome, "abandoned");
+
+        let terminal = ReadyRepairWorkerResult {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: "abandoned-test".to_string(),
+            project_root: status.project_root.clone(),
+            profile: status.profile.clone(),
+            run_id: status.run_id.clone(),
+            namespace: status.namespace.clone(),
+            pid: status.pid,
+            started_at_epoch_ms: status.started_at_epoch_ms,
+            finished_at_epoch_ms: now + 1,
+            outcome: "failed".to_string(),
+            exit_code: Some(17),
+            wait_error: None,
+            stdout_tail: "terminal evidence".to_string(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        write_ready_repair_worker_result(&sidecar, &terminal).expect("terminal result");
+        fs::write(
+            &status_path,
+            serde_json::to_string(&status).expect("status json"),
+        )
+        .expect("recreate abandoned status");
+
+        let repeated = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(
+            read_ready_repair_worker_result(project.path(), Some("shared-agent")),
+            Some(terminal),
+            "cleanup must preserve an existing matching terminal result"
         );
     }
 }

@@ -483,6 +483,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm 0.28.1",
  "directories",
+ "fs4",
  "notify",
  "ratatui",
  "serde",

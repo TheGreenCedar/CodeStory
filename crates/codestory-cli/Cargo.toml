@@ -17,6 +17,7 @@ codestory-workspace = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 directories = { workspace = true }
+fs4 = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
