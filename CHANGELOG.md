@@ -6,6 +6,13 @@
 
 - Added a `dev/codestory-next` merge workflow that closes same-repository
   issues named by `Closes`, `Fixes`, or `Resolves` in merged pull requests.
+- Made live incremental indexing crash-safe. Runs now persist an incomplete-run
+  marker and a transient cross-version schema fence before mutating graph
+  projections, exclude concurrent writers across processes, retry unchanged
+  `complete=false` files, and clear the marker only after resolution and both
+  grounding snapshot tiers succeed. Failed or cancelled runs report stale,
+  cannot serve strict sidecar retrieval or cache rehydrate, and recover through
+  the existing staged full-refresh publish path on the next refresh.
 - Separated release-update advice from runtime readiness. A newer GitHub
   release or a newer checksum-valid managed CLI now appears under the
   non-blocking `runtime_update` status field without disabling compatible local

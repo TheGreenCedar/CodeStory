@@ -843,6 +843,12 @@ fn strict_readiness_unavailable_reason(
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
 ) -> Result<Option<String>> {
+    if storage
+        .has_incomplete_incremental_run()
+        .context("inspect incomplete incremental index marker")?
+    {
+        return Ok(Some("incomplete_incremental_index_run".into()));
+    }
     if !manifest_has_current_sidecar_contract(project_id, manifest) {
         return Ok(None);
     }
@@ -850,6 +856,12 @@ fn strict_readiness_unavailable_reason(
         && manifest_contract_drift_should_win(&reason)
     {
         return Ok(None);
+    }
+    if let Some(path) = storage
+        .first_incomplete_file_path()
+        .context("inspect incomplete indexed files")?
+    {
+        return Ok(Some(format!("indexed_file_incomplete: {}", path.display())));
     }
 
     let embedding_backend = crate::embeddings::embedding_runtime_id();
@@ -905,6 +917,7 @@ fn strict_readiness_unavailable_reason(
                 path: file.path,
                 modification_time: file.modification_time,
                 indexed: file.indexed,
+                complete: file.complete,
             })
             .collect(),
         inventory: Default::default(),
@@ -1422,6 +1435,72 @@ mod tests {
             reason.contains("stored=onnx current=llamacpp"),
             "unexpected reason: {reason}"
         );
+    }
+
+    #[test]
+    fn strict_readiness_rejects_incomplete_run_before_manifest_fast_paths() {
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let project_id = project_id_for_root(project.path());
+        let manifest = retrieval_manifest_fixture(&project_id, "current");
+        let storage = Store::open(&storage_path).expect("open db");
+        storage
+            .begin_incremental_run()
+            .expect("mark incomplete run");
+
+        let reason = strict_readiness_unavailable_reason(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+        )
+        .expect("strict readiness")
+        .expect("incomplete run must degrade");
+
+        assert_eq!(reason, "incomplete_incremental_index_run");
+    }
+
+    #[test]
+    fn strict_readiness_rejects_unchanged_incomplete_indexed_file() {
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let indexed_mtime = live_mtime_millis(&source_path);
+        let project_id = project_id_for_root(project.path());
+        let manifest = retrieval_manifest_fixture(&project_id, "current");
+        let storage = Store::open(&storage_path).expect("open db");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: indexed_mtime,
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert incomplete file");
+
+        let reason = strict_readiness_unavailable_reason(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+        )
+        .expect("strict readiness")
+        .expect("incomplete file must degrade");
+
+        assert!(
+            reason.contains("indexed_file_incomplete"),
+            "unexpected reason: {reason}"
+        );
+        assert!(reason.contains(&source_path.display().to_string()));
     }
 
     #[test]

@@ -55,6 +55,7 @@ fn refresh_inputs_from_storage(storage: &Storage) -> codestory_workspace::Refres
                 path: file.path,
                 modification_time: file.modification_time,
                 indexed: file.indexed,
+                complete: file.complete,
             })
             .collect(),
         inventory: Default::default(),

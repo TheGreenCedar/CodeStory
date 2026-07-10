@@ -535,7 +535,9 @@ impl WorkspaceDiscovery {
                 Some(file) => {
                     existing_file_ids.insert(path.clone(), file.id);
                     match modification_time_millis(&path) {
-                        Ok(mtime) => mtime != file.modification_time || !file.indexed,
+                        Ok(mtime) => {
+                            mtime != file.modification_time || !file.indexed || !file.complete
+                        }
                         Err(_) => true,
                     }
                 }
@@ -920,6 +922,7 @@ mod tests {
                     path: file.clone(),
                     modification_time: 0,
                     indexed: true,
+                    complete: true,
                 }],
                 inventory: WorkspaceInventory::default(),
             },
@@ -948,6 +951,7 @@ mod tests {
                     path: file.clone(),
                     modification_time: modification_time_millis(&file)?,
                     indexed: true,
+                    complete: true,
                 }],
                 inventory: WorkspaceInventory::default(),
             },
@@ -958,6 +962,50 @@ mod tests {
             "unchanged files should not look dirty when stored mtimes use file-table millisecond precision"
         );
         assert_eq!(plan.existing_file_ids.get(&file), Some(&7));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_refresh_retries_unchanged_incomplete_files_from_both_inventories() -> Result<()>
+    {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let modification_time = modification_time_millis(&file)?;
+        let manifest = WorkspaceManifest::open(root)?;
+
+        let inputs = [
+            RefreshInputs {
+                stored_files: vec![StoredFileState {
+                    id: 7,
+                    path: file.clone(),
+                    modification_time,
+                    indexed: true,
+                    complete: false,
+                }],
+                inventory: WorkspaceInventory::default(),
+            },
+            RefreshInputs {
+                stored_files: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    file.clone(),
+                    IndexedFileRecord {
+                        file_id: 7,
+                        modification_time,
+                        indexed: true,
+                        complete: false,
+                    },
+                )]),
+            },
+        ];
+
+        for input in inputs {
+            let plan = WorkspaceDiscovery.build_refresh_plan(&manifest, &input)?;
+            assert_eq!(plan.files_to_index, vec![file.clone()]);
+            assert_eq!(plan.existing_file_ids.get(&file), Some(&7));
+        }
         Ok(())
     }
 
@@ -983,6 +1031,7 @@ mod tests {
                             file_id: 11,
                             modification_time: modification_time_millis(&file)?,
                             indexed: true,
+                            complete: true,
                         },
                     ),
                     (
@@ -991,6 +1040,7 @@ mod tests {
                             file_id: 19,
                             modification_time: 0,
                             indexed: true,
+                            complete: true,
                         },
                     ),
                 ]),

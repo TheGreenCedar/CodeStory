@@ -13,6 +13,7 @@ pub struct StoredFileState {
     pub path: PathBuf,
     pub modification_time: i64,
     pub indexed: bool,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub struct IndexedFileRecord {
     pub file_id: i64,
     pub modification_time: i64,
     pub indexed: bool,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -64,6 +66,7 @@ impl RefreshInputs {
                         path,
                         modification_time: record.modification_time,
                         indexed: record.indexed,
+                        complete: record.complete,
                     },
                 )
             })

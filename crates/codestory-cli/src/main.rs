@@ -15494,6 +15494,35 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_incremental_resolves_and_labels_staged_full_recovery() {
+        let mut summary = summary_with_files(3);
+        summary.freshness = Some(IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::Stale,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 3,
+            duration_ms: 0,
+            reason: Some("previous_incremental_run_incomplete_full_refresh_required".to_string()),
+            samples: Vec::new(),
+        });
+
+        assert_eq!(
+            resolve_refresh_request(RefreshMode::Auto, &summary),
+            Some(IndexMode::Full)
+        );
+        assert_eq!(
+            resolve_refresh_request(RefreshMode::Incremental, &summary),
+            Some(IndexMode::Full)
+        );
+        assert_eq!(
+            refresh_label(RefreshMode::Incremental, Some(IndexMode::Full)),
+            "incremental(recovery-full)"
+        );
+    }
+
+    #[test]
     fn render_index_markdown_includes_rich_timing_breakdown_when_available() {
         let summary = summary_with_files(3);
         let timings = sample_phase_timings();

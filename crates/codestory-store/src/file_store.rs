@@ -47,6 +47,7 @@ impl<'a> FileStore<'a> {
                     path: file.path,
                     modification_time: file.modification_time,
                     indexed: file.indexed,
+                    complete: file.complete,
                 })
             })
             .collect()
