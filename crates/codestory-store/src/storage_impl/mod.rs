@@ -3160,6 +3160,23 @@ impl Storage {
         Ok(clamp_i64_to_u32(count))
     }
 
+    pub fn has_symbol_search_doc_version_mismatch(
+        &self,
+        expected_version: u32,
+    ) -> Result<bool, StorageError> {
+        let mismatch = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM symbol_search_doc
+                WHERE doc_version <> ?1
+                LIMIT 1
+            )",
+            params![expected_version as i64],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(mismatch)
+    }
+
     pub fn clear_symbol_search_docs(&mut self) -> Result<usize, StorageError> {
         let removed = self.conn.execute("DELETE FROM symbol_search_doc", [])?;
         Ok(removed)

@@ -466,6 +466,36 @@ fn test_component_access_round_trip() -> Result<(), StorageError> {
 }
 
 #[test]
+fn test_symbol_search_doc_version_mismatch_detection() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[Node {
+        id: NodeId(500),
+        kind: NodeKind::FUNCTION,
+        serialized_name: "do_work".to_string(),
+        ..Default::default()
+    }])?;
+    storage.upsert_symbol_search_docs_batch(&[SymbolSearchDoc {
+        node_id: NodeId(500),
+        file_node_id: None,
+        kind: NodeKind::FUNCTION,
+        display_name: "do_work".to_string(),
+        qualified_name: Some("pkg::do_work".to_string()),
+        file_path: Some("src/lib.rs".to_string()),
+        start_line: Some(12),
+        doc_text: "semantic_doc_version: 6\nsymbol: do_work".to_string(),
+        doc_version: 6,
+        doc_hash: "symbol-search-hash-500".to_string(),
+        policy_version: "graph_first_v1".to_string(),
+        source_provenance: "extracted".to_string(),
+        updated_at_epoch_ms: 123,
+    }])?;
+
+    assert!(!storage.has_symbol_search_doc_version_mismatch(6)?);
+    assert!(storage.has_symbol_search_doc_version_mismatch(5)?);
+    Ok(())
+}
+
+#[test]
 fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;
     storage.insert_nodes_batch(&[Node {

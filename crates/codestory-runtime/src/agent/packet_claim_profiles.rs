@@ -959,9 +959,8 @@ fn packet_generic_hook_cache_flow_claims(symbol: &str, source: &str) -> Vec<Stri
     let mut claims = Vec::new();
     let cache_helper_call = source_shape_has_cache_helper_call(&normalized_source);
 
-    if source_lower.contains("withargs")
-        && source_lower.contains("export default")
-        && let Some((public_hook, handler)) = packet_source_with_args_wrapper(source)
+    if source_lower.contains("export default")
+        && let Some((public_hook, handler)) = packet_source_argument_wrapper(source)
     {
         claims.push(format!(
             "The public {public_hook} export wraps {handler} with argument normalization."
@@ -1536,41 +1535,45 @@ fn packet_css_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
 }
 
-fn packet_source_with_args_wrapper(source: &str) -> Option<(String, String)> {
-    let lower = source.to_ascii_lowercase();
+fn packet_source_argument_wrapper(source: &str) -> Option<(String, String)> {
     let mut search_from = 0usize;
 
-    while let Some(relative_at) = lower[search_from..].find("withargs") {
-        let with_args_at = search_from + relative_at;
-        let statement_start = source[..with_args_at]
+    while let Some(relative_at) = source[search_from..].find('=') {
+        let assignment_at = search_from + relative_at;
+        let statement_start = source[..assignment_at]
             .rfind(['\n', ';'])
             .map(|idx| idx + 1)
             .unwrap_or(0);
-        let before = &source[statement_start..with_args_at];
-        let Some(wrapper) = before
-            .rsplit_once('=')
-            .and_then(|(left, _)| packet_last_identifier(left))
-        else {
-            search_from = with_args_at + "withargs".len();
+        let Some(wrapper) = packet_last_identifier(&source[statement_start..assignment_at]) else {
+            search_from = assignment_at + 1;
             continue;
         };
 
-        let after = &source[with_args_at..];
+        let after = &source[assignment_at + 1..];
+        let Some(wrapper_factory) = packet_first_identifier(after) else {
+            search_from = assignment_at + 1;
+            continue;
+        };
+        let normalized_factory = normalize_identifier(&wrapper_factory);
+        if !normalized_factory.contains("args") && !normalized_factory.contains("argument") {
+            search_from = assignment_at + 1;
+            continue;
+        }
         let Some(handler_start) = after.find('(').map(|idx| idx + 1) else {
-            search_from = with_args_at + "withargs".len();
+            search_from = assignment_at + 1;
             continue;
         };
         let handler_tail = &after[handler_start..];
         let Some(handler) = packet_first_identifier_after_type_arguments(handler_tail) else {
-            search_from = with_args_at + "withargs".len();
+            search_from = assignment_at + 1;
             continue;
         };
 
-        if packet_source_exports_default_identifier(after, &wrapper) {
+        if packet_source_exports_default_identifier(source, &wrapper) {
             return Some((wrapper, handler));
         }
 
-        search_from = with_args_at + "withargs".len();
+        search_from = assignment_at + 1;
     }
 
     None
@@ -3216,6 +3219,21 @@ mod tests {
                 "expected production hook/cache claim `{expected}`; got {claims:?}"
             );
         }
+
+        let unrelated_wrapper_claims = packet_source_derived_claims_for_citation(
+            swr_prompt,
+            &citation,
+            r#"
+            const useData = target(useDataHandler)
+            export default useData
+            "#,
+        );
+        assert!(
+            unrelated_wrapper_claims
+                .iter()
+                .all(|claim| !claim.contains("argument normalization")),
+            "unrelated wrapper factories containing `arg` must not imply argument normalization; got {unrelated_wrapper_claims:?}"
+        );
 
         let _eval_probes = EvalProbesGuard::enabled();
         let claims =

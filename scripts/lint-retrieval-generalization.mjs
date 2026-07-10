@@ -11,6 +11,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { sourcetrailQueries } from "./cross-repo-sourcetrail-queries.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const extraScanRoots = (
@@ -67,10 +68,36 @@ const benchmarkIdentityScriptFiles = [
   path.join(repoRoot, "scripts", "codestory-manual-friction-check.mjs"),
   path.join(repoRoot, "scripts", "cross-repo-sourcetrail-queries.mjs"),
 ];
+const benchmarkPromptScriptOverride =
+  process.env.CODESTORY_RETRIEVAL_GENERALIZATION_PROMPT_SCRIPT;
+const benchmarkPromptScriptFiles = [
+  {
+    filePath: benchmarkPromptScriptOverride
+      ? path.resolve(benchmarkPromptScriptOverride)
+      : path.join(repoRoot, "scripts", "codestory-agent-ab-benchmark.mjs"),
+    startMarker: "const PUBLIC_REPOS =",
+    endMarker: "const ALL_REPOS =",
+  },
+];
 const benchmarkTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
+const benchmarkEvalProbeManifestPath = path.join(benchmarkTaskRoot, "eval-probes.json");
+const benchmarkEvalProbeSourcePath = path.join(
+  repoRoot,
+  "crates",
+  "codestory-runtime",
+  "src",
+  "agent",
+  "eval_probes.rs",
+);
 
-const missingBenchmarkBoundaryFiles = benchmarkIdentityScriptFiles
-  .filter((scriptPath) => !existsSync(scriptPath));
+const missingBenchmarkBoundaryFiles = [
+  ...benchmarkIdentityScriptFiles,
+  ...benchmarkPromptScriptFiles.map(({ filePath }) => filePath),
+  benchmarkEvalProbeManifestPath,
+  benchmarkEvalProbeSourcePath,
+].filter((scriptPath, index, paths) =>
+  paths.indexOf(scriptPath) === index && !existsSync(scriptPath)
+);
 if (missingBenchmarkBoundaryFiles.length > 0) {
   console.error("lint-retrieval-generalization: missing benchmark boundary script(s)");
   for (const missingPath of missingBenchmarkBoundaryFiles) {
@@ -100,6 +127,7 @@ const bannedPatterns = [
   "PersistentStorage",
   "SourceGroupCxxCdb",
   "IndexerJava",
+  "data[/\\\\]indexer",
   "ExecSharedCliOptions",
   "EventProcessorWithJsonOutput",
   "Subcommand::Exec",
@@ -173,6 +201,9 @@ const bannedPatterns = [
   "install\\.sh\\s+nvm",
   "bash_completion\\s+__nvm",
   ...benchmarkManifestDerivedPatterns(),
+  ...benchmarkEvalProbeDerivedPatterns(),
+  ...benchmarkScriptPromptDerivedPatterns(),
+  ...benchmarkQueryCatalogDerivedPatterns(),
 ];
 
 const bannedLiteralPatterns = [
@@ -213,19 +244,29 @@ const rankerFilenameLiteralPattern = /["'`][a-z0-9][a-z0-9._-]*\.[a-z0-9]+["'`]/
 
 function benchmarkManifestDerivedPatterns() {
   if (!existsSync(benchmarkTaskRoot)) {
-    return [];
+    throw new Error(`benchmark task root is missing: ${benchmarkTaskRoot}`);
   }
   const markers = new Set();
-  for (const filePath of walkFiles(benchmarkTaskRoot, (candidate) => candidate.endsWith(".task.json"))) {
+  const manifestFiles = walkFiles(
+    benchmarkTaskRoot,
+    (candidate) => candidate.endsWith(".task.json"),
+  );
+  if (manifestFiles.length === 0) {
+    throw new Error(`benchmark task root has no .task.json manifests: ${benchmarkTaskRoot}`);
+  }
+  let parsedTaskCount = 0;
+  for (const filePath of manifestFiles) {
     let manifest;
     try {
       manifest = JSON.parse(readFileSync(filePath, "utf8"));
-    } catch {
-      continue;
+    } catch (error) {
+      throw new Error(`failed to parse benchmark manifest ${filePath}: ${error}`);
     }
     for (const task of benchmarkManifestTasks(manifest)) {
+      parsedTaskCount += 1;
       addSpecificMarker(markers, task.id);
       addRepoMarkers(markers, task.repo);
+      addSpecificMarker(markers, task.prompt, { allowExactPhrase: true });
       for (const expectedFile of task.expected_files ?? []) {
         addSpecificMarker(markers, expectedFile, { allowSpecificComposite: true });
       }
@@ -244,9 +285,187 @@ function benchmarkManifestDerivedPatterns() {
       for (const claim of task.expected_claims ?? []) {
         addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
       }
+      for (const claim of task.forbidden_claims ?? []) {
+        addSpecificMarker(markers, claim?.text, { allowExactPhrase: true });
+      }
     }
   }
+  if (parsedTaskCount === 0 || markers.size === 0) {
+    throw new Error("benchmark manifests produced no generalization markers");
+  }
   return [...markers].sort().map(escapeRegExp);
+}
+
+function benchmarkScriptPromptDerivedPatterns() {
+  const markers = new Set();
+  const stringLiteralSource = javascriptStringLiteralSource();
+  const promptProperty = new RegExp(`\\bprompt\\s*:\\s*(${stringLiteralSource})`, "g");
+
+  for (const { filePath, startMarker, endMarker } of benchmarkPromptScriptFiles) {
+    const source = readFileSync(filePath, "utf8");
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start + startMarker.length);
+    if (start < 0 || end < 0 || end <= start) {
+      throw new Error(
+        `benchmark prompt script is missing corpus boundary markers: ${filePath}`,
+      );
+    }
+    const corpusSource = source.slice(start, end);
+    const discoveredPromptCount = [...corpusSource.matchAll(/\bprompt\s*:/g)].length;
+    let parsedPromptCount = 0;
+    let match;
+    while ((match = promptProperty.exec(corpusSource)) != null) {
+      parsedPromptCount += 1;
+      addSpecificMarker(markers, decodeJavaScriptStringLiteral(match[1]), {
+        allowExactPhrase: true,
+      });
+    }
+    if (parsedPromptCount === 0 || parsedPromptCount !== discoveredPromptCount) {
+      throw new Error(
+        `benchmark prompt script discovered ${discoveredPromptCount} prompt properties but parsed ${parsedPromptCount} literal prompts: ${filePath}`,
+      );
+    }
+    promptProperty.lastIndex = 0;
+  }
+
+  return [...markers].sort().map(escapeRegExp);
+}
+
+function benchmarkQueryCatalogDerivedPatterns() {
+  const markers = new Set();
+  if (!Array.isArray(sourcetrailQueries) || sourcetrailQueries.length === 0) {
+    throw new Error("cross-repo query catalog exported no queries");
+  }
+  for (const [index, entry] of sourcetrailQueries.entries()) {
+    if (
+      typeof entry?.query !== "string"
+      || !Array.isArray(entry?.expect)
+      || entry.expect.some((expected) => typeof expected !== "string")
+    ) {
+      throw new Error(`cross-repo query catalog entry ${index} has an invalid shape`);
+    }
+    addSpecificMarker(markers, entry.query, { allowExactPhrase: true });
+    for (const expected of entry.expect) {
+      if (queryCatalogExpectedMarkerIsSpecific(expected)) {
+        addSpecificMarker(markers, expected, { allowSpecificComposite: true });
+      }
+    }
+  }
+
+  return [...markers].sort().map(escapeRegExp);
+}
+
+function benchmarkEvalProbeDerivedPatterns() {
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(benchmarkEvalProbeManifestPath, "utf8"));
+  } catch (error) {
+    throw new Error(`failed to parse eval probe manifest: ${error}`);
+  }
+  const markers = new Set();
+  for (const group of ["flow_hint_rules", "required_probe_rules"]) {
+    const rules = manifest?.[group];
+    if (!Array.isArray(rules)) {
+      throw new Error(`eval probe manifest is missing ${group}`);
+    }
+    for (const [index, rule] of rules.entries()) {
+      if (!Array.isArray(rule?.queries) || rule.queries.some((query) => typeof query !== "string")) {
+        throw new Error(`eval probe manifest ${group}[${index}] has invalid queries`);
+      }
+      for (const query of rule.queries) {
+        addSpecificMarker(markers, query, { allowSpecificComposite: true });
+      }
+    }
+  }
+  if (!Array.isArray(manifest?.citation_rank_adjustments)) {
+    throw new Error("eval probe manifest is missing citation_rank_adjustments");
+  }
+  for (const adjustment of manifest.citation_rank_adjustments) {
+    addSpecificMarker(markers, adjustment?.normalized_display);
+    addSpecificMarker(markers, adjustment?.path, { allowSpecificComposite: true });
+  }
+
+  const source = readFileSync(benchmarkEvalProbeSourcePath, "utf8");
+  addEvalProbeSourceQueryMarkers(markers, source);
+  if (markers.size === 0) {
+    throw new Error("eval probe corpora produced no generalization markers");
+  }
+  return [...markers].sort().map(escapeRegExp);
+}
+
+function addEvalProbeSourceQueryMarkers(markers, source) {
+  let parsedLiteralCount = 0;
+  const singleQueryCall =
+    /\bpush_unique_term\(\s*queries\s*,\s*("(?:\\.|[^"\\])*")\s*\)/g;
+  let singleMatch;
+  while ((singleMatch = singleQueryCall.exec(source)) != null) {
+    parsedLiteralCount += 1;
+    addSpecificMarker(markers, JSON.parse(singleMatch[1]), {
+      allowSpecificComposite: true,
+    });
+  }
+
+  const queryArrayCall =
+    /\bpush_unique_terms\(\s*queries\s*,\s*&\[([\s\S]*?)\]\s*,?\s*\)/g;
+  let arrayMatch;
+  while ((arrayMatch = queryArrayCall.exec(source)) != null) {
+    const body = arrayMatch[1];
+    const literals = rustStringLiteralSpans(body);
+    if (literals.length === 0 || rustArrayNonLiteralRemainder(body, literals).trim() !== "") {
+      throw new Error("eval probe source query array contains an unparsed entry");
+    }
+    for (const { literal } of literals) {
+      parsedLiteralCount += 1;
+      addSpecificMarker(markers, rustStringLiteralContent(literal), {
+        allowSpecificComposite: true,
+      });
+    }
+  }
+
+  if (parsedLiteralCount === 0) {
+    throw new Error("eval probe source produced no static query literals");
+  }
+}
+
+function rustArrayNonLiteralRemainder(body, literals) {
+  const chars = body.split("");
+  for (const literal of literals) {
+    for (let index = literal.startOffset; index < literal.endOffset; index += 1) {
+      chars[index] = " ";
+    }
+  }
+  return chars.join("").replaceAll(",", "");
+}
+
+function javascriptStringLiteralSource() {
+  return '(?:"(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|`(?:\\\\.|[^`\\\\])*`)';
+}
+
+function queryCatalogExpectedMarkerIsSpecific(value) {
+  const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (["application", "typename"].includes(normalized)) {
+    return false;
+  }
+  return /[\\/.:]/.test(value) || /[a-z][A-Z]/.test(value);
+}
+
+function decodeJavaScriptStringLiteral(literal) {
+  const quote = literal[0];
+  if (quote === '"') {
+    return JSON.parse(literal);
+  }
+  const contents = literal.slice(1, -1);
+  if (quote === "`" && contents.includes("${")) {
+    throw new Error("template expressions are not supported in benchmark string literals");
+  }
+  const jsonContents = contents
+    .replaceAll(`\\${quote}`, quote)
+    .replaceAll('"', '\\"');
+  try {
+    return JSON.parse(`"${jsonContents}"`);
+  } catch (error) {
+    throw new Error(`failed to decode benchmark string literal ${literal}: ${error}`);
+  }
 }
 
 function benchmarkManifestTasks(manifest) {
@@ -348,7 +567,14 @@ function benchmarkMarkerTooGeneric(marker, options = {}) {
       "comments",
       "indexfile",
       "runindex",
+      "buildindex",
       "servicesrs",
+      "sourcegroup",
+      "indexercommand",
+      "subcommand",
+      "eventprocessor",
+      "jsonoutput",
+      "jsonlevent",
       "schema",
       "source",
       "storage",
