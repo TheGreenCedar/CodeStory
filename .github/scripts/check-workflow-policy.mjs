@@ -75,10 +75,11 @@ if (!fs.existsSync(closeDevIssues)) {
 } else {
   const content = fs.readFileSync(closeDevIssues, "utf8");
   const requiredSnippets = [
-    "pull_request:",
+    "push:",
     "dev/codestory-next",
-    "types: [closed]",
-    "github.event.pull_request.merged == true",
+    'commit = event["after"]',
+    'pull_request.get("merged_at")',
+    'pull_request.get("merge_commit_sha") == commit',
     "issues: write",
     'if "pull_request" in issue:',
     '"state_reason=completed"',
