@@ -82,7 +82,7 @@ async function writeFakeCli(cliPath) {
   }
   await writeFile(
     cliPath,
-    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} "$@"\n`,
+    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`,
     "utf8",
   );
   await chmod(cliPath, 0o755);
@@ -94,7 +94,7 @@ async function writeRecordingCli(cliPath) {
     await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
     return;
   }
-  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} "$@"\n`, "utf8");
+  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
   await chmod(cliPath, 0o755);
 }
 
