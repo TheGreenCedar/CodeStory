@@ -4,6 +4,16 @@
 
 ### Fixed
 
+- Bounded plugin-managed CLI storage to the active checksummed runtime plus one
+  verified upgrade or rollback candidate, with atomic staged publication,
+  recoverable owner locks, Windows lock-safe cleanup, and retained, removed,
+  and reclaimable byte diagnostics in plugin runtime status.
+- Added post-publication sidecar generation retention across Qdrant, lexical,
+  and SCIP artifacts. CodeStory now protects every manifest-referenced active
+  generation sharing the sidecar scope plus at most one verified rollback,
+  suppresses pruning on malformed or stale protection state, coordinates
+  publication with namespace GC, and exposes the same byte-accounted plan to
+  `retrieval inventory` and its explicit `--apply` path.
 - Published lexical shard data, metadata, and runtime sidecar state through
   validated same-directory temporary files with atomic replacement. Shard
   readiness and search now reject malformed, truncated, count-mismatched, or

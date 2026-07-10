@@ -37,6 +37,12 @@ pub struct QdrantHealthProbe {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QdrantDeleteOutcome {
+    Deleted,
+    NotFound,
+}
+
 #[derive(Debug, Clone)]
 pub struct QdrantClient {
     base_url: String,
@@ -223,20 +229,31 @@ impl QdrantClient {
 
     /// Drop collection when embedding backend/dim changes (idempotent).
     pub fn delete_collection(&self, collection: &str) -> Result<()> {
+        self.delete_collection_with_outcome(collection).map(|_| ())
+    }
+
+    pub(crate) fn delete_collection_with_outcome(
+        &self,
+        collection: &str,
+    ) -> Result<QdrantDeleteOutcome> {
         let url = format!("{}/collections/{collection}", self.base_url);
         match read_text(ureq::delete(&url).timeout(QDRANT_MUTATION_BUDGET).call()) {
             Ok(response) => {
                 let status = response.status;
-                if status == 200 || status == 404 {
+                if status == 200 {
                     self.clear_collection_stub_marker(collection);
-                    return Ok(());
+                    return Ok(QdrantDeleteOutcome::Deleted);
+                }
+                if status == 404 {
+                    self.clear_collection_stub_marker(collection);
+                    return Ok(QdrantDeleteOutcome::NotFound);
                 }
                 bail!("delete collection http {status}");
             }
             Err(error) => {
                 if error.is_status(404) {
                     self.clear_collection_stub_marker(collection);
-                    return Ok(());
+                    return Ok(QdrantDeleteOutcome::NotFound);
                 }
                 bail!("delete collection request failed: {error}")
             }

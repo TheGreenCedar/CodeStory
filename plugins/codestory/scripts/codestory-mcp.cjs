@@ -2,7 +2,7 @@
 
 const { spawn } = require('child_process');
 const { spawnSync } = require('child_process');
-const { createHash } = require('crypto');
+const { createHash, randomBytes } = require('crypto');
 const fs = require('fs');
 const https = require('https');
 const os = require('os');
@@ -21,6 +21,9 @@ const sharedAgentRunId = 'shared-agent';
 const releaseDownloadTimeoutMs = 60000;
 const releaseDownloadAttempts = 3;
 const releaseDownloadRetryDelaysMs = [1000, 3000];
+const managedCliLockStaleMs = 10 * 60 * 1000;
+const managedCliLockMaxAgeMs = 30 * 60 * 1000;
+const managedCliLockWaitMs = 120000;
 
 function readJson(file) {
   try {
@@ -580,19 +583,120 @@ function extractArchive(archivePath, destination) {
   }
 }
 
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function managedCliRoot(dataDir, create = false) {
+  const root = path.join(dataDir, 'codestory-cli');
+  if (fs.existsSync(root)) {
+    const metadata = fs.lstatSync(root);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(`managed_cli_root_not_direct:${root}`);
+    }
+  } else if (create) {
+    fs.mkdirSync(root, { recursive: true });
+  }
+  return root;
+}
+
+function reclaimStaleManagedCliLock(lockPath) {
+  let stale = false;
+  const ownerPath = path.join(lockPath, 'owner.json');
+  const owner = readJson(ownerPath);
+  if (owner && Number.isInteger(owner.pid)) {
+    const startedAt = Date.parse(owner.started_at || '');
+    const tooOld = Number.isFinite(startedAt) && Date.now() - startedAt > managedCliLockMaxAgeMs;
+    stale = !processIsAlive(owner.pid) || tooOld;
+  } else {
+    try {
+      stale = Date.now() - fs.statSync(lockPath).mtimeMs > managedCliLockStaleMs;
+    } catch {
+      return true;
+    }
+  }
+  if (!stale) return false;
+  const stalePath = `${lockPath}.stale-${process.pid}-${randomBytes(6).toString('hex')}`;
+  try {
+    fs.renameSync(lockPath, stalePath);
+    fs.rmSync(stalePath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireManagedCliLock(root, purpose, waitMs = 0) {
+  const lockPath = path.join(root, '.retention-lock');
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    try {
+      fs.mkdirSync(lockPath);
+      const token = randomBytes(16).toString('hex');
+      try {
+        fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+          pid: process.pid,
+          purpose,
+          token,
+          started_at: new Date().toISOString(),
+        }));
+      } catch (error) {
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        throw error;
+      }
+      return { lockPath, token };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (reclaimStaleManagedCliLock(lockPath)) continue;
+      if (Date.now() >= deadline) return null;
+      sleepSync(50);
+    }
+  }
+}
+
+function releaseManagedCliLock(lock) {
+  if (!lock) return;
+  const owner = readJson(path.join(lock.lockPath, 'owner.json'));
+  if (!owner || owner.token !== lock.token || owner.pid !== process.pid) return;
+  try {
+    fs.rmSync(lock.lockPath, { recursive: true, force: true });
+  } catch (error) {
+    try {
+      fs.writeFileSync(
+        path.join(lock.lockPath, 'owner.json'),
+        JSON.stringify({ ...owner, pid: -1, released_at: new Date().toISOString() }),
+      );
+    } catch {
+      // The next process can still reclaim a malformed lock after the stale timeout.
+    }
+    throw error;
+  }
+}
+
 async function provisionManagedCli(dataDir, version) {
   if (!dataDir || !version || process.env.CODESTORY_PLUGIN_DISABLE_PROVISION === '1') return null;
   const target = assetTarget();
   const asset = archiveName(version, target);
   if (!target || !asset) throw new Error(`unsupported_release_target:${process.platform}-${process.arch}`);
 
-  const versionDir = path.join(dataDir, 'codestory-cli', version);
-  const binDir = path.join(versionDir, 'bin');
-  const manifestPath = path.join(versionDir, 'manifest.json');
+  const root = managedCliRoot(dataDir, true);
+  const versionDir = path.join(root, version);
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codestory-plugin-cli-'));
   const sumsPath = path.join(tempRoot, 'SHA256SUMS.txt');
   const archivePath = path.join(tempRoot, asset);
   const extractDir = path.join(tempRoot, 'extract');
+  let stagingDir = null;
   try {
     await fetchReleaseFile(version, 'SHA256SUMS.txt', sumsPath);
     const archiveUrl = await fetchReleaseFile(version, asset, archivePath);
@@ -605,13 +709,16 @@ async function provisionManagedCli(dataDir, version) {
     const extracted = findFile(extractDir, fallbackBinaryNames);
     if (!extracted) throw new Error(`archive_missing_cli:${asset}`);
 
+    stagingDir = fs.mkdtempSync(path.join(root, `.provisioning-${version}-${process.pid}-`));
+    const binDir = path.join(stagingDir, 'bin');
+    const manifestPath = path.join(stagingDir, 'manifest.json');
     fs.mkdirSync(binDir, { recursive: true });
     const destination = path.join(binDir, path.basename(extracted));
     fs.copyFileSync(extracted, destination);
     if (process.platform !== 'win32') fs.chmodSync(destination, 0o755);
     const binarySha256 = fileSha256(destination);
     fs.writeFileSync(manifestPath, JSON.stringify({
-      path: path.relative(versionDir, destination).replace(/\\/gu, '/'),
+      path: path.relative(stagingDir, destination).replace(/\\/gu, '/'),
       sha256: binarySha256,
       version,
       build_source: 'github_release',
@@ -622,18 +729,58 @@ async function provisionManagedCli(dataDir, version) {
       target,
       provisioned_at: new Date().toISOString(),
     }, null, 2));
-    return resolveManifest(manifestPath);
+    const staged = resolveManifest(manifestPath);
+    if (!staged) {
+      throw new Error(`managed_cli_staging_verification_failed:${version}`);
+    }
+    const stagedProbe = probeResolvedCli({ ...staged, source: 'managed', version });
+    if (stagedProbe.error || stagedProbe.status !== 0 || stagedProbe.version !== version) {
+      throw new Error(`managed_cli_staging_version_probe_failed:${version}`);
+    }
+
+    const lock = acquireManagedCliLock(root, 'provision', managedCliLockWaitMs);
+    if (!lock) throw new Error('managed_cli_publish_locked');
+    try {
+      const existing = resolveManifest(path.join(versionDir, 'manifest.json'));
+      if (existing) return existing;
+      let replacedDir = null;
+      if (fs.existsSync(versionDir)) {
+        replacedDir = path.join(root, `.replaced-${version}-${process.pid}-${randomBytes(6).toString('hex')}`);
+        fs.renameSync(versionDir, replacedDir);
+      }
+      try {
+        fs.renameSync(stagingDir, versionDir);
+        stagingDir = null;
+      } catch (error) {
+        if (replacedDir && !fs.existsSync(versionDir) && fs.existsSync(replacedDir)) {
+          fs.renameSync(replacedDir, versionDir);
+        }
+        throw error;
+      }
+      if (replacedDir) fs.rmSync(replacedDir, { recursive: true, force: true });
+      return resolveManifest(path.join(versionDir, 'manifest.json'));
+    } finally {
+      releaseManagedCliLock(lock);
+    }
   } finally {
+    if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true });
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }
 
 async function resolveManagedCli(dataDir, version, warnings) {
   if (!dataDir || !version) return null;
+  try {
+    managedCliRoot(dataDir);
+  } catch (error) {
+    warnings.push(`managed_cli_root_invalid:${error.message}`);
+    return null;
+  }
   for (const manifestPath of [
     path.join(dataDir, 'codestory-cli', version, 'manifest.json'),
     path.join(dataDir, 'codestory-cli', 'manifest.json'),
   ]) {
+    if (managedProvisioningState(path.dirname(manifestPath)).active) continue;
     const resolved = resolveManifest(manifestPath);
     if (resolved) return resolved;
   }
@@ -642,7 +789,8 @@ async function resolveManagedCli(dataDir, version, warnings) {
     path.join(dataDir, 'codestory-cli', version, binaryName),
     path.join(dataDir, 'codestory-cli', version, 'bin', binaryName),
   ]) {
-    if (fs.existsSync(cliPath)) {
+    if (fs.existsSync(cliPath)
+        && !fs.existsSync(path.join(dataDir, 'codestory-cli', version, '.provisioning'))) {
       return { path: cliPath, sha256: fileSha256(cliPath), manifestPath: null };
     }
   }
@@ -650,6 +798,8 @@ async function resolveManagedCli(dataDir, version, warnings) {
     return await provisionManagedCli(dataDir, version);
   } catch (error) {
     warnings.push(`managed_cli_provision_failed:${error.message}`);
+    const concurrent = resolveManifest(path.join(dataDir, 'codestory-cli', version, 'manifest.json'));
+    if (concurrent) return concurrent;
   }
   return null;
 }
@@ -739,6 +889,418 @@ function failOpenReasonForProbe(resolved, probe) {
     return `${resolved.source}_cli_unspawnable`;
   }
   return null;
+}
+
+function compareManagedCliVersions(left, right) {
+  const leftParts = left.split('.').map(Number);
+  const rightParts = right.split('.').map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = leftParts[index] - rightParts[index];
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+function managedPathSize(pathname) {
+  const metadata = fs.lstatSync(pathname);
+  if (metadata.isSymbolicLink()) {
+    throw new Error(`managed_cli_retention_link:${pathname}`);
+  }
+  if (!metadata.isDirectory()) return metadata.size;
+  let bytes = 0;
+  for (const entry of fs.readdirSync(pathname, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) {
+      throw new Error(`managed_cli_retention_link:${path.join(pathname, entry.name)}`);
+    }
+    bytes += managedPathSize(path.join(pathname, entry.name));
+  }
+  return bytes;
+}
+
+function managedProvisioningState(versionDir) {
+  const sentinel = path.join(versionDir, '.provisioning');
+  if (!fs.existsSync(sentinel)) return { active: false, recovered: false };
+  let pid = null;
+  let staleByAge = false;
+  try {
+    pid = Number.parseInt(fs.readFileSync(sentinel, 'utf8').trim(), 10);
+    staleByAge = Date.now() - fs.statSync(sentinel).mtimeMs > managedCliLockStaleMs;
+  } catch {
+    return { active: true, recovered: false };
+  }
+  const stale = Number.isInteger(pid) && pid > 0
+    ? !processIsAlive(pid) || staleByAge
+    : staleByAge;
+  if (!stale) return { active: true, recovered: false };
+  try {
+    fs.unlinkSync(sentinel);
+    return { active: false, recovered: true };
+  } catch {
+    return { active: true, recovered: false };
+  }
+}
+
+function managedCliVersionEntries(dataDir) {
+  const root = path.join(dataDir, 'codestory-cli');
+  if (!fs.existsSync(root)) return { root, entries: [], staging: [], errors: [] };
+  const entries = [];
+  const staging = [];
+  const errors = [];
+  let children;
+  try {
+    const rootMetadata = fs.lstatSync(root);
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
+      return { root, entries, staging, errors: [`managed_cli_root_not_direct:${root}`] };
+    }
+    children = fs.readdirSync(root, { withFileTypes: true });
+  } catch (error) {
+    return { root, entries, staging, errors: [`scan:${error.code || error.message}`] };
+  }
+  for (const child of children) {
+    if (child.name.startsWith('.provisioning-') || child.name.startsWith('.replaced-')) {
+      const stagingPath = path.join(root, child.name);
+      try {
+        if (!child.isDirectory() || child.isSymbolicLink()) {
+          errors.push(`managed_cli_staging_not_direct:${stagingPath}`);
+          continue;
+        }
+        const match = /^\.(?:provisioning|replaced)-(\d+\.\d+\.\d+)-(\d+)-/u.exec(child.name);
+        const pid = match ? Number.parseInt(match[2], 10) : null;
+        const ageMs = Date.now() - fs.statSync(stagingPath).mtimeMs;
+        const stale = pid ? !processIsAlive(pid) || ageMs > managedCliLockMaxAgeMs : ageMs > managedCliLockStaleMs;
+        staging.push({
+          version: match?.[1] || child.name,
+          versionDir: stagingPath,
+          bytes: managedPathSize(stagingPath),
+          stale,
+          reason: child.name.startsWith('.replaced-') ? 'publish_backup' : 'provisioning',
+        });
+      } catch (error) {
+        errors.push(`scan_staging:${error.code || error.message}`);
+      }
+      continue;
+    }
+    const version = normalizeVersion(child.name);
+    if (!version || version !== child.name) continue;
+    const versionDir = path.join(root, child.name);
+    if (!child.isDirectory() || child.isSymbolicLink()) {
+      entries.push({
+        version,
+        versionDir,
+        bytes: 0,
+        scanError: 'link_or_non_directory',
+        provisioning: false,
+      });
+      continue;
+    }
+    try {
+      const provisioning = managedProvisioningState(versionDir);
+      entries.push({
+        version,
+        versionDir,
+        bytes: managedPathSize(versionDir),
+        scanError: null,
+        provisioning: provisioning.active,
+      });
+    } catch (error) {
+      entries.push({
+        version,
+        versionDir,
+        bytes: 0,
+        scanError: error.message,
+        provisioning: false,
+      });
+    }
+  }
+  entries.sort((left, right) => compareManagedCliVersions(right.version, left.version));
+  return { root, entries, staging, errors };
+}
+
+function verifyManagedCliVersion(entry, probeVersion = probeResolvedCli) {
+  if (entry.scanError || entry.provisioning) {
+    return { verified: false, reason: entry.scanError || 'provisioning' };
+  }
+  const manifestPath = path.join(entry.versionDir, 'manifest.json');
+  const manifest = readJson(manifestPath);
+  if (!manifest || manifest.version !== entry.version) {
+    return { verified: false, reason: 'manifest_version_mismatch' };
+  }
+  const executable = manifest.executable_path || manifest.executablePath || manifest.path;
+  const expectedSha256 = manifest.sha256 || manifest.executable_sha256 || manifest.executableSha256;
+  if (!executable || !/^[0-9a-f]{64}$/iu.test(String(expectedSha256 || ''))) {
+    return { verified: false, reason: 'manifest_incomplete' };
+  }
+  const executablePath = path.resolve(entry.versionDir, executable);
+  if (!pathInside(executablePath, entry.versionDir) || !fs.existsSync(executablePath)) {
+    return { verified: false, reason: 'manifest_path_unsafe' };
+  }
+  let realVersionDir;
+  let realExecutable;
+  try {
+    realVersionDir = fs.realpathSync(entry.versionDir);
+    realExecutable = fs.realpathSync(executablePath);
+  } catch (error) {
+    return { verified: false, reason: `manifest_path_unreadable:${error.code || error.message}` };
+  }
+  if (!pathInside(realExecutable, realVersionDir)) {
+    return { verified: false, reason: 'manifest_path_escape' };
+  }
+  let actualSha256;
+  try {
+    actualSha256 = fileSha256(realExecutable);
+  } catch (error) {
+    return { verified: false, reason: `checksum_unreadable:${error.code || error.message}` };
+  }
+  if (actualSha256 !== String(expectedSha256).toLowerCase()) {
+    return { verified: false, reason: 'checksum_mismatch' };
+  }
+  const resolved = {
+    source: 'managed',
+    path: realExecutable,
+    sha256: actualSha256,
+    version: entry.version,
+    cliVersion: entry.version,
+    manifestPath,
+    warnings: [],
+  };
+  const probe = probeVersion(resolved);
+  if (probe.error || probe.status !== 0 || probe.version !== entry.version) {
+    return { verified: false, reason: 'version_probe_mismatch' };
+  }
+  return { verified: true, reason: null, executablePath: realExecutable, resolved };
+}
+
+function reportUnverifiedManagedCliInventory(report, entries, reason) {
+  for (const entry of entries) {
+    report.reclaimable.push({
+      version: entry.version,
+      path: entry.versionDir,
+      bytes: entry.bytes,
+      reason,
+    });
+    report.reclaimable_bytes += entry.bytes;
+  }
+}
+
+function managedCliRetentionReportUnlocked(resolved, probe, options = {}) {
+  const dataDir = options.dataDir || pluginDataDir();
+  const dryRun = options.dryRun ?? process.env.CODESTORY_PLUGIN_CLI_RETENTION_DRY_RUN === '1';
+  const report = {
+    policy: 'active_plus_one_verified_adjacent',
+    dry_run: dryRun,
+    active_version: probe.version || resolved.version || null,
+    retained: [],
+    removed: [],
+    reclaimable: [],
+    retained_bytes: 0,
+    removed_bytes: 0,
+    reclaimable_bytes: 0,
+    warnings: [],
+  };
+  if (!dataDir || resolved.source !== 'managed') {
+    report.warnings.push('managed_cli_retention_not_applicable');
+    return report;
+  }
+  const inventory = managedCliVersionEntries(dataDir);
+  report.warnings.push(...inventory.errors);
+  if (inventory.errors.length > 0) return report;
+  for (const entry of inventory.staging) {
+    if (!dryRun && entry.stale) {
+      try {
+        fs.rmSync(entry.versionDir, { recursive: true, force: false });
+        report.removed.push({
+          version: entry.version,
+          path: entry.versionDir,
+          bytes: entry.bytes,
+          reason: `abandoned_${entry.reason}`,
+        });
+        report.removed_bytes += entry.bytes;
+        continue;
+      } catch (error) {
+        report.warnings.push(`managed_cli_staging_remove_failed:${error.code || error.message}`);
+      }
+    }
+    report.reclaimable.push({
+      version: entry.version,
+      path: entry.versionDir,
+      bytes: entry.bytes,
+      reason: entry.stale ? `abandoned_${entry.reason}` : entry.reason,
+    });
+    report.reclaimable_bytes += entry.bytes;
+  }
+  if (probe.error || probe.status !== 0) {
+    report.warnings.push('managed_cli_retention_active_unverified:version_probe_failed');
+    reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_unverified');
+    return report;
+  }
+  if (probe.version !== resolved.version) {
+    report.warnings.push('managed_cli_retention_active_version_mismatch');
+    reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_version_mismatch');
+    return report;
+  }
+
+  const active = inventory.entries.find((entry) => entry.version === resolved.version);
+  if (!active) {
+    report.warnings.push('managed_cli_retention_active_directory_missing');
+    reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_directory_missing');
+    return report;
+  }
+  const activeVerification = verifyManagedCliVersion(active, options.probeVersion || probeResolvedCli);
+  if (!activeVerification.verified
+      || !samePathText(activeVerification.executablePath, resolved.path)) {
+    report.warnings.push(`managed_cli_retention_active_unverified:${activeVerification.reason || 'path_mismatch'}`);
+    reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_unverified');
+    return report;
+  }
+
+  const newer = inventory.entries.filter((entry) => compareManagedCliVersions(entry.version, active.version) > 0);
+  const older = inventory.entries.filter((entry) => compareManagedCliVersions(entry.version, active.version) < 0);
+  let adjacent = null;
+  for (const entry of [...newer, ...older]) {
+    const verification = verifyManagedCliVersion(entry, options.probeVersion || probeResolvedCli);
+    if (verification.verified) {
+      adjacent = entry;
+      break;
+    }
+  }
+
+  const retainedVersions = new Set([active.version]);
+  if (adjacent) retainedVersions.add(adjacent.version);
+  for (const entry of inventory.entries) {
+    if (retainedVersions.has(entry.version)) {
+      const reason = entry.version === active.version
+        ? 'active'
+        : compareManagedCliVersions(entry.version, active.version) > 0
+          ? 'newer_pending_activation'
+          : 'rollback';
+      report.retained.push({ version: entry.version, path: entry.versionDir, bytes: entry.bytes, reason });
+      report.retained_bytes += entry.bytes;
+      continue;
+    }
+    if (entry.scanError || entry.provisioning) {
+      report.reclaimable.push({
+        version: entry.version,
+        path: entry.versionDir,
+        bytes: entry.bytes,
+        reason: entry.scanError || 'provisioning',
+      });
+      report.reclaimable_bytes += entry.bytes;
+      continue;
+    }
+    if (dryRun) {
+      report.reclaimable.push({
+        version: entry.version,
+        path: entry.versionDir,
+        bytes: entry.bytes,
+        reason: 'outside_retention_window',
+      });
+      report.reclaimable_bytes += entry.bytes;
+      continue;
+    }
+    const removal = removeManagedCliVersion(entry, {
+      platform: options.platform || process.platform,
+      unlinkSync: options.unlinkSync || fs.unlinkSync,
+      rmSync: options.rmSync || fs.rmSync,
+    });
+    if (removal.removed) {
+      report.removed.push({
+        version: entry.version,
+        path: entry.versionDir,
+        bytes: entry.bytes,
+        reason: 'outside_retention_window',
+      });
+      report.removed_bytes += entry.bytes;
+    } else {
+      let remainingBytes = entry.bytes;
+      try {
+        remainingBytes = fs.existsSync(entry.versionDir) ? managedPathSize(entry.versionDir) : 0;
+      } catch {
+        // Keep the pre-delete size when a partial failure also prevents measurement.
+      }
+      report.reclaimable.push({
+        version: entry.version,
+        path: entry.versionDir,
+        bytes: remainingBytes,
+        reason: removal.reason,
+      });
+      report.reclaimable_bytes += remainingBytes;
+    }
+  }
+  return report;
+}
+
+function managedCliRetentionReport(resolved, probe, options = {}) {
+  const dataDir = options.dataDir || pluginDataDir();
+  if (!dataDir || resolved.source !== 'managed') {
+    return managedCliRetentionReportUnlocked(resolved, probe, options);
+  }
+  let root;
+  try {
+    root = managedCliRoot(dataDir, true);
+  } catch (error) {
+    const report = managedCliRetentionReportUnlocked(resolved, probe, {
+      ...options,
+      dataDir,
+      dryRun: true,
+    });
+    report.warnings.push(`managed_cli_retention_root_failed:${error.code || error.message}`);
+    return report;
+  }
+  let lock;
+  try {
+    lock = acquireManagedCliLock(root, 'retention');
+  } catch (error) {
+    const report = managedCliRetentionReportUnlocked(resolved, probe, {
+      ...options,
+      dataDir,
+      dryRun: true,
+    });
+    report.warnings.push(`managed_cli_retention_lock_failed:${error.code || error.message}`);
+    return report;
+  }
+  if (!lock) {
+    const report = managedCliRetentionReportUnlocked(resolved, probe, {
+      ...options,
+      dataDir,
+      dryRun: true,
+    });
+    report.warnings.push('managed_cli_retention_locked');
+    return report;
+  }
+  try {
+    return managedCliRetentionReportUnlocked(resolved, probe, { ...options, dataDir });
+  } finally {
+    try {
+      releaseManagedCliLock(lock);
+    } catch {
+      // The PID/token lock is reclaimed after an interrupted owner exits.
+    }
+  }
+}
+
+function removeManagedCliVersion(entry, options) {
+  if (options.platform === 'win32') {
+    const knownExecutables = [
+      path.join(entry.versionDir, 'bin', binaryName),
+      path.join(entry.versionDir, binaryName),
+    ].filter((candidate) => fs.existsSync(candidate) && pathInside(candidate, entry.versionDir));
+    for (const executable of knownExecutables) {
+      try {
+        options.unlinkSync(executable);
+      } catch (error) {
+        if (['EPERM', 'EBUSY', 'EACCES'].includes(error.code)) {
+          return { removed: false, reason: `locked:${error.code}` };
+        }
+        return { removed: false, reason: `unlink_failed:${error.code || error.message}` };
+      }
+    }
+  }
+  try {
+    options.rmSync(entry.versionDir, { recursive: true, force: false });
+    return { removed: true, reason: null };
+  } catch (error) {
+    return { removed: false, reason: `remove_failed:${error.code || error.message}` };
+  }
 }
 
 function localWaitFreshCommand(projectRoot = launchCwd) {
@@ -991,6 +1553,7 @@ function pluginRuntimeForResolved(resolved) {
     managed_binary_path: resolved.source === 'managed' ? resolved.path : null,
     managed_binary_sha256: resolved.source === 'managed' ? resolved.sha256 : null,
     managed_manifest_path: resolved.manifestPath || null,
+    managed_cli_retention: resolved.managedCliRetention || null,
     warnings: resolved.warnings.filter(Boolean),
   };
 }
@@ -1192,15 +1755,18 @@ function projectRootUnavailableDiagnostic(resolved, probe, projectResolution) {
 async function bootstrapStatus(projectRoot = launchCwd) {
   projectRoot = normalizeProjectRoot(projectRoot);
   const resolved = await resolveCli();
-  rememberLaunch(resolved);
   const probe = probeResolvedCli(resolved);
   const failOpenReason = failOpenReasonForProbe(resolved, probe);
   if (failOpenReason) {
+    resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, { dryRun: true });
+    rememberLaunch(resolved);
     return {
       ready: false,
       ...fallbackDiagnostic(resolved, probe, failOpenReason, { projectRoot }),
     };
   }
+  resolved.managedCliRetention = managedCliRetentionReport(resolved, probe);
+  rememberLaunch(resolved);
 
   const localReadiness = probeLocalNavigation(resolved, projectRoot);
   if (!localReadiness.ready) {
@@ -1270,8 +1836,12 @@ async function handleBootstrapStatusCommand(argv) {
   try {
     if (!resolution.projectRoot) {
       const resolved = await resolveCli();
-      rememberLaunch(resolved);
       const probe = probeResolvedCli(resolved);
+      const failOpenReason = failOpenReasonForProbe(resolved, probe);
+      resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, {
+        dryRun: Boolean(failOpenReason),
+      });
+      rememberLaunch(resolved);
       process.stdout.write(`${JSON.stringify({
         ready: false,
         ...projectRootUnavailableDiagnostic(resolved, probe, resolution),
@@ -1581,6 +2151,7 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
       archiveSha256: resolved.archiveSha256 || null,
       archiveUrl: resolved.archiveUrl || null,
       provisionedAt: resolved.provisionedAt || null,
+      managedCliRetention: resolved.managedCliRetention || null,
       updatedAt: new Date().toISOString(),
     }, null, 2));
   } catch {
@@ -1607,6 +2178,7 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
     CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256: resolved.archiveSha256 || '',
     CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
     CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',
+    CODESTORY_PLUGIN_CLI_RETENTION: JSON.stringify(resolved.managedCliRetention || null),
     CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
     CODESTORY_PLUGIN_MULTI_PROJECT: '1',
     CODESTORY_PLUGIN_DATA: pluginDataDir() || '',
@@ -1637,16 +2209,19 @@ async function main() {
   handleSidecarPolicyCommand(process.argv);
   const runtimeCwd = releasePluginCacheCwd();
   const resolved = await resolveCli();
-  rememberLaunch(resolved, runtimeCwd);
   const probe = probeResolvedCli(resolved);
   const failOpenReason = failOpenReasonForProbe(resolved, probe);
   if (failOpenReason) {
+    resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, { dryRun: true });
+    rememberLaunch(resolved, runtimeCwd);
     runFailOpenMcp(fallbackDiagnostic(resolved, probe, failOpenReason, {
       projectRoot: null,
       projectRootSource: 'request_argument',
     }));
     return;
   }
+  resolved.managedCliRetention = managedCliRetentionReport(resolved, probe);
+  rememberLaunch(resolved, runtimeCwd);
   const child = spawnStdioRuntime(resolved, runtimeCwd, 'inherit');
 
   child.on('exit', (code, signal) => {
@@ -1714,7 +2289,12 @@ if (require.main === module) {
 } else {
   module.exports = {
     _test: {
+      compareManagedCliVersions,
       downloadFile,
+      managedCliRetentionReport,
+      managedCliVersionEntries,
+      removeManagedCliVersion,
+      verifyManagedCliVersion,
     },
   };
 }

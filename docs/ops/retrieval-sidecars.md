@@ -276,11 +276,14 @@ codestory-cli retrieval inventory --project <repo> --format json
 
 The inventory lists CodeStory-owned sidecar namespaces, state paths, cleanup
 commands, Compose projects, matching containers/networks, visible ports, and
-the required `bge-base-en-v1.5.Q8_0.gguf` model check. It classifies namespaces
-as `live`, `stale`, `orphaned`, `incomplete`, or `unknown` with safe-candidate
-and blocking reasons. It is a dry-run status surface only: it does not run
-Docker prune, remove containers, delete networks, or clear state files, and it
-works even when packet/search readiness is unavailable.
+the required `bge-base-en-v1.5.Q8_0.gguf` model check. It also reports the
+project's generation bundles as active, verified rollback, or reclaimable with
+retained and reclaimable byte totals. It classifies namespaces as `live`,
+`stale`, `orphaned`, `incomplete`, or `unknown` with safe-candidate and blocking
+reasons. The default command is a dry-run: it does not run Docker prune, remove
+containers, delete networks, clear state files, or delete generations. When
+the active manifest or sidecar proof is unavailable or malformed, generation
+pruning is explicitly suppressed rather than inferred.
 
 To let the CLI remove only CodeStory-owned inventory safe candidates, review the
 dry-run output first and then pass the explicit apply flag:
@@ -292,12 +295,15 @@ codestory-cli retrieval inventory --project <repo> --apply --format markdown
 codestory-cli retrieval inventory --project <repo> --apply --format json
 ```
 
-`--apply` removes only namespaces classified as inventory safe candidates. Live
-namespaces, incomplete state, and unknown ownership stay blocked with
-per-namespace reasons. The apply path removes exact CodeStory-owned state/data
-paths and explicitly matched sidecar resources only; it does not run Docker
-prune, broad Docker cleanup, host/global network deletion, readiness-triggered
-cleanup, or packet/search-triggered cleanup.
+`--apply` removes only namespaces classified as inventory safe candidates and
+applies the generation plan shown by the dry-run. Generation cleanup requires a
+fully healthy active manifest, retains every manifest-referenced active
+generation sharing that sidecar scope plus at most one health-verified
+rollback, and removes only matching stale Qdrant, SCIP, and lexical artifacts
+under the per-project publication lock. Live namespaces,
+incomplete state, unknown ownership, protection-scan errors, and malformed
+generation entries stay blocked with explicit reasons. The apply path does not
+run Docker prune, broad Docker cleanup, or host/global network deletion.
 
 1. Run the dry-run inventory in Markdown and JSON.
 2. Confirm the safe candidates and blocked reasons.
@@ -426,9 +432,14 @@ Before Compose starts, bootstrap may repair Qdrant storage:
    collections are protected.
 2. Offline cleanup runs only when Qdrant HTTP is unreachable. It removes invalid
    CodeStory collection dirs and migrates obsolete stub markers.
-3. Retention may prune unprotected `codestory_*` collections beyond the cap
-   (`64`). If scan errors exist, retention deletes are skipped unless
-   `CODESTORY_RETRIEVAL_PRUNE_ON_SCAN_ERROR=1`.
+3. Bootstrap does not prune valid generated collections. Bounded retention runs
+   only after a replacement generation reaches full mode and its manifest is
+   published, or through the operator-reviewed `retrieval inventory --apply`
+   path. The publication path retains the active Qdrant, SCIP, and lexical
+   manifest-referenced active generations sharing its sidecar scope plus at
+   most one health-verified rollback; protection-scan, inventory, or deletion
+   errors preserve active generations and are reported in retention
+   diagnostics.
 
 Non-`codestory_*` collection dirs are never deleted by this repair path.
 
