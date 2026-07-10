@@ -142,7 +142,8 @@ More pairs, anti-patterns, and language-flavored examples:
 | --- | --- |
 | No CodeStory `status` tool is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
 | CodeStory resources are visible but `mcp__codestory` tools are hidden | Report the host blocker. Unscoped resources cannot safely select a repository in multi-project mode |
-| Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
+| Status shows `runtime_update.state=available` | Current compatible surfaces keep working; reload when convenient if `restart_recommended=true` |
+| Status shows `repair_setup` | The active runtime could not start or prove compatibility; follow `recommended_next_calls` |
 | Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
 | Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | Status/grounding call times out | Restart stale CodeStory MCP processes, then call `status` with the target project in a fresh thread |
