@@ -21,6 +21,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
+pub mod atomic_file;
 mod repository_identity;
 pub use repository_identity::{
     PROJECT_IDENTITY_SCHEMA_VERSION, ProjectIdentityV2, REPOSITORY_IDENTITY_SCHEMA_VERSION,

@@ -153,8 +153,13 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
         cleanup_command: runtime.cleanup_command.clone(),
         started_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
-    let json = serde_json::to_string_pretty(&state).context("serialize sidecar state")?;
-    std::fs::write(&layout.state_file, json).context("write retrieval-sidecars.json")?;
+    let json = serde_json::to_vec_pretty(&state).context("serialize sidecar state")?;
+    codestory_workspace::atomic_file::write_bytes_atomic(
+        &layout.state_file,
+        "retrieval-sidecars",
+        &json,
+    )
+    .context("write retrieval-sidecars.json")?;
     Ok(state)
 }
 
@@ -1138,6 +1143,24 @@ mod tests {
             .expect("rewrite state preserving launch");
 
         assert_eq!(preserved.embedding_launch, Some(launch));
+    }
+
+    #[test]
+    fn sidecar_state_replacement_is_complete_and_leaves_no_temp_file() {
+        let _lock = crate::test_support::env_lock();
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        sidecar_up_with_runtime(&runtime, None).expect("initial state");
+        sidecar_up_with_runtime(&runtime, None).expect("replacement state");
+
+        let state = read_sidecar_state(&runtime.layout.state_file).expect("parse state");
+        assert!(sidecar_state_matches_runtime(&state, &runtime));
+        assert!(
+            std::fs::read_dir(root.path())
+                .expect("read root")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
     }
 
     fn native_embedding_launch_fixture() -> EmbeddingLaunchMetadata {
