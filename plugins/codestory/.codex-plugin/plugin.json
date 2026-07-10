@@ -1,6 +1,6 @@
 {
   "name": "codestory",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "CodeStory grounding for Codex over the local codestory-cli stdio server.",
   "author": {
     "name": "The Green Cedar",
@@ -26,7 +26,7 @@
     "defaultPrompt": [
       "Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]?",
       "I am editing a file in this repo. What symbols are affected and what tests should I run first?",
-      "Read codestory://status, ground this checkout if allowed, and report which surfaces are ready."
+      "Call CodeStory status with this repository's absolute path, ground the same project if allowed, and report which surfaces are ready."
     ],
     "brandColor": "#2563EB",
     "screenshots": []

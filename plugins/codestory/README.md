@@ -23,7 +23,9 @@ comparison and portable prompts.
 - `hooks/` -- lifecycle activation for hook-capable hosts
 - `skills/codestory-grounding/` -- canonical grounding skill (Codex and partial other hosts)
 
-The adapter prefers a checksummed plugin-managed CLI. It can provision from
+The adapter prefers a checksummed plugin-managed CLI and starts one projectless
+MCP runtime. Every tool call carries its repository root, so concurrent Codex
+tasks can use different projects without rebinding or restarting the server. It can provision from
 GitHub release `SHA256SUMS.txt`, honor `CODESTORY_CLI` as a local-dev override,
 and stay up with diagnostic `codestory://status` when managed setup fails.
 Ambient `PATH` binaries are reported as diagnostics only; installed plugin
@@ -50,8 +52,8 @@ before trusting the active MCP runtime.
 
 ## Repair and CLI
 
-Normal users repair through the agent and MCP (`codestory://status`,
-`sidecar_setup`). Power-user CLI transcripts:
+Normal users repair through the agent and MCP (`status` and `sidecar_setup`,
+both with an explicit `project`). Power-user CLI transcripts:
 [CLI reference](../../docs/users/cli-reference.md).
 
 Blocked session steps: [Troubleshooting](../../docs/users/troubleshooting.md).

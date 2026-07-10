@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.14.1
+
+CodeStory 0.14.1 is a hotfix for concurrent Codex tasks working in different
+repositories through the same plugin installation.
+
+### Fixed
+
+- Replaced plugin-startup workspace binding with request-scoped MCP routing.
+  Every MCP tool now requires an explicit `project`, and one stdio server can
+  safely process interleaved requests for multiple repositories without reading
+  another task's thread or global active-workspace state.
+- Added a project-scoped `status` tool and carried the selected project through
+  readiness, repair, retry, hook, skill, and agent-guide recommendations so
+  follow-up calls cannot silently switch repositories.
+- Added a two-repository stdio regression that queues requests for both projects
+  before reading their responses, then switches back and verifies each result
+  remains rooted in its requested repository.
+
 ## 0.14.0
 
 CodeStory 0.14.0 turns the 0.13.x MCP recovery fixes into a durable readiness

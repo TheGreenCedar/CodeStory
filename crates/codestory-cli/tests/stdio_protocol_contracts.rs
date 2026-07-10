@@ -335,6 +335,30 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
     }
 }
 
+fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+        .arg("serve")
+        .arg("--stdio")
+        .arg("--multi-project")
+        .arg("--refresh")
+        .arg("full")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
+        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
+        .spawn()
+        .expect("spawn multi-project stdio server");
+    let stdin = child.stdin.take().expect("multi-project stdio stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("multi-project stdio stdout"));
+    StdioServer {
+        child,
+        stdin,
+        stdout,
+    }
+}
+
 fn send_json(server: &mut StdioServer, request: Value) -> Value {
     send_line(server, &request.to_string())
 }
@@ -342,7 +366,10 @@ fn send_json(server: &mut StdioServer, request: Value) -> Value {
 fn send_line(server: &mut StdioServer, line: &str) -> Value {
     writeln!(server.stdin, "{line}").expect("write request line");
     server.stdin.flush().expect("flush request line");
+    read_json(server)
+}
 
+fn read_json(server: &mut StdioServer) -> Value {
     let mut response = String::new();
     let bytes = server
         .stdout
@@ -1033,6 +1060,127 @@ fn notification_messages_do_not_produce_responses() {
 }
 
 #[test]
+fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
+    let first = tempfile::tempdir().expect("first workspace");
+    let second = tempfile::tempdir().expect("second workspace");
+    let cache_root = tempfile::tempdir().expect("multi-project cache root");
+    write_tiny_rust_workspace(first.path());
+    write_tiny_rust_workspace(second.path());
+    fs::write(
+        first.path().join("src").join("first_only.rs"),
+        "pub fn first_only() {}\n",
+    )
+    .expect("write first-only source");
+    fs::write(
+        second.path().join("src").join("second_only.rs"),
+        "pub fn second_only() {}\n",
+    )
+    .expect("write second-only source");
+
+    let mut server = spawn_multi_project_stdio_server(cache_root.path());
+    let tools = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc": "2.0", "id": "multi-tools", "method": "tools/list"}),
+        ),
+        json!("multi-tools"),
+    )
+    .clone();
+    assert!(
+        tools["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .all(|tool| {
+                tool.pointer("/inputSchema/required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| required.contains(&json!("project")))
+            }),
+        "every MCP tool must require explicit project routing: {tools}"
+    );
+
+    let missing = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "multi-missing-project",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_eq!(
+        assert_tool_error(&missing, json!("multi-missing-project"))["code"],
+        json!("project_required")
+    );
+    let unavailable = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "multi-unavailable-project",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"project": first.path().join("missing"), "budget": "strict"}
+            }
+        }),
+    );
+    assert_eq!(
+        assert_tool_error(&unavailable, json!("multi-unavailable-project"))["code"],
+        json!("project_unavailable")
+    );
+
+    let ground_request = |id: &str, project: &Path| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"project": project, "budget": "strict"}
+            }
+        })
+    };
+    writeln!(
+        server.stdin,
+        "{}",
+        ground_request("multi-first", first.path())
+    )
+    .expect("queue first project request");
+    writeln!(
+        server.stdin,
+        "{}",
+        ground_request("multi-second", second.path())
+    )
+    .expect("queue second project request");
+    server.stdin.flush().expect("flush interleaved requests");
+    let first_response = read_json(&mut server);
+    let second_response = read_json(&mut server);
+    let first_snapshot = assert_tool_success(&first_response, json!("multi-first")).clone();
+    let second_snapshot = assert_tool_success(&second_response, json!("multi-second")).clone();
+
+    let first_again = {
+        let response = send_json(
+            &mut server,
+            ground_request("multi-first-again", first.path()),
+        );
+        assert_tool_success(&response, json!("multi-first-again")).clone()
+    };
+
+    let first_root = fs::canonicalize(first.path()).expect("canonical first workspace");
+    let second_root = fs::canonicalize(second.path()).expect("canonical second workspace");
+    assert_eq!(
+        PathBuf::from(first_snapshot["root"].as_str().expect("first root")),
+        first_root
+    );
+    assert_eq!(
+        PathBuf::from(second_snapshot["root"].as_str().expect("second root")),
+        second_root
+    );
+    assert_eq!(first_snapshot["root"], first_again["root"]);
+    assert_ne!(first_snapshot["root"], second_snapshot["root"]);
+}
+
+#[test]
 fn tool_catalog_keeps_stable_browser_and_setup_tool_names() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
@@ -1067,6 +1215,7 @@ fn tool_catalog_keeps_stable_browser_and_setup_tool_names() {
             "shortest_path",
             "sidecar_setup",
             "snippet",
+            "status",
             "symbol",
             "symbols",
             "trace",
@@ -2488,8 +2637,8 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
             && !next_call_text.contains("retrieval bootstrap")
             && !next_call_text.contains("retrieval index")
             && !next_call_text.contains("\"tool\":\"repair_all\"")
-            && next_call_text.contains("codestory://status")
-            && next_call_text.contains("codestory://agent-guide")
+            && next_call_text.contains("\"tool\":\"status\"")
+            && next_call_text.contains("\"project\":")
             && next_call_text.contains("not persisted for this host"),
         "status should block MCP sidecar repair without repeating a fresh core index when mode is not full and policy is unmanaged: {status}"
     );
@@ -2750,8 +2899,7 @@ fn resources_read_status_blocks_unmanaged_session_repair_without_persisted_polic
         "{status}"
     );
     assert!(
-        next_call_text.contains("\"uri\":\"codestory://status\"")
-            && next_call_text.contains("\"uri\":\"codestory://agent-guide\""),
+        next_call_text.contains("\"tool\":\"status\"") && next_call_text.contains("\"project\":"),
         "{status}"
     );
 }
@@ -2825,7 +2973,7 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
         "{status}"
     );
     assert!(
-        next_call_text.contains("\"uri\":\"codestory://status\""),
+        next_call_text.contains("\"tool\":\"status\"") && next_call_text.contains("\"project\":"),
         "enabled policy should include status readback after explicit repair: {status}"
     );
     assert!(
@@ -3013,7 +3161,7 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     );
     assert_eq!(
         setup["mcp_control"]["repair"],
-        json!({"method": "tools/call", "tool": "sidecar_setup", "arguments": {"action": "repair"}}),
+        json!({"method": "tools/call", "tool": "sidecar_setup", "arguments": {"project": setup["project"], "action": "repair"}}),
         "sidecar_setup should expose the MCP repair call, not a user CLI step: {setup}"
     );
 
@@ -3047,7 +3195,7 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     assert_eq!(repair_all["tool"], json!("repair_all"));
     assert_eq!(
         repair_all["canonical_arguments"],
-        json!({"action": "repair"})
+        json!({"project": setup["project"], "action": "repair"})
     );
     assert_eq!(
         repair_all["canonical_tool"],
@@ -3091,12 +3239,12 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     assert!(
         repair["recommended_next_calls"]
             .as_array()
-            .is_some_and(|calls| calls.iter().any(|call| call
-                .get("method")
-                .and_then(Value::as_str)
-                == Some("resources/read")
-                && call.get("uri").and_then(Value::as_str) == Some("codestory://status"))),
-        "sidecar_setup repair should point agents back to codestory://status: {repair}"
+            .is_some_and(|calls| calls.iter().any(|call| {
+                call.get("method").and_then(Value::as_str) == Some("tools/call")
+                    && call.get("tool").and_then(Value::as_str) == Some("status")
+                    && call.pointer("/arguments/project") == Some(&setup["project"])
+            })),
+        "sidecar_setup repair should point agents back to project-scoped status: {repair}"
     );
     if repair["status"] == json!("started") {
         assert!(
@@ -3137,7 +3285,7 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         "status should report Rust-owned repair through setup or broker state after explicit repair: {status}"
     );
     assert!(
-        next_call_text.contains("\"uri\":\"codestory://status\""),
+        next_call_text.contains("\"tool\":\"status\"") && next_call_text.contains("\"project\":"),
         "status should recommend status readback after explicit repair: {status}"
     );
 }
@@ -4237,9 +4385,9 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
             .or_else(|| guide.get("recommended_next_calls"))
             .and_then(Value::as_array)
             .is_some_and(|calls| {
-                calls
-                    .iter()
-                    .any(|call| call["uri"] == json!("codestory://status"))
+                calls.iter().any(|call| {
+                    call["tool"] == json!("status") && call.pointer("/arguments/project").is_some()
+                })
             })
             && guide
                 .get("readiness_lanes")

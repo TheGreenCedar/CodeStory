@@ -1,8 +1,9 @@
 # Status Contract
 
-When plugin MCP is live, `codestory://status` is the first and canonical runtime
-truth. Read it before `ground`, `files`, `packet`, or `search`. This document is
-the agent-facing field glossary alongside runtime `codestory://agent-guide`.
+When plugin MCP is live, the `status` tool with an explicit absolute `project`
+is the first and canonical runtime truth. Call it before `ground`, `files`,
+`packet`, or `search`, and pass the same project to every tool. The server has no
+global workspace binding.
 
 ## Status Fields
 
@@ -25,7 +26,7 @@ the agent-facing field glossary alongside runtime `codestory://agent-guide`.
 
 ## Runtime Repair
 
-Use managed `codestory://status`, release install records, or source-build
+Use managed project-scoped `status`, release install records, or source-build
 checks only for maintainer/debug transcripts when MCP is missing or suspect.
 They are not the supported agent repair path. `CODESTORY_CLI` is an explicit
 local-dev override; installed `.mcp.json` launches the managed adapter first,
@@ -33,8 +34,8 @@ provisions from `github_release` when needed, and records the launch source in
 `plugin_runtime`. If the managed runtime cannot spawn or be provisioned, the
 adapter stays up with `repair_setup` diagnostics instead of closing transport.
 
-If `codestory://status` reports a repairable state, run the MCP
-`recommended_next_calls` loop: call `sidecar_setup` with `action=repair` when
-recommended, then reread `codestory://status` before local navigation, packet,
-search, or context. Do not ask the human to install the binary unless network,
+If project-scoped `status` reports a repairable state, run the MCP
+`recommended_next_calls` loop: call `sidecar_setup` with the same `project` and
+`action=repair` when recommended, then call `status` again before local
+navigation, packet, search, or context. Do not ask the human to install the binary unless network,
 permissions, host reload, or release assets block the repair.
