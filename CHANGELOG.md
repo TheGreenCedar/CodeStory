@@ -70,6 +70,9 @@ the installed runtime is stale, busy, or unavailable.
 - Kept native llama.cpp sidecars alive and accurately owned across Windows,
   macOS, Linux, endpoint reuse, `retrieval up`, `retrieval down`, failed repair,
   host job-object restrictions, and Unix shutdown.
+- Prevented detached Windows llama.cpp sidecars from retaining the CLI's
+  redirected standard handles, so callers capturing bootstrap output can
+  complete while the owned sidecar remains alive.
 - Fixed Apple Silicon Metal source contracts so managed llama.cpp installs
   accept the upstream macOS payload, existing cached models are discovered, and
   Metal logs can prove accelerator-required packet/search readiness without

@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -41,11 +41,102 @@ const WINDOWS_CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 #[cfg(windows)]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(windows)]
+const WINDOWS_HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+#[cfg(windows)]
+const WINDOWS_STD_INPUT_HANDLE: u32 = -10_i32 as u32;
+#[cfg(windows)]
+const WINDOWS_STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
+#[cfg(windows)]
+const WINDOWS_STD_ERROR_HANDLE: u32 = -12_i32 as u32;
+#[cfg(windows)]
 const NATIVE_EMBEDDING_WINDOWS_BASE_CREATION_FLAGS: u32 =
     WINDOWS_DETACHED_PROCESS | WINDOWS_CREATE_NEW_PROCESS_GROUP | WINDOWS_CREATE_NO_WINDOW;
 #[cfg(windows)]
 const NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS: u32 =
     NATIVE_EMBEDDING_WINDOWS_BASE_CREATION_FLAGS | WINDOWS_CREATE_BREAKAWAY_FROM_JOB;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(std_handle: u32) -> *mut std::ffi::c_void;
+    fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+    fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+}
+
+#[cfg(windows)]
+struct WindowsStandardHandleInheritanceGuard {
+    handles: Vec<*mut std::ffi::c_void>,
+}
+
+#[cfg(windows)]
+impl WindowsStandardHandleInheritanceGuard {
+    fn new() -> io::Result<Self> {
+        let handles = [
+            windows_standard_handle(WINDOWS_STD_INPUT_HANDLE),
+            windows_standard_handle(WINDOWS_STD_OUTPUT_HANDLE),
+            windows_standard_handle(WINDOWS_STD_ERROR_HANDLE),
+        ];
+        Self::from_handles(handles.into_iter().flatten())
+    }
+
+    fn from_handles(handles: impl IntoIterator<Item = *mut std::ffi::c_void>) -> io::Result<Self> {
+        let mut guard = Self {
+            handles: Vec::new(),
+        };
+        for handle in handles {
+            let flags = windows_handle_information(handle)?;
+            if flags & WINDOWS_HANDLE_FLAG_INHERIT == 0 {
+                continue;
+            }
+            windows_set_handle_inheritance(handle, false)?;
+            guard.handles.push(handle);
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsStandardHandleInheritanceGuard {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            let _ = windows_set_handle_inheritance(handle, true);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_standard_handle(kind: u32) -> Option<*mut std::ffi::c_void> {
+    // SAFETY: GetStdHandle has no pointer preconditions.
+    let handle = unsafe { GetStdHandle(kind) };
+    (!handle.is_null() && handle as isize != -1).then_some(handle)
+}
+
+#[cfg(windows)]
+fn windows_handle_information(handle: *mut std::ffi::c_void) -> io::Result<u32> {
+    let mut flags = 0_u32;
+    // SAFETY: `flags` is writable and `handle` was returned by Windows or supplied by a test.
+    if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags)
+}
+
+#[cfg(windows)]
+fn windows_set_handle_inheritance(
+    handle: *mut std::ffi::c_void,
+    inheritable: bool,
+) -> io::Result<()> {
+    let flags = if inheritable {
+        WINDOWS_HANDLE_FLAG_INHERIT
+    } else {
+        0
+    };
+    // SAFETY: `handle` is valid for the duration of the call and the mask changes only inheritance.
+    if unsafe { SetHandleInformation(handle, WINDOWS_HANDLE_FLAG_INHERIT, flags) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct EmbedModelInventory {
@@ -1457,6 +1548,8 @@ fn spawn_native_embedding_server_once(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     configure_native_embedding_command(&mut command);
+    #[cfg(windows)]
+    let _standard_handle_guard = WindowsStandardHandleInheritanceGuard::new()?;
     command.spawn().map(|child| child.id())
 }
 
@@ -2504,6 +2597,38 @@ mod tests {
         assert_ne!(flags & WINDOWS_CREATE_NEW_PROCESS_GROUP, 0);
         assert_ne!(flags & WINDOWS_CREATE_BREAKAWAY_FROM_JOB, 0);
         assert_ne!(flags & WINDOWS_CREATE_NO_WINDOW, 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_embedding_spawn_guard_restores_standard_handle_inheritance() {
+        use std::os::windows::io::AsRawHandle;
+
+        let file = tempfile::tempfile().expect("temp file");
+        let handle = file.as_raw_handle();
+        windows_set_handle_inheritance(handle, true).expect("mark handle inheritable");
+        assert_ne!(
+            windows_handle_information(handle).expect("inheritable flags")
+                & WINDOWS_HANDLE_FLAG_INHERIT,
+            0
+        );
+
+        {
+            let _guard = WindowsStandardHandleInheritanceGuard::from_handles([handle])
+                .expect("clear inheritance");
+            assert_eq!(
+                windows_handle_information(handle).expect("guarded flags")
+                    & WINDOWS_HANDLE_FLAG_INHERIT,
+                0
+            );
+        }
+
+        assert_ne!(
+            windows_handle_information(handle).expect("restored flags")
+                & WINDOWS_HANDLE_FLAG_INHERIT,
+            0
+        );
+        windows_set_handle_inheritance(handle, false).expect("clear test inheritance");
     }
 
     #[test]
