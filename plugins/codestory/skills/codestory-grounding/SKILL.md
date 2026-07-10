@@ -63,8 +63,11 @@ surfaces were not visible.
   anything weaker is navigation hints only.
 - On macOS arm64, expected accelerated sidecar intent is
   `launch_mode=native_spawned` with request provider `metal`. Requested provider
-  and device are intent; observed device state and observation source are proof.
-  If status still reports `vulkan`/`Vulkan0` or
+  and device are intent; observed device state and source are proof inputs, not
+  sufficient proof. When acceleration is required, require
+  `gpu_proof.proof_status=verified`, `meaningful_accelerator_work_proven=true`,
+  and `embed_smoke_ok=true`; manual assertions and device inventory remain
+  diagnostic. If status still reports `vulkan`/`Vulkan0` or
   `accelerator_request_unobserved` on Apple Silicon, report a stale/pre-release
   runtime or failed repair and follow the MCP repair loop.
 - CPU-backed retrieval is an explicit degraded policy. It does not make

@@ -179,10 +179,12 @@ Command table: [CLI reference - readiness and repair](cli-reference.md#readiness
 
 On macOS arm64, the supported accelerated embedding path is the native Metal
 sidecar. A healthy repaired status should report the embedding launch as
-`native_spawned`, request provider `metal`, and then prove the observed device
-state from sidecar logs or an explicit operator assertion. The request fields
-show intent; `embedding_device_state`, `embedding_device_observation_source`,
-and `retrieval_mode` decide readiness.
+`native_spawned`, request provider `metal`, runtime observation from native
+sidecar logs, and a successful live timed embed smoke. Request fields, device
+inventory, and operator assertions are diagnostic only. Require
+`readiness_broker.gpu_proof.proof_status=verified`,
+`meaningful_accelerator_work_proven=true`, allowed packet/search surfaces, and
+`retrieval_mode=full` before trusting acceleration-backed readiness.
 
 The old failure pattern is `accelerator_request_provider=vulkan`,
 `accelerator_request_device=Vulkan0`, Docker/Colima embed launch, and

@@ -3401,7 +3401,10 @@ fn build_stdio_status_readiness(
     let setup_repair = stdio_setup_repair_input(server_executable);
     let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
     let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
-    let selected_agent_sidecar = &sidecar.selected_agent_sidecar;
+    let selected_agent_sidecar = stdio_agent_sidecar_with_gpu_proof(
+        &sidecar.selected_agent_sidecar,
+        broker.gpu_proof.as_ref(),
+    );
     let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
         project: &summary.root,
         stats: &summary.stats,
@@ -3438,7 +3441,7 @@ fn build_stdio_status_readiness(
         runtime,
         &readiness,
         None,
-        Some(selected_agent_sidecar),
+        Some(&selected_agent_sidecar),
         Some(broker),
     );
     let readiness_lanes_json =
@@ -3465,6 +3468,20 @@ fn build_stdio_status_readiness(
         effective_freshness,
         local,
     }
+}
+
+fn stdio_agent_sidecar_with_gpu_proof(
+    sidecar: &args::DoctorSidecarStatusOutput,
+    gpu_proof: Option<&crate::readiness_broker::BrokerGpuProofSnapshot>,
+) -> args::DoctorSidecarStatusOutput {
+    let mut sidecar = sidecar.clone();
+    if sidecar.retrieval_mode == "full"
+        && gpu_proof.is_some_and(|proof| proof.proof_status == "gpu_unverified")
+    {
+        sidecar.retrieval_mode = "unavailable".to_string();
+        sidecar.degraded_reason = Some("gpu_unverified".to_string());
+    }
+    sidecar
 }
 
 fn build_stdio_status_broker(
@@ -5574,6 +5591,64 @@ mod tests {
             index: None,
             sidecar: None,
         }
+    }
+
+    #[test]
+    fn stdio_gpu_proof_blocks_manual_assertion_and_allows_runtime_smoke() {
+        let sidecar = args::DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("agent-default".to_string()),
+            retrieval_mode: "full".to_string(),
+            degraded_reason: None,
+            embedding_device_policy: "accelerator_required".to_string(),
+            embedding_device_state: "accelerated".to_string(),
+            embedding_device_observation_source: "manual_env".to_string(),
+            embedding_detected_provider: Some("metal".to_string()),
+            embedding_detected_gpu: Some("Metal".to_string()),
+            embedding_accelerator_requested: true,
+            embedding_accelerator_request_provider: Some("metal".to_string()),
+            embedding_accelerator_request_device: None,
+            embedding_cpu_allowed: false,
+            manifest_generation: Some("generation".to_string()),
+            manifest_input_hash: Some("hash".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let input = crate::readiness_broker::BrokerGpuProofInput {
+            embedding_device_policy: Some(sidecar.embedding_device_policy.clone()),
+            embedding_device_state: Some(sidecar.embedding_device_state.clone()),
+            embedding_device_observation_source: Some(
+                sidecar.embedding_device_observation_source.clone(),
+            ),
+            embedding_detected_provider: sidecar.embedding_detected_provider.clone(),
+            embedding_detected_gpu: sidecar.embedding_detected_gpu.clone(),
+            embedding_accelerator_requested: Some(true),
+            embedding_accelerator_request_provider: Some("metal".to_string()),
+            embedding_accelerator_request_device: None,
+            embedding_cpu_allowed: Some(false),
+            embed_smoke_ok: Some(true),
+            embed_smoke_ms: Some(12),
+            degraded_reason: None,
+        };
+        let manual_proof = crate::readiness_broker::gpu_proof(input.clone());
+        assert_eq!(manual_proof.proof_status, "gpu_unverified");
+
+        let blocked = stdio_agent_sidecar_with_gpu_proof(&sidecar, Some(&manual_proof));
+
+        assert_eq!(blocked.retrieval_mode, "unavailable");
+        assert_eq!(blocked.degraded_reason.as_deref(), Some("gpu_unverified"));
+
+        let mut runtime_input = input;
+        runtime_input.embedding_device_observation_source = Some("native_log".to_string());
+        let runtime_proof = crate::readiness_broker::gpu_proof(runtime_input);
+        assert_eq!(runtime_proof.proof_status, "verified");
+
+        let allowed = stdio_agent_sidecar_with_gpu_proof(&sidecar, Some(&runtime_proof));
+
+        assert_eq!(allowed.retrieval_mode, "full");
+        assert_eq!(allowed.degraded_reason, None);
     }
 
     fn broker_snapshot_with_native_resource(
