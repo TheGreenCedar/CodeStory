@@ -1020,7 +1020,7 @@ fn packet_string_predicate_rank_bonus(normalized_display: &str, path: &str) -> f
     if path_stem.starts_with("string") && path_stem.ends_with("utils") {
         bonus += 7.0;
     }
-    if path.ends_with("strings.java") {
+    if path_stem == "strings" {
         bonus += 8.0;
     }
     if path_stem.contains("charsequence") && path_stem.ends_with("utils") {

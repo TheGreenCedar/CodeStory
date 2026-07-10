@@ -9,6 +9,16 @@
   repair. The worker now inherits the parent cache scope, and MCP records its
   terminal exit code plus bounded stdout/stderr tails before clearing repair
   ownership.
+- Removed the production semantic-document domain-alias catalog that encoded
+  benchmark-shaped Root & Runtime and Sourcetrail answer text. Historical
+  retrieval packets built with that catalog are no longer promotion evidence;
+  the semantic-document schema now invalidates the affected persisted data, and
+  semantic documents and sidecars must be regenerated.
+- Consolidated semantic-document leakage enforcement into the retrieval
+  generalization guard, which now derives prompts, expected and forbidden
+  claims, paths, and symbols from every benchmark manifest plus the checked-in
+  script prompt, cross-repo query, and eval-only probe corpora, and fails closed
+  when a registered corpus is missing, malformed, or only partially parsed.
 
 ## 0.14.2
 

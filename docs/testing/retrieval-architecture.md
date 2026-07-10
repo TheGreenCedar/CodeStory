@@ -158,7 +158,7 @@ Non-claims:
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
 | Packet integration | `codestory-runtime/src/agent/retrieval_primary.rs` | Primary sidecar path, diagnostic traces, promotion warnings |
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
-| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Bans repo literals in Rust production retrieval trees (CI via Rust guard test); benchmark/eval harness scripts and `codestory-runtime/src/agent/eval_probes.rs` may name holdout repos only inside their manifest/eval boundary |
+| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Derives banned identities, prompts, claims, paths, and query/probe phrases from benchmark manifests, script prompt/query catalogs, and the eval-only probe manifest/source, then scans Rust production retrieval trees after masking test-only items (CI via Rust guard test); missing, malformed, or partially parsed corpora fail closed |
 
 **Modes:** See the canonical
 [mode matrix](../architecture/retrieval-design.md#mode-matrix). Only `full` may

@@ -1192,7 +1192,6 @@ fn push_string_region_matching_probe_queries(
     push_unique_term(queries, "regionMatches");
     if packet_terms_have(terms, "strings") {
         push_unique_term(queries, "Strings regionMatches");
-        push_unique_term(queries, "Strings.java regionMatches");
     }
     for scope in scopes
         .iter()

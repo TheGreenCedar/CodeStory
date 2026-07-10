@@ -7021,8 +7021,8 @@ mod tests {
         let mut citations = (0..10)
             .map(|index| {
                 test_packet_citation(
-                    &format!("SourceGroupNoise{index}"),
-                    &format!("src/lib/project/SourceGroupNoise{index}.h"),
+                    &format!("UnrelatedNoise{index}"),
+                    &format!("src/lib/noise/UnrelatedNoise{index}.h"),
                     10.0 - (index as f32 * 0.1),
                 )
             })
@@ -10695,7 +10695,6 @@ mod tests {
         for source_probe in [
             "StringUtils.java isBlank",
             "StringUtils.java isEmpty",
-            "Strings.java regionMatches",
             "CharSequenceUtils.java regionMatches",
         ] {
             assert!(
@@ -10703,11 +10702,16 @@ mod tests {
                 "production packet plan should derive Java source-scoped predicate probe `{source_probe}` in {queries:?}"
             );
         }
+        assert!(
+            queries.contains(&"Strings regionMatches"),
+            "production packet plan should derive a generic named-scope predicate probe in {queries:?}"
+        );
         for eval_only_probe in [
             "StringUtils.isBlank",
             "StringUtils.isEmpty",
             "StringUtils.java",
             "Strings.java",
+            "Strings.java regionMatches",
             "CharSequenceUtils.java",
         ] {
             assert!(

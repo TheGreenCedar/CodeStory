@@ -100,6 +100,37 @@ fn run_lint_with_named_fixtures(fixtures: &[(&str, &str)]) -> Output {
     run_lint_with_scan_root(&repo_root, &script, fixture_root.path())
 }
 
+fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let fixture_root = TempDir::new().expect("create fixture root");
+    let prompt_script = fixture_root.path().join("prompt-corpus.mjs");
+    std::fs::write(
+        fixture_root.path().join("fixture.rs"),
+        "pub fn repository_neutral_fixture() {}\n",
+    )
+    .expect("write neutral Rust fixture");
+    std::fs::write(&prompt_script, contents).expect("write prompt script fixture");
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    Command::new("node")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
+            fixture_root.path(),
+        )
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_PROMPT_SCRIPT",
+            &prompt_script,
+        )
+        .output()
+        .expect("run lint with prompt script fixture")
+}
+
 #[test]
 fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let repo_root = workspace_root();
@@ -247,6 +278,85 @@ pub fn leaked_holdout_probe() -> &'static [&'static str] {
             "lint failure should report current holdout literal {expected}, stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn linter_catches_cross_repo_query_catalog_phrases_in_production() {
+    let output = run_lint_with_fixture(
+        r#"
+pub fn leaked_cross_repo_query() -> &'static str {
+    "project loads settings refreshes source groups computes refresh info and builds an index"
+}
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "fixture with a cross-repo query phrase should fail lint; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "project loads settings refreshes source groups computes refresh info and builds an index"
+        ),
+        "lint failure should report the query-catalog phrase, stderr={stderr}"
+    );
+}
+
+#[test]
+fn linter_catches_manifest_prompts_forbidden_claims_and_partial_holdout_paths() {
+    let prompt = "A bug report says response helpers sometimes choose the wrong status, body, or content type when callers use res.send, res.json, or sendFile. Identify the primary files and functions to inspect before editing.";
+    let forbidden_claim =
+        "Project::buildIndex directly parses source files instead of building indexing tasks.";
+    let output = run_lint_with_fixture(
+        r#"
+pub const LEAKED_MANIFEST_PROMPT: &str =
+    "A bug report says response helpers sometimes choose the wrong status, body, or content type when callers use res.send, res.json, or sendFile. Identify the primary files and functions to inspect before editing.";
+pub const LEAKED_FORBIDDEN_CLAIM: &str =
+    "Project::buildIndex directly parses source files instead of building indexing tasks.";
+pub const LEAKED_PARTIAL_HOLDOUT_PATH: &str = "/data/indexer/";
+pub const LEAKED_EVAL_MANIFEST_PROBE: &str = "run_exec_session";
+pub const LEAKED_EVAL_SOURCE_PROBE: &str = "createCacheHelper";
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "fixture with manifest prompt, forbidden claim, and partial holdout path should fail lint; stderr={stderr}"
+    );
+    for expected in [
+        prompt,
+        forbidden_claim,
+        "/data/indexer/",
+        "run_exec_session",
+        "createCacheHelper",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "lint failure should report {expected}, stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_fails_closed_when_one_prompt_corpus_entry_is_not_a_literal() {
+    let output = run_lint_with_prompt_script_fixture(
+        r#"
+const PUBLIC_REPOS = {
+  first: { prompt: "first benchmark prompt remains a static literal for the guard" },
+  second: { prompt: buildPromptAtRuntime() },
+};
+const ALL_REPOS = { ...PUBLIC_REPOS };
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "partial prompt parser drift must fail closed; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("discovered 2 prompt properties but parsed 1 literal prompts"),
+        "failure should report the partial corpus parse, stderr={stderr}"
+    );
 }
 
 #[test]
