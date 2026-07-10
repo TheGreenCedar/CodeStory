@@ -2564,7 +2564,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_native_launch_uses_gpu_layers_without_device_arg() {
+    fn metal_native_launch_uses_gpu_layers_and_proof_verbosity_without_device_arg() {
         let _lock = crate::test_support::env_lock();
         let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
@@ -2585,6 +2585,12 @@ mod tests {
                 .args
                 .windows(2)
                 .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
+        );
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--log-verbosity" && pair[1] == "4")
         );
         assert!(!launch.args.iter().any(|arg| arg == "--device"));
         let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()), None);

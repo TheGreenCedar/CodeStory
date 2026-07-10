@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+## 0.14.2
+
+### Fixed
+
+- Made the managed macOS arm64 Metal embedding launch emit the verbose llama.cpp
+  initialization lines required for runtime-backed GPU proof.
+
 ## 0.14.1
 
 CodeStory 0.14.1 is a hotfix for concurrent Codex tasks working in different
