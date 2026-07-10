@@ -351,8 +351,6 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
       JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
       "utf8",
     );
-    const realRepoRoot = await realpath(repoRoot);
-
     const result = spawnSync(process.execPath, [launcher], {
       env: {
         PLUGIN_DATA: dataDir,
@@ -370,19 +368,14 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.sha256, sha256);
     assert.equal(observed.pluginRoot, pluginRoot);
     assert.equal(observed.pluginCacheVersion, "");
-    assert.equal(observed.activeStatePath, join(dataDir, ".codestory-active"));
+    assert.equal(observed.activeStatePath, undefined);
     assert.equal(observed.sidecarPolicy, "ask");
     assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
     assert.match(observed.sidecarEnable, /--policy-file/u);
-    assert.equal(
-      observed.sidecarRepair.startsWith(`${JSON.stringify(cliPath)} ready --goal agent --repair`),
-      true,
-    );
-    assert.match(observed.sidecarRepair, /ready --goal agent --repair/u);
-    assert.match(observed.sidecarRepair, /--run-id shared-agent/u);
-    assert.equal(observed.dirtyMarkerRoot, realRepoRoot);
-    assert.equal(observed.dirtyMarkerPath, dirtyMarkerPathForProject(realRepoRoot, dataDir));
-    assert.deepEqual(observed.args, ["serve", "--stdio", "--refresh", "none", "--project", realRepoRoot]);
+    assert.equal(observed.sidecarRepair, undefined);
+    assert.equal(observed.dirtyMarkerRoot, undefined);
+    assert.equal(observed.dirtyMarkerPath, undefined);
+    assert.deepEqual(observed.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
 
     const enable = spawnSync(observed.sidecarEnable, {
       shell: true,
@@ -403,7 +396,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
   }
 });
 
-test("mcp launcher uses active project state when host launches from plugin root", async () => {
+test("mcp launcher starts projectless when host launches from plugin root", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-active-project-"));
@@ -483,15 +476,15 @@ test("mcp launcher uses active project state when host launches from plugin root
     const serve = calls.find((call) => call.args[0] === "serve");
     assert.deepEqual(readyCalls, []);
     assert.ok(serve, "expected serve call");
-    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", realRepoRoot]);
-    assert.equal(serve.cwd, realRepoRoot);
-    assert.equal(serve.projectRoot, realRepoRoot);
-    assert.equal(serve.projectRootSource, "plugin_active_state");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+    assert.match(serve.cwd, /runtime-cwd/u);
+    assert.equal(serve.projectRoot, "");
+    assert.equal(serve.projectRootSource, "");
     assert.equal(serve.launchCwd, pluginRoot);
     assert.notEqual(serve.runtimeCwd, pluginRoot);
     assert.match(serve.runtimeCwd, /runtime-cwd/u);
-    assert.equal(serve.dirtyMarkerRoot, realRepoRoot);
-    assert.equal(serve.dirtyMarkerPath, dirtyMarkerPathForProject(realRepoRoot, dataDir));
+    assert.equal(serve.dirtyMarkerRoot, "");
+    assert.equal(serve.dirtyMarkerPath, "");
     const runtimeState = JSON.parse(await readFile(join(dataDir, ".codestory-mcp-runtime.json"), "utf8"));
     assert.equal(runtimeState.launchCwd, pluginRoot);
     assert.equal(runtimeState.runtimeCwd, serve.runtimeCwd);
@@ -500,29 +493,17 @@ test("mcp launcher uses active project state when host launches from plugin root
   }
 });
 
-test("stdio workspace mismatch blocks stale repo repair guidance", async () => {
+test("multi-project stdio ignores mutable active-workspace state", async () => {
   const launcher = await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8");
   const transport = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_transport.rs"), "utf8");
 
-  // Keep a light structural smoke check for launcher wiring, then rely on the
-  // Rust behavioral unit test for status/setup payload shape.
-  assert.match(launcher, /function stdioRuntimeEnv\(resolved, projectRoot, projectRootSource, runtimeCwd, projectStatePath\)/u);
-  assert.match(launcher, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH:\s*projectStatePath \|\| activeStatePath\(\) \|\| ''/u);
+  assert.match(launcher, /function stdioRuntimeEnv\(resolved, runtimeCwd\)/u);
+  assert.match(launcher, /CODESTORY_PLUGIN_MULTI_PROJECT: '1'/u);
+  assert.doesNotMatch(launcher, /CODESTORY_PLUGIN_PROJECT_ROOT:/u);
+  assert.match(launcher, /\['serve', '--stdio', '--multi-project', '--refresh', 'none'\]/u);
   assert.match(transport, /fn stdio_workspace_mismatch\(runtime: &RuntimeContext\)/u);
-  assert.match(transport, /CODESTORY_PLUGIN_ACTIVE_STATE_PATH/u);
-  assert.match(transport, /fn stdio_workspace_mismatch_status\(/u);
-  assert.match(transport, /fn stdio_workspace_mismatch_sidecar_setup\(/u);
-  // Prefer includes for large-file symbols; full-file regex can flake under truncated reads.
-  assert.ok(
-    transport.includes("fn stdio_workspace_mismatch_status_blocks_repo_repair_guidance"),
-    "stdio_transport must keep the workspace-mismatch status unit test",
-  );
-  assert.match(
-    transport,
-    /fn read_stdio_status_resource_cached[\s\S]*if let Some\(mismatch\) = stdio_workspace_mismatch\(runtime\)/u,
-  );
-  assert.match(transport, /"repair" => \{[\s\S]*"code": "workspace_mismatch"[\s\S]*handle_stdio_sidecar_repair/u);
-  assert.match(transport, /fn handle_stdio_sidecar_repair[\s\S]*stdio_workspace_mismatch_error\(runtime\)/u);
+  assert.match(transport, /CODESTORY_PLUGIN_MULTI_PROJECT/u);
+  assert.match(transport, /project_required: pass the caller's repository root/u);
 });
 
 test("mcp launcher fails open when delegated stdio runtime exits", async () => {
@@ -605,8 +586,8 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
     assert.equal(responses.length, 2, result.stdout);
     const status = JSON.parse(responses[0].result.contents[0].text);
     assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
-    assert.equal(status.project_root, realRepoRoot);
-    assert.equal(status.project_root_source, "plugin_active_state");
+    assert.equal(status.project_root, null);
+    assert.equal(status.project_root_source, "request_argument");
     assert.equal(status.readiness[0].setup.probe_status, 17);
     assert.match(
       status.readiness[0].setup.probe_error,
@@ -625,7 +606,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
   }
 });
 
-test("mcp launcher rejects another thread's global active project state", async () => {
+test("mcp launcher does not route from another thread's global active project state", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-wrong-thread-active-project-"));
@@ -695,21 +676,18 @@ test("mcp launcher rejects another thread's global active project state", async 
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_thread_mismatch");
-    assert.equal(status.readiness[0].goal, "project_root");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    const serve = calls.find((call) => call.args[0] === "serve");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+    assert.equal(serve.projectRoot, "");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("mcp launcher prefers thread-scoped active project over another thread's global state", async () => {
+test("mcp launcher ignores thread-scoped and global project state", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-thread-active-project-"));
@@ -795,17 +773,17 @@ test("mcp launcher prefers thread-scoped active project over another thread's gl
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     const serve = calls.find((call) => call.args[0] === "serve");
     assert.ok(serve, "expected serve call");
-    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", currentRepo]);
-    assert.equal(serve.cwd, currentRepo);
-    assert.equal(serve.projectRoot, currentRepo);
-    assert.equal(serve.projectRootSource, "plugin_active_thread_state");
-    assert.equal(serve.activeStatePath, threadActiveStatePath(dataDir, currentThread));
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+    assert.match(serve.cwd, /runtime-cwd/u);
+    assert.equal(serve.projectRoot, "");
+    assert.equal(serve.projectRootSource, "");
+    assert.equal(serve.activeStatePath, "");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("mcp launcher uses fresh global active project state when current thread is unavailable", async () => {
+test("mcp launcher ignores fresh global active project state when current thread is unavailable", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-missing-thread-active-project-"));
@@ -880,15 +858,15 @@ test("mcp launcher uses fresh global active project state when current thread is
     assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
     const serve = calls.find((call) => call.args[0] === "serve");
     assert.ok(serve, "expected serve call");
-    assert.deepEqual(serve.args, ["serve", "--stdio", "--refresh", "none", "--project", previousRepo]);
-    assert.equal(serve.cwd, previousRepo);
-    assert.equal(serve.projectRoot, previousRepo);
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+    assert.match(serve.cwd, /runtime-cwd/u);
+    assert.equal(serve.projectRoot, "");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("mcp launcher rejects unscoped global active project state when current thread is available", async () => {
+test("mcp launcher ignores unscoped global active project state", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-threaded-global-active-project-"));
@@ -957,15 +935,13 @@ test("mcp launcher rejects unscoped global active project state when current thr
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_thread_mismatch");
-    assert.equal(status.readiness[0].goal, "project_root");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    assert.deepEqual(
+      calls.find((call) => call.args[0] === "serve").args,
+      ["serve", "--stdio", "--multi-project", "--refresh", "none"],
+    );
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1047,7 +1023,7 @@ test("mcp launcher uses fresh active project state from before launcher start", 
   }
 });
 
-test("mcp launcher rejects stale active project state from plugin root", async () => {
+test("mcp launcher ignores stale active project state from plugin root", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-stale-active-project-"));
@@ -1109,21 +1085,19 @@ test("mcp launcher rejects stale active project state from plugin root", async (
     });
 
     assert.equal(result.status, 0, result.stderr);
-    await assert.rejects(access(marker));
+    assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.map((call) => call.args[0]), ["--version"]);
-    const response = JSON.parse(result.stdout.trim());
-    const status = JSON.parse(response.result.contents[0].text);
-    assert.equal(status.degraded_reason, "project_root_unavailable");
-    assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_stale");
-    assert.equal(status.readiness[0].goal, "project_root");
+    assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
+    assert.deepEqual(
+      calls.find((call) => call.args[0] === "serve").args,
+      ["serve", "--stdio", "--multi-project", "--refresh", "none"],
+    );
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("fail-open mcp hands off to stdio runtime after active project appears", async () => {
+test("projectless mcp hands off to stdio without active project state", async () => {
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-live-active-project-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
@@ -1156,6 +1130,7 @@ test("fail-open mcp hands off to stdio runtime after active project appears", as
         "  fs.writeFileSync(process.env.TEST_OUT, args[0]);",
         "  let buffer = '';",
         "  process.stdin.setEncoding('utf8');",
+        "  process.stdin.on('end', () => process.exit(0));",
         "  process.stdin.on('data', (chunk) => {",
         "    buffer += chunk;",
         "    const lines = buffer.split(/\\r?\\n/u);",
@@ -1163,7 +1138,9 @@ test("fail-open mcp hands off to stdio runtime after active project appears", as
         "    for (const line of lines) {",
         "      if (!line.trim()) continue;",
         "      const request = JSON.parse(line);",
-      "      if (request.method === 'tools/list') {",
+      "      if (request.method === 'initialize') {",
+      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { serverInfo: { name: 'codestory' } } }) + '\\n');",
+      "      } else if (request.method === 'tools/list') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
       "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'sidecar_setup') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { state: 'runtime-sidecar-setup' } } }) + '\\n');",
@@ -1229,16 +1206,6 @@ test("fail-open mcp hands off to stdio runtime after active project appears", as
       child.stdin.write(`${JSON.stringify(request)}\n`);
       return pending;
     };
-    const readStatus = async (id) => {
-      const response = await sendRequest({
-        jsonrpc: "2.0",
-        id,
-        method: "resources/read",
-        params: { uri: "codestory://status" },
-      });
-      return JSON.parse(response.result.contents[0].text);
-    };
-
     const init = await sendRequest({
       jsonrpc: "2.0",
       id: "init",
@@ -1247,49 +1214,30 @@ test("fail-open mcp hands off to stdio runtime after active project appears", as
     });
     assert.equal(init.result.serverInfo.name, "codestory");
 
-    const staleStatus = await readStatus("stale");
-    assert.equal(staleStatus.degraded_reason, "project_root_unavailable");
-    assert.equal(staleStatus.project_root, null);
-    assert.equal(staleStatus.project_root_source, "plugin_active_state_stale");
-
-    const failOpenTools = await sendRequest({ jsonrpc: "2.0", id: "fail-open-tools", method: "tools/list" });
-    assert.deepEqual(failOpenTools.result.tools.map((tool) => tool.name), ["sidecar_setup"]);
-    assert.deepEqual(
-      failOpenTools.result.tools[0].inputSchema.properties.action.enum,
-      ["status", "enable", "disable", "ask"],
-    );
-
-    await writeFile(
-      activePath,
-      JSON.stringify({ event: "UserPromptSubmit", cwd: realRepoRoot, updatedAt: new Date().toISOString() }),
-      "utf8",
-    );
-
     const repaired = await sendRequest({
       jsonrpc: "2.0",
       id: "repair",
       method: "tools/call",
-      params: { name: "sidecar_setup", arguments: { action: "repair" } },
+      params: { name: "sidecar_setup", arguments: { project: realRepoRoot, action: "repair" } },
     });
     assert.equal(repaired.result.structuredContent.state, "runtime-sidecar-setup");
 
     const tools = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/list" });
     assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["ground"]);
 
-    const runtimeStatus = await readStatus("runtime-status");
-    assert.equal(runtimeStatus.project_root, realRepoRoot);
-    assert.equal(runtimeStatus.project_root_source, "plugin_active_state");
     assert.equal(await readFile(marker, "utf8"), "serve");
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.deepEqual(calls.map((call) => call.args[0]), ["--version", "serve"]);
     const serve = calls.find((call) => call.args[0] === "serve");
-    assert.equal(serve.cwd, realRepoRoot);
-    assert.equal(serve.projectRoot, realRepoRoot);
-    assert.equal(serve.activeStatePath, activePath);
+    assert.match(serve.cwd, /runtime-cwd/u);
+    assert.equal(serve.projectRoot, "");
+    assert.equal(serve.activeStatePath, "");
+    assert.deepEqual(serve.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
   } finally {
     if (child && !child.killed) {
-      child.kill();
+      child.stdin.end();
       await Promise.race([once(child, "exit"), new Promise((resolve) => setTimeout(resolve, 1000))]);
+      if (!child.killed) child.kill();
     }
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1495,7 +1443,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
     assert.equal(observed.path, cliPath);
     assert.equal(observed.pluginRoot, installRoot);
     assert.equal(observed.pluginCacheVersion, version);
-    assert.equal(observed.dirtyMarkerPath, dirtyMarkerPathForProject(repoRoot, dataDir));
+    assert.equal(observed.dirtyMarkerPath, undefined);
   } finally {
     await rm(codexHome, { recursive: true, force: true });
     await rm(pathDir, { recursive: true, force: true });
@@ -1552,7 +1500,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(responses.length, 6, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.plugin_version, version);
-    assert.equal(status.source_checkout_version, sourceVersion);
+    assert.equal(status.source_checkout_version, null);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
     assert.equal(status.plugin_runtime.cli_path, null);
@@ -1709,15 +1657,13 @@ test("mcp launcher starts stdio without local or agent repair", async () => {
     assert.equal(calls.some((call) => call.args.includes("agent")), false);
     assert.equal(calls.some((call) => call.args.includes("--repair")), false);
     assert.equal(calls.some((call) => call.sidecarRepair), false);
-    const realDataDir = await realpath(dataDir);
     assert.ok(calls.some((call) => {
       return JSON.stringify(call.args) === JSON.stringify([
         "serve",
         "--stdio",
+        "--multi-project",
         "--refresh",
         "none",
-        "--project",
-        realDataDir,
       ]);
     }));
   } finally {
@@ -1906,16 +1852,14 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
     const text = await readFile(logFile, "utf8");
     const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
     const repairCalls = calls.filter((call) => call.repair);
-    const realRepoRoot = await realpath(repoRoot);
     assert.equal(repairCalls.length, 0, text);
     const serveCall = calls.find((call) => {
       return JSON.stringify(call.args) === JSON.stringify([
         "serve",
         "--stdio",
+        "--multi-project",
         "--refresh",
         "none",
-        "--project",
-        realRepoRoot,
       ]);
     });
     assert.ok(serveCall, text);
@@ -1977,7 +1921,6 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
-    const realRepoRoot = await realpath(repoRoot);
     assert.equal(observed.source, "managed");
     assert.equal(observed.version, version);
     assert.equal(observed.repoRef, `v${version}`);
@@ -1987,7 +1930,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
       observed.path,
       new RegExp(String.raw`codestory-cli[\\/]+${version.replaceAll(".", String.raw`\.`)}[\\/]bin[\\/]codestory-cli`, "u"),
     );
-    assert.deepEqual(observed.args, ["serve", "--stdio", "--refresh", "none", "--project", realRepoRoot]);
+    assert.deepEqual(observed.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
 
     const manifest = JSON.parse(
       await readFile(join(dataDir, "codestory-cli", version, "manifest.json"), "utf8"),

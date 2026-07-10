@@ -1588,9 +1588,8 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
   }
 }
 
-function stdioRuntimeEnv(resolved, projectRoot, projectRootSource, runtimeCwd, projectStatePath) {
+function stdioRuntimeEnv(resolved, runtimeCwd) {
   const sidecarStatus = readSidecarPolicy();
-  const dirtyMarker = dirtyMarkerEnv(projectRoot);
   return {
     ...process.env,
     CODESTORY_PLUGIN_VERSION: resolved.version || '',
@@ -1609,31 +1608,27 @@ function stdioRuntimeEnv(resolved, projectRoot, projectRootSource, runtimeCwd, p
     CODESTORY_PLUGIN_CLI_ARCHIVE_URL: resolved.archiveUrl || '',
     CODESTORY_PLUGIN_CLI_PROVISIONED_AT: resolved.provisionedAt || '',
     CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
-    CODESTORY_PLUGIN_PROJECT_ROOT: projectRoot,
-    CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE: projectRootSource,
-    CODESTORY_PLUGIN_ACTIVE_STATE_PATH: projectStatePath || activeStatePath() || '',
+    CODESTORY_PLUGIN_MULTI_PROJECT: '1',
+    CODESTORY_PLUGIN_DATA: pluginDataDir() || '',
     CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
     CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
     CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
     CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
     CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
-    CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND: resolvedRepairCommandForProject(resolved, projectRoot),
     CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
     CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
     CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
     CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
-    CODESTORY_PLUGIN_DIRTY_MARKER_PATH: dirtyMarker.path,
-    CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT: dirtyMarker.projectRoot,
   };
 }
 
-function spawnStdioRuntime(resolved, projectRoot, projectRootSource, runtimeCwd, stdio, projectStatePath = null) {
-  return spawn(resolved.path, ['serve', '--stdio', '--refresh', 'none', '--project', projectRoot], {
-    cwd: projectRoot,
+function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
+  return spawn(resolved.path, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
+    cwd: runtimeCwd,
     stdio,
     shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     windowsHide: true,
-    env: stdioRuntimeEnv(resolved, projectRoot, projectRootSource, runtimeCwd, projectStatePath),
+    env: stdioRuntimeEnv(resolved, runtimeCwd),
   });
 }
 
@@ -1644,41 +1639,15 @@ async function main() {
   const resolved = await resolveCli();
   rememberLaunch(resolved, runtimeCwd);
   const probe = probeResolvedCli(resolved);
-  const projectResolution = resolveProjectRoot();
   const failOpenReason = failOpenReasonForProbe(resolved, probe);
   if (failOpenReason) {
     runFailOpenMcp(fallbackDiagnostic(resolved, probe, failOpenReason, {
-      projectRoot: projectResolution.projectRoot,
-      projectRootSource: projectResolution.source,
+      projectRoot: null,
+      projectRootSource: 'request_argument',
     }));
     return;
   }
-  if (!projectResolution.projectRoot) {
-    runFailOpenMcp(
-      () => projectRootUnavailableDiagnostic(resolved, probe, resolveProjectRoot()),
-      {
-        startRuntime: (liveStatus) => spawnStdioRuntime(
-          resolved,
-          liveStatus.project_root,
-          liveStatus.project_root_source,
-          runtimeCwd,
-          ['pipe', 'pipe', 'pipe'],
-          liveStatus.readiness?.[0]?.setup?.project_root_resolution_state_path || null,
-        ),
-      },
-    );
-    return;
-  }
-  const projectRoot = projectResolution.projectRoot;
-  // Keep the JSON-RPC server handshake first; codestory://status reports readiness after stdio is alive.
-  const child = spawnStdioRuntime(
-    resolved,
-    projectRoot,
-    projectResolution.source,
-    runtimeCwd,
-    'inherit',
-    projectResolution.statePath || null,
-  );
+  const child = spawnStdioRuntime(resolved, runtimeCwd, 'inherit');
 
   child.on('exit', (code, signal) => {
     if (signal) process.kill(process.pid, signal);
@@ -1692,11 +1661,11 @@ async function main() {
       error: `codestory-cli serve --stdio exited with status ${code}`,
       stderr: probe.stderr || '',
     }, 'runtime_stdio_child_exit', {
-      projectRoot,
-      projectRootSource: projectResolution.source,
+      projectRoot: null,
+      projectRootSource: 'request_argument',
       summary: 'CodeStory plugin MCP launched codestory-cli, but the stdio runtime exited before it could serve requests.',
       minimumNext: [
-        'Read codestory://status for the active runtime diagnostic.',
+        'Call the status tool with an explicit project for the active runtime diagnostic.',
         'Restart/reload the Codex host/app after updating or repairing the CodeStory plugin runtime.',
       ],
     }));
@@ -1710,8 +1679,8 @@ async function main() {
       stdout: '',
       stderr: '',
     }, `${resolved.source}_cli_unspawnable`, {
-      projectRoot,
-      projectRootSource: projectResolution.source,
+      projectRoot: null,
+      projectRootSource: 'request_argument',
     }));
   });
 }
