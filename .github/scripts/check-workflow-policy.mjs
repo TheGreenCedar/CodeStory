@@ -7,6 +7,7 @@ const trustedOwners = new Set(["actions", "github"]);
 const shaPattern = /^[0-9a-f]{40}$/i;
 const violations = [];
 const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
+const closeDevIssues = path.join(workflowRoot, "close-dev-issues.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
 const releaseWorkflow = path.join(workflowRoot, "release.yml");
@@ -66,6 +67,35 @@ if (fs.existsSync(sagaIssueLinkGuard)) {
     !closingRef.test("Closes https://github.com/TheGreenCedar/CodeStory/issues/123")
   ) {
     violations.push("saga-issue-link-guard.yml closing ref policy must reject bare numbers and accept # or full issue URLs");
+  }
+}
+
+if (!fs.existsSync(closeDevIssues)) {
+  violations.push("close-dev-issues.yml must close linked issues for merged dev PRs");
+} else {
+  const content = fs.readFileSync(closeDevIssues, "utf8");
+  const requiredSnippets = [
+    "pull_request:",
+    "dev/codestory-next",
+    "types: [closed]",
+    "github.event.pull_request.merged == true",
+    "issues: write",
+    'if "pull_request" in issue:',
+    '"state_reason=completed"',
+  ];
+
+  for (const snippet of requiredSnippets) {
+    if (!content.includes(snippet)) {
+      violations.push(`close-dev-issues.yml must include ${snippet}`);
+    }
+  }
+
+  if (
+    !content.includes(
+      'r"(?:#(\\d+)|https://github\\.com/TheGreenCedar/CodeStory/issues/(\\d+))\\b"',
+    )
+  ) {
+    violations.push("close-dev-issues.yml must accept only # or same-repository issue URLs");
   }
 }
 
