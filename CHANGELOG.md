@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- Made MCP sidecar repair transfer one durable attempt reservation to the
+  spawned CLI worker instead of rejecting its own handoff as a competing
+  repair. The worker now inherits the parent cache scope, and MCP records its
+  terminal exit code plus bounded stdout/stderr tails before clearing repair
+  ownership.
+
 ## 0.14.2
 
 ### Fixed

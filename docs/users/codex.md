@@ -162,6 +162,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | `readiness_broker.resources.native_embedding_runtime.status` | `available` | `busy` blocks repair only when the owner is foreign or unverifiable; same-project reusable owners should continue through `recommended_next_calls`; `stale` means retry repair so the broker can reclaim it |
 | `readiness_broker.gpu_proof.proof_status` | `verified` when accelerator is required and live embed smoke succeeded | `gpu_unverified` means repair should stop before a long semantic rebuild; inspect `embed_smoke_ok` / `embed_smoke_ms` |
 | `readiness_broker.persistence_status` | `persisted` | `failed` means inspect `persistence_error`; status may be live but not durable across processes |
+| `sidecar_setup.last_worker_result` | `outcome=succeeded` for the matching repair `attempt_id` | `failed` or `abandoned` means inspect the exit code and bounded output tails before retrying; it is terminal evidence, not an active lock |
 | `recommended_next_calls` | Start with `agent-guide`, then use allowed tools | For packet/search blockers, follow the listed `sidecar_setup repair` and status read sequence; if tools are hidden, stop and report host visibility |
 
 Shared repair lanes: [Troubleshooting](troubleshooting.md).

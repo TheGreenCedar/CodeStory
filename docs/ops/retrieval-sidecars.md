@@ -62,6 +62,7 @@ active runtime source when it is available.
 |-------|---------|-----------------|
 | `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph and sidecar packet/search infrastructure are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
 | `local_navigation=ready`, `agent_packet_search=repairing` | Agent sidecar repair is active and status should include the current `phase`, `profile`, `run_id`, and `namespace` | Wait or reread `codestory://status`; do not start a second agent repair for the same run |
+| `sidecar_setup.last_worker_result.outcome=failed` or `abandoned` | The background repair worker reached a durable terminal state without completing | Match `attempt_id`, then inspect `exit_code`, `wait_error`, and the bounded `stdout_tail` / `stderr_tail` before retrying the named failing layer |
 | `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; call MCP `sidecar_setup repair` from status before packet/search claims |
 | `local_navigation=repair_local` | Core index or cache is missing or stale | Follow `recommended_next_calls`, then reread status; use CLI local repair commands only for maintainer transcripts |
 | `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Call MCP `sidecar_setup repair`, then reread status; maintainers can inspect `retrieval status` and rerun explicit sidecar commands if needed |
@@ -89,6 +90,8 @@ Attach these artifacts to issues or PRs that claim readiness repair:
 
 - `codestory://status` transcript when MCP is live, or the full
   `agent preflight` JSON when it is not.
+- The matching `sidecar_setup.last_worker_result` when background repair fails,
+  including its `attempt_id`, exit code, and truncated-output flags.
 - `doctor --format markdown` or JSON output, including readiness verdicts and
   legacy/managed embedding diagnostics.
 - `retrieval status --format json`, including `retrieval_mode`,

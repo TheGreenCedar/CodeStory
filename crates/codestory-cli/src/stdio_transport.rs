@@ -18,11 +18,11 @@ use codestory_contracts::api::{
     TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -57,8 +57,8 @@ use std::time::{Duration, Instant};
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_RECENT_REPAIR_TTL: Duration = Duration::from_secs(30);
-const STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE: &str = "ready-repair-enqueue.lock";
-const STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL: Duration = Duration::from_secs(15);
+const STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES: usize = 32 * 1024;
+const STDIO_READY_REPAIR_RESERVATION_HEARTBEAT: Duration = Duration::from_secs(5);
 const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -453,6 +453,7 @@ struct StdioRecentSidecarRepair {
     namespace: String,
     compose_project: String,
     pid: u32,
+    attempt_id: String,
     started_at_epoch_ms: i64,
     observed_at: Instant,
 }
@@ -2617,6 +2618,7 @@ fn stdio_status_with_recent_sidecar_repair(
         "namespace": repair.namespace.clone(),
         "phase": "starting",
         "pid": repair.pid,
+        "attempt_id": repair.attempt_id,
         "updated_at_epoch_ms": repair.started_at_epoch_ms
     });
     let live_active_repair = status
@@ -2666,6 +2668,7 @@ fn stdio_status_with_recent_sidecar_repair(
                 .get("pid")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!(repair.pid)),
+            "attempt_id": repair.attempt_id.clone(),
             "started_at_epoch_ms": repair.started_at_epoch_ms,
             "updated_at_epoch_ms": active_repair
                 .get("updated_at_epoch_ms")
@@ -4407,6 +4410,8 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         .is_none()
         .then(|| crate::ready_repair_status::abandoned_ready_repair_status(project_root, None))
         .flatten();
+    let last_worker_result =
+        crate::ready_repair_status::read_ready_repair_worker_result(project_root, None);
     let last_repair_command = env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND");
     let active_cli_version = env_nonempty("CODESTORY_PLUGIN_CLI_VERSION")
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
@@ -4447,9 +4452,11 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "namespace": &status.namespace,
             "phase": &status.phase,
             "pid": status.pid,
+            "attempt_id": &status.attempt_id,
             "updated_at_epoch_ms": status.updated_at_epoch_ms
         })),
-        "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned"))
+        "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned")),
+        "last_worker_result": last_worker_result
     })
 }
 
@@ -4502,6 +4509,7 @@ fn stdio_ready_repair_status_json(
         "namespace": &status.namespace,
         "phase": &status.phase,
         "pid": status.pid,
+        "attempt_id": &status.attempt_id,
         "updated_at_epoch_ms": status.updated_at_epoch_ms,
         "age_ms": crate::ready_repair_status::now_epoch_ms().saturating_sub(status.updated_at_epoch_ms),
         "inspect_command": stdio_agent_retrieval_status_command(project_root, run_id),
@@ -4620,94 +4628,6 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StdioReadyRepairEnqueueLockFile {
-    schema_version: u32,
-    pid: u32,
-    started_at_epoch_ms: i64,
-    token: String,
-}
-
-#[derive(Debug)]
-struct StdioReadyRepairEnqueueLock {
-    path: PathBuf,
-    token: String,
-}
-
-impl Drop for StdioReadyRepairEnqueueLock {
-    fn drop(&mut self) {
-        let Some(lock) = read_stdio_ready_repair_enqueue_lock(&self.path) else {
-            return;
-        };
-        if lock.token == self.token {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn try_acquire_stdio_ready_repair_enqueue_lock(
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> std::io::Result<Option<StdioReadyRepairEnqueueLock>> {
-    let path = sidecar
-        .layout
-        .state_file
-        .with_file_name(STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
-    let pid = std::process::id();
-    let token = format!("{pid}:{started_at_epoch_ms}");
-    let lock = StdioReadyRepairEnqueueLockFile {
-        schema_version: 1,
-        pid,
-        started_at_epoch_ms,
-        token: token.clone(),
-    };
-    let content = serde_json::to_vec_pretty(&lock)?;
-    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
-        Ok(()) => {
-            return Ok(Some(StdioReadyRepairEnqueueLock { path, token }));
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    if !stdio_ready_repair_enqueue_lock_is_stale(&path) {
-        return Ok(None);
-    }
-    let _ = fs::remove_file(&path);
-    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
-        Ok(()) => Ok(Some(StdioReadyRepairEnqueueLock { path, token })),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn create_stdio_ready_repair_enqueue_lock(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn stdio_ready_repair_enqueue_lock_is_stale(path: &Path) -> bool {
-    let Some(lock) = read_stdio_ready_repair_enqueue_lock(path) else {
-        return true;
-    };
-    if !crate::ready_repair_status::process_is_running(lock.pid) {
-        return true;
-    }
-    let now = crate::ready_repair_status::now_epoch_ms();
-    now.saturating_sub(lock.started_at_epoch_ms)
-        > STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL.as_millis() as i64
-}
-
-fn read_stdio_ready_repair_enqueue_lock(path: &Path) -> Option<StdioReadyRepairEnqueueLockFile> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-}
-
 fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
@@ -4778,8 +4698,11 @@ fn handle_stdio_sidecar_repair(
     ) {
         return stdio_sidecar_repair_machine_busy_result(busy, &sidecar_setup);
     }
-    let _enqueue_lock = match try_acquire_stdio_ready_repair_enqueue_lock(&repair_sidecar) {
-        Ok(Some(lock)) => lock,
+    let mut reservation = match crate::ready_repair_status::try_reserve_ready_repair(
+        &repair_sidecar,
+        &runtime.project_root,
+    ) {
+        Ok(Some(reservation)) => reservation,
         Ok(None) => {
             return stdio_sidecar_repair_already_starting_result(
                 &runtime.project_root,
@@ -4817,6 +4740,8 @@ fn handle_stdio_sidecar_repair(
     };
 
     let mut command = Command::new(&exe);
+    let attempt_id = reservation.attempt_id().to_string();
+    let repair_started_at_epoch_ms = reservation.started_at_epoch_ms();
     command
         .arg("ready")
         .arg("--goal")
@@ -4824,32 +4749,34 @@ fn handle_stdio_sidecar_repair(
         .arg("--repair")
         .arg("--project")
         .arg(&runtime.project_root)
+        .arg("--cache-dir")
+        .arg(&runtime.cache_root)
         .arg("--format")
         .arg("json")
         .arg("--run-id")
         .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
         .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
+        .env(
+            crate::ready_repair_status::READY_REPAIR_ATTEMPT_ENV,
+            &attempt_id,
+        )
         .stdin(Stdio::null());
 
-    match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(mut child) => {
+    match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => {
             let child_pid = child.id();
-            let repair_started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
-            if let Err(error) = crate::ready_repair_status::write_ready_repair_status(
-                &repair_sidecar,
-                &runtime.project_root,
-                "starting",
+            reservation.disarm();
+            monitor_stdio_ready_repair_worker(
+                child,
+                repair_sidecar.clone(),
+                runtime.project_root.clone(),
+                attempt_id.clone(),
                 repair_started_at_epoch_ms,
-                child_pid,
-            ) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return serde_json::json!({
-                    "error": format!(
-                        "repair process was stopped because its durable status could not be published: {error}"
-                    )
-                });
-            }
+            );
             let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
                 crate::readiness_broker::BrokerSnapshotInput {
                     project_root: runtime.project_root.clone(),
@@ -4866,6 +4793,7 @@ fn handle_stdio_sidecar_repair(
                 namespace: repair_sidecar.namespace.clone(),
                 compose_project: repair_sidecar.compose_project.clone(),
                 pid: child_pid,
+                attempt_id: attempt_id.clone(),
                 started_at_epoch_ms: repair_started_at_epoch_ms,
                 observed_at: Instant::now(),
             });
@@ -4874,7 +4802,8 @@ fn handle_stdio_sidecar_repair(
                     "status": "started",
                     "mode": "background",
                     "pid": child_pid,
-                    "status_published": true,
+                    "attempt_id": attempt_id,
+                    "reservation_published": true,
                     "broker_snapshot": broker_snapshot,
                     "previous_abandoned_repair": previous_abandoned_repair,
                     "broker_reconciliation": broker_reconciliation_json,
@@ -4898,6 +4827,125 @@ fn handle_stdio_sidecar_repair(
             })
         }
         Err(error) => serde_json::json!({"error": error.to_string()}),
+    }
+}
+
+fn monitor_stdio_ready_repair_worker(
+    mut child: std::process::Child,
+    sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    project_root: PathBuf,
+    attempt_id: String,
+    started_at_epoch_ms: i64,
+) {
+    thread::spawn(move || {
+        let pid = child.id();
+        let stdout = child
+            .stdout
+            .take()
+            .map(|stdout| thread::spawn(move || read_stdio_ready_repair_tail(stdout)));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || read_stdio_ready_repair_tail(stderr)));
+        let mut last_heartbeat = Instant::now();
+        let wait = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+            if last_heartbeat.elapsed() >= STDIO_READY_REPAIR_RESERVATION_HEARTBEAT {
+                let _ = crate::ready_repair_status::heartbeat_ready_repair_reservation(
+                    &sidecar,
+                    &attempt_id,
+                );
+                last_heartbeat = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let (stdout_tail, stdout_truncated) = join_stdio_ready_repair_tail(stdout, "stdout");
+        let (stderr_tail, stderr_truncated) = join_stdio_ready_repair_tail(stderr, "stderr");
+        let (outcome, exit_code, wait_error) = match wait {
+            Ok(status) if status.success() => ("succeeded", status.code(), None),
+            Ok(status) => ("failed", status.code(), None),
+            Err(error) => ("failed", None, Some(error.to_string())),
+        };
+        let result = crate::ready_repair_status::ReadyRepairWorkerResult {
+            schema_version: crate::ready_repair_status::READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: attempt_id.clone(),
+            project_root: crate::display::clean_path_string(&project_root.to_string_lossy()),
+            profile: sidecar.profile.as_str().to_string(),
+            run_id: sidecar.run_id.clone(),
+            namespace: sidecar.namespace.clone(),
+            pid,
+            started_at_epoch_ms,
+            finished_at_epoch_ms: crate::ready_repair_status::now_epoch_ms(),
+            outcome: outcome.to_string(),
+            exit_code,
+            wait_error,
+            stdout_tail,
+            stderr_tail,
+            stdout_truncated,
+            stderr_truncated,
+        };
+        if let Err(error) =
+            crate::ready_repair_status::write_ready_repair_worker_result(&sidecar, &result)
+        {
+            eprintln!(
+                "[ready-repair] attempt_id={} pid={} status=result_write_failed error={error:#}",
+                attempt_id, pid
+            );
+            return;
+        }
+        crate::ready_repair_status::clear_ready_repair_status_by_attempt(&sidecar, &attempt_id);
+        crate::ready_repair_status::remove_ready_repair_reservation_if_attempt(
+            &sidecar,
+            &attempt_id,
+        );
+    });
+}
+
+fn read_stdio_ready_repair_tail(mut reader: impl Read) -> (String, bool) {
+    let mut tail = VecDeque::with_capacity(STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES);
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                let marker = format!("\n[output read failed: {error}]\n");
+                for byte in marker.bytes() {
+                    if tail.len() == STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES {
+                        tail.pop_front();
+                        truncated = true;
+                    }
+                    tail.push_back(byte);
+                }
+                break;
+            }
+        };
+        for byte in &buffer[..read] {
+            if tail.len() == STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES {
+                tail.pop_front();
+                truncated = true;
+            }
+            tail.push_back(*byte);
+        }
+    }
+    let bytes: Vec<u8> = tail.into_iter().collect();
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+}
+
+fn join_stdio_ready_repair_tail(
+    reader: Option<thread::JoinHandle<(String, bool)>>,
+    stream: &str,
+) -> (String, bool) {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .unwrap_or_else(|_| (format!("[{stream} reader thread panicked]"), false)),
+        None => (String::new(), false),
     }
 }
 
@@ -5710,18 +5758,18 @@ mod tests {
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
         );
 
-        let first = try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+        let first = crate::ready_repair_status::try_reserve_ready_repair(&sidecar, project.path())
             .expect("first enqueue lock")
             .expect("first enqueue lock acquired");
         assert!(
-            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+            crate::ready_repair_status::try_reserve_ready_repair(&sidecar, project.path())
                 .expect("second enqueue lock")
                 .is_none(),
             "concurrent stdio repair enqueue should be blocked"
         );
         drop(first);
         assert!(
-            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+            crate::ready_repair_status::try_reserve_ready_repair(&sidecar, project.path())
                 .expect("third enqueue lock")
                 .is_some(),
             "enqueue lock should be reusable after drop"
@@ -5869,6 +5917,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -5920,6 +5969,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: live_pid,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -5946,6 +5996,18 @@ mod tests {
             updated["readiness_broker"]["operations"][0]["pid"],
             json!(live_pid)
         );
+    }
+
+    #[test]
+    fn ready_repair_output_capture_keeps_only_the_bounded_tail() {
+        let mut bytes = vec![b'a'; STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES + 17];
+        bytes.extend_from_slice(b"terminal-marker");
+
+        let (tail, truncated) = read_stdio_ready_repair_tail(std::io::Cursor::new(bytes));
+
+        assert!(truncated);
+        assert_eq!(tail.len(), STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES);
+        assert!(tail.ends_with("terminal-marker"));
     }
 
     fn empty_recent_repair_status() -> serde_json::Value {
@@ -6001,6 +6063,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6030,6 +6093,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6068,6 +6132,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now()
                 .checked_sub(STDIO_RECENT_REPAIR_TTL + Duration::from_secs(1))
@@ -6098,6 +6163,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6124,6 +6190,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6140,6 +6207,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now()
                 .checked_sub(STDIO_RECENT_REPAIR_TTL + Duration::from_secs(1))
@@ -6158,6 +6226,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6178,6 +6247,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6198,6 +6268,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });

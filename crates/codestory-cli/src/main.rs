@@ -657,6 +657,7 @@ struct ReadyRepairProgress {
     start: Instant,
     started_at_epoch_ms: i64,
     pid: u32,
+    attempt_id: Option<String>,
     sidecar: codestory_retrieval::SidecarRuntimeConfig,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -672,6 +673,9 @@ impl ReadyRepairProgress {
         let start = Instant::now();
         let started_at_epoch_ms = ready_repair_status::now_epoch_ms();
         let pid = std::process::id();
+        let attempt_id = std::env::var(ready_repair_status::READY_REPAIR_ATTEMPT_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let profile = sidecar.profile.as_str();
         let run_id = sidecar.run_id.as_deref().unwrap_or("none").to_string();
         let namespace = sidecar.namespace.clone();
@@ -684,12 +688,14 @@ impl ReadyRepairProgress {
         let worker_namespace = namespace.clone();
         let worker_project_root = project_root.clone();
         let worker_cache_root = cache_root.clone();
-        let _ = ready_repair_status::write_ready_repair_status(
+        let worker_attempt_id = attempt_id.clone();
+        let _ = ready_repair_status::write_ready_repair_status_for_attempt(
             sidecar,
             &project_root,
             "starting",
             started_at_epoch_ms,
             pid,
+            attempt_id.as_deref(),
         );
         let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
             project_root: project_root.clone(),
@@ -721,12 +727,13 @@ impl ReadyRepairProgress {
                         "active"
                     )
                 );
-                let _ = ready_repair_status::write_ready_repair_status(
+                let _ = ready_repair_status::write_ready_repair_status_for_attempt(
                     &sidecar_for_worker,
                     &worker_project_root,
                     phase,
                     started_at_epoch_ms,
                     pid,
+                    worker_attempt_id.as_deref(),
                 );
                 let _ = readiness_broker::refresh_broker_snapshot(
                     readiness_broker::BrokerSnapshotInput {
@@ -752,6 +759,7 @@ impl ReadyRepairProgress {
             start,
             started_at_epoch_ms,
             pid,
+            attempt_id,
             sidecar: sidecar.clone(),
             handle: Some(handle),
         }
@@ -770,12 +778,13 @@ impl ReadyRepairProgress {
                 "started"
             )
         );
-        let _ = ready_repair_status::write_ready_repair_status(
+        let _ = ready_repair_status::write_ready_repair_status_for_attempt(
             &self.sidecar,
             &self.project_root,
             phase,
             self.started_at_epoch_ms,
             self.pid,
+            self.attempt_id.as_deref(),
         );
         let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
             project_root: self.project_root.clone(),
@@ -794,10 +803,11 @@ impl Drop for ReadyRepairProgress {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        ready_repair_status::clear_ready_repair_status(
+        ready_repair_status::clear_ready_repair_status_for_attempt(
             &self.sidecar,
             self.started_at_epoch_ms,
             self.pid,
+            self.attempt_id.as_deref(),
         );
     }
 }
@@ -2575,6 +2585,29 @@ fn repair_ready_state(
             run_id,
         )
     });
+    let plugin_worker = std::env::var("CODESTORY_PLUGIN_SIDECAR_REPAIR").as_deref() == Ok("1");
+    let handoff_attempt = std::env::var(ready_repair_status::READY_REPAIR_ATTEMPT_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut handoff_reservation =
+        match (sidecar.as_ref(), plugin_worker, handoff_attempt.as_deref()) {
+            (Some(sidecar), true, Some(attempt_id)) => Some(
+                ready_repair_status::adopt_ready_repair_reservation(
+                    sidecar,
+                    &runtime.project_root,
+                    attempt_id,
+                )
+                .context("adopt MCP ready-repair reservation")?,
+            ),
+            (_, true, None) => {
+                bail!("MCP ready-repair worker is missing its reservation attempt id")
+            }
+            (_, false, Some(_)) => bail!("ready-repair attempt id requires the MCP worker marker"),
+            _ => None,
+        };
+    if let Some(reservation) = handoff_reservation.as_mut() {
+        reservation.disarm();
+    }
     if let Some(sidecar) = sidecar.as_ref()
         && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
@@ -2622,6 +2655,9 @@ fn repair_ready_state(
             );
         }
     }
+
+    #[cfg(debug_assertions)]
+    maybe_exit_ready_repair_worker_probe(handoff_reservation.as_ref());
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
@@ -2724,6 +2760,44 @@ fn repair_ready_state(
         reconciliation: None,
     });
     Ok(Some(sidecar))
+}
+
+#[cfg(debug_assertions)]
+fn maybe_exit_ready_repair_worker_probe(
+    reservation: Option<&ready_repair_status::ReadyRepairReservation>,
+) {
+    use std::io::Write as _;
+
+    let Some(reservation) = reservation else {
+        return;
+    };
+    if std::env::var("CODESTORY_PLUGIN_SIDECAR_REPAIR").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(exit_code) = std::env::var("CODESTORY_TEST_READY_REPAIR_WORKER_EXIT_CODE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return;
+    };
+    let attempt_id = reservation.attempt_id();
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    let stdout_payload = vec![b'o'; 40 * 1024];
+    let stderr_payload = vec![b'e'; 40 * 1024];
+    let _ = stdout.write_all(&stdout_payload);
+    let _ = writeln!(
+        stdout,
+        "ready-repair worker probe stdout attempt_id={attempt_id}"
+    );
+    let _ = stderr.write_all(&stderr_payload);
+    let _ = writeln!(
+        stderr,
+        "ready-repair worker probe stderr attempt_id={attempt_id}"
+    );
+    let _ = stdout.flush();
+    let _ = stderr.flush();
+    std::process::exit(exit_code);
 }
 
 #[derive(Debug, Clone)]
