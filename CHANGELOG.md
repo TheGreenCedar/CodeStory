@@ -17,6 +17,8 @@ repositories through the same plugin installation.
 - Added a two-repository stdio regression that queues requests for both projects
   before reading their responses, then switches back and verifies each result
   remains rooted in its requested repository.
+- Updated the packaged release proof to pass its repository explicitly when it
+  reads project-scoped MCP status.
 
 ## 0.14.0
 
