@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Added a `dev/codestory-next` merge workflow that closes same-repository
+  issues named by `Closes`, `Fixes`, or `Resolves` in merged pull requests.
 - Separated release-update advice from runtime readiness. A newer GitHub
   release or a newer checksum-valid managed CLI now appears under the
   non-blocking `runtime_update` status field without disabling compatible local
