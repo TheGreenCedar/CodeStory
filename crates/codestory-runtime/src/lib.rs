@@ -101,8 +101,8 @@ pub(crate) fn process_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 pub use search_runtime::*;
 use semantic_doc_text::{
-    runtime_concept_phrases, semantic_doc_language_from_path, semantic_path_aliases,
-    semantic_symbol_aliases, semantic_symbol_role_aliases,
+    semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
+    semantic_symbol_role_aliases,
 };
 pub use services::{
     AgentService, BookmarkService, GroundingService, IndexService, ProjectService, SearchService,
@@ -3864,7 +3864,7 @@ fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
-const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 5;
+const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 6;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
@@ -4865,10 +4865,6 @@ fn build_llm_symbol_doc_text(
         if !aliases.owner_aliases.is_empty() {
             let _ = writeln!(out, "owner_aliases: {}", aliases.owner_aliases.join(", "));
         }
-        let domain_aliases = runtime_concept_phrases(display_name, node.qualified_name.as_deref());
-        if !domain_aliases.is_empty() {
-            let _ = writeln!(out, "domain_aliases: {}", domain_aliases.join(", "));
-        }
         if alias_mode == SemanticDocAliasMode::CurrentAlias {
             let path_aliases = semantic_path_aliases(file_path, 8);
             if !path_aliases.is_empty() {
@@ -5735,18 +5731,27 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
+    let graph_doc_schema_mismatch = llm_refresh_file_scope.is_some()
+        && storage
+            .has_symbol_search_doc_version_mismatch(LLM_SYMBOL_DOC_SCHEMA_VERSION)
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to inspect graph-native semantic doc versions: {e}"
+                ))
+            })?;
+    let dense_doc_contract_mismatch = embedding_contract.as_ref().is_some_and(|contract| {
+        llm_refresh_file_scope.is_some()
+            && existing_docs
+                .values()
+                .any(|existing_doc| !llm_symbol_doc_contract_matches(existing_doc, contract))
+    });
     let expand_semantic_scope_for_contract_repair =
-        if let Some(embedding_contract) = embedding_contract.as_ref() {
-            llm_refresh_file_scope.is_some()
-                && existing_docs.values().any(|existing_doc| {
-                    !llm_symbol_doc_contract_matches(existing_doc, embedding_contract)
-                })
-        } else {
-            false
-        };
+        graph_doc_schema_mismatch || dense_doc_contract_mismatch;
     if expand_semantic_scope_for_contract_repair {
         tracing::warn!(
-            "Stored semantic-doc contract differs from current embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
+            graph_doc_schema_mismatch,
+            dense_doc_contract_mismatch,
+            "Stored semantic-doc contract differs from the current schema or embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
         );
     }
     let effective_llm_refresh_file_scope = if expand_semantic_scope_for_contract_repair {
@@ -6875,9 +6880,7 @@ fn architecture_coverage_for_hit(hit: &SearchHit) -> Option<ArchitectureCoverage
             key: format!("project:build_index:{source_kind}"),
             score: 8,
         }
-    } else if normalized.contains("/data/indexer/")
-        || architecture_has_all_terms(&terms, &["indexer", "command"])
-    {
+    } else if architecture_has_all_terms(&terms, &["indexer", "command"]) {
         ArchitectureCoverage {
             key: format!(
                 "indexing:{}:{source_kind}",
@@ -14841,6 +14844,184 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(
             second_timings.semantic_docs_reused.unwrap_or(0) > 0,
             "unchanged full refresh should reuse semantic docs copied into the staged DB"
+        );
+    }
+
+    #[test]
+    fn unchanged_incremental_refresh_rebuilds_previous_semantic_doc_schema() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let mut contaminated_docs = Storage::open(&storage_path)
+            .expect("open storage before schema downgrade")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs before schema downgrade");
+        assert!(
+            !contaminated_docs.is_empty(),
+            "fixture should persist semantic docs"
+        );
+        for doc in &mut contaminated_docs {
+            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
+            doc.doc_text
+                .push_str("domain_aliases: benchmark-shaped legacy text\n");
+            doc.doc_shape = doc.doc_shape.as_ref().map(|shape| {
+                shape.replace(
+                    &format!("semantic_doc_version={LLM_SYMBOL_DOC_SCHEMA_VERSION}"),
+                    &format!("semantic_doc_version={}", LLM_SYMBOL_DOC_SCHEMA_VERSION - 1),
+                )
+            });
+        }
+        let contaminated_count = contaminated_docs.len();
+        Storage::open(&storage_path)
+            .expect("reopen storage for schema downgrade")
+            .upsert_llm_symbol_docs_batch(&contaminated_docs)
+            .expect("persist downgraded semantic docs");
+
+        let mut contaminated_symbol_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs before schema downgrade")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs before schema downgrade");
+        assert!(
+            !contaminated_symbol_docs.is_empty(),
+            "fixture should persist graph-native semantic docs"
+        );
+        for doc in &mut contaminated_symbol_docs {
+            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
+            doc.doc_text
+                .push_str("domain_aliases: benchmark-shaped legacy text\n");
+        }
+        let contaminated_symbol_count = contaminated_symbol_docs.len();
+        Storage::open(&storage_path)
+            .expect("reopen storage for graph-native schema downgrade")
+            .upsert_symbol_search_docs_batch(&contaminated_symbol_docs)
+            .expect("persist downgraded graph-native semantic docs");
+
+        let repair_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("unchanged incremental refresh repairs semantic doc schema");
+        assert!(
+            repair_timings.semantic_docs_embedded.unwrap_or(0)
+                >= clamp_usize_to_u32(contaminated_count),
+            "schema drift must expand an empty incremental scope and rebuild all semantic docs"
+        );
+        assert!(
+            repair_timings.symbol_search_docs_written.unwrap_or(0)
+                >= clamp_usize_to_u32(contaminated_symbol_count),
+            "schema drift must rebuild all graph-native semantic docs"
+        );
+
+        let repaired_docs = Storage::open(&storage_path)
+            .expect("open storage after schema repair")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs after schema repair");
+        assert!(
+            repaired_docs.iter().all(|doc| {
+                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
+                    && !doc.doc_text.contains("domain_aliases:")
+            }),
+            "unchanged incremental repair should replace every previous-schema semantic document"
+        );
+        let repaired_symbol_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs after schema repair")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs after schema repair");
+        assert!(
+            repaired_symbol_docs.iter().all(|doc| {
+                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    && !doc.doc_text.contains("domain_aliases:")
+            }),
+            "unchanged incremental repair should replace every previous-schema graph-native semantic document"
+        );
+    }
+
+    #[test]
+    fn unchanged_incremental_refresh_repairs_graph_docs_without_embedding_runtime() {
+        let mut env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let mut contaminated_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs before schema downgrade")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs before schema downgrade");
+        assert!(
+            !contaminated_docs.is_empty(),
+            "fixture should persist graph-native semantic docs"
+        );
+        for doc in &mut contaminated_docs {
+            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
+            doc.doc_text
+                .push_str("domain_aliases: benchmark-shaped legacy text\n");
+        }
+        let contaminated_count = contaminated_docs.len();
+        Storage::open(&storage_path)
+            .expect("reopen storage for graph-native schema downgrade")
+            .upsert_symbol_search_docs_batch(&contaminated_docs)
+            .expect("persist downgraded graph-native semantic docs");
+
+        env.push(EnvGuard::set(
+            EMBEDDING_RUNTIME_MODE_ENV,
+            "unavailable-test-backend",
+        ));
+        env.push(EnvGuard::set(
+            EMBEDDING_BACKEND_ENV,
+            "unavailable-test-backend",
+        ));
+        let reopened = AppController::new();
+        reopened
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("reopen project without embedding runtime");
+        let repair_timings = reopened
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("unchanged incremental refresh repairs graph-native docs");
+        assert_eq!(
+            repair_timings.semantic_docs_embedded.unwrap_or(0),
+            0,
+            "unavailable embedding runtime should not fabricate dense semantic rebuilds"
+        );
+        assert!(
+            repair_timings.symbol_search_docs_written.unwrap_or(0)
+                >= clamp_usize_to_u32(contaminated_count),
+            "graph-native schema repair must not depend on a dense embedding runtime"
+        );
+
+        let repaired_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs after no-embedding repair")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs after no-embedding repair");
+        assert!(
+            repaired_docs.iter().all(|doc| {
+                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    && !doc.doc_text.contains("domain_aliases:")
+            }),
+            "no-embedding repair should replace every previous-schema graph-native semantic document"
         );
     }
 

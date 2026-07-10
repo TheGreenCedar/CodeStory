@@ -329,7 +329,7 @@ present. A zero-evaluated run is not quality proof.
 ## Bench Surface Checks
 
 ```sh
-node scripts/semantic-doc-leakage-check.mjs
+node scripts/lint-retrieval-generalization.mjs
 cargo check -p codestory-bench --bench <name>
 ```
 
