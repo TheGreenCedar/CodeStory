@@ -331,6 +331,7 @@ def stdio_status(cli: Path, project: Path, artifact: Path, timeout_secs: int) ->
         [str(cli), "serve", "--stdio", "--refresh", "none", "--project", str(project)],
         artifact,
         timeout_secs,
+        project,
     )
 
 
@@ -350,6 +351,7 @@ def plugin_stdio_status(
             ["node", str(launcher)],
             artifact,
             timeout_secs,
+            project,
             layer="plugin_stdio",
             cwd=project,
             env={
@@ -365,6 +367,7 @@ def stdio_status_command(
     command: list[str],
     artifact: Path,
     timeout_secs: int,
+    project: Path,
     layer: str = "serve_stdio",
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
@@ -388,7 +391,7 @@ def stdio_status_command(
             "jsonrpc": "2.0",
             "id": "status",
             "method": "resources/read",
-            "params": {"uri": STATUS_URI},
+            "params": {"uri": STATUS_URI, "project": str(project)},
         },
     ]
     transcript: list[dict] = []
@@ -1073,6 +1076,13 @@ def self_test() -> None:
         )
         run_gate(args)
         assert (out_dir / "summary.json").is_file()
+        stdio_artifact = read_json_file(out_dir / "serve-stdio-status.json")
+        status_request = next(
+            entry["request"]
+            for entry in stdio_artifact["transcript"]
+            if entry["request"].get("id") == "status"
+        )
+        assert status_request["params"]["project"] == str(project.resolve())
 
         version_only_out = root / "version-only-out"
         version_only_args = argparse.Namespace(**vars(args))
