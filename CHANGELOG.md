@@ -9,6 +9,9 @@
   handoff, and installer ownership proof. Release notes and contributor
   guidance now preserve Apple Silicon, Windows arm64 acceleration,
   older-glibc, marketplace, and full-sidecar proof boundaries.
+- Kept strict sidecar readiness fail-closed on interrupted index-run markers
+  without globally rejecting completed generations that contain parser-partial
+  files; parser coverage remains visible through file diagnostics.
 - Standardized JSON-mode CLI failures on one versioned error envelope, including
   argument parsing, ambiguity, smoke checks, runtime failures, and background
   repair terminal state. Compacted MCP status by referencing canonical

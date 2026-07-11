@@ -5108,17 +5108,6 @@ impl Storage {
         }
     }
 
-    pub fn first_incomplete_file_path(&self) -> Result<Option<PathBuf>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM file WHERE complete = 0 ORDER BY id LIMIT 1")?;
-        let mut rows = stmt.query([])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(PathBuf::from(row.get::<_, String>(0)?))),
-            None => Ok(None),
-        }
-    }
-
     pub fn get_node_kinds_for_files(
         &self,
         file_ids: &[i64],

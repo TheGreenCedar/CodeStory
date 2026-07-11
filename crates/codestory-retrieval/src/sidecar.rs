@@ -863,13 +863,6 @@ fn strict_readiness_unavailable_reason(
     {
         return Ok(None);
     }
-    if let Some(path) = storage
-        .first_incomplete_file_path()
-        .context("inspect incomplete indexed files")?
-    {
-        return Ok(Some(format!("indexed_file_incomplete: {}", path.display())));
-    }
-
     let embedding_backend = crate::embeddings::embedding_runtime_id();
     let expected_doc_backend = crate::embeddings::embedding_backend_label();
     if let Ok(stats) = storage.get_llm_symbol_doc_stats() {
@@ -1487,7 +1480,9 @@ mod tests {
     }
 
     #[test]
-    fn strict_readiness_rejects_unchanged_incomplete_indexed_file() {
+    fn strict_readiness_does_not_conflate_parser_partial_file_with_interrupted_run() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -1495,8 +1490,7 @@ mod tests {
         std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
         let indexed_mtime = live_mtime_millis(&source_path);
         let project_id = project_id_for_root(project.path());
-        let manifest = retrieval_manifest_fixture(&project_id, "current");
-        let storage = Store::open(&storage_path).expect("open db");
+        let mut storage = Store::open(&storage_path).expect("open db");
         storage
             .insert_file(&FileInfo {
                 id: 1,
@@ -1509,22 +1503,29 @@ mod tests {
                 file_role: FileRole::Source,
             })
             .expect("insert incomplete file");
-
-        let reason = strict_readiness_unavailable_reason(
-            project.path(),
-            &storage_path,
+        let input = compute_sidecar_input_fingerprint(
             &storage,
+            &storage_path,
+            project.path(),
             &project_id,
-            &manifest,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
         )
-        .expect("strict readiness")
-        .expect("incomplete file must degrade");
+        .expect("sidecar input");
+        let mut manifest = retrieval_manifest_fixture(&project_id, &input.hash);
+        manifest.built_at_epoch_ms = indexed_mtime;
+        manifest.projection_count = Some(input.projection_count);
+        manifest.symbol_doc_count = Some(input.symbol_doc_count);
+        manifest.dense_projection_count = Some(input.dense_projection_count);
+        manifest.semantic_policy_version = input.semantic_policy_version;
+        manifest.graph_artifact_hash = Some(input.graph_artifact_hash);
+        manifest.dense_reason_counts_json = Some(input.dense_reason_counts_json);
+        storage
+            .upsert_retrieval_index_manifest(&manifest)
+            .expect("manifest");
 
-        assert!(
-            reason.contains("indexed_file_incomplete"),
-            "unexpected reason: {reason}"
-        );
-        assert!(reason.contains(&source_path.display().to_string()));
+        validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
+            .expect("parser coverage must not masquerade as an interrupted transaction");
     }
 
     #[test]
