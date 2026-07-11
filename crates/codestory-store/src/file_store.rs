@@ -1,6 +1,6 @@
 use crate::{FileInfo, StorageError, Store};
 use codestory_contracts::workspace::StoredFileRecord;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Read-only file inventory facade.
@@ -38,6 +38,12 @@ impl<'a> FileStore<'a> {
 
     /// Return the compact inventory contract consumed by refresh planning.
     pub fn inventory(&self) -> Result<Vec<StoredFileRecord>, StorageError> {
+        let retry_required_file_ids = self
+            .storage
+            .get_errors(None)?
+            .into_iter()
+            .filter_map(|error| error.file_id.map(|id| id.0))
+            .collect::<HashSet<_>>();
         self.storage
             .get_files()?
             .into_iter()
@@ -48,8 +54,61 @@ impl<'a> FileStore<'a> {
                     modification_time: file.modification_time,
                     indexed: file.indexed,
                     complete: file.complete,
+                    retry_required: !file.complete && retry_required_file_ids.contains(&file.id),
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FileRole;
+    use codestory_contracts::graph::{ErrorInfo, IndexStep, NodeId};
+
+    #[test]
+    fn inventory_retries_file_errors_but_not_parser_partial_coverage() {
+        let storage = Store::new_in_memory().expect("storage");
+        for id in [1, 2] {
+            storage
+                .insert_file(&FileInfo {
+                    id,
+                    path: PathBuf::from(format!("src/{id}.rs")),
+                    language: "rust".into(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: false,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                })
+                .expect("file");
+        }
+        storage
+            .insert_error(&ErrorInfo {
+                message: "read failed".into(),
+                file_id: Some(NodeId(2)),
+                line: None,
+                column: None,
+                is_fatal: true,
+                index_step: IndexStep::Indexing,
+            })
+            .expect("error");
+
+        let inventory = storage.files().inventory().expect("inventory");
+        assert!(
+            !inventory
+                .iter()
+                .find(|file| file.id == 1)
+                .unwrap()
+                .retry_required
+        );
+        assert!(
+            inventory
+                .iter()
+                .find(|file| file.id == 2)
+                .unwrap()
+                .retry_required
+        );
     }
 }

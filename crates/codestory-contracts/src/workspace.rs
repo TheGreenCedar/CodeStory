@@ -14,6 +14,7 @@ pub struct StoredFileState {
     pub modification_time: i64,
     pub indexed: bool,
     pub complete: bool,
+    pub retry_required: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -28,6 +29,7 @@ pub struct IndexedFileRecord {
     pub modification_time: i64,
     pub indexed: bool,
     pub complete: bool,
+    pub retry_required: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -67,6 +69,7 @@ impl RefreshInputs {
                         modification_time: record.modification_time,
                         indexed: record.indexed,
                         complete: record.complete,
+                        retry_required: record.retry_required,
                     },
                 )
             })

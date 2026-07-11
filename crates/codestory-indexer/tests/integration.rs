@@ -116,6 +116,7 @@ fn test_failed_file_attempt_is_recorded_as_incomplete_with_attached_error() -> a
     let dir = tempdir()?;
     let root = dir.path();
     let file_path = root.join("broken.ts");
+    fs::create_dir(&file_path)?;
 
     let mut storage = Storage::new_in_memory()?;
     run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
@@ -144,6 +145,25 @@ fn test_failed_file_attempt_is_recorded_as_incomplete_with_attached_error() -> a
         "reindexing the same failed file should replace, not duplicate, its error"
     );
     assert_eq!(errors[0].file_id, Some(NodeId(file.id)));
+
+    fs::remove_dir(&file_path)?;
+    fs::write(&file_path, "function broken( {\n")?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+
+    let files = storage.get_files()?;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].id, file.id);
+    assert!(files[0].indexed);
+    assert!(
+        !files[0].complete,
+        "malformed source should remain visible as parser-partial coverage"
+    );
+    assert!(
+        storage.get_errors(None)?.is_empty(),
+        "a successful parser-partial retry should clear the historical file error"
+    );
+    let inventory = storage.files().inventory()?;
+    assert!(!inventory[0].retry_required);
 
     Ok(())
 }
@@ -269,6 +289,36 @@ fn test_incremental_indexing_second_run_reuses_unchanged_extraction_cache_and_re
 
     let nodes = storage.get_nodes()?;
     assert!(nodes.iter().any(|node| node.serialized_name == "run"));
+
+    Ok(())
+}
+
+#[test]
+fn test_cached_parser_partial_retry_clears_transient_file_error() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path();
+    let file_path = root.join("broken.ts");
+    let malformed_source = "function broken( {\n";
+    fs::write(&file_path, malformed_source)?;
+
+    let mut storage = Storage::new_in_memory()?;
+    let first_stats = run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+    assert_eq!(first_stats.artifact_cache_writes, 1);
+    assert!(!storage.get_files()?[0].complete);
+    assert!(storage.get_errors(None)?.is_empty());
+
+    fs::remove_file(&file_path)?;
+    fs::create_dir(&file_path)?;
+    run_incremental_indexing(root, &mut storage, vec![file_path.clone()])?;
+    assert_eq!(storage.get_errors(None)?.len(), 1);
+    assert!(storage.files().inventory()?[0].retry_required);
+
+    fs::remove_dir(&file_path)?;
+    fs::write(&file_path, malformed_source)?;
+    let retry_stats = run_incremental_indexing(root, &mut storage, vec![file_path])?;
+    assert_eq!(retry_stats.artifact_cache_hits, 1);
+    assert!(storage.get_errors(None)?.is_empty());
+    assert!(!storage.files().inventory()?[0].retry_required);
 
     Ok(())
 }

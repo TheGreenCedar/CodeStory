@@ -16,7 +16,7 @@ use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
 };
 use codestory_store::Store;
-use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
+use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -892,6 +892,16 @@ fn strict_readiness_unavailable_reason(
         embedding_dim,
     )
     .context("compute strict sidecar input fingerprint")?;
+    let stored_files = storage
+        .files()
+        .inventory()
+        .context("load indexed file inventory")?;
+    if let Some(file) = stored_files.iter().find(|file| file.retry_required) {
+        return Ok(Some(format!(
+            "indexed_file_error_retry_required: {}",
+            file.path.display()
+        )));
+    }
     if manifest.sidecar_input_hash.as_deref() == Some(current_input.hash.as_str())
         && manifest.projection_count == Some(current_input.projection_count)
         && manifest.symbol_doc_count == Some(current_input.symbol_doc_count)
@@ -907,18 +917,8 @@ fn strict_readiness_unavailable_reason(
 
     let workspace = WorkspaceManifest::open(project_root.to_path_buf())
         .context("open workspace manifest for strict sidecar readiness")?;
-    let files = storage.files().get_files().context("load indexed files")?;
     let refresh_inputs = RefreshInputs {
-        stored_files: files
-            .into_iter()
-            .map(|file| StoredFileState {
-                id: file.id,
-                path: file.path,
-                modification_time: file.modification_time,
-                indexed: file.indexed,
-                complete: file.complete,
-            })
-            .collect(),
+        stored_files,
         inventory: Default::default(),
     };
     let plan = workspace
@@ -1017,7 +1017,7 @@ mod tests {
     };
     use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
     use crate::test_support::retrieval_manifest_fixture;
-    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_contracts::graph::{ErrorInfo, IndexStep, Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_readiness_does_not_conflate_parser_partial_file_with_interrupted_run() {
+    fn strict_readiness_distinguishes_parser_partial_from_file_error() {
         let _lock = crate::test_support::env_lock();
         let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
@@ -1526,6 +1526,33 @@ mod tests {
 
         validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
             .expect("parser coverage must not masquerade as an interrupted transaction");
+
+        storage
+            .insert_error(&ErrorInfo {
+                message: "read failed".into(),
+                file_id: Some(NodeId(1)),
+                line: None,
+                column: None,
+                is_fatal: true,
+                index_step: IndexStep::Indexing,
+            })
+            .expect("file error");
+        let reason = strict_readiness_unavailable_reason(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+        )
+        .expect("strict readiness")
+        .expect("file error must degrade");
+        assert_eq!(
+            reason,
+            format!(
+                "indexed_file_error_retry_required: {}",
+                source_path.display()
+            )
+        );
     }
 
     #[test]
