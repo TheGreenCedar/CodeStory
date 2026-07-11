@@ -329,6 +329,21 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .expect("storage file stem");
+    let generation_root = parent.join(format!("{stem}.search-generations"));
+    if generation_root.is_dir() {
+        let mut generations = fs::read_dir(&generation_root)
+            .expect("list persisted search generations")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generations.len(),
+            1,
+            "fresh CLI fixture should publish exactly one search generation"
+        );
+        return generations.pop().expect("published search generation");
+    }
     parent.join(format!("{stem}.search"))
 }
 

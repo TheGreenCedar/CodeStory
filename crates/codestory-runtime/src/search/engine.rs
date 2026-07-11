@@ -1581,10 +1581,6 @@ impl PersistedSearchIndexGuard {
         Self::acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Shared)
     }
 
-    fn acquire_exclusive(search_dir: &Path) -> Result<Self> {
-        Self::acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Exclusive)
-    }
-
     fn acquire_with_mode(search_dir: &Path, mode: PersistedSearchIndexLockMode) -> Result<Self> {
         let lock_path = persisted_search_index_lock_path(search_dir);
         if let Some(parent) = lock_path
@@ -1634,12 +1630,10 @@ impl PersistedSearchIndexGuard {
         Self::try_acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Shared)
     }
 
-    #[cfg(test)]
     fn try_acquire_exclusive(search_dir: &Path) -> Result<Self> {
         Self::try_acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Exclusive)
     }
 
-    #[cfg(test)]
     fn try_acquire_with_mode(
         search_dir: &Path,
         mode: PersistedSearchIndexLockMode,
@@ -1697,6 +1691,36 @@ impl PersistedSearchIndexGuard {
     fn is_exclusive(&self) -> bool {
         self.mode == PersistedSearchIndexLockMode::Exclusive
     }
+
+    fn downgrade_to_shared(&mut self) -> Result<()> {
+        if !self.is_exclusive() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        FileExt::lock_shared(&self.file).with_context(|| {
+            format!(
+                "Failed to downgrade persisted search index lock {} to shared",
+                self.path.display()
+            )
+        })?;
+        #[cfg(not(unix))]
+        {
+            FileExt::unlock(&self.file).with_context(|| {
+                format!(
+                    "Failed to unlock persisted search index {} before shared reopen",
+                    self.path.display()
+                )
+            })?;
+            FileExt::lock_shared(&self.file).with_context(|| {
+                format!(
+                    "Failed to reacquire persisted search index lock {} as shared",
+                    self.path.display()
+                )
+            })?;
+        }
+        self.mode = PersistedSearchIndexLockMode::Shared;
+        Ok(())
+    }
 }
 
 impl Drop for PersistedSearchIndexGuard {
@@ -1710,7 +1734,7 @@ impl Drop for PersistedSearchIndexGuard {
     }
 }
 
-fn persisted_search_index_lock_path(search_dir: &Path) -> PathBuf {
+pub(crate) fn persisted_search_index_lock_path(search_dir: &Path) -> PathBuf {
     let mut path = search_dir.as_os_str().to_os_string();
     path.push(".lock");
     PathBuf::from(path)
@@ -1811,7 +1835,7 @@ impl SearchEngine {
     pub fn new(storage_path: Option<&Path>) -> Result<Self> {
         let schema = Self::build_schema();
         let index = if let Some(path) = storage_path {
-            let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+            let guard = PersistedSearchIndexGuard::try_acquire_exclusive(path)?;
             return Self::new_persisted_with_guard(path, guard);
         } else {
             Index::create_in_ram(schema)
@@ -1825,12 +1849,18 @@ impl SearchEngine {
         Self::open_persisted_with_guard(path, guard)
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_open_existing(path: &Path) -> Result<Self> {
+        let guard = PersistedSearchIndexGuard::try_acquire_shared(path)?;
+        Self::open_persisted_with_guard(path, guard)
+    }
+
     pub(crate) fn open_existing_or_recreate(path: &Path) -> Result<(Self, Option<anyhow::Error>)> {
         let shared_guard = PersistedSearchIndexGuard::acquire_shared(path)?;
         match Self::open_persisted_with_guard(path, shared_guard) {
             Ok(engine) => Ok((engine, None)),
             Err(open_error) => {
-                let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+                let guard = PersistedSearchIndexGuard::try_acquire_exclusive(path)?;
                 let engine = Self::new_persisted_with_guard(path, guard)?;
                 Ok((engine, Some(open_error)))
             }
@@ -1846,10 +1876,17 @@ impl SearchEngine {
         match guard.filter(|guard| guard.is_exclusive()) {
             Some(guard) => Self::new_persisted_with_guard(path, guard),
             None => {
-                let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+                let guard = PersistedSearchIndexGuard::try_acquire_exclusive(path)?;
                 Self::new_persisted_with_guard(path, guard)
             }
         }
+    }
+
+    pub(crate) fn downgrade_persisted_lock_to_shared(&mut self) -> Result<()> {
+        if let Some(guard) = self._persisted_index_guard.as_mut() {
+            guard.downgrade_to_shared()?;
+        }
+        Ok(())
     }
 
     fn new_persisted_with_guard(path: &Path, guard: PersistedSearchIndexGuard) -> Result<Self> {
@@ -1863,14 +1900,19 @@ impl SearchEngine {
         let schema = Self::build_schema();
         let index = Index::create_in_dir(path, schema)
             .with_context(|| format!("Failed to create tantivy index at {}", path.display()))?;
-        Self::new_with_index(index, Some(guard))
+        let mut engine = Self::new_with_index(index, Some(guard))?;
+        engine.full_text_index_enabled = true;
+        Ok(engine)
     }
 
     fn open_persisted_with_guard(path: &Path, guard: PersistedSearchIndexGuard) -> Result<Self> {
         let index = Index::open_in_dir(path)
             .with_context(|| format!("Failed to open tantivy index at {}", path.display()))?;
-        Self::new_with_index(index, Some(guard))
-            .with_context(|| format!("Failed to initialize tantivy reader at {}", path.display()))
+        let mut engine = Self::new_with_index(index, Some(guard)).with_context(|| {
+            format!("Failed to initialize tantivy reader at {}", path.display())
+        })?;
+        engine.full_text_index_enabled = true;
+        Ok(engine)
     }
 
     #[cfg(test)]
@@ -1900,6 +1942,10 @@ impl SearchEngine {
         if !self.full_text_index_enabled {
             return self.symbols.len();
         }
+        self.tantivy_doc_count()
+    }
+
+    pub(crate) fn tantivy_doc_count(&self) -> usize {
         self.reader.searcher().num_docs() as usize
     }
 
@@ -2232,8 +2278,14 @@ fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> SymbolC
 
 fn recreate_search_storage_dir(path: &Path) -> Result<()> {
     if path.exists() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("Failed to clear search index dir {}", path.display()))?;
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)
+                .with_context(|| format!("Failed to clear search index dir {}", path.display()))?;
+        } else {
+            std::fs::remove_file(path).with_context(|| {
+                format!("Failed to clear search index artifact {}", path.display())
+            })?;
+        }
     }
     std::fs::create_dir_all(path)
         .with_context(|| format!("Failed to create search index dir {}", path.display()))?;

@@ -8,6 +8,12 @@
   full and incremental core database. Typed store and runtime reads now expose
   the generation that owns the live graph, and cache finalization verifies that
   identity before clearing the incomplete-run compatibility fence.
+- Published persisted symbol-search indexes into UUID-scoped generation
+  directories selected only by the live core publication identity. Missing or
+  corrupt expected generations rebuild in place with document-count validation;
+  retention keeps the active generation plus one verified rollback, skips
+  locked readers, and preserves the legacy path for databases without an
+  identity.
 
 ### Fixed
 
