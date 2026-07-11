@@ -15,6 +15,20 @@ pub(crate) fn reconcile_before_enqueue(
     run_id: Option<&str>,
     cli_version: &str,
 ) -> BrokerReconciliationSnapshot {
+    #[cfg(test)]
+    return super::paths::with_test_broker_root(|| {
+        reconcile_before_enqueue_inner(project_root, cache_root, run_id, cli_version)
+    });
+    #[cfg(not(test))]
+    reconcile_before_enqueue_inner(project_root, cache_root, run_id, cli_version)
+}
+
+fn reconcile_before_enqueue_inner(
+    project_root: &Path,
+    cache_root: &Path,
+    run_id: Option<&str>,
+    cli_version: &str,
+) -> BrokerReconciliationSnapshot {
     if let Some(active) = ready_repair_status::active_ready_repair_status(project_root, run_id) {
         return BrokerReconciliationSnapshot {
             status: "active_repair".to_string(),

@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -140,7 +140,7 @@ fn indexed_fixture() -> HttpFixture {
     let cache_dir = tempfile::tempdir().expect("cache dir");
     write_deep_rust_workspace(workspace.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .arg("index")
         .arg("--refresh")
         .arg("full")
@@ -179,7 +179,7 @@ fn http_serve_rejects_non_loopback_addr_before_opening_runtime_state() {
     let cache_dir = tempfile::tempdir().expect("cache dir");
     write_deep_rust_workspace(workspace.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .arg("serve")
         .arg("--refresh")
         .arg("none")
@@ -207,7 +207,7 @@ fn http_serve_rejects_non_loopback_addr_before_opening_runtime_state() {
 
 fn spawn_http_server(fixture: &HttpFixture) -> (HttpServer, String) {
     let addr = free_local_addr();
-    let child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let child = test_support::cli_command()
         .arg("serve")
         .arg("--refresh")
         .arg("none")
@@ -737,3 +737,4 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
         "/symbols should honor an explicit bounded root limit: {one_symbol}"
     );
 }
+mod test_support;

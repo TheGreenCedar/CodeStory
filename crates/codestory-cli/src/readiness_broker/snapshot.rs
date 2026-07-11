@@ -19,6 +19,13 @@ use super::types::{
 };
 
 pub(crate) fn refresh_broker_snapshot(input: BrokerSnapshotInput) -> ReadinessBrokerSnapshot {
+    #[cfg(test)]
+    return super::paths::with_test_broker_root(|| refresh_broker_snapshot_inner(input));
+    #[cfg(not(test))]
+    refresh_broker_snapshot_inner(input)
+}
+
+fn refresh_broker_snapshot_inner(input: BrokerSnapshotInput) -> ReadinessBrokerSnapshot {
     let identity = codestory_workspace::project_identity_v2(&input.project_root);
     let runtime_identity = current_gpu_runtime_identity(&input, &identity);
     refresh_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref())
@@ -49,6 +56,13 @@ fn refresh_broker_snapshot_with_identity(
 }
 
 pub(crate) fn observe_broker_snapshot(input: BrokerSnapshotInput) -> ReadinessBrokerSnapshot {
+    #[cfg(test)]
+    return super::paths::with_test_broker_root(|| observe_broker_snapshot_inner(input));
+    #[cfg(not(test))]
+    observe_broker_snapshot_inner(input)
+}
+
+fn observe_broker_snapshot_inner(input: BrokerSnapshotInput) -> ReadinessBrokerSnapshot {
     let identity = codestory_workspace::cached_project_identity_v2(&input.project_root);
     let runtime_identity = current_gpu_runtime_identity(&input, &identity);
     observe_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref())
@@ -90,8 +104,10 @@ pub(super) fn refresh_broker_snapshot_with_runtime_identity(
     input: BrokerSnapshotInput,
     runtime_identity: Option<&BrokerGpuRuntimeIdentity>,
 ) -> ReadinessBrokerSnapshot {
-    let identity = codestory_workspace::project_identity_v2(&input.project_root);
-    refresh_broker_snapshot_with_identity(input, identity, runtime_identity)
+    super::paths::with_test_broker_root(|| {
+        let identity = codestory_workspace::project_identity_v2(&input.project_root);
+        refresh_broker_snapshot_with_identity(input, identity, runtime_identity)
+    })
 }
 
 #[cfg(test)]
@@ -99,8 +115,10 @@ pub(super) fn observe_broker_snapshot_with_runtime_identity(
     input: BrokerSnapshotInput,
     runtime_identity: Option<&BrokerGpuRuntimeIdentity>,
 ) -> ReadinessBrokerSnapshot {
-    let identity = codestory_workspace::cached_project_identity_v2(&input.project_root);
-    observe_broker_snapshot_with_identity(input, identity, runtime_identity)
+    super::paths::with_test_broker_root(|| {
+        let identity = codestory_workspace::cached_project_identity_v2(&input.project_root);
+        observe_broker_snapshot_with_identity(input, identity, runtime_identity)
+    })
 }
 
 fn current_gpu_runtime_identity(
@@ -112,11 +130,20 @@ fn current_gpu_runtime_identity(
     } else {
         codestory_retrieval::SidecarProfile::Local
     };
+    #[cfg(not(test))]
     let runtime = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
         &input.project_root,
         profile,
         input.agent_run_id.as_deref(),
     );
+    #[cfg(test)]
+    let runtime =
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(&input.project_root),
+            profile,
+            input.agent_run_id.as_deref(),
+            &super::paths::broker_cache_root(),
+        );
     let state: codestory_retrieval::SidecarStateFile =
         serde_json::from_slice(&fs::read(&runtime.layout.state_file).ok()?).ok()?;
     if !codestory_retrieval::sidecar_state_matches_runtime(&state, &runtime) {

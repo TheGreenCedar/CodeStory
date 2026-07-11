@@ -601,13 +601,18 @@ fn packet_search_live_eval_uses_fixed_run_id() {
         ],
     );
     assert_eq!(search.get_program(), live_eval_cli_path().as_os_str());
-    assert_eq!(search.get_envs().count(), live_eval_env().len());
     assert!(
         search
             .get_envs()
             .any(|(name, value)| name == "CODESTORY_SIDECAR_RUN_ID"
                 && value == Some(std::ffi::OsStr::new(LIVE_EVAL_RUN_ID))),
         "search subprocess must inherit the fixed live eval run id"
+    );
+    assert!(
+        search
+            .get_envs()
+            .any(|(name, value)| name == "CODESTORY_CACHE_ROOT" && value.is_some()),
+        "search subprocess must retain the integration-test state root"
     );
     let search_args = search
         .get_args()
@@ -661,7 +666,7 @@ fn packet_search_live_eval_honors_explicit_cli_path() {
     );
     assert_eq!(
         live_eval_cli_path_from(None),
-        PathBuf::from(env!("CARGO_BIN_EXE_codestory-cli"))
+        test_support::cli_binary_path()
     );
 }
 
@@ -855,7 +860,7 @@ fn live_eval_run_cli(project: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn base_cli_command(project: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(live_eval_cli_path());
+    let mut command = test_support::command(live_eval_cli_path());
     command.args(args);
     command.arg("--project").arg(project);
     command
@@ -877,7 +882,7 @@ fn live_eval_cli_path_from(explicit: Option<OsString>) -> PathBuf {
     explicit
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_codestory-cli")))
+        .unwrap_or_else(test_support::cli_binary_path)
 }
 
 fn run_command_with_timeout(
@@ -1076,3 +1081,4 @@ fn hits(json: &Value) -> impl Iterator<Item = &Value> {
         .flatten()
         .chain(json["repo_text_hits"].as_array().into_iter().flatten())
 }
+mod test_support;

@@ -85,7 +85,7 @@ fn write_docker_compose_fixture(root: &Path) {
 }
 
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .args(args)
         .arg("--project")
@@ -102,7 +102,7 @@ fn run_cli_with_stdin(
     args: &[&str],
     stdin: &str,
 ) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let mut child = test_support::cli_command()
         .args(args)
         .arg("--project")
         .arg(workspace)
@@ -129,7 +129,7 @@ fn run_cli_with_embedding_env(
     args: &[&str],
     envs: &[(&str, &str)],
 ) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .args(args)
         .arg("--project")
@@ -246,7 +246,7 @@ fn install_fake_managed_embeddings(cache_dir: &Path) {
 }
 
 fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let mut child = test_support::cli_command()
         .arg("serve")
         .arg("--stdio")
         .arg("--refresh")
@@ -2734,3 +2734,4 @@ fn context_json_reports_deep_trace_by_default() {
     );
     assert_sidecar_failure_output(context);
 }
+mod test_support;

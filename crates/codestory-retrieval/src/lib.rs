@@ -55,8 +55,10 @@ pub use config::{
     SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile,
     SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
     default_sidecar_image_pins, embedding_server_launch_mode, sidecar_runtime_auto,
-    sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id,
+    sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id, user_cache_root,
 };
+#[cfg(feature = "test-support")]
+pub use config::{active_test_cache_root, with_test_cache_root};
 pub use embeddings::{
     BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingRuntimeProbe,
     RETRIEVAL_EMBEDDING_DIM, embedding_backend_label, embedding_runtime_id,

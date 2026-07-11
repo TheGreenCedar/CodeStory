@@ -1,7 +1,6 @@
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::tempdir;
 
 #[test]
@@ -299,7 +298,7 @@ fn helper(value: &str) -> String {
 }
 
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .args(args)
         .arg("--project")
         .arg(workspace)
@@ -345,3 +344,4 @@ fn helper(value: &str) -> String {
     )
     .expect("write lib.rs");
 }
+mod test_support;

@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use tempfile::tempdir;
 
 fn write_tiny_project(root: &Path) {
@@ -9,7 +9,7 @@ fn write_tiny_project(root: &Path) {
 }
 
 fn run_cli(project: &Path, cache_dir: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.args(args);
     command.arg("--project").arg(project);
     command.arg("--cache-dir").arg(cache_dir);
@@ -165,3 +165,4 @@ fn unknown_sidecar_subcommand_suggests_status_without_runtime_side_effects() {
         "unknown sidecar subcommand should fail before runtime cache creation"
     );
 }
+mod test_support;

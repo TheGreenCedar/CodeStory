@@ -16,7 +16,6 @@ codestory-runtime = { workspace = true }
 codestory-workspace = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
-directories = { workspace = true }
 fs4 = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -31,4 +30,5 @@ crossterm = { workspace = true }
 ratatui = { workspace = true }
 
 [dev-dependencies]
+codestory-retrieval = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

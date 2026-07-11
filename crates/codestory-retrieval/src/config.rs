@@ -267,7 +267,22 @@ impl SidecarRuntimeConfig {
         profile: SidecarProfile,
         run_id: Option<&str>,
     ) -> Self {
-        let base = user_cache_root();
+        Self::for_project_profile_with_run_id_in_cache(
+            project_root,
+            profile,
+            run_id,
+            &user_cache_root(),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn for_project_profile_with_run_id_in_cache(
+        project_root: Option<&Path>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+        cache_root: &Path,
+    ) -> Self {
+        let base = cache_root.to_path_buf();
         let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id));
         let namespace = namespace_for(project_root, profile, run_id.as_deref());
         let state_file = match profile {
@@ -1092,9 +1107,69 @@ pub fn user_cache_root() -> PathBuf {
             return PathBuf::from(path);
         }
     }
+    #[cfg(feature = "test-support")]
+    if let Some(path) = active_test_cache_root() {
+        return path;
+    }
+    #[cfg(test)]
+    if let Some(path) = automatic_unit_test_cache_root() {
+        return path;
+    }
     ProjectDirs::from("dev", "codestory", "codestory")
         .map(|dirs| dirs.cache_dir().to_path_buf())
         .unwrap_or_else(|| std::env::temp_dir().join("codestory").join("cache"))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TEST_CACHE_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn active_test_cache_root() -> Option<PathBuf> {
+    TEST_CACHE_ROOT_OVERRIDE.with(|root| root.borrow().clone())
+}
+
+#[cfg(test)]
+fn automatic_unit_test_cache_root() -> Option<PathBuf> {
+    let thread = std::thread::current();
+    let name = thread.name()?;
+    if name == "main" {
+        return None;
+    }
+    static PROCESS_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let process_root = PROCESS_ROOT.get_or_init(|| {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join("codestory-unit-tests")
+            .join(format!("{}-{nonce}", std::process::id()))
+    });
+    let label = normalized_label_component(name)?;
+    let prefix = &label[..label.len().min(32)];
+    let root = process_root.join(format!("{prefix}-{}", &fnv1a_hex(label.as_bytes())[..12]));
+    std::fs::create_dir_all(root.join("sidecars")).ok()?;
+    Some(root)
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn with_test_cache_root<T>(root: &Path, task: impl FnOnce() -> T) -> T {
+    struct Reset(Option<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_CACHE_ROOT_OVERRIDE.with(|root| {
+                *root.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous =
+        TEST_CACHE_ROOT_OVERRIDE.with(|current| current.replace(Some(root.to_path_buf())));
+    let _reset = Reset(previous);
+    task()
 }
 
 /// Docker compose profile for mandatory sidecars.

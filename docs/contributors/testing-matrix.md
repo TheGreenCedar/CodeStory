@@ -55,6 +55,26 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 These are the default broad checks for code changes after the lane picker says
 workspace-wide proof is useful.
 
+CLI integration tests must launch `codestory-cli` through
+`tests/test_support::cli_command` (or `command` for a supplied binary). The
+helper assigns a process-and-test-thread state root and explicitly isolates the
+cache, stdio cache, install identity, and plugin data. Do not serialize the
+workspace suite or clean the real user cache to make a test pass. Broker tests
+that cross a worker-thread boundary must carry their injected test cache root
+into that thread.
+
+Use the isolation contract as the focused regression gate:
+
+```sh
+cargo test -p codestory-cli --test test_state_isolation
+cargo test -p codestory-cli --bin codestory-cli observe_broker_snapshot_
+```
+
+The first command exercises a controlled decoy user profile and fails if CLI
+state escapes the injected root or an integration test constructs the CLI
+directly. The second command keeps the historically competing broker snapshot
+tests in one default-concurrency run.
+
 Do not use `cargo test --workspace --all-targets` as the routine broad test
 gate. `--all-targets` expands into benchmark targets; Criterion benches are
 compiled or run through the bench lane below.

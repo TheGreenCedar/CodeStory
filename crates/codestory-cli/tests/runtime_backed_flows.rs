@@ -1,7 +1,6 @@
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tempfile::tempdir;
 
 fn copy_tictactoe_workspace() -> tempfile::TempDir {
@@ -28,7 +27,7 @@ fn copy_tictactoe_workspace() -> tempfile::TempDir {
 }
 
 fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.args(args);
     command.arg("--project").arg(workspace);
     command.output().expect("run codestory-cli")
@@ -235,3 +234,4 @@ fn trail_command_default_width_matches_query_dsl_trail() {
         "trail --query and query trail(...) should expose the same default graph width"
     );
 }
+mod test_support;

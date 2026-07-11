@@ -14,7 +14,6 @@ use codestory_runtime::{
     BookmarkService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService,
     Runtime,
 };
-use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
@@ -439,12 +438,8 @@ pub(crate) fn cache_root_for_project(
 ) -> Result<PathBuf> {
     match override_dir {
         Some(path) => Ok(path.to_path_buf()),
-        None => {
-            let base = ProjectDirs::from("dev", "codestory", "codestory")
-                .map(|dirs| dirs.cache_dir().to_path_buf())
-                .unwrap_or_else(|| std::env::temp_dir().join("codestory").join("cache"));
-            Ok(base.join(fnv1a_hex(project_root.to_string_lossy().as_bytes())))
-        }
+        None => Ok(codestory_retrieval::user_cache_root()
+            .join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
     }
 }
 
