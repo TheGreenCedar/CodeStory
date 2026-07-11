@@ -52,7 +52,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, BufRead};
@@ -3363,6 +3363,13 @@ fn build_search_state(
             .index_nodes(search_nodes)
             .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
     }
+    if search_storage_path.is_some() && engine.full_text_doc_count() != nodes.len() {
+        return Err(ApiError::internal(format!(
+            "Persisted search generation validation failed: indexed {} docs for {} nodes",
+            engine.full_text_doc_count(),
+            nodes.len()
+        )));
+    }
     let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
     let search_stats = SearchStateBuildStats {
         search_projection_rebuild_ms,
@@ -3982,6 +3989,314 @@ fn search_index_storage_path(storage_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.search"))
 }
 
+fn search_index_generation_root(storage_path: &Path) -> PathBuf {
+    let parent = storage_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("codestory");
+    parent.join(format!("{stem}.search-generations"))
+}
+
+fn search_index_path_for_publication(
+    storage_path: &Path,
+    publication: Option<&IndexPublicationRecord>,
+) -> Result<PathBuf, ApiError> {
+    match publication {
+        Some(publication) => Uuid::parse_str(&publication.generation_id)
+            .map(|generation_id| {
+                search_index_generation_root(storage_path).join(generation_id.to_string())
+            })
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Invalid index publication generation id {}: {error}",
+                    publication.generation_id
+                ))
+            }),
+        None => Ok(search_index_storage_path(storage_path)),
+    }
+}
+
+const SEARCH_GENERATION_COMPLETION_SCHEMA_VERSION: u32 = 1;
+const SEARCH_GENERATION_COMPLETION_FILE: &str = ".codestory-complete.json";
+const SEARCH_GENERATION_COMPLETION_MAX_BYTES: u64 = 4 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchGenerationCompletion {
+    schema_version: u32,
+    generation_id: String,
+    symbol_count: u64,
+    tantivy_doc_count: u64,
+}
+
+fn search_generation_completion_path(search_path: &Path) -> PathBuf {
+    search_path.join(SEARCH_GENERATION_COMPLETION_FILE)
+}
+
+fn read_search_generation_completion(
+    search_path: &Path,
+    expected_generation_id: &str,
+) -> Option<SearchGenerationCompletion> {
+    let marker_path = search_generation_completion_path(search_path);
+    let metadata = std::fs::metadata(&marker_path).ok()?;
+    if !metadata.is_file() || metadata.len() > SEARCH_GENERATION_COMPLETION_MAX_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&marker_path).ok()?;
+    let marker = serde_json::from_slice::<SearchGenerationCompletion>(&bytes).ok()?;
+    (marker.schema_version == SEARCH_GENERATION_COMPLETION_SCHEMA_VERSION
+        && marker.generation_id == expected_generation_id)
+        .then_some(marker)
+}
+
+fn write_search_generation_completion(
+    search_path: &Path,
+    publication: &IndexPublicationRecord,
+    symbol_count: usize,
+    tantivy_doc_count: usize,
+) -> Result<(), ApiError> {
+    let generation_id = Uuid::parse_str(&publication.generation_id)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Invalid index publication generation id {}: {error}",
+                publication.generation_id
+            ))
+        })?
+        .to_string();
+    let marker = SearchGenerationCompletion {
+        schema_version: SEARCH_GENERATION_COMPLETION_SCHEMA_VERSION,
+        generation_id,
+        symbol_count: symbol_count as u64,
+        tantivy_doc_count: tantivy_doc_count as u64,
+    };
+    let bytes = serde_json::to_vec(&marker).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to encode persisted search generation completion marker: {error}"
+        ))
+    })?;
+    let marker_path = search_generation_completion_path(search_path);
+    let temp_path = search_path.join(format!(".codestory-complete.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> Result<(), ApiError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to create persisted search completion temp file {}: {error}",
+                    temp_path.display()
+                ))
+            })?;
+        std::io::Write::write_all(&mut file, &bytes).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to write persisted search completion temp file {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to sync persisted search completion temp file {}: {error}",
+                temp_path.display()
+            ))
+        })?;
+        std::fs::rename(&temp_path, &marker_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to publish persisted search completion marker {}: {error}",
+                marker_path.display()
+            ))
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+struct SearchGenerationCatalogGuard {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl SearchGenerationCatalogGuard {
+    fn acquire(storage_path: &Path) -> Result<Self, ApiError> {
+        let mut path = search_index_generation_root(storage_path).into_os_string();
+        path.push(".lock");
+        let path = PathBuf::from(path);
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to create search generation catalog lock directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to open search generation catalog lock {}: {error}",
+                    path.display()
+                ))
+            })?;
+        FileExt::lock_exclusive(&file).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to acquire search generation catalog lock {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { file, path })
+    }
+}
+
+impl Drop for SearchGenerationCatalogGuard {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "Failed to unlock search generation catalog: {error}"
+            );
+        }
+    }
+}
+
+fn inspect_search_generation(path: &Path) -> Result<Option<bool>, ApiError> {
+    let lock_path = crate::search::engine::persisted_search_index_lock_path(path);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to open persisted search generation lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+    if !FileExt::try_lock_shared(&lock).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to inspect persisted search generation lock {}: {error}",
+            lock_path.display()
+        ))
+    })? {
+        return Ok(None);
+    }
+    let generation_id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let marker = read_search_generation_completion(path, generation_id);
+    let valid = marker.is_some_and(|marker| {
+        SearchEngine::open_existing(path)
+            .is_ok_and(|engine| engine.tantivy_doc_count() as u64 == marker.tantivy_doc_count)
+    });
+    let _ = FileExt::unlock(&lock);
+    Ok(Some(valid))
+}
+
+fn try_remove_search_generation(path: &Path) -> Result<bool, ApiError> {
+    let lock_path = crate::search::engine::persisted_search_index_lock_path(path);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to open persisted search generation lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+    if !FileExt::try_lock_exclusive(&lock).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to lock persisted search generation {} for removal: {error}",
+            path.display()
+        ))
+    })? {
+        return Ok(false);
+    }
+    let removal = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    };
+    let _ = FileExt::unlock(&lock);
+    removal.map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to remove persisted search generation {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(true)
+}
+
+fn prune_search_generations(
+    storage_path: &Path,
+    active_generation_id: &str,
+) -> Result<(), ApiError> {
+    let root = search_index_generation_root(storage_path);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let mut generations = std::fs::read_dir(&root)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to list persisted search generations {}: {error}",
+                root.display()
+            ))
+        })?
+        .filter_map(Result::ok)
+        .filter(|entry| !entry.file_name().to_string_lossy().ends_with(".lock"))
+        .collect::<Vec<_>>();
+    generations.sort_by_key(|entry| {
+        std::cmp::Reverse(
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH),
+        )
+    });
+
+    let mut rollback_retained = false;
+    for entry in generations {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == active_generation_id {
+            continue;
+        }
+        let well_formed = Uuid::parse_str(&name).is_ok();
+        let inspection = if well_formed {
+            inspect_search_generation(&path)?
+        } else {
+            Some(false)
+        };
+        match inspection {
+            Some(true) if !rollback_retained => rollback_retained = true,
+            Some(_) => {
+                let _ = try_remove_search_generation(&path)?;
+            }
+            None => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "Skipping locked persisted search generation during retention"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_search_symbol_projection(storage: &mut Storage) -> Result<u32, ApiError> {
     let count = storage.get_search_symbol_projection_count().map_err(|e| {
         ApiError::internal(format!(
@@ -4080,13 +4395,36 @@ fn load_persisted_search_state(
     ),
     ApiError,
 > {
+    let _catalog_guard = SearchGenerationCatalogGuard::acquire(storage_path)?;
+    *storage = Storage::open(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to reopen storage under search generation catalog lock: {error}"
+        ))
+    })?;
     ensure_search_symbol_projection(storage)?;
     let (node_names, projection) =
         load_search_symbol_projection(storage, SEARCH_SYMBOL_PROJECTION_BATCH_SIZE)?;
-    let search_storage_path = search_index_storage_path(storage_path);
+    let publication = storage.get_index_publication().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to read search publication identity: {error}"
+        ))
+    })?;
+    let search_storage_path =
+        search_index_path_for_publication(storage_path, publication.as_ref())?;
+    let completion = publication.as_ref().and_then(|publication| {
+        let generation_id = Uuid::parse_str(&publication.generation_id)
+            .ok()?
+            .to_string();
+        read_search_generation_completion(&search_storage_path, &generation_id)
+            .filter(|marker| marker.symbol_count == projection.len() as u64)
+    });
+    let completion_missing = publication.is_some() && completion.is_none();
 
-    let engine = if projection.is_empty() {
-        build_search_engine_from_projection(search_storage_path.as_path(), &projection)?
+    let (mut engine, rebuilt) = if projection.is_empty() || completion_missing {
+        (
+            build_search_engine_from_projection(search_storage_path.as_path(), &projection)?,
+            true,
+        )
     } else {
         let (mut engine, open_error) =
             SearchEngine::open_existing_or_recreate(search_storage_path.as_path())
@@ -4097,30 +4435,69 @@ fn load_persisted_search_state(
                 search_storage_path.display(),
                 error
             );
-            index_projection_into_search_engine(Ok(engine), &projection)?
+            (
+                index_projection_into_search_engine(Ok(engine), &projection)?,
+                true,
+            )
         } else {
             engine.load_symbol_projection(
                 projection
                     .iter()
                     .map(|entry| (entry.node_id, entry.display_name.clone())),
             );
-            if engine.full_text_doc_count() != projection.len() {
+            let completion_count_mismatch = completion.as_ref().is_some_and(|marker| {
+                marker.tantivy_doc_count != engine.tantivy_doc_count() as u64
+            });
+            if engine.full_text_doc_count() != projection.len() || completion_count_mismatch {
                 tracing::warn!(
-                    "Persisted search index at {} has {} docs but projection has {}. Rebuilding from projection.",
+                    "Persisted search index at {} has {} searchable docs and {} stored docs but projection has {}. Rebuilding from projection.",
                     search_storage_path.display(),
                     engine.full_text_doc_count(),
+                    engine.tantivy_doc_count(),
                     projection.len()
                 );
-                rebuild_search_engine_from_projection(
-                    search_storage_path.as_path(),
-                    &projection,
-                    engine,
-                )?
+                (
+                    rebuild_search_engine_from_projection(
+                        search_storage_path.as_path(),
+                        &projection,
+                        engine,
+                    )?,
+                    true,
+                )
             } else {
-                engine
+                (engine, false)
             }
         }
     };
+    if rebuilt && let Some(publication) = publication.as_ref() {
+        write_search_generation_completion(
+            &search_storage_path,
+            publication,
+            projection.len(),
+            engine.tantivy_doc_count(),
+        )?;
+    }
+    if publication.is_some() {
+        engine
+            .downgrade_persisted_lock_to_shared()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to share completed search generation {}: {error}",
+                    search_storage_path.display()
+                ))
+            })?;
+    }
+    let live_publication = Store::database_index_publication(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to revalidate live publication after loading persisted search: {error}"
+        ))
+    })?;
+    if live_publication != publication {
+        return Err(ApiError::new(
+            "cache_busy",
+            "Core publication changed while persisted search state was loading. Retry against the new generation.",
+        ));
+    }
     Ok((node_names, engine))
 }
 
@@ -10808,6 +11185,13 @@ fn index_full(
         )));
     }
     let staged_path = staged.path().to_path_buf();
+    let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
     let publish_started = std::time::Instant::now();
     if let Err(err) = staged.publish(storage_path) {
         return Err(ApiError::internal(format!(
@@ -11122,6 +11506,13 @@ where
         )));
     }
     let staged_path = staged.path().to_path_buf();
+    let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
     let publish_started = Instant::now();
     if let Err(error) = staged.publish(storage_path) {
         return Err(ApiError::internal(format!(
@@ -11248,26 +11639,167 @@ fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
     })
 }
 
+fn reuse_completed_search_state(
+    storage: &mut Storage,
+    search_storage_path: &Path,
+    publication: &IndexPublicationRecord,
+    nodes: &[codestory_contracts::graph::Node],
+    llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+    hydrate_semantic_docs: bool,
+) -> Result<Option<SearchStateBuildResult>, ApiError> {
+    let generation_id = Uuid::parse_str(&publication.generation_id)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Invalid index publication generation id {}: {error}",
+                publication.generation_id
+            ))
+        })?
+        .to_string();
+    let Some(marker) = read_search_generation_completion(search_storage_path, &generation_id)
+        .filter(|marker| marker.symbol_count == nodes.len() as u64)
+    else {
+        return Ok(None);
+    };
+
+    let projection_started = Instant::now();
+    match llm_refresh_scope {
+        Some(scope) => storage.rebuild_search_symbol_projection_for_file_scope(scope),
+        None => storage.rebuild_search_symbol_projection_from_node_table(),
+    }
+    .map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to rebuild search symbol projection before generation reuse: {error}"
+        ))
+    })?;
+    let search_projection_rebuild_ms = clamp_u128_to_u32(projection_started.elapsed().as_millis());
+
+    let search_index_started = Instant::now();
+    let mut engine = match SearchEngine::open_existing(search_storage_path) {
+        Ok(engine) => engine,
+        Err(error) => {
+            tracing::warn!(
+                path = %search_storage_path.display(),
+                "Completed persisted search generation could not be reopened and will be rebuilt: {error}"
+            );
+            return Ok(None);
+        }
+    };
+    let mut node_names = HashMap::with_capacity(nodes.len());
+    engine.load_symbol_projection(nodes.iter().map(|node| {
+        let display_name = node_display_name(node);
+        node_names.insert(node.id, display_name.clone());
+        (node.id, display_name)
+    }));
+    if engine.full_text_doc_count() != nodes.len()
+        || engine.tantivy_doc_count() as u64 != marker.tantivy_doc_count
+    {
+        tracing::warn!(
+            path = %search_storage_path.display(),
+            searchable_docs = engine.full_text_doc_count(),
+            stored_docs = engine.tantivy_doc_count(),
+            expected_symbols = nodes.len(),
+            expected_stored_docs = marker.tantivy_doc_count,
+            "Completed persisted search generation count validation failed and will be rebuilt"
+        );
+        return Ok(None);
+    }
+    let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
+    let semantic_stats = sync_llm_symbol_projection(
+        storage,
+        nodes,
+        &node_names,
+        &mut engine,
+        llm_refresh_scope,
+        hydrate_semantic_docs,
+    )?;
+    Ok(Some(SearchStateBuildResult {
+        node_names,
+        engine,
+        search_stats: SearchStateBuildStats {
+            search_projection_rebuild_ms,
+            search_symbol_index_ms,
+        },
+        semantic_stats,
+    }))
+}
+
 fn rebuild_search_state_from_storage(
     storage: &mut Storage,
     storage_path: &Path,
     llm_refresh_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     hydrate_semantic_docs: bool,
 ) -> Result<SearchStateBuildResult, ApiError> {
-    match storage.get_nodes() {
-        Ok(nodes) => build_search_state(
+    let publication = storage.get_index_publication().map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to read search publication identity: {error}"
+        ))
+    })?;
+    let _catalog_guard = publication
+        .as_ref()
+        .map(|_| SearchGenerationCatalogGuard::acquire(storage_path))
+        .transpose()?;
+    let search_storage_path =
+        search_index_path_for_publication(storage_path, publication.as_ref())?;
+    let nodes = storage
+        .get_nodes()
+        .map_err(|e| ApiError::internal(format!("Failed to load nodes for search rebuild: {e}")))?;
+    let reused = match publication.as_ref() {
+        Some(publication) => reuse_completed_search_state(
             storage,
-            Some(search_index_storage_path(storage_path).as_path()),
+            &search_storage_path,
+            publication,
+            &nodes,
+            llm_refresh_scope,
+            hydrate_semantic_docs,
+        )?,
+        None => None,
+    };
+    let built_new = reused.is_none();
+    let mut result = match reused {
+        Some(result) => result,
+        None => build_search_state(
+            storage,
+            Some(search_storage_path.as_path()),
             nodes,
             llm_refresh_scope,
             SemanticProjectionMode::PersistBackedDocs,
             hydrate_semantic_docs,
         )
-        .map_err(|e| ApiError::internal(format!("Failed to rebuild search state: {}", e.message))),
-        Err(e) => Err(ApiError::internal(format!(
-            "Failed to load nodes for search rebuild: {e}"
-        ))),
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to rebuild search state: {}", e.message))
+        })?,
+    };
+    if built_new && let Some(publication) = publication.as_ref() {
+        write_search_generation_completion(
+            &search_storage_path,
+            publication,
+            result.node_names.len(),
+            result.engine.tantivy_doc_count(),
+        )?;
     }
+    if publication.is_some() {
+        result
+            .engine
+            .downgrade_persisted_lock_to_shared()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to share completed search generation {}: {error}",
+                    search_storage_path.display()
+                ))
+            })?;
+    }
+    if publication.is_some()
+        && let Some(active_generation_id) =
+            search_storage_path.file_name().and_then(|id| id.to_str())
+        && let Err(error) = prune_search_generations(storage_path, active_generation_id)
+    {
+        tracing::warn!(
+            generation_id = %active_generation_id,
+            "Failed to prune persisted search generations after publication: {}",
+            error.message
+        );
+    }
+    Ok(result)
 }
 
 fn refresh_caches(
@@ -11463,6 +11995,10 @@ mod tests {
     impl HybridTestEnv {
         fn push(&mut self, guard: EnvGuard) {
             self.guards.push(guard);
+        }
+
+        fn pop(&mut self) {
+            self.guards.pop();
         }
     }
 
@@ -12758,6 +13294,31 @@ pub fn exact_symbol_anchor() {{}}
                 },
             ])
             .expect("insert semantic fixture nodes");
+    }
+
+    fn test_index_publication(generation: u64, generation_id: &str) -> IndexPublicationRecord {
+        IndexPublicationRecord {
+            generation,
+            generation_id: generation_id.to_string(),
+            run_id: format!("test-run-{generation}"),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: generation as i64,
+        }
+    }
+
+    fn persisted_search_generation_names(storage_path: &Path) -> Vec<String> {
+        let root = search_index_generation_root(storage_path);
+        if !root.is_dir() {
+            return Vec::new();
+        }
+        let mut names = fs::read_dir(root)
+            .expect("list persisted search generations")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     #[test]
@@ -16346,6 +16907,405 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn search_generation_path_rejects_invalid_publication_identity() {
+        let publication = test_index_publication(1, "../outside");
+        let error =
+            search_index_path_for_publication(Path::new("codestory.db"), Some(&publication))
+                .expect_err("path-shaped generation identity must be rejected");
+
+        assert_eq!(error.code, "internal");
+        assert!(
+            error
+                .message
+                .contains("Invalid index publication generation id")
+        );
+    }
+
+    #[test]
+    fn persisted_search_generations_do_not_overwrite_a_racing_reader() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let file_path = write_semantic_fixture(temp.path());
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        insert_semantic_fixture_nodes(&mut storage, &file_path);
+
+        let old_publication = test_index_publication(1, "11111111-1111-4111-8111-111111111111");
+        storage
+            .put_index_publication(&old_publication)
+            .expect("publish old core generation");
+        let old_state = rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+            .expect("build old search generation");
+        let old_path = search_index_path_for_publication(&storage_path, Some(&old_publication))
+            .expect("old path");
+        let same_generation_reader = SearchEngine::try_open_existing(&old_path)
+            .expect("completed builder must retain only a shared generation lock");
+        assert_eq!(same_generation_reader.tantivy_doc_count(), 3);
+        drop(same_generation_reader);
+
+        storage
+            .insert_nodes_batch(&[Node {
+                id: CoreNodeId(4),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "gamma_generation_anchor".to_string(),
+                qualified_name: Some("pkg::gamma_generation_anchor".to_string()),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(8),
+                end_line: Some(8),
+                ..Default::default()
+            }])
+            .expect("insert new-generation symbol");
+        let new_publication = test_index_publication(2, "22222222-2222-4222-8222-222222222222");
+        storage
+            .put_index_publication(&new_publication)
+            .expect("publish new core generation");
+        let new_state = rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+            .expect("build new search generation while old reader is live");
+
+        assert!(
+            old_state
+                .engine
+                .search_symbol("gamma_generation_anchor")
+                .is_empty(),
+            "old reader must remain bound to the old generation"
+        );
+        assert_eq!(
+            new_state.engine.search_symbol("gamma_generation_anchor"),
+            vec![CoreNodeId(4)]
+        );
+        let new_path = search_index_path_for_publication(&storage_path, Some(&new_publication))
+            .expect("new path");
+        assert!(old_path.is_dir());
+        assert!(new_path.is_dir());
+        assert_ne!(old_path, new_path);
+    }
+
+    #[test]
+    fn catalog_waiting_loader_reopens_core_and_search_as_one_generation() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let file_path = write_semantic_fixture(temp.path());
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        insert_semantic_fixture_nodes(&mut storage, &file_path);
+        let old_publication = test_index_publication(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        storage
+            .put_index_publication(&old_publication)
+            .expect("publish old identity");
+        drop(
+            rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+                .expect("build old generation"),
+        );
+
+        let stale_storage = Storage::open(&storage_path).expect("open pre-publication reader");
+        let catalog_guard =
+            SearchGenerationCatalogGuard::acquire(&storage_path).expect("hold catalog for publish");
+        let loader_path = storage_path.clone();
+        let (started_tx, started_rx) = unbounded();
+        let loader = std::thread::spawn(move || {
+            let mut stale_storage = stale_storage;
+            started_tx.send(()).expect("announce loader");
+            let (node_names, engine) =
+                load_persisted_search_state(&mut stale_storage, &loader_path)
+                    .expect("load post-publication generation");
+            let publication = stale_storage
+                .get_index_publication()
+                .expect("read loader publication");
+            (node_names, engine, publication)
+        });
+        started_rx.recv().expect("loader started");
+
+        let mut staged = SnapshotStore::clone_live_to_staged(&storage_path)
+            .expect("clone live database for replacement");
+        staged
+            .store_mut()
+            .get_connection()
+            .execute(
+                "UPDATE node
+                 SET serialized_name = 'gamma_generation',
+                     qualified_name = 'pkg::gamma_generation'
+                 WHERE id = 2",
+                [],
+            )
+            .expect("rename symbol in staged core");
+        staged
+            .store_mut()
+            .clear_search_symbol_projection()
+            .expect("clear staged projection");
+        staged
+            .store_mut()
+            .rebuild_search_symbol_projection_from_node_table()
+            .expect("rebuild staged projection");
+        let new_publication = test_index_publication(2, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+        staged
+            .store_mut()
+            .put_index_publication(&new_publication)
+            .expect("publish staged identity");
+        staged
+            .publish(&storage_path)
+            .expect("publish replacement core");
+
+        let mut live = Storage::open(&storage_path).expect("open replacement core");
+        let nodes = live.get_nodes().expect("load replacement nodes");
+        let search_path = search_index_path_for_publication(&storage_path, Some(&new_publication))
+            .expect("replacement search path");
+        let mut built = build_search_state(
+            &mut live,
+            Some(&search_path),
+            nodes,
+            None,
+            SemanticProjectionMode::PersistBackedDocs,
+            false,
+        )
+        .expect("build replacement search generation");
+        write_search_generation_completion(
+            &search_path,
+            &new_publication,
+            built.node_names.len(),
+            built.engine.tantivy_doc_count(),
+        )
+        .expect("complete replacement search generation");
+        built
+            .engine
+            .downgrade_persisted_lock_to_shared()
+            .expect("share replacement generation");
+        drop(catalog_guard);
+
+        let (node_names, engine, publication) = loader.join().expect("join loader");
+        assert_eq!(publication, Some(new_publication));
+        assert_eq!(
+            node_names.get(&CoreNodeId(2)).map(String::as_str),
+            Some("pkg::gamma_generation")
+        );
+        assert!(
+            engine
+                .search_symbol("gamma_generation")
+                .contains(&CoreNodeId(2))
+        );
+        drop(built);
+    }
+
+    #[test]
+    fn legacy_search_rebuild_cannot_delete_a_generation_reader() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("codestory.db");
+        let legacy_path = search_index_storage_path(&storage_path);
+        let mut legacy = SearchEngine::new(Some(&legacy_path)).expect("create legacy search index");
+        legacy
+            .index_nodes(vec![(CoreNodeId(1), "legacy_symbol".to_string())])
+            .expect("index legacy symbol");
+        drop(legacy);
+
+        let publication = test_index_publication(1, "88888888-8888-4888-8888-888888888888");
+        let generation_path = search_index_path_for_publication(&storage_path, Some(&publication))
+            .expect("generation path");
+        let mut generation =
+            SearchEngine::new(Some(&generation_path)).expect("create generation search index");
+        generation
+            .index_nodes(vec![(CoreNodeId(2), "generation_symbol".to_string())])
+            .expect("index generation symbol");
+
+        let replacement_legacy =
+            SearchEngine::new(Some(&legacy_path)).expect("rebuild independent legacy index");
+
+        assert!(generation_path.is_dir());
+        assert_eq!(
+            generation.search_symbol("generation_symbol"),
+            vec![CoreNodeId(2)]
+        );
+        drop(replacement_legacy);
+        drop(generation);
+    }
+
+    #[test]
+    fn missing_or_corrupt_expected_search_generation_is_rebuilt_in_place() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let file_path = write_semantic_fixture(temp.path());
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        insert_semantic_fixture_nodes(&mut storage, &file_path);
+        let publication = test_index_publication(1, "33333333-3333-4333-8333-333333333333");
+        storage
+            .put_index_publication(&publication)
+            .expect("publish core generation");
+        let expected_path = search_index_path_for_publication(&storage_path, Some(&publication))
+            .expect("expected path");
+        let (_, initial) = load_persisted_search_state(&mut storage, &storage_path)
+            .expect("rebuild missing expected generation");
+        assert!(expected_path.is_dir());
+        assert_eq!(initial.full_text_doc_count(), 3);
+        drop(initial);
+        fs::remove_dir_all(&expected_path).expect("remove initial generation");
+        fs::write(&expected_path, b"corrupt search generation")
+            .expect("write corrupt generation artifact");
+
+        let (_, rebuilt) = load_persisted_search_state(&mut storage, &storage_path)
+            .expect("rebuild corrupt expected generation");
+
+        assert!(expected_path.is_dir());
+        assert_eq!(rebuilt.full_text_doc_count(), 3);
+        assert!(rebuilt.search_symbol("alpha").contains(&CoreNodeId(2)));
+    }
+
+    #[test]
+    fn indexing_finisher_reuses_generation_built_by_post_swap_loader() {
+        let mut env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let file_path = write_semantic_fixture(temp.path());
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        insert_semantic_fixture_nodes(&mut storage, &file_path);
+        let publication = test_index_publication(1, "cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+        storage
+            .put_index_publication(&publication)
+            .expect("publish core identity");
+
+        env.push(EnvGuard::set(
+            crate::search::engine::SYMBOL_FULL_TEXT_INDEX_ENV,
+            "false",
+        ));
+        let (_, loader_engine) = load_persisted_search_state(&mut storage, &storage_path)
+            .expect("post-swap loader builds search generation");
+        env.pop();
+        let finisher_state =
+            rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+                .expect("indexing finisher reuses loader generation");
+
+        assert_eq!(loader_engine.tantivy_doc_count(), 3);
+        assert_eq!(finisher_state.engine.tantivy_doc_count(), 3);
+        assert!(
+            finisher_state
+                .engine
+                .search_symbol("alpha")
+                .contains(&CoreNodeId(2))
+        );
+    }
+
+    #[test]
+    fn search_generation_retention_keeps_active_and_one_verified_rollback() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("codestory.db");
+        let ids = [
+            "44444444-4444-4444-8444-444444444444",
+            "55555555-5555-4555-8555-555555555555",
+            "66666666-6666-4666-8666-666666666666",
+            "77777777-7777-4777-8777-777777777777",
+        ];
+        let mut engines = Vec::new();
+        for (offset, id) in ids.iter().enumerate() {
+            let publication = test_index_publication(offset as u64 + 1, id);
+            let path = search_index_path_for_publication(&storage_path, Some(&publication))
+                .expect("generation path");
+            let mut engine = SearchEngine::new(Some(&path)).expect("create search generation");
+            engine
+                .index_nodes(vec![(
+                    CoreNodeId(offset as i64 + 1),
+                    format!("symbol_{offset}"),
+                )])
+                .expect("index generation symbol");
+            write_search_generation_completion(&path, &publication, 1, engine.tantivy_doc_count())
+                .expect("complete search generation");
+            engines.push(engine);
+        }
+        let active_engine = engines.pop().expect("active engine");
+        let locked_old_engine = engines.remove(0);
+        drop(engines);
+        let malformed = search_index_generation_root(&storage_path).join("not-a-generation");
+        fs::create_dir_all(&malformed).expect("create malformed generation");
+        let malformed_file = search_index_generation_root(&storage_path).join("partial-generation");
+        fs::write(&malformed_file, b"partial").expect("create partial generation artifact");
+        let partial_publication = test_index_publication(8, "99999999-9999-4999-8999-999999999999");
+        let partial_path =
+            search_index_path_for_publication(&storage_path, Some(&partial_publication))
+                .expect("partial generation path");
+        let mut partial =
+            SearchEngine::new(Some(&partial_path)).expect("create crash-partial generation");
+        partial
+            .index_nodes(vec![(CoreNodeId(99), "partial_symbol".to_string())])
+            .expect("commit partial generation batch");
+        drop(partial);
+        let partial_lock_path =
+            crate::search::engine::persisted_search_index_lock_path(&partial_path);
+
+        prune_search_generations(&storage_path, ids[3]).expect("prune with locked reader");
+        assert!(!malformed.exists());
+        assert!(!malformed_file.exists());
+        assert!(
+            !partial_path.exists(),
+            "structurally openable generation without completion marker is not a rollback"
+        );
+        assert!(
+            partial_lock_path.is_file(),
+            "generation lock files must remain durable after data pruning"
+        );
+        let first_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial_lock_path)
+            .expect("open first durable lock handle");
+        let second_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial_lock_path)
+            .expect("open second durable lock handle");
+        assert!(FileExt::try_lock_exclusive(&first_lock).expect("lock first handle"));
+        assert!(
+            !FileExt::try_lock_exclusive(&second_lock).expect("contend second handle"),
+            "both handles must coordinate through the same durable lock file"
+        );
+        FileExt::unlock(&first_lock).expect("unlock first handle");
+        assert!(
+            FileExt::try_lock_exclusive(&second_lock).expect("lock second handle after release")
+        );
+        FileExt::unlock(&second_lock).expect("unlock second handle");
+        assert!(
+            search_index_generation_root(&storage_path)
+                .join(ids[0])
+                .is_dir(),
+            "locked old generation must be skipped"
+        );
+
+        drop(locked_old_engine);
+        prune_search_generations(&storage_path, ids[3]).expect("prune unlocked generations");
+        let retained = fs::read_dir(search_index_generation_root(&storage_path))
+            .expect("list retained generations")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2, "active plus one rollback should remain");
+        assert!(
+            retained.iter().any(|entry| entry.file_name() == ids[3]),
+            "active generation must remain"
+        );
+        drop(active_engine);
+    }
+
+    #[test]
+    fn search_without_publication_identity_uses_legacy_storage_path() {
+        let _env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let file_path = write_semantic_fixture(temp.path());
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        insert_semantic_fixture_nodes(&mut storage, &file_path);
+
+        let rebuilt = rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+            .expect("build legacy search index");
+
+        assert!(search_index_storage_path(&storage_path).is_dir());
+        assert!(!search_index_generation_root(&storage_path).exists());
+        assert!(
+            rebuilt
+                .engine
+                .search_symbol("beta")
+                .contains(&CoreNodeId(3))
+        );
+    }
+
+    #[test]
     fn merge_search_hits_by_node_id_keeps_stronger_expanded_score() {
         let mut hits = vec![
             SearchHit {
@@ -16939,7 +17899,7 @@ fn build_llm_symbol_doc_text() -> String {
             finalize_incremental_run: false,
             publication: IndexPublicationRecord {
                 generation: 1,
-                generation_id: "test-generation".to_string(),
+                generation_id: "11111111-1111-4111-8111-111111111111".to_string(),
                 run_id: "test-run".to_string(),
                 mode: IndexPublicationMode::Full,
                 published_at_epoch_ms: 1,
@@ -17212,7 +18172,7 @@ fn build_llm_symbol_doc_text() -> String {
             .begin_incremental_run()
             .expect("simulate interrupted incremental");
 
-        let search_path = search_index_storage_path(&storage_path);
+        let search_path = search_index_generation_root(&storage_path);
         if search_path.is_dir() {
             fs::remove_dir_all(&search_path).expect("remove search directory");
         }
@@ -17378,6 +18338,7 @@ fn build_llm_symbol_doc_text() -> String {
             baseline_snapshots,
             baseline_schema,
             baseline_publication,
+            baseline_search_generations,
         ) = {
             let storage = Storage::open(&storage_path).expect("open baseline storage");
             let paths = storage
@@ -17397,7 +18358,15 @@ fn build_llm_symbol_doc_text() -> String {
                 .get_index_publication()
                 .expect("read baseline publication")
                 .expect("baseline publication identity");
-            (paths, stats, snapshots, schema, publication)
+            let search_generations = persisted_search_generation_names(&storage_path);
+            (
+                paths,
+                stats,
+                snapshots,
+                schema,
+                publication,
+                search_generations,
+            )
         };
 
         fs::remove_file(&old_path).expect("remove old source");
@@ -17465,6 +18434,11 @@ fn build_llm_symbol_doc_text() -> String {
                     .expect("read live publication identity"),
                 Some(baseline_publication.clone()),
                 "pre-publish failure must not advance the live generation"
+            );
+            assert_eq!(
+                persisted_search_generation_names(&storage_path),
+                baseline_search_generations,
+                "pre-publish failure must not create search state for an unpublished generation"
             );
             storage
                 .get_connection()
@@ -17721,7 +18695,7 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("initial full index");
 
-        let (baseline_stats, baseline_snapshots, baseline_publication) = {
+        let (baseline_stats, baseline_snapshots, baseline_publication, baseline_search_generations) = {
             let storage = Storage::open(&storage_path).expect("open baseline storage");
             (
                 storage.get_stats().expect("baseline stats"),
@@ -17733,6 +18707,7 @@ fn build_llm_symbol_doc_text() -> String {
                     .get_index_publication()
                     .expect("baseline publication read")
                     .expect("baseline publication identity"),
+                persisted_search_generation_names(&storage_path),
             )
         };
         fs::write(
@@ -17790,6 +18765,11 @@ fn build_llm_symbol_doc_text() -> String {
                 .get_index_publication()
                 .expect("cancelled live publication"),
             Some(baseline_publication)
+        );
+        assert_eq!(
+            persisted_search_generation_names(&storage_path),
+            baseline_search_generations,
+            "cancelled incremental must not create search state for an unpublished generation"
         );
         assert!(
             storage
