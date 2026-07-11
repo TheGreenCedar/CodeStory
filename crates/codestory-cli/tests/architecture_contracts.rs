@@ -402,8 +402,10 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
-        runtime.contains("store.snapshots().refresh_all_with_stats()"),
-        "incremental refresh should use the snapshot surface for summary/detail refresh"
+        runtime.contains("SnapshotStore::clone_live_to_staged(storage_path)")
+            && runtime.contains("staged.snapshots().finalize_staged()")
+            && runtime.contains("staged.snapshots().refresh_detail()"),
+        "incremental refresh should clone, finalize both snapshot tiers, and publish through the staged snapshot surface"
     );
     assert!(
         !runtime.contains("create_deferred_secondary_indexes()")

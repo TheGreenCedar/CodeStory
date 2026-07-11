@@ -8064,26 +8064,23 @@ impl AppController {
                         }
                     };
                     result.and_then(|summary| {
-                        finish_incremental_run_marker(&summary, &storage_path)?;
-                        Ok(summary)
+                        controller.finish_successful_indexing(summary, &storage_path, true, None)
                     })
                 }
                 Err(error) => Err(error),
             };
 
             match result {
-                Ok(summary) => {
-                    controller.clear_search_state();
+                Ok(phase_timings) => {
                     controller.state.lock().is_indexing = false;
                     let _ = events_tx.send(AppEventPayload::IndexingComplete {
                         duration_ms: clamp_u128_to_u32(indexing_started.elapsed().as_millis()),
-                        phase_timings: summary.phase_timings,
+                        phase_timings,
                     });
                 }
                 Err(err) => {
                     let _ = events_tx.send(AppEventPayload::IndexingFailed { error: err.message });
-                    controller.clear_search_state();
-                    controller.state.lock().is_indexing = false;
+                    controller.recover_failed_indexing(&storage_path, true);
                 }
             }
         });
@@ -10901,69 +10898,114 @@ fn run_incremental_indexing_common<F>(
 where
     F: FnOnce(&WorkspaceManifest, &RefreshInputs) -> Result<RefreshExecutionPlan, ApiError>,
 {
-    let mut store = Store::open(storage_path)
-        .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-
-    if store.has_incomplete_incremental_run().map_err(|e| {
-        ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
-    })? {
+    let live_exists = storage_path.exists();
+    let live_is_incomplete = live_exists
+        && Store::database_has_incomplete_incremental_run(storage_path).map_err(|e| {
+            ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
+        })?;
+    if live_is_incomplete {
         let _ = events_tx.send(AppEventPayload::StatusUpdate {
             message: "A prior incremental index run was interrupted; rebuilding through staged full recovery."
                 .to_string(),
         });
-        drop(store);
         return index_full(root, storage_path, events_tx, cancel_token);
     }
     if is_indexing_cancelled(cancel_token) {
         return Err(indexing_cancelled_error());
     }
-    store.begin_incremental_run().map_err(|e| {
-        ApiError::internal(format!("Failed to persist incomplete index marker: {e}"))
-    })?;
-    store.invalidate_grounding_snapshots().map_err(|e| {
-        ApiError::internal(format!("Failed to invalidate derived index snapshots: {e}"))
-    })?;
 
-    let workspace = WorkspaceManifest::open(root.to_path_buf())
-        .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+    let mut staged = if live_exists {
+        SnapshotStore::clone_live_to_staged(storage_path).map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to clone live storage for incremental build: {e}"
+            ))
+        })?
+    } else {
+        SnapshotStore::open_staged(storage_path).map_err(|e| {
+            ApiError::internal(format!("Failed to open staged incremental storage: {e}"))
+        })?
+    };
+    let staged_result = (|| {
+        staged.store_mut().begin_incremental_run().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to persist staged incomplete index marker: {e}"
+            ))
+        })?;
+        staged
+            .store_mut()
+            .invalidate_grounding_snapshots()
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to invalidate staged derived index snapshots: {e}"
+                ))
+            })?;
 
-    let refresh_inputs = workspace_refresh_inputs(&store)?;
-    let execution_plan = refresh_builder(&workspace, &refresh_inputs)?;
+        let workspace = WorkspaceManifest::open(root.to_path_buf())
+            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+        let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
+        let execution_plan = refresh_builder(&workspace, &refresh_inputs)?;
 
-    let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
-    let _ = events_tx.send(AppEventPayload::IndexingStarted {
-        file_count: total_files,
-    });
+        let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
+        let _ = events_tx.send(AppEventPayload::IndexingStarted {
+            file_count: total_files,
+        });
 
-    let bus = EventBus::new();
-    let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
+        let bus = EventBus::new();
+        let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
+        if is_indexing_cancelled(cancel_token) {
+            drop(bus);
+            let _ = forwarder.join();
+            return Err(indexing_cancelled_error());
+        }
+        let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
+        let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
-    if is_indexing_cancelled(cancel_token) {
+        // Drop bus so forwarder unblocks.
         drop(bus);
         let _ = forwarder.join();
-        return Err(indexing_cancelled_error());
-    }
-    let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
-    let result = indexer.run(&mut store, &execution_plan, &bus, cancel_token);
 
-    // Drop bus so forwarder unblocks.
-    drop(bus);
-    let _ = forwarder.join();
-
-    let index_stats = match result {
-        Ok(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
-        Ok(stats) => stats,
-        Err(_) if is_indexing_cancelled(cancel_token) => return Err(indexing_cancelled_error()),
-        Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
-    };
-    let snapshot_refresh_stats = store.snapshots().refresh_all_with_stats().map_err(|e| {
-        ApiError::internal(format!("Failed to refresh live grounding snapshots: {e}"))
-    })?;
-    let summary_snapshot_ms = snapshot_refresh_stats.summary_snapshot_ms;
-    let detail_snapshot_ms = snapshot_refresh_stats.detail_snapshot_ms;
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
-    }
+        let index_stats = match result {
+            Ok(_) if is_indexing_cancelled(cancel_token) => {
+                return Err(indexing_cancelled_error());
+            }
+            Ok(stats) => stats,
+            Err(_) if is_indexing_cancelled(cancel_token) => {
+                return Err(indexing_cancelled_error());
+            }
+            Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
+        };
+        let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to finalize staged incremental storage: {e}"
+            ))
+        })?;
+        let detail_started = Instant::now();
+        staged.snapshots().refresh_detail().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to refresh staged grounding detail snapshot: {e}"
+            ))
+        })?;
+        let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
+        Ok((
+            index_stats,
+            execution_plan,
+            staged_finalize_stats,
+            detail_snapshot_ms,
+        ))
+    })();
+    let (index_stats, execution_plan, staged_finalize_stats, detail_snapshot_ms) =
+        match staged_result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = staged.discard();
+                return Err(error);
+            }
+        };
+    let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
+    let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
 
     let mut llm_refresh_scope = HashSet::new();
@@ -10973,13 +11015,27 @@ where
         } else {
             root.join(path)
         };
-        if let Ok(Some(file_info)) = store.get_file_by_path(&normalized_path) {
+        if let Ok(Some(file_info)) = staged.store_mut().get_file_by_path(&normalized_path) {
             llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
         }
     }
     for file_id in &execution_plan.files_to_remove {
         llm_refresh_scope.insert(codestory_contracts::graph::NodeId(*file_id));
     }
+
+    if is_indexing_cancelled(cancel_token) {
+        let _ = staged.discard();
+        return Err(indexing_cancelled_error());
+    }
+    let staged_path = staged.path().to_path_buf();
+    let publish_started = Instant::now();
+    if let Err(error) = staged.publish(storage_path) {
+        return Err(ApiError::internal(format!(
+            "Failed to publish staged incremental storage: {error}. Preserved staged snapshot at {}",
+            staged_path.display()
+        )));
+    }
+    let publish_ms = clamp_u128_to_u32(publish_started.elapsed().as_millis());
 
     Ok(IndexingRunSummary {
         phase_timings: IndexingPhaseTimings {
@@ -11009,10 +11065,10 @@ where
             semantic_dense_central_graph_node: None,
             semantic_dense_component_report: None,
             semantic_dense_unstructured_doc: None,
-            deferred_indexes_ms: None,
+            deferred_indexes_ms: Some(deferred_indexes_ms),
             summary_snapshot_ms: Some(summary_snapshot_ms),
             detail_snapshot_ms: Some(detail_snapshot_ms),
-            publish_ms: None,
+            publish_ms: Some(publish_ms),
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
             flush_files_ms: resolution_telemetry.flush_files_ms,
@@ -16810,6 +16866,58 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn async_incremental_finishes_cache_boundary_before_clearing_marker() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        let events = controller.events();
+
+        controller
+            .start_indexing(StartIndexingRequest {
+                mode: IndexMode::Incremental,
+            })
+            .expect("start async incremental");
+
+        let phase_timings = loop {
+            match events
+                .recv_timeout(Duration::from_secs(30))
+                .expect("async indexing terminal event")
+            {
+                AppEventPayload::IndexingComplete { phase_timings, .. } => break phase_timings,
+                AppEventPayload::IndexingFailed { error } => {
+                    panic!("async incremental failed: {error}")
+                }
+                _ => {}
+            }
+        };
+
+        assert!(phase_timings.publish_ms.is_some());
+        assert!(phase_timings.cache_refresh_ms.is_some());
+        let storage = Storage::open(&storage_path).expect("open published storage");
+        assert!(
+            !storage
+                .has_incomplete_incremental_run()
+                .expect("marker after async completion")
+        );
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("schema after async completion"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        assert!(!controller.state.lock().is_indexing);
+    }
+
+    #[test]
     fn incremental_cache_rebuild_failure_keeps_incomplete_marker() {
         let temp = tempdir().expect("create temp dir");
         let storage_path = temp.path().join("codestory.db");
@@ -16969,14 +17077,21 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[derive(Debug, Clone, Copy)]
     enum IncrementalFailureBoundary {
+        Projection,
         Cleanup,
         Resolution,
-        SnapshotRefresh,
+        SummarySnapshot,
+        DetailSnapshot,
         MarkerClear,
     }
 
     fn incremental_failure_trigger(boundary: IncrementalFailureBoundary) -> &'static str {
         match boundary {
+            IncrementalFailureBoundary::Projection => {
+                "CREATE TRIGGER fail_incremental_boundary
+                 BEFORE INSERT ON file
+                 BEGIN SELECT RAISE(ABORT, 'forced projection failure'); END;"
+            }
             IncrementalFailureBoundary::Cleanup => {
                 "CREATE TRIGGER fail_incremental_boundary
                  BEFORE DELETE ON file
@@ -16988,10 +17103,15 @@ fn build_llm_symbol_doc_text() -> String {
                  WHEN NEW.resolved_source_node_id IS NOT NULL
                  BEGIN SELECT RAISE(ABORT, 'forced resolution failure'); END;"
             }
-            IncrementalFailureBoundary::SnapshotRefresh => {
+            IncrementalFailureBoundary::SummarySnapshot => {
+                "CREATE TRIGGER fail_incremental_boundary
+                 BEFORE INSERT ON grounding_file_snapshot
+                 BEGIN SELECT RAISE(ABORT, 'forced summary snapshot failure'); END;"
+            }
+            IncrementalFailureBoundary::DetailSnapshot => {
                 "CREATE TRIGGER fail_incremental_boundary
                  BEFORE INSERT ON grounding_node_snapshot
-                 BEGIN SELECT RAISE(ABORT, 'forced snapshot failure'); END;"
+                 BEGIN SELECT RAISE(ABORT, 'forced detail snapshot failure'); END;"
             }
             IncrementalFailureBoundary::MarkerClear => {
                 "CREATE TRIGGER fail_incremental_boundary
@@ -17003,14 +17123,16 @@ fn build_llm_symbol_doc_text() -> String {
 
     fn incremental_failure_message(boundary: IncrementalFailureBoundary) -> &'static str {
         match boundary {
+            IncrementalFailureBoundary::Projection => "forced projection failure",
             IncrementalFailureBoundary::Cleanup => "forced cleanup failure",
             IncrementalFailureBoundary::Resolution => "forced resolution failure",
-            IncrementalFailureBoundary::SnapshotRefresh => "forced snapshot failure",
+            IncrementalFailureBoundary::SummarySnapshot => "forced summary snapshot failure",
+            IncrementalFailureBoundary::DetailSnapshot => "forced detail snapshot failure",
             IncrementalFailureBoundary::MarkerClear => "forced marker clear failure",
         }
     }
 
-    fn assert_interrupted_incremental_recovers(boundary: IncrementalFailureBoundary) {
+    fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
         let workspace = tempdir().expect("workspace dir");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let old_path = workspace.path().join("old.rs");
@@ -17027,6 +17149,24 @@ fn build_llm_symbol_doc_text() -> String {
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("initial full index");
+
+        let (baseline_paths, baseline_stats, baseline_snapshots, baseline_schema) = {
+            let storage = Storage::open(&storage_path).expect("open baseline storage");
+            let paths = storage
+                .get_files()
+                .expect("read baseline files")
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>();
+            let stats = storage.get_stats().expect("read baseline stats");
+            let snapshots = storage
+                .snapshots()
+                .get_metadata()
+                .expect("read baseline snapshot metadata");
+            let schema = Storage::database_schema_version(&storage_path)
+                .expect("read baseline schema version");
+            (paths, stats, snapshots, schema)
+        };
 
         fs::remove_file(&old_path).expect("remove old source");
         fs::write(
@@ -17053,68 +17193,111 @@ fn build_llm_symbol_doc_text() -> String {
             "wrong failure boundary for {boundary:?}: {error:?}"
         );
 
+        let is_pre_publish = !matches!(boundary, IncrementalFailureBoundary::MarkerClear);
+        if is_pre_publish {
+            let storage = Storage::open(&storage_path).expect("reopen live storage");
+            assert!(
+                !storage
+                    .has_incomplete_incremental_run()
+                    .expect("read live marker"),
+                "pre-publish failure must not mark live storage: {boundary:?}"
+            );
+            assert_eq!(
+                Storage::database_schema_version(&storage_path).expect("live schema version"),
+                baseline_schema,
+                "pre-publish failure must not change the live schema: {boundary:?}"
+            );
+            let live_paths = storage
+                .get_files()
+                .expect("read live files")
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>();
+            assert_eq!(live_paths, baseline_paths, "boundary={boundary:?}");
+            let live_stats = storage.get_stats().expect("read live stats");
+            assert_eq!(live_stats.node_count, baseline_stats.node_count);
+            assert_eq!(live_stats.edge_count, baseline_stats.edge_count);
+            assert_eq!(live_stats.file_count, baseline_stats.file_count);
+            assert_eq!(live_stats.error_count, baseline_stats.error_count);
+            assert_eq!(
+                storage
+                    .snapshots()
+                    .get_metadata()
+                    .expect("read live snapshot metadata"),
+                baseline_snapshots,
+                "pre-publish failure must preserve the complete old snapshot generation"
+            );
+            storage
+                .get_connection()
+                .execute_batch("DROP TRIGGER fail_incremental_boundary;")
+                .expect("remove injected live trigger");
+            drop(storage);
+
+            let dry_run = controller
+                .dry_run_index(IndexMode::Incremental)
+                .expect("dry-run direct retry");
+            assert_eq!(dry_run.refresh, IndexMode::Incremental);
+            let timings = controller
+                .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+                .expect("direct incremental retry");
+            assert!(timings.publish_ms.is_some());
+            let storage = Storage::open(&storage_path).expect("open retried storage");
+            assert!(
+                storage
+                    .get_file_by_path(&old_path)
+                    .expect("read old file after retry")
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .get_file_by_path(&new_path)
+                    .expect("read new file after retry")
+                    .is_some()
+            );
+            assert!(
+                !storage
+                    .has_incomplete_incremental_run()
+                    .expect("marker after direct retry")
+            );
+            return;
+        }
+
         {
-            let storage = Storage::open(&storage_path).expect("reopen interrupted storage");
+            let storage = Storage::open(&storage_path).expect("reopen published storage");
             assert!(
                 storage
                     .has_incomplete_incremental_run()
-                    .expect("read incomplete marker"),
-                "boundary={boundary:?}"
+                    .expect("read incomplete marker")
             );
             assert_ne!(
                 Storage::database_schema_version(&storage_path).expect("schema version"),
                 codestory_store::CURRENT_SCHEMA_VERSION,
-                "interrupted state must remain fenced from older runtimes"
+                "late failure must fence the published replacement"
             );
             assert!(
                 storage
                     .get_file_by_path(&new_path)
                     .expect("read new file")
-                    .is_some(),
-                "projection flush must commit before boundary={boundary:?}"
+                    .is_some()
             );
-            match boundary {
-                IncrementalFailureBoundary::Cleanup => assert!(
-                    storage
-                        .get_file_by_path(&old_path)
-                        .expect("read old file")
-                        .is_some(),
-                    "cleanup trigger should preserve the removed-file row"
-                ),
-                IncrementalFailureBoundary::Resolution
-                | IncrementalFailureBoundary::SnapshotRefresh
-                | IncrementalFailureBoundary::MarkerClear => assert!(
-                    storage
-                        .get_file_by_path(&old_path)
-                        .expect("read old file")
-                        .is_none(),
-                    "cleanup must commit before boundary={boundary:?}"
-                ),
-            }
-            if matches!(boundary, IncrementalFailureBoundary::SnapshotRefresh) {
-                assert!(
-                    storage
-                        .get_edges()
-                        .expect("read edges")
-                        .iter()
-                        .any(|edge| edge.resolved_target.is_some()),
-                    "resolution must commit before snapshot refresh"
-                );
-            }
-            if matches!(boundary, IncrementalFailureBoundary::MarkerClear) {
-                assert!(
-                    storage
-                        .snapshots()
-                        .has_ready_summary()
-                        .expect("summary readiness")
-                );
-                assert!(
-                    storage
-                        .snapshots()
-                        .has_ready_detail()
-                        .expect("detail readiness")
-                );
-            }
+            assert!(
+                storage
+                    .get_file_by_path(&old_path)
+                    .expect("read old file")
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .snapshots()
+                    .has_ready_summary()
+                    .expect("summary readiness")
+            );
+            assert!(
+                storage
+                    .snapshots()
+                    .has_ready_detail()
+                    .expect("detail readiness")
+            );
         }
 
         let recovery = AppController::new();
@@ -17169,14 +17352,16 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn interrupted_incremental_boundaries_fail_closed_and_recover_through_staged_full() {
+    fn incremental_boundaries_publish_atomically_and_late_failure_recovers() {
         for boundary in [
+            IncrementalFailureBoundary::Projection,
             IncrementalFailureBoundary::Cleanup,
             IncrementalFailureBoundary::Resolution,
-            IncrementalFailureBoundary::SnapshotRefresh,
+            IncrementalFailureBoundary::SummarySnapshot,
+            IncrementalFailureBoundary::DetailSnapshot,
             IncrementalFailureBoundary::MarkerClear,
         ] {
-            assert_interrupted_incremental_recovers(boundary);
+            assert_incremental_boundary_is_atomic(boundary);
         }
     }
 
@@ -17211,7 +17396,46 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn cancelled_incremental_stays_marked_until_recovery() {
+    fn cancelled_first_incremental_does_not_create_a_live_database() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let (events_tx, _events_rx) = unbounded();
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        let error = index_incremental(
+            workspace.path(),
+            &storage_path,
+            &events_tx,
+            Some(&cancel_token),
+        )
+        .expect_err("pre-cancelled first incremental must fail visibly");
+
+        assert_eq!(error.code, "cancelled");
+        assert!(
+            !storage_path.exists(),
+            "a cancelled first run must not manufacture a live generation"
+        );
+        let cache_dir = storage_path.parent().expect("cache parent");
+        if cache_dir.exists() {
+            let staged_artifacts = fs::read_dir(cache_dir)
+                .expect("list cache dir")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("read cache entries");
+            assert!(
+                staged_artifacts.is_empty(),
+                "cancelled first run left staged debris: {staged_artifacts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_incremental_preserves_live_generation_and_retries_incrementally() {
         let workspace = tempdir().expect("workspace dir");
         for index in 0..64 {
             fs::write(
@@ -17230,6 +17454,25 @@ fn build_llm_symbol_doc_text() -> String {
                 storage_path.clone(),
             )
             .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let (baseline_stats, baseline_snapshots) = {
+            let storage = Storage::open(&storage_path).expect("open baseline storage");
+            (
+                storage.get_stats().expect("baseline stats"),
+                storage
+                    .snapshots()
+                    .get_metadata()
+                    .expect("baseline snapshot metadata"),
+            )
+        };
+        fs::write(
+            workspace.path().join("module_0.rs"),
+            "pub fn replacement_value() -> i32 { 42 }\n",
+        )
+        .expect("change source before incremental");
 
         let events = controller.events();
         let cancel_token = CancellationToken::new();
@@ -17256,32 +17499,64 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(error.code, "cancelled");
         let storage = Storage::open(&storage_path).expect("open cancelled storage");
         assert!(
-            storage
+            !storage
                 .has_incomplete_incremental_run()
-                .expect("cancelled marker")
+                .expect("cancelled live marker")
+        );
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("cancelled live schema"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        let cancelled_stats = storage.get_stats().expect("cancelled live stats");
+        assert_eq!(cancelled_stats.node_count, baseline_stats.node_count);
+        assert_eq!(cancelled_stats.edge_count, baseline_stats.edge_count);
+        assert_eq!(cancelled_stats.file_count, baseline_stats.file_count);
+        assert_eq!(
+            storage
+                .snapshots()
+                .get_metadata()
+                .expect("cancelled snapshot metadata"),
+            baseline_snapshots
+        );
+        assert!(
+            storage
+                .get_nodes()
+                .expect("cancelled live nodes")
+                .iter()
+                .all(|node| node.serialized_name != "replacement_value")
         );
         drop(storage);
 
-        let recovery = AppController::new();
-        let summary = recovery
+        let summary = controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
                 storage_path.clone(),
             )
-            .expect("open cancelled project");
+            .expect("reopen cancelled project");
         assert_eq!(
             summary.freshness.expect("cancelled freshness").status,
             IndexFreshnessStatusDto::Stale
         );
-        let timings = recovery
+        let dry_run = controller
+            .dry_run_index(IndexMode::Incremental)
+            .expect("dry-run direct retry");
+        assert_eq!(dry_run.refresh, IndexMode::Incremental);
+        let timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("recover cancelled index");
+            .expect("retry cancelled incremental");
         assert!(timings.publish_ms.is_some());
-        let storage = Storage::open(&storage_path).expect("open recovered storage");
+        let storage = Storage::open(&storage_path).expect("open retried storage");
         assert!(
             !storage
                 .has_incomplete_incremental_run()
-                .expect("marker after recovery")
+                .expect("marker after retry")
+        );
+        assert!(
+            storage
+                .get_nodes()
+                .expect("retried nodes")
+                .iter()
+                .any(|node| node.serialized_name == "replacement_value")
         );
     }
 
