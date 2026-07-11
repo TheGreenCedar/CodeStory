@@ -17,6 +17,11 @@
 
 ### Fixed
 
+- Finalized graph-native and dense semantic documents in staged full and
+  incremental databases before core publication. Post-publication cache loads
+  now hydrate semantic state without rewriting live rows, and an unavailable
+  embedding runtime clears the dense corpus instead of carrying an incomplete
+  generation that could later be reported ready.
 - Staged incremental graph projection, removed-file cleanup, resolution,
   deferred indexes, and both grounding snapshot tiers in a coherent SQLite
   clone before publishing the new core generation. Pre-publication failures

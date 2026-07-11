@@ -3249,6 +3249,7 @@ fn read_line_capped<R: BufRead>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticProjectionMode {
     PersistBackedDocs,
+    LoadPersistedDocs,
     SkipPersistence,
 }
 
@@ -3272,6 +3273,17 @@ struct SemanticProjectionStats {
     dense_central_graph_node: u32,
     dense_component_report: u32,
     dense_unstructured_doc: u32,
+}
+
+struct ComponentReportRefreshScope {
+    previous_file_paths: HashMap<codestory_contracts::graph::NodeId, String>,
+    removed_component_keys: HashSet<String>,
+}
+
+#[derive(Clone, Copy)]
+struct SemanticRefreshScope<'a> {
+    file_ids: Option<&'a HashSet<codestory_contracts::graph::NodeId>>,
+    component_reports: Option<&'a ComponentReportRefreshScope>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3375,33 +3387,34 @@ fn build_search_state(
         search_projection_rebuild_ms,
         search_symbol_index_ms,
     };
-    if semantic_projection_mode == SemanticProjectionMode::PersistBackedDocs {
-        let semantic_stats = sync_llm_symbol_projection(
+    let semantic_stats = match semantic_projection_mode {
+        SemanticProjectionMode::PersistBackedDocs => sync_llm_symbol_projection(
             storage,
             &nodes,
             &node_names,
             &mut engine,
-            llm_refresh_file_scope,
+            SemanticRefreshScope {
+                file_ids: llm_refresh_file_scope,
+                component_reports: None,
+            },
             hydrate_semantic_docs,
-        )?;
-        Ok(SearchStateBuildResult {
-            node_names,
-            engine,
-            search_stats,
-            semantic_stats,
-        })
-    } else {
-        tracing::debug!(
-            "Skipping semantic doc persistence for transient build_search_state invocation"
-        );
-        engine.index_llm_symbol_docs(Vec::new());
-        Ok(SearchStateBuildResult {
-            node_names,
-            engine,
-            search_stats,
-            semantic_stats: SemanticProjectionStats::default(),
-        })
-    }
+            None,
+        )?,
+        SemanticProjectionMode::LoadPersistedDocs => {
+            load_persisted_semantic_docs(storage, &mut engine, hydrate_semantic_docs)?
+        }
+        SemanticProjectionMode::SkipPersistence => {
+            tracing::debug!("Skipping semantic docs for transient search-state build");
+            engine.index_llm_symbol_docs(Vec::new());
+            SemanticProjectionStats::default()
+        }
+    };
+    Ok(SearchStateBuildResult {
+        node_names,
+        engine,
+        search_stats,
+        semantic_stats,
+    })
 }
 
 fn current_epoch_ms() -> i64 {
@@ -4637,6 +4650,17 @@ fn retrieval_state_from_storage(storage: &Storage) -> Result<RetrievalStateDto, 
     let probe = embedding_runtime_availability_from_env();
     let current_embedding = current_embedding_contract_from_env();
     let stored_embedding = stored_semantic_docs_contract_from_stats(&stats);
+    let contract_mismatch = stats.doc_count > 0
+        && probe.available
+        && !current_embedding
+            .as_ref()
+            .is_some_and(|contract| semantic_doc_stats_match_contract(&stats, contract));
+    let fallback_message = probe.fallback_message.or_else(|| {
+        contract_mismatch.then(|| {
+            "Stored semantic docs do not match the current embedding contract. Run `retrieval index --refresh full` before trusting hybrid retrieval."
+                .to_string()
+        })
+    });
     Ok(retrieval_state_from_parts(
         stats.doc_count,
         stats
@@ -4649,11 +4673,36 @@ fn retrieval_state_from_storage(storage: &Storage) -> Result<RetrievalStateDto, 
             })
             .or(probe.model_id),
         probe.available,
-        probe.fallback_message,
+        fallback_message,
         current_embedding,
         Some(stored_embedding),
-        false,
+        contract_mismatch,
     ))
+}
+
+fn semantic_doc_stats_match_contract(
+    stats: &LlmSymbolDocStats,
+    contract: &EmbeddingProfileContractDto,
+) -> bool {
+    !stats.mixed_embedding_profiles
+        && !stats.mixed_embedding_models
+        && !stats.mixed_embedding_backends
+        && !stats.mixed_dimensions
+        && !stats.mixed_doc_versions
+        && !stats.mixed_doc_shapes
+        && !stats.mixed_semantic_policy_versions
+        && stats.embedding_profile.as_deref() == Some(contract.profile.as_str())
+        && stats.embedding_model.as_deref() == Some(contract.cache_key.as_str())
+        && stats.embedding_backend.as_deref() == Some(contract.backend.as_str())
+        && stats.embedding_dim.is_some_and(|dimension| {
+            dimension > 0
+                && contract
+                    .dimension
+                    .is_none_or(|expected| expected == dimension)
+        })
+        && stats.doc_version == Some(LLM_SYMBOL_DOC_SCHEMA_VERSION)
+        && stats.doc_shape.as_deref() == Some(contract.doc_shape.as_str())
+        && stats.semantic_policy_version.as_deref() == Some(SEMANTIC_POLICY_VERSION)
 }
 
 fn stored_semantic_docs_contract_from_stats(
@@ -5992,9 +6041,13 @@ fn flush_pending_llm_symbol_docs(
     embedding_contract: &EmbeddingProfileContractDto,
     updated_at_epoch_ms: i64,
     stats: &mut SemanticProjectionStats,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<(), ApiError> {
     if batch.is_empty() {
         return Ok(());
+    }
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
     }
 
     let payloads = batch
@@ -6008,6 +6061,9 @@ fn flush_pending_llm_symbol_docs(
     stats.embedding_ms = stats
         .embedding_ms
         .saturating_add(clamp_u128_to_u32(embedding_started.elapsed().as_millis()));
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
 
     let docs = batch
         .iter()
@@ -6035,9 +6091,21 @@ fn flush_pending_llm_symbol_docs(
         })
         .collect::<Vec<_>>();
 
+    persist_embedded_llm_symbol_docs(storage, &docs, stats, cancel_token)
+}
+
+fn persist_embedded_llm_symbol_docs(
+    storage: &mut Storage,
+    docs: &[LlmSymbolDoc],
+    stats: &mut SemanticProjectionStats,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(), ApiError> {
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
     let upsert_started = Instant::now();
     storage
-        .upsert_llm_symbol_docs_batch(&docs)
+        .upsert_llm_symbol_docs_batch(docs)
         .map_err(|e| ApiError::internal(format!("Failed to upsert LLM symbol docs: {e}")))?;
     stats.db_upsert_ms = stats
         .db_upsert_ms
@@ -6045,33 +6113,6 @@ fn flush_pending_llm_symbol_docs(
     stats.docs_embedded = stats
         .docs_embedded
         .saturating_add(clamp_usize_to_u32(docs.len()));
-
-    Ok(())
-}
-
-fn flush_streaming_llm_symbol_doc_window(
-    storage: &mut Storage,
-    engine: &mut SearchEngine,
-    pending_docs: &mut Vec<PendingLlmSymbolDoc>,
-    embed_batch_size: usize,
-    embedding_contract: &EmbeddingProfileContractDto,
-    updated_at_epoch_ms: i64,
-    stats: &mut SemanticProjectionStats,
-) -> Result<(), ApiError> {
-    if pending_docs.len() < embed_batch_size {
-        return Ok(());
-    }
-
-    sort_pending_llm_symbol_docs_for_embedding_batches(pending_docs);
-    flush_pending_llm_symbol_docs(
-        storage,
-        engine,
-        &pending_docs[..embed_batch_size],
-        embedding_contract,
-        updated_at_epoch_ms,
-        stats,
-    )?;
-    pending_docs.drain(..embed_batch_size);
     Ok(())
 }
 
@@ -6080,13 +6121,17 @@ fn sync_llm_symbol_projection(
     nodes: &[codestory_contracts::graph::Node],
     node_names: &HashMap<codestory_contracts::graph::NodeId, String>,
     engine: &mut SearchEngine,
-    llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+    refresh_scope: SemanticRefreshScope<'_>,
     hydrate_semantic_docs: bool,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<SemanticProjectionStats, ApiError> {
     let mut stats = SemanticProjectionStats {
         reported: true,
         ..Default::default()
     };
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
 
     if !hybrid_retrieval_enabled() {
         if hydrate_semantic_docs {
@@ -6117,7 +6162,7 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
-    let graph_doc_schema_mismatch = llm_refresh_file_scope.is_some()
+    let graph_doc_schema_mismatch = refresh_scope.file_ids.is_some()
         && storage
             .has_symbol_search_doc_version_mismatch(LLM_SYMBOL_DOC_SCHEMA_VERSION)
             .map_err(|e| {
@@ -6126,7 +6171,7 @@ fn sync_llm_symbol_projection(
                 ))
             })?;
     let dense_doc_contract_mismatch = embedding_contract.as_ref().is_some_and(|contract| {
-        llm_refresh_file_scope.is_some()
+        refresh_scope.file_ids.is_some()
             && existing_docs
                 .values()
                 .any(|existing_doc| !llm_symbol_doc_contract_matches(existing_doc, contract))
@@ -6143,20 +6188,8 @@ fn sync_llm_symbol_projection(
     let effective_llm_refresh_file_scope = if expand_semantic_scope_for_contract_repair {
         None
     } else {
-        llm_refresh_file_scope
+        refresh_scope.file_ids
     };
-
-    if let Some(scope) = effective_llm_refresh_file_scope
-        && scope.is_empty()
-    {
-        if hydrate_semantic_docs {
-            let reload_started = Instant::now();
-            reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-            stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
-        }
-        return Ok(stats);
-    }
-
     let embed_batch_size = llm_doc_embed_batch_size();
     let stream_pending_docs = stream_pending_llm_symbol_docs_from_env();
     let stream_sort_window_batches = semantic_stream_sort_window_batches_from_env();
@@ -6165,11 +6198,17 @@ fn sync_llm_symbol_projection(
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_symbol_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut seen_dense_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
+    let mut component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
+    let mut dense_component_report_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut doc_build_ns = 0_u128;
-    let semantic_nodes = nodes
+    let all_semantic_nodes = nodes
         .iter()
         .filter(|node| llm_indexable_kind(node.kind))
         .filter(|node| !is_retrieval_artifact_node(node))
+        .collect::<Vec<_>>();
+    let semantic_nodes = all_semantic_nodes
+        .iter()
+        .copied()
         .filter(|node| {
             effective_llm_refresh_file_scope
                 .map(|scope| {
@@ -6180,6 +6219,82 @@ fn sync_llm_symbol_projection(
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
+    let file_paths = semantic_file_table_path_map(
+        storage
+            .get_files()
+            .map_err(|e| ApiError::internal(format!("Failed to load semantic doc files: {e}")))?,
+    );
+    let effective_component_report_scope = if expand_semantic_scope_for_contract_repair {
+        None
+    } else if let Some(refresh) = refresh_scope.component_reports {
+        let normalization_changed =
+            refresh
+                .previous_file_paths
+                .iter()
+                .any(|(file_id, old_path)| {
+                    file_paths
+                        .get(file_id)
+                        .is_some_and(|new_path| new_path != old_path)
+                });
+        if normalization_changed {
+            tracing::warn!(
+                "Semantic file-path normalization changed; rebuilding all component reports"
+            );
+            None
+        } else {
+            let mut scope = refresh.removed_component_keys.clone();
+            if let Some(file_scope) = effective_llm_refresh_file_scope {
+                for file_id in file_scope {
+                    if let Some(component_key) = file_paths
+                        .get(file_id)
+                        .and_then(|path| semantic_component_key_for_path(Some(path)))
+                    {
+                        scope.insert(component_key);
+                    }
+                }
+            }
+            Some(scope)
+        }
+    } else {
+        None
+    };
+    if let Some(scope) = effective_component_report_scope.as_ref() {
+        for node in nodes.iter().filter(|node| is_retrieval_artifact_node(node)) {
+            let component_key = node
+                .serialized_name
+                .strip_prefix("component_report:")
+                .unwrap_or(&node.serialized_name);
+            if !scope.contains(component_key) {
+                component_report_node_ids.push(node.id);
+                dense_component_report_node_ids.push(node.id);
+            }
+        }
+    }
+    let report_semantic_nodes = all_semantic_nodes
+        .iter()
+        .copied()
+        .filter(|node| {
+            effective_component_report_scope
+                .as_ref()
+                .map(|scope| {
+                    node.file_node_id
+                        .and_then(|file_node_id| file_paths.get(&file_node_id))
+                        .and_then(|path| semantic_component_key_for_path(Some(path)))
+                        .is_some_and(|component_key| scope.contains(&component_key))
+                })
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let mut context_nodes = semantic_nodes.clone();
+    let mut context_node_ids = semantic_nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    for node in &report_semantic_nodes {
+        if context_node_ids.insert(node.id) {
+            context_nodes.push(*node);
+        }
+    }
     let semantic_node_ids = semantic_nodes
         .iter()
         .map(|node| node.id)
@@ -6187,12 +6302,15 @@ fn sync_llm_symbol_projection(
     let component_access = storage
         .get_component_access_map_for_nodes(&semantic_node_ids)
         .map_err(|e| ApiError::internal(format!("Failed to load symbol access metadata: {e}")))?;
-    let graph_context = SemanticDocGraphContext::build(storage, &semantic_nodes, nodes)?;
+    let graph_context = SemanticDocGraphContext::build(storage, &context_nodes, nodes)?;
     let file_cache_started = Instant::now();
     let file_text_cache = build_semantic_file_text_cache(&graph_context, &semantic_nodes);
     doc_build_ns = doc_build_ns.saturating_add(file_cache_started.elapsed().as_nanos());
 
     for semantic_window in semantic_nodes.chunks(stream_sort_window_size.max(1)) {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
         let doc_build_started = Instant::now();
         let built_docs = semantic_window
             .par_iter()
@@ -6276,6 +6394,9 @@ fn sync_llm_symbol_projection(
             })
             .collect::<Vec<_>>();
         doc_build_ns = doc_build_ns.saturating_add(doc_build_started.elapsed().as_nanos());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
 
         let symbol_docs = built_docs
             .iter()
@@ -6310,31 +6431,42 @@ fn sync_llm_symbol_projection(
         }
 
         while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
             let Some(embedding_contract) = embedding_contract.as_ref() else {
                 break;
             };
-            flush_streaming_llm_symbol_doc_window(
+            sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
+            flush_pending_llm_symbol_docs(
                 storage,
                 engine,
-                &mut pending_docs,
-                embed_batch_size,
+                &pending_docs[..embed_batch_size],
                 embedding_contract,
                 updated_at_epoch_ms,
                 &mut stats,
+                cancel_token,
             )?;
+            pending_docs.drain(..embed_batch_size);
         }
     }
 
-    if effective_llm_refresh_file_scope.is_none() {
+    {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
         let report_build_started = Instant::now();
         let built_reports = build_component_report_docs(
             &graph_context,
-            &semantic_nodes,
+            &report_semantic_nodes,
             &existing_docs,
             embedding_contract.as_ref(),
             updated_at_epoch_ms,
         );
         doc_build_ns = doc_build_ns.saturating_add(report_build_started.elapsed().as_nanos());
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
+        }
         if !built_reports.is_empty() {
             let report_symbol_docs = built_reports
                 .iter()
@@ -6375,11 +6507,13 @@ fn sync_llm_symbol_projection(
 
             for built_doc in built_reports {
                 seen_symbol_node_ids.push(built_doc.symbol_doc.node_id);
+                component_report_node_ids.push(built_doc.symbol_doc.node_id);
                 let Some(pending_doc) = built_doc.pending else {
                     stats.dense_docs_skipped = stats.dense_docs_skipped.saturating_add(1);
                     continue;
                 };
                 seen_dense_node_ids.push(pending_doc.node_id);
+                dense_component_report_node_ids.push(pending_doc.node_id);
                 observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
                 if built_doc.reusable {
                     stats.docs_reused = stats.docs_reused.saturating_add(1);
@@ -6390,18 +6524,23 @@ fn sync_llm_symbol_projection(
             }
 
             while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+                if is_indexing_cancelled(cancel_token) {
+                    return Err(indexing_cancelled_error());
+                }
                 let Some(embedding_contract) = embedding_contract.as_ref() else {
                     break;
                 };
-                flush_streaming_llm_symbol_doc_window(
+                sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
+                flush_pending_llm_symbol_docs(
                     storage,
                     engine,
-                    &mut pending_docs,
-                    embed_batch_size,
+                    &pending_docs[..embed_batch_size],
                     embedding_contract,
                     updated_at_epoch_ms,
                     &mut stats,
+                    cancel_token,
                 )?;
+                pending_docs.drain(..embed_batch_size);
             }
         }
     }
@@ -6412,6 +6551,9 @@ fn sync_llm_symbol_projection(
     }
     if let Some(embedding_contract) = embedding_contract.as_ref() {
         for batch in pending_docs.chunks(embed_batch_size) {
+            if is_indexing_cancelled(cancel_token) {
+                return Err(indexing_cancelled_error());
+            }
             flush_pending_llm_symbol_docs(
                 storage,
                 engine,
@@ -6419,10 +6561,14 @@ fn sync_llm_symbol_projection(
                 embedding_contract,
                 updated_at_epoch_ms,
                 &mut stats,
+                cancel_token,
             )?;
         }
     }
 
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
     let prune_started = Instant::now();
     let stale_symbol_docs = if let Some(scope) = effective_llm_refresh_file_scope {
         let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
@@ -6452,10 +6598,24 @@ fn sync_llm_symbol_projection(
                 .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
         }
     } else {
-        0
+        storage.clear_llm_symbol_docs().map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to clear dense docs without an embedding runtime: {e}"
+            ))
+        })?
     };
+    let stale_component_docs = storage
+        .prune_retrieval_artifacts_to_node_ids(
+            &component_report_node_ids,
+            &dense_component_report_node_ids,
+        )
+        .map_err(|e| ApiError::internal(format!("Failed to prune component reports: {e}")))?;
     stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
-    stats.docs_stale = clamp_usize_to_u32(stale_dense_docs.saturating_add(stale_symbol_docs));
+    stats.docs_stale = clamp_usize_to_u32(
+        stale_dense_docs
+            .saturating_add(stale_symbol_docs)
+            .saturating_add(stale_component_docs),
+    );
 
     if hydrate_semantic_docs {
         let reload_started = Instant::now();
@@ -6463,6 +6623,76 @@ fn sync_llm_symbol_projection(
         stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
     }
 
+    Ok(stats)
+}
+
+fn finalize_staged_semantic_docs(
+    storage: &mut Storage,
+    llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
+    component_report_refresh: Option<&ComponentReportRefreshScope>,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<SemanticProjectionStats, ApiError> {
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    let nodes = storage
+        .get_nodes()
+        .map_err(|error| ApiError::internal(format!("Failed to load staged nodes: {error}")))?;
+    let node_names = nodes
+        .iter()
+        .map(|node| (node.id, node_display_name(node)))
+        .collect::<HashMap<_, _>>();
+    let mut engine = SearchEngine::new(None)
+        .map_err(|error| ApiError::internal(format!("Failed to init semantic engine: {error}")))?;
+    sync_llm_symbol_projection(
+        storage,
+        &nodes,
+        &node_names,
+        &mut engine,
+        SemanticRefreshScope {
+            file_ids: llm_refresh_file_scope,
+            component_reports: component_report_refresh,
+        },
+        false,
+        cancel_token,
+    )
+}
+
+fn load_persisted_semantic_docs(
+    storage: &Storage,
+    engine: &mut SearchEngine,
+    hydrate_semantic_docs: bool,
+) -> Result<SemanticProjectionStats, ApiError> {
+    let mut stats = SemanticProjectionStats {
+        reported: true,
+        ..Default::default()
+    };
+    if !hydrate_semantic_docs || !hybrid_retrieval_enabled() {
+        return Ok(stats);
+    }
+    if let Err(error) = engine.set_embedding_runtime_from_env() {
+        tracing::warn!(
+            "embedding runtime unavailable while hydrating completed semantic docs: {error}"
+        );
+        return Ok(stats);
+    }
+    let current_contract = current_embedding_contract_from_env().ok_or_else(|| {
+        ApiError::internal(
+            "Failed to resolve current embedding profile contract after configuring runtime",
+        )
+    })?;
+    let stored_stats = storage
+        .get_llm_symbol_doc_stats()
+        .map_err(|error| ApiError::internal(format!("Failed to inspect semantic docs: {error}")))?;
+    if !semantic_doc_stats_match_contract(&stored_stats, &current_contract) {
+        tracing::warn!(
+            "Stored semantic docs do not match the current embedding contract; skipping runtime hydration until a staged reindex publishes matching docs"
+        );
+        return Ok(stats);
+    }
+    let reload_started = Instant::now();
+    reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
+    stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
     Ok(stats)
 }
 
@@ -8558,7 +8788,7 @@ impl AppController {
                 },
             )
         };
-        let cache_stats = match cache_stats_result {
+        let mut cache_stats = match cache_stats_result {
             Ok(cache_stats) => cache_stats,
             Err(error) => {
                 self.clear_search_state();
@@ -8569,6 +8799,10 @@ impl AppController {
         summary.phase_timings.cache_refresh_ms = Some(clamp_u128_to_u32(
             cache_refresh_started.elapsed().as_millis(),
         ));
+        if summary.staged_semantic_stats.reported {
+            summary.staged_semantic_stats.reload_ms = cache_stats.semantic_stats.reload_ms;
+            cache_stats.semantic_stats = summary.staged_semantic_stats;
+        }
         apply_cache_refresh_stats(&mut summary.phase_timings, cache_stats);
         if is_indexing_cancelled(cancel_token) {
             self.clear_search_state();
@@ -10913,6 +11147,7 @@ fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
 #[derive(Debug, Clone)]
 struct IndexingRunSummary {
     phase_timings: IndexingPhaseTimings,
+    staged_semantic_stats: SemanticProjectionStats,
     llm_refresh_scope: Option<HashSet<codestory_contracts::graph::NodeId>>,
     finalize_incremental_run: bool,
     publication: IndexPublicationRecord,
@@ -11134,6 +11369,18 @@ fn index_full(
             }
         }
     }
+    let staged_semantic_stats =
+        match finalize_staged_semantic_docs(staged.store_mut(), None, None, cancel_token) {
+            Ok(stats) => stats,
+            Err(error) => {
+                let _ = staged.discard();
+                return Err(error);
+            }
+        };
+    if is_indexing_cancelled(cancel_token) {
+        let _ = staged.discard();
+        return Err(indexing_cancelled_error());
+    }
     let staged_finalize_stats = match staged.snapshots().finalize_staged() {
         Ok(stats) => stats,
         Err(err) => {
@@ -11292,6 +11539,7 @@ fn index_full(
             resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
             resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
         },
+        staged_semantic_stats,
         llm_refresh_scope: None,
         finalize_incremental_run: recovering_incomplete_run,
         publication,
@@ -11386,103 +11634,152 @@ where
         }
     };
     let publication_run_id = Uuid::new_v4().to_string();
-    let staged_result = (|| {
-        staged.store_mut().begin_incremental_run().map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to persist staged incomplete index marker: {e}"
-            ))
-        })?;
-        staged
-            .store_mut()
-            .invalidate_grounding_snapshots()
-            .map_err(|e| {
+    let staged_result =
+        (|| {
+            staged.store_mut().begin_incremental_run().map_err(|e| {
                 ApiError::internal(format!(
-                    "Failed to invalidate staged derived index snapshots: {e}"
+                    "Failed to persist staged incomplete index marker: {e}"
                 ))
             })?;
+            staged
+                .store_mut()
+                .invalidate_grounding_snapshots()
+                .map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to invalidate staged derived index snapshots: {e}"
+                    ))
+                })?;
 
-        let workspace = WorkspaceManifest::open(root.to_path_buf())
-            .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
-        let execution_plan = refresh_builder(&workspace, &refresh_inputs)?;
+            let workspace = WorkspaceManifest::open(root.to_path_buf())
+                .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+            let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
+            let execution_plan = refresh_builder(&workspace, &refresh_inputs)?;
+            let existing_file_paths =
+                semantic_file_table_path_map(staged.store_mut().get_files().map_err(|error| {
+                    ApiError::internal(format!("Failed to load files: {error}"))
+                })?);
+            let mut removed_component_keys = HashSet::new();
+            for file_id in &execution_plan.files_to_remove {
+                let path = existing_file_paths
+                    .get(&codestory_contracts::graph::NodeId(*file_id))
+                    .ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "Removed file is missing from staged component scope: {file_id}"
+                        ))
+                    })?;
+                if let Some(component_key) = semantic_component_key_for_path(Some(path)) {
+                    removed_component_keys.insert(component_key);
+                }
+            }
+            let component_report_refresh = ComponentReportRefreshScope {
+                previous_file_paths: existing_file_paths,
+                removed_component_keys,
+            };
 
-        let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
-        let _ = events_tx.send(AppEventPayload::IndexingStarted {
-            file_count: total_files,
-        });
+            let total_files = execution_plan.files_to_index.len().min(u32::MAX as usize) as u32;
+            let _ = events_tx.send(AppEventPayload::IndexingStarted {
+                file_count: total_files,
+            });
 
-        let bus = EventBus::new();
-        let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
-        if is_indexing_cancelled(cancel_token) {
+            let bus = EventBus::new();
+            let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
+            if is_indexing_cancelled(cancel_token) {
+                drop(bus);
+                let _ = forwarder.join();
+                return Err(indexing_cancelled_error());
+            }
+            let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
+            let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
+
+            // Drop bus so forwarder unblocks.
             drop(bus);
             let _ = forwarder.join();
-            return Err(indexing_cancelled_error());
-        }
-        let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
-        let result = indexer.run(staged.store_mut(), &execution_plan, &bus, cancel_token);
 
-        // Drop bus so forwarder unblocks.
-        drop(bus);
-        let _ = forwarder.join();
-
-        let index_stats = match result {
-            Ok(_) if is_indexing_cancelled(cancel_token) => {
+            let index_stats = match result {
+                Ok(_) if is_indexing_cancelled(cancel_token) => {
+                    return Err(indexing_cancelled_error());
+                }
+                Ok(stats) => stats,
+                Err(_) if is_indexing_cancelled(cancel_token) => {
+                    return Err(indexing_cancelled_error());
+                }
+                Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
+            };
+            let mut llm_refresh_scope = HashSet::new();
+            for path in &execution_plan.files_to_index {
+                let normalized_path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                };
+                let file_info = staged
+                    .store_mut()
+                    .get_file_by_path(&normalized_path)
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to resolve indexed semantic scope for {}: {error}",
+                            normalized_path.display()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "Indexed file is missing from staged semantic scope: {}",
+                            normalized_path.display()
+                        ))
+                    })?;
+                llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
+            }
+            for file_id in &execution_plan.files_to_remove {
+                llm_refresh_scope.insert(codestory_contracts::graph::NodeId(*file_id));
+            }
+            let staged_semantic_stats = finalize_staged_semantic_docs(
+                staged.store_mut(),
+                Some(&llm_refresh_scope),
+                Some(&component_report_refresh),
+                cancel_token,
+            )?;
+            if is_indexing_cancelled(cancel_token) {
                 return Err(indexing_cancelled_error());
             }
-            Ok(stats) => stats,
-            Err(_) if is_indexing_cancelled(cancel_token) => {
+            let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to finalize staged incremental storage: {e}"
+                ))
+            })?;
+            let detail_started = Instant::now();
+            staged.snapshots().refresh_detail().map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to refresh staged grounding detail snapshot: {e}"
+                ))
+            })?;
+            let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
+            if is_indexing_cancelled(cancel_token) {
                 return Err(indexing_cancelled_error());
             }
-            Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
-        };
-        let staged_finalize_stats = staged.snapshots().finalize_staged().map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to finalize staged incremental storage: {e}"
+            Ok((
+                index_stats,
+                staged_finalize_stats,
+                detail_snapshot_ms,
+                llm_refresh_scope,
+                staged_semantic_stats,
             ))
-        })?;
-        let detail_started = Instant::now();
-        staged.snapshots().refresh_detail().map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to refresh staged grounding detail snapshot: {e}"
-            ))
-        })?;
-        let detail_snapshot_ms = clamp_u128_to_u32(detail_started.elapsed().as_millis());
-        if is_indexing_cancelled(cancel_token) {
-            return Err(indexing_cancelled_error());
+        })();
+    let (
+        index_stats,
+        staged_finalize_stats,
+        detail_snapshot_ms,
+        llm_refresh_scope,
+        staged_semantic_stats,
+    ) = match staged_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
         }
-        Ok((
-            index_stats,
-            execution_plan,
-            staged_finalize_stats,
-            detail_snapshot_ms,
-        ))
-    })();
-    let (index_stats, execution_plan, staged_finalize_stats, detail_snapshot_ms) =
-        match staged_result {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = staged.discard();
-                return Err(error);
-            }
-        };
+    };
     let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
-
-    let mut llm_refresh_scope = HashSet::new();
-    for path in &execution_plan.files_to_index {
-        let normalized_path = if path.is_absolute() {
-            path.clone()
-        } else {
-            root.join(path)
-        };
-        if let Ok(Some(file_info)) = staged.store_mut().get_file_by_path(&normalized_path) {
-            llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
-        }
-    }
-    for file_id in &execution_plan.files_to_remove {
-        llm_refresh_scope.insert(codestory_contracts::graph::NodeId(*file_id));
-    }
 
     if is_indexing_cancelled(cancel_token) {
         let _ = staged.discard();
@@ -11613,6 +11910,7 @@ where
             resolved_imports_fuzzy: resolution_telemetry.resolved_imports_fuzzy,
             resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
         },
+        staged_semantic_stats,
         llm_refresh_scope: Some(llm_refresh_scope),
         finalize_incremental_run: true,
         publication,
@@ -11704,14 +12002,7 @@ fn reuse_completed_search_state(
         return Ok(None);
     }
     let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
-    let semantic_stats = sync_llm_symbol_projection(
-        storage,
-        nodes,
-        &node_names,
-        &mut engine,
-        llm_refresh_scope,
-        hydrate_semantic_docs,
-    )?;
+    let semantic_stats = load_persisted_semantic_docs(storage, &mut engine, hydrate_semantic_docs)?;
     Ok(Some(SearchStateBuildResult {
         node_names,
         engine,
@@ -11762,7 +12053,7 @@ fn rebuild_search_state_from_storage(
             Some(search_storage_path.as_path()),
             nodes,
             llm_refresh_scope,
-            SemanticProjectionMode::PersistBackedDocs,
+            SemanticProjectionMode::LoadPersistedDocs,
             hydrate_semantic_docs,
         )
         .map_err(|e| {
@@ -15986,6 +16277,14 @@ fn build_llm_symbol_doc_text() -> String {
             }),
             "no-embedding repair should replace every previous-schema graph-native semantic document"
         );
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open dense docs after no-embedding repair")
+                .get_all_llm_symbol_docs()
+                .expect("dense docs after no-embedding repair")
+                .is_empty(),
+            "an unavailable embedding runtime must not carry stale dense docs into the new core generation"
+        );
     }
 
     #[test]
@@ -16115,6 +16414,14 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("reopen storage before incremental")
             .get_all_llm_symbol_docs()
             .expect("semantic docs before incremental");
+        let before_reports = Storage::open(&storage_path)
+            .expect("reopen reports before incremental")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("component reports before incremental")
+            .into_iter()
+            .filter(|doc| doc.display_name.starts_with("component_report:"))
+            .map(|doc| (doc.node_id, doc.doc_hash))
+            .collect::<HashMap<_, _>>();
 
         let rust_fixture = workspace.path().join("rust_tictactoe.rs");
         let mut source = fs::read_to_string(&rust_fixture).expect("read rust fixture");
@@ -16151,6 +16458,175 @@ fn build_llm_symbol_doc_text() -> String {
             docs.iter()
                 .any(|doc| doc.display_name.contains("codestory_added_move_hint")),
             "incremental symbol docs should include the new symbol"
+        );
+        assert!(
+            docs.iter().any(|doc| {
+                doc.display_name.starts_with("component_report:")
+                    && before_reports
+                        .get(&doc.node_id)
+                        .is_some_and(|before_hash| before_hash != &doc.doc_hash)
+            }),
+            "incremental indexing should refresh the affected global component report"
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_removes_stale_component_reports() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace dir");
+        for component in ["alpha", "beta"] {
+            let component_dir = workspace.path().join(component);
+            fs::create_dir_all(&component_dir).expect("create component dir");
+            fs::write(
+                component_dir.join("lib.rs"),
+                format!("pub fn {component}_value() -> i32 {{ 1 }}\n"),
+            )
+            .expect("write component source");
+        }
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full index");
+
+        let full_reports = Storage::open(&storage_path)
+            .expect("open full reports")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("full component reports")
+            .into_iter()
+            .filter(|doc| doc.display_name.starts_with("component_report:"))
+            .map(|doc| (doc.display_name, doc.doc_hash))
+            .collect::<HashMap<_, _>>();
+        fs::write(
+            workspace.path().join("alpha").join("lib.rs"),
+            "pub fn alpha_value() -> i32 { 2 }\npub fn alpha_added() {}\n",
+        )
+        .expect("change alpha source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental alpha change");
+        let changed_reports = Storage::open(&storage_path)
+            .expect("open changed reports")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("changed component reports")
+            .into_iter()
+            .filter(|doc| doc.display_name.starts_with("component_report:"))
+            .map(|doc| (doc.display_name, doc.doc_hash))
+            .collect::<HashMap<_, _>>();
+        assert_ne!(
+            changed_reports.get("component_report:dir:alpha"),
+            full_reports.get("component_report:dir:alpha")
+        );
+        assert_eq!(
+            changed_reports.get("component_report:dir:beta"),
+            full_reports.get("component_report:dir:beta"),
+            "an incremental change should preserve unaffected component reports"
+        );
+
+        let before_removal = Storage::open(&storage_path).expect("open changed index");
+        let beta_report_id = before_removal
+            .get_nodes()
+            .expect("component report nodes")
+            .into_iter()
+            .find(|node| node.serialized_name == "component_report:dir:beta")
+            .map(|node| node.id)
+            .expect("beta component report");
+        let category_id = before_removal
+            .create_bookmark_category("Reports")
+            .expect("create report bookmark category");
+        before_removal
+            .add_bookmark(category_id, beta_report_id, Some("temporary report"))
+            .expect("bookmark component report");
+        drop(before_removal);
+
+        fs::remove_file(workspace.path().join("beta").join("lib.rs")).expect("remove beta source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental removal");
+
+        let storage = Storage::open(&storage_path).expect("open indexed storage");
+        assert!(
+            storage
+                .get_nodes()
+                .expect("nodes after removal")
+                .iter()
+                .all(|node| node.serialized_name != "component_report:dir:beta")
+        );
+        assert!(
+            storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("symbol docs after removal")
+                .iter()
+                .all(|doc| doc.display_name != "component_report:dir:beta")
+        );
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("dense docs after removal")
+                .iter()
+                .all(|doc| doc.display_name != "component_report:dir:beta")
+        );
+        assert!(
+            storage
+                .get_bookmarks(None)
+                .expect("bookmarks after report removal")
+                .is_empty(),
+            "pruning a stale component report should remove dependent bookmarks"
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_rebuilds_reports_when_path_normalization_changes() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace dir");
+        fs::create_dir_all(workspace.path().join("alpha")).expect("create alpha dir");
+        fs::write(
+            workspace.path().join("alpha").join("lib.rs"),
+            "pub fn alpha_value() -> i32 { 1 }\n",
+        )
+        .expect("write alpha source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full index");
+
+        fs::create_dir_all(workspace.path().join("beta")).expect("create beta dir");
+        fs::write(
+            workspace.path().join("beta").join("lib.rs"),
+            "pub fn beta_value() -> i32 { 2 }\n",
+        )
+        .expect("write beta source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental index");
+
+        let report_names = Storage::open(&storage_path)
+            .expect("open indexed storage")
+            .get_nodes()
+            .expect("component report nodes")
+            .into_iter()
+            .filter(|node| node.serialized_name.starts_with("component_report:"))
+            .map(|node| node.serialized_name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            report_names,
+            HashSet::from([
+                "component_report:dir:alpha".to_string(),
+                "component_report:dir:beta".to_string(),
+            ])
         );
     }
 
@@ -16833,7 +17309,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn rebuild_search_state_rebuilds_mixed_model_docs() {
+    fn staged_semantic_finalization_rebuilds_mixed_model_docs() {
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
         let mut storage = Storage::new_in_memory().expect("storage");
@@ -16841,8 +17317,8 @@ fn build_llm_symbol_doc_text() -> String {
 
         let mut env = hybrid_test_env();
         env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-a"));
-        rebuild_search_state_from_storage(&mut storage, temp.path(), None, true)
-            .expect("initial rebuild");
+        finalize_staged_semantic_docs(&mut storage, None, None, None)
+            .expect("initial finalization");
         assert_eq!(
             storage
                 .get_llm_symbol_doc_stats()
@@ -16893,8 +17369,8 @@ fn build_llm_symbol_doc_text() -> String {
         );
 
         env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-b"));
-        rebuild_search_state_from_storage(&mut storage, temp.path(), None, true)
-            .expect("mixed corpus should force rebuild");
+        finalize_staged_semantic_docs(&mut storage, None, None, None)
+            .expect("mixed corpus should force finalization");
 
         let docs = storage
             .get_all_llm_symbol_docs()
@@ -16904,6 +17380,86 @@ fn build_llm_symbol_doc_text() -> String {
             docs.iter().all(|doc| doc.embedding_model == "model-b"),
             "expected mixed semantic docs to be rebuilt to a uniform model"
         );
+    }
+
+    #[test]
+    fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
+        let mut env = hybrid_test_env();
+        let temp = tempdir().expect("create temp dir");
+        let file_path = write_semantic_fixture(temp.path());
+        let storage_path = temp.path().join("codestory.db");
+        let mut storage = Storage::open(&storage_path).expect("open storage");
+        insert_semantic_fixture_nodes(&mut storage, &file_path);
+        storage
+            .put_index_publication(&test_index_publication(
+                1,
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            ))
+            .expect("publish identity");
+        finalize_staged_semantic_docs(&mut storage, None, None, None)
+            .expect("finalize semantic rows");
+        let before = storage
+            .get_all_llm_symbol_docs()
+            .expect("semantic rows before cache load");
+        storage
+            .get_connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_live_llm_insert BEFORE INSERT ON llm_symbol_doc
+                 BEGIN SELECT RAISE(ABORT, 'live llm insert'); END;
+                 CREATE TRIGGER reject_live_llm_update BEFORE UPDATE ON llm_symbol_doc
+                 BEGIN SELECT RAISE(ABORT, 'live llm update'); END;
+                 CREATE TRIGGER reject_live_llm_delete BEFORE DELETE ON llm_symbol_doc
+                 BEGIN SELECT RAISE(ABORT, 'live llm delete'); END;
+                 CREATE TRIGGER reject_live_symbol_insert BEFORE INSERT ON symbol_search_doc
+                 BEGIN SELECT RAISE(ABORT, 'live symbol insert'); END;
+                 CREATE TRIGGER reject_live_symbol_update BEFORE UPDATE ON symbol_search_doc
+                 BEGIN SELECT RAISE(ABORT, 'live symbol update'); END;
+                 CREATE TRIGGER reject_live_symbol_delete BEFORE DELETE ON symbol_search_doc
+                 BEGIN SELECT RAISE(ABORT, 'live symbol delete'); END;",
+            )
+            .expect("install live semantic mutation guards");
+
+        let result = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
+            .expect("hydrate cache without semantic persistence");
+
+        assert!(result.engine.semantic_index_ready());
+        assert_eq!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("semantic rows after cache load"),
+            before
+        );
+
+        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "incompatible-model"));
+        let mismatched = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
+            .expect("reject incompatible semantic cache without persistence");
+        assert_eq!(mismatched.engine.semantic_doc_count(), 0);
+        let retrieval = retrieval_state_from_storage(&storage).expect("mismatched retrieval state");
+        assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
+        assert_eq!(
+            retrieval.fallback_reason,
+            Some(RetrievalFallbackReasonDto::DegradedRuntime)
+        );
+        assert_eq!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("semantic rows after rejected cache load"),
+            before
+        );
+
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let error = persist_embedded_llm_symbol_docs(
+            &mut storage,
+            &before[..1],
+            &mut SemanticProjectionStats::default(),
+            Some(&cancel_token),
+        )
+        .expect_err("cancelled semantic persistence must stop before DB upsert");
+        assert_eq!(error.code, "cancelled");
+        let error = finalize_staged_semantic_docs(&mut storage, None, None, Some(&cancel_token))
+            .expect_err("cancelled semantic finalization must stop before persistence");
+        assert_eq!(error.code, "cancelled");
     }
 
     #[test]
@@ -17895,6 +18451,7 @@ fn build_llm_symbol_doc_text() -> String {
     fn empty_indexing_run_summary() -> IndexingRunSummary {
         IndexingRunSummary {
             phase_timings: IndexingPhaseTimings::default(),
+            staged_semantic_stats: SemanticProjectionStats::default(),
             llm_refresh_scope: None,
             finalize_incremental_run: false,
             publication: IndexPublicationRecord {
@@ -18262,6 +18819,7 @@ fn build_llm_symbol_doc_text() -> String {
         Projection,
         Cleanup,
         Resolution,
+        SemanticDocs,
         SummarySnapshot,
         DetailSnapshot,
         MarkerClear,
@@ -18284,6 +18842,11 @@ fn build_llm_symbol_doc_text() -> String {
                  BEFORE UPDATE OF resolved_source_node_id ON edge
                  WHEN NEW.resolved_source_node_id IS NOT NULL
                  BEGIN SELECT RAISE(ABORT, 'forced resolution failure'); END;"
+            }
+            IncrementalFailureBoundary::SemanticDocs => {
+                "CREATE TRIGGER fail_incremental_boundary
+                 BEFORE INSERT ON symbol_search_doc
+                 BEGIN SELECT RAISE(ABORT, 'forced semantic doc failure'); END;"
             }
             IncrementalFailureBoundary::SummarySnapshot => {
                 "CREATE TRIGGER fail_incremental_boundary
@@ -18308,6 +18871,7 @@ fn build_llm_symbol_doc_text() -> String {
             IncrementalFailureBoundary::Projection => "forced projection failure",
             IncrementalFailureBoundary::Cleanup => "forced cleanup failure",
             IncrementalFailureBoundary::Resolution => "forced resolution failure",
+            IncrementalFailureBoundary::SemanticDocs => "forced semantic doc failure",
             IncrementalFailureBoundary::SummarySnapshot => "forced summary snapshot failure",
             IncrementalFailureBoundary::DetailSnapshot => "forced detail snapshot failure",
             IncrementalFailureBoundary::MarkerClear => "forced marker clear failure",
@@ -18339,6 +18903,8 @@ fn build_llm_symbol_doc_text() -> String {
             baseline_schema,
             baseline_publication,
             baseline_search_generations,
+            baseline_semantic_docs,
+            baseline_symbol_doc_count,
         ) = {
             let storage = Storage::open(&storage_path).expect("open baseline storage");
             let paths = storage
@@ -18359,6 +18925,12 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("read baseline publication")
                 .expect("baseline publication identity");
             let search_generations = persisted_search_generation_names(&storage_path);
+            let semantic_docs = storage
+                .get_all_llm_symbol_docs()
+                .expect("read baseline semantic docs");
+            let symbol_doc_count = storage
+                .get_symbol_search_doc_count()
+                .expect("read baseline symbol doc count");
             (
                 paths,
                 stats,
@@ -18366,6 +18938,8 @@ fn build_llm_symbol_doc_text() -> String {
                 schema,
                 publication,
                 search_generations,
+                semantic_docs,
+                symbol_doc_count,
             )
         };
 
@@ -18439,6 +19013,20 @@ fn build_llm_symbol_doc_text() -> String {
                 persisted_search_generation_names(&storage_path),
                 baseline_search_generations,
                 "pre-publish failure must not create search state for an unpublished generation"
+            );
+            assert_eq!(
+                storage
+                    .get_all_llm_symbol_docs()
+                    .expect("read live semantic docs"),
+                baseline_semantic_docs,
+                "pre-publish failure must preserve the live semantic corpus"
+            );
+            assert_eq!(
+                storage
+                    .get_symbol_search_doc_count()
+                    .expect("read live symbol doc count"),
+                baseline_symbol_doc_count,
+                "pre-publish failure must preserve graph-native semantic docs"
             );
             storage
                 .get_connection()
@@ -18594,6 +19182,7 @@ fn build_llm_symbol_doc_text() -> String {
             IncrementalFailureBoundary::Projection,
             IncrementalFailureBoundary::Cleanup,
             IncrementalFailureBoundary::Resolution,
+            IncrementalFailureBoundary::SemanticDocs,
             IncrementalFailureBoundary::SummarySnapshot,
             IncrementalFailureBoundary::DetailSnapshot,
             IncrementalFailureBoundary::MarkerClear,
