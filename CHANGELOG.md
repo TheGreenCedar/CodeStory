@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Added native five-asset pre-publish and post-publish acceptance evidence,
+  including Windows x64 managed plugin provisioning, local grounding, repair
+  handoff, and installer ownership proof. Release notes and contributor
+  guidance now preserve Apple Silicon, Windows arm64 acceleration,
+  older-glibc, marketplace, and full-sidecar proof boundaries.
 - Standardized JSON-mode CLI failures on one versioned error envelope, including
   argument parsing, ambiguity, smoke checks, runtime failures, and background
   repair terminal state. Compacted MCP status by referencing canonical

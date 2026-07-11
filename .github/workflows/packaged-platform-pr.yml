@@ -1,0 +1,22 @@
+name: Packaged platform acceptance
+
+on:
+  pull_request:
+    paths:
+      - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/package-codestory-release.py
+      - .github/workflows/packaged-platform-pr.yml
+      - .github/workflows/post-publish-release-smoke.yml
+      - .github/workflows/release.yml
+      - plugins/codestory/**
+      - scripts/install-codestory.ps1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-packaged-proof:
+    uses: ./.github/workflows/release.yml
+    with:
+      proof_only: true

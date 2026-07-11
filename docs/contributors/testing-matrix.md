@@ -120,6 +120,32 @@ the active plugin runtime plus observed and missing server-advertised MCP
 resources. This proves the installed plugin launcher advertises the resources;
 it is not Codex host/model visibility proof.
 
+Packaged acceptance uses the same five native hosted-runner cells before and
+after publication. Pull requests that change release, packaging, installer, or
+plugin-launch surfaces call the same release build in non-publishing
+`proof_only` mode, so the native matrix is reviewed before a release:
+
+| Asset | Native runner | Required packaged proof |
+| --- | --- | --- |
+| Linux x64 | `ubuntu-latest` | Version, help, stdio shape, and the full-sidecar agent proof |
+| Linux arm64 | `ubuntu-24.04-arm` | Version, help, and stdio shape |
+| Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, local ground, and repair handoff |
+| Windows arm64 | `windows-11-arm` | Version, help, and stdio shape |
+| macOS arm64 | `macos-15` | Version, help, and stdio shape |
+
+The Windows managed handoff proves that the packaged CLI can be installed by
+the plugin, serve status, use the local graph, and publish a background repair
+reservation. It does not prove full sidecars or GPU execution. macOS arm64
+package execution does not close #887; live managed Metal endpoint survival
+still needs reporter or equivalent Apple Silicon hardware evidence. Current
+Ubuntu execution does not prove older-glibc compatibility.
+
+Release closeout is not complete until every published asset cell passes and
+the corresponding CodeStory plugin-source update is committed or merged in
+`TheGreenCedar/AgentPluginMarketplace`, followed by marketplace refresh and
+managed-plugin version/status readback. Source CI cannot substitute for that
+external pointer and installed-runtime proof.
+
 ## Docs-Only Fast Path
 
 If you only changed documentation or plugin doc surfaces, use the smallest credible
