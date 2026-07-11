@@ -616,18 +616,23 @@ fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<
                 return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
             }
             let runtime = session.runtime.as_ref().expect("stdio project selected");
-            match stdio_tool_blocked_error(runtime, &mut session.state, name) {
-                Ok(Some(error)) => {
-                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let error = serde_json::json!({
-                        "code": "readiness_unavailable",
-                        "message": format!("Unable to evaluate CodeStory readiness before running `{name}`: {error}"),
-                        "tool": name
-                    });
-                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+            // Status is the readiness source. Preflighting it by building another
+            // status snapshot can start a second refresh worker and turn ordinary
+            // publication churn into a spurious cache_busy response.
+            if name != "status" {
+                match stdio_tool_blocked_error(runtime, &mut session.state, name) {
+                    Ok(Some(error)) => {
+                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let error = serde_json::json!({
+                            "code": "readiness_unavailable",
+                            "message": format!("Unable to evaluate CodeStory readiness before running `{name}`: {error}"),
+                            "tool": name
+                        });
+                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                    }
                 }
             }
             let publication_before = if stdio_tool_reads_publication(name) {
