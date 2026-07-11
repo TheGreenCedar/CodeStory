@@ -1264,15 +1264,16 @@ def run_gate(args: argparse.Namespace) -> None:
         summary["artifacts"]["packet"] = str(packet_artifact)
         write_json(out_dir / "summary.json", summary)
 
-        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
-        stdio_attempts = [stdio_status_payload]
-        require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
-        allowed = stdio_status_payload.get("allowed_surfaces", {})
-        if not all(allowed.get(name, {}).get("allowed") is True for name in ("packet", "search", "context")):
-            shutil.copy2(stdio_artifact, out_dir / "serve-stdio-status-initial.json")
+        stdio_attempts = []
+        try:
             stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
             stdio_attempts.append(stdio_status_payload)
-        try:
+            require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
+            allowed = stdio_status_payload.get("allowed_surfaces", {})
+            if not all(allowed.get(name, {}).get("allowed") is True for name in ("packet", "search", "context")):
+                shutil.copy2(stdio_artifact, out_dir / "serve-stdio-status-initial.json")
+                stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
+                stdio_attempts.append(stdio_status_payload)
             require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
         finally:
             for status_attempt in stdio_attempts:
@@ -1391,7 +1392,7 @@ def write_fake_cli(path: Path) -> None:
             elif layer == "serve":
                 marker = None
                 repair_attempt = None
-                if fail == "serve_first_blocked":
+                if fail in {"serve_first_blocked", "serve_first_blocked_then_timeout"}:
                     try:
                         project = sys.argv[sys.argv.index("--project") + 1]
                         marker = os.path.join(project, ".fake-serve-first-blocked-seen")
@@ -1425,6 +1426,9 @@ def write_fake_cli(path: Path) -> None:
                         repair_attempt = repair["attempt_id"]
                         result = {"content": [{"type": "text", "text": json.dumps(repair)}], "structuredContent": repair}
                     else:
+                        if fail == "serve_first_blocked_then_timeout" and marker is not None and os.path.exists(marker):
+                            time.sleep(60)
+                            continue
                         serve_allowed = True
                         refresh_worker_pid = None
                         if marker is not None and not os.path.exists(marker):
@@ -1666,6 +1670,40 @@ def self_test() -> None:
             assert delayed_status_worker.returncode is not None
         finally:
             terminate_worker_pid(delayed_status_worker.pid)
+            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+            os.environ.pop("CODESTORY_FAKE_STATUS_WORKER_PID", None)
+
+        retry_timeout_project = root / "repo-retry-timeout"
+        retry_timeout_project.mkdir()
+        retry_timeout_args = argparse.Namespace(**vars(args))
+        retry_timeout_args.project = str(retry_timeout_project)
+        retry_timeout_args.out_dir = str(root / "retry-timeout-out")
+        retry_timeout_args.timeout_secs = 2
+        retry_timeout_worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                if os.name == "nt"
+                else 0
+            ),
+            start_new_session=os.name != "nt",
+        )
+        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_first_blocked_then_timeout"
+        os.environ["CODESTORY_FAKE_STATUS_WORKER_PID"] = str(retry_timeout_worker.pid)
+        try:
+            try:
+                run_gate(retry_timeout_args)
+            except GateFailure as exc:
+                assert exc.layer == "serve_stdio"
+                assert "serve-stdio-status.json" in str(exc.artifact)
+            else:
+                raise AssertionError("timed-out stdio readiness retry should fail the gate")
+            retry_timeout_worker.wait(timeout=5)
+            assert retry_timeout_worker.returncode is not None
+        finally:
+            terminate_worker_pid(retry_timeout_worker.pid)
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
             os.environ.pop("CODESTORY_FAKE_STATUS_WORKER_PID", None)
 
