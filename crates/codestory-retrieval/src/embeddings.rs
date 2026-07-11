@@ -9,8 +9,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -42,6 +44,8 @@ const LLAMACPP_DEVICE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_DEVICE";
 const LLAMACPP_N_GPU_LAYERS_ENV: &str = "CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS";
 const ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
 const NATIVE_LLAMA_LOG_START_MARKER: &str = "starting native llama.cpp embedding server:";
+const NATIVE_LLAMA_LOG_READ_TAIL_BYTES: u64 = 512 * 1024;
+const NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES: u64 = 256 * 1024;
 const RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_EMBED_DEVICE_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 
@@ -236,7 +240,11 @@ fn observe_sidecar_embedding_device_state(
 fn observe_native_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    let text = std::fs::read_to_string(native_embedding_log_path(runtime)).ok();
+    let text = read_native_embedding_log_tail(
+        &native_embedding_log_path(runtime),
+        NATIVE_LLAMA_LOG_READ_TAIL_BYTES,
+    )
+    .ok();
     if let Some(text) = text.as_deref() {
         match observed_embedding_device_state_from_text(native_embedding_log_current_launch(text)) {
             "unknown" => {}
@@ -307,6 +315,49 @@ pub(crate) fn native_embedding_log_path(runtime: &crate::config::SidecarRuntimeC
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("llama-server-native.log")
+}
+
+pub(crate) fn prepare_native_embedding_log_for_launch(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let previous = read_native_embedding_log_tail_bytes(path, NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES)
+        .with_context(|| format!("read bounded native embedding log tail {}", path.display()))?;
+    let previous_path = path.with_file_name("llama-server-native.previous.log");
+    codestory_workspace::atomic_file::write_bytes_atomic(
+        &previous_path,
+        "native-embedding-log",
+        &previous,
+    )
+    .with_context(|| {
+        format!(
+            "write bounded previous native embedding log {}",
+            previous_path.display()
+        )
+    })?;
+    OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("truncate native embedding log {}", path.display()))?;
+    Ok(())
+}
+
+fn read_native_embedding_log_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    Ok(
+        String::from_utf8_lossy(&read_native_embedding_log_tail_bytes(path, max_bytes)?)
+            .into_owned(),
+    )
+}
+
+fn read_native_embedding_log_tail_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))?;
+    let remaining = len.min(max_bytes);
+    let mut bytes = Vec::with_capacity(remaining as usize);
+    file.take(remaining).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn native_embedding_log_current_launch(text: &str) -> &str {
@@ -1415,6 +1466,51 @@ mod tests {
             observed_embedding_device_state_from_text(current),
             "accelerated"
         );
+    }
+
+    #[test]
+    fn native_log_rotation_keeps_exact_bounded_raw_tail() {
+        let dir = tempfile::tempdir().expect("log dir");
+        let path = dir.path().join("llama-server-native.log");
+        let mut bytes = vec![b'x'; NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES as usize + 37];
+        let tail_start = bytes.len() - NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES as usize;
+        bytes[tail_start] = 0xff;
+        std::fs::write(&path, &bytes).expect("write oversized log");
+
+        prepare_native_embedding_log_for_launch(&path).expect("rotate log");
+
+        assert_eq!(std::fs::metadata(&path).expect("current metadata").len(), 0);
+        let previous = std::fs::read(dir.path().join("llama-server-native.previous.log"))
+            .expect("previous tail");
+        assert_eq!(
+            previous.len(),
+            NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES as usize
+        );
+        assert_eq!(previous, bytes[tail_start..]);
+    }
+
+    #[test]
+    fn bounded_native_log_read_ignores_stale_acceleration_outside_tail() {
+        let dir = tempfile::tempdir().expect("log dir");
+        let path = dir.path().join("llama-server-native.log");
+        let mut bytes =
+            b"starting native llama.cpp embedding server: old\noffloaded 33/33 layers to GPU\n"
+                .to_vec();
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            NATIVE_LLAMA_LOG_READ_TAIL_BYTES as usize,
+        ));
+        bytes.extend_from_slice(NATIVE_LLAMA_LOG_START_MARKER.as_bytes());
+        bytes.extend_from_slice(b" current\nn_gpu_layers = 0\n");
+        std::fs::write(&path, bytes).expect("write multi-launch log");
+
+        let text = read_native_embedding_log_tail(&path, NATIVE_LLAMA_LOG_READ_TAIL_BYTES)
+            .expect("bounded tail");
+        let current = native_embedding_log_current_launch(&text);
+
+        assert!(current.contains("current"));
+        assert!(!current.contains("offloaded 33/33"));
+        assert_eq!(observed_embedding_device_state_from_text(current), "cpu");
     }
 
     #[test]

@@ -316,6 +316,23 @@ run Docker prune, broad Docker cleanup, or host/global network deletion.
 `retrieval down` clears the sidecar state file only. Stop Docker/Compose
 separately if containers must be removed.
 
+Agent namespaces reserve dynamic ports in
+`<cache>/sidecars/port-allocations.json`. Allocation automatically compacts
+state-less entries whose ports are free while holding the registry lock and
+publishes the compacted file atomically. Valid state, bound ports, malformed or
+unreadable ownership, and a ten-minute startup reservation are retained
+fail-closed. Cleanup that prunes entries or encounters failures reports pruned,
+retained, and failed counts on stderr; renewable owner leases remain a separate
+lifecycle contract.
+
+Native embedding output uses `llama-server-native.log` for the current launch
+and `llama-server-native.previous.log` for at most the final 256 KiB of the
+previous launch. A verified new spawn truncates the current log after publishing
+that bounded tail when the files are writable; housekeeping failures are
+reported on stderr and do not block the server launch. Readiness inspects at
+most the final 512 KiB of current output, so a long-running server cannot make
+status latency scale with the full log.
+
 Default Windows cache locations:
 
 | Service | Default port | Data dir |

@@ -261,6 +261,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     options: BootstrapSidecarsOptions,
     mut progress: impl FnMut(&'static str),
 ) -> Result<BootstrapReport> {
+    runtime.ensure_ports_allocated()?;
     let BootstrapSidecarsOptions {
         storage_scope,
         compose_file,
@@ -1468,12 +1469,8 @@ fn spawn_native_embedding_server_with_probe(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create native llama.cpp log dir {}", parent.display()))?;
     }
-    let mut log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&launch.log_path)
-        .with_context(|| format!("open native llama.cpp log {}", launch.log_path.display()))?;
     if native_embedding_server_reusable(&probe) {
+        let mut log = open_native_embedding_log(&launch.log_path)?;
         if let Some(spawn) = reusable_native_embedding_spawn_from_state(runtime, launch)? {
             writeln!(
                 log,
@@ -1494,6 +1491,7 @@ fn spawn_native_embedding_server_with_probe(
         );
     }
     if !allow_spawn {
+        let mut log = open_native_embedding_log(&launch.log_path)?;
         writeln!(
             log,
             "refusing native llama.cpp embedding server spawn under reuse-only broker lease after probe failed: {}",
@@ -1504,6 +1502,14 @@ fn spawn_native_embedding_server_with_probe(
             "native llama.cpp embedding endpoint is unreachable and the broker lease is reuse-only; refusing to start another native embedding server"
         );
     }
+    if let Err(error) = crate::embeddings::prepare_native_embedding_log_for_launch(&launch.log_path)
+    {
+        eprintln!(
+            "CodeStory native embedding log rotation warning: path={} error={error:#}",
+            launch.log_path.display()
+        );
+    }
+    let mut log = open_native_embedding_log(&launch.log_path)?;
     writeln!(
         log,
         "starting native llama.cpp embedding server: after probe failed ({}) {} {}",
@@ -1534,6 +1540,14 @@ fn spawn_native_embedding_server_with_probe(
             )
         }),
     }
+}
+
+fn open_native_embedding_log(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open native llama.cpp log {}", path.display()))
 }
 
 fn spawn_native_embedding_server_once(
@@ -2684,6 +2698,8 @@ mod tests {
             detail: "llama.cpp embeddings unavailable".into(),
             elapsed_ms: Some(5),
         };
+        std::fs::create_dir_all(launch.log_path.parent().expect("log parent")).expect("log parent");
+        std::fs::write(&launch.log_path, b"existing launch output\n").expect("existing log");
 
         let error = spawn_native_embedding_server_with_probe(&launch, &runtime, false, probe)
             .expect_err("reuse-only lease must not fall through to spawn");
@@ -2697,6 +2713,80 @@ mod tests {
             !error_text.contains("missing-llama-server"),
             "spawn path should not run under reuse-only lease: {error:?}"
         );
+        let log = std::fs::read_to_string(&launch.log_path).expect("current log");
+        assert!(log.contains("existing launch output"));
+        assert!(log.contains("reuse-only"));
+        assert!(
+            !launch
+                .log_path
+                .with_file_name("llama-server-native.previous.log")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn native_embedding_new_spawn_rotates_log_before_attempt() {
+        let temp = tempdir().expect("temp");
+        let runtime = compose_test_runtime(temp.path());
+        let launch = native_embedding_server_launch_from_paths(
+            temp.path().join("missing-llama-server.exe"),
+            temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
+            &runtime,
+        );
+        std::fs::create_dir_all(launch.log_path.parent().expect("log parent")).expect("log parent");
+        std::fs::write(&launch.log_path, b"existing launch output\n").expect("existing log");
+        let probe = crate::embeddings::EmbeddingRuntimeProbe {
+            reachable: false,
+            detail: "llama.cpp embeddings unavailable".into(),
+            elapsed_ms: Some(5),
+        };
+
+        spawn_native_embedding_server_with_probe(&launch, &runtime, true, probe)
+            .expect_err("missing executable must fail after rotation");
+
+        let current = std::fs::read_to_string(&launch.log_path).expect("current log");
+        assert!(!current.contains("existing launch output"));
+        assert!(current.contains("starting native llama.cpp embedding server"));
+        let previous = std::fs::read_to_string(
+            launch
+                .log_path
+                .with_file_name("llama-server-native.previous.log"),
+        )
+        .expect("previous log");
+        assert_eq!(previous, "existing launch output\n");
+    }
+
+    #[test]
+    fn native_embedding_spawn_continues_when_log_rotation_is_blocked() {
+        let temp = tempdir().expect("temp");
+        let runtime = compose_test_runtime(temp.path());
+        let launch = native_embedding_server_launch_from_paths(
+            temp.path().join("missing-llama-server.exe"),
+            temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
+            &runtime,
+        );
+        std::fs::create_dir_all(launch.log_path.parent().expect("log parent")).expect("log parent");
+        std::fs::write(&launch.log_path, b"existing launch output\n").expect("existing log");
+        std::fs::create_dir(
+            launch
+                .log_path
+                .with_file_name("llama-server-native.previous.log"),
+        )
+        .expect("block previous log publication");
+        let probe = crate::embeddings::EmbeddingRuntimeProbe {
+            reachable: false,
+            detail: "llama.cpp embeddings unavailable".into(),
+            elapsed_ms: Some(5),
+        };
+
+        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, true, probe)
+            .expect_err("missing executable must still be the terminal failure");
+
+        let error = format!("{error:?}");
+        assert!(!error.contains("write bounded previous native embedding log"));
+        let current = std::fs::read_to_string(&launch.log_path).expect("current log");
+        assert!(current.contains("existing launch output"));
+        assert!(current.contains("starting native llama.cpp embedding server"));
     }
 
     #[test]

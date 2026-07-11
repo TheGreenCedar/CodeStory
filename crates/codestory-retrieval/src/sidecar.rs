@@ -120,6 +120,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     compose_file: Option<&Path>,
     embedding_launch: Option<EmbeddingLaunchMetadata>,
 ) -> Result<SidecarStateFile> {
+    runtime.ensure_ports_allocated()?;
     let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness();

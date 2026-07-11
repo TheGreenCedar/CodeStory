@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Compacted stale agent sidecar port allocations atomically under the existing
+  registry lock while preserving live, state-backed, recently reserved, and
+  unverified owners. Native embedding launches now attempt to preserve only a
+  bounded previous log tail and truncate the current log without blocking
+  startup when housekeeping fails, while accelerator proof reads only a bounded
+  current tail.
 - Bounded plugin-managed CLI storage to the active checksummed runtime plus one
   verified upgrade or rollback candidate, with atomic staged publication,
   recoverable owner locks, Windows lock-safe cleanup, and retained, removed,
