@@ -424,6 +424,14 @@ mod tests {
                 },
             ])
             .expect("seed old generation");
+            live.put_index_publication(&crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "old-generation".to_string(),
+                run_id: "old-run".to_string(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("identify old generation");
             live.snapshots()
                 .refresh_all()
                 .expect("finalize old snapshots");
@@ -473,6 +481,16 @@ mod tests {
             .snapshots()
             .refresh_all()
             .expect("finalize new snapshots");
+        staged
+            .store_mut()
+            .put_index_publication(&crate::IndexPublicationRecord {
+                generation: 2,
+                generation_id: "new-generation".to_string(),
+                run_id: "new-run".to_string(),
+                mode: crate::IndexPublicationMode::Incremental,
+                published_at_epoch_ms: 2,
+            })
+            .expect("identify new generation");
         let staged_path = staged.path().to_path_buf();
         let racing_live_path = live_path.clone();
         let (old_observed_tx, old_observed_rx) = mpsc::channel();
@@ -501,6 +519,10 @@ mod tests {
                         .snapshots()
                         .has_ready_detail()
                         .expect("racing detail readiness");
+                let publication = reader
+                    .get_index_publication()
+                    .expect("racing publication read")
+                    .expect("racing publication identity");
                 reader
                     .get_connection()
                     .execute_batch("COMMIT;")
@@ -510,11 +532,13 @@ mod tests {
                     "racing reader observed unready snapshots for {paths:?}"
                 );
                 if paths == old_generation {
+                    assert_eq!(publication.generation, 1);
                     if !announced_old {
                         old_observed_tx.send(()).expect("announce old generation");
                         announced_old = true;
                     }
                 } else if paths == new_generation {
+                    assert_eq!(publication.generation, 2);
                     assert!(announced_old, "racing reader must span publication");
                     return;
                 } else {
@@ -538,6 +562,14 @@ mod tests {
             old_paths,
             vec![PathBuf::from("old_a.rs"), PathBuf::from("old_b.rs")]
         );
+        assert_eq!(
+            old_reader
+                .get_index_publication()
+                .expect("held reader publication")
+                .expect("held reader publication identity")
+                .generation,
+            1
+        );
 
         let new_reader = Store::open(&live_path).expect("open fresh reader");
         let new_paths = new_reader
@@ -549,6 +581,14 @@ mod tests {
         assert_eq!(
             new_paths,
             vec![PathBuf::from("new_a.rs"), PathBuf::from("new_b.rs")]
+        );
+        assert_eq!(
+            new_reader
+                .get_index_publication()
+                .expect("new reader publication")
+                .expect("new reader publication identity")
+                .generation,
+            2
         );
         assert!(
             new_reader

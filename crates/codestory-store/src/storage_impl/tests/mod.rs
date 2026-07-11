@@ -68,6 +68,68 @@ fn incomplete_incremental_run_marker_survives_reopen_until_success() -> Result<(
 }
 
 #[test]
+fn index_publication_identity_round_trips_through_typed_and_read_only_reads()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("index-publication-round-trip");
+    let publication = IndexPublicationRecord {
+        generation: 7,
+        generation_id: "generation-7".to_string(),
+        run_id: "run-7".to_string(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 1234,
+    };
+    {
+        let storage = Storage::open(&path)?;
+        assert!(storage.get_index_publication()?.is_none());
+        storage.put_index_publication(&publication)?;
+        assert_eq!(storage.get_index_publication()?, Some(publication.clone()));
+    }
+    assert_eq!(
+        Storage::database_index_publication(&path)?,
+        Some(publication)
+    );
+
+    let _ = cleanup_sqlite_sidecars(&path);
+    Ok(())
+}
+
+#[test]
+fn index_publication_identity_rejects_negative_published_timestamp() {
+    assert!(
+        index_publication_record_from_values(
+            1,
+            "generation-1".to_string(),
+            "run-1".to_string(),
+            "full".to_string(),
+            -1,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn schema_18_migrates_to_empty_publication_identity_without_synthesis() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("index-publication-v18-migration");
+    {
+        let storage = Storage::open(&path)?;
+        storage
+            .get_connection()
+            .execute_batch("DROP TABLE index_publication;")?;
+        storage.set_schema_version(18)?;
+    }
+
+    assert!(Storage::database_index_publication(&path)?.is_none());
+    let storage = Storage::open(&path)?;
+    assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+    assert!(storage.get_index_publication()?.is_none());
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
+    Ok(())
+}
+
+#[test]
 fn incomplete_incremental_begin_failure_keeps_clean_schema_and_no_marker()
 -> Result<(), StorageError> {
     let path = unique_temp_db_path("incomplete-begin-rollback");

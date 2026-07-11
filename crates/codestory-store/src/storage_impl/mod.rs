@@ -28,7 +28,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 19;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -498,6 +498,117 @@ pub struct StorageStats {
     pub fatal_error_count: i64,
 }
 
+/// Indexing mode that produced one durable core database generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPublicationMode {
+    Full,
+    Incremental,
+}
+
+impl IndexPublicationMode {
+    fn db_value(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "full" => Ok(Self::Full),
+            "incremental" => Ok(Self::Incremental),
+            _ => Err(StorageError::Other(format!(
+                "Unsupported index publication mode: {value}"
+            ))),
+        }
+    }
+}
+
+/// Durable identity of the complete core database generation at the live path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexPublicationRecord {
+    pub generation: u64,
+    pub generation_id: String,
+    pub run_id: String,
+    pub mode: IndexPublicationMode,
+    pub published_at_epoch_ms: i64,
+}
+
+fn index_publication_record_from_values(
+    generation: i64,
+    generation_id: String,
+    run_id: String,
+    mode: String,
+    published_at_epoch_ms: i64,
+) -> Result<IndexPublicationRecord, StorageError> {
+    let generation = u64::try_from(generation).map_err(|_| {
+        StorageError::Other(format!(
+            "Invalid index publication generation: {generation}"
+        ))
+    })?;
+    if generation == 0
+        || generation_id.trim().is_empty()
+        || run_id.trim().is_empty()
+        || published_at_epoch_ms < 0
+    {
+        return Err(StorageError::Other(
+            "Index publication identity contains an empty or zero field".to_string(),
+        ));
+    }
+    Ok(IndexPublicationRecord {
+        generation,
+        generation_id,
+        run_id,
+        mode: IndexPublicationMode::from_db(&mode)?,
+        published_at_epoch_ms,
+    })
+}
+
+fn read_index_publication(
+    conn: &Connection,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'index_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(None);
+    }
+    let values = conn.query_row(
+        "SELECT generation, generation_id, run_id, mode, published_at_epoch_ms
+         FROM index_publication WHERE id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    );
+    match values {
+        Ok((generation, generation_id, run_id, mode, published_at_epoch_ms)) => {
+            index_publication_record_from_values(
+                generation,
+                generation_id,
+                run_id,
+                mode,
+                published_at_epoch_ms,
+            )
+            .map(Some)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn is_framework_synthetic_node(node: &Node) -> bool {
     node.canonical_id.as_deref().is_some_and(|canonical_id| {
         canonical_id.starts_with("tauri:command:")
@@ -930,6 +1041,14 @@ impl Storage {
         Ok(marked)
     }
 
+    /// Read the durable publication identity without migrating or mutating the database.
+    pub fn database_index_publication(
+        path: &Path,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        read_index_publication(&conn)
+    }
+
     pub fn copy_database_snapshot(
         source_path: &Path,
         target_path: &Path,
@@ -1290,6 +1409,47 @@ impl Storage {
         transaction.execute("DELETE FROM incomplete_index_run WHERE id = 1", [])?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION.to_string())?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Return the durable identity of the currently stored core generation.
+    pub fn get_index_publication(&self) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        read_index_publication(&self.conn)
+    }
+
+    /// Store the identity that will describe this database once it is published.
+    pub fn put_index_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<(), StorageError> {
+        if publication.generation == 0
+            || publication.generation > i64::MAX as u64
+            || publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || publication.published_at_epoch_ms < 0
+        {
+            return Err(StorageError::Other(
+                "Index publication identity contains an invalid field".to_string(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO index_publication (
+                id, generation, generation_id, run_id, mode, published_at_epoch_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                generation = excluded.generation,
+                generation_id = excluded.generation_id,
+                run_id = excluded.run_id,
+                mode = excluded.mode,
+                published_at_epoch_ms = excluded.published_at_epoch_ms",
+            params![
+                publication.generation as i64,
+                publication.generation_id.as_str(),
+                publication.run_id.as_str(),
+                publication.mode.db_value(),
+                publication.published_at_epoch_ms,
+            ],
+        )?;
         Ok(())
     }
 
