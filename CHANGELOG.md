@@ -30,6 +30,9 @@
 - Closed packaged-proof stdio input before force-terminating the launcher so
   delegated Windows CLI processes exit and release managed binaries before
   temporary plugin data is removed.
+- Kept the cross-platform concurrent-publication proof independent of cached
+  build output so macOS runner image and Xcode updates cannot restore binaries
+  linked against vanished toolchain paths.
 - Finalized graph-native and dense semantic documents in staged full and
   incremental databases before core publication. Post-publication cache loads
   now hydrate semantic state without rewriting live rows, and an unavailable
