@@ -659,8 +659,15 @@ def stdio_status_command(
             entry["response"] = response
             responses.append(response)
     finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
         if not process_terminated:
-            terminate_process_tree(process)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(process)
             process_terminated = True
         worker_pids: set[int] = set()
         for response in responses:
@@ -676,14 +683,9 @@ def stdio_status_command(
                     worker_pids.update(running_status_worker_pids(status))
         for worker_pid in worker_pids:
             terminate_worker_pid(worker_pid)
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
+        if process.poll() is None:
             process.kill()
+            process.wait(timeout=2)
         stdout_thread.join(timeout=0.2)
         stderr_thread.join(timeout=0.2)
 
