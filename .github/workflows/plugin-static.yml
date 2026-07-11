@@ -16,6 +16,7 @@ on:
       - .github/workflows/release.yml
       - .github/workflows/post-publish-release-smoke.yml
       - .github/workflows/packaged-platform-pr.yml
+      - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
   push:
@@ -36,6 +37,7 @@ on:
       - .github/workflows/release.yml
       - .github/workflows/post-publish-release-smoke.yml
       - .github/workflows/packaged-platform-pr.yml
+      - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
   workflow_dispatch:

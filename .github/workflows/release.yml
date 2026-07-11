@@ -5,35 +5,20 @@ on:
     inputs:
       version:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
-        required: false
+        required: true
         type: string
-        default: ""
-      proof_only:
-        description: "Build and prove native packaged assets without publishing"
-        required: false
-        type: boolean
-        default: false
   workflow_dispatch:
     inputs:
       version:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
-        required: false
+        required: true
         type: string
-        default: ""
-      proof_only:
-        description: "Build and prove native packaged assets without publishing"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-env:
-  RELEASE_RUST_TOOLCHAIN: "1.95.0"
-
 concurrency:
-  group: release-${{ inputs.proof_only && github.ref || inputs.version }}
+  group: release-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -63,7 +48,6 @@ jobs:
           fetch-depth: 0
 
       - name: Refuse non-main release
-        if: ${{ !inputs.proof_only }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF_NAME" != "main" ]; then
@@ -75,23 +59,14 @@ jobs:
         id: version
         env:
           INPUT_VERSION: ${{ inputs.version }}
-          PROOF_ONLY: ${{ inputs.proof_only }}
         run: |
           set -euo pipefail
           version="${INPUT_VERSION#v}"
-          if [ -z "$version" ] && [ "$PROOF_ONLY" = "true" ]; then
-            version="$(python -c "import tomllib; print(tomllib.load(open('crates/codestory-cli/Cargo.toml', 'rb'))['package']['version'])")"
-          fi
-          if [ -z "$version" ]; then
-            echo "::error::version input is required for a publishing release"
-            exit 1
-          fi
           python .github/scripts/check-codestory-release.py --version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       - name: Refuse existing tag or release
-        if: ${{ !inputs.proof_only }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -106,215 +81,17 @@ jobs:
             exit 1
           fi
 
-  build:
-    name: Build ${{ matrix.asset_target }}
+  packaged-proof:
     needs: preflight
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            asset_target: linux-x64
-            exe_suffix: ""
-          - os: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-            asset_target: linux-arm64
-            exe_suffix: ""
-          - os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            asset_target: windows-x64
-            exe_suffix: ".exe"
-          - os: windows-11-arm
-            rust_target: aarch64-pc-windows-msvc
-            asset_target: windows-arm64
-            exe_suffix: ".exe"
-          # ponytail: ort-sys has no x86_64-apple-darwin prebuilt; add macos-x64
-          # when the release path links a custom ONNX Runtime build.
-          - os: macos-15
-            rust_target: aarch64-apple-darwin
-            asset_target: macos-arm64
-            exe_suffix: ""
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install pinned Rust
-        run: |
-          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
-          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
-          rustup target add "${{ matrix.rust_target }}"
-
-      - name: Capture Rust cache key
-        id: rust-cache-key
-        shell: bash
-        run: |
-          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore Cargo registry, git sources, and build output
-        id: cargo-cache-restore
-        uses: actions/cache/restore@v5
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
-
-      - name: Build codestory-cli
-        run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
-
-      - name: Smoke codestory-cli
-        if: runner.os != 'Windows'
-        run: |
-          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
-          "$bin" --version
-          "$bin" --help
-
-      - name: Smoke codestory-cli on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
-          & $bin --version
-          & $bin --help
-
-      - name: Clear release asset output
-        run: python -c "import shutil; shutil.rmtree('target/release-dist', ignore_errors=True)"
-
-      - name: Package release asset
-        if: runner.os != 'Windows'
-        run: |
-          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
-          python .github/scripts/package-codestory-release.py \
-            --version "${{ needs.preflight.outputs.version }}" \
-            --target "${{ matrix.asset_target }}" \
-            --binary "$bin" \
-            --out-dir target/release-dist
-
-      - name: Smoke packaged release asset
-        if: runner.os != 'Windows'
-        run: |
-          python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
-            --checksum-file target/release-dist/SHA256SUMS.txt \
-            --expected-version "${{ needs.preflight.outputs.version }}" \
-            --version-only \
-            --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
-
-      - name: Fetch retrieval embedding model
-        if: matrix.asset_target == 'linux-x64'
-        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
-
-      - name: Packaged full-sidecar agent proof
-        if: matrix.asset_target == 'linux-x64'
-        env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: |
-          python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
-            --checksum-file target/release-dist/SHA256SUMS.txt \
-            --expected-version "${{ needs.preflight.outputs.version }}" \
-            --project "${{ github.workspace }}" \
-            --plugin-root plugins/codestory \
-            --out-dir target/packaged-agent-proof
-
-      - name: Upload packaged agent proof artifacts
-        if: always() && matrix.asset_target == 'linux-x64'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: packaged-agent-proof-${{ matrix.asset_target }}
-          path: target/packaged-agent-proof
-          if-no-files-found: warn
-
-      - name: Package release asset on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
-          python .github/scripts/package-codestory-release.py `
-            --version "${{ needs.preflight.outputs.version }}" `
-            --target "${{ matrix.asset_target }}" `
-            --binary $bin `
-            --out-dir target/release-dist
-
-      - name: Smoke packaged release asset on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          python .github/scripts/check-packaged-agent-proof.py `
-            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.zip" `
-            --checksum-file target/release-dist/SHA256SUMS.txt `
-            --expected-version "${{ needs.preflight.outputs.version }}" `
-            --version-only `
-            --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
-
-      - name: Upload packaged version proof
-        if: always()
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: packaged-version-proof-${{ matrix.asset_target }}
-          path: target/packaged-version-smoke/${{ matrix.asset_target }}
-          if-no-files-found: warn
-
-      - name: Run Windows installer ownership self-test
-        if: matrix.asset_target == 'windows-x64'
-        shell: pwsh
-        run: pwsh -File scripts/install-codestory.ps1 -SelfTest
-
-      - name: Prove Windows managed plugin handoff
-        if: matrix.asset_target == 'windows-x64'
-        shell: pwsh
-        run: >-
-          python .github/scripts/check-packaged-agent-proof.py
-          --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.zip"
-          --checksum-file target/release-dist/SHA256SUMS.txt
-          --expected-version "${{ needs.preflight.outputs.version }}"
-          --project "${{ github.workspace }}"
-          --plugin-root plugins/codestory
-          --managed-plugin-handoff
-          --out-dir target/packaged-managed-proof
-
-      - name: Upload Windows managed plugin proof
-        if: always() && matrix.asset_target == 'windows-x64'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: packaged-managed-proof-${{ matrix.asset_target }}
-          path: target/packaged-managed-proof
-          if-no-files-found: warn
-
-      - name: Upload release asset
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: codestory-cli-${{ matrix.asset_target }}
-          path: |
-            target/release-dist/*.tar.gz
-            target/release-dist/*.zip
-            target/release-dist/*.sha256
-          if-no-files-found: error
-
-      - name: Save Cargo registry, git sources, and build output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
-        uses: actions/cache/save@v5
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
+    uses: ./.github/workflows/packaged-platform-proof.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
 
   publish:
     name: Publish GitHub release
-    if: ${{ !inputs.proof_only }}
     needs:
       - preflight
-      - build
+      - packaged-proof
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -392,7 +169,6 @@ jobs:
 
   post-publish-smoke:
     name: Post-publish release asset smoke
-    if: ${{ !inputs.proof_only }}
     needs:
       - preflight
       - publish

@@ -122,8 +122,9 @@ it is not Codex host/model visibility proof.
 
 Packaged acceptance uses the same five native hosted-runner cells before and
 after publication. Pull requests that change release, packaging, installer, or
-plugin-launch surfaces call the same release build in non-publishing
-`proof_only` mode, so the native matrix is reviewed before a release:
+plugin-launch surfaces call the same read-only reusable packaged-proof workflow
+as the release, so the native matrix is reviewed before publication without
+granting release permissions to pull-request code:
 
 | Asset | Native runner | Required packaged proof |
 | --- | --- | --- |
