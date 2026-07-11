@@ -541,8 +541,8 @@ mod tests {
             serde_json::to_string(&LocalRefreshLockFile {
                 schema_version: LOCAL_REFRESH_STATUS_SCHEMA_VERSION,
                 project_root: clean_path_text(project.path()),
-                pid: u32::MAX,
-                process_start_identity: None,
+                pid: std::process::id(),
+                process_start_identity: Some("different-process-start".to_string()),
                 started_at_epoch_ms: old_started,
                 token: "stale".to_string(),
             })
@@ -556,8 +556,8 @@ mod tests {
                 status: "refreshing".to_string(),
                 project_root: clean_path_text(project.path()),
                 phase: "incremental_index".to_string(),
-                pid: u32::MAX,
-                process_start_identity: None,
+                pid: std::process::id(),
+                process_start_identity: Some("different-process-start".to_string()),
                 started_at_epoch_ms: old_started,
                 updated_at_epoch_ms: now_epoch_ms()
                     - LOCAL_REFRESH_STATUS_TTL.as_millis() as i64

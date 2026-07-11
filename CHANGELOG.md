@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Isolated CLI integration tests from user caches, install identity, plugin
+  data, stdio state, sidecar port registries, and managed runtime roots. Test
+  processes now share one explicit per-process state root, broker unit tests
+  inject machine-state roots across worker threads, and a regression invariant
+  rejects direct CLI process construction that bypasses the isolation helper.
 - Compacted stale agent sidecar port allocations atomically under the existing
   registry lock while preserving live, state-backed, recently reserved, and
   unverified owners. Native embedding launches now attempt to preserve only a

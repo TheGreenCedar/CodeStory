@@ -2,11 +2,10 @@
 
 use serde_json::Value;
 use std::fs;
-use std::process::Command;
 use tempfile::tempdir;
 
 fn run_bootstrap(project: &std::path::Path, extra_args: &[&str]) -> Value {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args(["retrieval", "bootstrap", "--project"]);
     command.arg(project);
@@ -21,7 +20,7 @@ fn run_bootstrap(project: &std::path::Path, extra_args: &[&str]) -> Value {
 }
 
 fn run_status(project: &std::path::Path, extra_args: &[&str]) -> Value {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args(["retrieval", "status", "--project"]);
     command.arg(project);
@@ -36,7 +35,7 @@ fn run_status(project: &std::path::Path, extra_args: &[&str]) -> Value {
 }
 
 fn run_down(project: &std::path::Path, extra_args: &[&str]) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args(["retrieval", "down", "--project"]);
     command.arg(project);
@@ -62,7 +61,7 @@ fn assert_digest_image_pins(json: &Value) {
 }
 
 fn create_valid_cache_with_cli(project: &std::path::Path, cache: &std::path::Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .args(["index", "--project"])
         .arg(project)
@@ -417,7 +416,7 @@ fn bootstrap_json_surfaces_prune_suppressed_reason_on_scan_errors() {
     fs::create_dir_all(&corrupt_subdir).expect("corrupt subdir");
     fs::write(corrupt_subdir.join("codestory.db"), b"not sqlite").expect("corrupt hashed db");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.args([
         "retrieval",
@@ -452,3 +451,4 @@ fn bootstrap_json_surfaces_prune_suppressed_reason_on_scan_errors() {
     );
     assert_eq!(repair["pruned_collections"].as_u64(), Some(0));
 }
+mod test_support;

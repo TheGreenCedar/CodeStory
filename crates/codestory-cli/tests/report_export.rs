@@ -1,12 +1,11 @@
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::tempdir;
 
 #[test]
 fn report_command_help_names_markdown_and_json_exports() {
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .arg("report")
         .arg("--help")
         .output()
@@ -72,7 +71,7 @@ fn report_handoff_profile_renders_handoff_header_and_json_metadata() {
 }
 
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .args(args)
         .arg("--project")
         .arg(workspace)
@@ -118,3 +117,4 @@ fn helper(value: &str) -> String {
     )
     .expect("write lib.rs");
 }
+mod test_support;

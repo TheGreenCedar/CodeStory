@@ -92,6 +92,7 @@ pub(crate) fn install_id() -> String {
     )
 }
 
+#[cfg(not(test))]
 pub(crate) fn broker_cache_root() -> PathBuf {
     codestory_retrieval::SidecarRuntimeConfig::local()
         .layout
@@ -99,6 +100,46 @@ pub(crate) fn broker_cache_root() -> PathBuf {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(test)]
+pub(crate) fn broker_cache_root() -> PathBuf {
+    if let Some(root) = codestory_retrieval::active_test_cache_root() {
+        return root;
+    }
+    static PROCESS_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let process_root = PROCESS_ROOT.get_or_init(|| {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join("codestory-cli-unit-tests")
+            .join(format!("{}-{nonce}", std::process::id()))
+    });
+    let thread = std::thread::current();
+    let label = thread
+        .name()
+        .map(safe_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("{:?}", thread.id()));
+    let prefix = &label[..label.len().min(32)];
+    let root = process_root.join(format!("{prefix}-{}", &hash_text(&label)[..12]));
+    std::fs::create_dir_all(root.join("sidecars")).expect("create broker test state root");
+    root
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_broker_root<T>(task: impl FnOnce() -> T) -> T {
+    codestory_retrieval::with_test_cache_root(&broker_cache_root(), task)
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_with_test_broker_root<T: Send + 'static>(
+    task: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    let root = broker_cache_root();
+    std::thread::spawn(move || codestory_retrieval::with_test_cache_root(&root, task))
 }
 
 pub(crate) fn safe_name(value: &str) -> String {

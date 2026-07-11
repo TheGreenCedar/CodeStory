@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::time::Instant;
 use tempfile::{TempDir, tempdir};
 
@@ -213,7 +213,7 @@ fn indexed_fixture(binary: &Path) -> (WarmLoopFixture, TimedJson) {
 
 fn run_cli_json(binary: &Path, workspace: &Path, cache_dir: &Path, args: &[String]) -> TimedJson {
     let started = Instant::now();
-    let output = Command::new(binary)
+    let output = test_support::command(binary)
         .args(args)
         .arg("--project")
         .arg(workspace)
@@ -238,7 +238,7 @@ fn run_cli_json(binary: &Path, workspace: &Path, cache_dir: &Path, args: &[Strin
 }
 
 fn spawn_stdio_server(binary: &Path, fixture: &WarmLoopFixture) -> StdioServer {
-    let mut child = Command::new(binary)
+    let mut child = test_support::command(binary)
         .arg("serve")
         .arg("--stdio")
         .arg("--refresh")
@@ -796,3 +796,4 @@ fn warm_stdio_agent_loop_emits_stats_without_protocol_pollution() {
         stats.protocol.first_tool_ms
     );
 }
+mod test_support;

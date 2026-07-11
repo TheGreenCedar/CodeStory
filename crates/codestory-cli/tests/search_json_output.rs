@@ -2,7 +2,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -133,7 +132,7 @@ fn write_openapi_route_fixture(root: &Path) {
 }
 
 fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.args(args);
     command.arg("--project").arg(workspace);
     command.env("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true");
@@ -2027,3 +2026,4 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         "search latency should stay bounded on eval fixture, got {max_latency_ms}ms"
     );
 }
+mod test_support;

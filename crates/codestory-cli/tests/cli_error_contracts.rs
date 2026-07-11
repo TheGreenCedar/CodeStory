@@ -177,7 +177,7 @@ impl AppController {
 }
 
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .args(args)
         .arg("--project")
@@ -265,7 +265,7 @@ fn ambiguous_error_alternatives(json: &Value) -> &Vec<Value> {
 
 #[test]
 fn top_level_help_names_command_purposes() {
-    let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let help = test_support::cli_command()
         .arg("--help")
         .output()
         .expect("run top-level help");
@@ -347,7 +347,7 @@ fn smoke_ci_agent_invalid_project_emits_json_failure() {
     let workspace = tempdir().expect("workspace dir");
     let missing = workspace.path().join("missing");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .args([
             "smoke",
             "--profile",
@@ -1191,7 +1191,7 @@ fn ambiguous_query_writes_output_file_even_on_failure() {
 
 #[test]
 fn choose_flag_resolves_by_displayed_alternative_number_when_available() {
-    let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let help = test_support::cli_command()
         .args(["symbol", "--help"])
         .output()
         .expect("run symbol help");
@@ -1259,3 +1259,4 @@ fn choose_flag_resolves_by_displayed_alternative_number_when_available() {
         "--choose should resolve the node id displayed as alternative #2"
     );
 }
+mod test_support;

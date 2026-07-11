@@ -129,7 +129,7 @@ fn write_dirty_marker_fixture(fixture: &StdioFixture, name: &str, marker: Value)
 }
 
 fn refresh_fixture_index(fixture: &StdioFixture) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .arg("index")
         .arg("--refresh")
@@ -155,7 +155,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
     let cache_dir = tempfile::tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .arg("index")
         .arg("--refresh")
@@ -221,7 +221,7 @@ fn full_retrieval_fixture() -> Result<Option<StdioFixture>, String> {
         return Ok(None);
     }
     let fixture = indexed_fixture_with_embedding_mode(false);
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .arg("retrieval")
         .arg("index")
         .arg("--refresh")
@@ -241,7 +241,7 @@ fn full_retrieval_fixture() -> Result<Option<StdioFixture>, String> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let status = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let status = test_support::cli_command()
         .arg("retrieval")
         .arg("status")
         .arg("--format")
@@ -310,7 +310,7 @@ fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
 }
 
 fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .arg("serve")
         .arg("--stdio")
@@ -388,7 +388,7 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
 }
 
 fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let mut child = test_support::cli_command()
         .arg("serve")
         .arg("--stdio")
         .arg("--multi-project")
@@ -885,11 +885,7 @@ fn write_repair_status_fixture(
 ) -> (PathBuf, RemoveDirOnDrop) {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &canonical_root,
-        codestory_retrieval::SidecarProfile::Agent,
-        Some(run_id),
-    );
+    let sidecar = test_sidecar_runtime(&canonical_root, run_id);
     let status_path = sidecar
         .layout
         .state_file
@@ -924,6 +920,15 @@ fn write_repair_status_fixture(
     )
     .expect("write repair status fixture");
     (status_path, RemoveDirOnDrop(status_dir))
+}
+
+fn test_sidecar_runtime(project: &Path, run_id: &str) -> codestory_retrieval::SidecarRuntimeConfig {
+    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        Some(project),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(run_id),
+        &test_support::test_state_root().join("cache"),
+    )
 }
 
 fn continuation_uris_for(node_id: &str) -> Vec<String> {
@@ -3225,11 +3230,8 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     let policy_path = fixture.cache_dir.path().join("plugin-sidecar-policy.json");
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &canonical_root,
-        codestory_retrieval::SidecarProfile::Agent,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    );
+    let repair_sidecar =
+        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
     let repair_state_dir = repair_sidecar
         .layout
         .state_file
@@ -3415,11 +3417,8 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
     fixture.ready_repair_worker_probe_exit_code = Some(0);
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &canonical_root,
-        codestory_retrieval::SidecarProfile::Agent,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    );
+    let repair_sidecar =
+        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
     let _repair_state_cleanup = RemoveDirOnDrop(
         repair_sidecar
             .layout
@@ -4196,18 +4195,35 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     fs::remove_file(fixture.workspace.path().join("src").join("alpha.rs"))
         .expect("remove indexed file after indexing");
 
-    let refreshed = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "status-freshness-after-mutation",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-    let refreshed_result =
-        assert_success_envelope(&refreshed, json!("status-freshness-after-mutation"));
-    let refreshed_status = json_resource_content(refreshed_result, "codestory://status");
+    let refresh_deadline = Instant::now() + Duration::from_secs(15);
+    let mut refresh_attempt = 0;
+    let refreshed_status = loop {
+        let id = format!("status-freshness-after-mutation-{refresh_attempt}");
+        let refreshed = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "resources/read",
+                "params": {"uri": "codestory://status"}
+            }),
+        );
+        let refreshed_result = assert_success_envelope(&refreshed, json!(id));
+        let status = json_resource_content(refreshed_result, "codestory://status");
+        if find_index_freshness(&status)
+            .and_then(|freshness| freshness.get("status"))
+            .and_then(Value::as_str)
+            == Some("fresh")
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < refresh_deadline,
+            "background local refresh did not complete within 15 seconds: {status}"
+        );
+        refresh_attempt += 1;
+        thread::sleep(Duration::from_millis(50));
+    };
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after mutation");
     assert_eq!(
         refreshed_status["local_refresh"]["reason"],
@@ -4274,7 +4290,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
         "warm status freshness check p95 should stay under 1s for a small repo, got median={median:?}, p95={p95:?}"
     );
 
-    let mut index_command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut index_command = test_support::cli_command();
     index_command
         .arg("index")
         .arg("--refresh")
@@ -5666,3 +5682,4 @@ fn unknown_prompt_returns_jsonrpc_error() {
         "unknown prompt message should identify the missing prompt: {response}"
     );
 }
+mod test_support;
