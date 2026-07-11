@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Staged incremental graph projection, removed-file cleanup, resolution,
+  deferred indexes, and both grounding snapshot tiers in a coherent SQLite
+  clone before publishing the new core generation. Pre-publication failures
+  and cancellation now discard staged artifacts without changing the live
+  database, schema, snapshots, or incomplete-run marker; late search or cache
+  failures keep the already-published generation fenced for staged recovery.
+
 ## 0.14.3
 
 ### Fixed
