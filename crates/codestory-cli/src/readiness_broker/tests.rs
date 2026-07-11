@@ -26,6 +26,19 @@ fn test_scope(project: &Path, run_id: &str) -> BrokerScope {
     agent_repair_scope(project, Some(run_id), "9.9.9")
 }
 
+fn test_sidecar_runtime(
+    project: &Path,
+    profile: codestory_retrieval::SidecarProfile,
+    run_id: Option<&str>,
+) -> codestory_retrieval::SidecarRuntimeConfig {
+    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        Some(project),
+        profile,
+        run_id,
+        &broker_cache_root(),
+    )
+}
+
 fn write_machine_lock(resource: &str, scope: &BrokerScope, pid: u32) -> PathBuf {
     write_machine_lock_at(resource, scope, pid, now_epoch_ms())
 }
@@ -344,7 +357,7 @@ fn native_embedding_reuse_does_not_cross_workspace_roots() {
     let project = tempdir().expect("project");
     let other_worktree = tempdir().expect("other worktree");
     let scope = test_scope(project.path(), "shared-agent");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
@@ -380,7 +393,7 @@ fn native_embedding_busy_lock_reuses_matching_sidecar_owner() {
     let resource = unique_resource("native-reuse");
     cleanup_machine_resource(&resource);
     let scope = test_scope(project.path(), "shared-agent");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
@@ -411,7 +424,7 @@ fn native_embedding_busy_lock_rejects_mismatched_state_pid() {
     let resource = unique_resource("native-mismatch");
     cleanup_machine_resource(&resource);
     let scope = test_scope(project.path(), "shared-agent");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
@@ -463,7 +476,7 @@ fn native_embedding_acquired_lease_releases_without_handoff_on_error() {
     let resource = unique_resource("native-error-release");
     cleanup_machine_resource(&resource);
     let scope = test_scope(project.path(), "shared-agent");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
@@ -492,7 +505,7 @@ fn native_embedding_cleanup_failure_preserves_acquired_lock_for_recorded_launch(
     let resource = unique_resource("native-cleanup-failure-preserve");
     cleanup_machine_resource(&resource);
     let scope = test_scope(project.path(), "shared-agent");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
@@ -624,7 +637,7 @@ fn native_embedding_acquired_post_transfer_cleanup_releases_handed_off_lock() {
 #[test]
 fn native_embedding_reused_post_transfer_cleanup_skips_state_read() {
     let project = tempdir().expect("temp project");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
@@ -792,7 +805,7 @@ fn machine_resource_reaper_stale_takeover_has_single_winner() {
     for _ in 0..contender_count {
         let resource = resource.clone();
         let barrier = barrier.clone();
-        handles.push(thread::spawn(move || {
+        handles.push(spawn_with_test_broker_root(move || {
             barrier.wait();
             try_acquire_machine_resource_reaper_lock(&resource).expect("try reaper")
         }));
@@ -1006,7 +1019,7 @@ fn write_ready_repair_status_file(
     updated_at_epoch_ms: i64,
     phase: &str,
 ) -> PathBuf {
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project,
         codestory_retrieval::SidecarProfile::Agent,
         Some(run_id),
@@ -1261,7 +1274,7 @@ fn machine_resource_lock_contention_has_single_winner_across_threads() {
         let resource = resource.clone();
         let scope = scope.clone();
         let barrier = barrier.clone();
-        handles.push(thread::spawn(move || {
+        handles.push(spawn_with_test_broker_root(move || {
             barrier.wait();
             try_acquire_machine_resource_lock(&resource, &scope).expect("try lock")
         }));
@@ -1298,7 +1311,7 @@ fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared(
     let project = tempdir().expect("project");
     let cache = tempdir().expect("cache");
     let run_id = "shared-agent";
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some(run_id),
@@ -1385,6 +1398,18 @@ fn observe_broker_snapshot_is_stable_and_does_not_publish() {
     assert_eq!(first.updated_at_epoch_ms, 0);
     assert_eq!(first.persistence_status, "observed");
     assert!(!snapshot_path.exists());
+}
+
+#[test]
+fn broker_unit_test_paths_use_injected_machine_state_root() {
+    let root = broker_cache_root();
+
+    assert!(
+        root.starts_with(std::env::temp_dir().join("codestory-cli-unit-tests")),
+        "broker test root must be process-local: {}",
+        root.display()
+    );
+    assert!(machine_resource_lock_path(NATIVE_EMBEDDING_RESOURCE).starts_with(&root));
 }
 
 #[test]

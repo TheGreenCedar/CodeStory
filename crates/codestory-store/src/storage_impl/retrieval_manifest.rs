@@ -1,5 +1,32 @@
 use super::{Storage, StorageError};
+use rusqlite::Row;
 use serde::{Deserialize, Serialize};
+
+const MANIFEST_SELECT: &str = "
+    SELECT
+        project_id,
+        zoekt_version,
+        qdrant_collection,
+        scip_revision,
+        built_at_epoch_ms,
+        disk_bytes,
+        degraded_modes_json,
+        embedding_backend,
+        embedding_dim,
+        sidecar_schema_version,
+        sidecar_input_hash,
+        sidecar_generation,
+        projection_count,
+        symbol_doc_count,
+        dense_projection_count,
+        semantic_policy_version,
+        graph_artifact_hash,
+        dense_reason_counts_json,
+        precise_semantic_import_status,
+        precise_semantic_import_reason,
+        precise_semantic_import_revision,
+        precise_semantic_import_producer
+    FROM retrieval_index_manifest";
 
 /// Manifest row describing retrieval sidecar freshness for one project id.
 ///
@@ -126,61 +153,30 @@ impl Storage {
         &self,
         project_id: &str,
     ) -> Result<Option<RetrievalIndexManifest>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                project_id,
-                zoekt_version,
-                qdrant_collection,
-                scip_revision,
-                built_at_epoch_ms,
-                disk_bytes,
-                degraded_modes_json,
-                embedding_backend,
-                embedding_dim,
-                sidecar_schema_version,
-                sidecar_input_hash,
-                sidecar_generation,
-                projection_count,
-                symbol_doc_count,
-                dense_projection_count,
-                semantic_policy_version,
-                graph_artifact_hash,
-                dense_reason_counts_json,
-                precise_semantic_import_status,
-                precise_semantic_import_reason,
-                precise_semantic_import_revision,
-                precise_semantic_import_producer
-             FROM retrieval_index_manifest
-             WHERE project_id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{MANIFEST_SELECT} WHERE project_id = ?1"))?;
         let mut rows = stmt.query(rusqlite::params![project_id])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        Ok(Some(RetrievalIndexManifest {
-            project_id: row.get(0)?,
-            zoekt_version: row.get(1)?,
-            qdrant_collection: row.get(2)?,
-            scip_revision: row.get(3)?,
-            built_at_epoch_ms: row.get(4)?,
-            disk_bytes: row.get(5)?,
-            degraded_modes_json: row.get(6)?,
-            embedding_backend: row.get(7)?,
-            embedding_dim: row.get(8)?,
-            sidecar_schema_version: row.get(9)?,
-            sidecar_input_hash: row.get(10)?,
-            sidecar_generation: row.get(11)?,
-            projection_count: row.get(12)?,
-            symbol_doc_count: row.get(13)?,
-            dense_projection_count: row.get(14)?,
-            semantic_policy_version: row.get(15)?,
-            graph_artifact_hash: row.get(16)?,
-            dense_reason_counts_json: row.get(17)?,
-            precise_semantic_import_status: row.get(18)?,
-            precise_semantic_import_reason: row.get(19)?,
-            precise_semantic_import_revision: row.get(20)?,
-            precise_semantic_import_producer: row.get(21)?,
-        }))
+        Ok(Some(manifest_from_row(row)?))
+    }
+
+    /// Return every current retrieval manifest in this store.
+    ///
+    /// Retention scans use the complete set so a shared sidecar root never
+    /// removes a generation still referenced by another project row.
+    pub fn list_retrieval_index_manifests(
+        &self,
+    ) -> Result<Vec<RetrievalIndexManifest>, StorageError> {
+        let mut stmt = self.conn.prepare(MANIFEST_SELECT)?;
+        let rows = stmt.query_map([], manifest_from_row)?;
+        let mut manifests = Vec::new();
+        for row in rows {
+            manifests.push(row?);
+        }
+        Ok(manifests)
     }
 
     /// Return Qdrant collection names referenced by stored retrieval manifests.
@@ -219,6 +215,33 @@ impl Storage {
         }
         Ok(collections)
     }
+}
+
+fn manifest_from_row(row: &Row<'_>) -> rusqlite::Result<RetrievalIndexManifest> {
+    Ok(RetrievalIndexManifest {
+        project_id: row.get(0)?,
+        zoekt_version: row.get(1)?,
+        qdrant_collection: row.get(2)?,
+        scip_revision: row.get(3)?,
+        built_at_epoch_ms: row.get(4)?,
+        disk_bytes: row.get(5)?,
+        degraded_modes_json: row.get(6)?,
+        embedding_backend: row.get(7)?,
+        embedding_dim: row.get(8)?,
+        sidecar_schema_version: row.get(9)?,
+        sidecar_input_hash: row.get(10)?,
+        sidecar_generation: row.get(11)?,
+        projection_count: row.get(12)?,
+        symbol_doc_count: row.get(13)?,
+        dense_projection_count: row.get(14)?,
+        semantic_policy_version: row.get(15)?,
+        graph_artifact_hash: row.get(16)?,
+        dense_reason_counts_json: row.get(17)?,
+        precise_semantic_import_status: row.get(18)?,
+        precise_semantic_import_reason: row.get(19)?,
+        precise_semantic_import_revision: row.get(20)?,
+        precise_semantic_import_producer: row.get(21)?,
+    })
 }
 
 #[cfg(test)]
@@ -316,6 +339,61 @@ mod tests {
             .expect("manifest exists");
 
         assert_eq!(loaded, manifest);
+    }
+
+    #[test]
+    fn list_retrieval_index_manifests_returns_every_project_row() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("codestory.db");
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        for (project_id, suffix) in [
+            ("proj_a", "aaaaaaaaaaaaaaaa"),
+            ("proj_b", "bbbbbbbbbbbbbbbb"),
+        ] {
+            storage
+                .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
+                    project_id: project_id.into(),
+                    zoekt_version: "v1".into(),
+                    qdrant_collection: format!("codestory_{project_id}_{suffix}"),
+                    scip_revision: Some(format!("graph-{suffix}")),
+                    built_at_epoch_ms: 1,
+                    disk_bytes: None,
+                    degraded_modes_json: "[]".into(),
+                    embedding_backend: None,
+                    embedding_dim: None,
+                    sidecar_schema_version: Some(2),
+                    sidecar_input_hash: Some(suffix.repeat(4)),
+                    sidecar_generation: Some(format!("{project_id}-{suffix}")),
+                    projection_count: Some(1),
+                    symbol_doc_count: Some(1),
+                    dense_projection_count: Some(1),
+                    semantic_policy_version: Some("graph_first_v1".into()),
+                    graph_artifact_hash: Some("graph".into()),
+                    dense_reason_counts_json: Some("{}".into()),
+                    precise_semantic_import_status: None,
+                    precise_semantic_import_reason: None,
+                    precise_semantic_import_revision: None,
+                    precise_semantic_import_producer: None,
+                })
+                .expect("upsert manifest");
+        }
+
+        let mut manifests = storage
+            .list_retrieval_index_manifests()
+            .expect("list manifests");
+        manifests.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+
+        assert_eq!(
+            manifests
+                .iter()
+                .map(|manifest| manifest.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["proj_a", "proj_b"]
+        );
+        assert_eq!(
+            manifests[1].sidecar_generation.as_deref(),
+            Some("proj_b-bbbbbbbbbbbbbbbb")
+        );
     }
 
     #[test]

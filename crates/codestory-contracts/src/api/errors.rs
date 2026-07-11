@@ -3,7 +3,7 @@ use specta::Type;
 
 use super::dto::ReadinessVerdictDto;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ApiError {
     pub code: String,
     pub message: String,
@@ -11,7 +11,7 @@ pub struct ApiError {
     pub details: Option<Box<ApiErrorDetails>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct ApiErrorDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed_layer: Option<String>,
@@ -25,6 +25,31 @@ pub struct ApiErrorDetails {
     pub full_repair: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<ReadinessVerdictDto>,
+}
+
+pub const COMMAND_FAILURE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandFailureEnvelope {
+    pub schema_version: u32,
+    pub error: ApiError,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<serde_json::Value>,
+}
+
+impl CommandFailureEnvelope {
+    pub fn new(error: ApiError) -> Self {
+        Self {
+            schema_version: COMMAND_FAILURE_SCHEMA_VERSION,
+            error,
+            context: None,
+        }
+    }
+
+    pub fn with_context(mut self, context: serde_json::Value) -> Self {
+        self.context = Some(context);
+        self
+    }
 }
 
 impl ApiErrorDetails {
@@ -136,5 +161,18 @@ mod tests {
             value["details"]["full_repair"][1],
             "codestory-cli retrieval status --project \"C:/repo/example\" --format json"
         );
+    }
+
+    #[test]
+    fn command_failure_envelope_round_trips_shared_api_error() {
+        let envelope = CommandFailureEnvelope::new(ApiError::invalid_argument("bad input"))
+            .with_context(serde_json::json!({"argument": "--format"}));
+
+        let json = serde_json::to_string(&envelope).expect("serialize envelope");
+        let decoded: CommandFailureEnvelope =
+            serde_json::from_str(&json).expect("deserialize envelope");
+
+        assert_eq!(decoded, envelope);
+        assert_eq!(decoded.schema_version, COMMAND_FAILURE_SCHEMA_VERSION);
     }
 }

@@ -142,10 +142,26 @@ More pairs, anti-patterns, and language-flavored examples:
 | --- | --- |
 | No CodeStory `status` tool is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
 | CodeStory resources are visible but `mcp__codestory` tools are hidden | Report the host blocker. Unscoped resources cannot safely select a repository in multi-project mode |
-| Status shows `repair_setup` | Let the agent follow `recommended_next_calls` from status; restart host if binary was updated |
+| Status shows `runtime_update.state=available` | Current compatible surfaces keep working; reload when convenient if `restart_recommended=true` |
+| Status shows `repair_setup` | The active runtime could not start or prove compatibility; follow `recommended_next_calls` |
 | Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
 | Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
-| Status/grounding call times out | Restart stale CodeStory MCP processes, then call `status` with the target project in a fresh thread |
+| Status/grounding call times out | If status remains visible, reread it and follow its bounded blocker/next call; do not kill or restart managed MCP for index or sidecar readiness. Reload only for host transport/registration failure, plugin/config replacement, or a runtime update whose status says `restart_recommended=true` |
+
+### Managed platform matrix
+
+| Host | Managed CLI | Managed accelerated embeddings |
+| --- | --- | --- |
+| Windows x64 | Yes | Native Vulkan |
+| Windows arm64 | Yes | No managed accelerated sidecar cell; use a proven external endpoint or explicit degraded CPU opt-in |
+| Linux x64 / arm64 | Yes | Docker Vulkan with a verified `/dev/dri` render node |
+| macOS arm64 | Yes | Native Metal |
+| macOS x64 | No release asset; managed plugin runtime unsupported | Build or provide an explicit compatible `CODESTORY_CLI` first; then use a proven external embedding endpoint or explicit degraded CPU opt-in |
+
+Linux CUDA, HIP/ROCm, SYCL, and OpenVINO remain contract-only until packaging,
+launch, and live GPU evidence exist. A compatible version difference is
+advisory; an already-running MCP changes binaries only after an actual runtime
+replacement and host reload.
 
 ### Native embedding busy decision tree
 
@@ -162,6 +178,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | `readiness_broker.resources.native_embedding_runtime.status` | `available` | `busy` blocks repair only when the owner is foreign or unverifiable; same-project reusable owners should continue through `recommended_next_calls`; `stale` means retry repair so the broker can reclaim it |
 | `readiness_broker.gpu_proof.proof_status` | `verified` when accelerator is required and live embed smoke succeeded | `gpu_unverified` means repair should stop before a long semantic rebuild; inspect `embed_smoke_ok` / `embed_smoke_ms` |
 | `readiness_broker.persistence_status` | `persisted` | `failed` means inspect `persistence_error`; status may be live but not durable across processes |
+| `sidecar_setup.last_worker_result` | `outcome=succeeded` for the matching repair `attempt_id` | `failed` or `abandoned` means branch on `terminal_envelope.error.code` when present. Legacy persisted results can omit the envelope; use `wait_error` and bounded tails as compatibility diagnostics. It is terminal evidence, not an active lock |
 | `recommended_next_calls` | Start with `agent-guide`, then use allowed tools | For packet/search blockers, follow the listed `sidecar_setup repair` and status read sequence; if tools are hidden, stop and report host visibility |
 
 Shared repair lanes: [Troubleshooting](troubleshooting.md).

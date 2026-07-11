@@ -66,17 +66,17 @@ Degraded retrieval is navigation help only. See [Glossary](../glossary.md#retrie
 ## Stale local cache
 
 ```sh
-codestory-cli doctor --project <repo>
-codestory-cli index --project <repo> --refresh full
-codestory-cli doctor --project <repo>
+codestory-cli ready --goal local --repair --project <repo> --format json
 ```
 
 Read commands default to `--refresh none`. Use `--refresh incremental` when a
 read should refresh an existing cache first.
 
-If the cache directory is suspect, get the path from `doctor`, verify it is
-under the CodeStory cache root, move it aside, rebuild, and delete the backup
-only after `doctor` is healthy.
+Reserve `index --refresh full` or moving a cache aside for maintainer-directed
+recovery after status/`doctor` identifies that exact cache and coordinated local
+repair cannot converge. Verify the path is under the active CodeStory cache
+root, preserve the old directory until the replacement is healthy, and never
+clean a user cache merely to make tests pass.
 
 ## Index and ground
 

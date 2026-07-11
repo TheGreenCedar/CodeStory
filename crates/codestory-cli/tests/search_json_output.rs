@@ -2,7 +2,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -133,7 +132,7 @@ fn write_openapi_route_fixture(root: &Path) {
 }
 
 fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.args(args);
     command.arg("--project").arg(workspace);
     command.env("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true");
@@ -277,20 +276,27 @@ fn search_json_fails_closed_without_full_sidecars() {
         "mandatory sidecar search should fail without full sidecars: {}",
         String::from_utf8_lossy(&search.stdout)
     );
-    let stderr = String::from_utf8_lossy(&search.stderr);
     assert!(
-        stderr.contains(
+        search.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+    let failure: Value = serde_json::from_slice(&search.stdout).expect("parse failure envelope");
+    let failure_text = failure.to_string();
+    assert_eq!(failure["schema_version"], 1);
+    assert_eq!(failure["error"]["code"], "command_failed");
+    assert!(
+        failure_text.contains(
             "retrieval_unavailable: sidecar retrieval primary is unavailable or degraded"
-        ) && stderr.contains("expected profile=agent mode=full"),
-        "search should report mandatory agent sidecar full-mode boundary: {stderr}"
+        ) && failure_text.contains("expected profile=agent mode=full"),
+        "search should report mandatory agent sidecar full-mode boundary: {failure:#}"
     );
     assert!(
-        stderr.contains("Minimum next:")
-            && stderr.contains("Full repair:")
-            && stderr.contains("codestory-cli ready --goal agent --repair")
-            && stderr.contains("codestory-cli retrieval status")
-            && stderr.contains("codestory-cli doctor"),
-        "search should include retrieval repair commands: {stderr}"
+        failure_text.contains("Minimum next:")
+            && failure_text.contains("Full repair:")
+            && failure_text.contains("codestory-cli ready --goal agent --repair")
+            && failure_text.contains("codestory-cli retrieval status")
+            && failure_text.contains("codestory-cli doctor"),
+        "search should include retrieval repair commands: {failure:#}"
     );
 }
 
@@ -315,10 +321,17 @@ fn search_json_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
         "removed hybrid tuning flags should be rejected by CLI parsing: {}",
         String::from_utf8_lossy(&search.stdout)
     );
-    let stderr = String::from_utf8_lossy(&search.stderr);
     assert!(
-        stderr.contains("unexpected argument '--hybrid-lexical'"),
-        "search should reject removed hybrid tuning flags as unknown args: {stderr}"
+        search.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+    let failure: Value = serde_json::from_slice(&search.stdout).expect("parse failure envelope");
+    assert_eq!(failure["error"]["code"], "invalid_arguments");
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unexpected argument '--hybrid-lexical'")),
+        "search should reject removed hybrid tuning flags as unknown args: {failure:#}"
     );
 }
 
@@ -343,10 +356,17 @@ fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
         "removed context hybrid tuning flags should be rejected by CLI parsing: {}",
         String::from_utf8_lossy(&context.stdout)
     );
-    let stderr = String::from_utf8_lossy(&context.stderr);
     assert!(
-        stderr.contains("unexpected argument '--hybrid-semantic'"),
-        "context should reject removed hybrid tuning flags as unknown args: {stderr}"
+        context.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+    let failure: Value = serde_json::from_slice(&context.stdout).expect("parse failure envelope");
+    assert_eq!(failure["error"]["code"], "invalid_arguments");
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unexpected argument '--hybrid-semantic'")),
+        "context should reject removed hybrid tuning flags as unknown args: {failure:#}"
     );
 }
 
@@ -2027,3 +2047,4 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
         "search latency should stay bounded on eval fixture, got {max_latency_ms}ms"
     );
 }
+mod test_support;

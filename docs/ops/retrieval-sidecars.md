@@ -27,8 +27,8 @@ Promotion checks: [`retrieval-architecture.md`](../testing/retrieval-architectur
 
 ```mermaid
 flowchart LR
-    cli[codestory-cli] --> zoekt["Zoekt localhost:6070"]
-    cli --> qdrant["Qdrant localhost:6333"]
+    cli[codestory-cli] --> zoekt["Zoekt at profile-selected localhost port"]
+    cli --> qdrant["Qdrant at profile-selected localhost ports"]
     cli --> scip[SCIP artifacts in user cache]
     cli --> embed[llama.cpp embedding endpoint]
 ```
@@ -62,6 +62,7 @@ active runtime source when it is available.
 |-------|---------|-----------------|
 | `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph and sidecar packet/search infrastructure are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
 | `local_navigation=ready`, `agent_packet_search=repairing` | Agent sidecar repair is active and status should include the current `phase`, `profile`, `run_id`, and `namespace` | Wait or reread `codestory://status`; do not start a second agent repair for the same run |
+| `sidecar_setup.last_worker_result.outcome=failed` or `abandoned` | The background repair worker reached a durable terminal state without completing | Match `attempt_id` and, when present, branch on `terminal_envelope.error.code` and its failed layer. For a legacy persisted result without an envelope, use `wait_error` and bounded tails as compatibility diagnostics |
 | `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; call MCP `sidecar_setup repair` from status before packet/search claims |
 | `local_navigation=repair_local` | Core index or cache is missing or stale | Follow `recommended_next_calls`, then reread status; use CLI local repair commands only for maintainer transcripts |
 | `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Call MCP `sidecar_setup repair`, then reread status; maintainers can inspect `retrieval status` and rerun explicit sidecar commands if needed |
@@ -72,8 +73,8 @@ Layer repair should follow the first failing layer, not a broad rebuild:
 | Failing layer | Evidence to capture | Small repair |
 |---------------|---------------------|--------------|
 | Active runtime or plugin adapter | `codestory://status` fields, `server_executable`, `cli_version`, `plugin_runtime`, `allowed_surfaces` | Reload or reinstall the active CLI/plugin runtime, then reread status |
-| Core SQLite graph | `doctor` cache/index checks and indexed file counts | Follow status `recommended_next_calls`; CLI transcript: `codestory-cli fix --project <repo> --format json` |
-| Zoekt lexical sidecar | `retrieval status` mode/degraded reason and Zoekt health text | Free port `6070` or rerun bootstrap, then `retrieval index --refresh full` |
+| Core SQLite graph | `doctor` cache/index checks and indexed file counts | Follow status `recommended_next_calls`; CLI transcript: `codestory-cli ready --goal local --repair --project <repo> --format json` |
+| Zoekt lexical sidecar | `retrieval status` mode/degraded reason, selected profile/port, ownership, and Zoekt health text | Rerun bootstrap for the selected profile; for managed Agent state, do not assume or free the Local default port |
 | Qdrant dense sidecar | Qdrant health, collection name, point count, dense-anchor count, backend/dimension fields | Fix Qdrant/model/backend state; move the Qdrant cache aside only if repeated health checks fail |
 | SCIP graph artifacts | `scip_unavailable`, graph artifact hash/path, manifest contract | Rerun `retrieval index --refresh full`; inspect SCIP cache paths if it repeats |
 | Embedding endpoint | `CODESTORY_EMBED_LLAMACPP_URL`, managed embeddings probe, model/backend/dimension fields | Start or reconfigure llama.cpp, then rerun retrieval index/status |
@@ -89,6 +90,9 @@ Attach these artifacts to issues or PRs that claim readiness repair:
 
 - `codestory://status` transcript when MCP is live, or the full
   `agent preflight` JSON when it is not.
+- The matching `sidecar_setup.last_worker_result` when background repair fails,
+  including its `attempt_id`, exit code, truncated-output flags, and shared
+  `terminal_envelope` when the result was written by a current runtime.
 - `doctor --format markdown` or JSON output, including readiness verdicts and
   legacy/managed embedding diagnostics.
 - `retrieval status --format json`, including `retrieval_mode`,
@@ -107,8 +111,10 @@ Attach these artifacts to issues or PRs that claim readiness repair:
   sidecars.
 - Node.js 18+ if you need `scripts/setup-retrieval-env.mjs` to fetch or verify
   the pinned GGUF.
-- Localhost ports available: Zoekt `6070`, Qdrant HTTP `6333`, Qdrant gRPC
-  `6334`, and llama.cpp embeddings `8080`.
+- For manual Local profile only, the default localhost ports are Zoekt `6070`,
+  Qdrant HTTP `6333`, Qdrant gRPC `6334`, and llama.cpp embeddings `8080`.
+  Managed Agent profiles allocate or reuse namespace-specific ports; read them
+  from status rather than assuming the Local defaults.
 - GGUF embedding model available through `CODESTORY_EMBED_MODEL_DIR`, or fetched
   with the setup wrapper.
 
@@ -118,8 +124,9 @@ the CLI status proof below reports `full`.
 
 ### Minimum environment
 
-For product sidecar retrieval, leave most knobs unset. Set these only when the
-defaults do not match your machine:
+For product sidecar retrieval, leave most knobs unset. These endpoint/port
+overrides are Local/manual controls; Agent allocation remains dynamic unless an
+explicit override or persisted Agent state selects a port.
 
 | Variable | Minimum operator use |
 |----------|----------------------|
@@ -250,7 +257,7 @@ closed and must not claim sidecar-backed evidence.
 | Status or condition | Meaning | Operator action |
 |---------------------|---------|-----------------|
 | `retrieval_manifest_missing` | Sidecars may be running, but no finalized manifest proves this workspace | Run `retrieval index --project <repo> --refresh full`, then rerun status |
-| `unavailable` or Zoekt down | Lexical sidecar is unavailable | Free port `6070` or fix Zoekt, rerun bootstrap, then rerun index/status |
+| `unavailable` or Zoekt down | Lexical sidecar is unavailable | Inspect the selected profile, namespace, port, and ownership in status; rerun bootstrap, then rerun index/status |
 | `no_semantic`, `lexical_only`, or Qdrant down when dense anchors are expected | Semantic sidecar is unavailable or stale | Fix Qdrant/model/backend, rerun bootstrap and retrieval index, then rerun status |
 | `no_scip` | Graph artifacts are missing or stale | Rerun retrieval index; inspect SCIP artifact paths if it repeats |
 | Obsolete, stale, or partial manifest | Source, schema, graph, symbol-doc, dense-anchor, or backend contract drifted | Rerun `retrieval index --project <repo> --refresh full` |
@@ -273,11 +280,14 @@ codestory-cli retrieval inventory --project <repo> --format json
 
 The inventory lists CodeStory-owned sidecar namespaces, state paths, cleanup
 commands, Compose projects, matching containers/networks, visible ports, and
-the required `bge-base-en-v1.5.Q8_0.gguf` model check. It classifies namespaces
-as `live`, `stale`, `orphaned`, `incomplete`, or `unknown` with safe-candidate
-and blocking reasons. It is a dry-run status surface only: it does not run
-Docker prune, remove containers, delete networks, or clear state files, and it
-works even when packet/search readiness is unavailable.
+the required `bge-base-en-v1.5.Q8_0.gguf` model check. It also reports the
+project's generation bundles as active, verified rollback, or reclaimable with
+retained and reclaimable byte totals. It classifies namespaces as `live`,
+`stale`, `orphaned`, `incomplete`, or `unknown` with safe-candidate and blocking
+reasons. The default command is a dry-run: it does not run Docker prune, remove
+containers, delete networks, clear state files, or delete generations. When
+the active manifest or sidecar proof is unavailable or malformed, generation
+pruning is explicitly suppressed rather than inferred.
 
 To let the CLI remove only CodeStory-owned inventory safe candidates, review the
 dry-run output first and then pass the explicit apply flag:
@@ -289,12 +299,15 @@ codestory-cli retrieval inventory --project <repo> --apply --format markdown
 codestory-cli retrieval inventory --project <repo> --apply --format json
 ```
 
-`--apply` removes only namespaces classified as inventory safe candidates. Live
-namespaces, incomplete state, and unknown ownership stay blocked with
-per-namespace reasons. The apply path removes exact CodeStory-owned state/data
-paths and explicitly matched sidecar resources only; it does not run Docker
-prune, broad Docker cleanup, host/global network deletion, readiness-triggered
-cleanup, or packet/search-triggered cleanup.
+`--apply` removes only namespaces classified as inventory safe candidates and
+applies the generation plan shown by the dry-run. Generation cleanup requires a
+fully healthy active manifest, retains every manifest-referenced active
+generation sharing that sidecar scope plus at most one health-verified
+rollback, and removes only matching stale Qdrant, SCIP, and lexical artifacts
+under the per-project publication lock. Live namespaces,
+incomplete state, unknown ownership, protection-scan errors, and malformed
+generation entries stay blocked with explicit reasons. The apply path does not
+run Docker prune, broad Docker cleanup, or host/global network deletion.
 
 1. Run the dry-run inventory in Markdown and JSON.
 2. Confirm the safe candidates and blocked reasons.
@@ -307,15 +320,34 @@ cleanup, or packet/search-triggered cleanup.
 `retrieval down` clears the sidecar state file only. Stop Docker/Compose
 separately if containers must be removed.
 
-Default Windows cache locations:
+Agent namespaces reserve dynamic ports in
+`<cache>/sidecars/port-allocations.json`. Allocation automatically compacts
+state-less entries whose ports are free while holding the registry lock and
+publishes the compacted file atomically. Valid state, bound ports, malformed or
+unreadable ownership, and a ten-minute startup reservation are retained
+fail-closed. Cleanup that prunes entries or encounters failures reports pruned,
+retained, and failed counts on stderr; renewable owner leases remain a separate
+lifecycle contract.
 
-| Service | Default port | Data dir |
-|---------|--------------|----------|
-| Zoekt web/search | `6070` | `%LOCALAPPDATA%\codestory\cache\zoekt\` |
-| Qdrant HTTP | `6333` | `%LOCALAPPDATA%\codestory\cache\qdrant\` |
-| Qdrant gRPC | `6334` | `%LOCALAPPDATA%\codestory\cache\qdrant\` |
-| SCIP artifacts | n/a | `%LOCALAPPDATA%\codestory\cache\scip\<sidecar-generation>\` |
-| Sidecar state | n/a | `%LOCALAPPDATA%\codestory\cache\retrieval-sidecars.json` |
+Native embedding output uses `llama-server-native.log` for the current launch
+and `llama-server-native.previous.log` for at most the final 256 KiB of the
+previous launch. A verified new spawn truncates the current log after publishing
+that bounded tail when the files are writable; housekeeping failures are
+reported on stderr and do not block the server launch. Readiness inspects at
+most the final 512 KiB of current output, so a long-running server cannot make
+status latency scale with the full log.
+
+Cache-root and profile layout:
+
+| Scope | Location |
+|-------|----------|
+| Explicit override | `CODESTORY_CACHE_ROOT` wins for CLI, managed embeddings, broker, and sidecar state |
+| Windows default | `%LOCALAPPDATA%\codestory\codestory\cache` |
+| macOS default | `~/Library/Caches/dev.codestory.codestory` |
+| Linux default | `$XDG_CACHE_HOME/codestory`, normally `~/.cache/codestory` |
+| Local profile | `<cache>/{zoekt,qdrant,scip,retrieval-sidecars.json}` with configurable Local ports |
+| Managed Agent profile | `<cache>/sidecars/<namespace>/{zoekt,qdrant,scip,retrieval-sidecars.json}` with dynamic or persisted ports |
+| Agent port registry | `<cache>/sidecars/port-allocations.json` |
 
 Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
 `target/retrieval-models` are accepted only after pinned size and SHA-256
@@ -332,8 +364,8 @@ sidecar-layer symptoms during ops work:
 
 | Symptom | Likely cause | Action |
 |---------|--------------|--------|
-| `retrieval up` port in use | Stale process or container | Run `retrieval down`; inspect `docker ps`, Task Manager, or `ps`; free the port |
-| Zoekt unhealthy or unreachable | Server not started or shard missing | Start Zoekt on `6070`, rerun retrieval index |
+| `retrieval up` port in use | Stale process, container, or namespace ownership | Read selected profile/namespace ownership and cleanup command from status; run only the bounded cleanup for that state, then rerun bootstrap |
+| Zoekt unhealthy or unreachable | Server not started, wrong profile-selected port, or shard missing | Rerun bootstrap for the selected profile and rerun retrieval index; do not assume port `6070` for managed Agent state |
 | Qdrant unhealthy | Wrong image tag, stale collection, volume permissions, or model/backend mismatch | Rerun bootstrap; if repeated, move the Qdrant cache aside and rebuild |
 | Qdrant unavailable while dense-anchor count is `0` | Expected graph-first policy skip | Verify Zoekt, SCIP, and manifest contract fields |
 | SCIP `scip_unavailable` | Graph artifacts missing | Rerun retrieval index and inspect the SCIP cache path |
@@ -423,9 +455,14 @@ Before Compose starts, bootstrap may repair Qdrant storage:
    collections are protected.
 2. Offline cleanup runs only when Qdrant HTTP is unreachable. It removes invalid
    CodeStory collection dirs and migrates obsolete stub markers.
-3. Retention may prune unprotected `codestory_*` collections beyond the cap
-   (`64`). If scan errors exist, retention deletes are skipped unless
-   `CODESTORY_RETRIEVAL_PRUNE_ON_SCAN_ERROR=1`.
+3. Bootstrap does not prune valid generated collections. Bounded retention runs
+   only after a replacement generation reaches full mode and its manifest is
+   published, or through the operator-reviewed `retrieval inventory --apply`
+   path. The publication path retains the active Qdrant, SCIP, and lexical
+   manifest-referenced active generations sharing its sidecar scope plus at
+   most one health-verified rollback; protection-scan, inventory, or deletion
+   errors preserve active generations and are reported in retention
+   diagnostics.
 
 Non-`codestory_*` collection dirs are never deleted by this repair path.
 

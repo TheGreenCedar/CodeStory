@@ -110,8 +110,6 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
             && normalized_display.contains("indexer")
             && normalized_display.contains("queue"))
         || normalized_display.contains("indexercommand")
-        || normalized_display.contains("javaindexer")
-        || path.contains("/data/indexer/")
     {
         Some(PacketEvidenceRole::IndexingWorkQueue)
     } else if normalized_display.contains("interceptor") || path.contains("interceptor") {

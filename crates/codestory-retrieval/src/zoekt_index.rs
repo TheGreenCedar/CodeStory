@@ -1,16 +1,48 @@
 //! Build per-project Zoekt shard directories (lexical index + optional remote index).
 
 use crate::config::ZOEKT_REAL_VERSION_PIN;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codestory_store::{FileRole, Store, SymbolSearchDoc};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const LEXICAL_INDEX_FILE: &str = "lexical-index.jsonl";
 const SHARD_META_FILE: &str = "shard-meta.json";
 const STUB_MARKER: &str = ".zoekt-stub";
 
 const MAX_FILE_BYTES: usize = 256 * 1024;
+const VALIDATED_SHARD_CACHE_CAPACITY: usize = 128;
+const VALIDATED_SHARD_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified_nanos: u128,
+    change_token: i128,
+    device: u64,
+    file_id: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShardValidationCacheKey {
+    index_path: PathBuf,
+    expected_sidecar_input_hash: String,
+    binding_sha256: String,
+    data_identity: FileIdentity,
+    meta_identity: FileIdentity,
+}
+
+#[derive(Debug, Clone)]
+struct CachedShardValidation {
+    key: ShardValidationCacheKey,
+    validated_at: Instant,
+}
+
+static VALIDATED_SHARD_CACHE: OnceLock<Mutex<VecDeque<CachedShardValidation>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LexicalIndexEntry {
@@ -45,12 +77,20 @@ impl LexicalDocumentSource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ShardMeta {
     version: String,
     project_id: String,
     file_count: u32,
     lexical_hash: Option<String>,
+    #[serde(default)]
+    sidecar_input_hash: Option<String>,
+    #[serde(default)]
+    data_sha256: Option<String>,
+    #[serde(default)]
+    data_bytes: Option<u64>,
+    #[serde(default)]
+    binding_sha256: Option<String>,
     indexed_at_epoch_ms: i64,
 }
 
@@ -60,58 +100,127 @@ pub struct LexicalInputFingerprint {
     pub hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardPublishPhase {
+    DataWrite,
+    DataPublish,
+    MetadataWrite,
+    MetadataPublish,
+}
+
 /// Populate `shards/<project_id>/` with a searchable lexical index; remove stub marker on success.
 pub fn build_zoekt_shard(
     project_root: &Path,
     storage_path: Option<&Path>,
     zoekt_data_dir: &Path,
     project_id: &str,
-    zoekt_http_reachable: bool,
+    expected: &LexicalInputFingerprint,
+    sidecar_input_hash: &str,
 ) -> Result<bool> {
-    let shard_dir = zoekt_data_dir.join("shards").join(project_id);
-    std::fs::create_dir_all(&shard_dir)
-        .with_context(|| format!("create zoekt shard dir {}", shard_dir.display()))?;
+    build_zoekt_shard_with_checkpoint(
+        project_root,
+        storage_path,
+        zoekt_data_dir,
+        project_id,
+        expected,
+        sidecar_input_hash,
+        |_| Ok(()),
+    )
+}
 
+fn build_zoekt_shard_with_checkpoint(
+    project_root: &Path,
+    storage_path: Option<&Path>,
+    zoekt_data_dir: &Path,
+    project_id: &str,
+    expected: &LexicalInputFingerprint,
+    sidecar_input_hash: &str,
+    mut checkpoint: impl FnMut(ShardPublishPhase) -> Result<()>,
+) -> Result<bool> {
     let entries = collect_lexical_entries(project_root, storage_path)?;
     if entries.is_empty() {
         return Ok(false);
     }
     let lexical_hash = lexical_entries_hash(&entries);
-
-    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
-    let mut writer = std::fs::File::create(&index_path)
-        .with_context(|| format!("create {}", index_path.display()))?;
-    use std::io::Write;
-    for entry in &entries {
-        let line = serde_json::to_string(entry).context("serialize lexical index entry")?;
-        writeln!(writer, "{line}").context("write lexical index line")?;
+    if entries.len().min(u32::MAX as usize) as u32 != expected.file_count
+        || lexical_hash != expected.hash
+    {
+        bail!(
+            "lexical input changed while building shard: expected {} entries with hash {}, collected {} entries with hash {lexical_hash}",
+            expected.file_count,
+            expected.hash,
+            entries.len()
+        );
     }
 
+    let shard_dir = zoekt_data_dir.join("shards").join(project_id);
+    std::fs::create_dir_all(&shard_dir)
+        .with_context(|| format!("create zoekt shard dir {}", shard_dir.display()))?;
+
+    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
     let version = ZOEKT_REAL_VERSION_PIN.to_string();
-    let meta = ShardMeta {
+    let mut meta = ShardMeta {
         version: version.clone(),
         project_id: project_id.to_string(),
         file_count: entries.len() as u32,
         lexical_hash: Some(lexical_hash),
+        sidecar_input_hash: Some(sidecar_input_hash.to_string()),
+        data_sha256: None,
+        data_bytes: None,
+        binding_sha256: None,
         indexed_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
-    std::fs::write(
-        shard_dir.join(SHARD_META_FILE),
-        serde_json::to_string_pretty(&meta).context("serialize shard meta")?,
+    checkpoint(ShardPublishPhase::DataWrite)?;
+    codestory_workspace::atomic_file::write_file_atomic(
+        &index_path,
+        "lexical-index",
+        |file| write_lexical_entries(file, &entries),
+        |temp_path| {
+            validate_lexical_index_file(temp_path, &meta)?;
+            checkpoint(ShardPublishPhase::DataPublish)
+        },
     )
-    .context("write shard meta")?;
+    .context("publish lexical index")?;
+
+    let (data_bytes, data_sha256) = lexical_index_file_fingerprint(&index_path)?;
+    meta.data_bytes = Some(data_bytes);
+    meta.data_sha256 = Some(data_sha256);
+    meta.binding_sha256 = Some(shard_meta_binding(&meta));
+
+    let meta_path = shard_dir.join(SHARD_META_FILE);
+    checkpoint(ShardPublishPhase::MetadataWrite)?;
+    let meta_json = serde_json::to_vec_pretty(&meta).context("serialize shard meta")?;
+    codestory_workspace::atomic_file::write_file_atomic(
+        &meta_path,
+        "shard-meta",
+        |file| file.write_all(&meta_json).context("write shard metadata"),
+        |temp_path| {
+            let candidate = read_shard_meta(temp_path)?;
+            if candidate != meta {
+                bail!("temporary shard metadata differs from the expected metadata");
+            }
+            validate_lexical_index_file(&index_path, &candidate)?;
+            checkpoint(ShardPublishPhase::MetadataPublish)
+        },
+    )
+    .context("publish shard metadata")?;
 
     let stub = shard_dir.join(STUB_MARKER);
     if stub.is_file() {
         std::fs::remove_file(&stub).context("remove zoekt stub marker")?;
     }
 
-    let _ = zoekt_http_reachable;
     Ok(true)
 }
 
-pub fn shard_has_lexical_index(shard_dir: &Path) -> bool {
-    shard_dir.join(LEXICAL_INDEX_FILE).is_file() && !shard_dir.join(STUB_MARKER).is_file()
+pub fn shard_has_lexical_index(shard_dir: &Path, expected_sidecar_input_hash: &str) -> bool {
+    let Ok(Some((index_path, meta))) =
+        validated_shard_files(shard_dir, expected_sidecar_input_hash)
+    else {
+        return false;
+    };
+    validate_lexical_index_bytes_cached(shard_dir, &index_path, &meta, expected_sidecar_input_hash)
+        .is_ok()
 }
 
 pub fn shard_matches_lexical_input(
@@ -119,21 +228,374 @@ pub fn shard_matches_lexical_input(
     sidecar_generation: &str,
     expected_file_count: u32,
     expected_hash: &str,
+    expected_sidecar_input_hash: &str,
 ) -> bool {
     let shard_dir = shard_dir_for(zoekt_data_dir, sidecar_generation);
-    if !shard_has_lexical_index(&shard_dir) {
-        return false;
-    }
-    let Ok(body) = std::fs::read_to_string(shard_dir.join(SHARD_META_FILE)) else {
-        return false;
-    };
-    let Ok(meta) = serde_json::from_str::<ShardMeta>(&body) else {
+    let Ok(Some((meta, _entries))) = load_validated_shard(&shard_dir, expected_sidecar_input_hash)
+    else {
         return false;
     };
     meta.version == ZOEKT_REAL_VERSION_PIN
         && meta.project_id == sidecar_generation
         && meta.file_count == expected_file_count
         && meta.lexical_hash.as_deref() == Some(expected_hash)
+}
+
+fn write_lexical_entries(file: &mut std::fs::File, entries: &[LexicalIndexEntry]) -> Result<()> {
+    let mut writer = BufWriter::new(file);
+    for entry in entries {
+        serde_json::to_writer(&mut writer, entry).context("serialize lexical index entry")?;
+        writer
+            .write_all(b"\n")
+            .context("write lexical index newline")?;
+    }
+    writer.flush().context("flush lexical index")
+}
+
+fn load_validated_shard(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+) -> Result<Option<(ShardMeta, Vec<LexicalIndexEntry>)>> {
+    let Some((index_path, meta)) = validated_shard_files(shard_dir, expected_sidecar_input_hash)?
+    else {
+        return Ok(None);
+    };
+    let entries = validate_lexical_index_file(&index_path, &meta)?;
+    Ok(Some((meta, entries)))
+}
+
+fn validated_shard_files(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+) -> Result<Option<(PathBuf, ShardMeta)>> {
+    if shard_dir.join(STUB_MARKER).is_file() {
+        return Ok(None);
+    }
+    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
+    let meta_path = shard_dir.join(SHARD_META_FILE);
+    match (index_path.is_file(), meta_path.is_file()) {
+        (false, false) => return Ok(None),
+        (true, true) => {}
+        _ => bail!("lexical shard is incomplete: data and metadata must both exist"),
+    }
+    let meta = read_shard_meta(&meta_path)?;
+    if meta.version != ZOEKT_REAL_VERSION_PIN {
+        bail!("lexical shard version is not current");
+    }
+    let expected_project_id = shard_dir.file_name().and_then(|name| name.to_str());
+    if expected_project_id != Some(meta.project_id.as_str()) {
+        bail!("lexical shard metadata project id does not match its directory");
+    }
+    if meta.sidecar_input_hash.as_deref() != Some(expected_sidecar_input_hash) {
+        bail!("lexical shard metadata does not match the sidecar input hash");
+    }
+    if meta.data_sha256.is_none() || meta.data_bytes.is_none() {
+        bail!("lexical shard metadata is missing the published data fingerprint");
+    }
+    if meta.binding_sha256.as_deref() != Some(shard_meta_binding(&meta).as_str()) {
+        bail!("lexical shard metadata binding is invalid");
+    }
+    Ok(Some((index_path, meta)))
+}
+
+fn read_shard_meta(path: &Path) -> Result<ShardMeta> {
+    let body =
+        std::fs::read(path).with_context(|| format!("read shard metadata {}", path.display()))?;
+    serde_json::from_slice(&body)
+        .with_context(|| format!("parse shard metadata {}", path.display()))
+}
+
+fn shard_meta_binding(meta: &ShardMeta) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"codestory-lexical-shard-meta-v1");
+    hasher.update(meta.version.as_bytes());
+    hasher.update([0]);
+    hasher.update(meta.project_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(meta.file_count.to_le_bytes());
+    hasher.update(meta.lexical_hash.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(
+        meta.sidecar_input_hash
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update([0]);
+    hasher.update(meta.data_sha256.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(meta.data_bytes.unwrap_or_default().to_le_bytes());
+    hasher.update(meta.indexed_at_epoch_ms.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn validate_lexical_index_file(path: &Path, meta: &ShardMeta) -> Result<Vec<LexicalIndexEntry>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open lexical index {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut raw_hasher = sha2::Sha256::default();
+    let mut data_bytes = 0_u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("read lexical index {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        use sha2::Digest;
+        raw_hasher.update(&line);
+        data_bytes = data_bytes.saturating_add(read as u64);
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        let line_number = entries.len() + 1;
+        if line.is_empty() {
+            bail!(
+                "lexical index {} contains blank line {}",
+                path.display(),
+                line_number
+            );
+        }
+        let line = std::str::from_utf8(&line).with_context(|| {
+            format!(
+                "decode lexical index {} line {}",
+                path.display(),
+                line_number
+            )
+        })?;
+        entries.push(serde_json::from_str(line).with_context(|| {
+            format!(
+                "parse lexical index {} line {}",
+                path.display(),
+                line_number
+            )
+        })?);
+    }
+    let actual_count = entries.len().min(u32::MAX as usize) as u32;
+    if actual_count != meta.file_count {
+        bail!(
+            "lexical index row count mismatch: metadata={}, actual={actual_count}",
+            meta.file_count
+        );
+    }
+    let Some(expected_hash) = meta.lexical_hash.as_deref() else {
+        bail!("lexical shard metadata is missing lexical_hash");
+    };
+    let actual_hash = lexical_entries_hash(&entries);
+    if actual_hash != expected_hash {
+        bail!("lexical index hash mismatch: metadata={expected_hash}, actual={actual_hash}");
+    }
+    if let Some(expected_bytes) = meta.data_bytes
+        && data_bytes != expected_bytes
+    {
+        bail!("lexical index byte count mismatch: metadata={expected_bytes}, actual={data_bytes}");
+    }
+    if let Some(expected_sha256) = meta.data_sha256.as_deref() {
+        use sha2::Digest;
+        let actual_sha256 = format!("{:x}", raw_hasher.finalize());
+        if actual_sha256 != expected_sha256 {
+            bail!(
+                "lexical index data hash mismatch: metadata={expected_sha256}, actual={actual_sha256}"
+            );
+        }
+    }
+    Ok(entries)
+}
+
+fn validate_lexical_index_bytes(path: &Path, meta: &ShardMeta) -> Result<()> {
+    let (actual_bytes, actual_sha256) = lexical_index_file_fingerprint(path)?;
+    if meta.data_bytes != Some(actual_bytes)
+        || meta.data_sha256.as_deref() != Some(actual_sha256.as_str())
+    {
+        bail!("lexical index published data fingerprint does not match metadata");
+    }
+    Ok(())
+}
+
+fn validate_lexical_index_bytes_cached(
+    shard_dir: &Path,
+    index_path: &Path,
+    meta: &ShardMeta,
+    expected_sidecar_input_hash: &str,
+) -> Result<()> {
+    let key = shard_validation_cache_key(shard_dir, index_path, meta, expected_sidecar_input_hash)?;
+    let cache = VALIDATED_SHARD_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+    {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|entry| entry.validated_at.elapsed() <= VALIDATED_SHARD_CACHE_TTL);
+        if cache.iter().any(|entry| entry.key == key) {
+            return Ok(());
+        }
+    }
+
+    validate_lexical_index_bytes(index_path, meta)?;
+    let validated_key =
+        shard_validation_cache_key(shard_dir, index_path, meta, expected_sidecar_input_hash)?;
+    if validated_key != key {
+        bail!("lexical shard changed while its published data was being validated");
+    }
+
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.retain(|entry| entry.key.index_path != key.index_path);
+    cache.push_back(CachedShardValidation {
+        key,
+        validated_at: Instant::now(),
+    });
+    while cache.len() > VALIDATED_SHARD_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    Ok(())
+}
+
+fn shard_validation_cache_key(
+    shard_dir: &Path,
+    index_path: &Path,
+    meta: &ShardMeta,
+    expected_sidecar_input_hash: &str,
+) -> Result<ShardValidationCacheKey> {
+    Ok(ShardValidationCacheKey {
+        index_path: index_path.to_path_buf(),
+        expected_sidecar_input_hash: expected_sidecar_input_hash.to_string(),
+        binding_sha256: meta.binding_sha256.clone().unwrap_or_default(),
+        data_identity: file_identity(index_path)?,
+        meta_identity: file_identity(&shard_dir.join(SHARD_META_FILE))?,
+    })
+}
+
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open file for identity {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("read file metadata {}", path.display()))?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let (change_token, device, file_id) = platform_file_identity(&file, &metadata)?;
+    Ok(FileIdentity {
+        len: metadata.len(),
+        modified_nanos,
+        change_token,
+        device,
+        file_id,
+    })
+}
+
+#[cfg(unix)]
+fn platform_file_identity(
+    _file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Result<(i128, u64, u128)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let change_token = i128::from(metadata.ctime())
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i128::from(metadata.ctime_nsec()));
+    Ok((change_token, metadata.dev(), u128::from(metadata.ino())))
+}
+
+#[cfg(windows)]
+fn platform_file_identity(
+    file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+) -> Result<(i128, u64, u128)> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut c_void,
+            file_information_class: i32,
+            file_information: *mut c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    const FILE_BASIC_INFO_CLASS: i32 = 0;
+    const FILE_ID_INFO_CLASS: i32 = 18;
+
+    fn query<T: Default>(file: &std::fs::File, class: i32) -> Result<T> {
+        let mut info = T::default();
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle().cast(),
+                class,
+                std::ptr::from_mut(&mut info).cast(),
+                size_of::<T>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error()).context("query Windows file identity");
+        }
+        Ok(info)
+    }
+
+    let basic: FileBasicInfo = query(file, FILE_BASIC_INFO_CLASS)?;
+    let id: FileIdInfo = query(file, FILE_ID_INFO_CLASS)?;
+    Ok((
+        i128::from(basic.change_time),
+        id.volume_serial_number,
+        u128::from_le_bytes(id.file_id),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_file_identity(
+    _file: &std::fs::File,
+    _metadata: &std::fs::Metadata,
+) -> Result<(i128, u64, u128)> {
+    Ok((0, 0, 0))
+}
+
+fn lexical_index_file_fingerprint(path: &Path) -> Result<(u64, String)> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open lexical index {}", path.display()))?;
+    let mut hasher = sha2::Sha256::default();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read lexical index {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        use sha2::Digest;
+        hasher.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    use sha2::Digest;
+    Ok((bytes, format!("{:x}", hasher.finalize())))
 }
 
 pub fn lexical_input_fingerprint(
@@ -195,23 +657,19 @@ fn finalize_lexical_entries_hash(hasher: sha2::Sha256) -> String {
 
 pub fn search_lexical_index(
     shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
     query: &str,
     limit: usize,
 ) -> Result<Vec<LexicalHit>> {
-    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
-    if !index_path.is_file() {
+    let Some((_meta, entries)) = load_validated_shard(shard_dir, expected_sidecar_input_hash)?
+    else {
         return Ok(Vec::new());
-    }
+    };
     let tokens = lexical_query_tokens(query);
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
     let command_tokens = command_query_tokens(query);
-    let content = std::fs::read_to_string(&index_path).context("read lexical index")?;
-    let entries = content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<LexicalIndexEntry>(line).ok())
-        .collect::<Vec<_>>();
     let token_frequencies = token_document_frequencies(&entries, &tokens);
     let token_weights = token_frequencies
         .iter()
@@ -719,6 +1177,39 @@ mod tests {
         }
     }
 
+    fn write_test_shard(shard: &Path, entries: &[LexicalIndexEntry]) {
+        std::fs::create_dir_all(shard).expect("create shard");
+        let mut file = std::fs::File::create(shard.join(LEXICAL_INDEX_FILE)).expect("index file");
+        write_lexical_entries(&mut file, entries).expect("write index");
+        file.sync_all().expect("sync index");
+        drop(file);
+        let (data_bytes, data_sha256) =
+            lexical_index_file_fingerprint(&shard.join(LEXICAL_INDEX_FILE))
+                .expect("fingerprint index");
+        let meta = ShardMeta {
+            version: ZOEKT_REAL_VERSION_PIN.to_string(),
+            project_id: shard
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("shard name")
+                .to_string(),
+            file_count: entries.len() as u32,
+            lexical_hash: Some(lexical_entries_hash(entries)),
+            sidecar_input_hash: Some("test-input".to_string()),
+            data_sha256: Some(data_sha256),
+            data_bytes: Some(data_bytes),
+            binding_sha256: None,
+            indexed_at_epoch_ms: 1,
+        };
+        let mut meta = meta;
+        meta.binding_sha256 = Some(shard_meta_binding(&meta));
+        std::fs::write(
+            shard.join(SHARD_META_FILE),
+            serde_json::to_vec_pretty(&meta).expect("serialize meta"),
+        )
+        .expect("write meta");
+    }
+
     #[test]
     fn lexical_index_finds_repo_relative_paths() {
         let project = TempDir::new().expect("project");
@@ -728,10 +1219,19 @@ mod tests {
         )
         .expect("write");
         let zoekt_root = TempDir::new().expect("zoekt");
-        build_zoekt_shard(project.path(), None, zoekt_root.path(), "abc123", false).expect("build");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        build_zoekt_shard(
+            project.path(),
+            None,
+            zoekt_root.path(),
+            "abc123",
+            &fingerprint,
+            "test-input",
+        )
+        .expect("build");
         let shard = shard_dir_for(zoekt_root.path(), "abc123");
-        assert!(shard_has_lexical_index(&shard));
-        let hits = search_lexical_index(&shard, "extension", 8).expect("search");
+        assert!(shard_has_lexical_index(&shard, "test-input"));
+        let hits = search_lexical_index(&shard, "test-input", "extension", 8).expect("search");
         assert!(hits.iter().any(|hit| hit.path == "lib.rs"));
     }
 
@@ -824,11 +1324,13 @@ mod tests {
             Some(&storage_path),
             zoekt_root.path(),
             "symbols",
-            false,
+            &streaming_fingerprint,
+            "test-input",
         )
         .expect("build");
         let shard = shard_dir_for(zoekt_root.path(), "symbols");
-        let hits = search_lexical_index(&shard, "cache skip logic", 4).expect("search");
+        let hits =
+            search_lexical_index(&shard, "test-input", "cache skip logic", 4).expect("search");
         let hit = hits
             .iter()
             .find(|hit| hit.symbol_name.as_deref() == Some("private_helper"))
@@ -844,21 +1346,251 @@ mod tests {
         std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("write");
         let zoekt_root = TempDir::new().expect("zoekt");
         let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
-        build_zoekt_shard(project.path(), None, zoekt_root.path(), "generation", false)
-            .expect("build");
+        build_zoekt_shard(
+            project.path(),
+            None,
+            zoekt_root.path(),
+            "generation",
+            &fingerprint,
+            "test-input",
+        )
+        .expect("build");
 
         assert!(shard_matches_lexical_input(
             zoekt_root.path(),
             "generation",
             fingerprint.file_count,
-            &fingerprint.hash
+            &fingerprint.hash,
+            "test-input"
         ));
         assert!(!shard_matches_lexical_input(
             zoekt_root.path(),
             "generation",
             fingerprint.file_count,
-            "not-the-current-hash"
+            "not-the-current-hash",
+            "test-input"
         ));
+        assert!(!shard_matches_lexical_input(
+            zoekt_root.path(),
+            "generation",
+            fingerprint.file_count,
+            &fingerprint.hash,
+            "wrong-input"
+        ));
+        assert!(
+            search_lexical_index(
+                &shard_dir_for(zoekt_root.path(), "generation"),
+                "wrong-input",
+                "alpha",
+                4
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_or_truncated_rows_fail_closed() {
+        let shard_root = TempDir::new().expect("shard root");
+        let shard = shard_root.path().join("generation");
+        let entries = [entry("src/a.rs", "alpha"), entry("src/b.rs", "beta")];
+        write_test_shard(&shard, &entries);
+        let first = serde_json::to_string(&entries[0]).expect("serialize first");
+        let second = serde_json::to_string(&entries[1]).expect("serialize second");
+
+        std::fs::write(
+            shard.join(LEXICAL_INDEX_FILE),
+            format!("{first}\n{{not-json}}\n{second}\n"),
+        )
+        .expect("write malformed index");
+        assert!(!shard_has_lexical_index(&shard, "test-input"));
+        assert!(search_lexical_index(&shard, "test-input", "alpha", 4).is_err());
+
+        std::fs::write(
+            shard.join(LEXICAL_INDEX_FILE),
+            format!("{first}\n{}", &second[..second.len() - 1]),
+        )
+        .expect("write truncated index");
+        assert!(!shard_has_lexical_index(&shard, "test-input"));
+        assert!(search_lexical_index(&shard, "test-input", "alpha", 4).is_err());
+    }
+
+    #[test]
+    fn readiness_cache_invalidates_when_published_data_changes() {
+        let shard_root = TempDir::new().expect("shard root");
+        let shard = shard_root.path().join("generation");
+        write_test_shard(&shard, &[entry("src/a.rs", "alpha")]);
+        assert!(shard_has_lexical_index(&shard, "test-input"));
+
+        let index_path = shard.join(LEXICAL_INDEX_FILE);
+        let original_modified = std::fs::metadata(&index_path)
+            .expect("index metadata")
+            .modified()
+            .expect("index modified time");
+        let mut bytes = std::fs::read(&index_path).expect("read index");
+        bytes[0] = b'[';
+        std::fs::write(&index_path, bytes).expect("replace index");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&index_path)
+            .expect("open index to restore timestamp")
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .expect("restore index timestamp");
+
+        assert!(!shard_has_lexical_index(&shard, "test-input"));
+    }
+
+    #[test]
+    fn readiness_cache_revalidates_expired_matching_identity() {
+        let shard_root = TempDir::new().expect("shard root");
+        let shard = shard_root.path().join("generation");
+        write_test_shard(&shard, &[entry("src/a.rs", "alpha")]);
+
+        let index_path = shard.join(LEXICAL_INDEX_FILE);
+        let mut bytes = std::fs::read(&index_path).expect("read index");
+        bytes[0] = b'[';
+        std::fs::write(&index_path, bytes).expect("replace index");
+        let meta = read_shard_meta(&shard.join(SHARD_META_FILE)).expect("read shard metadata");
+        let key = shard_validation_cache_key(&shard, &index_path, &meta, "test-input")
+            .expect("build cache key");
+        let cache = VALIDATED_SHARD_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.retain(|entry| entry.key.index_path != index_path);
+        cache.push_back(CachedShardValidation {
+            key,
+            validated_at: Instant::now()
+                .checked_sub(VALIDATED_SHARD_CACHE_TTL + Duration::from_millis(1))
+                .expect("expired timestamp"),
+        });
+        drop(cache);
+
+        assert!(!shard_has_lexical_index(&shard, "test-input"));
+    }
+
+    #[test]
+    fn row_count_and_hash_mismatches_fail_closed() {
+        let shard_root = TempDir::new().expect("shard root");
+        let shard = shard_root.path().join("generation");
+        let entries = [entry("src/a.rs", "alpha")];
+        write_test_shard(&shard, &entries);
+        let meta_path = shard.join(SHARD_META_FILE);
+        let mut meta = read_shard_meta(&meta_path).expect("meta");
+
+        meta.file_count += 1;
+        std::fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&meta).expect("serialize count mismatch"),
+        )
+        .expect("write count mismatch");
+        assert!(!shard_has_lexical_index(&shard, "test-input"));
+
+        meta.file_count = entries.len() as u32;
+        meta.lexical_hash = Some("wrong-hash".to_string());
+        std::fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&meta).expect("serialize hash mismatch"),
+        )
+        .expect("write hash mismatch");
+        assert!(!shard_has_lexical_index(&shard, "test-input"));
+    }
+
+    #[test]
+    fn changed_input_does_not_replace_last_known_good_shard() {
+        let project = TempDir::new().expect("project");
+        let source = project.path().join("lib.rs");
+        std::fs::write(&source, "pub fn alpha() {}").expect("write alpha");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        let zoekt_root = TempDir::new().expect("zoekt");
+        build_zoekt_shard(
+            project.path(),
+            None,
+            zoekt_root.path(),
+            "generation",
+            &fingerprint,
+            "test-input",
+        )
+        .expect("initial build");
+
+        std::fs::write(&source, "pub fn beta() {}").expect("write beta");
+        let error = build_zoekt_shard(
+            project.path(),
+            None,
+            zoekt_root.path(),
+            "generation",
+            &fingerprint,
+            "test-input",
+        )
+        .expect_err("changed input must not publish");
+        assert!(error.to_string().contains("lexical input changed"));
+
+        let shard = shard_dir_for(zoekt_root.path(), "generation");
+        assert!(shard_has_lexical_index(&shard, "test-input"));
+        assert_eq!(
+            search_lexical_index(&shard, "test-input", "alpha", 4)
+                .expect("search last-known-good")
+                .len(),
+            1
+        );
+        assert!(
+            search_lexical_index(&shard, "test-input", "beta", 4)
+                .expect("search old shard")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn publish_phase_failures_preserve_last_known_good_shard() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("write source");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        let zoekt_root = TempDir::new().expect("zoekt");
+        build_zoekt_shard(
+            project.path(),
+            None,
+            zoekt_root.path(),
+            "generation",
+            &fingerprint,
+            "test-input",
+        )
+        .expect("initial build");
+
+        for failure_phase in [
+            ShardPublishPhase::DataWrite,
+            ShardPublishPhase::DataPublish,
+            ShardPublishPhase::MetadataWrite,
+            ShardPublishPhase::MetadataPublish,
+        ] {
+            let error = build_zoekt_shard_with_checkpoint(
+                project.path(),
+                None,
+                zoekt_root.path(),
+                "generation",
+                &fingerprint,
+                "test-input",
+                |phase| {
+                    if phase == failure_phase {
+                        bail!("injected {phase:?} failure");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("injected phase must fail");
+            assert!(format!("{error:#}").contains("injected"));
+
+            let shard = shard_dir_for(zoekt_root.path(), "generation");
+            assert!(
+                shard_has_lexical_index(&shard, "test-input"),
+                "{failure_phase:?} must preserve readiness"
+            );
+            assert_eq!(
+                search_lexical_index(&shard, "test-input", "alpha", 4)
+                    .expect("search last-known-good")
+                    .len(),
+                1,
+                "{failure_phase:?} must preserve search"
+            );
+        }
     }
 
     #[test]
@@ -867,14 +1599,9 @@ mod tests {
         let shard = zoekt_root.path();
         let weak = entry("src/a_weak.rs", "handler mentioned once");
         let strong = entry("src/z_strong_handler.rs", "handler handler handler");
-        let lines = [weak, strong]
-            .into_iter()
-            .map(|entry| serde_json::to_string(&entry).expect("serialize"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(shard.join(LEXICAL_INDEX_FILE), lines).expect("write index");
+        write_test_shard(shard, &[weak, strong]);
 
-        let hits = search_lexical_index(shard, "handler", 1).expect("search");
+        let hits = search_lexical_index(shard, "test-input", "handler", 1).expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "src/z_strong_handler.rs");
     }
@@ -893,9 +1620,18 @@ mod tests {
         }
 
         let zoekt_root = TempDir::new().expect("zoekt");
-        build_zoekt_shard(project.path(), None, zoekt_root.path(), "large", false).expect("build");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        build_zoekt_shard(
+            project.path(),
+            None,
+            zoekt_root.path(),
+            "large",
+            &fingerprint,
+            "test-input",
+        )
+        .expect("build");
         let shard = shard_dir_for(zoekt_root.path(), "large");
-        let hits = search_lexical_index(&shard, "symbol_4099", 4).expect("search");
+        let hits = search_lexical_index(&shard, "test-input", "symbol_4099", 4).expect("search");
 
         assert!(
             hits.iter().any(|hit| hit.path == "src/file_4099.ts"),
@@ -909,14 +1645,9 @@ mod tests {
         let shard = zoekt_root.path();
         let later = entry("src/b.rs", "handler");
         let earlier = entry("src/a.rs", "handler");
-        let lines = [later, earlier]
-            .into_iter()
-            .map(|entry| serde_json::to_string(&entry).expect("serialize"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(shard.join(LEXICAL_INDEX_FILE), lines).expect("write index");
+        write_test_shard(shard, &[later, earlier]);
 
-        let hits = search_lexical_index(shard, "handler", 2).expect("search");
+        let hits = search_lexical_index(shard, "test-input", "handler", 2).expect("search");
         assert_eq!(
             hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
             vec!["src/a.rs", "src/b.rs",]
@@ -944,15 +1675,14 @@ mod tests {
             "workspace/app-protocol/schema/typescript/v2/CommandRequestParams.ts",
             "app server command request turn start request",
         );
-        let lines = [test, unrelated, generic_agent_doc, generated_schema, source]
-            .into_iter()
-            .map(|entry| serde_json::to_string(&entry).expect("serialize"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(shard.join(LEXICAL_INDEX_FILE), lines).expect("write index");
+        write_test_shard(
+            shard,
+            &[test, unrelated, generic_agent_doc, generated_schema, source],
+        );
 
         let hits = search_lexical_index(
             shard,
+            "test-input",
             "Explain how `app request --json` flows from CLI into runtime thread turn start JSONL event output",
             4,
         )

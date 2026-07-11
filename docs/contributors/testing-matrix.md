@@ -55,6 +55,26 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 These are the default broad checks for code changes after the lane picker says
 workspace-wide proof is useful.
 
+CLI integration tests must launch `codestory-cli` through
+`tests/test_support::cli_command` (or `command` for a supplied binary). The
+helper assigns a process-and-test-thread state root and explicitly isolates the
+cache, stdio cache, install identity, and plugin data. Do not serialize the
+workspace suite or clean the real user cache to make a test pass. Broker tests
+that cross a worker-thread boundary must carry their injected test cache root
+into that thread.
+
+Use the isolation contract as the focused regression gate:
+
+```sh
+cargo test -p codestory-cli --test test_state_isolation
+cargo test -p codestory-cli --bin codestory-cli observe_broker_snapshot_
+```
+
+The first command exercises a controlled decoy user profile and fails if CLI
+state escapes the injected root or an integration test constructs the CLI
+directly. The second command keeps the historically competing broker snapshot
+tests in one default-concurrency run.
+
 Do not use `cargo test --workspace --all-targets` as the routine broad test
 gate. `--all-targets` expands into benchmark targets; Criterion benches are
 compiled or run through the bench lane below.
@@ -99,6 +119,33 @@ the MCP `resources/list` response does not expose both `codestory://status` and
 the active plugin runtime plus observed and missing server-advertised MCP
 resources. This proves the installed plugin launcher advertises the resources;
 it is not Codex host/model visibility proof.
+
+Packaged acceptance uses the same five native hosted-runner cells before and
+after publication. Pull requests that change release, packaging, installer, or
+plugin-launch surfaces call the same read-only reusable packaged-proof workflow
+as the release, so the native matrix is reviewed before publication without
+granting release permissions to pull-request code:
+
+| Asset | Native runner | Required packaged proof |
+| --- | --- | --- |
+| Linux x64 | `ubuntu-latest` | Version, help, stdio shape, and the full-sidecar agent proof |
+| Linux arm64 | `ubuntu-24.04-arm` | Version, help, and stdio shape |
+| Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, local ground, and repair handoff |
+| Windows arm64 | `windows-11-arm` | Version, help, and stdio shape |
+| macOS arm64 | `macos-15` | Version, help, and stdio shape |
+
+The Windows managed handoff proves that the packaged CLI can be installed by
+the plugin, serve status, use the local graph, and publish a background repair
+reservation. It does not prove full sidecars or GPU execution. macOS arm64
+package execution does not close #887; live managed Metal endpoint survival
+still needs reporter or equivalent Apple Silicon hardware evidence. Current
+Ubuntu execution does not prove older-glibc compatibility.
+
+Release closeout is not complete until every published asset cell passes and
+the corresponding CodeStory plugin-source update is committed or merged in
+`TheGreenCedar/AgentPluginMarketplace`, followed by marketplace refresh and
+managed-plugin version/status readback. Source CI cannot substitute for that
+external pointer and installed-runtime proof.
 
 ## Docs-Only Fast Path
 
@@ -329,7 +376,7 @@ present. A zero-evaluated run is not quality proof.
 ## Bench Surface Checks
 
 ```sh
-node scripts/semantic-doc-leakage-check.mjs
+node scripts/lint-retrieval-generalization.mjs
 cargo check -p codestory-bench --bench <name>
 ```
 

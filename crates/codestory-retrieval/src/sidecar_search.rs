@@ -27,6 +27,7 @@ pub struct LiveSidecarSearch {
     layout: SidecarLayout,
     project_id: String,
     sidecar_generation: String,
+    sidecar_input_hash: String,
     qdrant_collection: String,
     embedding_device: Option<EmbeddingDeviceReadiness>,
     zoekt: ZoektClient,
@@ -53,6 +54,9 @@ impl LiveSidecarSearch {
         let sidecar_generation = manifest
             .and_then(|manifest| manifest.sidecar_generation.clone())
             .unwrap_or_else(|| format!("{project_id}-missing-manifest"));
+        let sidecar_input_hash = manifest
+            .and_then(|manifest| manifest.sidecar_input_hash.clone())
+            .unwrap_or_else(|| "missing-manifest".to_string());
         let qdrant_collection = manifest
             .map(|manifest| manifest.qdrant_collection.clone())
             .unwrap_or_else(|| format!("codestory_{project_id}_missing_manifest"));
@@ -60,6 +64,7 @@ impl LiveSidecarSearch {
             layout,
             project_id,
             sidecar_generation,
+            sidecar_input_hash,
             qdrant_collection,
             embedding_device,
             zoekt,
@@ -90,8 +95,13 @@ impl SidecarSearch for LiveSidecarSearch {
     }
 
     fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
-        self.zoekt
-            .search(&self.layout, &self.sidecar_generation, query, limit)
+        self.zoekt.search(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+        )
     }
 
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {

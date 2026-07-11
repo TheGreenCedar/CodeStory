@@ -2,6 +2,85 @@
 
 ## Unreleased
 
+## 0.14.3
+
+### Fixed
+
+- Added native five-asset pre-publish and post-publish acceptance evidence,
+  including Windows x64 managed plugin provisioning, local grounding, repair
+  handoff, and installer ownership proof. Release notes and contributor
+  guidance now preserve Apple Silicon, Windows arm64 acceleration,
+  older-glibc, marketplace, and full-sidecar proof boundaries.
+- Kept strict sidecar readiness fail-closed on interrupted index-run markers
+  without globally rejecting completed generations that contain parser-partial
+  files or repeatedly refreshing unchanged parser-partial inputs; parser
+  coverage remains visible through file diagnostics.
+- Standardized JSON-mode CLI failures on one versioned error envelope, including
+  argument parsing, ambiguity, smoke checks, runtime failures, and background
+  repair terminal state. Compacted MCP status by referencing canonical
+  readiness verdicts instead of cloning them across every surface, and aligned
+  operator guidance with local defaults, managed dynamic state, supported
+  accelerator cells, and host-reload boundaries.
+- Isolated CLI integration tests from user caches, install identity, plugin
+  data, stdio state, sidecar port registries, and managed runtime roots. Test
+  processes now share one explicit per-process state root, broker unit tests
+  inject machine-state roots across worker threads, and a regression invariant
+  rejects direct CLI process construction that bypasses the isolation helper.
+- Compacted stale agent sidecar port allocations atomically under the existing
+  registry lock while preserving live, state-backed, recently reserved, and
+  unverified owners. Native embedding launches now attempt to preserve only a
+  bounded previous log tail and truncate the current log without blocking
+  startup when housekeeping fails, while accelerator proof reads only a bounded
+  current tail.
+- Bounded plugin-managed CLI storage to the active checksummed runtime plus one
+  verified upgrade or rollback candidate, with atomic staged publication,
+  recoverable owner locks, Windows lock-safe cleanup, and retained, removed,
+  and reclaimable byte diagnostics in plugin runtime status.
+- Added post-publication sidecar generation retention across Qdrant, lexical,
+  and SCIP artifacts. CodeStory now protects every manifest-referenced active
+  generation sharing the sidecar scope plus at most one verified rollback,
+  suppresses pruning on malformed or stale protection state, coordinates
+  publication with namespace GC, and exposes the same byte-accounted plan to
+  `retrieval inventory` and its explicit `--apply` path.
+- Published lexical shard data, metadata, and runtime sidecar state through
+  validated same-directory temporary files with atomic replacement. Shard
+  readiness and search now reject malformed, truncated, count-mismatched, or
+  hash-mismatched JSONL; bind published bytes and metadata to the manifest's
+  sidecar input; and recheck live lexical input before manifest publication so
+  failed or raced rebuilds preserve the last known good shard.
+- Added a `dev/codestory-next` merge workflow that closes same-repository
+  issues named by `Closes`, `Fixes`, or `Resolves` in merged pull requests.
+- Made live incremental indexing crash-safe. Runs now persist an incomplete-run
+  marker and a transient cross-version schema fence before mutating graph
+  projections, exclude concurrent writers across processes, retry unchanged
+  `complete=false` files, and clear the marker only after resolution and both
+  grounding snapshot tiers succeed. Failed or cancelled runs report stale,
+  cannot serve strict sidecar retrieval or cache rehydrate, and recover through
+  the existing staged full-refresh publish path on the next refresh.
+- Separated release-update advice from runtime readiness. A newer GitHub
+  release or a newer checksum-valid managed CLI now appears under the
+  non-blocking `runtime_update` status field without disabling compatible local
+  graph or agent surfaces; an installed newer runtime recommends a host reload.
+- Removed GitHub release discovery and CLI subprocess probes from the status
+  request path. Release metadata is cached for six hours, refreshed in the
+  background under a cross-process lock, and remains advisory when offline,
+  rate-limited, stale, or malformed.
+- Made MCP sidecar repair transfer one durable attempt reservation to the
+  spawned CLI worker instead of rejecting its own handoff as a competing
+  repair. The worker now inherits the parent cache scope, and MCP records its
+  terminal exit code plus bounded stdout/stderr tails before clearing repair
+  ownership.
+- Removed the production semantic-document domain-alias catalog that encoded
+  benchmark-shaped Root & Runtime and Sourcetrail answer text. Historical
+  retrieval packets built with that catalog are no longer promotion evidence;
+  the semantic-document schema now invalidates the affected persisted data, and
+  semantic documents and sidecars must be regenerated.
+- Consolidated semantic-document leakage enforcement into the retrieval
+  generalization guard, which now derives prompts, expected and forbidden
+  claims, paths, and symbols from every benchmark manifest plus the checked-in
+  script prompt, cross-repo query, and eval-only probe corpora, and fails closed
+  when a registered corpus is missing, malformed, or only partially parsed.
+
 ## 0.14.2
 
 ### Fixed

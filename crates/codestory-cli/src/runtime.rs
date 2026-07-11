@@ -14,7 +14,6 @@ use codestory_runtime::{
     BookmarkService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService,
     Runtime,
 };
-use directories::ProjectDirs;
 use std::path::{Path, PathBuf};
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
@@ -27,6 +26,8 @@ use crate::query_resolution::{
 };
 
 const HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT: usize = 10;
+const INCOMPLETE_INDEX_RECOVERY_REASON: &str =
+    "previous_incremental_run_incomplete_full_refresh_required";
 
 #[derive(Debug)]
 /// Project state after a command has opened or refreshed the repository.
@@ -437,12 +438,8 @@ pub(crate) fn cache_root_for_project(
 ) -> Result<PathBuf> {
     match override_dir {
         Some(path) => Ok(path.to_path_buf()),
-        None => {
-            let base = ProjectDirs::from("dev", "codestory", "codestory")
-                .map(|dirs| dirs.cache_dir().to_path_buf())
-                .unwrap_or_else(|| std::env::temp_dir().join("codestory").join("cache"));
-            Ok(base.join(fnv1a_hex(project_root.to_string_lossy().as_bytes())))
-        }
+        None => Ok(codestory_retrieval::user_cache_root()
+            .join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
     }
 }
 
@@ -469,14 +466,23 @@ pub(crate) fn resolve_refresh_request(
     refresh: RefreshMode,
     summary: &ProjectSummary,
 ) -> Option<IndexMode> {
+    let requires_full_recovery = summary
+        .freshness
+        .as_ref()
+        .and_then(|freshness| freshness.reason.as_deref())
+        == Some(INCOMPLETE_INDEX_RECOVERY_REASON);
     match refresh {
-        RefreshMode::Auto => Some(if summary.stats.node_count == 0 {
+        RefreshMode::Auto => Some(if summary.stats.node_count == 0 || requires_full_recovery {
             IndexMode::Full
         } else {
             IndexMode::Incremental
         }),
         RefreshMode::Full => Some(IndexMode::Full),
-        RefreshMode::Incremental => Some(IndexMode::Incremental),
+        RefreshMode::Incremental => Some(if requires_full_recovery {
+            IndexMode::Full
+        } else {
+            IndexMode::Incremental
+        }),
         RefreshMode::None => None,
     }
 }
@@ -487,7 +493,10 @@ pub(crate) fn refresh_label(requested: RefreshMode, resolved: Option<IndexMode>)
         (RefreshMode::Auto, Some(IndexMode::Full)) => "auto(full)".to_string(),
         (RefreshMode::Auto, Some(IndexMode::Incremental)) => "auto(incremental)".to_string(),
         (RefreshMode::Full, Some(_)) => "full".to_string(),
-        (RefreshMode::Incremental, Some(_)) => "incremental".to_string(),
+        (RefreshMode::Incremental, Some(IndexMode::Full)) => {
+            "incremental(recovery-full)".to_string()
+        }
+        (RefreshMode::Incremental, Some(IndexMode::Incremental)) => "incremental".to_string(),
         (RefreshMode::None, None) => "none".to_string(),
         _ => "unknown".to_string(),
     }

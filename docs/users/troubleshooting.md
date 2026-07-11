@@ -60,7 +60,7 @@ flowchart TD
 | Symptom | Codex | Cursor | Claude Code | Copilot |
 | --- | --- | --- | --- | --- |
 | MCP missing | Fresh thread after `/plugins` install | Check `.cursor/mcp.json`; reload MCP server | MCP configured separately from hooks | MCP not auto-started; configure or use CLI |
-| Stale index / wrong symbols | New thread; hooks refresh on session start | Reload MCP; run local repair | New session; run local repair | New session; run [local repair](cli-reference.md#readiness-and-repair) |
+| Stale index / wrong symbols | Follow status repair guidance in the current thread | Run local repair; reload MCP only for transport or registration changes | Run local repair in the current session | Run [local repair](cli-reference.md#readiness-and-repair) |
 | Packet/search blocked | Agent calls MCP `sidecar_setup repair` when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
 | Version drift after update | Refresh marketplace, refresh plugin package, restart host, fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
 
@@ -140,8 +140,10 @@ codestory-cli fix --project <repo> --format json
 codestory-cli doctor --project <repo>
 ```
 
-If the cache is suspect, get the cache path from `doctor`, move it aside, and
-rebuild. Details: [CLI reference - stale cache](cli-reference.md#stale-local-cache).
+If a maintainer has evidence of cache corruption after supported repair fails,
+get the exact cache path from `doctor`, move only that project cache aside, and
+rebuild. This is a destructive diagnostic fallback, not the normal managed
+repair path. Details: [CLI reference - stale cache](cli-reference.md#stale-local-cache).
 
 Dirty-marker Git hooks (optional, local freshness after Git rewrite):
 
@@ -226,10 +228,16 @@ CLI health does not prove MCP is live in the agent host.
 
 ## Runtime drift after update
 
-Symptoms: `repair_setup`, stale `server_executable`, or version mismatch in status.
+Symptoms: `runtime_update.state=available`, a stale `server_executable`, or an
+actual runtime launch/compatibility failure reported as `repair_setup`.
 
-**You:** Let the plugin provision the current release, or restart the host after
-install. Confirm with a fresh `codestory://status` read.
+Release availability is advisory: it never disables otherwise compatible
+surfaces. Keep using the current runtime according to `allowed_surfaces`. If
+`runtime_update.restart_recommended=true`, restart the host when convenient so
+MCP launches the already-installed newer CLI. If status reports
+`repair_setup`, follow `recommended_next_calls`; that state is reserved for an
+actual runtime startup or compatibility problem. Confirm any runtime change
+with a fresh `codestory://status` read.
 
 **Local dev:** Set `CODESTORY_CLI` to a built binary; status labels this
 `local_dev_override`.

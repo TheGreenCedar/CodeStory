@@ -177,7 +177,7 @@ impl AppController {
 }
 
 fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .args(args)
         .arg("--project")
@@ -258,14 +258,14 @@ fn normalized_path(value: &str) -> String {
 }
 
 fn ambiguous_error_alternatives(json: &Value) -> &Vec<Value> {
-    json.pointer("/error/alternatives")
+    json.pointer("/context/alternatives")
         .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("ambiguous JSON should expose /error/alternatives: {json:#}"))
+        .unwrap_or_else(|| panic!("ambiguous JSON should expose /context/alternatives: {json:#}"))
 }
 
 #[test]
 fn top_level_help_names_command_purposes() {
-    let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let help = test_support::cli_command()
         .arg("--help")
         .output()
         .expect("run top-level help");
@@ -347,7 +347,7 @@ fn smoke_ci_agent_invalid_project_emits_json_failure() {
     let workspace = tempdir().expect("workspace dir");
     let missing = workspace.path().join("missing");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .args([
             "smoke",
             "--profile",
@@ -367,14 +367,138 @@ fn smoke_ci_agent_invalid_project_emits_json_failure() {
     );
 
     let json: Value = serde_json::from_slice(&output.stdout).expect("parse smoke json");
-    assert_eq!(json_string(&json, "/profile"), "ci-agent");
-    assert_eq!(json_string(&json, "/status"), "fail");
-    assert_eq!(json_string(&json, "/checked_surfaces/0/surface"), "project");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json_string(&json, "/error/code"), "smoke_failed");
+    assert_eq!(json_string(&json, "/context/profile"), "ci-agent");
+    assert_eq!(json_string(&json, "/context/status"), "fail");
+    assert_eq!(
+        json_string(&json, "/context/checked_surfaces/0/surface"),
+        "project"
+    );
     assert!(
-        json["repair_hints"]
+        json["context"]["repair_hints"]
             .as_array()
             .is_some_and(|hints| !hints.is_empty()),
         "failure JSON should include repair hints: {json:#}"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+}
+
+#[test]
+fn runtime_json_failure_emits_one_shared_envelope_without_stderr() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(!output.status.success());
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["error"]["code"], "command_failed");
+    assert_eq!(json["error"]["details"]["failed_layer"], "command");
+    assert!(
+        output.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+}
+
+#[test]
+fn runtime_json_failure_honors_equals_output_file() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    let output_dir = tempdir().expect("output dir");
+    let output_path = output_dir.path().join("failure.json");
+    write_tiny_rust_workspace(workspace.path());
+
+    let output = run_cli(
+        workspace.path(),
+        cache_dir.path(),
+        &[
+            "search",
+            "--query",
+            "AppController",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            &format!("--output-file={}", output_path.display()),
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "file output must not duplicate stdout"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+    let json: Value =
+        serde_json::from_str(&std::fs::read_to_string(&output_path).expect("failure output file"))
+            .expect("failure output JSON");
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["error"]["code"], "command_failed");
+}
+
+#[test]
+fn clap_json_failure_emits_one_shared_envelope_without_stderr() {
+    let output = test_support::cli_command()
+        .args([
+            "search",
+            "--format",
+            "json",
+            "--definitely-not-a-real-option",
+        ])
+        .output()
+        .expect("run invalid CLI arguments");
+
+    assert!(!output.status.success());
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["error"]["code"], "invalid_arguments");
+    assert_eq!(json["error"]["details"]["failed_layer"], "cli_arguments");
+    assert!(
+        output.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+}
+
+#[test]
+fn malformed_output_file_does_not_consume_the_next_option_as_a_path() {
+    let workspace = tempdir().expect("workspace dir");
+    let output = test_support::cli_command()
+        .current_dir(workspace.path())
+        .args(["search", "--output-file", "--format", "json"])
+        .output()
+        .expect("run invalid output-file arguments");
+
+    assert!(!output.status.success());
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["error"]["code"], "invalid_arguments");
+    assert!(
+        output.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
+    assert!(
+        !workspace.path().join("--format").exists(),
+        "the next option must never be treated as an output path"
     );
 }
 
@@ -783,18 +907,12 @@ fn ambiguous_query_lists_ranked_alternatives_and_next_steps() {
 
     assert_fails_with(
         output,
-        &[
-            "Query `configure` is ambiguous",
-            "Top equally ranked matches",
-            "alpha.rs",
-            "beta.rs",
-            "resolve the exact `--id` from `search` output",
-        ],
+        &["ambiguous_target", "alpha.rs", "beta.rs", "--choose 1"],
     );
 }
 
 #[test]
-fn ambiguous_query_prioritizes_next_commands_and_caps_human_alternatives() {
+fn ambiguous_query_keeps_human_error_compact_and_json_detailed() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_many_ambiguous_rust_workspace(workspace.path(), 12);
@@ -818,33 +936,11 @@ fn ambiguous_query_prioritizes_next_commands_and_caps_human_alternatives() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let next_commands = combined
-        .find("Next commands:")
-        .unwrap_or_else(|| panic!("missing Next commands in:\n{combined}"));
-    let alternatives = combined
-        .find("Top equally ranked matches")
-        .unwrap_or_else(|| panic!("missing alternatives heading in:\n{combined}"));
     assert!(
-        next_commands < alternatives,
-        "Next commands should precede alternatives in the human diagnostic:\n{combined}"
-    );
-    assert!(
-        combined.contains("Top equally ranked matches (showing 10 of 12):"),
-        "human diagnostic should explain the displayed cap:\n{combined}"
-    );
-    let displayed_alternatives = combined
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            trimmed.contains(" id=`")
-                && trimmed
-                    .split_once('.')
-                    .is_some_and(|(number, _)| number.chars().all(|ch| ch.is_ascii_digit()))
-        })
-        .count();
-    assert_eq!(
-        displayed_alternatives, 10,
-        "human diagnostic should display at most 10 alternatives:\n{combined}"
+        combined.contains("Error: Query `configure` is ambiguous")
+            && !combined.contains("Top equally ranked matches")
+            && !combined.contains("Next commands:"),
+        "human diagnostic should stay compact and defer details to JSON:\n{combined}"
     );
 
     let json_output = run_cli(
@@ -865,6 +961,10 @@ fn ambiguous_query_prioritizes_next_commands_and_caps_human_alternatives() {
         "ambiguous JSON query should fail without selecting a target"
     );
     let json = parse_stdout_json(&json_output);
+    assert!(
+        json_output.stderr.is_empty(),
+        "JSON failure must not emit stderr"
+    );
     assert_eq!(
         ambiguous_error_alternatives(&json).len(),
         12,
@@ -904,14 +1004,7 @@ fn ambiguous_query_quotes_shell_sensitive_file_filters_in_next_commands() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        combined.contains("--file '$hidden path'"),
-        "human diagnostic should single-quote shell-sensitive file filters:\n{combined}"
-    );
-    assert!(
-        !combined.contains("--file \"$hidden path\""),
-        "human diagnostic should not double-quote shell-sensitive file filters:\n{combined}"
-    );
+    assert!(combined.contains("Error: Query `configure` is ambiguous"));
 
     let json_output = run_cli(
         workspace.path(),
@@ -939,7 +1032,7 @@ fn ambiguous_query_quotes_shell_sensitive_file_filters_in_next_commands() {
         "filtered ambiguity JSON should keep every tied alternative: {json:#}"
     );
     assert!(
-        json.pointer("/error/next_commands")
+        json.pointer("/error/details/next_commands")
             .and_then(Value::as_array)
             .is_some_and(|commands| commands.iter().any(|command| command
                 .as_str()
@@ -982,12 +1075,13 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
         "ambiguous JSON should carry a machine-readable error code: {json:#}"
     );
     assert_eq!(
-        json.pointer("/error/failed_layer").and_then(Value::as_str),
+        json.pointer("/error/details/failed_layer")
+            .and_then(Value::as_str),
         Some("query_resolution"),
         "ambiguous JSON should identify the failed layer: {json:#}"
     );
     assert!(
-        json.pointer("/error/layer_notes")
+        json.pointer("/context/layer_notes")
             .and_then(Value::as_array)
             .is_some_and(|notes| notes.iter().any(|note| note
                 .as_str()
@@ -995,7 +1089,7 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
         "ambiguous JSON should preserve layer notes: {json:#}"
     );
     assert!(
-        json.pointer("/error/layer_notes")
+        json.pointer("/context/layer_notes")
             .and_then(Value::as_array)
             .is_some_and(|notes| notes
                 .iter()
@@ -1003,7 +1097,7 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
         "ambiguous JSON should not imply `search --file` exists: {json:#}"
     );
     assert!(
-        json.pointer("/error/layer_notes")
+        json.pointer("/context/layer_notes")
             .and_then(Value::as_array)
             .is_some_and(|notes| notes.iter().any(|note| note
                 .as_str()
@@ -1057,7 +1151,7 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
     let filtered_json = parse_stdout_json(&filtered);
     assert!(
         filtered_json
-            .pointer("/error/next_commands")
+            .pointer("/error/details/next_commands")
             .and_then(Value::as_array)
             .is_some_and(|commands| commands.iter().any(|command| command
                 .as_str()
@@ -1086,7 +1180,7 @@ fn ambiguous_symbol_json_includes_numbered_alternatives_with_stable_refs() {
     let explore_json = parse_stdout_json(&explore);
     assert_eq!(
         explore_json
-            .pointer("/error/failed_layer")
+            .pointer("/error/details/failed_layer")
             .and_then(Value::as_str),
         Some("query_resolution"),
         "explore ambiguity should preserve the failed query-resolution layer: {explore_json:#}"
@@ -1191,7 +1285,7 @@ fn ambiguous_query_writes_output_file_even_on_failure() {
 
 #[test]
 fn choose_flag_resolves_by_displayed_alternative_number_when_available() {
-    let help = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let help = test_support::cli_command()
         .args(["symbol", "--help"])
         .output()
         .expect("run symbol help");
@@ -1259,3 +1353,4 @@ fn choose_flag_resolves_by_displayed_alternative_number_when_available() {
         "--choose should resolve the node id displayed as alternative #2"
     );
 }
+mod test_support;

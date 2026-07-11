@@ -3,7 +3,6 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -501,7 +500,7 @@ fn run_cli_output(
     args: &[String],
 ) -> (f64, Vec<u8>) {
     let started = Instant::now();
-    let output = Command::new(binary)
+    let output = test_support::command(binary)
         .current_dir(project_root)
         .args(args)
         .arg("--project")
@@ -1681,3 +1680,4 @@ fn assert_anchor_summary_usable(repo_json: &Value, anchor: &str) {
         "{anchor} should retain source-truth target pointers"
     );
 }
+mod test_support;

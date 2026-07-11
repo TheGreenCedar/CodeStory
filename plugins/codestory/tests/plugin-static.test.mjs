@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import { once } from "node:events";
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
 const require = createRequire(import.meta.url);
+const launcherTest = require(join(pluginRoot, "scripts", "codestory-mcp.cjs"))._test;
 const {
   dirtyMarkerPathForProject,
   dirtyHookStatus,
@@ -70,18 +71,18 @@ function releaseAssetForPlatform(version) {
 }
 
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
-      `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`,
+      `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`,
       "utf8",
     );
     return;
   }
   await writeFile(
     cliPath,
-    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} "$@"\n`,
+    `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`,
     "utf8",
   );
   await chmod(cliPath, 0o755);
@@ -90,11 +91,26 @@ async function writeFakeCli(cliPath) {
 async function writeRecordingCli(cliPath) {
   const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'&&process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR!=='1'&&args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args})+'\\n')";
   if (process.platform === "win32") {
-    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" %*\r\n`, "utf8");
+    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
     return;
   }
-  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} "$@"\n`, "utf8");
+  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
   await chmod(cliPath, 0o755);
+}
+
+async function writeManagedCliFixture(dataDir, version, body = version) {
+  const cliName = process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli";
+  const versionDir = join(dataDir, "codestory-cli", version);
+  const cliPath = join(versionDir, "bin", cliName);
+  await mkdir(dirname(cliPath), { recursive: true });
+  await writeFile(cliPath, body, "utf8");
+  const sha256 = createHash("sha256").update(await readFile(cliPath)).digest("hex");
+  await writeFile(
+    join(versionDir, "manifest.json"),
+    JSON.stringify({ path: `bin/${cliName}`, sha256, version }),
+    "utf8",
+  );
+  return { cliPath, versionDir };
 }
 
 test("plugin metadata maps skill and direct stdio server", async () => {
@@ -348,13 +364,14 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256, version }),
       "utf8",
     );
     const result = spawnSync(process.execPath, [launcher], {
       env: {
         PLUGIN_DATA: dataDir,
         TEST_OUT: outFile,
+        TEST_CODESTORY_VERSION: version,
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -366,6 +383,13 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.source, "managed");
     assert.equal(observed.path, cliPath);
     assert.equal(observed.sha256, sha256);
+    const retention = JSON.parse(observed.retention);
+    assert.deepEqual(
+      retention.retained.map((entry) => entry.version),
+      [version],
+      JSON.stringify(retention),
+    );
+    assert.equal(retention.reclaimable_bytes, 0);
     assert.equal(observed.pluginRoot, pluginRoot);
     assert.equal(observed.pluginCacheVersion, "");
     assert.equal(observed.activeStatePath, undefined);
@@ -393,6 +417,234 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(policy.state, "enabled");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention keeps active plus a verified adjacent version", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-"));
+  try {
+    assert.equal(launcherTest.compareManagedCliVersions("0.14.10", "0.14.9"), 1);
+    const oldest = await writeManagedCliFixture(dataDir, "0.14.0");
+    const active = await writeManagedCliFixture(dataDir, "0.14.1");
+    const newer = await writeManagedCliFixture(dataDir, "0.14.2");
+    const malformedDir = join(dataDir, "codestory-cli", "0.13.9");
+    await mkdir(malformedDir, { recursive: true });
+    await writeFile(join(malformedDir, "partial"), "stale", "utf8");
+    const probeVersion = (resolved) => ({
+      status: 0,
+      error: null,
+      version: resolved.version,
+      stdout: "",
+      stderr: "",
+    });
+    const resolved = {
+      source: "managed",
+      version: "0.14.1",
+      path: active.cliPath,
+      warnings: [],
+    };
+    const probe = probeVersion(resolved);
+
+    const dryRun = launcherTest.managedCliRetentionReport(resolved, probe, {
+      dataDir,
+      dryRun: true,
+      probeVersion,
+    });
+    assert.deepEqual(dryRun.retained.map((entry) => entry.version), ["0.14.2", "0.14.1"]);
+    assert.deepEqual(dryRun.reclaimable.map((entry) => entry.version), ["0.14.0", "0.13.9"]);
+    assert.equal(dryRun.removed_bytes, 0);
+    assert.equal(dryRun.reclaimable_bytes > 0, true);
+    await access(oldest.versionDir);
+    await access(malformedDir);
+
+    const applied = launcherTest.managedCliRetentionReport(resolved, probe, {
+      dataDir,
+      probeVersion,
+    });
+    assert.deepEqual(applied.retained.map((entry) => entry.version), ["0.14.2", "0.14.1"]);
+    assert.deepEqual(applied.removed.map((entry) => entry.version), ["0.14.0", "0.13.9"]);
+    assert.equal(applied.removed_bytes, dryRun.reclaimable_bytes);
+    await assert.rejects(access(oldest.versionDir));
+    await assert.rejects(access(malformedDir));
+    await access(active.versionDir);
+    await access(newer.versionDir);
+
+    const afterActivation = launcherTest.managedCliRetentionReport(
+      { ...resolved, version: "0.14.2", path: newer.cliPath },
+      { ...probe, version: "0.14.2" },
+      { dataDir, dryRun: true, probeVersion },
+    );
+    assert.deepEqual(afterActivation.retained.map((entry) => entry.version), ["0.14.2", "0.14.1"]);
+    assert.equal(afterActivation.retained.find((entry) => entry.version === "0.14.1").reason, "rollback");
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention reports a locked Windows executable without pruning it", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-lock-"));
+  try {
+    const stale = await writeManagedCliFixture(dataDir, "0.13.9");
+    const rollback = await writeManagedCliFixture(dataDir, "0.14.0");
+    const active = await writeManagedCliFixture(dataDir, "0.14.1");
+    const probeVersion = (resolved) => ({
+      status: 0,
+      error: null,
+      version: resolved.version,
+      stdout: "",
+      stderr: "",
+    });
+    const report = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probeVersion({ version: "0.14.1" }),
+      {
+        dataDir,
+        platform: "win32",
+        probeVersion,
+        unlinkSync(pathname) {
+          if (pathname.startsWith(stale.versionDir)) {
+            const error = new Error("locked");
+            error.code = "EPERM";
+            throw error;
+          }
+          return rm(pathname, { force: false });
+        },
+      },
+    );
+
+    assert.deepEqual(report.retained.map((entry) => entry.version), ["0.14.1", "0.14.0"]);
+    assert.equal(report.reclaimable.find((entry) => entry.version === "0.13.9").reason, "locked:EPERM");
+    assert.equal(report.removed_bytes, 0);
+    await access(stale.versionDir);
+    await access(rollback.versionDir);
+    await access(active.versionDir);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention suppresses deletion when the active manifest escapes its version", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-escape-"));
+  try {
+    const stale = await writeManagedCliFixture(dataDir, "0.14.0");
+    const active = await writeManagedCliFixture(dataDir, "0.14.1");
+    const outside = join(dataDir, "outside-cli");
+    await writeFile(outside, "outside", "utf8");
+    const outsideSha = createHash("sha256").update(await readFile(outside)).digest("hex");
+    await writeFile(
+      join(active.versionDir, "manifest.json"),
+      JSON.stringify({ path: "../../outside-cli", sha256: outsideSha, version: "0.14.1" }),
+      "utf8",
+    );
+    const probe = { status: 0, error: null, version: "0.14.1", stdout: "", stderr: "" };
+
+    const report = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probe,
+      {
+        dataDir,
+        probeVersion: () => probe,
+      },
+    );
+
+    assert.equal(
+      report.warnings.some((warning) => warning.includes("active_unverified:manifest_path_unsafe")),
+      true,
+    );
+    assert.equal(report.removed.length, 0);
+    await access(stale.versionDir);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention reclaims an abandoned lock and provisioning sentinel", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-abandoned-"));
+  try {
+    const stale = await writeManagedCliFixture(dataDir, "0.13.9");
+    await writeFile(join(stale.versionDir, ".provisioning"), "2147483647\n", "utf8");
+    await writeManagedCliFixture(dataDir, "0.14.0");
+    const active = await writeManagedCliFixture(dataDir, "0.14.1");
+    const lockDir = join(dataDir, "codestory-cli", ".retention-lock");
+    await mkdir(lockDir);
+    await writeFile(
+      join(lockDir, "owner.json"),
+      JSON.stringify({
+        pid: process.pid,
+        token: "abandoned",
+        purpose: "retention",
+        started_at: "2000-01-01T00:00:00.000Z",
+      }),
+      "utf8",
+    );
+    const probeVersion = (resolved) => ({
+      status: 0,
+      error: null,
+      version: resolved.version,
+      stdout: "",
+      stderr: "",
+    });
+
+    const report = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probeVersion({ version: "0.14.1" }),
+      { dataDir, probeVersion },
+    );
+
+    assert.deepEqual(report.removed.map((entry) => entry.version), ["0.13.9"]);
+    await assert.rejects(access(stale.versionDir));
+    await assert.rejects(access(lockDir));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention inventories versions when the active probe fails", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-unhealthy-"));
+  try {
+    const old = await writeManagedCliFixture(dataDir, "0.14.0");
+    const active = await writeManagedCliFixture(dataDir, "0.14.1");
+    const report = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      { status: 1, error: null, version: null, stdout: "", stderr: "broken" },
+      { dataDir, dryRun: true },
+    );
+
+    assert.deepEqual(report.reclaimable.map((entry) => entry.version), ["0.14.1", "0.14.0"]);
+    assert.equal(report.reclaimable_bytes > 0, true);
+    assert.equal(report.removed.length, 0);
+    await access(old.versionDir);
+    await access(active.versionDir);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention refuses a linked managed root", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-linked-"));
+  const outside = await mkdtemp(join(tmpdir(), "codestory-managed-retention-outside-"));
+  try {
+    const outsideData = join(outside, "data");
+    const active = await writeManagedCliFixture(outsideData, "0.14.1");
+    await symlink(
+      join(outsideData, "codestory-cli"),
+      join(dataDir, "codestory-cli"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const probe = { status: 0, error: null, version: "0.14.1", stdout: "", stderr: "" };
+
+    const report = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probe,
+      { dataDir, probeVersion: () => probe },
+    );
+
+    assert.equal(report.warnings.some((warning) => warning.includes("managed_cli_root_not_direct")), true);
+    assert.equal(report.removed.length, 0);
+    await access(active.versionDir);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });
 
@@ -1349,9 +1601,11 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
     assert.equal(result.status, 0, result.stderr);
     const status = JSON.parse(result.stdout.trim());
     assert.equal(status.ready, true);
-    assert.equal(status.runtime_truth.sidecar_status.mode, "full");
-    assert.equal(status.runtime_truth.sidecar_status.run_id, "shared-agent");
-    assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.status, "ready");
+    assert.equal(status.runtime_truth.sidecar_status_ref, "readiness_lanes.agent_packet_search");
+    assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
+    assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
+    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
     assert.deepEqual(status.readiness_broker, {
       schema_version: 2,
@@ -1507,10 +1761,13 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(status.runtime_truth.runtime_source, "managed_unavailable");
     assert.equal(status.runtime_truth.plugin_root, pluginRoot);
     assert.equal(status.runtime_truth.sidecar_policy, "ask");
-    assert.equal(status.runtime_truth.sidecar_status.mode, "unavailable");
-    assert.equal(status.runtime_truth.sidecar_status.run_id, "unavailable");
-    assert.equal(status.runtime_truth.readiness_lanes.local_graph.status, "repair_setup");
-    assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.profile, "agent");
+    assert.equal(status.runtime_truth.sidecar_status_ref, null);
+    assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
+    assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
+    assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "local_default"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "agent_packet_search"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
     for (const key of [
@@ -1915,6 +2172,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
         CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
         PLUGIN_DATA: dataDir,
         TEST_OUT: outFile,
+        TEST_CODESTORY_VERSION: version,
       },
       encoding: "utf8",
     });

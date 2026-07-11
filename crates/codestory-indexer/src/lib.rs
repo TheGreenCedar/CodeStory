@@ -902,6 +902,8 @@ impl WorkspaceIndexer {
         // 1. Parallel Indexing (chunked and flushed)
         let mut batched_storage = IntermediateStorage::default();
         let mut all_errors = Vec::new();
+        let mut pending_error_file_ids = HashSet::new();
+        let mut pending_file_errors = Vec::new();
         let mut had_edges = false;
         let full_refresh_defaults =
             IncrementalIndexingConfig::for_mode(codestory_workspace::BuildMode::FullRefresh);
@@ -1028,7 +1030,6 @@ impl WorkspaceIndexer {
             }
 
             for mut local_storage in chunk_results {
-                all_errors.append(&mut local_storage.errors);
                 if let Some(file_info) = local_storage.files.first()
                     && plan.mode == codestory_workspace::BuildMode::Incremental
                     && existing_projection_file_ids.contains(&file_info.id)
@@ -1043,8 +1044,7 @@ impl WorkspaceIndexer {
                         &local_storage.callable_projection_states,
                     );
                     match update_mode {
-                        ProjectionUpdateMode::InsertFresh => {}
-                        ProjectionUpdateMode::NoChanges => {}
+                        ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {}
                         ProjectionUpdateMode::Delta { changed_callers } => {
                             storage
                                 .delete_projection_for_callers(file_info.id, &changed_callers)
@@ -1059,6 +1059,15 @@ impl WorkspaceIndexer {
                     stats.cleanup_ms = stats
                         .cleanup_ms
                         .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
+                }
+                pending_error_file_ids.extend(local_storage.files.iter().map(|file| file.id));
+                for error in local_storage.errors.drain(..) {
+                    if let Some(file_id) = error.file_id {
+                        pending_error_file_ids.insert(file_id.0);
+                        pending_file_errors.push(error);
+                    } else {
+                        all_errors.push(error);
+                    }
                 }
                 batched_storage.merge(local_storage);
 
@@ -1087,6 +1096,11 @@ impl WorkspaceIndexer {
                         &mut had_edges,
                     )?;
                     accumulate_flush_breakdown(&mut stats, breakdown);
+                    Self::flush_file_errors(
+                        storage,
+                        &mut pending_error_file_ids,
+                        &mut pending_file_errors,
+                    )?;
                 }
 
                 if all_errors.len() >= batch_config.error_batch_size {
@@ -1099,6 +1113,14 @@ impl WorkspaceIndexer {
             }
 
             if cancelled.load(Ordering::Relaxed) {
+                let breakdown =
+                    Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
+                accumulate_flush_breakdown(&mut stats, breakdown);
+                Self::flush_file_errors(
+                    storage,
+                    &mut pending_error_file_ids,
+                    &mut pending_file_errors,
+                )?;
                 event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
                 return Ok(stats);
             }
@@ -1106,6 +1128,14 @@ impl WorkspaceIndexer {
 
         // Check if cancelled during indexing
         if cancelled.load(Ordering::Relaxed) {
+            let breakdown =
+                Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
+            accumulate_flush_breakdown(&mut stats, breakdown);
+            Self::flush_file_errors(
+                storage,
+                &mut pending_error_file_ids,
+                &mut pending_file_errors,
+            )?;
             event_bus.publish(Event::IndexingComplete { duration_ms: 0 });
             return Ok(stats);
         }
@@ -1113,6 +1143,11 @@ impl WorkspaceIndexer {
         let breakdown =
             Self::flush_projection_batch(storage, &mut batched_storage, &mut had_edges)?;
         accumulate_flush_breakdown(&mut stats, breakdown);
+        Self::flush_file_errors(
+            storage,
+            &mut pending_error_file_ids,
+            &mut pending_file_errors,
+        )?;
 
         if plan.mode == codestory_workspace::BuildMode::Incremental
             && !plan.files_to_remove.is_empty()
@@ -1505,6 +1540,23 @@ impl WorkspaceIndexer {
         Ok(())
     }
 
+    fn flush_file_errors(
+        storage: &mut Storage,
+        file_ids: &mut HashSet<i64>,
+        errors: &mut Vec<codestory_contracts::graph::ErrorInfo>,
+    ) -> Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let file_ids = file_ids.drain().collect::<Vec<_>>();
+        storage
+            .replace_errors_for_files_batch(&file_ids, errors)
+            .map_err(|e| anyhow!("Storage file error replacement error: {:?}", e))?;
+        errors.clear();
+        Ok(())
+    }
+
     fn flush_projection_batch(
         storage: &mut Storage,
         batched_storage: &mut IntermediateStorage,
@@ -1533,7 +1585,7 @@ impl WorkspaceIndexer {
     #[allow(clippy::result_large_err)]
     fn prepare_index_work(
         &self,
-        storage: &Storage,
+        storage: &mut Storage,
         path: &PathBuf,
         root: &Path,
         existing_projection_id: Option<i64>,
@@ -1761,6 +1813,24 @@ impl WorkspaceIndexer {
                                     full_path, error
                                 ),
                                 file_id: Some(file_id),
+                                line: None,
+                                column: None,
+                                is_fatal: false,
+                                index_step: codestory_contracts::graph::IndexStep::Indexing,
+                            });
+                            return Err(local_storage);
+                        }
+                        if let Some(file_info) = artifact.files.first()
+                            && let Err(error) =
+                                storage.replace_errors_for_files_batch(&[file_info.id], &[])
+                        {
+                            let mut local_storage = IntermediateStorage::default();
+                            local_storage.add_error(codestory_contracts::graph::ErrorInfo {
+                                message: format!(
+                                    "Failed to replace cached file errors for {:?}: {:?}",
+                                    full_path, error
+                                ),
+                                file_id: Some(NodeId(file_info.id)),
                                 line: None,
                                 column: None,
                                 is_fatal: false,

@@ -16,25 +16,28 @@ use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAnswerDto,
     AgentAskRequest, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto,
-    EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto, GraphArtifactDto,
-    GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest,
-    NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto, PacketSufficiencyStatusDto,
-    PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit,
-    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
-    SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
-    TrailDirection, TrailMode,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto, ApiError,
+    ApiErrorDetails, AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
+    CommandFailureEnvelope, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto,
+    EvidencePacketDto, EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto,
+    GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto,
+    PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
+    ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
+    SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ffi::{OsStr, OsString},
     fmt::Write as _,
     fs,
     io::{IsTerminal, Read},
     net::{TcpListener, ToSocketAddrs},
     path::{Path, PathBuf},
+    process::ExitCode,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -187,13 +190,63 @@ fn with_drill_command_duration(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    run_cli().await
+async fn main() -> ExitCode {
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    let json = json_output_requested(&raw_args);
+    let cli = match Cli::try_parse_from(&raw_args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                let _ = error.print();
+                return ExitCode::SUCCESS;
+            }
+            if json {
+                let envelope = command_failure_envelope(
+                    "invalid_arguments",
+                    "cli_arguments",
+                    error.to_string(),
+                    serde_json::json!({"kind": format!("{:?}", error.kind())}),
+                );
+                emit_command_failure(&envelope, requested_output_file(&raw_args));
+            } else {
+                let _ = error.print();
+            }
+            return ExitCode::from(2);
+        }
+    };
+
+    match run_cli(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let structured = error.downcast_ref::<StructuredCommandFailure>();
+            if json {
+                let envelope = structured
+                    .map(|failure| failure.envelope.clone())
+                    .unwrap_or_else(|| generic_command_failure(&error));
+                let output_file = structured
+                    .and_then(|failure| failure.output_file.as_deref())
+                    .or_else(|| requested_output_file(&raw_args));
+                emit_command_failure(&envelope, output_file);
+            } else {
+                if let Some(failure) = structured
+                    && let (Some(path), Some(markdown)) =
+                        (failure.output_file.as_deref(), failure.markdown.as_deref())
+                    && let Err(write_error) = fs::write(path, markdown)
+                {
+                    eprintln!("Error: failed to write {}: {write_error}", path.display());
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("Error: {}", error);
+            }
+            ExitCode::FAILURE
+        }
+    }
 }
 
-async fn run_cli() -> Result<()> {
-    let cli = Cli::parse();
-
+async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
@@ -229,6 +282,87 @@ async fn run_cli() -> Result<()> {
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::Sidecar(cmd) => run_sidecar(cmd),
     }
+}
+
+#[derive(Debug)]
+struct StructuredCommandFailure {
+    envelope: CommandFailureEnvelope,
+    output_file: Option<PathBuf>,
+    markdown: Option<String>,
+}
+
+impl std::fmt::Display for StructuredCommandFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.envelope.error.message)
+    }
+}
+
+impl std::error::Error for StructuredCommandFailure {}
+
+fn command_failure_envelope(
+    code: impl Into<String>,
+    failed_layer: impl Into<String>,
+    message: impl Into<String>,
+    context: serde_json::Value,
+) -> CommandFailureEnvelope {
+    CommandFailureEnvelope::new(ApiError::with_details(
+        code,
+        message,
+        ApiErrorDetails {
+            failed_layer: Some(failed_layer.into()),
+            project: None,
+            next_commands: Vec::new(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            readiness: None,
+        },
+    ))
+    .with_context(context)
+}
+
+fn generic_command_failure(error: &anyhow::Error) -> CommandFailureEnvelope {
+    command_failure_envelope(
+        "command_failed",
+        "command",
+        error.to_string(),
+        serde_json::json!({
+            "causes": error.chain().skip(1).map(ToString::to_string).collect::<Vec<_>>()
+        }),
+    )
+}
+
+fn json_output_requested(args: &[OsString]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == OsStr::new("--format") && pair[1] == OsStr::new("json"))
+        || args.iter().any(|arg| arg == OsStr::new("--format=json"))
+}
+
+fn requested_output_file(args: &[OsString]) -> Option<&Path> {
+    args.iter()
+        .find_map(|arg| {
+            arg.to_str()
+                .and_then(|arg| arg.strip_prefix("--output-file="))
+                .filter(|path| !path.is_empty())
+                .map(Path::new)
+        })
+        .or_else(|| {
+            args.windows(2).find_map(|pair| {
+                (pair[0] == OsStr::new("--output-file")
+                    && !pair[1].to_string_lossy().starts_with('-'))
+                .then(|| Path::new(&pair[1]))
+            })
+        })
+}
+
+fn emit_command_failure(envelope: &CommandFailureEnvelope, output_file: Option<&Path>) {
+    let json = serde_json::to_string_pretty(envelope)
+        .expect("the command failure envelope is always JSON-serializable");
+    if let Some(path) = output_file
+        && fs::write(path, format!("{json}\n")).is_ok()
+    {
+        return;
+    }
+    println!("{json}");
 }
 
 fn run_sidecar(cmd: SidecarCommand) -> Result<()> {
@@ -657,6 +791,7 @@ struct ReadyRepairProgress {
     start: Instant,
     started_at_epoch_ms: i64,
     pid: u32,
+    attempt_id: Option<String>,
     sidecar: codestory_retrieval::SidecarRuntimeConfig,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -672,6 +807,9 @@ impl ReadyRepairProgress {
         let start = Instant::now();
         let started_at_epoch_ms = ready_repair_status::now_epoch_ms();
         let pid = std::process::id();
+        let attempt_id = std::env::var(ready_repair_status::READY_REPAIR_ATTEMPT_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let profile = sidecar.profile.as_str();
         let run_id = sidecar.run_id.as_deref().unwrap_or("none").to_string();
         let namespace = sidecar.namespace.clone();
@@ -684,12 +822,14 @@ impl ReadyRepairProgress {
         let worker_namespace = namespace.clone();
         let worker_project_root = project_root.clone();
         let worker_cache_root = cache_root.clone();
-        let _ = ready_repair_status::write_ready_repair_status(
+        let worker_attempt_id = attempt_id.clone();
+        let _ = ready_repair_status::write_ready_repair_status_for_attempt(
             sidecar,
             &project_root,
             "starting",
             started_at_epoch_ms,
             pid,
+            attempt_id.as_deref(),
         );
         let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
             project_root: project_root.clone(),
@@ -721,12 +861,13 @@ impl ReadyRepairProgress {
                         "active"
                     )
                 );
-                let _ = ready_repair_status::write_ready_repair_status(
+                let _ = ready_repair_status::write_ready_repair_status_for_attempt(
                     &sidecar_for_worker,
                     &worker_project_root,
                     phase,
                     started_at_epoch_ms,
                     pid,
+                    worker_attempt_id.as_deref(),
                 );
                 let _ = readiness_broker::refresh_broker_snapshot(
                     readiness_broker::BrokerSnapshotInput {
@@ -752,6 +893,7 @@ impl ReadyRepairProgress {
             start,
             started_at_epoch_ms,
             pid,
+            attempt_id,
             sidecar: sidecar.clone(),
             handle: Some(handle),
         }
@@ -770,12 +912,13 @@ impl ReadyRepairProgress {
                 "started"
             )
         );
-        let _ = ready_repair_status::write_ready_repair_status(
+        let _ = ready_repair_status::write_ready_repair_status_for_attempt(
             &self.sidecar,
             &self.project_root,
             phase,
             self.started_at_epoch_ms,
             self.pid,
+            self.attempt_id.as_deref(),
         );
         let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
             project_root: self.project_root.clone(),
@@ -794,10 +937,11 @@ impl Drop for ReadyRepairProgress {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        ready_repair_status::clear_ready_repair_status(
+        ready_repair_status::clear_ready_repair_status_for_attempt(
             &self.sidecar,
             self.started_at_epoch_ms,
             self.pid,
+            self.attempt_id.as_deref(),
         );
     }
 }
@@ -895,11 +1039,28 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
     };
     let failed = output.status == "fail";
     let markdown = render_smoke_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())?;
     if failed {
-        bail!("smoke profile {} failed", output.profile);
+        let envelope = CommandFailureEnvelope::new(ApiError::with_details(
+            "smoke_failed",
+            format!("smoke profile {} failed", output.profile),
+            ApiErrorDetails {
+                failed_layer: Some("smoke".to_string()),
+                project: Some(output.project.clone()),
+                next_commands: output.repair_hints.clone(),
+                minimum_next: output.repair_hints.iter().take(1).cloned().collect(),
+                full_repair: output.repair_hints.clone(),
+                readiness: None,
+            },
+        ))
+        .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);
+        return Err(StructuredCommandFailure {
+            envelope,
+            output_file: cmd.output_file,
+            markdown: (cmd.format != args::OutputFormat::Json).then_some(markdown),
+        }
+        .into());
     }
-    Ok(())
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
 fn run_ci_agent_smoke(project: &ProjectArgs) -> SmokeOutput {
@@ -2442,7 +2603,6 @@ pub(crate) fn local_refresh_output_from_summary(
             project: &summary.root,
             stats: &summary.stats,
             freshness: summary.freshness.as_ref(),
-            setup: None,
             sidecar: None,
         },
     );
@@ -2575,6 +2735,29 @@ fn repair_ready_state(
             run_id,
         )
     });
+    let plugin_worker = std::env::var("CODESTORY_PLUGIN_SIDECAR_REPAIR").as_deref() == Ok("1");
+    let handoff_attempt = std::env::var(ready_repair_status::READY_REPAIR_ATTEMPT_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let mut handoff_reservation =
+        match (sidecar.as_ref(), plugin_worker, handoff_attempt.as_deref()) {
+            (Some(sidecar), true, Some(attempt_id)) => Some(
+                ready_repair_status::adopt_ready_repair_reservation(
+                    sidecar,
+                    &runtime.project_root,
+                    attempt_id,
+                )
+                .context("adopt MCP ready-repair reservation")?,
+            ),
+            (_, true, None) => {
+                bail!("MCP ready-repair worker is missing its reservation attempt id")
+            }
+            (_, false, Some(_)) => bail!("ready-repair attempt id requires the MCP worker marker"),
+            _ => None,
+        };
+    if let Some(reservation) = handoff_reservation.as_mut() {
+        reservation.disarm();
+    }
     if let Some(sidecar) = sidecar.as_ref()
         && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
@@ -2622,6 +2805,9 @@ fn repair_ready_state(
             );
         }
     }
+
+    #[cfg(debug_assertions)]
+    maybe_exit_ready_repair_worker_probe(handoff_reservation.as_ref());
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
@@ -2724,6 +2910,44 @@ fn repair_ready_state(
         reconciliation: None,
     });
     Ok(Some(sidecar))
+}
+
+#[cfg(debug_assertions)]
+fn maybe_exit_ready_repair_worker_probe(
+    reservation: Option<&ready_repair_status::ReadyRepairReservation>,
+) {
+    use std::io::Write as _;
+
+    let Some(reservation) = reservation else {
+        return;
+    };
+    if std::env::var("CODESTORY_PLUGIN_SIDECAR_REPAIR").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(exit_code) = std::env::var("CODESTORY_TEST_READY_REPAIR_WORKER_EXIT_CODE")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return;
+    };
+    let attempt_id = reservation.attempt_id();
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    let stdout_payload = vec![b'o'; 40 * 1024];
+    let stderr_payload = vec![b'e'; 40 * 1024];
+    let _ = stdout.write_all(&stdout_payload);
+    let _ = writeln!(
+        stdout,
+        "ready-repair worker probe stdout attempt_id={attempt_id}"
+    );
+    let _ = stderr.write_all(&stderr_payload);
+    let _ = writeln!(
+        stderr,
+        "ready-repair worker probe stderr attempt_id={attempt_id}"
+    );
+    let _ = stdout.flush();
+    let _ = stderr.flush();
+    std::process::exit(exit_code);
 }
 
 #[derive(Debug, Clone)]
@@ -10791,18 +11015,43 @@ fn resolve_target_or_emit_ambiguity(
         Err(error) => {
             if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
                 let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-                if output_file.is_some() || format == args::OutputFormat::Json {
-                    emit(
-                        format,
-                        &output,
-                        render_cli_error_markdown(&output),
-                        output_file,
-                    )?;
+                let markdown = (format != args::OutputFormat::Json)
+                    .then(|| render_cli_error_markdown(&output));
+                return Err(StructuredCommandFailure {
+                    envelope: ambiguous_command_failure(&output, &runtime.project_root),
+                    output_file: output_file.map(Path::to_path_buf),
+                    markdown,
                 }
+                .into());
             }
             Err(error)
         }
     }
+}
+
+fn ambiguous_command_failure(
+    output: &CliErrorOutput,
+    project_root: &Path,
+) -> CommandFailureEnvelope {
+    let message = cli_error_markdown_message(output).to_string();
+    CommandFailureEnvelope::new(ApiError::with_details(
+        output.error.code,
+        message,
+        ApiErrorDetails {
+            failed_layer: Some(output.error.failed_layer.to_string()),
+            project: Some(display::clean_path_string(&project_root.to_string_lossy())),
+            next_commands: output.error.next_commands.clone(),
+            minimum_next: output.error.next_commands.iter().take(1).cloned().collect(),
+            full_repair: output.error.next_commands.clone(),
+            readiness: None,
+        },
+    ))
+    .with_context(serde_json::json!({
+        "query": output.error.query,
+        "file_filter": output.error.file_filter,
+        "alternatives": output.error.alternatives,
+        "layer_notes": output.error.layer_notes,
+    }))
 }
 
 fn render_cli_error_markdown(output: &CliErrorOutput) -> String {
@@ -11100,7 +11349,6 @@ fn build_summary_readiness(
         project,
         stats,
         freshness,
-        setup: None,
         sidecar: Some(readiness_sidecar_input(sidecar)),
     })
 }
@@ -15418,6 +15666,35 @@ mod tests {
         assert_eq!(
             resolve_refresh_request(RefreshMode::Auto, &summary_with_files(3)),
             Some(IndexMode::Incremental)
+        );
+    }
+
+    #[test]
+    fn interrupted_incremental_resolves_and_labels_staged_full_recovery() {
+        let mut summary = summary_with_files(3);
+        summary.freshness = Some(IndexFreshnessDto {
+            status: IndexFreshnessStatusDto::Stale,
+            changed_file_count: 0,
+            new_file_count: 0,
+            removed_file_count: 0,
+            checked_file_count: 0,
+            indexed_file_count: 3,
+            duration_ms: 0,
+            reason: Some("previous_incremental_run_incomplete_full_refresh_required".to_string()),
+            samples: Vec::new(),
+        });
+
+        assert_eq!(
+            resolve_refresh_request(RefreshMode::Auto, &summary),
+            Some(IndexMode::Full)
+        );
+        assert_eq!(
+            resolve_refresh_request(RefreshMode::Incremental, &summary),
+            Some(IndexMode::Full)
+        );
+        assert_eq!(
+            refresh_label(RefreshMode::Incremental, Some(IndexMode::Full)),
+            "incremental(recovery-full)"
         );
     }
 

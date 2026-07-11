@@ -29,6 +29,9 @@ use helpers::{
 };
 
 const SCHEMA_VERSION: u32 = 18;
+// Reserved outside the sequential migration range so a future real schema version cannot
+// accidentally be treated as an interrupted run from this release.
+const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
 /// Current SQLite schema version expected by `Store`.
 pub const CURRENT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 const GROUNDING_SNAPSHOT_VERSION: i64 = 1;
@@ -895,6 +898,38 @@ impl Storage {
         Ok(version.max(0) as u32)
     }
 
+    /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
+    pub fn database_has_incomplete_incremental_run(path: &Path) -> Result<bool, StorageError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && version > SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
+            )));
+        }
+        let table_exists: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'incomplete_index_run'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        let marked = table_exists != 0
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incomplete_index_run WHERE id = 1)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+        if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && !marked {
+            return Err(StorageError::Other(format!(
+                "Database schema version {version} is only valid while an incremental index run is marked incomplete"
+            )));
+        }
+        Ok(marked)
+    }
+
     pub fn copy_database_snapshot(
         source_path: &Path,
         target_path: &Path,
@@ -1217,6 +1252,44 @@ impl Storage {
     pub fn invalidate_grounding_snapshots(&self) -> Result<(), StorageError> {
         self.mark_grounding_snapshots_dirty()?;
         self.invalidate_resolution_support_snapshot()?;
+        Ok(())
+    }
+
+    /// Mark a live incremental index run incomplete before it mutates projections.
+    pub fn begin_incremental_run(&self) -> Result<(), StorageError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
+             VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET
+                started_at_epoch_ms = excluded.started_at_epoch_ms",
+            params![current_epoch_ms()],
+        )?;
+        transaction.pragma_update(
+            None,
+            "user_version",
+            INCOMPLETE_INCREMENTAL_SCHEMA_VERSION.to_string(),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Whether a prior live incremental index run did not reach its success boundary.
+    pub fn has_incomplete_incremental_run(&self) -> Result<bool, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM incomplete_index_run WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Clear the live incremental marker only after resolution and snapshots succeed.
+    pub fn finish_incremental_run(&self) -> Result<(), StorageError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("DELETE FROM incomplete_index_run WHERE id = 1", [])?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION.to_string())?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -3158,6 +3231,23 @@ impl Storage {
                 row.get::<_, i64>(0)
             })?;
         Ok(clamp_i64_to_u32(count))
+    }
+
+    pub fn has_symbol_search_doc_version_mismatch(
+        &self,
+        expected_version: u32,
+    ) -> Result<bool, StorageError> {
+        let mismatch = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM symbol_search_doc
+                WHERE doc_version <> ?1
+                LIMIT 1
+            )",
+            params![expected_version as i64],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(mismatch)
     }
 
     pub fn clear_symbol_search_docs(&mut self) -> Result<usize, StorageError> {
@@ -5441,6 +5531,54 @@ impl Storage {
     pub fn clear_errors(&self) -> Result<(), StorageError> {
         self.conn.execute("DELETE FROM error", [])?;
         self.invalidate_grounding_snapshots()?;
+        Ok(())
+    }
+
+    /// Replace errors for reprocessed files after their latest projection is durable.
+    pub fn replace_errors_for_files_batch(
+        &mut self,
+        file_ids: &[i64],
+        errors: &[codestory_contracts::graph::ErrorInfo],
+    ) -> Result<(), StorageError> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        debug_assert!(errors.iter().all(|error| {
+            error
+                .file_id
+                .is_some_and(|file_id| file_ids.contains(&file_id.0))
+        }));
+
+        let tx = self.conn.transaction()?;
+        let mut removed_error_count = 0;
+        {
+            let mut delete = tx.prepare("DELETE FROM error WHERE file_id = ?1")?;
+            for file_id in &file_ids {
+                removed_error_count += delete.execute(params![file_id])?;
+            }
+        }
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for error in errors {
+                insert.execute(params![
+                    error.message,
+                    error.file_id.map(|id| id.0),
+                    error.line,
+                    error.column,
+                    error.is_fatal as i32,
+                    (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        if removed_error_count > 0 || !errors.is_empty() {
+            self.invalidate_grounding_snapshots()?;
+        }
         Ok(())
     }
 

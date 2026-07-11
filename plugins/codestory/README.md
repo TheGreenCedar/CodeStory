@@ -31,6 +31,15 @@ and stay up with diagnostic `codestory://status` when managed setup fails.
 Ambient `PATH` binaries are reported as diagnostics only; installed plugin
 runtime does not launch them.
 
+After a managed runtime passes checksum and `--version` verification, the
+adapter retains that active version plus one verified pending upgrade or
+rollback. New installs publish from a verified staging directory under a
+PID/token lock. Older version directories are removed best-effort; live Windows
+executables, active installs, links, malformed manifests, and concurrent runs
+are preserved, while abandoned locks/staging are safely reclaimed. Results are
+reported under `managed_cli_retention` in `codestory://status`, including
+retained, removed, and reclaimable byte totals.
+
 ## Codex install (summary)
 
 1. Open Codex in the repository you want to ground.

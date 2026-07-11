@@ -981,7 +981,7 @@ pub(crate) fn packet_required_probe_needs_exact_match(query: &str) -> bool {
 
 fn packet_required_probe_needs_concrete_file(query: &str) -> bool {
     let normalized_query = normalize_identifier(query);
-    normalized_query.contains("execevents") || normalized_query == "eventoutputprocessor"
+    normalized_query.ends_with("events") || normalized_query == "eventoutputprocessor"
 }
 
 fn packet_required_probe_needs_full_token_coverage(query: &str) -> bool {

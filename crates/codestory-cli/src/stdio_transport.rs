@@ -18,15 +18,16 @@ use codestory_contracts::api::{
     TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -57,14 +58,24 @@ use std::time::{Duration, Instant};
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_RECENT_REPAIR_TTL: Duration = Duration::from_secs(30);
-const STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE: &str = "ready-repair-enqueue.lock";
-const STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL: Duration = Duration::from_secs(15);
+const STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES: usize = 32 * 1024;
+const STDIO_READY_REPAIR_RESERVATION_HEARTBEAT: Duration = Duration::from_secs(5);
 const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
-const STDIO_CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(3);
-const STDIO_CLI_VERSION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const STDIO_RELEASE_METADATA_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const STDIO_RELEASE_METADATA_FAILURE_TTL: Duration = Duration::from_secs(60 * 60);
+const STDIO_RELEASE_METADATA_SCHEMA_VERSION: u32 = 1;
 const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
+
+static STDIO_RELEASE_METADATA_REFRESHES: OnceLock<Mutex<StdioReleaseMetadataRefreshes>> =
+    OnceLock::new();
+
+#[derive(Default)]
+struct StdioReleaseMetadataRefreshes {
+    in_flight: HashSet<PathBuf>,
+    last_started: HashMap<PathBuf, Instant>,
+}
 
 /// Run the stdio server until stdin closes.
 ///
@@ -453,6 +464,7 @@ struct StdioRecentSidecarRepair {
     namespace: String,
     compose_project: String,
     pid: u32,
+    attempt_id: String,
     started_at_epoch_ms: i64,
     observed_at: Instant,
 }
@@ -716,21 +728,22 @@ fn stdio_tool_blocked_error(
         .get("blocked_reason")
         .and_then(serde_json::Value::as_str)
         .or_else(|| surface.get("summary").and_then(serde_json::Value::as_str))
+        .or_else(|| verdict.and_then(|verdict| verdict.get("summary")?.as_str()))
         .unwrap_or("CodeStory readiness blocks this tool.");
     Ok(Some(serde_json::json!({
         "code": "codestory_tool_blocked",
         "message": format!("CodeStory tool `{name}` is blocked: {message}"),
         "tool": name,
         "readiness_goal": surface.get("readiness_goal").cloned().unwrap_or(serde_json::Value::Null),
-        "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "status": surface.get("status").cloned().or_else(|| verdict.and_then(|verdict| verdict.get("status")).cloned()).unwrap_or(serde_json::Value::Null),
         "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
         "canonical_tool": surface.get("canonical_tool").cloned().unwrap_or(serde_json::Value::Null),
         "canonical_arguments": surface.get("canonical_arguments").cloned().unwrap_or(serde_json::Value::Null),
         "deprecated": surface.get("deprecated").cloned().unwrap_or(serde_json::Value::Null),
         "local_refresh": status.get("local_refresh").cloned().unwrap_or(serde_json::Value::Null),
-        "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next"), &runtime.project_root),
-        "full_repair": stdio_repair_calls_from_value(surface.get("full_repair"), &runtime.project_root),
+        "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next").or_else(|| verdict.and_then(|verdict| verdict.get("minimum_next"))), &runtime.project_root),
+        "full_repair": stdio_repair_calls_from_value(surface.get("full_repair").or_else(|| verdict.and_then(|verdict| verdict.get("full_repair"))), &runtime.project_root),
         "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
         "sidecar": verdict.and_then(|verdict| verdict.get("sidecar")).cloned().unwrap_or(serde_json::Value::Null),
     })))
@@ -2617,6 +2630,7 @@ fn stdio_status_with_recent_sidecar_repair(
         "namespace": repair.namespace.clone(),
         "phase": "starting",
         "pid": repair.pid,
+        "attempt_id": repair.attempt_id,
         "updated_at_epoch_ms": repair.started_at_epoch_ms
     });
     let live_active_repair = status
@@ -2666,6 +2680,7 @@ fn stdio_status_with_recent_sidecar_repair(
                 .get("pid")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!(repair.pid)),
+            "attempt_id": repair.attempt_id.clone(),
             "started_at_epoch_ms": repair.started_at_epoch_ms,
             "updated_at_epoch_ms": active_repair
                 .get("updated_at_epoch_ms")
@@ -2751,7 +2766,7 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
         format!("storage:{}", runtime.storage_path.display()),
         format!(
             "storage_state:{}",
-            stdio_path_fingerprint(&runtime.storage_path)
+            stdio_storage_fingerprint(&runtime.storage_path)
         ),
         format!(
             "sidecar_state:{}",
@@ -2792,6 +2807,15 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
                 .map(PathBuf::from)
                 .map(|path| stdio_path_fingerprint(&path))
                 .unwrap_or_else(|| "not_configured".to_string())
+        ),
+        format!(
+            "release_metadata:{}",
+            stdio_path_fingerprint(&stdio_release_metadata_cache_path())
+        ),
+        format!(
+            "release_override:{}",
+            std::env::var("CODESTORY_LATEST_RELEASE_VERSION")
+                .unwrap_or_else(|_| "not_configured".to_string())
         ),
         format!(
             "active_embedding_backend:{}",
@@ -3057,7 +3081,7 @@ fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_j
             "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
             "managed_cli_path": diagnostic["managed_cli_path"].clone(),
             "launcher_source": diagnostic["cli_source"].clone(),
-            "workspace": diagnostic.clone(),
+            "workspace_ref": "workspace_mismatch",
         },
         "runtime_boundary": {
             "restart_required_for_runtime_change": true,
@@ -3164,10 +3188,26 @@ fn stdio_workspace_mismatch_allowed_surfaces() -> serde_json::Value {
         "packet",
         "search",
         "context",
-        "repair_all",
     ] {
         surfaces.insert(surface.to_string(), stdio_workspace_mismatch_surface());
     }
+    surfaces.insert(
+        "repair_all".to_string(),
+        serde_json::json!({
+            "allowed": false,
+            "readiness_goal": "workspace",
+            "status": "workspace_mismatch",
+            "failed_layer": "workspace_binding",
+            "summary": "repair_all is blocked until the host relaunches MCP for the active workspace.",
+            "blocked_reason": "workspace_mismatch_repair_blocked",
+            "repair_reason": "workspace_mismatch",
+            "canonical_tool": "sidecar_setup",
+            "canonical_arguments": {"action": "status"},
+            "deprecated": true,
+            "minimum_next": [],
+            "full_repair": [],
+        }),
+    );
     surfaces.insert(
         "sidecar_setup".to_string(),
         serde_json::json!({
@@ -3189,13 +3229,8 @@ fn stdio_workspace_mismatch_surface() -> serde_json::Value {
     serde_json::json!({
         "allowed": false,
         "readiness_goal": "workspace",
-        "status": "workspace_mismatch",
         "failed_layer": "workspace_binding",
-        "summary": "CodeStory MCP is serving a stale workspace; restart/reload the host before using repo-specific tools or repairs.",
         "repair_reason": "workspace_mismatch",
-        "blocked_reason": "CodeStory MCP is serving a stale workspace.",
-        "minimum_next": [],
-        "full_repair": [],
     })
 }
 
@@ -3288,7 +3323,6 @@ struct StdioStatusReadinessParts {
     sidecar_setup: serde_json::Value,
     dirty_marker: StdioDirtyMarkerStatus,
     effective_freshness: Option<IndexFreshnessDto>,
-    local: ReadinessVerdictDto,
 }
 
 struct StdioStatusBrokerParts {
@@ -3311,6 +3345,7 @@ fn read_stdio_status_resource(
     let sidecar = build_stdio_status_sidecar(runtime);
     let (server_executable, server_executable_sha256, server_warnings) =
         stdio_server_executable_status();
+    let runtime_update = stdio_runtime_update_advisory(server_executable.as_deref());
     let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
     let plugin_runtime = stdio_plugin_runtime_status();
     let broker = build_stdio_status_broker(runtime, &sidecar.selected_agent_sidecar);
@@ -3318,7 +3353,6 @@ fn read_stdio_status_resource(
         runtime,
         &summary,
         local_refresh,
-        server_executable.as_deref(),
         &sidecar,
         &broker.readiness_broker,
     );
@@ -3335,6 +3369,7 @@ fn read_stdio_status_resource(
         "server_executable": server_executable,
         "server_executable_sha256": server_executable_sha256,
         "source_checkout_version": source_checkout_version,
+        "runtime_update": runtime_update,
         "sidecar_contract_version": codestory_retrieval::SIDECAR_SCHEMA_VERSION,
         "plugin_runtime": plugin_runtime,
         "runtime_truth": surfaces.runtime_truth,
@@ -3509,11 +3544,9 @@ fn build_stdio_status_readiness(
     runtime: &RuntimeContext,
     summary: &ProjectSummary,
     local_refresh: Option<crate::readiness::LocalRefreshOutput>,
-    server_executable: Option<&str>,
     sidecar: &StdioSidecarStatusParts,
     broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
 ) -> StdioStatusReadinessParts {
-    let setup_repair = stdio_setup_repair_input(server_executable);
     let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
     let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
     let selected_agent_sidecar = stdio_agent_sidecar_with_gpu_proof(
@@ -3524,7 +3557,6 @@ fn build_stdio_status_readiness(
         project: &summary.root,
         stats: &summary.stats,
         freshness: effective_freshness.as_ref(),
-        setup: setup_repair.as_ref(),
         sidecar: Some(crate::readiness::ReadinessSidecarInput {
             profile: selected_agent_sidecar.profile.as_deref(),
             run_id: selected_agent_sidecar.run_id.as_deref(),
@@ -3581,7 +3613,6 @@ fn build_stdio_status_readiness(
         sidecar_setup,
         dirty_marker,
         effective_freshness,
-        local,
     }
 }
 
@@ -3663,14 +3694,7 @@ fn build_stdio_status_surfaces(
         &readiness.sidecar_setup,
         native_embedding_hard_busy,
     );
-    let runtime_truth = stdio_runtime_truth_status(
-        plugin_runtime,
-        &readiness.sidecar_setup,
-        &readiness.readiness_lanes_json,
-        &readiness.local,
-        &readiness.local_refresh_json,
-        &broker.readiness_broker_json,
-    );
+    let runtime_truth = stdio_runtime_truth_status(plugin_runtime, &readiness.sidecar_setup);
     StdioStatusSurfacesParts {
         allowed_surfaces,
         recommended_next_calls,
@@ -3681,10 +3705,6 @@ fn build_stdio_status_surfaces(
 fn stdio_runtime_truth_status(
     plugin_runtime: &serde_json::Value,
     sidecar_setup: &serde_json::Value,
-    readiness_lanes: &serde_json::Value,
-    local: &ReadinessVerdictDto,
-    local_refresh: &serde_json::Value,
-    readiness_broker: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime_source": plugin_runtime
@@ -3704,123 +3724,15 @@ fn stdio_runtime_truth_status(
             .get("state")
             .cloned()
             .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "sidecar_status": {
-            "profile": readiness_lanes
-                .pointer("/agent_packet_search/profile")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "run_id": readiness_lanes
-                .pointer("/agent_packet_search/run_id")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "mode": readiness_lanes
-                .pointer("/agent_packet_search/sidecar_mode")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "degraded_reason": readiness_lanes
-                .pointer("/agent_packet_search/degraded_reason")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "namespace": readiness_lanes
-                .pointer("/agent_packet_search/namespace")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "phase": readiness_lanes
-                .pointer("/agent_packet_search/phase")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
+        "sidecar_status_ref": "readiness_lanes.agent_packet_search",
+        "readiness_refs": {
+            "local_graph": "readiness[goal=local_navigation]",
+            "local_refresh": "local_refresh",
+            "local_default": "readiness_lanes.local_default",
+            "agent_packet_search": "readiness_lanes.agent_packet_search",
         },
-        "readiness_lanes": {
-            "local_graph": {
-                "status": local.status,
-                "refresh_state": local_refresh
-                    .get("state")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!("unavailable")),
-                "blocks_local_surfaces": local_refresh
-                    .get("blocks_local_surfaces")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            },
-            "local_default": readiness_lanes
-                .pointer("/local_default")
-                .map(stdio_runtime_truth_sidecar_lane)
-                .unwrap_or(serde_json::Value::Null),
-            "agent_packet_search": readiness_lanes
-                .pointer("/agent_packet_search")
-                .map(stdio_runtime_truth_sidecar_lane)
-                .unwrap_or(serde_json::Value::Null),
-        },
-        "readiness_broker": {
-            "project_id": readiness_broker
-                .get("project_id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "persistence_status": readiness_broker
-                .get("persistence_status")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "reconciliation": readiness_broker
-                .get("reconciliation")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "gpu_proof": readiness_broker
-                .get("gpu_proof")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "resources": readiness_broker
-                .get("resources")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-        }
+        "readiness_broker_ref": "readiness_broker",
     })
-}
-
-fn stdio_runtime_truth_sidecar_lane(lane: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "status": lane
-            .get("status")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "profile": lane
-            .get("profile")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "run_id": lane.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
-        "namespace": lane.get("namespace").cloned().unwrap_or(serde_json::Value::Null),
-        "compose_project": lane
-            .get("compose_project")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "phase": lane.get("phase").cloned().unwrap_or(serde_json::Value::Null),
-        "repair_updated_at_epoch_ms": lane
-            .get("repair_updated_at_epoch_ms")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "sidecar_mode": lane
-            .get("sidecar_mode")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "degraded_reason": lane.get("degraded_reason").cloned().unwrap_or(serde_json::Value::Null),
-    })
-}
-
-fn stdio_setup_repair_input(
-    server_executable: Option<&str>,
-) -> Option<crate::readiness::ReadinessSetupInput> {
-    let latest = stdio_latest_release_version()?;
-    let active = env!("CARGO_PKG_VERSION");
-    if compare_semver(active, &latest).is_some_and(|ordering| ordering.is_lt()) {
-        let newer = stdio_newer_installed_cli(active, &latest, server_executable);
-        return Some(crate::readiness::ReadinessSetupInput {
-            active_path: server_executable.unwrap_or("<unknown>").to_string(),
-            active_version: active.to_string(),
-            latest_version: latest,
-            newer_installed_path: newer.as_ref().map(|cli| cli.path.clone()),
-            newer_installed_version: newer.map(|cli| cli.version),
-        });
-    }
-    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3829,114 +3741,353 @@ struct InstalledCliCandidate {
     version: String,
 }
 
-fn stdio_newer_installed_cli(
+#[derive(Debug, Clone)]
+struct InstalledCliManifestCandidate {
+    manifest_path: PathBuf,
+    executable: String,
+    expected_sha256: String,
+    version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StdioReleaseMetadataCache {
+    schema_version: u32,
+    latest_version: Option<String>,
+    checked_at_epoch_ms: i64,
+    refresh_failed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StdioLatestReleaseMetadata {
+    latest_version: Option<String>,
+    source: &'static str,
+    checked_at_epoch_ms: Option<i64>,
+    stale: bool,
+    refresh_scheduled: bool,
+}
+
+fn stdio_runtime_update_advisory(server_executable: Option<&str>) -> serde_json::Value {
+    let active_version = env!("CARGO_PKG_VERSION");
+    let metadata = stdio_latest_release_metadata();
+    let newer_installed = (env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE").as_deref()
+        == Some("managed"))
+    .then(|| stdio_newer_installed_cli(active_version, server_executable))
+    .flatten();
+    stdio_runtime_update_advisory_from(
+        server_executable.unwrap_or("<unknown>"),
+        active_version,
+        metadata,
+        newer_installed,
+    )
+}
+
+fn stdio_runtime_update_advisory_from(
+    active_path: &str,
     active_version: &str,
-    latest_version: &str,
-    server_executable: Option<&str>,
-) -> Option<InstalledCliCandidate> {
-    if std::env::var("CODESTORY_DISABLE_INSTALLED_CLI_PROBE").is_ok() {
+    metadata: StdioLatestReleaseMetadata,
+    newer_installed: Option<InstalledCliCandidate>,
+) -> serde_json::Value {
+    let release_ordering = metadata
+        .latest_version
+        .as_deref()
+        .and_then(|latest| compare_semver(active_version, latest));
+    let release_available = release_ordering.is_some_and(|ordering| ordering.is_lt());
+    let state = if release_available || newer_installed.is_some() {
+        "available"
+    } else {
+        match release_ordering {
+            Some(std::cmp::Ordering::Equal) => "current",
+            Some(std::cmp::Ordering::Greater) => "ahead",
+            Some(std::cmp::Ordering::Less) => unreachable!("release availability handled above"),
+            None => "unknown",
+        }
+    };
+    let restart_recommended = newer_installed.is_some();
+    let recommended_action = if restart_recommended {
+        "restart_host"
+    } else if release_available {
+        "install_latest"
+    } else {
+        "none"
+    };
+    let message = match (state, restart_recommended) {
+        ("available", true) => {
+            "A newer checksum-valid managed runtime is installed. Restart/reload is recommended; current CodeStory surfaces remain governed by readiness."
+        }
+        ("available", false) => {
+            "A newer release is available. Updating is recommended but does not block compatible CodeStory surfaces."
+        }
+        ("current", _) => "The active runtime matches the latest cached release metadata.",
+        ("ahead", _) => "The active runtime is newer than the latest cached release metadata.",
+        _ => "Release metadata is unavailable. This does not affect CodeStory surface readiness.",
+    };
+    serde_json::json!({
+        "state": state,
+        "blocking": false,
+        "readiness_impact": "none",
+        "active_path": active_path,
+        "active_version": active_version,
+        "latest_version": metadata.latest_version,
+        "newer_installed_path": newer_installed.as_ref().map(|candidate| candidate.path.as_str()),
+        "newer_installed_version": newer_installed.as_ref().map(|candidate| candidate.version.as_str()),
+        "restart_recommended": restart_recommended,
+        "recommended_action": recommended_action,
+        "metadata_source": metadata.source,
+        "metadata_checked_at_epoch_ms": metadata.checked_at_epoch_ms,
+        "metadata_stale": metadata.stale,
+        "metadata_refresh_scheduled": metadata.refresh_scheduled,
+        "message": message,
+    })
+}
+
+fn stdio_latest_release_metadata() -> StdioLatestReleaseMetadata {
+    if let Ok(version) = std::env::var("CODESTORY_LATEST_RELEASE_VERSION")
+        && let Some(version) = normalize_release_version(&version)
+    {
+        return StdioLatestReleaseMetadata {
+            latest_version: Some(version),
+            source: "environment_override",
+            checked_at_epoch_ms: None,
+            stale: false,
+            refresh_scheduled: false,
+        };
+    }
+    let release_probe_disabled = std::env::var_os("CODESTORY_DISABLE_RELEASE_PROBE").is_some();
+    let path = stdio_release_metadata_cache_path();
+    let cache = stdio_read_release_metadata_cache(&path);
+    let now = crate::ready_repair_status::now_epoch_ms();
+    let due = cache
+        .as_ref()
+        .is_none_or(|cache| stdio_release_metadata_cache_due(cache, now));
+    let refresh_scheduled =
+        due && !release_probe_disabled && stdio_schedule_release_metadata_refresh(path);
+    let stale = cache
+        .as_ref()
+        .is_some_and(|cache| cache.refresh_failed || due);
+    let source = match cache.as_ref() {
+        Some(cache) if cache.refresh_failed || due => "stale_cache",
+        Some(_) => "github_cache",
+        None if release_probe_disabled => "disabled",
+        None => "unavailable",
+    };
+    StdioLatestReleaseMetadata {
+        latest_version: cache
+            .as_ref()
+            .and_then(|cache| cache.latest_version.clone()),
+        source,
+        checked_at_epoch_ms: cache.as_ref().map(|cache| cache.checked_at_epoch_ms),
+        stale,
+        refresh_scheduled,
+    }
+}
+
+fn stdio_release_metadata_cache_path() -> PathBuf {
+    env_nonempty("CODESTORY_PLUGIN_DATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            codestory_retrieval::SidecarRuntimeConfig::local()
+                .layout
+                .state_file
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir)
+        })
+        .join("release-metadata.json")
+}
+
+fn stdio_read_release_metadata_cache(path: &Path) -> Option<StdioReleaseMetadataCache> {
+    let cache: StdioReleaseMetadataCache = crate::file_state::read_json(path)?;
+    if cache.schema_version != STDIO_RELEASE_METADATA_SCHEMA_VERSION
+        || cache.checked_at_epoch_ms <= 0
+        || cache
+            .latest_version
+            .as_deref()
+            .is_some_and(|version| normalize_release_version(version).as_deref() != Some(version))
+    {
         return None;
     }
-    stdio_installed_cli_candidates(latest_version)
+    Some(cache)
+}
+
+fn stdio_release_metadata_cache_due(cache: &StdioReleaseMetadataCache, now_epoch_ms: i64) -> bool {
+    if cache.checked_at_epoch_ms > now_epoch_ms.saturating_add(5 * 60 * 1000) {
+        return true;
+    }
+    let ttl = if cache.refresh_failed {
+        STDIO_RELEASE_METADATA_FAILURE_TTL
+    } else {
+        STDIO_RELEASE_METADATA_TTL
+    };
+    now_epoch_ms.saturating_sub(cache.checked_at_epoch_ms) as u128 >= ttl.as_millis()
+}
+
+fn stdio_schedule_release_metadata_refresh(path: PathBuf) -> bool {
+    let refreshes = STDIO_RELEASE_METADATA_REFRESHES
+        .get_or_init(|| Mutex::new(StdioReleaseMetadataRefreshes::default()));
+    {
+        let mut refreshes = refreshes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refreshes.in_flight.contains(&path)
+            || refreshes
+                .last_started
+                .get(&path)
+                .is_some_and(|started| started.elapsed() < STDIO_RELEASE_METADATA_FAILURE_TTL)
+        {
+            return false;
+        }
+        refreshes.in_flight.insert(path.clone());
+        refreshes.last_started.insert(path.clone(), Instant::now());
+    }
+    thread::spawn(move || {
+        stdio_refresh_release_metadata_cache(&path);
+        STDIO_RELEASE_METADATA_REFRESHES
+            .get_or_init(|| Mutex::new(StdioReleaseMetadataRefreshes::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .in_flight
+            .remove(&path);
+    });
+    true
+}
+
+fn stdio_refresh_release_metadata_cache(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let lock_path = path.with_file_name("release-metadata.lock");
+    let Ok(lock) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+    else {
+        return;
+    };
+    if !FileExt::try_lock_exclusive(&lock).unwrap_or(false) {
+        return;
+    }
+    let now = crate::ready_repair_status::now_epoch_ms();
+    let existing = stdio_read_release_metadata_cache(path);
+    if existing
+        .as_ref()
+        .is_some_and(|cache| !stdio_release_metadata_cache_due(cache, now))
+    {
+        return;
+    }
+    let latest = stdio_fetch_latest_release_version();
+    let cache = StdioReleaseMetadataCache {
+        schema_version: STDIO_RELEASE_METADATA_SCHEMA_VERSION,
+        latest_version: latest.clone().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|cache| cache.latest_version.clone())
+        }),
+        checked_at_epoch_ms: now,
+        refresh_failed: latest.is_none(),
+    };
+    let _ = crate::file_state::write_json_atomic(path, "release-metadata", &cache);
+}
+
+fn stdio_fetch_latest_release_version() -> Option<String> {
+    let response = codestory_retrieval::outbound_http::read_text(
+        ureq::get("https://api.github.com/repos/TheGreenCedar/CodeStory/releases/latest")
+            .timeout(StdDuration::from_secs(2))
+            .call(),
+    )
+    .ok()?;
+    let body: serde_json::Value = serde_json::from_str(&response.body).ok()?;
+    body.get("tag_name")
+        .and_then(|value| value.as_str())
+        .and_then(normalize_release_version)
+}
+
+fn stdio_newer_installed_cli(
+    active_version: &str,
+    server_executable: Option<&str>,
+) -> Option<InstalledCliCandidate> {
+    if std::env::var_os("CODESTORY_DISABLE_INSTALLED_CLI_PROBE").is_some() {
+        return None;
+    }
+    let plugin_data = env_nonempty("CODESTORY_PLUGIN_DATA").map(PathBuf::from)?;
+    let managed_root = plugin_data.join("codestory-cli");
+    let mut manifests = vec![managed_root.join("manifest.json")];
+    if let Ok(entries) = fs::read_dir(&managed_root) {
+        manifests.extend(
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path().join("manifest.json")),
+        );
+    }
+    let mut candidates = manifests
         .into_iter()
-        .filter(|candidate| {
-            server_executable.is_none_or(|active| !same_path_text(candidate, active))
-        })
-        .filter_map(|candidate| stdio_cli_version(&candidate).map(|version| (candidate, version)))
-        .filter(|(_, version)| {
-            compare_semver(version, active_version).is_some_and(|ordering| ordering.is_gt())
-        })
-        .max_by(|left, right| {
-            semver_triplet(&left.1)
-                .unwrap_or_default()
-                .cmp(&semver_triplet(&right.1).unwrap_or_default())
-        })
-        .map(|(path, version)| InstalledCliCandidate { path, version })
+        .filter_map(|manifest| stdio_managed_cli_manifest_candidate(&manifest, active_version))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(semver_triplet(&candidate.version)));
+    candidates
+        .into_iter()
+        .find_map(|candidate| stdio_validate_managed_cli_candidate(candidate, server_executable))
 }
 
-fn stdio_installed_cli_candidates(latest_version: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(cli) = std::env::var("CODESTORY_CLI")
-        && !cli.trim().is_empty()
+fn stdio_managed_cli_manifest_candidate(
+    manifest_path: &Path,
+    active_version: &str,
+) -> Option<InstalledCliManifestCandidate> {
+    let manifest: serde_json::Value = crate::file_state::read_json(manifest_path)?;
+    let version = manifest
+        .get("version")
+        .or_else(|| manifest.get("cli_version"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_release_version)?;
+    if !compare_semver(&version, active_version).is_some_and(|ordering| ordering.is_gt()) {
+        return None;
+    }
+    let executable = manifest
+        .get("path")
+        .or_else(|| manifest.get("executable_path"))
+        .or_else(|| manifest.get("executablePath"))
+        .and_then(serde_json::Value::as_str)?;
+    let expected_sha256 = manifest
+        .get("sha256")
+        .or_else(|| manifest.get("executable_sha256"))
+        .or_else(|| manifest.get("executableSha256"))
+        .and_then(serde_json::Value::as_str)?;
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        candidates.push(cli);
+        return None;
     }
-    for home in stdio_codestory_home_candidates() {
-        let bin = home.join("bin");
-        push_cli_candidate_paths(&mut candidates, &bin);
-        push_cli_candidate_paths(&mut candidates, &bin.join("releases").join(latest_version));
-    }
-    dedupe_path_text(candidates)
+    Some(InstalledCliManifestCandidate {
+        manifest_path: manifest_path.to_path_buf(),
+        executable: executable.to_string(),
+        expected_sha256: expected_sha256.to_string(),
+        version,
+    })
 }
 
-fn stdio_codestory_home_candidates() -> Vec<PathBuf> {
-    let mut homes = Vec::new();
-    if let Ok(home) = std::env::var("CODESTORY_HOME")
-        && !home.trim().is_empty()
+fn stdio_validate_managed_cli_candidate(
+    candidate: InstalledCliManifestCandidate,
+    server_executable: Option<&str>,
+) -> Option<InstalledCliCandidate> {
+    let manifest_dir = fs::canonicalize(candidate.manifest_path.parent()?).ok()?;
+    let executable = fs::canonicalize(manifest_dir.join(candidate.executable)).ok()?;
+    if !executable.starts_with(&manifest_dir)
+        || server_executable
+            .is_some_and(|active| stdio_same_path_text(&executable, Path::new(active)))
+        || !candidate
+            .expected_sha256
+            .eq_ignore_ascii_case(&sha256_file(&executable).ok()?)
     {
-        homes.push(PathBuf::from(home));
+        return None;
     }
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA")
-        && !local_app_data.trim().is_empty()
-    {
-        homes.push(PathBuf::from(local_app_data).join("CodeStory"));
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        homes.push(PathBuf::from(home).join(".codestory"));
-    }
-    dedupe_pathbufs(homes)
-}
-
-fn push_cli_candidate_paths(candidates: &mut Vec<String>, directory: &Path) {
-    candidates.push(
-        directory
-            .join(if cfg!(windows) {
-                "codestory-cli.exe"
-            } else {
-                "codestory-cli"
-            })
-            .to_string_lossy()
-            .to_string(),
-    );
-    candidates.push(
-        directory
-            .join("codestory-cli")
-            .to_string_lossy()
-            .to_string(),
-    );
-}
-
-fn stdio_cli_version(candidate: &str) -> Option<String> {
-    stdio_cli_version_with_timeout(candidate, STDIO_CLI_VERSION_TIMEOUT)
-}
-
-fn stdio_cli_version_with_timeout(candidate: &str, timeout: Duration) -> Option<String> {
-    let started_at = Instant::now();
-    let mut child = Command::new(candidate)
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    loop {
-        if let Some(status) = child.try_wait().ok()? {
-            let output = child.wait_with_output().ok()?;
-            if !status.success() {
-                return None;
-            }
-            let text = String::from_utf8_lossy(&output.stdout);
-            return text.split_whitespace().find_map(normalize_release_version);
-        }
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        let remaining = timeout.saturating_sub(started_at.elapsed());
-        std::thread::sleep(STDIO_CLI_VERSION_POLL_INTERVAL.min(remaining));
-    }
+    Some(InstalledCliCandidate {
+        path: crate::display::clean_path_string(&executable.to_string_lossy()),
+        version: candidate.version,
+    })
 }
 
 fn stdio_source_checkout_version(project_root: &Path) -> Option<String> {
@@ -3971,54 +4122,6 @@ fn cargo_package_version(manifest: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn same_path_text(left: &str, right: &str) -> bool {
-    left.trim_end_matches(['\\', '/'])
-        .eq_ignore_ascii_case(right.trim_end_matches(['\\', '/']))
-}
-
-fn dedupe_path_text(paths: Vec<String>) -> Vec<String> {
-    let mut deduped: Vec<String> = Vec::new();
-    for path in paths {
-        if path.trim().is_empty() || deduped.iter().any(|seen| same_path_text(seen, &path)) {
-            continue;
-        }
-        deduped.push(path);
-    }
-    deduped
-}
-
-fn dedupe_pathbufs(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut deduped: Vec<PathBuf> = Vec::new();
-    for path in paths {
-        if deduped
-            .iter()
-            .any(|seen| same_path_text(&seen.to_string_lossy(), &path.to_string_lossy()))
-        {
-            continue;
-        }
-        deduped.push(path);
-    }
-    deduped
-}
-
-fn stdio_latest_release_version() -> Option<String> {
-    if let Ok(version) = std::env::var("CODESTORY_LATEST_RELEASE_VERSION")
-        && let Some(version) = normalize_release_version(&version)
-    {
-        return Some(version);
-    }
-    let response = codestory_retrieval::outbound_http::read_text(
-        ureq::get("https://api.github.com/repos/TheGreenCedar/CodeStory/releases/latest")
-            .timeout(StdDuration::from_secs(2))
-            .call(),
-    )
-    .ok()?;
-    let body: serde_json::Value = serde_json::from_str(&response.body).ok()?;
-    body.get("tag_name")
-        .and_then(|value| value.as_str())
-        .and_then(normalize_release_version)
 }
 
 fn normalize_release_version(version: &str) -> Option<String> {
@@ -4329,6 +4432,9 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let managed_cli_retention = env_nonempty("CODESTORY_PLUGIN_CLI_RETENTION")
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+        .filter(|value| !value.is_null());
     serde_json::json!({
         "plugin_version": env_nonempty("CODESTORY_PLUGIN_VERSION"),
         "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
@@ -4346,6 +4452,7 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
         "managed_binary_path": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_PATH") } else { None },
         "managed_binary_sha256": if cli_source == "managed" { env_nonempty("CODESTORY_PLUGIN_CLI_SHA256") } else { None },
         "managed_manifest_path": env_nonempty("CODESTORY_PLUGIN_CLI_MANIFEST_PATH"),
+        "managed_cli_retention": managed_cli_retention,
         "warnings": warnings
     })
 }
@@ -4407,6 +4514,8 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
         .is_none()
         .then(|| crate::ready_repair_status::abandoned_ready_repair_status(project_root, None))
         .flatten();
+    let last_worker_result =
+        crate::ready_repair_status::read_ready_repair_worker_result(project_root, None);
     let last_repair_command = env_nonempty("CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND");
     let active_cli_version = env_nonempty("CODESTORY_PLUGIN_CLI_VERSION")
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
@@ -4447,9 +4556,11 @@ pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Val
             "namespace": &status.namespace,
             "phase": &status.phase,
             "pid": status.pid,
+            "attempt_id": &status.attempt_id,
             "updated_at_epoch_ms": status.updated_at_epoch_ms
         })),
-        "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned"))
+        "abandoned_repair": abandoned_repair.as_ref().map(|status| stdio_ready_repair_status_json(project_root, status, "abandoned")),
+        "last_worker_result": last_worker_result
     })
 }
 
@@ -4502,6 +4613,7 @@ fn stdio_ready_repair_status_json(
         "namespace": &status.namespace,
         "phase": &status.phase,
         "pid": status.pid,
+        "attempt_id": &status.attempt_id,
         "updated_at_epoch_ms": status.updated_at_epoch_ms,
         "age_ms": crate::ready_repair_status::now_epoch_ms().saturating_sub(status.updated_at_epoch_ms),
         "inspect_command": stdio_agent_retrieval_status_command(project_root, run_id),
@@ -4620,94 +4732,6 @@ fn stdio_write_sidecar_policy(action: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StdioReadyRepairEnqueueLockFile {
-    schema_version: u32,
-    pid: u32,
-    started_at_epoch_ms: i64,
-    token: String,
-}
-
-#[derive(Debug)]
-struct StdioReadyRepairEnqueueLock {
-    path: PathBuf,
-    token: String,
-}
-
-impl Drop for StdioReadyRepairEnqueueLock {
-    fn drop(&mut self) {
-        let Some(lock) = read_stdio_ready_repair_enqueue_lock(&self.path) else {
-            return;
-        };
-        if lock.token == self.token {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn try_acquire_stdio_ready_repair_enqueue_lock(
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> std::io::Result<Option<StdioReadyRepairEnqueueLock>> {
-    let path = sidecar
-        .layout
-        .state_file
-        .with_file_name(STDIO_READY_REPAIR_ENQUEUE_LOCK_FILE);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
-    let pid = std::process::id();
-    let token = format!("{pid}:{started_at_epoch_ms}");
-    let lock = StdioReadyRepairEnqueueLockFile {
-        schema_version: 1,
-        pid,
-        started_at_epoch_ms,
-        token: token.clone(),
-    };
-    let content = serde_json::to_vec_pretty(&lock)?;
-    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
-        Ok(()) => {
-            return Ok(Some(StdioReadyRepairEnqueueLock { path, token }));
-        }
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    if !stdio_ready_repair_enqueue_lock_is_stale(&path) {
-        return Ok(None);
-    }
-    let _ = fs::remove_file(&path);
-    match create_stdio_ready_repair_enqueue_lock(&path, &content) {
-        Ok(()) => Ok(Some(StdioReadyRepairEnqueueLock { path, token })),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn create_stdio_ready_repair_enqueue_lock(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn stdio_ready_repair_enqueue_lock_is_stale(path: &Path) -> bool {
-    let Some(lock) = read_stdio_ready_repair_enqueue_lock(path) else {
-        return true;
-    };
-    if !crate::ready_repair_status::process_is_running(lock.pid) {
-        return true;
-    }
-    let now = crate::ready_repair_status::now_epoch_ms();
-    now.saturating_sub(lock.started_at_epoch_ms)
-        > STDIO_READY_REPAIR_ENQUEUE_LOCK_TTL.as_millis() as i64
-}
-
-fn read_stdio_ready_repair_enqueue_lock(path: &Path) -> Option<StdioReadyRepairEnqueueLockFile> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-}
-
 fn handle_stdio_sidecar_repair(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
@@ -4778,8 +4802,11 @@ fn handle_stdio_sidecar_repair(
     ) {
         return stdio_sidecar_repair_machine_busy_result(busy, &sidecar_setup);
     }
-    let _enqueue_lock = match try_acquire_stdio_ready_repair_enqueue_lock(&repair_sidecar) {
-        Ok(Some(lock)) => lock,
+    let mut reservation = match crate::ready_repair_status::try_reserve_ready_repair(
+        &repair_sidecar,
+        &runtime.project_root,
+    ) {
+        Ok(Some(reservation)) => reservation,
         Ok(None) => {
             return stdio_sidecar_repair_already_starting_result(
                 &runtime.project_root,
@@ -4817,6 +4844,8 @@ fn handle_stdio_sidecar_repair(
     };
 
     let mut command = Command::new(&exe);
+    let attempt_id = reservation.attempt_id().to_string();
+    let repair_started_at_epoch_ms = reservation.started_at_epoch_ms();
     command
         .arg("ready")
         .arg("--goal")
@@ -4824,32 +4853,34 @@ fn handle_stdio_sidecar_repair(
         .arg("--repair")
         .arg("--project")
         .arg(&runtime.project_root)
+        .arg("--cache-dir")
+        .arg(&runtime.cache_root)
         .arg("--format")
         .arg("json")
         .arg("--run-id")
         .arg(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
         .env("CODESTORY_PLUGIN_SIDECAR_REPAIR", "1")
+        .env(
+            crate::ready_repair_status::READY_REPAIR_ATTEMPT_ENV,
+            &attempt_id,
+        )
         .stdin(Stdio::null());
 
-    match command.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-        Ok(mut child) => {
+    match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => {
             let child_pid = child.id();
-            let repair_started_at_epoch_ms = crate::ready_repair_status::now_epoch_ms();
-            if let Err(error) = crate::ready_repair_status::write_ready_repair_status(
-                &repair_sidecar,
-                &runtime.project_root,
-                "starting",
+            reservation.disarm();
+            monitor_stdio_ready_repair_worker(
+                child,
+                repair_sidecar.clone(),
+                runtime.project_root.clone(),
+                attempt_id.clone(),
                 repair_started_at_epoch_ms,
-                child_pid,
-            ) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return serde_json::json!({
-                    "error": format!(
-                        "repair process was stopped because its durable status could not be published: {error}"
-                    )
-                });
-            }
+            );
             let broker_snapshot = crate::readiness_broker::refresh_broker_snapshot(
                 crate::readiness_broker::BrokerSnapshotInput {
                     project_root: runtime.project_root.clone(),
@@ -4866,6 +4897,7 @@ fn handle_stdio_sidecar_repair(
                 namespace: repair_sidecar.namespace.clone(),
                 compose_project: repair_sidecar.compose_project.clone(),
                 pid: child_pid,
+                attempt_id: attempt_id.clone(),
                 started_at_epoch_ms: repair_started_at_epoch_ms,
                 observed_at: Instant::now(),
             });
@@ -4874,7 +4906,8 @@ fn handle_stdio_sidecar_repair(
                     "status": "started",
                     "mode": "background",
                     "pid": child_pid,
-                    "status_published": true,
+                    "attempt_id": attempt_id,
+                    "reservation_published": true,
                     "broker_snapshot": broker_snapshot,
                     "previous_abandoned_repair": previous_abandoned_repair,
                     "broker_reconciliation": broker_reconciliation_json,
@@ -4898,6 +4931,166 @@ fn handle_stdio_sidecar_repair(
             })
         }
         Err(error) => serde_json::json!({"error": error.to_string()}),
+    }
+}
+
+fn monitor_stdio_ready_repair_worker(
+    mut child: std::process::Child,
+    sidecar: codestory_retrieval::SidecarRuntimeConfig,
+    project_root: PathBuf,
+    attempt_id: String,
+    started_at_epoch_ms: i64,
+) {
+    thread::spawn(move || {
+        let pid = child.id();
+        let stdout = child
+            .stdout
+            .take()
+            .map(|stdout| thread::spawn(move || read_stdio_ready_repair_tail(stdout)));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || read_stdio_ready_repair_tail(stderr)));
+        let mut last_heartbeat = Instant::now();
+        let wait = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+            if last_heartbeat.elapsed() >= STDIO_READY_REPAIR_RESERVATION_HEARTBEAT {
+                let _ = crate::ready_repair_status::heartbeat_ready_repair_reservation(
+                    &sidecar,
+                    &attempt_id,
+                );
+                last_heartbeat = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        let (stdout_tail, stdout_truncated) = join_stdio_ready_repair_tail(stdout, "stdout");
+        let (stderr_tail, stderr_truncated) = join_stdio_ready_repair_tail(stderr, "stderr");
+        let (outcome, exit_code, wait_error) = match wait {
+            Ok(status) if status.success() => ("succeeded", status.code(), None),
+            Ok(status) => ("failed", status.code(), None),
+            Err(error) => ("failed", None, Some(error.to_string())),
+        };
+        let terminal_envelope = stdio_ready_repair_terminal_envelope(
+            outcome,
+            wait_error.as_deref(),
+            &stdout_tail,
+            &stderr_tail,
+        );
+        let result = crate::ready_repair_status::ReadyRepairWorkerResult {
+            schema_version: crate::ready_repair_status::READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: attempt_id.clone(),
+            project_root: crate::display::clean_path_string(&project_root.to_string_lossy()),
+            profile: sidecar.profile.as_str().to_string(),
+            run_id: sidecar.run_id.clone(),
+            namespace: sidecar.namespace.clone(),
+            pid,
+            started_at_epoch_ms,
+            finished_at_epoch_ms: crate::ready_repair_status::now_epoch_ms(),
+            outcome: outcome.to_string(),
+            exit_code,
+            wait_error,
+            terminal_envelope,
+            stdout_tail,
+            stderr_tail,
+            stdout_truncated,
+            stderr_truncated,
+        };
+        if let Err(error) =
+            crate::ready_repair_status::write_ready_repair_worker_result(&sidecar, &result)
+        {
+            eprintln!(
+                "[ready-repair] attempt_id={} pid={} status=result_write_failed error={error:#}",
+                attempt_id, pid
+            );
+            return;
+        }
+        crate::ready_repair_status::clear_ready_repair_status_by_attempt(&sidecar, &attempt_id);
+        crate::ready_repair_status::remove_ready_repair_reservation_if_attempt(
+            &sidecar,
+            &attempt_id,
+        );
+    });
+}
+
+fn stdio_ready_repair_terminal_envelope(
+    outcome: &str,
+    wait_error: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+) -> Option<codestory_contracts::api::CommandFailureEnvelope> {
+    if outcome == "succeeded" {
+        return None;
+    }
+    if let Some(value) = stdio_parse_trailing_json_object(stdout)
+        && let Ok(envelope) = serde_json::from_value(value)
+    {
+        return Some(envelope);
+    }
+    let message = wait_error
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or("background repair worker failed without a structured error");
+    Some(codestory_contracts::api::CommandFailureEnvelope::new(
+        codestory_contracts::api::ApiError::with_details(
+            "background_repair_failed",
+            message,
+            codestory_contracts::api::ApiErrorDetails {
+                failed_layer: Some("background_repair".to_string()),
+                project: None,
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+            },
+        ),
+    ))
+}
+
+fn read_stdio_ready_repair_tail(mut reader: impl Read) -> (String, bool) {
+    let mut tail = VecDeque::with_capacity(STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES);
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                let marker = format!("\n[output read failed: {error}]\n");
+                for byte in marker.bytes() {
+                    if tail.len() == STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES {
+                        tail.pop_front();
+                        truncated = true;
+                    }
+                    tail.push_back(byte);
+                }
+                break;
+            }
+        };
+        for byte in &buffer[..read] {
+            if tail.len() == STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES {
+                tail.pop_front();
+                truncated = true;
+            }
+            tail.push_back(*byte);
+        }
+    }
+    let bytes: Vec<u8> = tail.into_iter().collect();
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
+}
+
+fn join_stdio_ready_repair_tail(
+    reader: Option<thread::JoinHandle<(String, bool)>>,
+    stream: &str,
+) -> (String, bool) {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .unwrap_or_else(|_| (format!("[{stream} reader thread panicked]"), false)),
+        None => (String::new(), false),
     }
 }
 
@@ -5096,7 +5289,6 @@ fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_js
     }
 }
 
-#[cfg(test)]
 fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -5302,25 +5494,15 @@ fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::V
             serde_json::json!({
                 "allowed": allowed,
                 "readiness_goal": crate::readiness::goal_label(verdict.goal),
-                "status": crate::readiness::status_label(verdict.status),
                 "failed_layer": crate::readiness::failed_layer(verdict),
-                "summary": verdict.summary,
                 "repair_reason": stdio_repair_reason(verdict),
-                "blocked_reason": if allowed { None } else { Some(verdict.summary.as_str()) },
-                "minimum_next": verdict.minimum_next,
-                "full_repair": verdict.full_repair,
             })
         }
         None => serde_json::json!({
             "allowed": false,
             "readiness_goal": null,
-            "status": "unknown",
             "failed_layer": null,
-            "summary": "Readiness verdict was not available for this surface.",
             "repair_reason": null,
-            "blocked_reason": "Readiness verdict was not available for this surface.",
-            "minimum_next": [],
-            "full_repair": [],
         }),
     }
 }
@@ -5710,18 +5892,18 @@ mod tests {
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
         );
 
-        let first = try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+        let first = crate::ready_repair_status::try_reserve_ready_repair(&sidecar, project.path())
             .expect("first enqueue lock")
             .expect("first enqueue lock acquired");
         assert!(
-            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+            crate::ready_repair_status::try_reserve_ready_repair(&sidecar, project.path())
                 .expect("second enqueue lock")
                 .is_none(),
             "concurrent stdio repair enqueue should be blocked"
         );
         drop(first);
         assert!(
-            try_acquire_stdio_ready_repair_enqueue_lock(&sidecar)
+            crate::ready_repair_status::try_reserve_ready_repair(&sidecar, project.path())
                 .expect("third enqueue lock")
                 .is_some(),
             "enqueue lock should be reusable after drop"
@@ -5869,6 +6051,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -5920,6 +6103,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: live_pid,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -5946,6 +6130,18 @@ mod tests {
             updated["readiness_broker"]["operations"][0]["pid"],
             json!(live_pid)
         );
+    }
+
+    #[test]
+    fn ready_repair_output_capture_keeps_only_the_bounded_tail() {
+        let mut bytes = vec![b'a'; STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES + 17];
+        bytes.extend_from_slice(b"terminal-marker");
+
+        let (tail, truncated) = read_stdio_ready_repair_tail(std::io::Cursor::new(bytes));
+
+        assert!(truncated);
+        assert_eq!(tail.len(), STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES);
+        assert!(tail.ends_with("terminal-marker"));
     }
 
     fn empty_recent_repair_status() -> serde_json::Value {
@@ -6001,6 +6197,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6030,6 +6227,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6068,6 +6266,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now()
                 .checked_sub(STDIO_RECENT_REPAIR_TTL + Duration::from_secs(1))
@@ -6098,6 +6297,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6124,6 +6324,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6140,6 +6341,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now()
                 .checked_sub(STDIO_RECENT_REPAIR_TTL + Duration::from_secs(1))
@@ -6158,6 +6360,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6178,6 +6381,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6198,6 +6402,7 @@ mod tests {
             namespace: "codestory-test".to_string(),
             compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
+            attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
             observed_at: Instant::now(),
         });
@@ -6482,47 +6687,152 @@ version = "0.11.20"
     }
 
     #[test]
-    fn stdio_cli_version_returns_none_when_probe_times_out() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "codestory-stdio-cli-timeout-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        let candidate = temp_dir.join(if cfg!(windows) {
-            "codestory-cli.cmd"
+    fn runtime_update_version_matrix_is_advisory() {
+        let cases = [
+            ("1.2.3", Some("1.2.4"), "available", "install_latest"),
+            ("1.2.3", Some("1.2.3"), "current", "none"),
+            ("1.2.4", Some("1.2.3"), "ahead", "none"),
+            ("1.2.3", None, "unknown", "none"),
+        ];
+        for (active, latest, expected_state, expected_action) in cases {
+            let advisory = stdio_runtime_update_advisory_from(
+                "C:/managed/codestory-cli.exe",
+                active,
+                StdioLatestReleaseMetadata {
+                    latest_version: latest.map(ToOwned::to_owned),
+                    source: "test",
+                    checked_at_epoch_ms: Some(1),
+                    stale: false,
+                    refresh_scheduled: false,
+                },
+                None,
+            );
+            assert_eq!(advisory["state"], json!(expected_state));
+            assert_eq!(advisory["recommended_action"], json!(expected_action));
+            assert_eq!(advisory["blocking"], json!(false));
+            assert_eq!(advisory["readiness_impact"], json!("none"));
+        }
+
+        let advisory = stdio_runtime_update_advisory_from(
+            "C:/managed/1.2.3/codestory-cli.exe",
+            "1.2.3",
+            StdioLatestReleaseMetadata {
+                latest_version: Some("1.2.3".to_string()),
+                source: "test",
+                checked_at_epoch_ms: Some(1),
+                stale: false,
+                refresh_scheduled: false,
+            },
+            Some(InstalledCliCandidate {
+                path: "C:/managed/1.2.4/codestory-cli.exe".to_string(),
+                version: "1.2.4".to_string(),
+            }),
+        );
+        assert_eq!(advisory["state"], json!("available"));
+        assert_eq!(advisory["restart_recommended"], json!(true));
+        assert_eq!(advisory["recommended_action"], json!("restart_host"));
+    }
+
+    #[test]
+    fn managed_cli_advisory_requires_a_safe_checksum_valid_manifest() {
+        let plugin_data = tempfile::tempdir().expect("plugin data");
+        let version_dir = plugin_data.path().join("codestory-cli").join("1.2.4");
+        let bin_dir = version_dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("managed bin dir");
+        let executable = bin_dir.join(if cfg!(windows) {
+            "codestory-cli.exe"
         } else {
             "codestory-cli"
         });
+        fs::write(&executable, b"managed-cli-fixture").expect("managed executable");
+        let manifest_path = version_dir.join("manifest.json");
         fs::write(
-            &candidate,
-            if cfg!(windows) {
-                "@echo off\r\nping -n 6 127.0.0.1 > nul\r\necho codestory-cli 9.9.9\r\n"
-            } else {
-                "#!/bin/sh\nsleep 5\necho codestory-cli 9.9.9\n"
-            },
+            &manifest_path,
+            json!({
+                "path": format!("bin/{}", executable.file_name().unwrap().to_string_lossy()),
+                "sha256": sha256_file(&executable).expect("fixture sha256"),
+                "version": "1.2.4"
+            })
+            .to_string(),
         )
-        .expect("write slow cli probe");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&candidate)
-                .expect("candidate metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&candidate, permissions).expect("chmod candidate");
-        }
+        .expect("managed manifest");
 
-        let started_at = Instant::now();
-        let version =
-            stdio_cli_version_with_timeout(&candidate.to_string_lossy(), Duration::from_millis(50));
-
-        assert_eq!(version, None);
+        let candidate = stdio_validate_managed_cli_candidate(
+            stdio_managed_cli_manifest_candidate(&manifest_path, "1.2.3")
+                .expect("valid manifest candidate"),
+            None,
+        )
+        .expect("valid candidate");
+        assert_eq!(candidate.version, "1.2.4");
         assert!(
-            started_at.elapsed() < Duration::from_secs(2),
-            "version probe should return near the configured timeout"
+            candidate
+                .path
+                .ends_with(executable.file_name().unwrap().to_string_lossy().as_ref())
         );
-        let _ = fs::remove_dir_all(&temp_dir);
+
+        fs::write(&executable, b"corrupt").expect("corrupt managed executable");
+        assert_eq!(
+            stdio_validate_managed_cli_candidate(
+                stdio_managed_cli_manifest_candidate(&manifest_path, "1.2.3")
+                    .expect("corrupt binary manifest remains parseable"),
+                None,
+            ),
+            None
+        );
+
+        let outside = plugin_data.path().join("outside-cli");
+        fs::write(&outside, b"outside").expect("outside executable");
+        fs::write(
+            &manifest_path,
+            json!({
+                "path": "../../outside-cli",
+                "sha256": sha256_file(&outside).expect("outside sha256"),
+                "version": "1.2.5"
+            })
+            .to_string(),
+        )
+        .expect("unsafe manifest");
+        assert_eq!(
+            stdio_validate_managed_cli_candidate(
+                stdio_managed_cli_manifest_candidate(&manifest_path, "1.2.3")
+                    .expect("unsafe manifest remains parseable"),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn release_metadata_cache_uses_hour_scale_success_and_failure_ttls() {
+        let now = 10_000_000_000_i64;
+        let mut cache = StdioReleaseMetadataCache {
+            schema_version: STDIO_RELEASE_METADATA_SCHEMA_VERSION,
+            latest_version: Some("1.2.4".to_string()),
+            checked_at_epoch_ms: now,
+            refresh_failed: false,
+        };
+        assert!(!stdio_release_metadata_cache_due(
+            &cache,
+            now + STDIO_RELEASE_METADATA_TTL.as_millis() as i64 - 1
+        ));
+        assert!(stdio_release_metadata_cache_due(
+            &cache,
+            now + STDIO_RELEASE_METADATA_TTL.as_millis() as i64
+        ));
+
+        cache.refresh_failed = true;
+        assert!(!stdio_release_metadata_cache_due(
+            &cache,
+            now + STDIO_RELEASE_METADATA_FAILURE_TTL.as_millis() as i64 - 1
+        ));
+        assert!(stdio_release_metadata_cache_due(
+            &cache,
+            now + STDIO_RELEASE_METADATA_FAILURE_TTL.as_millis() as i64
+        ));
+
+        let corrupt = tempfile::NamedTempFile::new().expect("corrupt cache");
+        fs::write(corrupt.path(), b"not json").expect("write corrupt cache");
+        assert!(stdio_read_release_metadata_cache(corrupt.path()).is_none());
     }
 
     #[test]
@@ -6544,6 +6854,19 @@ starting sidecar setup
 
         assert_eq!(parsed["status"], json!("ready"));
         assert_eq!(parsed["readiness"][0]["goal"], json!("agent_packet_search"));
+    }
+
+    #[test]
+    fn ready_repair_terminal_result_preserves_child_failure_envelope() {
+        let expected = codestory_contracts::api::CommandFailureEnvelope::new(
+            codestory_contracts::api::ApiError::invalid_argument("bad repair argument"),
+        );
+        let stdout = serde_json::to_string(&expected).expect("serialize child envelope");
+
+        let observed = stdio_ready_repair_terminal_envelope("failed", None, &stdout, "")
+            .expect("terminal failure envelope");
+
+        assert_eq!(observed, expected);
     }
 
     #[test]
@@ -6574,12 +6897,19 @@ starting sidecar setup
 
         assert_eq!(packet["allowed"], json!(false));
         assert_eq!(packet["failed_layer"], json!("retrieval_sidecar"));
-        assert_eq!(packet["minimum_next"], json!([repair]));
+        assert_eq!(packet["readiness_goal"], json!("agent_packet_search"));
         assert!(
-            packet["full_repair"]
-                .as_array()
-                .is_some_and(|commands| commands.len() == 3),
-            "full repair should keep proof commands behind the canonical minimum repair: {packet}"
+            packet.get("minimum_next").is_none() && packet.get("full_repair").is_none(),
+            "ordinary surfaces must reference rather than clone repair detail: {packet}"
+        );
+        let verdict = readiness
+            .iter()
+            .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch)
+            .expect("agent readiness verdict");
+        assert_eq!(verdict.minimum_next, vec![repair]);
+        assert!(
+            verdict.full_repair.len() == 3,
+            "full repair should remain on the canonical verdict: {verdict:?}"
         );
     }
 
@@ -6681,7 +7011,6 @@ starting sidecar setup
                 project: "C:/repo/example",
                 stats: &stats,
                 freshness: None,
-                setup: None,
                 sidecar: Some(crate::readiness::ReadinessSidecarInput {
                     profile: Some("local"),
                     run_id: None,
@@ -6712,11 +7041,16 @@ starting sidecar setup
                 "local/default full sidecar must not unlock {surface}: {surfaces}"
             );
             assert_eq!(
-                surfaces[surface]["status"],
-                json!("blocked"),
-                "blocked agent surface should stay on the agent retrieval lane: {surfaces}"
+                surfaces[surface]["readiness_goal"],
+                json!("agent_packet_search")
             );
+            assert!(surfaces[surface].get("status").is_none());
         }
+        let agent = readiness
+            .iter()
+            .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch)
+            .expect("agent readiness verdict");
+        assert_eq!(agent.status, ReadinessStatusDto::Blocked);
     }
 
     #[test]
@@ -7099,5 +7433,33 @@ starting sidecar setup
         std::fs::write(temp.path().join("codestory.db-wal"), b"wal").expect("write wal");
         let with_wal = stdio_storage_fingerprint(&db_path);
         assert_ne!(rewritten, with_wal);
+    }
+
+    #[test]
+    fn stdio_status_cache_key_tracks_wal_changes() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let runtime = crate::runtime::RuntimeContext::new_inspect_only(&crate::args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("inspect runtime");
+        std::fs::create_dir_all(runtime.storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        std::fs::write(&runtime.storage_path, b"db").expect("write db");
+        let clean = stdio_status_cache_key(&runtime);
+
+        let wal_path = runtime.storage_path.with_extension("db-wal");
+        std::fs::write(&wal_path, b"incomplete-marker-frame").expect("write marker WAL frame");
+        let incomplete = stdio_status_cache_key(&runtime);
+        assert_ne!(clean, incomplete, "WAL write must bust cached fresh status");
+
+        std::fs::write(&wal_path, b"incomplete-marker-frame-cleared")
+            .expect("write marker-clear WAL frame");
+        let finished = stdio_status_cache_key(&runtime);
+        assert_ne!(
+            incomplete, finished,
+            "marker clear must bust cached stale status"
+        );
     }
 }

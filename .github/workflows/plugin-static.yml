@@ -7,11 +7,18 @@ on:
       - .github/scripts/detect-codestory-release.py
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
+      - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
       - .github/workflows/rust-ci.yml
+      - .github/workflows/release.yml
+      - .github/workflows/post-publish-release-smoke.yml
+      - .github/workflows/packaged-platform-pr.yml
+      - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/plugin-static.yml
+      - scripts/install-codestory.ps1
   push:
     branches:
       - main
@@ -21,11 +28,18 @@ on:
       - .github/scripts/detect-codestory-release.py
       - .github/scripts/test-detect-codestory-release.py
       - .github/scripts/check-codestory-release.py
+      - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
       - .github/workflows/rust-ci.yml
+      - .github/workflows/release.yml
+      - .github/workflows/post-publish-release-smoke.yml
+      - .github/workflows/packaged-platform-pr.yml
+      - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/plugin-static.yml
+      - scripts/install-codestory.ps1
   workflow_dispatch:
 
 permissions:
@@ -48,6 +62,12 @@ jobs:
 
       - name: Check workflow policy
         run: node .github/scripts/check-workflow-policy.mjs
+
+      - name: Check packaged proof harness
+        run: python .github/scripts/check-packaged-agent-proof.py --self-test
+
+      - name: Check release packager
+        run: python .github/scripts/package-codestory-release.py --self-test
 
       - name: Check auto-release detector
         run: python .github/scripts/test-detect-codestory-release.py

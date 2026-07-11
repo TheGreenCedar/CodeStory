@@ -1,0 +1,91 @@
+name: close dev merged issues
+
+on:
+  push:
+    branches:
+      - dev/codestory-next
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  close-linked-issues:
+    name: close linked issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Close issues referenced by the merged PR
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+
+          repository = event["repository"]["full_name"]
+          commit = event["after"]
+          pull_requests = json.loads(
+              subprocess.check_output(
+                  ["gh", "api", f"repos/{repository}/commits/{commit}/pulls"],
+                  text=True,
+              )
+          )
+          merged_pull_requests = [
+              pull_request
+              for pull_request in pull_requests
+              if pull_request.get("merged_at")
+              and pull_request.get("merge_commit_sha") == commit
+              and pull_request.get("base", {}).get("ref") == "dev/codestory-next"
+          ]
+
+          if not merged_pull_requests:
+              print("Push was not a pull request merge into dev/codestory-next.")
+
+          closing_keyword = re.compile(
+              r"(?im)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+"
+              r"(?:#(\d+)|https://github\.com/TheGreenCedar/CodeStory/issues/(\d+))\b"
+          )
+          for pull_request in merged_pull_requests:
+              body = pull_request.get("body") or ""
+              issue_numbers = sorted(
+                  {int(short or full) for short, full in closing_keyword.findall(body)}
+              )
+              if not issue_numbers:
+                  print(f"PR #{pull_request['number']} has no closing issue references.")
+
+              for issue_number in issue_numbers:
+                  endpoint = f"repos/{repository}/issues/{issue_number}"
+                  issue = json.loads(
+                      subprocess.check_output(["gh", "api", endpoint], text=True)
+                  )
+                  if "pull_request" in issue:
+                      print(f"::warning::Skipping #{issue_number}: it is a pull request.")
+                      continue
+                  if issue["state"] == "closed":
+                      print(f"Issue #{issue_number} is already closed.")
+                      continue
+                  subprocess.run(
+                      [
+                          "gh",
+                          "api",
+                          "--method",
+                          "PATCH",
+                          endpoint,
+                          "-f",
+                          "state=closed",
+                          "-f",
+                          "state_reason=completed",
+                      ],
+                      check=True,
+                  )
+                  print(
+                      f"Closed issue #{issue_number} from merged PR "
+                      f"#{pull_request['number']}."
+                  )

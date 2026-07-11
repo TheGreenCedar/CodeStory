@@ -41,8 +41,10 @@ Stop treating CodeStory-backed answers as proof when any of these apply:
    the agent never grounded the checkout. Answers may be generic exploration.
 4. **Degraded broad search.** Packet or search ran while retrieval was not
    `full`. Treat output as a lead, verify in source.
-5. **Version drift.** You updated the plugin or CLI but kept an old host
-   session. Start fresh and re-check readiness.
+5. **Proven runtime incompatibility.** Status reports an actual runtime,
+   protocol, or schema failure for the surface. A newer release being available
+   under `runtime_update` is advice only and does not invalidate otherwise-ready
+   surfaces.
 
 When in doubt, ask a narrow local question first ("Where is `Foo` defined?") and
 confirm the answer cites real paths before trusting broader claims.

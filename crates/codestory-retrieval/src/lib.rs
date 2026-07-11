@@ -28,6 +28,7 @@ mod qdrant_storage;
 mod query;
 mod query_features;
 mod ranker;
+mod retention;
 mod scip_client;
 mod scip_index;
 mod sidecar;
@@ -54,8 +55,10 @@ pub use config::{
     SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile,
     SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
     default_sidecar_image_pins, embedding_server_launch_mode, sidecar_runtime_auto,
-    sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id,
+    sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id, user_cache_root,
 };
+#[cfg(feature = "test-support")]
+pub use config::{active_test_cache_root, with_test_cache_root};
 pub use embeddings::{
     BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingRuntimeProbe,
     RETRIEVAL_EMBEDDING_DIM, embedding_backend_label, embedding_runtime_id,
@@ -78,7 +81,7 @@ pub use index::{
 pub use inventory::{
     SidecarDockerResource, SidecarDockerResourceKind, SidecarGcNamespaceResult, SidecarGcReport,
     SidecarInventoryEntry, SidecarInventoryReport, SidecarInventoryState, sidecar_gc_apply,
-    sidecar_inventory,
+    sidecar_gc_apply_with_storage, sidecar_inventory, sidecar_inventory_with_storage,
 };
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
@@ -89,7 +92,8 @@ pub use qdrant_client::{
 };
 pub use qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION,
-    PRUNE_SUPPRESSED_PROTECTION_SCAN_ERROR, QdrantStorageRepairReport, repair_qdrant_storage,
+    PRUNE_SUPPRESSED_POST_PUBLICATION_RETENTION, PRUNE_SUPPRESSED_PROTECTION_SCAN_ERROR,
+    QdrantStorageRepairReport, repair_qdrant_storage,
 };
 pub use query::{
     QueryBatchItem, QueryBatchRequest, QueryRequest, execute_retrieval_query,
@@ -97,6 +101,7 @@ pub use query::{
 };
 pub use query_features::{QueryFeatures, QueryShape, classify_query};
 pub use ranker::rank_candidates;
+pub use retention::{GenerationRetentionApplyReport, GenerationRetentionPlan};
 pub use scip_client::ScipClient;
 pub use sidecar::{
     NativeEmbeddingLaunchIdentityStatus, SidecarStateFile, ensure_native_embedding_launch_identity,

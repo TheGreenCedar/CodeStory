@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -12,13 +13,17 @@ struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,
     hash_embeddings: bool,
-    latest_release_version: String,
+    latest_release_version: Option<String>,
+    disable_release_probe: bool,
     disable_installed_cli_probe: bool,
+    plugin_data_dir: Option<PathBuf>,
+    plugin_cli_source: Option<String>,
     sidecar_policy_state: Option<String>,
     sidecar_last_repair_command: Option<String>,
     dirty_marker_path: Option<PathBuf>,
     dirty_marker_project_root: Option<PathBuf>,
     local_refresh_timeout_ms: Option<u64>,
+    ready_repair_worker_probe_exit_code: Option<i32>,
 }
 
 struct StdioServer {
@@ -124,7 +129,7 @@ fn write_dirty_marker_fixture(fixture: &StdioFixture, name: &str, marker: Value)
 }
 
 fn refresh_fixture_index(fixture: &StdioFixture) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .arg("index")
         .arg("--refresh")
@@ -150,7 +155,7 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
     let cache_dir = tempfile::tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .arg("index")
         .arg("--refresh")
@@ -174,13 +179,17 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         workspace,
         cache_dir,
         hash_embeddings,
-        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
         disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
         sidecar_policy_state: None,
         sidecar_last_repair_command: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
+        ready_repair_worker_probe_exit_code: None,
     }
 }
 
@@ -193,13 +202,17 @@ fn unindexed_fixture() -> StdioFixture {
         workspace,
         cache_dir,
         hash_embeddings: true,
-        latest_release_version: env!("CARGO_PKG_VERSION").to_string(),
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
         disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
         sidecar_policy_state: None,
         sidecar_last_repair_command: None,
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
+        ready_repair_worker_probe_exit_code: None,
     }
 }
 
@@ -208,7 +221,7 @@ fn full_retrieval_fixture() -> Result<Option<StdioFixture>, String> {
         return Ok(None);
     }
     let fixture = indexed_fixture_with_embedding_mode(false);
-    let output = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let output = test_support::cli_command()
         .arg("retrieval")
         .arg("index")
         .arg("--refresh")
@@ -228,7 +241,7 @@ fn full_retrieval_fixture() -> Result<Option<StdioFixture>, String> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let status = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let status = test_support::cli_command()
         .arg("retrieval")
         .arg("status")
         .arg("--format")
@@ -265,6 +278,31 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+fn write_managed_cli_fixture(plugin_data: &Path, version: &str) -> PathBuf {
+    let version_dir = plugin_data.join("codestory-cli").join(version);
+    let bin_dir = version_dir.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create managed CLI fixture dir");
+    let executable = bin_dir.join(if cfg!(windows) {
+        "codestory-cli.exe"
+    } else {
+        "codestory-cli"
+    });
+    let content = format!("managed CLI fixture {version}");
+    fs::write(&executable, content.as_bytes()).expect("write managed CLI fixture");
+    let sha256 = format!("{:x}", Sha256::digest(content.as_bytes()));
+    fs::write(
+        version_dir.join("manifest.json"),
+        json!({
+            "path": format!("bin/{}", executable.file_name().unwrap().to_string_lossy()),
+            "sha256": sha256,
+            "version": version
+        })
+        .to_string(),
+    )
+    .expect("write managed CLI fixture manifest");
+    executable
+}
+
 fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
     if hash_embeddings {
         command.env("CODESTORY_EMBED_RUNTIME_MODE", "hash");
@@ -272,7 +310,7 @@ fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
 }
 
 fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command
         .arg("serve")
         .arg("--stdio")
@@ -286,12 +324,20 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
-    command.env(
-        "CODESTORY_LATEST_RELEASE_VERSION",
-        &fixture.latest_release_version,
-    );
+    if let Some(version) = &fixture.latest_release_version {
+        command.env("CODESTORY_LATEST_RELEASE_VERSION", version);
+    }
+    if fixture.disable_release_probe {
+        command.env("CODESTORY_DISABLE_RELEASE_PROBE", "1");
+    }
     if fixture.disable_installed_cli_probe {
         command.env("CODESTORY_DISABLE_INSTALLED_CLI_PROBE", "1");
+    }
+    if let Some(plugin_data) = &fixture.plugin_data_dir {
+        command.env("CODESTORY_PLUGIN_DATA", plugin_data);
+    }
+    if let Some(source) = &fixture.plugin_cli_source {
+        command.env("CODESTORY_PLUGIN_CLI_SOURCE", source);
     }
     if let Some(state) = &fixture.sidecar_policy_state {
         command.env("CODESTORY_PLUGIN_SIDECAR_POLICY_STATE", state);
@@ -324,6 +370,12 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
             timeout_ms.to_string(),
         );
     }
+    if let Some(exit_code) = fixture.ready_repair_worker_probe_exit_code {
+        command.env(
+            "CODESTORY_TEST_READY_REPAIR_WORKER_EXIT_CODE",
+            exit_code.to_string(),
+        );
+    }
     let mut child = command.spawn().expect("spawn stdio server");
 
     let stdin = child.stdin.take().expect("stdio stdin");
@@ -336,7 +388,7 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
 }
 
 fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_codestory-cli"))
+    let mut child = test_support::cli_command()
         .arg("serve")
         .arg("--stdio")
         .arg("--multi-project")
@@ -399,6 +451,36 @@ fn assert_tool_success(response: &Value, id: Value) -> &Value {
     result
         .get("structuredContent")
         .expect("tools/call success should include structuredContent")
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_sidecar_worker_result(server: &mut StdioServer, attempt_id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let response = send_json(
+            server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "sidecar-setup-terminal-status",
+                "method": "tools/call",
+                "params": {
+                    "name": "sidecar_setup",
+                    "arguments": {"action": "status"}
+                }
+            }),
+        );
+        let setup = assert_tool_success(&response, json!("sidecar-setup-terminal-status"));
+        if setup["last_worker_result"]["attempt_id"] == json!(attempt_id)
+            && setup["active_repair"].is_null()
+        {
+            return setup.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "repair worker did not reach a durable terminal state: {setup}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn assert_structured_citations_have_no_evidence(value: &Value) {
@@ -693,33 +775,37 @@ fn assert_allowed_surface(
         "unexpected readiness goal for {surface}: {surface_status}"
     );
     assert_eq!(
-        surface_status["status"],
+        surface_status.get("summary"),
+        None,
+        "ordinary surface {surface} must reference, not clone, its verdict"
+    );
+    let verdict = status["readiness"]
+        .as_array()
+        .and_then(|readiness| {
+            readiness
+                .iter()
+                .find(|verdict| verdict["goal"] == expected_goal)
+        })
+        .unwrap_or_else(|| panic!("missing canonical readiness verdict {expected_goal}: {status}"));
+    assert_eq!(
+        verdict["status"],
         json!(expected_status),
-        "unexpected readiness status for {surface}: {surface_status}"
+        "unexpected canonical readiness status for {surface}: {verdict}"
     );
     assert!(
-        surface_status["summary"]
+        verdict["summary"]
             .as_str()
             .is_some_and(|text| !text.is_empty()),
-        "surface status should include a readiness summary for {surface}: {surface_status}"
+        "canonical verdict should include a readiness summary for {surface}: {verdict}"
     );
     if expected_allowed {
-        assert!(
-            surface_status["blocked_reason"].is_null(),
-            "allowed surface {surface} should not include a blocked reason: {surface_status}"
-        );
+        assert_eq!(verdict["status"], "ready");
     } else {
         assert!(
-            surface_status["blocked_reason"]
-                .as_str()
-                .is_some_and(|text| !text.is_empty()),
-            "blocked surface {surface} should explain why it is blocked: {surface_status}"
-        );
-        assert!(
-            surface_status["minimum_next"]
+            verdict["minimum_next"]
                 .as_array()
                 .is_some_and(|commands| !commands.is_empty()),
-            "blocked surface {surface} should include minimum repair guidance: {surface_status}"
+            "canonical verdict should include minimum repair guidance: {verdict}"
         );
     }
 }
@@ -803,11 +889,7 @@ fn write_repair_status_fixture(
 ) -> (PathBuf, RemoveDirOnDrop) {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &canonical_root,
-        codestory_retrieval::SidecarProfile::Agent,
-        Some(run_id),
-    );
+    let sidecar = test_sidecar_runtime(&canonical_root, run_id);
     let status_path = sidecar
         .layout
         .state_file
@@ -842,6 +924,15 @@ fn write_repair_status_fixture(
     )
     .expect("write repair status fixture");
     (status_path, RemoveDirOnDrop(status_dir))
+}
+
+fn test_sidecar_runtime(project: &Path, run_id: &str) -> codestory_retrieval::SidecarRuntimeConfig {
+    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        Some(project),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(run_id),
+        &test_support::test_state_root().join("cache"),
+    )
 }
 
 fn continuation_uris_for(node_id: &str) -> Vec<String> {
@@ -2388,6 +2479,18 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
 
     let result = assert_success_envelope(&response, json!("status-resource"));
     let status = json_resource_content(result, "codestory://status");
+    let minified = serde_json::to_vec(&status).expect("serialize minified status");
+    assert!(
+        minified.len() < 24 * 1024,
+        "MCP status must stay below 24 KiB; got {} bytes",
+        minified.len()
+    );
+    let local_summary = "Local navigation can use the current index.";
+    assert_eq!(
+        status.to_string().matches(local_summary).count(),
+        1,
+        "canonical readiness guidance must not be cloned per surface: {status}"
+    );
     assert_eq!(
         status["server_version"],
         json!(env!("CARGO_PKG_VERSION")),
@@ -2453,14 +2556,18 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "direct stdio status should make unmanaged sidecar policy explicit: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["sidecar_status"]["mode"],
-        status["readiness_lanes"]["agent_packet_search"]["sidecar_mode"],
-        "runtime truth should reuse the selected agent readiness lane mode: {status}"
+        status["runtime_truth"]["sidecar_status_ref"],
+        json!("readiness_lanes.agent_packet_search"),
+        "runtime truth should reference the canonical agent readiness lane: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["sidecar_status"]["degraded_reason"],
-        status["readiness_lanes"]["agent_packet_search"]["degraded_reason"],
-        "runtime truth should reuse the selected agent readiness lane reason: {status}"
+        status["runtime_truth"]["readiness_broker_ref"],
+        json!("readiness_broker"),
+        "runtime truth should reference rather than clone broker diagnostics: {status}"
+    );
+    assert!(
+        status["runtime_truth"].get("readiness_broker").is_none(),
+        "runtime truth must not duplicate the variable-sized broker payload: {status}"
     );
     assert!(
         status
@@ -2571,19 +2678,19 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "agent lane should expose the agent-scoped next command: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["local_graph"]["status"],
-        json!("ready"),
-        "runtime truth should include the local graph readiness lane: {status}"
+        status["runtime_truth"]["readiness_refs"]["local_graph"],
+        json!("readiness[goal=local_navigation]"),
+        "runtime truth should reference the local graph verdict: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["local_graph"]["refresh_state"],
-        json!("refreshed"),
-        "runtime truth should include local refresh state: {status}"
+        status["runtime_truth"]["readiness_refs"]["local_refresh"],
+        json!("local_refresh"),
+        "runtime truth should reference local refresh state: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
-        json!("blocked"),
-        "runtime truth should include the agent packet/search readiness lane: {status}"
+        status["runtime_truth"]["readiness_refs"]["agent_packet_search"],
+        json!("readiness_lanes.agent_packet_search"),
+        "runtime truth should reference agent packet/search readiness: {status}"
     );
     for surface in [
         "ground",
@@ -2702,18 +2809,8 @@ fn resources_read_status_reports_active_agent_repair_phase() {
         "repairing status should include the active namespace: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
-        json!("repairing"),
-        "{status}"
-    );
-    assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["phase"],
-        json!("Qdrant finalize"),
-        "{status}"
-    );
-    assert_eq!(
-        status["runtime_truth"]["sidecar_status"]["phase"],
-        json!("Qdrant finalize"),
+        status["runtime_truth"]["sidecar_status_ref"],
+        json!("readiness_lanes.agent_packet_search"),
         "{status}"
     );
     assert!(
@@ -3099,6 +3196,30 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
         !next_call_text.contains("\"method\":\"cli\""),
         "disabled policy should not expose CLI as the normal recovery path: {status}"
     );
+
+    let repair_all_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "repair-all-disabled",
+            "method": "tools/call",
+            "params": {"name": "repair_all", "arguments": {}}
+        }),
+    );
+    let repair_all = assert_tool_error(&repair_all_response, json!("repair-all-disabled"));
+    assert_eq!(
+        repair_all["status"],
+        json!("repair_disabled"),
+        "{repair_all}"
+    );
+    assert_eq!(repair_all["minimum_next"], json!([]), "{repair_all}");
+    assert_eq!(repair_all["full_repair"], json!([]), "{repair_all}");
+    assert!(
+        !repair_all
+            .to_string()
+            .contains("ready --goal agent --repair"),
+        "disabled repair_all must not recover commands from the canonical verdict: {repair_all}"
+    );
 }
 
 #[test]
@@ -3134,11 +3255,24 @@ fn sidecar_setup_status_marks_old_last_repair_as_stale() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("ask".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(17);
     let policy_path = fixture.cache_dir.path().join("plugin-sidecar-policy.json");
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let repair_sidecar =
+        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
+    let repair_state_dir = repair_sidecar
+        .layout
+        .state_file
+        .parent()
+        .expect("repair state dir")
+        .to_path_buf();
+    let _repair_state_cleanup = RemoveDirOnDrop(repair_state_dir);
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -3216,13 +3350,15 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         }),
     );
     let repair = assert_tool_success(&repair_response, json!("sidecar-setup-repair"));
-    assert!(
-        matches!(
-            repair["status"].as_str(),
-            Some("started" | "already_running" | "already_starting")
-        ),
-        "sidecar_setup repair should return a bounded repair state: {repair}"
+    assert_eq!(
+        repair["status"],
+        json!("started"),
+        "a unique fixture must start exactly one repair worker: {repair}"
     );
+    let attempt_id = repair["attempt_id"]
+        .as_str()
+        .expect("started repair attempt id")
+        .to_string();
     assert_eq!(
         repair["mode"],
         json!("background"),
@@ -3246,47 +3382,153 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
             })),
         "sidecar_setup repair should point agents back to project-scoped status: {repair}"
     );
-    if repair["status"] == json!("started") {
-        assert!(
-            repair["broker_reconciliation"]["status"]
-                .as_str()
-                .is_some_and(|status| matches!(status, "clean" | "abandoned_cleaned")),
-            "sidecar_setup repair should reconcile broker state before spawning: {repair}"
-        );
-    }
+    assert!(
+        repair["broker_reconciliation"]["status"]
+            .as_str()
+            .is_some_and(|status| matches!(status, "clean" | "abandoned_cleaned")),
+        "sidecar_setup repair should reconcile broker state before spawning: {repair}"
+    );
 
-    let status_response = send_json(
+    let terminal_setup = wait_for_sidecar_worker_result(&mut server, &attempt_id);
+    let terminal = &terminal_setup["last_worker_result"];
+    assert_eq!(terminal["outcome"], json!("failed"), "{terminal_setup}");
+    assert_eq!(terminal["exit_code"], json!(17), "{terminal_setup}");
+    assert!(terminal["wait_error"].is_null(), "{terminal_setup}");
+    assert_eq!(
+        terminal["terminal_envelope"]["error"]["code"],
+        json!("background_repair_failed"),
+        "{terminal_setup}"
+    );
+    assert_eq!(
+        terminal["terminal_envelope"]["error"]["details"]["failed_layer"],
+        json!("background_repair"),
+        "{terminal_setup}"
+    );
+    assert_eq!(terminal["stdout_truncated"], json!(true));
+    assert_eq!(terminal["stderr_truncated"], json!(true));
+    assert_eq!(
+        terminal_setup["state"],
+        json!("enabled"),
+        "{terminal_setup}"
+    );
+    assert!(
+        terminal["stdout_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("worker probe stdout") && tail.contains(&attempt_id)),
+        "{terminal_setup}"
+    );
+    assert!(
+        terminal["stderr_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("worker probe stderr") && tail.contains(&attempt_id)),
+        "{terminal_setup}"
+    );
+
+    let result_path = repair_sidecar
+        .layout
+        .state_file
+        .with_file_name("ready-repair-result.json");
+    let durable: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("durable repair worker result"),
+    )
+    .expect("repair worker result json");
+    assert_eq!(durable["attempt_id"], json!(attempt_id));
+    assert_eq!(durable["exit_code"], json!(17));
+    assert_eq!(durable["outcome"], json!("failed"));
+    assert_eq!(
+        durable["terminal_envelope"]["error"]["code"],
+        json!("background_repair_failed")
+    );
+    assert!(
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-enqueue.lock")
+            .exists(),
+        "terminal monitor should compare-and-clear the adopted reservation"
+    );
+    assert!(
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-status.json")
+            .exists(),
+        "terminal monitor should leave no active repair marker"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(0);
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let repair_sidecar =
+        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
+    let _repair_state_cleanup = RemoveDirOnDrop(
+        repair_sidecar
+            .layout
+            .state_file
+            .parent()
+            .expect("repair state dir")
+            .to_path_buf(),
+    );
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "sidecar-setup-status",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
+            "id": "sidecar-setup-success-repair",
+            "method": "tools/call",
+            "params": {
+                "name": "sidecar_setup",
+                "arguments": {"action": "repair"}
+            }
         }),
     );
-    let result = assert_success_envelope(&status_response, json!("sidecar-setup-status"));
-    let status = json_resource_content(result, "codestory://status");
-    assert_eq!(
-        status["sidecar_setup"]["state"],
-        json!("enabled"),
-        "{status}"
-    );
-    let next_call_text = status["recommended_next_calls"].to_string();
-    assert_eq!(
-        status["status_resource_auto_repair"],
-        Value::Null,
-        "status should not start another repair after explicit repair: {status}"
+    let repair = assert_tool_success(&response, json!("sidecar-setup-success-repair"));
+    assert_eq!(repair["status"], json!("started"), "{repair}");
+    let attempt_id = repair["attempt_id"]
+        .as_str()
+        .expect("repair attempt id")
+        .to_string();
+
+    let setup = wait_for_sidecar_worker_result(&mut server, &attempt_id);
+    let terminal = &setup["last_worker_result"];
+
+    assert_eq!(terminal["outcome"], json!("succeeded"), "{setup}");
+    assert_eq!(terminal["exit_code"], json!(0), "{setup}");
+    assert!(terminal["wait_error"].is_null(), "{setup}");
+    assert_eq!(terminal["stdout_truncated"], json!(true));
+    assert_eq!(terminal["stderr_truncated"], json!(true));
+    assert!(
+        terminal["stdout_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains(&attempt_id)),
+        "{setup}"
     );
     assert!(
-        status["sidecar_setup"]["active_repair"]["status"] == json!("repairing")
-            || status["readiness_broker"]["operations"]
-                .as_array()
-                .is_some_and(|operations| !operations.is_empty()),
-        "status should report Rust-owned repair through setup or broker state after explicit repair: {status}"
+        terminal["stderr_tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains(&attempt_id)),
+        "{setup}"
     );
     assert!(
-        next_call_text.contains("\"tool\":\"status\"") && next_call_text.contains("\"project\":"),
-        "status should recommend status readback after explicit repair: {status}"
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-enqueue.lock")
+            .exists()
+    );
+    assert!(
+        !repair_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-status.json")
+            .exists()
     );
 }
 
@@ -3779,9 +4021,80 @@ fn resources_read_status_dirty_marker_fail_open_matrix() {
 }
 
 #[test]
-fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
+fn update_available_is_advisory_and_preserves_compatible_surfaces() {
     let mut fixture = indexed_fixture();
-    fixture.latest_release_version = "999.0.0".to_string();
+    let plugin_data = fixture.cache_dir.path().join("plugin-data-update");
+    let installed = write_managed_cli_fixture(&plugin_data, "999.0.0");
+    fixture.latest_release_version = Some("999.0.0".to_string());
+    fixture.plugin_data_dir = Some(plugin_data);
+    fixture.plugin_cli_source = Some("managed".to_string());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-update-advisory",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-update-advisory"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["runtime_update"]["state"], json!("available"));
+    assert_eq!(status["runtime_update"]["blocking"], json!(false));
+    assert_eq!(status["runtime_update"]["readiness_impact"], json!("none"));
+    assert_eq!(
+        status["runtime_update"]["active_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_eq!(status["runtime_update"]["latest_version"], "999.0.0");
+    assert_eq!(status["runtime_update"]["restart_recommended"], json!(true));
+    assert_eq!(
+        status["runtime_update"]["recommended_action"],
+        json!("restart_host")
+    );
+    assert_eq!(
+        status["runtime_update"]["newer_installed_version"],
+        json!("999.0.0")
+    );
+    assert!(
+        status["runtime_update"]["newer_installed_path"]
+            .as_str()
+            .is_some_and(
+                |path| path.ends_with(installed.file_name().unwrap().to_string_lossy().as_ref())
+            ),
+        "status should expose the checksum-valid managed candidate: {status}"
+    );
+    assert_eq!(status["readiness"][0]["status"], json!("ready"));
+    assert!(status["readiness"][0].get("setup").is_none());
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_allowed_surface(&status, "files", true, "local_navigation", "ready");
+    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
+    let next_call_text = status["recommended_next_calls"].to_string();
+    assert!(
+        !next_call_text.contains("install-codestory.ps1") && !next_call_text.contains("999.0.0"),
+        "release availability must not replace readiness repair guidance: {status}"
+    );
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-with-update-available",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {}}
+        }),
+    );
+    assert_tool_success(&ground, json!("ground-with-update-available"));
+}
+
+#[test]
+fn offline_release_metadata_is_non_blocking_and_unknown() {
+    let mut fixture = indexed_fixture();
+    fixture.plugin_data_dir = Some(fixture.cache_dir.path().join("plugin-data-offline"));
+    fixture.latest_release_version = None;
+    fixture.disable_release_probe = true;
     fixture.disable_installed_cli_probe = true;
     let mut server = spawn_stdio_server(&fixture);
 
@@ -3789,113 +4102,107 @@ fn resources_read_status_blocks_all_surfaces_when_active_cli_is_stale() {
         &mut server,
         json!({
             "jsonrpc": "2.0",
-            "id": "status-stale-cli",
+            "id": "status-offline-release-metadata",
             "method": "resources/read",
             "params": {"uri": "codestory://status"}
         }),
     );
-    let result = assert_success_envelope(&response, json!("status-stale-cli"));
+    let result = assert_success_envelope(&response, json!("status-offline-release-metadata"));
     let status = json_resource_content(result, "codestory://status");
 
+    assert_eq!(status["runtime_update"]["state"], json!("unknown"));
     assert_eq!(
-        status["readiness"][0]["status"],
-        json!("repair_setup"),
-        "stale active CLI should be a hard setup repair state: {status}"
+        status["runtime_update"]["metadata_source"],
+        json!("disabled")
     );
-    let setup = &status["readiness"][0]["setup"];
-    assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(setup["latest_version"], "999.0.0");
-    assert!(
-        setup["active_path"]
-            .as_str()
-            .is_some_and(|path| path.contains("codestory-cli")),
-        "setup snapshot should expose active executable path: {status}"
+    assert_eq!(status["runtime_update"]["blocking"], json!(false));
+    assert_eq!(
+        status["runtime_update"]["metadata_refresh_scheduled"],
+        json!(false)
     );
-    for surface in [
-        "ground",
-        "files",
-        "packet",
-        "search",
-        "context",
-        "repair_all",
-    ] {
-        let surface_status = &status["allowed_surfaces"][surface];
-        assert_eq!(surface_status["allowed"], json!(false));
-        assert_eq!(surface_status["status"], json!("repair_setup"));
-        assert_eq!(surface_status["repair_reason"], json!("stale_active_cli"));
-    }
-    let next_call_text = status["recommended_next_calls"].to_string();
-    assert!(
-        next_call_text.contains("install-codestory.ps1") && next_call_text.contains("999.0.0"),
-        "stale active CLI repair should be an installer command, not a prompt: {status}"
-    );
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
 }
 
 #[test]
-fn tool_calls_block_all_surfaces_when_active_cli_is_stale() {
+fn failed_release_refresh_keeps_stale_cached_advice_without_blocking() {
     let mut fixture = indexed_fixture();
-    fixture.latest_release_version = "999.0.0".to_string();
+    let plugin_data = fixture.cache_dir.path().join("plugin-data-stale-cache");
+    fs::create_dir_all(&plugin_data).expect("create stale release cache dir");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis() as i64;
+    fs::write(
+        plugin_data.join("release-metadata.json"),
+        json!({
+            "schema_version": 1,
+            "latest_version": "999.0.0",
+            "checked_at_epoch_ms": now,
+            "refresh_failed": true
+        })
+        .to_string(),
+    )
+    .expect("write stale release metadata");
+    fixture.plugin_data_dir = Some(plugin_data);
+    fixture.latest_release_version = None;
+    fixture.disable_release_probe = true;
     fixture.disable_installed_cli_probe = true;
     let mut server = spawn_stdio_server(&fixture);
 
-    for (tool, arguments) in [
-        ("ground", json!({})),
-        ("search", json!({"query": "AppController"})),
-        ("repair_all", json!({})),
-    ] {
-        let response = send_json(
-            &mut server,
-            json!({
-                "jsonrpc": "2.0",
-                "id": format!("stale-{tool}"),
-                "method": "tools/call",
-                "params": {
-                    "name": tool,
-                    "arguments": arguments
-                }
-            }),
-        );
-        let error = assert_tool_error(&response, json!(format!("stale-{tool}")));
-        assert_eq!(
-            error.pointer("/code").and_then(Value::as_str),
-            Some("codestory_tool_blocked")
-        );
-        assert_eq!(
-            error.pointer("/status").and_then(Value::as_str),
-            Some("repair_setup")
-        );
-        assert_eq!(
-            error.pointer("/repair_reason").and_then(Value::as_str),
-            Some("stale_active_cli")
-        );
-        let setup = error
-            .pointer("/setup")
-            .unwrap_or_else(|| panic!("blocked stale CLI tool should include setup: {response}"));
-        assert_eq!(setup["active_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(setup["latest_version"], "999.0.0");
-        let minimum_next = error
-            .pointer("/minimum_next")
-            .and_then(Value::as_array)
-            .unwrap_or_else(|| {
-                panic!("blocked stale CLI tool should include minimum_next: {response}")
-            });
-        assert!(
-            minimum_next.iter().all(|call| call
-                .get("method")
-                .and_then(Value::as_str)
-                .is_some_and(|method| method != "cli")),
-            "blocked stale CLI tool should not expose CLI as the normal repair method: {response}"
-        );
-        assert!(
-            minimum_next.iter().any(|call| call
-                .get("debug_command")
-                .and_then(Value::as_str)
-                .is_some_and(
-                    |text| text.contains("install-codestory.ps1") && text.contains("999.0.0")
-                )),
-            "blocked stale CLI tool should keep installer detail as debug metadata: {response}"
-        );
-    }
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-stale-release-metadata",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-stale-release-metadata"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["runtime_update"]["state"], json!("available"));
+    assert_eq!(
+        status["runtime_update"]["metadata_source"],
+        json!("stale_cache")
+    );
+    assert_eq!(status["runtime_update"]["metadata_stale"], json!(true));
+    assert_eq!(
+        status["runtime_update"]["metadata_refresh_scheduled"],
+        json!(false)
+    );
+    assert_eq!(status["runtime_update"]["blocking"], json!(false));
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+}
+
+#[test]
+fn local_dev_override_does_not_recommend_restart_for_managed_history() {
+    let mut fixture = indexed_fixture();
+    let plugin_data = fixture.cache_dir.path().join("plugin-data-local-override");
+    write_managed_cli_fixture(&plugin_data, "999.0.0");
+    fixture.plugin_data_dir = Some(plugin_data);
+    fixture.plugin_cli_source = Some("local_dev_override".to_string());
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-local-dev-override",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("status-local-dev-override"));
+    let status = json_resource_content(result, "codestory://status");
+
+    assert_eq!(status["runtime_update"]["state"], json!("current"));
+    assert_eq!(
+        status["runtime_update"]["restart_recommended"],
+        json!(false)
+    );
+    assert!(status["runtime_update"]["newer_installed_path"].is_null());
+    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
 }
 
 #[test]
@@ -3936,18 +4243,35 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     fs::remove_file(fixture.workspace.path().join("src").join("alpha.rs"))
         .expect("remove indexed file after indexing");
 
-    let refreshed = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "status-freshness-after-mutation",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-    let refreshed_result =
-        assert_success_envelope(&refreshed, json!("status-freshness-after-mutation"));
-    let refreshed_status = json_resource_content(refreshed_result, "codestory://status");
+    let refresh_deadline = Instant::now() + Duration::from_secs(15);
+    let mut refresh_attempt = 0;
+    let refreshed_status = loop {
+        let id = format!("status-freshness-after-mutation-{refresh_attempt}");
+        let refreshed = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "resources/read",
+                "params": {"uri": "codestory://status"}
+            }),
+        );
+        let refreshed_result = assert_success_envelope(&refreshed, json!(id));
+        let status = json_resource_content(refreshed_result, "codestory://status");
+        if find_index_freshness(&status)
+            .and_then(|freshness| freshness.get("status"))
+            .and_then(Value::as_str)
+            == Some("fresh")
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < refresh_deadline,
+            "background local refresh did not complete within 15 seconds: {status}"
+        );
+        refresh_attempt += 1;
+        thread::sleep(Duration::from_millis(50));
+    };
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after mutation");
     assert_eq!(
         refreshed_status["local_refresh"]["reason"],
@@ -3965,7 +4289,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
         "fresh local graph should allow local graph surfaces: {refreshed_status}"
     );
     assert_eq!(
-        refreshed_status["allowed_surfaces"]["packet"]["status"],
+        refreshed_status["readiness_lanes"]["agent_packet_search"]["status"],
         json!("blocked"),
         "packet/search should stay gated by the agent retrieval lane after local refresh: {refreshed_status}"
     );
@@ -4014,7 +4338,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
         "warm status freshness check p95 should stay under 1s for a small repo, got median={median:?}, p95={p95:?}"
     );
 
-    let mut index_command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut index_command = test_support::cli_command();
     index_command
         .arg("index")
         .arg("--refresh")
@@ -4235,7 +4559,7 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         "tool dispatch should have refreshed the long-lived server before status was reread: {status}"
     );
     assert_eq!(
-        status["allowed_surfaces"]["search"]["status"],
+        status["readiness_lanes"]["agent_packet_search"]["status"],
         json!("blocked"),
         "local graph refresh must not make packet/search readiness claims: {status}"
     );
@@ -5406,3 +5730,4 @@ fn unknown_prompt_returns_jsonrpc_error() {
         "unknown prompt message should identify the missing prompt: {response}"
     );
 }
+mod test_support;

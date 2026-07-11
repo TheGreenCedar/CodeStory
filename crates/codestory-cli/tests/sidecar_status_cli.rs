@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use tempfile::tempdir;
 
 fn write_tiny_project(root: &Path) {
@@ -9,7 +9,7 @@ fn write_tiny_project(root: &Path) {
 }
 
 fn run_cli(project: &Path, cache_dir: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_codestory-cli"));
+    let mut command = test_support::cli_command();
     command.args(args);
     command.arg("--project").arg(project);
     command.arg("--cache-dir").arg(cache_dir);
@@ -98,6 +98,21 @@ fn sidecar_inventory_reports_read_only_dry_run_json() {
     let json = stdout_json(&output);
     assert_eq!(json["dry_run"].as_bool(), Some(true));
     assert!(json["namespaces"].is_array());
+    assert_eq!(
+        json["generation_retention"]["dry_run"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        json["generation_retention"]["pruning_suppressed"].as_bool(),
+        Some(true)
+    );
+    assert!(
+        json["generation_retention"]["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains("active retrieval manifest is unavailable"))))
+    );
 }
 
 #[test]
@@ -119,6 +134,7 @@ fn retrieval_inventory_has_human_output() {
         "inventory should have a human-readable heading:\n{stdout}"
     );
     assert!(stdout.contains("dry_run"));
+    assert!(stdout.contains("generation_retention_pruning_suppressed: true"));
 }
 
 #[test]
@@ -149,3 +165,4 @@ fn unknown_sidecar_subcommand_suggests_status_without_runtime_side_effects() {
         "unknown sidecar subcommand should fail before runtime cache creation"
     );
 }
+mod test_support;

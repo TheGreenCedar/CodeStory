@@ -16,7 +16,7 @@ use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
 };
 use codestory_store::Store;
-use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
+use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -120,6 +120,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     compose_file: Option<&Path>,
     embedding_launch: Option<EmbeddingLaunchMetadata>,
 ) -> Result<SidecarStateFile> {
+    runtime.ensure_ports_allocated()?;
     let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness();
@@ -153,8 +154,13 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
         cleanup_command: runtime.cleanup_command.clone(),
         started_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
-    let json = serde_json::to_string_pretty(&state).context("serialize sidecar state")?;
-    std::fs::write(&layout.state_file, json).context("write retrieval-sidecars.json")?;
+    let json = serde_json::to_vec_pretty(&state).context("serialize sidecar state")?;
+    codestory_workspace::atomic_file::write_bytes_atomic(
+        &layout.state_file,
+        "retrieval-sidecars",
+        &json,
+    )
+    .context("write retrieval-sidecars.json")?;
     Ok(state)
 }
 
@@ -843,6 +849,12 @@ fn strict_readiness_unavailable_reason(
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
 ) -> Result<Option<String>> {
+    if storage
+        .has_incomplete_incremental_run()
+        .context("inspect incomplete incremental index marker")?
+    {
+        return Ok(Some("incomplete_incremental_index_run".into()));
+    }
     if !manifest_has_current_sidecar_contract(project_id, manifest) {
         return Ok(None);
     }
@@ -851,7 +863,6 @@ fn strict_readiness_unavailable_reason(
     {
         return Ok(None);
     }
-
     let embedding_backend = crate::embeddings::embedding_runtime_id();
     let expected_doc_backend = crate::embeddings::embedding_backend_label();
     if let Ok(stats) = storage.get_llm_symbol_doc_stats() {
@@ -881,6 +892,16 @@ fn strict_readiness_unavailable_reason(
         embedding_dim,
     )
     .context("compute strict sidecar input fingerprint")?;
+    let stored_files = storage
+        .files()
+        .inventory()
+        .context("load indexed file inventory")?;
+    if let Some(file) = stored_files.iter().find(|file| file.retry_required) {
+        return Ok(Some(format!(
+            "indexed_file_error_retry_required: {}",
+            file.path.display()
+        )));
+    }
     if manifest.sidecar_input_hash.as_deref() == Some(current_input.hash.as_str())
         && manifest.projection_count == Some(current_input.projection_count)
         && manifest.symbol_doc_count == Some(current_input.symbol_doc_count)
@@ -896,17 +917,8 @@ fn strict_readiness_unavailable_reason(
 
     let workspace = WorkspaceManifest::open(project_root.to_path_buf())
         .context("open workspace manifest for strict sidecar readiness")?;
-    let files = storage.files().get_files().context("load indexed files")?;
     let refresh_inputs = RefreshInputs {
-        stored_files: files
-            .into_iter()
-            .map(|file| StoredFileState {
-                id: file.id,
-                path: file.path,
-                modification_time: file.modification_time,
-                indexed: file.indexed,
-            })
-            .collect(),
+        stored_files,
         inventory: Default::default(),
     };
     let plan = workspace
@@ -1005,7 +1017,7 @@ mod tests {
     };
     use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
     use crate::test_support::retrieval_manifest_fixture;
-    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_contracts::graph::{ErrorInfo, IndexStep, Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -1125,6 +1137,24 @@ mod tests {
             .expect("rewrite state preserving launch");
 
         assert_eq!(preserved.embedding_launch, Some(launch));
+    }
+
+    #[test]
+    fn sidecar_state_replacement_is_complete_and_leaves_no_temp_file() {
+        let _lock = crate::test_support::env_lock();
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        sidecar_up_with_runtime(&runtime, None).expect("initial state");
+        sidecar_up_with_runtime(&runtime, None).expect("replacement state");
+
+        let state = read_sidecar_state(&runtime.layout.state_file).expect("parse state");
+        assert!(sidecar_state_matches_runtime(&state, &runtime));
+        assert!(
+            std::fs::read_dir(root.path())
+                .expect("read root")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
     }
 
     fn native_embedding_launch_fixture() -> EmbeddingLaunchMetadata {
@@ -1421,6 +1451,107 @@ mod tests {
         assert!(
             reason.contains("stored=onnx current=llamacpp"),
             "unexpected reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn strict_readiness_rejects_incomplete_run_before_manifest_fast_paths() {
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let project_id = project_id_for_root(project.path());
+        let manifest = retrieval_manifest_fixture(&project_id, "current");
+        let storage = Store::open(&storage_path).expect("open db");
+        storage
+            .begin_incremental_run()
+            .expect("mark incomplete run");
+
+        let reason = strict_readiness_unavailable_reason(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+        )
+        .expect("strict readiness")
+        .expect("incomplete run must degrade");
+
+        assert_eq!(reason, "incomplete_incremental_index_run");
+    }
+
+    #[test]
+    fn strict_readiness_distinguishes_parser_partial_from_file_error() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let source_path = project.path().join("lib.rs");
+        std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let indexed_mtime = live_mtime_millis(&source_path);
+        let project_id = project_id_for_root(project.path());
+        let mut storage = Store::open(&storage_path).expect("open db");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: indexed_mtime,
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert incomplete file");
+        let input = compute_sidecar_input_fingerprint(
+            &storage,
+            &storage_path,
+            project.path(),
+            &project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+        )
+        .expect("sidecar input");
+        let mut manifest = retrieval_manifest_fixture(&project_id, &input.hash);
+        manifest.built_at_epoch_ms = indexed_mtime;
+        manifest.projection_count = Some(input.projection_count);
+        manifest.symbol_doc_count = Some(input.symbol_doc_count);
+        manifest.dense_projection_count = Some(input.dense_projection_count);
+        manifest.semantic_policy_version = input.semantic_policy_version;
+        manifest.graph_artifact_hash = Some(input.graph_artifact_hash);
+        manifest.dense_reason_counts_json = Some(input.dense_reason_counts_json);
+        storage
+            .upsert_retrieval_index_manifest(&manifest)
+            .expect("manifest");
+
+        validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
+            .expect("parser coverage must not masquerade as an interrupted transaction");
+
+        storage
+            .insert_error(&ErrorInfo {
+                message: "read failed".into(),
+                file_id: Some(NodeId(1)),
+                line: None,
+                column: None,
+                is_fatal: true,
+                index_step: IndexStep::Indexing,
+            })
+            .expect("file error");
+        let reason = strict_readiness_unavailable_reason(
+            project.path(),
+            &storage_path,
+            &storage,
+            &project_id,
+            &manifest,
+        )
+        .expect("strict readiness")
+        .expect("file error must degrade");
+        assert_eq!(
+            reason,
+            format!(
+                "indexed_file_error_retry_required: {}",
+                source_path.display()
+            )
         );
     }
 

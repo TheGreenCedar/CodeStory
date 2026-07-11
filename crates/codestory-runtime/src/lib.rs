@@ -47,10 +47,9 @@ use codestory_store::{
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
     SymbolSummaryRecord,
 };
-use codestory_workspace::{
-    IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, WorkspaceInventory, WorkspaceManifest,
-};
+use codestory_workspace::{RefreshExecutionPlan, RefreshInputs, WorkspaceManifest};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -101,8 +100,8 @@ pub(crate) fn process_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 pub use search_runtime::*;
 use semantic_doc_text::{
-    runtime_concept_phrases, semantic_doc_language_from_path, semantic_path_aliases,
-    semantic_symbol_aliases, semantic_symbol_role_aliases,
+    semantic_doc_language_from_path, semantic_path_aliases, semantic_symbol_aliases,
+    semantic_symbol_role_aliases,
 };
 pub use services::{
     AgentService, BookmarkService, GroundingService, IndexService, ProjectService, SearchService,
@@ -3478,35 +3477,6 @@ fn not_checked_index_freshness(
     }
 }
 
-fn refresh_inputs_from_files(files: Vec<FileInfo>) -> RefreshInputs {
-    let inventory = files
-        .iter()
-        .map(|file| {
-            (
-                file.path.clone(),
-                IndexedFileRecord {
-                    file_id: file.id,
-                    modification_time: file.modification_time,
-                    indexed: file.indexed,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let stored_files = files
-        .into_iter()
-        .map(|file| codestory_workspace::StoredFileState {
-            id: file.id,
-            path: file.path,
-            modification_time: file.modification_time,
-            indexed: file.indexed,
-        });
-
-    RefreshInputs {
-        stored_files: stored_files.collect(),
-        inventory: WorkspaceInventory::from_records(inventory),
-    }
-}
-
 fn indexable_source_path(path: &Path) -> bool {
     let tree_sitter_supported = path
         .extension()
@@ -3547,6 +3517,31 @@ fn index_freshness_from_storage(
         }
     };
     let indexed_file_count = clamp_usize_to_u32(files.len());
+    match storage.has_incomplete_incremental_run() {
+        Ok(true) => {
+            return IndexFreshnessDto {
+                status: IndexFreshnessStatusDto::Stale,
+                changed_file_count: 0,
+                new_file_count: 0,
+                removed_file_count: 0,
+                checked_file_count: 0,
+                indexed_file_count,
+                duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
+                reason: Some(
+                    "previous_incremental_run_incomplete_full_refresh_required".to_string(),
+                ),
+                samples: Vec::new(),
+            };
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return not_checked_index_freshness(
+                format!("failed to inspect incomplete index marker: {error}"),
+                indexed_file_count,
+                started_at,
+            );
+        }
+    }
     if files.is_empty() {
         return not_checked_index_freshness(
             "no indexed file inventory is available yet",
@@ -3566,11 +3561,24 @@ fn index_freshness_from_storage(
         );
     }
 
+    let stored_files = match storage.files().inventory() {
+        Ok(files) => files,
+        Err(error) => {
+            return not_checked_index_freshness(
+                format!("failed to read refresh inventory: {error}"),
+                indexed_file_count,
+                started_at,
+            );
+        }
+    };
     let removed_paths = files
         .iter()
         .map(|file| (file.id, file.path.clone()))
         .collect::<HashMap<_, _>>();
-    let refresh_inputs = refresh_inputs_from_files(files);
+    let refresh_inputs = RefreshInputs {
+        stored_files,
+        inventory: Default::default(),
+    };
     let plan = match workspace
         .build_execution_plan_bounded(&refresh_inputs, INDEX_FRESHNESS_CURRENT_FILE_CAP)
     {
@@ -3864,7 +3872,7 @@ fn local_symbol_summary(doc: &LlmSymbolDoc) -> String {
     )
 }
 
-const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 5;
+const LLM_SYMBOL_DOC_SCHEMA_VERSION: u32 = 6;
 const LLM_SYMBOL_DOC_VERSION_PREFIX: &str = "semantic_doc_version:";
 const SEARCH_NODE_BATCH_SIZE: usize = 8_192;
 const SEARCH_SYMBOL_PROJECTION_BATCH_SIZE: usize = 4_096;
@@ -4865,10 +4873,6 @@ fn build_llm_symbol_doc_text(
         if !aliases.owner_aliases.is_empty() {
             let _ = writeln!(out, "owner_aliases: {}", aliases.owner_aliases.join(", "));
         }
-        let domain_aliases = runtime_concept_phrases(display_name, node.qualified_name.as_deref());
-        if !domain_aliases.is_empty() {
-            let _ = writeln!(out, "domain_aliases: {}", domain_aliases.join(", "));
-        }
         if alias_mode == SemanticDocAliasMode::CurrentAlias {
             let path_aliases = semantic_path_aliases(file_path, 8);
             if !path_aliases.is_empty() {
@@ -5735,18 +5739,27 @@ fn sync_llm_symbol_projection(
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
 
+    let graph_doc_schema_mismatch = llm_refresh_file_scope.is_some()
+        && storage
+            .has_symbol_search_doc_version_mismatch(LLM_SYMBOL_DOC_SCHEMA_VERSION)
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to inspect graph-native semantic doc versions: {e}"
+                ))
+            })?;
+    let dense_doc_contract_mismatch = embedding_contract.as_ref().is_some_and(|contract| {
+        llm_refresh_file_scope.is_some()
+            && existing_docs
+                .values()
+                .any(|existing_doc| !llm_symbol_doc_contract_matches(existing_doc, contract))
+    });
     let expand_semantic_scope_for_contract_repair =
-        if let Some(embedding_contract) = embedding_contract.as_ref() {
-            llm_refresh_file_scope.is_some()
-                && existing_docs.values().any(|existing_doc| {
-                    !llm_symbol_doc_contract_matches(existing_doc, embedding_contract)
-                })
-        } else {
-            false
-        };
+        graph_doc_schema_mismatch || dense_doc_contract_mismatch;
     if expand_semantic_scope_for_contract_repair {
         tracing::warn!(
-            "Stored semantic-doc contract differs from current embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
+            graph_doc_schema_mismatch,
+            dense_doc_contract_mismatch,
+            "Stored semantic-doc contract differs from the current schema or embedding contract; expanding incremental semantic sync to rebuild all semantic docs"
         );
     }
     let effective_llm_refresh_file_scope = if expand_semantic_scope_for_contract_repair {
@@ -6875,9 +6888,7 @@ fn architecture_coverage_for_hit(hit: &SearchHit) -> Option<ArchitectureCoverage
             key: format!("project:build_index:{source_kind}"),
             score: 8,
         }
-    } else if normalized.contains("/data/indexer/")
-        || architecture_has_all_terms(&terms, &["indexer", "command"])
-    {
+    } else if architecture_has_all_terms(&terms, &["indexer", "command"]) {
         ArchitectureCoverage {
             key: format!(
                 "indexing:{}:{source_kind}",
@@ -8034,6 +8045,7 @@ impl AppController {
                 .clone()
                 .unwrap_or_else(|| root.join("codestory.db"));
             s.is_indexing = true;
+            s.index_freshness_cache = None;
             (root, storage_path)
         };
 
@@ -8043,9 +8055,20 @@ impl AppController {
         // Use a dedicated thread so callers can keep their runtime responsive.
         std::thread::spawn(move || {
             let indexing_started = std::time::Instant::now();
-            let result = match req.mode {
-                IndexMode::Full => index_full(&root, &storage_path, &events_tx, None),
-                IndexMode::Incremental => index_incremental(&root, &storage_path, &events_tx, None),
+            let result = match IndexWriterGuard::try_acquire(&storage_path) {
+                Ok(_writer_guard) => {
+                    let result = match req.mode {
+                        IndexMode::Full => index_full(&root, &storage_path, &events_tx, None),
+                        IndexMode::Incremental => {
+                            index_incremental(&root, &storage_path, &events_tx, None)
+                        }
+                    };
+                    result.and_then(|summary| {
+                        finish_incremental_run_marker(&summary, &storage_path)?;
+                        Ok(summary)
+                    })
+                }
+                Err(error) => Err(error),
             };
 
             match result {
@@ -8087,7 +8110,16 @@ impl AppController {
                 .clone()
                 .unwrap_or_else(|| root.join("codestory.db"));
             s.is_indexing = true;
+            s.index_freshness_cache = None;
             (root, storage_path)
+        };
+
+        let _writer_guard = match IndexWriterGuard::try_acquire(&storage_path) {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.state.lock().is_indexing = false;
+                return Err(error);
+            }
         };
 
         let result = match mode {
@@ -8098,9 +8130,12 @@ impl AppController {
         };
 
         match result {
-            Ok(summary) => {
-                self.finish_successful_indexing(summary, &storage_path, refresh_runtime_caches)
-            }
+            Ok(summary) => self.finish_successful_indexing(
+                summary,
+                &storage_path,
+                refresh_runtime_caches,
+                cancel_token,
+            ),
             Err(error) => {
                 self.recover_failed_indexing(&storage_path, refresh_runtime_caches);
                 Err(error)
@@ -8113,6 +8148,7 @@ impl AppController {
         mut summary: IndexingRunSummary,
         storage_path: &Path,
         refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         // Drop any existing persisted search-index guard before rebuilding the index.
         self.clear_search_state();
@@ -8159,17 +8195,32 @@ impl AppController {
             cache_refresh_started.elapsed().as_millis(),
         ));
         apply_cache_refresh_stats(&mut summary.phase_timings, cache_stats);
+        if is_indexing_cancelled(cancel_token) {
+            self.clear_search_state();
+            self.state.lock().is_indexing = false;
+            return Err(indexing_cancelled_error());
+        }
+        if let Err(error) = finish_incremental_run_marker(&summary, storage_path) {
+            self.clear_search_state();
+            self.state.lock().is_indexing = false;
+            return Err(error);
+        }
         Ok(summary.phase_timings)
     }
 
     fn recover_failed_indexing(&self, storage_path: &Path, refresh_runtime_caches: bool) {
         if refresh_runtime_caches && let Ok(mut storage) = Storage::open(storage_path) {
-            self.clear_search_state();
-            let _ = refresh_caches(self, &mut storage, storage_path, None);
-            return;
+            let incomplete = storage.has_incomplete_incremental_run().unwrap_or(true);
+            if !incomplete {
+                self.clear_search_state();
+                let _ = refresh_caches(self, &mut storage, storage_path, None);
+                return;
+            }
         }
         self.clear_search_state();
-        self.state.lock().is_indexing = false;
+        let mut state = self.state.lock();
+        state.index_freshness_cache = None;
+        state.is_indexing = false;
     }
 
     pub fn run_indexing_blocking(&self, mode: IndexMode) -> Result<IndexingPhaseTimings, ApiError> {
@@ -8204,14 +8255,23 @@ impl AppController {
         let storage_path = self.require_storage_path()?;
         let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
+        let mut incomplete_incremental_run = false;
         let refresh_inputs = if storage_path.exists() {
             let store = Store::open(&storage_path)
                 .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+            incomplete_incremental_run = store.has_incomplete_incremental_run().map_err(|e| {
+                ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
+            })?;
             workspace_refresh_inputs(&store)?
         } else {
             RefreshInputs::default()
         };
-        let execution_plan = match mode {
+        let effective_mode = if mode == IndexMode::Incremental && incomplete_incremental_run {
+            IndexMode::Full
+        } else {
+            mode
+        };
+        let execution_plan = match effective_mode {
             IndexMode::Full => workspace.full_refresh_execution_plan().map_err(|e| {
                 ApiError::internal(format!("Failed to generate full refresh plan: {e}"))
             })?,
@@ -8230,7 +8290,7 @@ impl AppController {
         Ok(IndexDryRunDto {
             root: root.to_string_lossy().to_string(),
             storage_path: storage_path.to_string_lossy().to_string(),
-            refresh: mode,
+            refresh: effective_mode,
             files_to_index: execution_plan.files_to_index.len().min(u32::MAX as usize) as u32,
             files_to_remove: execution_plan.files_to_remove.len().min(u32::MAX as usize) as u32,
             sample_files_to_index: execution_plan
@@ -9548,22 +9608,8 @@ impl AppController {
     }
 
     pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
-        let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let storage_fingerprint = storage_fingerprint(&storage_path);
-        {
-            let state = self.state.lock();
-            if let Some(cached) = state.index_freshness_cache.as_ref()
-                && cached.root == root
-                && cached.storage_path == storage_path
-                && cached.storage_fingerprint == storage_fingerprint
-                && cached.cached_at.elapsed() < ttl
-            {
-                return Ok(cached.value.clone());
-            }
-        }
-
         let storage = self.open_storage()?;
         let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
@@ -9579,6 +9625,10 @@ impl AppController {
         workspace: &WorkspaceManifest,
         storage: &Storage,
     ) -> IndexFreshnessDto {
+        if !matches!(storage.has_incomplete_incremental_run(), Ok(false)) {
+            self.state.lock().index_freshness_cache = None;
+            return index_freshness_from_storage(root, workspace, storage);
+        }
         let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
         let storage_fingerprint = storage_fingerprint(storage_path);
         {
@@ -10479,6 +10529,81 @@ fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
 struct IndexingRunSummary {
     phase_timings: IndexingPhaseTimings,
     llm_refresh_scope: Option<HashSet<codestory_contracts::graph::NodeId>>,
+    finalize_incremental_run: bool,
+}
+
+struct IndexWriterGuard {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl IndexWriterGuard {
+    fn try_acquire(storage_path: &Path) -> Result<Self, ApiError> {
+        let path = storage_path.with_extension("index-writer.lock");
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to create index writer lock directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to open index writer lock {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if !FileExt::try_lock_exclusive(&file).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to acquire index writer lock {}: {error}",
+                path.display()
+            ))
+        })? {
+            return Err(ApiError::new(
+                "cache_busy",
+                format!(
+                    "Another indexing run owns the writer lock at {}. Wait for it to finish and retry.",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(Self { file, path })
+    }
+}
+
+impl Drop for IndexWriterGuard {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(
+                path = %self.path.display(),
+                "Failed to unlock index writer lock: {error}"
+            );
+        }
+    }
+}
+
+fn finish_incremental_run_marker(
+    summary: &IndexingRunSummary,
+    storage_path: &Path,
+) -> Result<(), ApiError> {
+    if !summary.finalize_incremental_run {
+        return Ok(());
+    }
+    let storage = Storage::open(storage_path)
+        .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
+    storage
+        .finish_incremental_run()
+        .map_err(|e| ApiError::internal(format!("Failed to clear incomplete index marker: {e}")))
 }
 
 fn index_full(
@@ -10487,6 +10612,34 @@ fn index_full(
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<IndexingRunSummary, ApiError> {
+    let recovering_incomplete_run = if storage_path.exists() {
+        match Storage::database_schema_version(storage_path) {
+            Ok(version) if version > codestory_store::CURRENT_SCHEMA_VERSION => {
+                Storage::database_has_incomplete_incremental_run(storage_path).map_err(|error| {
+                    ApiError::internal(format!("Failed to inspect live storage: {error}"))
+                })?
+            }
+            Ok(_) => match Storage::database_has_incomplete_incremental_run(storage_path) {
+                Ok(marked) => marked,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %storage_path.display(),
+                        "Live storage could not be inspected; rebuilding without copying derived state: {error}"
+                    );
+                    true
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    path = %storage_path.display(),
+                    "Live storage schema could not be read; rebuilding without copying derived state: {error}"
+                );
+                true
+            }
+        }
+    } else {
+        false
+    };
     let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
     let execution_plan = workspace
@@ -10500,7 +10653,7 @@ fn index_full(
 
     let mut staged = SnapshotStore::open_staged(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open staged storage: {e}")))?;
-    let can_copy_forward = storage_path.exists();
+    let can_copy_forward = !recovering_incomplete_run && storage_path.exists();
 
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
@@ -10569,6 +10722,28 @@ fn index_full(
     };
     let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
+    let detail_snapshot_ms = if recovering_incomplete_run {
+        let started = Instant::now();
+        if let Err(err) = staged.snapshots().refresh_detail() {
+            let _ = staged.discard();
+            return Err(ApiError::internal(format!(
+                "Failed to finalize staged recovery detail snapshots: {err}"
+            )));
+        }
+        Some(clamp_u128_to_u32(started.elapsed().as_millis()))
+    } else {
+        None
+    };
+    if is_indexing_cancelled(cancel_token) {
+        let _ = staged.discard();
+        return Err(indexing_cancelled_error());
+    }
+    if recovering_incomplete_run && let Err(err) = staged.store_mut().begin_incremental_run() {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to preserve incomplete marker through staged recovery: {err}"
+        )));
+    }
     let staged_path = staged.path().to_path_buf();
     let publish_started = std::time::Instant::now();
     if let Err(err) = staged.publish(storage_path) {
@@ -10609,7 +10784,7 @@ fn index_full(
             semantic_dense_unstructured_doc: None,
             deferred_indexes_ms: Some(deferred_indexes_ms),
             summary_snapshot_ms: Some(summary_snapshot_ms),
-            detail_snapshot_ms: None,
+            detail_snapshot_ms,
             publish_ms: Some(publish_ms),
             setup_existing_projection_ids_ms: resolution_telemetry.setup_existing_projection_ids_ms,
             setup_seed_symbol_table_ms: resolution_telemetry.setup_seed_symbol_table_ms,
@@ -10671,6 +10846,7 @@ fn index_full(
             resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
         },
         llm_refresh_scope: None,
+        finalize_incremental_run: recovering_incomplete_run,
     })
 }
 
@@ -10728,6 +10904,26 @@ where
     let mut store = Store::open(storage_path)
         .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
 
+    if store.has_incomplete_incremental_run().map_err(|e| {
+        ApiError::internal(format!("Failed to inspect incomplete index marker: {e}"))
+    })? {
+        let _ = events_tx.send(AppEventPayload::StatusUpdate {
+            message: "A prior incremental index run was interrupted; rebuilding through staged full recovery."
+                .to_string(),
+        });
+        drop(store);
+        return index_full(root, storage_path, events_tx, cancel_token);
+    }
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
+    store.begin_incremental_run().map_err(|e| {
+        ApiError::internal(format!("Failed to persist incomplete index marker: {e}"))
+    })?;
+    store.invalidate_grounding_snapshots().map_err(|e| {
+        ApiError::internal(format!("Failed to invalidate derived index snapshots: {e}"))
+    })?;
+
     let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
 
@@ -10742,6 +10938,11 @@ where
     let bus = EventBus::new();
     let forwarder = spawn_progress_forwarder(bus.receiver(), events_tx.clone());
 
+    if is_indexing_cancelled(cancel_token) {
+        drop(bus);
+        let _ = forwarder.join();
+        return Err(indexing_cancelled_error());
+    }
     let indexer = V2WorkspaceIndexer::new(root.to_path_buf());
     let result = indexer.run(&mut store, &execution_plan, &bus, cancel_token);
 
@@ -10760,6 +10961,9 @@ where
     })?;
     let summary_snapshot_ms = snapshot_refresh_stats.summary_snapshot_ms;
     let detail_snapshot_ms = snapshot_refresh_stats.detail_snapshot_ms;
+    if is_indexing_cancelled(cancel_token) {
+        return Err(indexing_cancelled_error());
+    }
     let resolution_telemetry = OptionalResolutionTelemetry::from_incremental_stats(&index_stats);
 
     let mut llm_refresh_scope = HashSet::new();
@@ -10869,6 +11073,7 @@ where
             resolved_imports_semantic: resolution_telemetry.resolved_imports_semantic,
         },
         llm_refresh_scope: Some(llm_refresh_scope),
+        finalize_incremental_run: true,
     })
 }
 
@@ -10883,11 +11088,13 @@ fn indexing_cancelled_error() -> ApiError {
 }
 
 fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
-    let files = store
-        .files()
-        .get_files()
-        .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?;
-    Ok(refresh_inputs_from_files(files))
+    Ok(RefreshInputs {
+        stored_files: store
+            .files()
+            .inventory()
+            .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?,
+        inventory: Default::default(),
+    })
 }
 
 fn rebuild_search_state_from_storage(
@@ -11048,6 +11255,53 @@ mod tests {
             !indexable_source_path(Path::new("target/run-output.log")),
             "runtime freshness should not count unsupported output artifacts"
         );
+    }
+
+    #[test]
+    fn parser_partial_freshness_distinguishes_file_level_errors() {
+        let project = tempdir().expect("project");
+        let source_path = project.path().join("lib.rs");
+        fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let modification_time = fs::metadata(&source_path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time,
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert parser-partial file");
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(freshness.changed_file_count, 0);
+
+        storage
+            .insert_error(&codestory_contracts::graph::ErrorInfo {
+                message: "read failed".into(),
+                file_id: Some(codestory_contracts::graph::NodeId(1)),
+                line: None,
+                column: None,
+                is_fatal: true,
+                index_step: codestory_contracts::graph::IndexStep::Indexing,
+            })
+            .expect("file error");
+        let retry = index_freshness_from_storage(project.path(), &workspace, &storage);
+        assert_eq!(retry.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(retry.changed_file_count, 1);
     }
 
     struct HybridTestEnv {
@@ -14845,6 +15099,184 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn unchanged_incremental_refresh_rebuilds_previous_semantic_doc_schema() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let mut contaminated_docs = Storage::open(&storage_path)
+            .expect("open storage before schema downgrade")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs before schema downgrade");
+        assert!(
+            !contaminated_docs.is_empty(),
+            "fixture should persist semantic docs"
+        );
+        for doc in &mut contaminated_docs {
+            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
+            doc.doc_text
+                .push_str("domain_aliases: benchmark-shaped legacy text\n");
+            doc.doc_shape = doc.doc_shape.as_ref().map(|shape| {
+                shape.replace(
+                    &format!("semantic_doc_version={LLM_SYMBOL_DOC_SCHEMA_VERSION}"),
+                    &format!("semantic_doc_version={}", LLM_SYMBOL_DOC_SCHEMA_VERSION - 1),
+                )
+            });
+        }
+        let contaminated_count = contaminated_docs.len();
+        Storage::open(&storage_path)
+            .expect("reopen storage for schema downgrade")
+            .upsert_llm_symbol_docs_batch(&contaminated_docs)
+            .expect("persist downgraded semantic docs");
+
+        let mut contaminated_symbol_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs before schema downgrade")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs before schema downgrade");
+        assert!(
+            !contaminated_symbol_docs.is_empty(),
+            "fixture should persist graph-native semantic docs"
+        );
+        for doc in &mut contaminated_symbol_docs {
+            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
+            doc.doc_text
+                .push_str("domain_aliases: benchmark-shaped legacy text\n");
+        }
+        let contaminated_symbol_count = contaminated_symbol_docs.len();
+        Storage::open(&storage_path)
+            .expect("reopen storage for graph-native schema downgrade")
+            .upsert_symbol_search_docs_batch(&contaminated_symbol_docs)
+            .expect("persist downgraded graph-native semantic docs");
+
+        let repair_timings = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("unchanged incremental refresh repairs semantic doc schema");
+        assert!(
+            repair_timings.semantic_docs_embedded.unwrap_or(0)
+                >= clamp_usize_to_u32(contaminated_count),
+            "schema drift must expand an empty incremental scope and rebuild all semantic docs"
+        );
+        assert!(
+            repair_timings.symbol_search_docs_written.unwrap_or(0)
+                >= clamp_usize_to_u32(contaminated_symbol_count),
+            "schema drift must rebuild all graph-native semantic docs"
+        );
+
+        let repaired_docs = Storage::open(&storage_path)
+            .expect("open storage after schema repair")
+            .get_all_llm_symbol_docs()
+            .expect("semantic docs after schema repair");
+        assert!(
+            repaired_docs.iter().all(|doc| {
+                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
+                    && !doc.doc_text.contains("domain_aliases:")
+            }),
+            "unchanged incremental repair should replace every previous-schema semantic document"
+        );
+        let repaired_symbol_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs after schema repair")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs after schema repair");
+        assert!(
+            repaired_symbol_docs.iter().all(|doc| {
+                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    && !doc.doc_text.contains("domain_aliases:")
+            }),
+            "unchanged incremental repair should replace every previous-schema graph-native semantic document"
+        );
+    }
+
+    #[test]
+    fn unchanged_incremental_refresh_repairs_graph_docs_without_embedding_runtime() {
+        let mut env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let mut contaminated_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs before schema downgrade")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs before schema downgrade");
+        assert!(
+            !contaminated_docs.is_empty(),
+            "fixture should persist graph-native semantic docs"
+        );
+        for doc in &mut contaminated_docs {
+            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
+            doc.doc_text
+                .push_str("domain_aliases: benchmark-shaped legacy text\n");
+        }
+        let contaminated_count = contaminated_docs.len();
+        Storage::open(&storage_path)
+            .expect("reopen storage for graph-native schema downgrade")
+            .upsert_symbol_search_docs_batch(&contaminated_docs)
+            .expect("persist downgraded graph-native semantic docs");
+
+        env.push(EnvGuard::set(
+            EMBEDDING_RUNTIME_MODE_ENV,
+            "unavailable-test-backend",
+        ));
+        env.push(EnvGuard::set(
+            EMBEDDING_BACKEND_ENV,
+            "unavailable-test-backend",
+        ));
+        let reopened = AppController::new();
+        reopened
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("reopen project without embedding runtime");
+        let repair_timings = reopened
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("unchanged incremental refresh repairs graph-native docs");
+        assert_eq!(
+            repair_timings.semantic_docs_embedded.unwrap_or(0),
+            0,
+            "unavailable embedding runtime should not fabricate dense semantic rebuilds"
+        );
+        assert!(
+            repair_timings.symbol_search_docs_written.unwrap_or(0)
+                >= clamp_usize_to_u32(contaminated_count),
+            "graph-native schema repair must not depend on a dense embedding runtime"
+        );
+
+        let repaired_docs = Storage::open(&storage_path)
+            .expect("open graph-native docs after no-embedding repair")
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("graph-native docs after no-embedding repair");
+        assert!(
+            repaired_docs.iter().all(|doc| {
+                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
+                    && !doc.doc_text.contains("domain_aliases:")
+            }),
+            "no-embedding repair should replace every previous-schema graph-native semantic document"
+        );
+    }
+
+    #[test]
     fn full_refresh_repairs_reused_semantic_docs_missing_contract_metadata() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -16353,6 +16785,7 @@ fn build_llm_symbol_doc_text() -> String {
         IndexingRunSummary {
             phase_timings: IndexingPhaseTimings::default(),
             llm_refresh_scope: None,
+            finalize_incremental_run: false,
         }
     }
 
@@ -16369,11 +16802,128 @@ fn build_llm_symbol_doc_text() -> String {
         }
 
         let timings = controller
-            .finish_successful_indexing(empty_indexing_run_summary(), &storage_path, true)
+            .finish_successful_indexing(empty_indexing_run_summary(), &storage_path, true, None)
             .expect("cache refresh should succeed");
 
         assert!(timings.cache_refresh_ms.is_some());
         assert!(!controller.state.lock().is_indexing);
+    }
+
+    #[test]
+    fn incremental_cache_rebuild_failure_keeps_incomplete_marker() {
+        let temp = tempdir().expect("create temp dir");
+        let storage_path = temp.path().join("codestory.db");
+        {
+            let mut storage = Storage::open(&storage_path).expect("seed storage");
+            storage
+                .insert_nodes_batch(&[Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "value".into(),
+                    ..Default::default()
+                }])
+                .expect("seed node");
+            storage
+                .begin_incremental_run()
+                .expect("mark incremental incomplete");
+            storage
+                .get_connection()
+                .execute_batch(
+                    "CREATE TRIGGER fail_search_projection_rebuild
+                     BEFORE INSERT ON search_symbol_projection
+                     BEGIN SELECT RAISE(ABORT, 'forced search projection failure'); END;",
+                )
+                .expect("install cache rebuild fault");
+        }
+        let controller = AppController::new();
+        controller.state.lock().is_indexing = true;
+        let mut summary = empty_indexing_run_summary();
+        summary.finalize_incremental_run = true;
+
+        let error = controller
+            .finish_successful_indexing(summary, &storage_path, false, None)
+            .expect_err("cache rebuild failure must fail indexing");
+
+        assert!(error.message.contains("forced search projection failure"));
+        let storage = Storage::open(&storage_path).expect("reopen interrupted storage");
+        assert!(
+            storage
+                .has_incomplete_incremental_run()
+                .expect("marker after cache failure")
+        );
+        assert_ne!(
+            Storage::database_schema_version(&storage_path).expect("schema fence"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        assert!(!controller.state.lock().is_indexing);
+    }
+
+    #[test]
+    fn staged_recovery_cache_failure_keeps_replacement_database_marked() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+        Storage::open(&storage_path)
+            .expect("open storage")
+            .begin_incremental_run()
+            .expect("simulate interrupted incremental");
+
+        let search_path = search_index_storage_path(&storage_path);
+        if search_path.is_dir() {
+            fs::remove_dir_all(&search_path).expect("remove search directory");
+        }
+        fs::write(&search_path, b"not a search directory").expect("block search rebuild path");
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("explicit full recovery cache rebuild must fail");
+
+        assert!(
+            error.message.contains("search"),
+            "unexpected error: {error:?}"
+        );
+        let storage = Storage::open(&storage_path).expect("open replacement database");
+        assert!(
+            storage
+                .has_incomplete_incremental_run()
+                .expect("replacement marker")
+        );
+        assert!(
+            storage
+                .snapshots()
+                .has_ready_summary()
+                .expect("replacement summary readiness")
+                && storage
+                    .snapshots()
+                    .has_ready_detail()
+                    .expect("replacement detail readiness"),
+            "recovery publish must complete both snapshot tiers before cache finalization"
+        );
+        assert_ne!(
+            Storage::database_schema_version(&storage_path).expect("replacement schema"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            controller
+                .index_freshness()
+                .expect("recovery freshness")
+                .status,
+            IndexFreshnessStatusDto::Stale
+        );
     }
 
     #[test]
@@ -16393,7 +16943,7 @@ fn build_llm_symbol_doc_text() -> String {
         }
 
         let error = controller
-            .finish_successful_indexing(empty_indexing_run_summary(), &storage_path, true)
+            .finish_successful_indexing(empty_indexing_run_summary(), &storage_path, true, None)
             .expect_err("storage reopen failure should propagate");
 
         assert_eq!(error.code, "internal");
@@ -16415,6 +16965,324 @@ fn build_llm_symbol_doc_text() -> String {
 
         assert_eq!(error.code, "invalid_argument");
         assert!(!controller.state.lock().is_indexing);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum IncrementalFailureBoundary {
+        Cleanup,
+        Resolution,
+        SnapshotRefresh,
+        MarkerClear,
+    }
+
+    fn incremental_failure_trigger(boundary: IncrementalFailureBoundary) -> &'static str {
+        match boundary {
+            IncrementalFailureBoundary::Cleanup => {
+                "CREATE TRIGGER fail_incremental_boundary
+                 BEFORE DELETE ON file
+                 BEGIN SELECT RAISE(ABORT, 'forced cleanup failure'); END;"
+            }
+            IncrementalFailureBoundary::Resolution => {
+                "CREATE TRIGGER fail_incremental_boundary
+                 BEFORE UPDATE OF resolved_source_node_id ON edge
+                 WHEN NEW.resolved_source_node_id IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'forced resolution failure'); END;"
+            }
+            IncrementalFailureBoundary::SnapshotRefresh => {
+                "CREATE TRIGGER fail_incremental_boundary
+                 BEFORE INSERT ON grounding_node_snapshot
+                 BEGIN SELECT RAISE(ABORT, 'forced snapshot failure'); END;"
+            }
+            IncrementalFailureBoundary::MarkerClear => {
+                "CREATE TRIGGER fail_incremental_boundary
+                 BEFORE DELETE ON incomplete_index_run
+                 BEGIN SELECT RAISE(ABORT, 'forced marker clear failure'); END;"
+            }
+        }
+    }
+
+    fn incremental_failure_message(boundary: IncrementalFailureBoundary) -> &'static str {
+        match boundary {
+            IncrementalFailureBoundary::Cleanup => "forced cleanup failure",
+            IncrementalFailureBoundary::Resolution => "forced resolution failure",
+            IncrementalFailureBoundary::SnapshotRefresh => "forced snapshot failure",
+            IncrementalFailureBoundary::MarkerClear => "forced marker clear failure",
+        }
+    }
+
+    fn assert_interrupted_incremental_recovers(boundary: IncrementalFailureBoundary) {
+        let workspace = tempdir().expect("workspace dir");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let old_path = workspace.path().join("old.rs");
+        let new_path = workspace.path().join("new.rs");
+        fs::write(&old_path, "pub fn old_value() -> i32 { 1 }\n").expect("write old source");
+
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        fs::remove_file(&old_path).expect("remove old source");
+        fs::write(
+            &new_path,
+            "pub fn caller() -> i32 { target() }\npub fn target() -> i32 { 2 }\n",
+        )
+        .expect("write new source");
+        {
+            let storage = Storage::open(&storage_path).expect("open storage for fault trigger");
+            storage
+                .get_connection()
+                .execute_batch(incremental_failure_trigger(boundary))
+                .expect("install fault trigger");
+        }
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect_err("incremental boundary fault must fail the run");
+        assert_eq!(error.code, "internal", "boundary={boundary:?}: {error:?}");
+        assert!(
+            error
+                .message
+                .contains(incremental_failure_message(boundary)),
+            "wrong failure boundary for {boundary:?}: {error:?}"
+        );
+
+        {
+            let storage = Storage::open(&storage_path).expect("reopen interrupted storage");
+            assert!(
+                storage
+                    .has_incomplete_incremental_run()
+                    .expect("read incomplete marker"),
+                "boundary={boundary:?}"
+            );
+            assert_ne!(
+                Storage::database_schema_version(&storage_path).expect("schema version"),
+                codestory_store::CURRENT_SCHEMA_VERSION,
+                "interrupted state must remain fenced from older runtimes"
+            );
+            assert!(
+                storage
+                    .get_file_by_path(&new_path)
+                    .expect("read new file")
+                    .is_some(),
+                "projection flush must commit before boundary={boundary:?}"
+            );
+            match boundary {
+                IncrementalFailureBoundary::Cleanup => assert!(
+                    storage
+                        .get_file_by_path(&old_path)
+                        .expect("read old file")
+                        .is_some(),
+                    "cleanup trigger should preserve the removed-file row"
+                ),
+                IncrementalFailureBoundary::Resolution
+                | IncrementalFailureBoundary::SnapshotRefresh
+                | IncrementalFailureBoundary::MarkerClear => assert!(
+                    storage
+                        .get_file_by_path(&old_path)
+                        .expect("read old file")
+                        .is_none(),
+                    "cleanup must commit before boundary={boundary:?}"
+                ),
+            }
+            if matches!(boundary, IncrementalFailureBoundary::SnapshotRefresh) {
+                assert!(
+                    storage
+                        .get_edges()
+                        .expect("read edges")
+                        .iter()
+                        .any(|edge| edge.resolved_target.is_some()),
+                    "resolution must commit before snapshot refresh"
+                );
+            }
+            if matches!(boundary, IncrementalFailureBoundary::MarkerClear) {
+                assert!(
+                    storage
+                        .snapshots()
+                        .has_ready_summary()
+                        .expect("summary readiness")
+                );
+                assert!(
+                    storage
+                        .snapshots()
+                        .has_ready_detail()
+                        .expect("detail readiness")
+                );
+            }
+        }
+
+        let recovery = AppController::new();
+        let summary = recovery
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open interrupted project");
+        let freshness = summary.freshness.expect("summary freshness");
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(
+            freshness.reason.as_deref(),
+            Some("previous_incremental_run_incomplete_full_refresh_required")
+        );
+        let dry_run = recovery
+            .dry_run_index(IndexMode::Incremental)
+            .expect("dry-run recovery");
+        assert_eq!(dry_run.refresh, IndexMode::Full);
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open after dry run")
+                .has_incomplete_incremental_run()
+                .expect("marker after dry run"),
+            "dry-run must not mutate interrupted state"
+        );
+
+        let timings = recovery
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("staged full recovery");
+        assert!(
+            timings.publish_ms.is_some(),
+            "recovery must use staged full publish"
+        );
+        let storage = Storage::open(&storage_path).expect("open recovered storage");
+        assert!(
+            !storage
+                .has_incomplete_incremental_run()
+                .expect("marker after recovery")
+        );
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("recovered schema"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            recovery
+                .index_freshness()
+                .expect("recovered freshness")
+                .status,
+            IndexFreshnessStatusDto::Fresh
+        );
+    }
+
+    #[test]
+    fn interrupted_incremental_boundaries_fail_closed_and_recover_through_staged_full() {
+        for boundary in [
+            IncrementalFailureBoundary::Cleanup,
+            IncrementalFailureBoundary::Resolution,
+            IncrementalFailureBoundary::SnapshotRefresh,
+            IncrementalFailureBoundary::MarkerClear,
+        ] {
+            assert_interrupted_incremental_recovers(boundary);
+        }
+    }
+
+    #[test]
+    fn index_writer_lock_reports_cache_busy_and_releases_after_drop() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+
+        let guard = IndexWriterGuard::try_acquire(&storage_path).expect("first writer lock");
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("second writer must be excluded");
+        assert_eq!(error.code, "cache_busy");
+        assert!(!controller.state.lock().is_indexing);
+
+        drop(guard);
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("writer lock should be reusable after drop");
+    }
+
+    #[test]
+    fn cancelled_incremental_stays_marked_until_recovery() {
+        let workspace = tempdir().expect("workspace dir");
+        for index in 0..64 {
+            fs::write(
+                workspace.path().join(format!("module_{index}.rs")),
+                format!(
+                    "pub fn caller_{index}() {{ callee_{index}(); }}\npub fn callee_{index}() {{}}\n"
+                ),
+            )
+            .expect("write source");
+        }
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+
+        let events = controller.events();
+        let cancel_token = CancellationToken::new();
+        let cancel_from_progress = cancel_token.clone();
+        let canceller = std::thread::spawn(move || {
+            while let Ok(event) = events.recv_timeout(Duration::from_secs(10)) {
+                if let AppEventPayload::IndexingProgress { current, total } = event
+                    && current == total
+                {
+                    cancel_from_progress.cancel();
+                    return;
+                }
+            }
+            panic!("incremental progress did not reach the cancellation boundary");
+        });
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh_with_cancel(
+                IndexMode::Incremental,
+                &cancel_token,
+            )
+            .expect_err("cancelled incremental must fail visibly");
+        canceller.join().expect("progress canceller");
+        assert_eq!(error.code, "cancelled");
+        let storage = Storage::open(&storage_path).expect("open cancelled storage");
+        assert!(
+            storage
+                .has_incomplete_incremental_run()
+                .expect("cancelled marker")
+        );
+        drop(storage);
+
+        let recovery = AppController::new();
+        let summary = recovery
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open cancelled project");
+        assert_eq!(
+            summary.freshness.expect("cancelled freshness").status,
+            IndexFreshnessStatusDto::Stale
+        );
+        let timings = recovery
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("recover cancelled index");
+        assert!(timings.publish_ms.is_some());
+        let storage = Storage::open(&storage_path).expect("open recovered storage");
+        assert!(
+            !storage
+                .has_incomplete_incremental_run()
+                .expect("marker after recovery")
+        );
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -144,13 +143,7 @@ pub(crate) fn managed_root(cache_override: Option<&Path>) -> Result<PathBuf> {
     if let Some(cache_override) = cache_override {
         return Ok(cache_override.join(MANAGED_DIR_NAME));
     }
-    Ok(ProjectDirs::from("dev", "codestory", "codestory")
-        .map(|dirs| dirs.cache_dir().join(MANAGED_DIR_NAME))
-        .unwrap_or_else(|| {
-            std::env::temp_dir()
-                .join("codestory")
-                .join(MANAGED_DIR_NAME)
-        }))
+    Ok(codestory_retrieval::user_cache_root().join(MANAGED_DIR_NAME))
 }
 
 pub(crate) fn runtime_managed_root(cache_override: Option<&Path>) -> Result<PathBuf> {

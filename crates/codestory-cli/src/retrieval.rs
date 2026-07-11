@@ -198,12 +198,18 @@ pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
     if cmd.apply {
-        let report = codestory_retrieval::sidecar_gc_apply(&runtime.project_root)
-            .context("retrieval inventory apply")?;
+        let report = codestory_retrieval::sidecar_gc_apply_with_storage(
+            &runtime.project_root,
+            &runtime.storage_path,
+        )
+        .context("retrieval inventory apply")?;
         return emit_retrieval_gc(cmd.format, &report, cmd.output_file.as_deref());
     }
-    let report = codestory_retrieval::sidecar_inventory(&runtime.project_root)
-        .context("retrieval inventory")?;
+    let report = codestory_retrieval::sidecar_inventory_with_storage(
+        &runtime.project_root,
+        &runtime.storage_path,
+    )
+    .context("retrieval inventory")?;
     emit_retrieval_inventory(cmd.format, &report, cmd.output_file.as_deref())
 }
 
@@ -427,6 +433,8 @@ struct RetrievalIndexOutput<'a> {
     zoekt_stubbed: bool,
     qdrant_stubbed: bool,
     scip_stubbed: bool,
+    generation_retention_plan: &'a codestory_retrieval::GenerationRetentionPlan,
+    generation_retention: &'a codestory_retrieval::GenerationRetentionApplyReport,
 }
 
 fn emit_retrieval_index(
@@ -440,14 +448,21 @@ fn emit_retrieval_index(
         zoekt_stubbed: outcome.zoekt_stubbed,
         qdrant_stubbed: outcome.qdrant_stubbed,
         scip_stubbed: outcome.scip_stubbed,
+        generation_retention_plan: &outcome.generation_retention_plan,
+        generation_retention: &outcome.generation_retention,
     };
     let markdown = format!(
-        "# Retrieval index\n\n- project_id: `{}`\n- zoekt_version: `{}`\n- qdrant_collection: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n",
+        "# Retrieval index\n\n- project_id: `{}`\n- zoekt_version: `{}`\n- qdrant_collection: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n- retention_retained_bytes: {}\n- retention_reclaimable_bytes: {}\n- retention_removed_bytes: {}\n- retention_remaining_reclaimable_bytes: {}\n- retention_pruning_suppressed: {}\n",
         payload.manifest.project_id,
         payload.manifest.zoekt_version,
         payload.manifest.qdrant_collection,
         payload.manifest.scip_revision,
         payload.degraded_modes,
+        payload.generation_retention.retained_bytes,
+        payload.generation_retention.reclaimable_bytes,
+        payload.generation_retention.removed_bytes,
+        payload.generation_retention.remaining_reclaimable_bytes,
+        payload.generation_retention.pruning_suppressed,
     );
     emit(format, &payload, markdown, output_file)
 }
@@ -537,6 +552,13 @@ fn emit_retrieval_bootstrap(
         .prune_suppressed_reason
         .as_deref()
         .map(|reason| {
+            if reason
+                == codestory_retrieval::PRUNE_SUPPRESSED_POST_PUBLICATION_RETENTION
+            {
+                return format!(
+                    "\n- storage_repair_prune_suppressed: `{reason}` (valid generations are pruned only after a replacement is fully published)\n"
+                );
+            }
             format!(
                 "\n- storage_repair_prune_suppressed: `{reason}` (retention deletes skipped; set CODESTORY_RETRIEVAL_PRUNE_ON_SCAN_ERROR=1 to override)\n"
             )
@@ -727,6 +749,18 @@ fn emit_retrieval_inventory(
     if let Some(error) = report.docker_error.as_deref() {
         markdown.push_str(&format!("- docker_error: `{error}`\n"));
     }
+    if let Some(retention) = report.generation_retention.as_ref() {
+        markdown.push_str(&format!(
+            "- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
+            retention.retained_bytes, retention.reclaimable_bytes, retention.pruning_suppressed
+        ));
+        if !retention.errors.is_empty() {
+            markdown.push_str(&format!(
+                "- generation_retention_errors: `{}`\n",
+                retention.errors.join("; ")
+            ));
+        }
+    }
     if report.namespaces.is_empty() {
         markdown.push_str("\nNo sidecar namespaces found.\n");
     }
@@ -785,6 +819,22 @@ fn emit_retrieval_gc(
     );
     if let Some(error) = report.docker_error.as_deref() {
         markdown.push_str(&format!("- docker_error: `{error}`\n"));
+    }
+    if let Some(retention) = report.generation_retention.as_ref() {
+        markdown.push_str(&format!(
+            "- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_removed_bytes: {}\n- generation_retention_remaining_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
+            retention.retained_bytes,
+            retention.reclaimable_bytes,
+            retention.removed_bytes,
+            retention.remaining_reclaimable_bytes,
+            retention.pruning_suppressed
+        ));
+        if !retention.errors.is_empty() {
+            markdown.push_str(&format!(
+                "- generation_retention_errors: `{}`\n",
+                retention.errors.join("; ")
+            ));
+        }
     }
     markdown.push_str("\n## Removed namespaces\n");
     if report.removed.is_empty() {

@@ -455,14 +455,12 @@ pub fn probe_infrastructure_health_with_embedding_device(
 fn zoekt_capabilities(
     layout: &SidecarLayout,
     sidecar_generation: &str,
-    reachable: bool,
-    _zoekt_client: &ZoektClient,
+    sidecar_input_hash: &str,
 ) -> SidecarCapabilities {
     let shard_dir = crate::zoekt_index::shard_dir_for(&layout.zoekt_data_dir, sidecar_generation);
-    if !crate::zoekt_index::shard_has_lexical_index(&shard_dir) {
+    if !crate::zoekt_index::shard_has_lexical_index(&shard_dir, sidecar_input_hash) {
         return SidecarCapabilities::NONE;
     }
-    let _ = reachable;
     SidecarCapabilities {
         lexical: true,
         semantic: false,
@@ -610,12 +608,11 @@ pub fn probe_sidecar_health_with_embedding_device(
     let zoekt_client = ZoektClient::new(layout);
     let zoekt_probe = zoekt_client.health_probe();
     let sidecar_generation = manifest_sidecar_generation(&manifest);
-    let zoekt_capabilities = zoekt_capabilities(
-        layout,
-        sidecar_generation,
-        zoekt_probe.reachable,
-        &zoekt_client,
-    );
+    let sidecar_input_hash = manifest
+        .sidecar_input_hash
+        .as_deref()
+        .expect("manifest contract validation requires sidecar_input_hash");
+    let zoekt_capabilities = zoekt_capabilities(layout, sidecar_generation, sidecar_input_hash);
     let zoekt_stub = zoekt_probe.reachable && !zoekt_capabilities.lexical;
     let zoekt = ComponentHealth {
         name: "zoekt".into(),
@@ -804,6 +801,8 @@ fn zero_dense_qdrant_health(
 mod tests {
     use super::*;
     use crate::config::SidecarLayout;
+    use crate::test_support::retrieval_manifest_fixture;
+    use crate::zoekt_index::{build_zoekt_shard, lexical_input_fingerprint, shard_dir_for};
     use tempfile::TempDir;
 
     struct EnvGuard {
@@ -923,6 +922,37 @@ mod tests {
         assert_eq!(report.zoekt.capabilities, SidecarCapabilities::NONE);
         assert_eq!(report.qdrant.capabilities, SidecarCapabilities::NONE);
         assert_eq!(report.scip.capabilities, SidecarCapabilities::NONE);
+    }
+
+    #[test]
+    fn malformed_lexical_shard_cannot_report_full_readiness() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("write source");
+        let data = TempDir::new().expect("data");
+        let mut layout = SidecarLayout::from_env();
+        layout.zoekt_data_dir = data.path().to_path_buf();
+        let manifest = retrieval_manifest_fixture("testproject", "test-input");
+        let generation = manifest.sidecar_generation.as_deref().expect("generation");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        build_zoekt_shard(
+            project.path(),
+            None,
+            &layout.zoekt_data_dir,
+            generation,
+            &fingerprint,
+            "test-input",
+        )
+        .expect("build shard");
+        std::fs::write(
+            shard_dir_for(&layout.zoekt_data_dir, generation).join("lexical-index.jsonl"),
+            b"{not-json}\n",
+        )
+        .expect("corrupt shard");
+
+        let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
+
+        assert!(!report.zoekt.capabilities.lexical);
+        assert_ne!(report.retrieval_mode, "full");
     }
 
     #[test]
