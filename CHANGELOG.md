@@ -26,7 +26,9 @@
   the exact complete publication used by the response, and max grounding no
   longer writes missing detail snapshots into the live reader database. The
   status tool also reads readiness directly instead of recursively preflighting
-  itself and starting a competing refresh worker.
+  itself and starting a competing refresh worker. Incremental semantic
+  finalization now scopes itself to files materialized in the staged graph, so
+  changes to discovered files without graph collectors do not abort publication.
 - Closed packaged-proof stdio input before force-terminating the launcher so
   delegated Windows CLI processes exit and release managed binaries before
   temporary plugin data is removed.

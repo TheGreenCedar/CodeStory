@@ -11789,14 +11789,13 @@ where
                             "Failed to resolve indexed semantic scope for {}: {error}",
                             normalized_path.display()
                         ))
-                    })?
-                    .ok_or_else(|| {
-                        ApiError::internal(format!(
-                            "Indexed file is missing from staged semantic scope: {}",
-                            normalized_path.display()
-                        ))
                     })?;
-                llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
+                // Workspace refresh plans include discovered files that have no
+                // graph collector. Only files materialized in the staged graph
+                // can own semantic documents.
+                if let Some(file_info) = file_info {
+                    llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
+                }
             }
             for file_id in &execution_plan.files_to_remove {
                 llm_refresh_scope.insert(codestory_contracts::graph::NodeId(*file_id));
@@ -18705,6 +18704,64 @@ fn build_llm_symbol_doc_text() -> String {
         assert_ne!(third.generation_id, second.generation_id);
         assert_ne!(third.run_id, second.run_id);
         assert!(third.published_at_epoch_ms >= second.published_at_epoch_ms);
+    }
+
+    #[test]
+    fn incremental_publication_ignores_changed_files_without_graph_collectors() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn first_value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let instructions = workspace.path().join("AGENTS.md");
+        fs::write(&instructions, "# Initial instructions\n").expect("write instructions");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("first full publication");
+        let first = controller
+            .index_publication()
+            .expect("read first publication")
+            .expect("first publication identity");
+
+        fs::write(&instructions, "# Updated instructions\n").expect("update instructions");
+        let dry_run = controller
+            .dry_run_index(IndexMode::Incremental)
+            .expect("plan unsupported file refresh");
+        assert!(
+            dry_run
+                .sample_files_to_index
+                .iter()
+                .any(|path| path == "AGENTS.md"),
+            "the regression must exercise a discovered file in the refresh plan: {dry_run:?}"
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental publication after unsupported file change");
+        let second = controller
+            .index_publication()
+            .expect("read second publication")
+            .expect("second publication identity");
+
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(second.mode, IndexPublicationMode::Incremental);
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open published storage")
+                .get_file_by_path(&instructions)
+                .expect("look up unsupported file")
+                .is_none(),
+            "files without graph collectors should not be invented in semantic scope"
+        );
     }
 
     #[test]
