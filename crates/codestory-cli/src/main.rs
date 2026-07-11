@@ -2492,17 +2492,13 @@ pub(crate) fn wait_for_local_freshness(
         local_refresh_status::LocalRefreshLockAttempt::Acquired(lock) => lock,
         local_refresh_status::LocalRefreshLockAttempt::Busy(busy) => {
             let mut output = local_refresh_output_from_summary(&summary);
-            output.state = if busy.status.is_some() {
-                readiness::LocalRefreshState::Refreshing
-            } else {
-                readiness::LocalRefreshState::Skipped
-            };
+            output.state = readiness::LocalRefreshState::Refreshing;
             output.blocks_local_surfaces = true;
             output.readiness_status = ReadinessStatusDto::RepairIndex;
             output.reason = Some(if busy.status.is_some() {
                 "refreshing".to_string()
             } else {
-                "skipped_locked".to_string()
+                "refresh_lock_held".to_string()
             });
             if let Some(status) = busy.status {
                 output.phase = Some(status.phase);
@@ -2513,13 +2509,21 @@ pub(crate) fn wait_for_local_freshness(
             } else {
                 output.pid = busy.pid;
                 output.started_at_epoch_ms = busy.started_at_epoch_ms;
+                output.phase = Some("starting".to_string());
             }
             output.lock_path = Some(display::clean_path_string(
                 &busy.lock_path.to_string_lossy(),
             ));
+            attach_complete_publication(&mut output, &summary);
             return Ok((summary, Some(output)));
         }
     };
+    let summary = inspect_runtime.open_project_summary()?;
+    if !local_freshness_needs_refresh(&summary) {
+        let mut output = local_refresh_output_from_summary(&summary);
+        output.reason = Some("coalesced_refresh_completed".to_string());
+        return Ok((summary, Some(output)));
+    }
     let refresh_started_at_epoch_ms = lock.started_at_epoch_ms();
     let refresh_pid = lock.pid();
     let refresh_phase = "incremental_index";
@@ -2580,8 +2584,25 @@ pub(crate) fn wait_for_local_freshness(
             output.started_at_epoch_ms = Some(refresh_started_at_epoch_ms);
             output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
             output.last_failure_reason = Some(error_text);
+            attach_complete_publication(&mut output, &summary);
             Ok((summary, Some(output)))
         }
+    }
+}
+
+pub(crate) fn attach_complete_publication(
+    output: &mut readiness::LocalRefreshOutput,
+    summary: &ProjectSummary,
+) {
+    output.serving_publication = summary
+        .publication
+        .as_ref()
+        .and_then(|publication| serde_json::to_value(publication).ok());
+    if output.serving_publication.is_some()
+        && output.state == readiness::LocalRefreshState::Refreshing
+    {
+        output.blocks_local_surfaces = false;
+        output.readiness_status = ReadinessStatusDto::Ready;
     }
 }
 
@@ -14499,6 +14520,7 @@ mod tests {
             members: Vec::new(),
             retrieval: None,
             freshness: None,
+            publication: None,
         }
     }
 

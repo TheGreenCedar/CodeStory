@@ -49,6 +49,24 @@ pub struct ProjectSummary {
     pub retrieval: Option<RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<IndexFreshnessDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<IndexPublicationDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct IndexPublicationDto {
+    pub generation: u64,
+    pub generation_id: String,
+    pub run_id: String,
+    pub mode: IndexPublicationModeDto,
+    pub published_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPublicationModeDto {
+    Full,
+    Incremental,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

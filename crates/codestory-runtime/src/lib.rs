@@ -14,15 +14,16 @@ use codestory_contracts::api::{
     GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
     GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexMode, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
-    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
-    IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
-    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
-    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    IndexFreshnessStatusDto, IndexMode, IndexPublicationDto, IndexPublicationModeDto,
+    IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileLanguageCountDto,
+    IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
+    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
+    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
+    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
+    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
+    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
@@ -43,9 +44,10 @@ use codestory_indexer::{
     CancellationToken, IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
 use codestory_store::{
-    FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, IndexPublicationMode,
-    IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc, SymbolSummaryRecord,
+    CURRENT_SCHEMA_VERSION, FileInfo, GroundingEdgeKindCount, GroundingNodeRecord,
+    IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
+    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
+    SymbolSummaryRecord,
 };
 use codestory_workspace::{RefreshExecutionPlan, RefreshInputs, WorkspaceManifest};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -3293,6 +3295,7 @@ struct SearchStateBuildStats {
 }
 
 struct SearchStateBuildResult {
+    publication: Option<IndexPublicationRecord>,
     node_names: HashMap<codestory_contracts::graph::NodeId, String>,
     engine: SearchEngine,
     search_stats: SearchStateBuildStats,
@@ -3410,6 +3413,7 @@ fn build_search_state(
         }
     };
     Ok(SearchStateBuildResult {
+        publication: None,
         node_names,
         engine,
         search_stats,
@@ -4310,19 +4314,19 @@ fn prune_search_generations(
     Ok(())
 }
 
-fn ensure_search_symbol_projection(storage: &mut Storage) -> Result<u32, ApiError> {
-    let count = storage.get_search_symbol_projection_count().map_err(|e| {
-        ApiError::internal(format!(
-            "Failed to query search symbol projection count: {e}"
-        ))
-    })?;
-    if count > 0 {
-        return Ok(count);
+fn discard_unpublished_search_generation(
+    storage_path: &Path,
+    publication: &IndexPublicationRecord,
+) {
+    if matches!(
+        Store::database_index_publication(storage_path),
+        Ok(Some(live)) if live == *publication
+    ) {
+        return;
     }
-
-    storage
-        .rebuild_search_symbol_projection_from_node_table()
-        .map_err(|e| ApiError::internal(format!("Failed to rebuild search symbol projection: {e}")))
+    if let Ok(path) = search_index_path_for_publication(storage_path, Some(publication)) {
+        let _ = try_remove_search_generation(&path);
+    }
 }
 
 fn load_search_symbol_projection(
@@ -4357,71 +4361,51 @@ fn load_search_symbol_projection(
     Ok((node_names, entries))
 }
 
-fn build_search_engine_from_projection(
-    search_storage_path: &Path,
-    projection: &[SearchSymbolProjection],
-) -> Result<SearchEngine, ApiError> {
-    index_projection_into_search_engine(SearchEngine::new(Some(search_storage_path)), projection)
-}
-
-fn rebuild_search_engine_from_projection(
-    search_storage_path: &Path,
-    projection: &[SearchSymbolProjection],
-    existing: SearchEngine,
-) -> Result<SearchEngine, ApiError> {
-    index_projection_into_search_engine(
-        SearchEngine::recreate_persisted_from_existing(search_storage_path, existing),
-        projection,
-    )
-}
-
-fn index_projection_into_search_engine(
-    engine: anyhow::Result<SearchEngine>,
-    projection: &[SearchSymbolProjection],
-) -> Result<SearchEngine, ApiError> {
-    let mut engine =
-        engine.map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
-    let mut search_nodes = Vec::with_capacity(projection.len().min(SEARCH_NODE_BATCH_SIZE));
-    for entry in projection {
-        search_nodes.push((entry.node_id, entry.display_name.clone()));
-        if search_nodes.len() >= SEARCH_NODE_BATCH_SIZE {
-            engine
-                .index_nodes(std::mem::take(&mut search_nodes))
-                .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
-        }
-    }
-    if !search_nodes.is_empty() {
-        engine
-            .index_nodes(search_nodes)
-            .map_err(|e| ApiError::internal(format!("Failed to index search nodes: {e}")))?;
-    }
-    Ok(engine)
+struct LoadedSearchState {
+    publication: Option<IndexPublicationRecord>,
+    node_names: HashMap<codestory_contracts::graph::NodeId, String>,
+    engine: SearchEngine,
 }
 
 fn load_persisted_search_state(
     storage: &mut Storage,
     storage_path: &Path,
-) -> Result<
-    (
-        HashMap<codestory_contracts::graph::NodeId, String>,
-        SearchEngine,
-    ),
-    ApiError,
-> {
+) -> Result<LoadedSearchState, ApiError> {
     let _catalog_guard = SearchGenerationCatalogGuard::acquire(storage_path)?;
-    *storage = Storage::open(storage_path).map_err(|error| {
+    *storage = open_storage_for_read(storage_path)?;
+    let publication = storage.get_complete_index_publication().map_err(|error| {
         ApiError::internal(format!(
-            "Failed to reopen storage under search generation catalog lock: {error}"
+            "Failed to read complete search publication identity: {error}"
         ))
     })?;
-    ensure_search_symbol_projection(storage)?;
+    if publication.is_none() {
+        let nodes = storage.get_nodes().map_err(|error| {
+            ApiError::internal(format!("Failed to load legacy search nodes: {error}"))
+        })?;
+        let mut node_names = HashMap::with_capacity(nodes.len());
+        let mut engine = SearchEngine::new(None).map_err(|error| {
+            ApiError::internal(format!("Failed to init search engine: {error}"))
+        })?;
+        let search_nodes = nodes
+            .iter()
+            .map(|node| {
+                let display_name = node_display_name(node);
+                node_names.insert(node.id, display_name.clone());
+                (node.id, display_name)
+            })
+            .collect();
+        engine.index_nodes(search_nodes).map_err(|error| {
+            ApiError::internal(format!("Failed to index legacy search nodes: {error}"))
+        })?;
+        load_persisted_semantic_docs(storage, &mut engine, false)?;
+        return Ok(LoadedSearchState {
+            publication: None,
+            node_names,
+            engine,
+        });
+    }
     let (node_names, projection) =
         load_search_symbol_projection(storage, SEARCH_SYMBOL_PROJECTION_BATCH_SIZE)?;
-    let publication = storage.get_index_publication().map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to read search publication identity: {error}"
-        ))
-    })?;
     let search_storage_path =
         search_index_path_for_publication(storage_path, publication.as_ref())?;
     let completion = publication.as_ref().and_then(|publication| {
@@ -4431,64 +4415,38 @@ fn load_persisted_search_state(
         read_search_generation_completion(&search_storage_path, &generation_id)
             .filter(|marker| marker.symbol_count == projection.len() as u64)
     });
-    let completion_missing = publication.is_some() && completion.is_none();
-
-    let (mut engine, rebuilt) = if projection.is_empty() || completion_missing {
-        (
-            build_search_engine_from_projection(search_storage_path.as_path(), &projection)?,
-            true,
-        )
-    } else {
-        let (mut engine, open_error) =
-            SearchEngine::open_existing_or_recreate(search_storage_path.as_path())
-                .map_err(|e| ApiError::internal(format!("Failed to init search engine: {e}")))?;
-        if let Some(error) = open_error {
-            tracing::warn!(
-                "Failed to open persisted search index at {}: {}. Rebuilding from projection.",
-                search_storage_path.display(),
-                error
-            );
-            (
-                index_projection_into_search_engine(Ok(engine), &projection)?,
-                true,
+    if publication.is_some() && completion.is_none() {
+        return Err(ApiError::new(
+            "cache_busy",
+            "The complete core publication does not yet have a completed search generation.",
+        ));
+    }
+    let mut engine =
+        SearchEngine::open_existing(search_storage_path.as_path()).map_err(|error| {
+            ApiError::new(
+                "cache_busy",
+                format!(
+                    "Failed to open completed search generation {}: {error}",
+                    search_storage_path.display()
+                ),
             )
-        } else {
-            engine.load_symbol_projection(
-                projection
-                    .iter()
-                    .map(|entry| (entry.node_id, entry.display_name.clone())),
-            );
-            let completion_count_mismatch = completion.as_ref().is_some_and(|marker| {
-                marker.tantivy_doc_count != engine.tantivy_doc_count() as u64
-            });
-            if engine.full_text_doc_count() != projection.len() || completion_count_mismatch {
-                tracing::warn!(
-                    "Persisted search index at {} has {} searchable docs and {} stored docs but projection has {}. Rebuilding from projection.",
-                    search_storage_path.display(),
-                    engine.full_text_doc_count(),
-                    engine.tantivy_doc_count(),
-                    projection.len()
-                );
-                (
-                    rebuild_search_engine_from_projection(
-                        search_storage_path.as_path(),
-                        &projection,
-                        engine,
-                    )?,
-                    true,
-                )
-            } else {
-                (engine, false)
-            }
-        }
-    };
-    if rebuilt && let Some(publication) = publication.as_ref() {
-        write_search_generation_completion(
-            &search_storage_path,
-            publication,
-            projection.len(),
-            engine.tantivy_doc_count(),
-        )?;
+        })?;
+    engine.load_symbol_projection(
+        projection
+            .iter()
+            .map(|entry| (entry.node_id, entry.display_name.clone())),
+    );
+    let completion_count_mismatch = completion
+        .as_ref()
+        .is_some_and(|marker| marker.tantivy_doc_count != engine.tantivy_doc_count() as u64);
+    if engine.full_text_doc_count() != projection.len() || completion_count_mismatch {
+        return Err(ApiError::new(
+            "cache_busy",
+            format!(
+                "Completed search generation {} does not match its core projection.",
+                search_storage_path.display()
+            ),
+        ));
     }
     if publication.is_some() {
         engine
@@ -4500,18 +4458,23 @@ fn load_persisted_search_state(
                 ))
             })?;
     }
-    let live_publication = Store::database_index_publication(storage_path).map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to revalidate live publication after loading persisted search: {error}"
-        ))
-    })?;
+    let live_publication =
+        Store::database_complete_index_publication(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to revalidate live publication after loading persisted search: {error}"
+            ))
+        })?;
     if live_publication != publication {
         return Err(ApiError::new(
             "cache_busy",
             "Core publication changed while persisted search state was loading. Retry against the new generation.",
         ));
     }
-    Ok((node_names, engine))
+    Ok(LoadedSearchState {
+        publication,
+        node_names,
+        engine,
+    })
 }
 
 fn reload_llm_docs_from_storage(
@@ -7702,6 +7665,7 @@ struct AppState {
     storage_path: Option<PathBuf>,
     node_names: HashMap<codestory_contracts::graph::NodeId, String>,
     search_engine: Option<SearchEngine>,
+    search_publication: Option<IndexPublicationRecord>,
     is_indexing: bool,
     index_freshness_cache: Option<CachedIndexFreshness>,
     #[cfg(test)]
@@ -7739,13 +7703,34 @@ fn storage_path_fingerprint(path: &Path) -> String {
     format!("len:{}:mtime_ms:{modified_ms}", metadata.len())
 }
 
-fn publish_search_engine(state: &mut AppState, engine: SearchEngine) {
+fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
+    let requires_initialization = !path.exists()
+        || Storage::database_schema_version(path)
+            .map(|version| version != CURRENT_SCHEMA_VERSION)
+            .map_err(|error| {
+                ApiError::internal(format!("Failed to inspect storage schema: {error}"))
+            })?;
+    let storage = if requires_initialization {
+        Storage::open(path)
+    } else {
+        Storage::open_read_only(path)
+    };
+    storage.map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
+}
+
+fn publish_search_engine(
+    state: &mut AppState,
+    engine: SearchEngine,
+    publication: Option<IndexPublicationRecord>,
+) {
     state.index_freshness_cache = None;
     state.search_engine = Some(engine);
+    state.search_publication = publication;
 }
 
 fn clear_search_engine(state: &mut AppState) {
     state.search_engine = None;
+    state.search_publication = None;
 }
 
 /// GUI-agnostic orchestrator for CodeStory.
@@ -7758,7 +7743,6 @@ fn clear_search_engine(state: &mut AppState) {
 pub struct AppController {
     state: Arc<Mutex<AppState>>,
     sidecar_query_cache: Arc<Mutex<SidecarQueryCacheState>>,
-    grounding_detail_refresh: Arc<Mutex<()>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
 }
@@ -7832,13 +7816,13 @@ impl AppController {
                 storage_path: None,
                 node_names: HashMap::new(),
                 search_engine: None,
+                search_publication: None,
                 is_indexing: false,
                 index_freshness_cache: None,
                 #[cfg(test)]
                 last_hybrid_instrumentation: None,
             })),
             sidecar_query_cache: Arc::new(Mutex::new(SidecarQueryCacheState::new())),
-            grounding_detail_refresh: Arc::new(Mutex::new(())),
             events_tx,
             events_rx,
         }
@@ -7904,6 +7888,11 @@ impl AppController {
             .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))
     }
 
+    fn open_storage_read_only(&self) -> Result<Storage, ApiError> {
+        let storage_path = self.require_storage_path()?;
+        open_storage_for_read(&storage_path)
+    }
+
     fn resolve_project_file_path(
         &self,
         path: &str,
@@ -7952,29 +7941,41 @@ impl AppController {
     }
 
     fn ensure_search_state(&self) -> Result<(), ApiError> {
+        let storage_path = self.require_storage_path()?;
+        let current_publication = Store::database_complete_index_publication(&storage_path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read current search publication: {error}"
+                ))
+            })?;
         {
             let s = self.state.lock();
-            if s.search_engine.is_some() {
+            if s.search_engine.is_some() && s.search_publication == current_publication {
                 return Ok(());
             }
         }
 
-        let storage_path = self.require_storage_path()?;
-        let mut storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-        let (node_names, engine) = load_persisted_search_state(&mut storage, &storage_path)?;
+        let mut attempts = 0;
+        let loaded = loop {
+            let mut storage = open_storage_for_read(&storage_path)?;
+            match load_persisted_search_state(&mut storage, &storage_path) {
+                Ok(state) => break state,
+                Err(error) if error.code == "cache_busy" && attempts == 0 => attempts += 1,
+                Err(error) => return Err(error),
+            }
+        };
 
         let mut s = self.state.lock();
-        if s.search_engine.is_none() {
-            s.node_names = node_names;
-            publish_search_engine(&mut s, engine);
+        if s.search_engine.is_none() || s.search_publication != loaded.publication {
+            s.node_names = loaded.node_names;
+            publish_search_engine(&mut s, loaded.engine, loaded.publication);
         }
 
         Ok(())
     }
 
     pub fn retrieval_state(&self) -> Result<RetrievalStateDto, ApiError> {
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         retrieval_state_from_storage(&storage)
     }
 
@@ -8450,7 +8451,7 @@ impl AppController {
         max_results: usize,
     ) -> Result<Vec<SearchHit>, ApiError> {
         self.ensure_search_state()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let (matches, node_names) = {
             let mut s = self.state.lock();
             let engine = s.search_engine.as_mut().ok_or_else(|| {
@@ -8502,6 +8503,14 @@ impl AppController {
         let members = workspace_member_storage_summaries(root, &workspace, storage)?;
         let freshness =
             self.cached_index_freshness_from_storage(root, storage_path, &workspace, storage);
+        let publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read complete index publication: {error}"
+                ))
+            })?
+            .map(index_publication_dto);
 
         Ok(ProjectSummary {
             root: root.to_string_lossy().to_string(),
@@ -8509,7 +8518,24 @@ impl AppController {
             members,
             retrieval: Some(retrieval_state_from_storage(storage)?),
             freshness: Some(freshness),
+            publication,
         })
+    }
+
+    pub fn complete_index_publication_at(
+        &self,
+        storage_path: &Path,
+    ) -> Result<Option<IndexPublicationDto>, ApiError> {
+        if !storage_path.is_file() {
+            return Ok(None);
+        }
+        Store::database_complete_index_publication(storage_path)
+            .map(|publication| publication.map(index_publication_dto))
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read complete index publication: {error}"
+                ))
+            })
     }
 
     fn open_project_summary_with_storage_inner(
@@ -8517,8 +8543,7 @@ impl AppController {
         root: PathBuf,
         storage_path: PathBuf,
     ) -> Result<ProjectSummary, ApiError> {
-        let storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+        let storage = open_storage_for_read(&storage_path)?;
         let summary = self.project_summary_from_storage(&root, &storage_path, &storage)?;
 
         {
@@ -8538,9 +8563,8 @@ impl AppController {
         root: PathBuf,
         storage_path: PathBuf,
     ) -> Result<ProjectSummary, ApiError> {
-        let mut storage = Storage::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-        let (node_names, engine) = load_persisted_search_state(&mut storage, &storage_path)?;
+        let mut storage = open_storage_for_read(&storage_path)?;
+        let loaded = load_persisted_search_state(&mut storage, &storage_path)?;
         let mut summary = self.project_summary_from_storage(&root, &storage_path, &storage)?;
         summary.retrieval = Some(retrieval_state_from_storage(&storage)?);
 
@@ -8548,8 +8572,8 @@ impl AppController {
             let mut s = self.state.lock();
             s.project_root = Some(root);
             s.storage_path = Some(storage_path);
-            s.node_names = node_names;
-            publish_search_engine(&mut s, engine);
+            s.node_names = loaded.node_names;
+            publish_search_engine(&mut s, loaded.engine, loaded.publication);
         }
         self.sidecar_query_cache.lock().clear();
 
@@ -8753,12 +8777,22 @@ impl AppController {
         mut summary: IndexingRunSummary,
         storage_path: &Path,
         refresh_runtime_caches: bool,
-        cancel_token: Option<&CancellationToken>,
+        _cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
-        // Drop any existing persisted search-index guard before rebuilding the index.
-        self.clear_search_state();
         let cache_refresh_started = Instant::now();
-        let cache_stats_result = if refresh_runtime_caches {
+        let cache_stats_result = if let Some(prepared) = summary.prepared_search_state.take() {
+            if refresh_runtime_caches {
+                Ok(publish_prepared_search_state(self, prepared))
+            } else {
+                self.clear_search_state();
+                self.state.lock().is_indexing = false;
+                Ok(CacheRefreshStats {
+                    search_stats: prepared.search_stats,
+                    semantic_stats: prepared.semantic_stats,
+                    runtime_cache_publish_ms: None,
+                })
+            }
+        } else if refresh_runtime_caches {
             (|| {
                 let mut storage = Storage::open(storage_path)
                     .map_err(|e| ApiError::internal(format!("Failed to reopen storage: {e}")))?;
@@ -8804,11 +8838,6 @@ impl AppController {
             cache_stats.semantic_stats = summary.staged_semantic_stats;
         }
         apply_cache_refresh_stats(&mut summary.phase_timings, cache_stats);
-        if is_indexing_cancelled(cancel_token) {
-            self.clear_search_state();
-            self.state.lock().is_indexing = false;
-            return Err(indexing_cancelled_error());
-        }
         if let Err(error) = finish_incremental_run_marker(&summary, storage_path) {
             self.clear_search_state();
             self.state.lock().is_indexing = false;
@@ -9517,7 +9546,7 @@ impl AppController {
         indexed_symbol_hits.truncate(limit_per_source);
         annotate_search_hit_match_quality(&query, &mut indexed_symbol_hits);
 
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let retrieval = retrieval_state_from_storage(&storage)?;
         let freshness = self.index_freshness().ok();
         let mut repo_text_hits = Vec::new();
@@ -9634,7 +9663,7 @@ impl AppController {
     pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
         self.ensure_consistent_read_state("Files")?;
         let root = self.require_project_root()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let mut files = storage
             .get_files()
             .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
@@ -9763,7 +9792,7 @@ impl AppController {
         let root = self.require_project_root()?;
         let depth = req.depth.unwrap_or(2).clamp(1, 8);
         let filter = req.filter.as_deref().map(normalize_path_key);
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let files = storage
             .get_files()
             .map_err(|e| ApiError::internal(format!("Failed to load indexed files: {e}")))?;
@@ -10219,7 +10248,7 @@ impl AppController {
     pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let freshness =
@@ -10233,6 +10262,17 @@ impl AppController {
         Store::database_index_publication(&storage_path).map_err(|error| {
             ApiError::internal(format!(
                 "Failed to read index publication identity: {error}"
+            ))
+        })
+    }
+
+    /// Return the durable publication only when the live database is not fenced
+    /// by an incomplete legacy incremental run.
+    pub fn complete_index_publication(&self) -> Result<Option<IndexPublicationRecord>, ApiError> {
+        let storage_path = self.require_storage_path()?;
+        Store::database_complete_index_publication(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read complete index publication: {error}"
             ))
         })
     }
@@ -10350,7 +10390,7 @@ impl AppController {
         request_weights: Option<AgentHybridWeightsDto>,
     ) -> Result<(Vec<HybridSearchScoredHit>, RetrievalStateDto), ApiError> {
         self.ensure_search_state()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let semantic_disabled = semantic_disabled_by_request_weights(request_weights.as_ref());
         let storage_retrieval = if semantic_disabled {
             None
@@ -10534,7 +10574,7 @@ impl AppController {
         req: ListRootSymbolsRequest,
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
         self.ensure_search_state()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
 
         let mut roots = storage
             .get_root_symbols()
@@ -10561,7 +10601,7 @@ impl AppController {
     ) -> Result<Vec<SymbolSummaryDto>, ApiError> {
         self.ensure_search_state()?;
         let parent_id = req.parent_id.to_core()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
 
         let mut children = storage
             .get_children_symbols(parent_id)
@@ -10616,7 +10656,7 @@ impl AppController {
     }
 
     pub fn graph_trail_filter_options(&self) -> Result<TrailFilterOptionsDto, ApiError> {
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let node_kinds = storage
             .get_present_node_kinds()
             .map_err(|e| ApiError::internal(format!("Failed to load node kinds: {e}")))?
@@ -10636,7 +10676,7 @@ impl AppController {
     }
 
     pub fn list_bookmark_categories(&self) -> Result<Vec<BookmarkCategoryDto>, ApiError> {
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let categories = storage
             .get_bookmark_categories()
             .map_err(|e| ApiError::internal(format!("Failed to load bookmark categories: {e}")))?;
@@ -10705,7 +10745,7 @@ impl AppController {
     }
 
     pub fn list_bookmarks(&self, category_id: Option<i64>) -> Result<Vec<BookmarkDto>, ApiError> {
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let bookmarks = storage
             .get_bookmarks(category_id)
             .map_err(|e| ApiError::internal(format!("Failed to load bookmarks: {e}")))?;
@@ -10817,7 +10857,7 @@ impl AppController {
         req: OpenDefinitionRequest,
     ) -> Result<SystemActionResponse, ApiError> {
         let node_id = req.node_id.to_core()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let node = storage
             .get_node(node_id)
             .map_err(|e| ApiError::internal(format!("Failed to load node: {e}")))?
@@ -10854,7 +10894,7 @@ impl AppController {
     pub fn node_details(&self, req: NodeDetailsRequest) -> Result<NodeDetailsDto, ApiError> {
         let id = req.id.to_core()?;
 
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
 
         let node = storage
             .get_node(id)
@@ -11017,7 +11057,7 @@ impl AppController {
         req: NodeOccurrencesRequest,
     ) -> Result<Vec<SourceOccurrenceDto>, ApiError> {
         let id = req.id.to_core()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let mut occurrences = storage
             .get_occurrences_for_node(id)
             .map_err(|e| ApiError::internal(format!("Failed to load node occurrences: {e}")))?
@@ -11043,7 +11083,7 @@ impl AppController {
         req: EdgeOccurrencesRequest,
     ) -> Result<Vec<SourceOccurrenceDto>, ApiError> {
         let id = req.id.to_core()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let mut occurrences = storage
             .get_occurrences_for_element(id.0)
             .map_err(|e| ApiError::internal(format!("Failed to load edge occurrences: {e}")))?
@@ -11144,13 +11184,13 @@ fn is_low_confidence_search_plan_bridge(bridge: &SearchPlanBridgeDto) -> bool {
     bridge.confidence == SearchPlanBridgeConfidenceDto::Low
 }
 
-#[derive(Debug, Clone)]
 struct IndexingRunSummary {
     phase_timings: IndexingPhaseTimings,
     staged_semantic_stats: SemanticProjectionStats,
     llm_refresh_scope: Option<HashSet<codestory_contracts::graph::NodeId>>,
     finalize_incremental_run: bool,
     publication: IndexPublicationRecord,
+    prepared_search_state: Option<SearchStateBuildResult>,
 }
 
 fn next_index_publication(
@@ -11170,6 +11210,19 @@ fn next_index_publication(
         mode,
         published_at_epoch_ms: current_epoch_ms(),
     })
+}
+
+fn index_publication_dto(publication: IndexPublicationRecord) -> IndexPublicationDto {
+    IndexPublicationDto {
+        generation: publication.generation,
+        generation_id: publication.generation_id,
+        run_id: publication.run_id,
+        mode: match publication.mode {
+            IndexPublicationMode::Full => IndexPublicationModeDto::Full,
+            IndexPublicationMode::Incremental => IndexPublicationModeDto::Incremental,
+        },
+        published_at_epoch_ms: publication.published_at_epoch_ms,
+    }
 }
 
 struct IndexWriterGuard {
@@ -11392,18 +11445,14 @@ fn index_full(
     };
     let deferred_indexes_ms = staged_finalize_stats.deferred_indexes_ms;
     let summary_snapshot_ms = staged_finalize_stats.summary_snapshot_ms;
-    let detail_snapshot_ms = if recovering_incomplete_run {
-        let started = Instant::now();
-        if let Err(err) = staged.snapshots().refresh_detail() {
-            let _ = staged.discard();
-            return Err(ApiError::internal(format!(
-                "Failed to finalize staged recovery detail snapshots: {err}"
-            )));
-        }
-        Some(clamp_u128_to_u32(started.elapsed().as_millis()))
-    } else {
-        None
-    };
+    let detail_started = Instant::now();
+    if let Err(err) = staged.snapshots().refresh_detail() {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to finalize staged detail snapshots: {err}"
+        )));
+    }
+    let detail_snapshot_ms = Some(clamp_u128_to_u32(detail_started.elapsed().as_millis()));
     if is_indexing_cancelled(cancel_token) {
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
@@ -11431,16 +11480,35 @@ fn index_full(
             "Failed to persist staged full publication identity: {error}"
         )));
     }
+    let prepared_search_state =
+        match rebuild_search_state_from_storage(staged.store_mut(), storage_path, None, false) {
+            Ok(state) => state,
+            Err(error) => {
+                let _ = staged.discard();
+                discard_unpublished_search_generation(storage_path, &publication);
+                return Err(error);
+            }
+        };
+    if is_indexing_cancelled(cancel_token) {
+        drop(prepared_search_state);
+        let _ = staged.discard();
+        discard_unpublished_search_generation(storage_path, &publication);
+        return Err(indexing_cancelled_error());
+    }
     let staged_path = staged.path().to_path_buf();
     let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
         Ok(guard) => guard,
         Err(error) => {
+            drop(prepared_search_state);
             let _ = staged.discard();
+            discard_unpublished_search_generation(storage_path, &publication);
             return Err(error);
         }
     };
     let publish_started = std::time::Instant::now();
     if let Err(err) = staged.publish(storage_path) {
+        drop(prepared_search_state);
+        discard_unpublished_search_generation(storage_path, &publication);
         return Err(ApiError::internal(format!(
             "Failed to publish staged storage: {err}. Preserved staged snapshot at {}",
             staged_path.display()
@@ -11543,6 +11611,7 @@ fn index_full(
         llm_refresh_scope: None,
         finalize_incremental_run: recovering_incomplete_run,
         publication,
+        prepared_search_state: Some(prepared_search_state),
     })
 }
 
@@ -11720,14 +11789,13 @@ where
                             "Failed to resolve indexed semantic scope for {}: {error}",
                             normalized_path.display()
                         ))
-                    })?
-                    .ok_or_else(|| {
-                        ApiError::internal(format!(
-                            "Indexed file is missing from staged semantic scope: {}",
-                            normalized_path.display()
-                        ))
                     })?;
-                llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
+                // Workspace refresh plans include discovered files that have no
+                // graph collector. Only files materialized in the staged graph
+                // can own semantic documents.
+                if let Some(file_info) = file_info {
+                    llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
+                }
             }
             for file_id in &execution_plan.files_to_remove {
                 llm_refresh_scope.insert(codestory_contracts::graph::NodeId(*file_id));
@@ -11802,16 +11870,39 @@ where
             "Failed to persist staged incremental publication identity: {error}"
         )));
     }
+    let prepared_search_state = match rebuild_search_state_from_storage(
+        staged.store_mut(),
+        storage_path,
+        Some(&llm_refresh_scope),
+        false,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = staged.discard();
+            discard_unpublished_search_generation(storage_path, &publication);
+            return Err(error);
+        }
+    };
+    if is_indexing_cancelled(cancel_token) {
+        drop(prepared_search_state);
+        let _ = staged.discard();
+        discard_unpublished_search_generation(storage_path, &publication);
+        return Err(indexing_cancelled_error());
+    }
     let staged_path = staged.path().to_path_buf();
     let _catalog_guard = match SearchGenerationCatalogGuard::acquire(storage_path) {
         Ok(guard) => guard,
         Err(error) => {
+            drop(prepared_search_state);
             let _ = staged.discard();
+            discard_unpublished_search_generation(storage_path, &publication);
             return Err(error);
         }
     };
     let publish_started = Instant::now();
     if let Err(error) = staged.publish(storage_path) {
+        drop(prepared_search_state);
+        discard_unpublished_search_generation(storage_path, &publication);
         return Err(ApiError::internal(format!(
             "Failed to publish staged incremental storage: {error}. Preserved staged snapshot at {}",
             staged_path.display()
@@ -11914,6 +12005,7 @@ where
         llm_refresh_scope: Some(llm_refresh_scope),
         finalize_incremental_run: true,
         publication,
+        prepared_search_state: Some(prepared_search_state),
     })
 }
 
@@ -12004,6 +12096,7 @@ fn reuse_completed_search_state(
     let search_symbol_index_ms = clamp_u128_to_u32(search_index_started.elapsed().as_millis());
     let semantic_stats = load_persisted_semantic_docs(storage, &mut engine, hydrate_semantic_docs)?;
     Ok(Some(SearchStateBuildResult {
+        publication: Some(publication.clone()),
         node_names,
         engine,
         search_stats: SearchStateBuildStats {
@@ -12090,6 +12183,7 @@ fn rebuild_search_state_from_storage(
             error.message
         );
     }
+    result.publication = publication;
     Ok(result)
 }
 
@@ -12102,35 +12196,37 @@ fn refresh_caches(
     let refreshed =
         rebuild_search_state_from_storage(storage, storage_path, llm_refresh_scope, true);
 
-    let mut s = controller.state.lock();
     match refreshed {
-        Ok(result) => {
-            let publish_started = Instant::now();
-            let semantic_stats = result.semantic_stats;
-            let search_stats = result.search_stats;
-            s.node_names = result.node_names;
-            publish_search_engine(&mut s, result.engine);
-            controller.sidecar_query_cache.lock().clear();
-            s.is_indexing = false;
-            Ok(CacheRefreshStats {
-                search_stats,
-                semantic_stats,
-                runtime_cache_publish_ms: Some(clamp_u128_to_u32(
-                    publish_started.elapsed().as_millis(),
-                )),
-            })
-        }
+        Ok(result) => Ok(publish_prepared_search_state(controller, result)),
         Err(error) => {
             tracing::warn!(
                 "Failed to rebuild search caches from storage: {}",
                 error.message
             );
-            s.node_names.clear();
-            clear_search_engine(&mut s);
+            let mut state = controller.state.lock();
+            state.node_names.clear();
+            clear_search_engine(&mut state);
             controller.sidecar_query_cache.lock().clear();
-            s.is_indexing = false;
+            state.is_indexing = false;
             Err(error)
         }
+    }
+}
+
+fn publish_prepared_search_state(
+    controller: &AppController,
+    result: SearchStateBuildResult,
+) -> CacheRefreshStats {
+    let publish_started = Instant::now();
+    let mut state = controller.state.lock();
+    state.node_names = result.node_names;
+    publish_search_engine(&mut state, result.engine, result.publication);
+    controller.sidecar_query_cache.lock().clear();
+    state.is_indexing = false;
+    CacheRefreshStats {
+        search_stats: result.search_stats,
+        semantic_stats: result.semantic_stats,
+        runtime_cache_publish_ms: Some(clamp_u128_to_u32(publish_started.elapsed().as_millis())),
     }
 }
 
@@ -16083,8 +16179,8 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("second full index");
         assert!(
-            second_timings.cache_refresh_ms.unwrap_or(0) > 0,
-            "cache refresh timing should include persisted search plus semantic sync"
+            second_timings.search_symbol_index_ms.is_some(),
+            "staged persisted search timing should be reported"
         );
         assert!(
             second_timings.semantic_doc_build_ms.is_some(),
@@ -17561,13 +17657,8 @@ fn build_llm_symbol_doc_text() -> String {
         let loader = std::thread::spawn(move || {
             let mut stale_storage = stale_storage;
             started_tx.send(()).expect("announce loader");
-            let (node_names, engine) =
-                load_persisted_search_state(&mut stale_storage, &loader_path)
-                    .expect("load post-publication generation");
-            let publication = stale_storage
-                .get_index_publication()
-                .expect("read loader publication");
-            (node_names, engine, publication)
+            load_persisted_search_state(&mut stale_storage, &loader_path)
+                .expect("load post-publication generation")
         });
         started_rx.recv().expect("loader started");
 
@@ -17627,14 +17718,15 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("share replacement generation");
         drop(catalog_guard);
 
-        let (node_names, engine, publication) = loader.join().expect("join loader");
-        assert_eq!(publication, Some(new_publication));
+        let loaded = loader.join().expect("join loader");
+        assert_eq!(loaded.publication, Some(new_publication));
         assert_eq!(
-            node_names.get(&CoreNodeId(2)).map(String::as_str),
+            loaded.node_names.get(&CoreNodeId(2)).map(String::as_str),
             Some("pkg::gamma_generation")
         );
         assert!(
-            engine
+            loaded
+                .engine
                 .search_symbol("gamma_generation")
                 .contains(&CoreNodeId(2))
         );
@@ -17675,7 +17767,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn missing_or_corrupt_expected_search_generation_is_rebuilt_in_place() {
+    fn missing_or_corrupt_expected_search_generation_is_not_rebuilt_by_a_reader() {
         let _env = hybrid_test_env();
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
@@ -17688,25 +17780,33 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("publish core generation");
         let expected_path = search_index_path_for_publication(&storage_path, Some(&publication))
             .expect("expected path");
-        let (_, initial) = load_persisted_search_state(&mut storage, &storage_path)
-            .expect("rebuild missing expected generation");
-        assert!(expected_path.is_dir());
-        assert_eq!(initial.full_text_doc_count(), 3);
-        drop(initial);
-        fs::remove_dir_all(&expected_path).expect("remove initial generation");
+        let missing_error = match load_persisted_search_state(&mut storage, &storage_path) {
+            Err(error) => error,
+            Ok(_) => panic!("reader must not rebuild a missing search generation"),
+        };
+        assert_eq!(missing_error.code, "cache_busy");
+        assert!(!expected_path.exists());
+
+        storage = Storage::open(&storage_path).expect("reopen writer storage");
+        drop(
+            rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+                .expect("writer builds expected generation"),
+        );
+        fs::remove_dir_all(&expected_path).expect("remove built generation");
         fs::write(&expected_path, b"corrupt search generation")
             .expect("write corrupt generation artifact");
 
-        let (_, rebuilt) = load_persisted_search_state(&mut storage, &storage_path)
-            .expect("rebuild corrupt expected generation");
+        let corrupt_error = match load_persisted_search_state(&mut storage, &storage_path) {
+            Err(error) => error,
+            Ok(_) => panic!("reader must not rebuild a corrupt search generation"),
+        };
 
-        assert!(expected_path.is_dir());
-        assert_eq!(rebuilt.full_text_doc_count(), 3);
-        assert!(rebuilt.search_symbol("alpha").contains(&CoreNodeId(2)));
+        assert_eq!(corrupt_error.code, "cache_busy");
+        assert!(expected_path.is_file());
     }
 
     #[test]
-    fn indexing_finisher_reuses_generation_built_by_post_swap_loader() {
+    fn persisted_loader_reuses_generation_built_by_indexing_finisher() {
         let mut env = hybrid_test_env();
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
@@ -17718,18 +17818,19 @@ fn build_llm_symbol_doc_text() -> String {
             .put_index_publication(&publication)
             .expect("publish core identity");
 
+        let finisher_state =
+            rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
+                .expect("indexing finisher builds search generation");
         env.push(EnvGuard::set(
             crate::search::engine::SYMBOL_FULL_TEXT_INDEX_ENV,
             "false",
         ));
-        let (_, loader_engine) = load_persisted_search_state(&mut storage, &storage_path)
-            .expect("post-swap loader builds search generation");
+        let loaded = load_persisted_search_state(&mut storage, &storage_path)
+            .expect("reader loads completed search generation");
         env.pop();
-        let finisher_state =
-            rebuild_search_state_from_storage(&mut storage, &storage_path, None, false)
-                .expect("indexing finisher reuses loader generation");
 
-        assert_eq!(loader_engine.tantivy_doc_count(), 3);
+        assert_eq!(loaded.publication, Some(publication));
+        assert_eq!(loaded.engine.tantivy_doc_count(), 3);
         assert_eq!(finisher_state.engine.tantivy_doc_count(), 3);
         assert!(
             finisher_state
@@ -18430,7 +18531,7 @@ fn build_llm_symbol_doc_text() -> String {
                 .node_names
                 .insert(CoreNodeId(999), "stale_symbol".to_string());
             let engine = SearchEngine::new(None).expect("search engine");
-            publish_search_engine(&mut state, engine);
+            publish_search_engine(&mut state, engine, None);
         }
 
         let error = controller
@@ -18461,6 +18562,7 @@ fn build_llm_symbol_doc_text() -> String {
                 mode: IndexPublicationMode::Full,
                 published_at_epoch_ms: 1,
             },
+            prepared_search_state: None,
         }
     }
 
@@ -18605,6 +18707,99 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn incremental_publication_ignores_changed_files_without_graph_collectors() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn first_value() -> i32 { 1 }\n",
+        )
+        .expect("write source");
+        let instructions = workspace.path().join("AGENTS.md");
+        fs::write(&instructions, "# Initial instructions\n").expect("write instructions");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("first full publication");
+        let first = controller
+            .index_publication()
+            .expect("read first publication")
+            .expect("first publication identity");
+
+        fs::write(&instructions, "# Updated instructions\n").expect("update instructions");
+        let dry_run = controller
+            .dry_run_index(IndexMode::Incremental)
+            .expect("plan unsupported file refresh");
+        assert!(
+            dry_run
+                .sample_files_to_index
+                .iter()
+                .any(|path| path == "AGENTS.md"),
+            "the regression must exercise a discovered file in the refresh plan: {dry_run:?}"
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental publication after unsupported file change");
+        let second = controller
+            .index_publication()
+            .expect("read second publication")
+            .expect("second publication identity");
+
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(second.mode, IndexPublicationMode::Incremental);
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open published storage")
+                .get_file_by_path(&instructions)
+                .expect("look up unsupported file")
+                .is_none(),
+            "files without graph collectors should not be invented in semantic scope"
+        );
+    }
+
+    #[test]
+    fn incomplete_legacy_run_is_not_a_servable_complete_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(workspace.path().join("lib.rs"), "pub fn value() {}\n").expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("publish complete generation");
+        assert!(
+            controller
+                .complete_index_publication()
+                .expect("read complete publication")
+                .is_some()
+        );
+
+        Storage::open(&storage_path)
+            .expect("open live storage")
+            .begin_incremental_run()
+            .expect("mark legacy incomplete run");
+
+        assert!(
+            controller
+                .complete_index_publication()
+                .expect("read fenced publication")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn legacy_schema_18_incomplete_marker_recovers_to_first_publication() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
@@ -18706,7 +18901,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn staged_recovery_cache_failure_keeps_replacement_database_marked() {
+    fn staged_recovery_search_failure_preserves_the_marked_live_database() {
         let workspace = tempdir().expect("workspace dir");
         fs::write(
             workspace.path().join("lib.rs"),
@@ -18753,12 +18948,15 @@ fn build_llm_symbol_doc_text() -> String {
             storage
                 .snapshots()
                 .has_ready_summary()
-                .expect("replacement summary readiness")
-                && storage
-                    .snapshots()
-                    .has_ready_detail()
-                    .expect("replacement detail readiness"),
-            "recovery publish must complete both snapshot tiers before cache finalization"
+                .expect("live summary readiness"),
+            "pre-publication failure must preserve the live summary snapshot"
+        );
+        assert!(
+            storage
+                .snapshots()
+                .has_ready_detail()
+                .expect("live detail readiness"),
+            "pre-publication failure must preserve the live detail snapshot"
         );
         assert_ne!(
             Storage::database_schema_version(&storage_path).expect("replacement schema"),
@@ -18786,7 +18984,7 @@ fn build_llm_symbol_doc_text() -> String {
                 .node_names
                 .insert(CoreNodeId(999), "stale_symbol".to_string());
             let engine = SearchEngine::new(None).expect("search engine");
-            publish_search_engine(&mut state, engine);
+            publish_search_engine(&mut state, engine, None);
         }
 
         let error = controller
@@ -19234,13 +19432,15 @@ fn build_llm_symbol_doc_text() -> String {
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
 
-        let error = index_incremental(
+        let error = match index_incremental(
             workspace.path(),
             &storage_path,
             &events_tx,
             Some(&cancel_token),
-        )
-        .expect_err("pre-cancelled first incremental must fail visibly");
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("pre-cancelled first incremental must fail visibly"),
+        };
 
         assert_eq!(error.code, "cancelled");
         assert!(
@@ -19480,7 +19680,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn full_refresh_returns_with_summary_ready_and_detail_dirty() {
+    fn full_refresh_publishes_both_grounding_snapshot_tiers() {
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let controller = AppController::new();
@@ -19504,11 +19704,11 @@ fn build_llm_symbol_doc_text() -> String {
             "full refresh should publish ready grounding summary snapshots"
         );
         assert!(
-            !storage
+            storage
                 .snapshots()
                 .has_ready_detail()
                 .expect("detail snapshot readiness"),
-            "full refresh should leave grounding detail snapshots dirty"
+            "full refresh should publish ready grounding detail snapshots"
         );
     }
 

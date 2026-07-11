@@ -380,16 +380,28 @@ def terminate_worker_pid(pid: int) -> None:
     if pid <= 0:
         return
     if os.name == "nt":
+        process_handle = None
+        try:
+            import ctypes
+
+            process_handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+        except (AttributeError, OSError):
+            process_handle = None
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=2,
+                timeout=10,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
+        if process_handle:
+            try:
+                ctypes.windll.kernel32.WaitForSingleObject(process_handle, 10_000)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
     else:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -659,8 +671,15 @@ def stdio_status_command(
             entry["response"] = response
             responses.append(response)
     finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
         if not process_terminated:
-            terminate_process_tree(process)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(process)
             process_terminated = True
         worker_pids: set[int] = set()
         for response in responses:
@@ -676,14 +695,9 @@ def stdio_status_command(
                     worker_pids.update(running_status_worker_pids(status))
         for worker_pid in worker_pids:
             terminate_worker_pid(worker_pid)
-        try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
+        if process.poll() is None:
             process.kill()
+            process.wait(timeout=2)
         stdout_thread.join(timeout=0.2)
         stderr_thread.join(timeout=0.2)
 

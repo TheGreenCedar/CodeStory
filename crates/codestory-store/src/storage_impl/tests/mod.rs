@@ -1785,8 +1785,8 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
     let _ = cleanup_sqlite_sidecars(&backup_path);
 
     {
-        let mut live = Storage::open(&live_path)?;
-        live.insert_files_batch(&[FileInfo {
+        let mut seed = Storage::open(&live_path)?;
+        seed.insert_files_batch(&[FileInfo {
             id: 1,
             path: PathBuf::from("live.rs"),
             language: "rust".to_string(),
@@ -1796,6 +1796,8 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             line_count: 10,
             file_role: FileRole::Source,
         }])?;
+        drop(seed);
+        let live = Storage::open_read_only(&live_path)?;
 
         {
             let mut staged = Storage::open_build(&staged_path)?;
