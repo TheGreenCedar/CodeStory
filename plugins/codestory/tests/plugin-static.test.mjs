@@ -1601,9 +1601,11 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
     assert.equal(result.status, 0, result.stderr);
     const status = JSON.parse(result.stdout.trim());
     assert.equal(status.ready, true);
-    assert.equal(status.runtime_truth.sidecar_status.mode, "full");
-    assert.equal(status.runtime_truth.sidecar_status.run_id, "shared-agent");
-    assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.status, "ready");
+    assert.equal(status.runtime_truth.sidecar_status_ref, "readiness_lanes.agent_packet_search");
+    assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
+    assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
+    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
     assert.deepEqual(status.readiness_broker, {
       schema_version: 2,
@@ -1759,10 +1761,13 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(status.runtime_truth.runtime_source, "managed_unavailable");
     assert.equal(status.runtime_truth.plugin_root, pluginRoot);
     assert.equal(status.runtime_truth.sidecar_policy, "ask");
-    assert.equal(status.runtime_truth.sidecar_status.mode, "unavailable");
-    assert.equal(status.runtime_truth.sidecar_status.run_id, "unavailable");
-    assert.equal(status.runtime_truth.readiness_lanes.local_graph.status, "repair_setup");
-    assert.equal(status.runtime_truth.readiness_lanes.agent_packet_search.profile, "agent");
+    assert.equal(status.runtime_truth.sidecar_status_ref, null);
+    assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
+    assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
+    assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "local_default"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "agent_packet_search"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
     for (const key of [

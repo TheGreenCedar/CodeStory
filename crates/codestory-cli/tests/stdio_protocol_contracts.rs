@@ -775,33 +775,37 @@ fn assert_allowed_surface(
         "unexpected readiness goal for {surface}: {surface_status}"
     );
     assert_eq!(
-        surface_status["status"],
+        surface_status.get("summary"),
+        None,
+        "ordinary surface {surface} must reference, not clone, its verdict"
+    );
+    let verdict = status["readiness"]
+        .as_array()
+        .and_then(|readiness| {
+            readiness
+                .iter()
+                .find(|verdict| verdict["goal"] == expected_goal)
+        })
+        .unwrap_or_else(|| panic!("missing canonical readiness verdict {expected_goal}: {status}"));
+    assert_eq!(
+        verdict["status"],
         json!(expected_status),
-        "unexpected readiness status for {surface}: {surface_status}"
+        "unexpected canonical readiness status for {surface}: {verdict}"
     );
     assert!(
-        surface_status["summary"]
+        verdict["summary"]
             .as_str()
             .is_some_and(|text| !text.is_empty()),
-        "surface status should include a readiness summary for {surface}: {surface_status}"
+        "canonical verdict should include a readiness summary for {surface}: {verdict}"
     );
     if expected_allowed {
-        assert!(
-            surface_status["blocked_reason"].is_null(),
-            "allowed surface {surface} should not include a blocked reason: {surface_status}"
-        );
+        assert_eq!(verdict["status"], "ready");
     } else {
         assert!(
-            surface_status["blocked_reason"]
-                .as_str()
-                .is_some_and(|text| !text.is_empty()),
-            "blocked surface {surface} should explain why it is blocked: {surface_status}"
-        );
-        assert!(
-            surface_status["minimum_next"]
+            verdict["minimum_next"]
                 .as_array()
                 .is_some_and(|commands| !commands.is_empty()),
-            "blocked surface {surface} should include minimum repair guidance: {surface_status}"
+            "canonical verdict should include minimum repair guidance: {verdict}"
         );
     }
 }
@@ -2475,6 +2479,18 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
 
     let result = assert_success_envelope(&response, json!("status-resource"));
     let status = json_resource_content(result, "codestory://status");
+    let minified = serde_json::to_vec(&status).expect("serialize minified status");
+    assert!(
+        minified.len() < 24 * 1024,
+        "MCP status must stay below 24 KiB; got {} bytes",
+        minified.len()
+    );
+    let local_summary = "Local navigation can use the current index.";
+    assert_eq!(
+        status.to_string().matches(local_summary).count(),
+        1,
+        "canonical readiness guidance must not be cloned per surface: {status}"
+    );
     assert_eq!(
         status["server_version"],
         json!(env!("CARGO_PKG_VERSION")),
@@ -2540,14 +2556,18 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "direct stdio status should make unmanaged sidecar policy explicit: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["sidecar_status"]["mode"],
-        status["readiness_lanes"]["agent_packet_search"]["sidecar_mode"],
-        "runtime truth should reuse the selected agent readiness lane mode: {status}"
+        status["runtime_truth"]["sidecar_status_ref"],
+        json!("readiness_lanes.agent_packet_search"),
+        "runtime truth should reference the canonical agent readiness lane: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["sidecar_status"]["degraded_reason"],
-        status["readiness_lanes"]["agent_packet_search"]["degraded_reason"],
-        "runtime truth should reuse the selected agent readiness lane reason: {status}"
+        status["runtime_truth"]["readiness_broker_ref"],
+        json!("readiness_broker"),
+        "runtime truth should reference rather than clone broker diagnostics: {status}"
+    );
+    assert!(
+        status["runtime_truth"].get("readiness_broker").is_none(),
+        "runtime truth must not duplicate the variable-sized broker payload: {status}"
     );
     assert!(
         status
@@ -2658,19 +2678,19 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "agent lane should expose the agent-scoped next command: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["local_graph"]["status"],
-        json!("ready"),
-        "runtime truth should include the local graph readiness lane: {status}"
+        status["runtime_truth"]["readiness_refs"]["local_graph"],
+        json!("readiness[goal=local_navigation]"),
+        "runtime truth should reference the local graph verdict: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["local_graph"]["refresh_state"],
-        json!("refreshed"),
-        "runtime truth should include local refresh state: {status}"
+        status["runtime_truth"]["readiness_refs"]["local_refresh"],
+        json!("local_refresh"),
+        "runtime truth should reference local refresh state: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
-        json!("blocked"),
-        "runtime truth should include the agent packet/search readiness lane: {status}"
+        status["runtime_truth"]["readiness_refs"]["agent_packet_search"],
+        json!("readiness_lanes.agent_packet_search"),
+        "runtime truth should reference agent packet/search readiness: {status}"
     );
     for surface in [
         "ground",
@@ -2789,18 +2809,8 @@ fn resources_read_status_reports_active_agent_repair_phase() {
         "repairing status should include the active namespace: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["status"],
-        json!("repairing"),
-        "{status}"
-    );
-    assert_eq!(
-        status["runtime_truth"]["readiness_lanes"]["agent_packet_search"]["phase"],
-        json!("Qdrant finalize"),
-        "{status}"
-    );
-    assert_eq!(
-        status["runtime_truth"]["sidecar_status"]["phase"],
-        json!("Qdrant finalize"),
+        status["runtime_truth"]["sidecar_status_ref"],
+        json!("readiness_lanes.agent_packet_search"),
         "{status}"
     );
     assert!(
@@ -3186,6 +3196,30 @@ fn resources_read_status_suppresses_auto_repair_when_policy_disabled() {
         !next_call_text.contains("\"method\":\"cli\""),
         "disabled policy should not expose CLI as the normal recovery path: {status}"
     );
+
+    let repair_all_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "repair-all-disabled",
+            "method": "tools/call",
+            "params": {"name": "repair_all", "arguments": {}}
+        }),
+    );
+    let repair_all = assert_tool_error(&repair_all_response, json!("repair-all-disabled"));
+    assert_eq!(
+        repair_all["status"],
+        json!("repair_disabled"),
+        "{repair_all}"
+    );
+    assert_eq!(repair_all["minimum_next"], json!([]), "{repair_all}");
+    assert_eq!(repair_all["full_repair"], json!([]), "{repair_all}");
+    assert!(
+        !repair_all
+            .to_string()
+            .contains("ready --goal agent --repair"),
+        "disabled repair_all must not recover commands from the canonical verdict: {repair_all}"
+    );
 }
 
 #[test]
@@ -3360,6 +3394,16 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     assert_eq!(terminal["outcome"], json!("failed"), "{terminal_setup}");
     assert_eq!(terminal["exit_code"], json!(17), "{terminal_setup}");
     assert!(terminal["wait_error"].is_null(), "{terminal_setup}");
+    assert_eq!(
+        terminal["terminal_envelope"]["error"]["code"],
+        json!("background_repair_failed"),
+        "{terminal_setup}"
+    );
+    assert_eq!(
+        terminal["terminal_envelope"]["error"]["details"]["failed_layer"],
+        json!("background_repair"),
+        "{terminal_setup}"
+    );
     assert_eq!(terminal["stdout_truncated"], json!(true));
     assert_eq!(terminal["stderr_truncated"], json!(true));
     assert_eq!(
@@ -3391,6 +3435,10 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     assert_eq!(durable["attempt_id"], json!(attempt_id));
     assert_eq!(durable["exit_code"], json!(17));
     assert_eq!(durable["outcome"], json!("failed"));
+    assert_eq!(
+        durable["terminal_envelope"]["error"]["code"],
+        json!("background_repair_failed")
+    );
     assert!(
         !repair_sidecar
             .layout
@@ -4241,7 +4289,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
         "fresh local graph should allow local graph surfaces: {refreshed_status}"
     );
     assert_eq!(
-        refreshed_status["allowed_surfaces"]["packet"]["status"],
+        refreshed_status["readiness_lanes"]["agent_packet_search"]["status"],
         json!("blocked"),
         "packet/search should stay gated by the agent retrieval lane after local refresh: {refreshed_status}"
     );
@@ -4511,7 +4559,7 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         "tool dispatch should have refreshed the long-lived server before status was reread: {status}"
     );
     assert_eq!(
-        status["allowed_surfaces"]["search"]["status"],
+        status["readiness_lanes"]["agent_packet_search"]["status"],
         json!("blocked"),
         "local graph refresh must not make packet/search readiness claims: {status}"
     );

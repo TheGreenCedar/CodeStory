@@ -62,7 +62,7 @@ High-signal environment toggles:
 |----------|-----|
 | `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Include the broader all-symbol symbol-doc scope for diagnostics. Accepted aliases are `all`, `full`, `all-symbols`, and `all_symbols`; omitted or other values default to durable symbols. |
 | `CODESTORY_EMBED_BACKEND=llamacpp` | Use the mandatory local llama.cpp embedding sidecar. |
-| `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings` | Product embedding endpoint for bge-base sidecar vectors. |
+| `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings` | Explicit external embedding endpoint override for bge-base sidecar vectors across profiles. When unset, managed Agent profiles allocate and persist a dynamic endpoint. |
 | `CODESTORY_SUMMARY_ENDPOINT=local` | Enable deterministic local summaries with `--summarize`. |
 
 Use other embedding, alias, batch-size, tokenizer, provider, hash, ONNX, and

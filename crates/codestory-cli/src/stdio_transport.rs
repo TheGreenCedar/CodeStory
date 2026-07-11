@@ -728,21 +728,22 @@ fn stdio_tool_blocked_error(
         .get("blocked_reason")
         .and_then(serde_json::Value::as_str)
         .or_else(|| surface.get("summary").and_then(serde_json::Value::as_str))
+        .or_else(|| verdict.and_then(|verdict| verdict.get("summary")?.as_str()))
         .unwrap_or("CodeStory readiness blocks this tool.");
     Ok(Some(serde_json::json!({
         "code": "codestory_tool_blocked",
         "message": format!("CodeStory tool `{name}` is blocked: {message}"),
         "tool": name,
         "readiness_goal": surface.get("readiness_goal").cloned().unwrap_or(serde_json::Value::Null),
-        "status": surface.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "status": surface.get("status").cloned().or_else(|| verdict.and_then(|verdict| verdict.get("status")).cloned()).unwrap_or(serde_json::Value::Null),
         "failed_layer": surface.get("failed_layer").cloned().unwrap_or(serde_json::Value::Null),
         "repair_reason": surface.get("repair_reason").cloned().unwrap_or(serde_json::Value::Null),
         "canonical_tool": surface.get("canonical_tool").cloned().unwrap_or(serde_json::Value::Null),
         "canonical_arguments": surface.get("canonical_arguments").cloned().unwrap_or(serde_json::Value::Null),
         "deprecated": surface.get("deprecated").cloned().unwrap_or(serde_json::Value::Null),
         "local_refresh": status.get("local_refresh").cloned().unwrap_or(serde_json::Value::Null),
-        "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next"), &runtime.project_root),
-        "full_repair": stdio_repair_calls_from_value(surface.get("full_repair"), &runtime.project_root),
+        "minimum_next": stdio_repair_calls_from_value(surface.get("minimum_next").or_else(|| verdict.and_then(|verdict| verdict.get("minimum_next"))), &runtime.project_root),
+        "full_repair": stdio_repair_calls_from_value(surface.get("full_repair").or_else(|| verdict.and_then(|verdict| verdict.get("full_repair"))), &runtime.project_root),
         "setup": verdict.and_then(|verdict| verdict.get("setup")).cloned().unwrap_or(serde_json::Value::Null),
         "sidecar": verdict.and_then(|verdict| verdict.get("sidecar")).cloned().unwrap_or(serde_json::Value::Null),
     })))
@@ -3080,7 +3081,7 @@ fn stdio_workspace_mismatch_status(mismatch: &StdioWorkspaceMismatch) -> serde_j
             "plugin_root": env_nonempty("CODESTORY_PLUGIN_ROOT"),
             "managed_cli_path": diagnostic["managed_cli_path"].clone(),
             "launcher_source": diagnostic["cli_source"].clone(),
-            "workspace": diagnostic.clone(),
+            "workspace_ref": "workspace_mismatch",
         },
         "runtime_boundary": {
             "restart_required_for_runtime_change": true,
@@ -3187,10 +3188,26 @@ fn stdio_workspace_mismatch_allowed_surfaces() -> serde_json::Value {
         "packet",
         "search",
         "context",
-        "repair_all",
     ] {
         surfaces.insert(surface.to_string(), stdio_workspace_mismatch_surface());
     }
+    surfaces.insert(
+        "repair_all".to_string(),
+        serde_json::json!({
+            "allowed": false,
+            "readiness_goal": "workspace",
+            "status": "workspace_mismatch",
+            "failed_layer": "workspace_binding",
+            "summary": "repair_all is blocked until the host relaunches MCP for the active workspace.",
+            "blocked_reason": "workspace_mismatch_repair_blocked",
+            "repair_reason": "workspace_mismatch",
+            "canonical_tool": "sidecar_setup",
+            "canonical_arguments": {"action": "status"},
+            "deprecated": true,
+            "minimum_next": [],
+            "full_repair": [],
+        }),
+    );
     surfaces.insert(
         "sidecar_setup".to_string(),
         serde_json::json!({
@@ -3212,13 +3229,8 @@ fn stdio_workspace_mismatch_surface() -> serde_json::Value {
     serde_json::json!({
         "allowed": false,
         "readiness_goal": "workspace",
-        "status": "workspace_mismatch",
         "failed_layer": "workspace_binding",
-        "summary": "CodeStory MCP is serving a stale workspace; restart/reload the host before using repo-specific tools or repairs.",
         "repair_reason": "workspace_mismatch",
-        "blocked_reason": "CodeStory MCP is serving a stale workspace.",
-        "minimum_next": [],
-        "full_repair": [],
     })
 }
 
@@ -3311,7 +3323,6 @@ struct StdioStatusReadinessParts {
     sidecar_setup: serde_json::Value,
     dirty_marker: StdioDirtyMarkerStatus,
     effective_freshness: Option<IndexFreshnessDto>,
-    local: ReadinessVerdictDto,
 }
 
 struct StdioStatusBrokerParts {
@@ -3602,7 +3613,6 @@ fn build_stdio_status_readiness(
         sidecar_setup,
         dirty_marker,
         effective_freshness,
-        local,
     }
 }
 
@@ -3684,14 +3694,7 @@ fn build_stdio_status_surfaces(
         &readiness.sidecar_setup,
         native_embedding_hard_busy,
     );
-    let runtime_truth = stdio_runtime_truth_status(
-        plugin_runtime,
-        &readiness.sidecar_setup,
-        &readiness.readiness_lanes_json,
-        &readiness.local,
-        &readiness.local_refresh_json,
-        &broker.readiness_broker_json,
-    );
+    let runtime_truth = stdio_runtime_truth_status(plugin_runtime, &readiness.sidecar_setup);
     StdioStatusSurfacesParts {
         allowed_surfaces,
         recommended_next_calls,
@@ -3702,10 +3705,6 @@ fn build_stdio_status_surfaces(
 fn stdio_runtime_truth_status(
     plugin_runtime: &serde_json::Value,
     sidecar_setup: &serde_json::Value,
-    readiness_lanes: &serde_json::Value,
-    local: &ReadinessVerdictDto,
-    local_refresh: &serde_json::Value,
-    readiness_broker: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "runtime_source": plugin_runtime
@@ -3725,104 +3724,14 @@ fn stdio_runtime_truth_status(
             .get("state")
             .cloned()
             .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "sidecar_status": {
-            "profile": readiness_lanes
-                .pointer("/agent_packet_search/profile")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "run_id": readiness_lanes
-                .pointer("/agent_packet_search/run_id")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "mode": readiness_lanes
-                .pointer("/agent_packet_search/sidecar_mode")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!("unavailable")),
-            "degraded_reason": readiness_lanes
-                .pointer("/agent_packet_search/degraded_reason")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "namespace": readiness_lanes
-                .pointer("/agent_packet_search/namespace")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "phase": readiness_lanes
-                .pointer("/agent_packet_search/phase")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
+        "sidecar_status_ref": "readiness_lanes.agent_packet_search",
+        "readiness_refs": {
+            "local_graph": "readiness[goal=local_navigation]",
+            "local_refresh": "local_refresh",
+            "local_default": "readiness_lanes.local_default",
+            "agent_packet_search": "readiness_lanes.agent_packet_search",
         },
-        "readiness_lanes": {
-            "local_graph": {
-                "status": local.status,
-                "refresh_state": local_refresh
-                    .get("state")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!("unavailable")),
-                "blocks_local_surfaces": local_refresh
-                    .get("blocks_local_surfaces")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            },
-            "local_default": readiness_lanes
-                .pointer("/local_default")
-                .map(stdio_runtime_truth_sidecar_lane)
-                .unwrap_or(serde_json::Value::Null),
-            "agent_packet_search": readiness_lanes
-                .pointer("/agent_packet_search")
-                .map(stdio_runtime_truth_sidecar_lane)
-                .unwrap_or(serde_json::Value::Null),
-        },
-        "readiness_broker": {
-            "project_id": readiness_broker
-                .get("project_id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "persistence_status": readiness_broker
-                .get("persistence_status")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "reconciliation": readiness_broker
-                .get("reconciliation")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "gpu_proof": readiness_broker
-                .get("gpu_proof")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            "resources": readiness_broker
-                .get("resources")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({})),
-        }
-    })
-}
-
-fn stdio_runtime_truth_sidecar_lane(lane: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "status": lane
-            .get("status")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "profile": lane
-            .get("profile")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "run_id": lane.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
-        "namespace": lane.get("namespace").cloned().unwrap_or(serde_json::Value::Null),
-        "compose_project": lane
-            .get("compose_project")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "phase": lane.get("phase").cloned().unwrap_or(serde_json::Value::Null),
-        "repair_updated_at_epoch_ms": lane
-            .get("repair_updated_at_epoch_ms")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "sidecar_mode": lane
-            .get("sidecar_mode")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!("unavailable")),
-        "degraded_reason": lane.get("degraded_reason").cloned().unwrap_or(serde_json::Value::Null),
+        "readiness_broker_ref": "readiness_broker",
     })
 }
 
@@ -5065,6 +4974,12 @@ fn monitor_stdio_ready_repair_worker(
             Ok(status) => ("failed", status.code(), None),
             Err(error) => ("failed", None, Some(error.to_string())),
         };
+        let terminal_envelope = stdio_ready_repair_terminal_envelope(
+            outcome,
+            wait_error.as_deref(),
+            &stdout_tail,
+            &stderr_tail,
+        );
         let result = crate::ready_repair_status::ReadyRepairWorkerResult {
             schema_version: crate::ready_repair_status::READY_REPAIR_STATUS_SCHEMA_VERSION,
             attempt_id: attempt_id.clone(),
@@ -5078,6 +4993,7 @@ fn monitor_stdio_ready_repair_worker(
             outcome: outcome.to_string(),
             exit_code,
             wait_error,
+            terminal_envelope,
             stdout_tail,
             stderr_tail,
             stdout_truncated,
@@ -5098,6 +5014,40 @@ fn monitor_stdio_ready_repair_worker(
             &attempt_id,
         );
     });
+}
+
+fn stdio_ready_repair_terminal_envelope(
+    outcome: &str,
+    wait_error: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+) -> Option<codestory_contracts::api::CommandFailureEnvelope> {
+    if outcome == "succeeded" {
+        return None;
+    }
+    if let Some(value) = stdio_parse_trailing_json_object(stdout)
+        && let Ok(envelope) = serde_json::from_value(value)
+    {
+        return Some(envelope);
+    }
+    let message = wait_error
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or("background repair worker failed without a structured error");
+    Some(codestory_contracts::api::CommandFailureEnvelope::new(
+        codestory_contracts::api::ApiError::with_details(
+            "background_repair_failed",
+            message,
+            codestory_contracts::api::ApiErrorDetails {
+                failed_layer: Some("background_repair".to_string()),
+                project: None,
+                next_commands: Vec::new(),
+                minimum_next: Vec::new(),
+                full_repair: Vec::new(),
+                readiness: None,
+            },
+        ),
+    ))
 }
 
 fn read_stdio_ready_repair_tail(mut reader: impl Read) -> (String, bool) {
@@ -5339,7 +5289,6 @@ fn stdio_repair_policy_next_calls(sidecar_setup: &serde_json::Value) -> serde_js
     }
 }
 
-#[cfg(test)]
 fn stdio_parse_trailing_json_object(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -5545,25 +5494,15 @@ fn stdio_allowed_surface(verdict: Option<&ReadinessVerdictDto>) -> serde_json::V
             serde_json::json!({
                 "allowed": allowed,
                 "readiness_goal": crate::readiness::goal_label(verdict.goal),
-                "status": crate::readiness::status_label(verdict.status),
                 "failed_layer": crate::readiness::failed_layer(verdict),
-                "summary": verdict.summary,
                 "repair_reason": stdio_repair_reason(verdict),
-                "blocked_reason": if allowed { None } else { Some(verdict.summary.as_str()) },
-                "minimum_next": verdict.minimum_next,
-                "full_repair": verdict.full_repair,
             })
         }
         None => serde_json::json!({
             "allowed": false,
             "readiness_goal": null,
-            "status": "unknown",
             "failed_layer": null,
-            "summary": "Readiness verdict was not available for this surface.",
             "repair_reason": null,
-            "blocked_reason": "Readiness verdict was not available for this surface.",
-            "minimum_next": [],
-            "full_repair": [],
         }),
     }
 }
@@ -6918,6 +6857,19 @@ starting sidecar setup
     }
 
     #[test]
+    fn ready_repair_terminal_result_preserves_child_failure_envelope() {
+        let expected = codestory_contracts::api::CommandFailureEnvelope::new(
+            codestory_contracts::api::ApiError::invalid_argument("bad repair argument"),
+        );
+        let stdout = serde_json::to_string(&expected).expect("serialize child envelope");
+
+        let observed = stdio_ready_repair_terminal_envelope("failed", None, &stdout, "")
+            .expect("terminal failure envelope");
+
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
     fn stdio_blocked_agent_surfaces_name_retrieval_layer_and_canonical_repair() {
         let repair =
             "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
@@ -6945,12 +6897,19 @@ starting sidecar setup
 
         assert_eq!(packet["allowed"], json!(false));
         assert_eq!(packet["failed_layer"], json!("retrieval_sidecar"));
-        assert_eq!(packet["minimum_next"], json!([repair]));
+        assert_eq!(packet["readiness_goal"], json!("agent_packet_search"));
         assert!(
-            packet["full_repair"]
-                .as_array()
-                .is_some_and(|commands| commands.len() == 3),
-            "full repair should keep proof commands behind the canonical minimum repair: {packet}"
+            packet.get("minimum_next").is_none() && packet.get("full_repair").is_none(),
+            "ordinary surfaces must reference rather than clone repair detail: {packet}"
+        );
+        let verdict = readiness
+            .iter()
+            .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch)
+            .expect("agent readiness verdict");
+        assert_eq!(verdict.minimum_next, vec![repair]);
+        assert!(
+            verdict.full_repair.len() == 3,
+            "full repair should remain on the canonical verdict: {verdict:?}"
         );
     }
 
@@ -7082,11 +7041,16 @@ starting sidecar setup
                 "local/default full sidecar must not unlock {surface}: {surfaces}"
             );
             assert_eq!(
-                surfaces[surface]["status"],
-                json!("blocked"),
-                "blocked agent surface should stay on the agent retrieval lane: {surfaces}"
+                surfaces[surface]["readiness_goal"],
+                json!("agent_packet_search")
             );
+            assert!(surfaces[surface].get("status").is_none());
         }
+        let agent = readiness
+            .iter()
+            .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch)
+            .expect("agent readiness verdict");
+        assert_eq!(agent.status, ReadinessStatusDto::Blocked);
     }
 
     #[test]

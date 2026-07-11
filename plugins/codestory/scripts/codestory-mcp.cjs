@@ -376,59 +376,40 @@ function dirtyMarkerEnv(projectRoot = launchCwd) {
   };
 }
 
-function runtimeLaneFromReadiness(lanes, name, fallback) {
-  const lane = lanes && typeof lanes === 'object' ? lanes[name] : null;
-  if (!lane || typeof lane !== 'object') return fallback;
-  return {
-    ...fallback,
-    ...lane,
-    sidecar_mode: lane.sidecar_mode || lane.mode || fallback.sidecar_mode,
-    degraded_reason: Object.hasOwn(lane, 'degraded_reason')
-      ? lane.degraded_reason
-      : fallback.degraded_reason,
-  };
-}
-
-function runtimeTruthStatus(plugin, repair, options = {}) {
-  const fallbackAgentLane = {
-    status: 'unavailable',
-    profile: 'agent',
-    run_id: 'unavailable',
-    sidecar_mode: 'unavailable',
-    degraded_reason: options.degradedReason || repair.repair_reason || null,
-  };
-  const fallbackLocalLane = {
-    status: 'unavailable',
-    profile: 'local',
-    sidecar_mode: 'unavailable',
-    degraded_reason: 'unavailable',
-  };
-  const readinessLanes = options.readinessLanes || null;
-  const agentLane = runtimeLaneFromReadiness(readinessLanes, 'agent_packet_search', fallbackAgentLane);
-  const localLane = runtimeLaneFromReadiness(readinessLanes, 'local_default', fallbackLocalLane);
+function runtimeTruthStatus(plugin, options = {}) {
+  const readinessGoals = new Set(options.readinessGoals || []);
+  const readinessLanes = options.readinessLanes && typeof options.readinessLanes === 'object'
+    ? options.readinessLanes
+    : null;
+  const readinessRefs = {};
+  if (readinessGoals.has('local_navigation')) {
+    readinessRefs.local_graph = 'readiness[goal=local_navigation]';
+  }
+  if (readinessGoals.has('agent_packet_search')) {
+    readinessRefs.agent_packet_search = 'readiness[goal=agent_packet_search]';
+  }
+  if (readinessGoals.has('project_root')) {
+    readinessRefs.project_root = 'readiness[goal=project_root]';
+  }
+  if (options.localRefresh) readinessRefs.local_refresh = 'local_refresh';
+  if (readinessLanes?.local_default) readinessRefs.local_default = 'readiness_lanes.local_default';
+  if (readinessLanes?.agent_packet_search) {
+    readinessRefs.agent_packet_search = 'readiness_lanes.agent_packet_search';
+  }
+  const sidecarStatusRef = readinessLanes?.agent_packet_search
+    ? 'readiness_lanes.agent_packet_search'
+    : readinessGoals.has('agent_packet_search')
+      ? 'readiness[goal=agent_packet_search]'
+      : null;
   return {
     runtime_source: plugin.cli_source || 'unavailable',
     plugin_root: plugin.plugin_root || null,
     managed_cli_path: plugin.managed_binary_path || null,
     launcher_source: plugin.cli_source || 'unavailable',
     sidecar_policy: options.sidecarPolicy || 'unavailable',
-    sidecar_status: {
-      profile: agentLane.profile || 'agent',
-      run_id: agentLane.run_id || 'unavailable',
-      mode: agentLane.sidecar_mode || 'unavailable',
-      degraded_reason: agentLane.degraded_reason || null,
-      namespace: agentLane.namespace || null,
-      phase: agentLane.phase || null,
-    },
-    readiness_lanes: {
-      local_graph: {
-        status: repair.status || 'unavailable',
-        refresh_state: options.localRefresh?.state || 'unavailable',
-        blocks_local_surfaces: options.localRefresh?.blocks_local_surfaces ?? null,
-      },
-      local_default: localLane,
-      agent_packet_search: agentLane,
-    },
+    sidecar_status_ref: sidecarStatusRef,
+    readiness_refs: readinessRefs,
+    readiness_broker_ref: options.hasReadinessBroker ? 'readiness_broker' : null,
   };
 }
 
@@ -1611,17 +1592,15 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     'query_subgraph',
   ];
   const sidecarSurfaces = ['packet', 'search', 'context'];
-  const blockedSurface = (surface, goal) => ({
+  const blockedSurface = () => ({
     allowed: false,
-    readiness_goal: goal,
-    status: repair.status,
+    readiness_goal: repair.goal,
+    failed_layer: 'runtime_setup',
     repair_reason: reason,
-    minimum_next: minimumNext,
-    full_repair: fullRepair,
   });
   const allowedSurfaces = Object.fromEntries([
-    ...localSurfaces.map((surface) => [surface, blockedSurface(surface, 'local_navigation')]),
-    ...sidecarSurfaces.map((surface) => [surface, blockedSurface(surface, 'agent_packet_search')]),
+    ...localSurfaces.map((surface) => [surface, blockedSurface()]),
+    ...sidecarSurfaces.map((surface) => [surface, blockedSurface()]),
   ]);
   allowedSurfaces.repair_all = {
     ...blockedSurface('repair_all', 'agent_packet_search'),
@@ -1643,7 +1622,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   };
   allowedSurfaces.sidecar_setup = {
     allowed: true,
-    readiness_goal: 'agent_packet_search',
+    readiness_goal: repair.goal,
     status: repair.status,
     repair_reason: reason,
     blocked_reason: 'diagnostic_fail_open_repair_unavailable',
@@ -1702,10 +1681,11 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     source_checkout_version: sourceCheckoutVersion(projectRoot),
     sidecar_contract_version: null,
     plugin_runtime: plugin,
-    runtime_truth: runtimeTruthStatus(plugin, repair, {
+    runtime_truth: runtimeTruthStatus(plugin, {
       sidecarPolicy: sidecarPolicy.state || 'unavailable',
       localRefresh: options.localRefresh || null,
-      degradedReason: reason,
+      readinessGoals: [repair.goal],
+      hasReadinessBroker: true,
     }),
     runtime_boundary: {
       restart_required_for_runtime_change: true,
@@ -1817,10 +1797,12 @@ async function bootstrapStatus(projectRoot = launchCwd) {
     cli_version: probe.version,
     plugin_runtime: plugin,
     project_root_source: 'argument',
-    runtime_truth: runtimeTruthStatus(plugin, repair, {
+    runtime_truth: runtimeTruthStatus(plugin, {
       sidecarPolicy: sidecarPolicy.state || 'unavailable',
       localRefresh,
+      readinessGoals: readiness.map((verdict) => verdict.goal),
       readinessLanes: agentReadiness.parsed?.readiness_lanes || null,
+      hasReadinessBroker: Boolean(agentReadiness.parsed?.readiness_broker),
     }),
     local_refresh: localRefresh,
     readiness,
