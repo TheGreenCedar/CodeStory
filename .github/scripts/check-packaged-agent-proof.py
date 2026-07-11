@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -129,6 +130,32 @@ def verify_archive_checksum(archive: Path, checksum_file: Path, artifact: Path) 
     )
     require(expected is not None, "checksum", artifact, f"checksum file does not list {archive.name}")
     require(actual == expected, "checksum", artifact, f"checksum mismatch for {archive.name}")
+
+
+def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path) -> None:
+    env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
+    for profile, extra in (("local", []), ("agent", ["--run-id", "shared-agent"])):
+        try:
+            subprocess.run(
+                [
+                    str(cli),
+                    "retrieval",
+                    "down",
+                    "--project",
+                    str(project),
+                    "--profile",
+                    profile,
+                    *extra,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+                check=False,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    shutil.rmtree(cache_root, ignore_errors=True)
 
 
 def require_plugin_manifest_version(plugin_root: Path, expected_version: str) -> None:
@@ -941,15 +968,21 @@ def run_gate(args: argparse.Namespace) -> None:
     if args.checksum_file:
         verify_archive_checksum(archive, Path(args.checksum_file).resolve(), checksum_artifact)
 
-    with tempfile.TemporaryDirectory(prefix="codestory-packaged-agent-proof-", dir=out_dir) as temp:
+    with (
+        tempfile.TemporaryDirectory(prefix="codestory-packaged-agent-proof-", dir=out_dir) as temp,
+        contextlib.ExitStack() as cleanup_stack,
+    ):
         unpacked = Path(temp) / "unpacked"
         unpacked.mkdir()
         unpack_archive(archive, unpacked)
         cli = find_cli(unpacked)
         plugin_skill = find_plugin_skill(unpacked)
-        cache_root = Path(temp) / "cache"
+        cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-proof-cache-"))
+        cleanup_stack.callback(cleanup_proof_cache, cli, project, cache_root)
         proof_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
-        stdio_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(Path(temp) / "stdio-cache")}
+        stdio_cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-stdio-cache-"))
+        cleanup_stack.callback(cleanup_proof_cache, cli, project, stdio_cache_root)
+        stdio_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(stdio_cache_root)}
 
         summary = {
             "archive": str(archive),
@@ -1003,8 +1036,6 @@ def run_gate(args: argparse.Namespace) -> None:
                     "--repair",
                     "--project",
                     str(project),
-                    "--cache-dir",
-                    str(cache_root),
                     "--format",
                     "json",
                     "--output-file",
@@ -1024,8 +1055,6 @@ def run_gate(args: argparse.Namespace) -> None:
                     "ground",
                     "--project",
                     str(project),
-                    "--cache-dir",
-                    str(cache_root),
                     "--refresh",
                     "none",
                     "--format",
@@ -1597,7 +1626,7 @@ def self_test() -> None:
         assert (out_dir / "summary.json").is_file()
         stdio_artifact = read_json_file(out_dir / "serve-stdio-status.json")
         full_cache_root = read_json_file(out_dir / "local-retrieval-bootstrap.json")["cache_root"]
-        assert Path(full_cache_root).name == "cache"
+        assert Path(full_cache_root).name.startswith("codestory-packaged-proof-cache-")
         assert stdio_artifact["status"]["cache_root"] == full_cache_root
         status_request = next(
             entry["request"]
@@ -1615,7 +1644,7 @@ def self_test() -> None:
         assert version_only_summary["artifacts"].keys() == {"checksum", "version", "help", "serve_stdio"}
         assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
         version_only_status = read_json_file(version_only_out / "serve-stdio-status.json")["status"]
-        assert Path(version_only_status["cache_root"]).name == "stdio-cache"
+        assert Path(version_only_status["cache_root"]).name.startswith("codestory-packaged-stdio-cache-")
         assert version_only_status["cache_root"] != full_cache_root
 
         bad_checksum = root / "BAD_SHA256SUMS.txt"
@@ -1678,7 +1707,7 @@ def self_test() -> None:
         retry_timeout_args = argparse.Namespace(**vars(args))
         retry_timeout_args.project = str(retry_timeout_project)
         retry_timeout_args.out_dir = str(root / "retry-timeout-out")
-        retry_timeout_args.timeout_secs = 2
+        retry_timeout_args.timeout_secs = 5
         retry_timeout_worker = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)"],
             stdout=subprocess.DEVNULL,
@@ -1797,10 +1826,10 @@ def self_test() -> None:
             )
             assert managed_status_after["sidecar_setup"]["active_repair"]["attempt_id"] == "fake-attempt"
             managed_cache_root = read_json_file(Path(managed_args.out_dir) / "managed-local-ground.json")["cache_root"]
-            assert Path(managed_cache_root).name == "cache"
+            assert Path(managed_cache_root).name.startswith("codestory-packaged-proof-cache-")
             assert managed_status_after["cache_root"] == managed_cache_root
             managed_direct_status = read_json_file(Path(managed_args.out_dir) / "serve-stdio-status.json")["status"]
-            assert Path(managed_direct_status["cache_root"]).name == "stdio-cache"
+            assert Path(managed_direct_status["cache_root"]).name.startswith("codestory-packaged-stdio-cache-")
             assert managed_direct_status["cache_root"] != managed_cache_root
         finally:
             os.environ.pop("CODESTORY_FAKE_PLUGIN_MANAGED", None)
