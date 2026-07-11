@@ -5108,17 +5108,6 @@ impl Storage {
         }
     }
 
-    pub fn first_incomplete_file_path(&self) -> Result<Option<PathBuf>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM file WHERE complete = 0 ORDER BY id LIMIT 1")?;
-        let mut rows = stmt.query([])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(PathBuf::from(row.get::<_, String>(0)?))),
-            None => Ok(None),
-        }
-    }
-
     pub fn get_node_kinds_for_files(
         &self,
         file_ids: &[i64],
@@ -5542,6 +5531,54 @@ impl Storage {
     pub fn clear_errors(&self) -> Result<(), StorageError> {
         self.conn.execute("DELETE FROM error", [])?;
         self.invalidate_grounding_snapshots()?;
+        Ok(())
+    }
+
+    /// Replace errors for reprocessed files after their latest projection is durable.
+    pub fn replace_errors_for_files_batch(
+        &mut self,
+        file_ids: &[i64],
+        errors: &[codestory_contracts::graph::ErrorInfo],
+    ) -> Result<(), StorageError> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        debug_assert!(errors.iter().all(|error| {
+            error
+                .file_id
+                .is_some_and(|file_id| file_ids.contains(&file_id.0))
+        }));
+
+        let tx = self.conn.transaction()?;
+        let mut removed_error_count = 0;
+        {
+            let mut delete = tx.prepare("DELETE FROM error WHERE file_id = ?1")?;
+            for file_id in &file_ids {
+                removed_error_count += delete.execute(params![file_id])?;
+            }
+        }
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO error (message, file_id, line, column, fatal, indexed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for error in errors {
+                insert.execute(params![
+                    error.message,
+                    error.file_id.map(|id| id.0),
+                    error.line,
+                    error.column,
+                    error.is_fatal as i32,
+                    (error.index_step == codestory_contracts::graph::IndexStep::Indexing) as i32,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        if removed_error_count > 0 || !errors.is_empty() {
+            self.invalidate_grounding_snapshots()?;
+        }
         Ok(())
     }
 

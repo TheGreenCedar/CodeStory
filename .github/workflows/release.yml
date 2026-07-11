@@ -17,9 +17,6 @@ on:
 permissions:
   contents: read
 
-env:
-  RELEASE_RUST_TOOLCHAIN: "1.95.0"
-
 concurrency:
   group: release-${{ inputs.version }}
   cancel-in-progress: false
@@ -84,177 +81,17 @@ jobs:
             exit 1
           fi
 
-  build:
-    name: Build ${{ matrix.asset_target }}
+  packaged-proof:
     needs: preflight
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            asset_target: linux-x64
-            exe_suffix: ""
-          - os: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-            asset_target: linux-arm64
-            exe_suffix: ""
-          - os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            asset_target: windows-x64
-            exe_suffix: ".exe"
-          - os: windows-11-arm
-            rust_target: aarch64-pc-windows-msvc
-            asset_target: windows-arm64
-            exe_suffix: ".exe"
-          # ponytail: ort-sys has no x86_64-apple-darwin prebuilt; add macos-x64
-          # when the release path links a custom ONNX Runtime build.
-          - os: macos-15
-            rust_target: aarch64-apple-darwin
-            asset_target: macos-arm64
-            exe_suffix: ""
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install pinned Rust
-        run: |
-          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
-          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
-          rustup target add "${{ matrix.rust_target }}"
-
-      - name: Capture Rust cache key
-        id: rust-cache-key
-        shell: bash
-        run: |
-          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
-
-      - name: Restore Cargo registry, git sources, and build output
-        id: cargo-cache-restore
-        uses: actions/cache/restore@v5
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
-
-      - name: Build codestory-cli
-        run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
-
-      - name: Smoke codestory-cli
-        if: runner.os != 'Windows'
-        run: |
-          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
-          "$bin" --version
-          "$bin" --help
-
-      - name: Smoke codestory-cli on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
-          & $bin --version
-          & $bin --help
-
-      - name: Clear release asset output
-        run: python -c "import shutil; shutil.rmtree('target/release-dist', ignore_errors=True)"
-
-      - name: Package release asset
-        if: runner.os != 'Windows'
-        run: |
-          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
-          python .github/scripts/package-codestory-release.py \
-            --version "${{ needs.preflight.outputs.version }}" \
-            --target "${{ matrix.asset_target }}" \
-            --binary "$bin" \
-            --out-dir target/release-dist
-
-      - name: Smoke packaged release asset
-        if: runner.os != 'Windows'
-        run: |
-          python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
-            --expected-version "${{ needs.preflight.outputs.version }}" \
-            --version-only \
-            --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
-
-      - name: Fetch retrieval embedding model
-        if: matrix.asset_target == 'linux-x64'
-        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
-
-      - name: Packaged full-sidecar agent proof
-        if: matrix.asset_target == 'linux-x64'
-        env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: |
-          python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.tar.gz" \
-            --expected-version "${{ needs.preflight.outputs.version }}" \
-            --project "${{ github.workspace }}" \
-            --plugin-root plugins/codestory \
-            --out-dir target/packaged-agent-proof
-
-      - name: Upload packaged agent proof artifacts
-        if: always() && matrix.asset_target == 'linux-x64'
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: packaged-agent-proof-${{ matrix.asset_target }}
-          path: target/packaged-agent-proof
-          if-no-files-found: warn
-
-      - name: Package release asset on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $bin = Join-Path "target/${{ matrix.rust_target }}/release" "codestory-cli${{ matrix.exe_suffix }}"
-          python .github/scripts/package-codestory-release.py `
-            --version "${{ needs.preflight.outputs.version }}" `
-            --target "${{ matrix.asset_target }}" `
-            --binary $bin `
-            --out-dir target/release-dist
-
-      - name: Smoke packaged release asset on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          python .github/scripts/check-packaged-agent-proof.py `
-            --archive "target/release-dist/codestory-cli-v${{ needs.preflight.outputs.version }}-${{ matrix.asset_target }}.zip" `
-            --expected-version "${{ needs.preflight.outputs.version }}" `
-            --version-only `
-            --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
-
-      - name: Upload release asset
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: codestory-cli-${{ matrix.asset_target }}
-          path: |
-            target/release-dist/*.tar.gz
-            target/release-dist/*.zip
-            target/release-dist/*.sha256
-          if-no-files-found: error
-
-      - name: Save Cargo registry, git sources, and build output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
-        uses: actions/cache/save@v5
-        continue-on-error: true
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
+    uses: ./.github/workflows/packaged-platform-proof.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
 
   publish:
     name: Publish GitHub release
     needs:
       - preflight
-      - build
+      - packaged-proof
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -312,10 +149,22 @@ jobs:
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
+          cat > target/release-assets/proof-boundaries.md <<'EOF'
+          ## Platform proof boundaries
+
+          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS arm64.
+
+          - Windows x64 managed install, local ground, and repair handoff are acceptance-smoked; this is not full sidecar or GPU proof.
+          - Apple Silicon packaging is acceptance-smoked, while live managed Metal endpoint survival remains open in #887.
+          - Windows arm64 ships a CLI asset but has no managed native accelerated embedding cell.
+          - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
+          - Older-glibc compatibility is unproven; execution on the current hosted Ubuntu runner does not establish it.
+          EOF
           gh release create "$TAG" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "CodeStory $TAG" \
+            --notes-file target/release-assets/proof-boundaries.md \
             --generate-notes
 
   post-publish-smoke:
@@ -323,60 +172,8 @@ jobs:
     needs:
       - preflight
       - publish
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    uses: ./.github/workflows/post-publish-release-smoke.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
     permissions:
       contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Download published release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.preflight.outputs.tag }}
-          VERSION: ${{ needs.preflight.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p target/post-publish-release-assets
-          gh release download "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "codestory-cli-v${VERSION}-*.tar.gz" \
-            --pattern "codestory-cli-v${VERSION}-*.zip" \
-            --pattern "SHA256SUMS.txt" \
-            --dir target/post-publish-release-assets \
-            --clobber
-          shopt -s nullglob
-          assets=(
-            target/post-publish-release-assets/codestory-cli-v${VERSION}-*.tar.gz
-            target/post-publish-release-assets/codestory-cli-v${VERSION}-*.zip
-          )
-          if [ "${#assets[@]}" -ne 5 ]; then
-            echo "::error::Expected five binary archives, found ${#assets[@]}."
-            printf '%s\n' "${assets[@]}"
-            exit 1
-          fi
-          (cd target/post-publish-release-assets && sha256sum -c SHA256SUMS.txt)
-
-      - name: Fetch retrieval embedding model
-        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
-
-      - name: Prove published Linux agent runtime
-        env:
-          CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: |
-          set -euo pipefail
-          python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/post-publish-release-assets/codestory-cli-v${{ needs.preflight.outputs.version }}-linux-x64.tar.gz" \
-            --expected-version "${{ needs.preflight.outputs.version }}" \
-            --project "${{ github.workspace }}" \
-            --plugin-root plugins/codestory \
-            --out-dir target/post-publish-agent-proof
-
-      - name: Upload post-publish agent proof artifacts
-        if: always()
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: post-publish-agent-proof-linux-x64
-          path: target/post-publish-agent-proof
-          if-no-files-found: warn

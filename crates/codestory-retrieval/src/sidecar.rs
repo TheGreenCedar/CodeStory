@@ -16,7 +16,7 @@ use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
 };
 use codestory_store::Store;
-use codestory_workspace::{RefreshInputs, StoredFileState, WorkspaceManifest};
+use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -863,13 +863,6 @@ fn strict_readiness_unavailable_reason(
     {
         return Ok(None);
     }
-    if let Some(path) = storage
-        .first_incomplete_file_path()
-        .context("inspect incomplete indexed files")?
-    {
-        return Ok(Some(format!("indexed_file_incomplete: {}", path.display())));
-    }
-
     let embedding_backend = crate::embeddings::embedding_runtime_id();
     let expected_doc_backend = crate::embeddings::embedding_backend_label();
     if let Ok(stats) = storage.get_llm_symbol_doc_stats() {
@@ -899,6 +892,16 @@ fn strict_readiness_unavailable_reason(
         embedding_dim,
     )
     .context("compute strict sidecar input fingerprint")?;
+    let stored_files = storage
+        .files()
+        .inventory()
+        .context("load indexed file inventory")?;
+    if let Some(file) = stored_files.iter().find(|file| file.retry_required) {
+        return Ok(Some(format!(
+            "indexed_file_error_retry_required: {}",
+            file.path.display()
+        )));
+    }
     if manifest.sidecar_input_hash.as_deref() == Some(current_input.hash.as_str())
         && manifest.projection_count == Some(current_input.projection_count)
         && manifest.symbol_doc_count == Some(current_input.symbol_doc_count)
@@ -914,18 +917,8 @@ fn strict_readiness_unavailable_reason(
 
     let workspace = WorkspaceManifest::open(project_root.to_path_buf())
         .context("open workspace manifest for strict sidecar readiness")?;
-    let files = storage.files().get_files().context("load indexed files")?;
     let refresh_inputs = RefreshInputs {
-        stored_files: files
-            .into_iter()
-            .map(|file| StoredFileState {
-                id: file.id,
-                path: file.path,
-                modification_time: file.modification_time,
-                indexed: file.indexed,
-                complete: file.complete,
-            })
-            .collect(),
+        stored_files,
         inventory: Default::default(),
     };
     let plan = workspace
@@ -1024,7 +1017,7 @@ mod tests {
     };
     use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
     use crate::test_support::retrieval_manifest_fixture;
-    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_contracts::graph::{ErrorInfo, IndexStep, Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -1487,7 +1480,9 @@ mod tests {
     }
 
     #[test]
-    fn strict_readiness_rejects_unchanged_incomplete_indexed_file() {
+    fn strict_readiness_distinguishes_parser_partial_from_file_error() {
+        let _lock = crate::test_support::env_lock();
+        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
         let project = TempDir::new().expect("project");
         let storage_dir = TempDir::new().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -1495,8 +1490,7 @@ mod tests {
         std::fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
         let indexed_mtime = live_mtime_millis(&source_path);
         let project_id = project_id_for_root(project.path());
-        let manifest = retrieval_manifest_fixture(&project_id, "current");
-        let storage = Store::open(&storage_path).expect("open db");
+        let mut storage = Store::open(&storage_path).expect("open db");
         storage
             .insert_file(&FileInfo {
                 id: 1,
@@ -1509,7 +1503,40 @@ mod tests {
                 file_role: FileRole::Source,
             })
             .expect("insert incomplete file");
+        let input = compute_sidecar_input_fingerprint(
+            &storage,
+            &storage_path,
+            project.path(),
+            &project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+        )
+        .expect("sidecar input");
+        let mut manifest = retrieval_manifest_fixture(&project_id, &input.hash);
+        manifest.built_at_epoch_ms = indexed_mtime;
+        manifest.projection_count = Some(input.projection_count);
+        manifest.symbol_doc_count = Some(input.symbol_doc_count);
+        manifest.dense_projection_count = Some(input.dense_projection_count);
+        manifest.semantic_policy_version = input.semantic_policy_version;
+        manifest.graph_artifact_hash = Some(input.graph_artifact_hash);
+        manifest.dense_reason_counts_json = Some(input.dense_reason_counts_json);
+        storage
+            .upsert_retrieval_index_manifest(&manifest)
+            .expect("manifest");
 
+        validate_strict_sidecar_readiness(project.path(), &storage_path, &storage)
+            .expect("parser coverage must not masquerade as an interrupted transaction");
+
+        storage
+            .insert_error(&ErrorInfo {
+                message: "read failed".into(),
+                file_id: Some(NodeId(1)),
+                line: None,
+                column: None,
+                is_fatal: true,
+                index_step: IndexStep::Indexing,
+            })
+            .expect("file error");
         let reason = strict_readiness_unavailable_reason(
             project.path(),
             &storage_path,
@@ -1518,13 +1545,14 @@ mod tests {
             &manifest,
         )
         .expect("strict readiness")
-        .expect("incomplete file must degrade");
-
-        assert!(
-            reason.contains("indexed_file_incomplete"),
-            "unexpected reason: {reason}"
+        .expect("file error must degrade");
+        assert_eq!(
+            reason,
+            format!(
+                "indexed_file_error_retry_required: {}",
+                source_path.display()
+            )
         );
-        assert!(reason.contains(&source_path.display().to_string()));
     }
 
     #[test]

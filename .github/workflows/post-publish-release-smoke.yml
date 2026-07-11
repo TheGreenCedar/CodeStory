@@ -1,6 +1,12 @@
 name: Post-publish release smoke
 
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version to smoke, with or without a leading v.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       version:
@@ -13,9 +19,28 @@ permissions:
 
 jobs:
   smoke:
-    name: Published release asset smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    name: Published ${{ matrix.asset_target }} smoke
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_target: linux-x64
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
+            asset_target: linux-arm64
+            extension: tar.gz
+          - os: windows-latest
+            asset_target: windows-x64
+            extension: zip
+          - os: windows-11-arm
+            asset_target: windows-arm64
+            extension: zip
+          - os: macos-15
+            asset_target: macos-arm64
+            extension: tar.gz
     steps:
       - name: Normalize release version
         id: release
@@ -36,52 +61,80 @@ jobs:
         with:
           ref: ${{ steps.release.outputs.tag }}
 
-      - name: Download published release assets
+      - name: Download published asset and checksum
+        id: asset
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
           VERSION: ${{ steps.release.outputs.version }}
+          ASSET_TARGET: ${{ matrix.asset_target }}
+          EXTENSION: ${{ matrix.extension }}
         run: |
           set -euo pipefail
-          mkdir -p target/post-publish-release-assets
+          dir="target/post-publish-release-assets"
+          asset="codestory-cli-v${VERSION}-${ASSET_TARGET}.${EXTENSION}"
+          mkdir -p "$dir"
           gh release download "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "codestory-cli-v${VERSION}-*.tar.gz" \
-            --pattern "codestory-cli-v${VERSION}-*.zip" \
+            --pattern "$asset" \
             --pattern "SHA256SUMS.txt" \
-            --dir target/post-publish-release-assets \
+            --dir "$dir" \
             --clobber
-          shopt -s nullglob
-          assets=(
-            target/post-publish-release-assets/codestory-cli-v${VERSION}-*.tar.gz
-            target/post-publish-release-assets/codestory-cli-v${VERSION}-*.zip
-          )
-          if [ "${#assets[@]}" -ne 5 ]; then
-            echo "::error::Expected five binary archives, found ${#assets[@]}."
-            printf '%s\n' "${assets[@]}"
-            exit 1
-          fi
-          (cd target/post-publish-release-assets && sha256sum -c SHA256SUMS.txt)
+          echo "archive=$dir/$asset" >> "$GITHUB_OUTPUT"
+          echo "checksum=$dir/SHA256SUMS.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Prove packaged version, help, and stdio shape
+        run: >-
+          python .github/scripts/check-packaged-agent-proof.py
+          --archive "${{ steps.asset.outputs.archive }}"
+          --checksum-file "${{ steps.asset.outputs.checksum }}"
+          --expected-version "${{ steps.release.outputs.version }}"
+          --version-only
+          --out-dir "target/post-publish-version-proof/${{ matrix.asset_target }}"
+
+      - name: Run Windows installer ownership self-test
+        if: matrix.asset_target == 'windows-x64'
+        shell: pwsh
+        run: pwsh -File scripts/install-codestory.ps1 -SelfTest
+
+      - name: Prove Windows managed plugin handoff
+        if: matrix.asset_target == 'windows-x64'
+        shell: pwsh
+        run: >-
+          python .github/scripts/check-packaged-agent-proof.py
+          --archive "${{ steps.asset.outputs.archive }}"
+          --checksum-file "${{ steps.asset.outputs.checksum }}"
+          --expected-version "${{ steps.release.outputs.version }}"
+          --project "${{ github.workspace }}"
+          --plugin-root plugins/codestory
+          --managed-plugin-handoff
+          --out-dir target/post-publish-managed-proof
 
       - name: Fetch retrieval embedding model
+        if: matrix.asset_target == 'linux-x64'
         run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
 
-      - name: Prove published Linux agent runtime
+      - name: Prove published Linux full-sidecar agent runtime
+        if: matrix.asset_target == 'linux-x64'
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
-        run: |
-          set -euo pipefail
-          python .github/scripts/check-packaged-agent-proof.py \
-            --archive "target/post-publish-release-assets/codestory-cli-v${{ steps.release.outputs.version }}-linux-x64.tar.gz" \
-            --expected-version "${{ steps.release.outputs.version }}" \
-            --project "${{ github.workspace }}" \
-            --plugin-root plugins/codestory \
-            --out-dir target/post-publish-agent-proof
+        run: >-
+          python .github/scripts/check-packaged-agent-proof.py
+          --archive "${{ steps.asset.outputs.archive }}"
+          --checksum-file "${{ steps.asset.outputs.checksum }}"
+          --expected-version "${{ steps.release.outputs.version }}"
+          --project "${{ github.workspace }}"
+          --plugin-root plugins/codestory
+          --out-dir target/post-publish-agent-proof
 
-      - name: Upload post-publish agent proof artifacts
+      - name: Upload post-publish proof artifacts
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: post-publish-agent-proof-linux-x64-${{ steps.release.outputs.version }}
-          path: target/post-publish-agent-proof
+          name: post-publish-proof-${{ matrix.asset_target }}-${{ steps.release.outputs.version }}
+          path: |
+            target/post-publish-version-proof/${{ matrix.asset_target }}
+            target/post-publish-managed-proof
+            target/post-publish-agent-proof
           if-no-files-found: warn

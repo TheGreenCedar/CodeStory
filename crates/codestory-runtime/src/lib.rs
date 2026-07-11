@@ -47,9 +47,7 @@ use codestory_store::{
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
     SymbolSummaryRecord,
 };
-use codestory_workspace::{
-    IndexedFileRecord, RefreshExecutionPlan, RefreshInputs, WorkspaceInventory, WorkspaceManifest,
-};
+use codestory_workspace::{RefreshExecutionPlan, RefreshInputs, WorkspaceManifest};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
@@ -3479,37 +3477,6 @@ fn not_checked_index_freshness(
     }
 }
 
-fn refresh_inputs_from_files(files: Vec<FileInfo>) -> RefreshInputs {
-    let inventory = files
-        .iter()
-        .map(|file| {
-            (
-                file.path.clone(),
-                IndexedFileRecord {
-                    file_id: file.id,
-                    modification_time: file.modification_time,
-                    indexed: file.indexed,
-                    complete: file.complete,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    let stored_files = files
-        .into_iter()
-        .map(|file| codestory_workspace::StoredFileState {
-            id: file.id,
-            path: file.path,
-            modification_time: file.modification_time,
-            indexed: file.indexed,
-            complete: file.complete,
-        });
-
-    RefreshInputs {
-        stored_files: stored_files.collect(),
-        inventory: WorkspaceInventory::from_records(inventory),
-    }
-}
-
 fn indexable_source_path(path: &Path) -> bool {
     let tree_sitter_supported = path
         .extension()
@@ -3594,11 +3561,24 @@ fn index_freshness_from_storage(
         );
     }
 
+    let stored_files = match storage.files().inventory() {
+        Ok(files) => files,
+        Err(error) => {
+            return not_checked_index_freshness(
+                format!("failed to read refresh inventory: {error}"),
+                indexed_file_count,
+                started_at,
+            );
+        }
+    };
     let removed_paths = files
         .iter()
         .map(|file| (file.id, file.path.clone()))
         .collect::<HashMap<_, _>>();
-    let refresh_inputs = refresh_inputs_from_files(files);
+    let refresh_inputs = RefreshInputs {
+        stored_files,
+        inventory: Default::default(),
+    };
     let plan = match workspace
         .build_execution_plan_bounded(&refresh_inputs, INDEX_FRESHNESS_CURRENT_FILE_CAP)
     {
@@ -11108,11 +11088,13 @@ fn indexing_cancelled_error() -> ApiError {
 }
 
 fn workspace_refresh_inputs(store: &Store) -> Result<RefreshInputs, ApiError> {
-    let files = store
-        .files()
-        .get_files()
-        .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?;
-    Ok(refresh_inputs_from_files(files))
+    Ok(RefreshInputs {
+        stored_files: store
+            .files()
+            .inventory()
+            .map_err(|e| ApiError::internal(format!("Failed to read workspace inventory: {e}")))?,
+        inventory: Default::default(),
+    })
 }
 
 fn rebuild_search_state_from_storage(
@@ -11273,6 +11255,53 @@ mod tests {
             !indexable_source_path(Path::new("target/run-output.log")),
             "runtime freshness should not count unsupported output artifacts"
         );
+    }
+
+    #[test]
+    fn parser_partial_freshness_distinguishes_file_level_errors() {
+        let project = tempdir().expect("project");
+        let source_path = project.path().join("lib.rs");
+        fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let modification_time = fs::metadata(&source_path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time,
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert parser-partial file");
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(freshness.changed_file_count, 0);
+
+        storage
+            .insert_error(&codestory_contracts::graph::ErrorInfo {
+                message: "read failed".into(),
+                file_id: Some(codestory_contracts::graph::NodeId(1)),
+                line: None,
+                column: None,
+                is_fatal: true,
+                index_step: codestory_contracts::graph::IndexStep::Indexing,
+            })
+            .expect("file error");
+        let retry = index_freshness_from_storage(project.path(), &workspace, &storage);
+        assert_eq!(retry.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(retry.changed_file_count, 1);
     }
 
     struct HybridTestEnv {

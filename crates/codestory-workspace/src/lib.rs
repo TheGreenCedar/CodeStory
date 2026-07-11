@@ -370,8 +370,9 @@ impl WorkspaceManifest {
 
     /// Build an incremental refresh plan from stored file inventory.
     ///
-    /// A file is scheduled when it is new, unreadable, previously unindexed, or
-    /// its filesystem mtime differs from the stored millisecond timestamp.
+    /// A file is scheduled when it is new, unreadable, previously unindexed,
+    /// carries a retryable file-level error, or its filesystem mtime differs
+    /// from the stored millisecond timestamp.
     /// Stored file ids absent from current discovery are scheduled for removal.
     pub fn build_execution_plan(&self, inputs: &RefreshInputs) -> Result<RefreshPlan> {
         WorkspaceDiscovery.build_refresh_plan(self, inputs)
@@ -537,7 +538,7 @@ impl WorkspaceDiscovery {
                     existing_file_ids.insert(path.clone(), file.id);
                     match modification_time_millis(&path) {
                         Ok(mtime) => {
-                            mtime != file.modification_time || !file.indexed || !file.complete
+                            mtime != file.modification_time || !file.indexed || file.retry_required
                         }
                         Err(_) => true,
                     }
@@ -924,6 +925,7 @@ mod tests {
                     modification_time: 0,
                     indexed: true,
                     complete: true,
+                    retry_required: false,
                 }],
                 inventory: WorkspaceInventory::default(),
             },
@@ -953,6 +955,7 @@ mod tests {
                     modification_time: modification_time_millis(&file)?,
                     indexed: true,
                     complete: true,
+                    retry_required: false,
                 }],
                 inventory: WorkspaceInventory::default(),
             },
@@ -967,8 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_refresh_retries_unchanged_incomplete_files_from_both_inventories() -> Result<()>
-    {
+    fn incremental_refresh_does_not_spin_on_unchanged_parser_partial_files() -> Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("repo");
         fs::create_dir_all(&root)?;
@@ -985,6 +987,7 @@ mod tests {
                     modification_time,
                     indexed: true,
                     complete: false,
+                    retry_required: false,
                 }],
                 inventory: WorkspaceInventory::default(),
             },
@@ -997,6 +1000,54 @@ mod tests {
                         modification_time,
                         indexed: true,
                         complete: false,
+                        retry_required: false,
+                    },
+                )]),
+            },
+        ];
+
+        for input in inputs {
+            let plan = WorkspaceDiscovery.build_refresh_plan(&manifest, &input)?;
+            assert!(
+                plan.files_to_index.is_empty(),
+                "parser coverage is diagnostic state, not source freshness"
+            );
+            assert_eq!(plan.existing_file_ids.get(&file), Some(&7));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_refresh_retries_unchanged_file_level_failures() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n")?;
+        let modification_time = modification_time_millis(&file)?;
+        let manifest = WorkspaceManifest::open(root)?;
+        let inputs = [
+            RefreshInputs {
+                stored_files: vec![StoredFileState {
+                    id: 7,
+                    path: file.clone(),
+                    modification_time,
+                    indexed: true,
+                    complete: false,
+                    retry_required: true,
+                }],
+                inventory: WorkspaceInventory::default(),
+            },
+            RefreshInputs {
+                stored_files: Vec::new(),
+                inventory: WorkspaceInventory::from_records([(
+                    file.clone(),
+                    IndexedFileRecord {
+                        file_id: 7,
+                        modification_time,
+                        indexed: true,
+                        complete: false,
+                        retry_required: true,
                     },
                 )]),
             },
@@ -1033,6 +1084,7 @@ mod tests {
                             modification_time: modification_time_millis(&file)?,
                             indexed: true,
                             complete: true,
+                            retry_required: false,
                         },
                     ),
                     (
@@ -1042,6 +1094,7 @@ mod tests {
                             modification_time: 0,
                             indexed: true,
                             complete: true,
+                            retry_required: false,
                         },
                     ),
                 ]),

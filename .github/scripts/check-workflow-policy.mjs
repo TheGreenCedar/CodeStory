@@ -11,6 +11,9 @@ const closeDevIssues = path.join(workflowRoot, "close-dev-issues.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
 const releaseWorkflow = path.join(workflowRoot, "release.yml");
+const postPublishReleaseSmoke = path.join(workflowRoot, "post-publish-release-smoke.yml");
+const packagedPlatformPr = path.join(workflowRoot, "packaged-platform-pr.yml");
+const packagedPlatformProof = path.join(workflowRoot, "packaged-platform-proof.yml");
 const mainBranchSourceGuard = path.join(workflowRoot, "main-branch-source-guard.yml");
 
 for (const file of fs
@@ -109,7 +112,16 @@ if (!fs.existsSync(pluginStatic)) {
     "dev/codestory-next",
     "node --test plugins/codestory/tests/plugin-static.test.mjs",
     "node .github/scripts/check-workflow-policy.mjs",
+    "python .github/scripts/check-packaged-agent-proof.py --self-test",
+    "python .github/scripts/package-codestory-release.py --self-test",
     "python .github/scripts/check-codestory-release.py --version",
+    ".github/scripts/check-packaged-agent-proof.py",
+    ".github/scripts/package-codestory-release.py",
+    ".github/workflows/release.yml",
+    ".github/workflows/post-publish-release-smoke.yml",
+    ".github/workflows/packaged-platform-pr.yml",
+    ".github/workflows/packaged-platform-proof.yml",
+    "scripts/install-codestory.ps1",
   ];
 
   for (const snippet of requiredSnippets) {
@@ -145,11 +157,124 @@ if (!fs.existsSync(releaseWorkflow)) {
   violations.push("release.yml must exist for release automation");
 } else {
   const content = fs.readFileSync(releaseWorkflow, "utf8");
-  if (!content.includes('RELEASE_RUST_TOOLCHAIN: "1.95.0"')) {
-    violations.push("release.yml must pin RELEASE_RUST_TOOLCHAIN to 1.95.0");
-  }
   if (content.includes("rustup toolchain install stable")) {
     violations.push("release.yml release builds must not install floating stable Rust");
+  }
+  for (const snippet of [
+    "uses: ./.github/workflows/packaged-platform-proof.yml",
+    "version: ${{ needs.preflight.outputs.version }}",
+    "uses: ./.github/workflows/post-publish-release-smoke.yml",
+    "--notes-file target/release-assets/proof-boundaries.md",
+    "live managed Metal endpoint survival remains open in #887",
+    "Older-glibc compatibility is unproven",
+    "--generate-notes",
+  ]) {
+    if (!content.includes(snippet)) {
+      violations.push(`release.yml must include ${snippet}`);
+    }
+  }
+  for (const row of [
+    "needs:\n      - preflight\n      - publish\n    uses: ./.github/workflows/post-publish-release-smoke.yml",
+  ]) {
+    if (!content.includes(row)) {
+      violations.push(`release.yml must preserve release proof block ${row.split("\n")[0]}`);
+    }
+  }
+}
+
+if (!fs.existsSync(packagedPlatformProof)) {
+  violations.push("packaged-platform-proof.yml must own the reusable native package matrix");
+} else {
+  const content = fs.readFileSync(packagedPlatformProof, "utf8");
+  for (const snippet of [
+    "workflow_call:",
+    "contents: read",
+    'RELEASE_RUST_TOOLCHAIN: "1.95.0"',
+    "packaged-version-proof-${{ matrix.asset_target }}",
+    "--managed-plugin-handoff",
+    "scripts/install-codestory.ps1 -SelfTest",
+    "--checksum-file target/release-dist/SHA256SUMS.txt",
+  ]) {
+    if (!content.includes(snippet)) {
+      violations.push(`packaged-platform-proof.yml must include ${snippet}`);
+    }
+  }
+  for (const row of [
+    "- os: ubuntu-latest\n            rust_target: x86_64-unknown-linux-gnu\n            asset_target: linux-x64",
+    "- os: ubuntu-24.04-arm\n            rust_target: aarch64-unknown-linux-gnu\n            asset_target: linux-arm64",
+    "- os: windows-latest\n            rust_target: x86_64-pc-windows-msvc\n            asset_target: windows-x64",
+    "- os: windows-11-arm\n            rust_target: aarch64-pc-windows-msvc\n            asset_target: windows-arm64",
+    "- os: macos-15\n            rust_target: aarch64-apple-darwin\n            asset_target: macos-arm64",
+    "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
+  ]) {
+    if (!content.includes(row)) {
+      violations.push(`packaged-platform-proof.yml must preserve native proof block ${row.split("\n")[0]}`);
+    }
+  }
+}
+
+if (!fs.existsSync(postPublishReleaseSmoke)) {
+  violations.push("post-publish-release-smoke.yml must exist for native published-asset proof");
+} else {
+  const content = fs.readFileSync(postPublishReleaseSmoke, "utf8");
+  for (const snippet of [
+    "workflow_call:",
+    "ubuntu-latest",
+    "ubuntu-24.04-arm",
+    "windows-latest",
+    "windows-11-arm",
+    "macos-15",
+    "linux-x64",
+    "linux-arm64",
+    "windows-x64",
+    "windows-arm64",
+    "macos-arm64",
+    "--version-only",
+    "--managed-plugin-handoff",
+    "scripts/install-codestory.ps1 -SelfTest",
+    "--checksum-file \"${{ steps.asset.outputs.checksum }}\"",
+  ]) {
+    if (!content.includes(snippet)) {
+      violations.push(`post-publish-release-smoke.yml must include ${snippet}`);
+    }
+  }
+  for (const row of [
+    "- os: ubuntu-latest\n            asset_target: linux-x64\n            extension: tar.gz",
+    "- os: ubuntu-24.04-arm\n            asset_target: linux-arm64\n            extension: tar.gz",
+    "- os: windows-latest\n            asset_target: windows-x64\n            extension: zip",
+    "- os: windows-11-arm\n            asset_target: windows-arm64\n            extension: zip",
+    "- os: macos-15\n            asset_target: macos-arm64\n            extension: tar.gz",
+    "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
+    "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: >-\n          python .github/scripts/check-packaged-agent-proof.py",
+  ]) {
+    if (!content.includes(row)) {
+      violations.push(`post-publish-release-smoke.yml must preserve native proof block ${row.split("\n")[0]}`);
+    }
+  }
+  if (content.includes("sha256sum")) {
+    violations.push("post-publish-release-smoke.yml must use the portable Python checksum gate");
+  }
+}
+
+if (!fs.existsSync(packagedPlatformPr)) {
+  violations.push("packaged-platform-pr.yml must run the native package matrix on implementation PRs");
+} else {
+  const content = fs.readFileSync(packagedPlatformPr, "utf8");
+  for (const snippet of [
+    "pull_request:",
+    "contents: read",
+    "uses: ./.github/workflows/packaged-platform-proof.yml",
+    "version: ${{ needs.prepare.outputs.version }}",
+    ".github/scripts/check-packaged-agent-proof.py",
+    ".github/workflows/post-publish-release-smoke.yml",
+    ".github/workflows/packaged-platform-proof.yml",
+  ]) {
+    if (!content.includes(snippet)) {
+      violations.push(`packaged-platform-pr.yml must include ${snippet}`);
+    }
+  }
+  if (content.includes("contents: write") || content.includes("uses: ./.github/workflows/release.yml")) {
+    violations.push("packaged-platform-pr.yml must not request release permissions or call the publishing workflow");
   }
 }
 

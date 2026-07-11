@@ -47,17 +47,9 @@ fn open_temp_storage() -> (TempDir, Storage) {
 fn refresh_inputs_from_storage(storage: &Storage) -> codestory_workspace::RefreshInputs {
     codestory_workspace::RefreshInputs {
         stored_files: storage
-            .get_files()
-            .expect("list benchmark storage files")
-            .into_iter()
-            .map(|file| codestory_workspace::StoredFileState {
-                id: file.id,
-                path: file.path,
-                modification_time: file.modification_time,
-                indexed: file.indexed,
-                complete: file.complete,
-            })
-            .collect(),
+            .files()
+            .inventory()
+            .expect("list benchmark storage inventory"),
         inventory: Default::default(),
     }
 }

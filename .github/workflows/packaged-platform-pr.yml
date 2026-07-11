@@ -1,0 +1,36 @@
+name: Packaged platform acceptance
+
+on:
+  pull_request:
+    paths:
+      - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/package-codestory-release.py
+      - .github/workflows/packaged-platform-pr.yml
+      - .github/workflows/packaged-platform-proof.yml
+      - .github/workflows/post-publish-release-smoke.yml
+      - .github/workflows/release.yml
+      - plugins/codestory/**
+      - scripts/install-codestory.ps1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        run: |
+          version="$(python -c "import tomllib; print(tomllib.load(open('crates/codestory-cli/Cargo.toml', 'rb'))['package']['version'])")"
+          python .github/scripts/check-codestory-release.py --version "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  native-packaged-proof:
+    needs: prepare
+    uses: ./.github/workflows/packaged-platform-proof.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
