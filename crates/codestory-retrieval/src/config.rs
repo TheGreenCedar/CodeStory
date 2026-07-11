@@ -6,8 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-use tracing::warn;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Phase 2 lexical shard pin (local index + optional Zoekt webserver).
 pub const ZOEKT_REAL_VERSION_PIN: &str = "zoekt-20250506123554";
@@ -48,6 +47,7 @@ pub const NATIVE_LLAMA_MANAGED_CACHE_REL_PATH: &str =
 pub const NATIVE_LLAMA_SOURCE_CACHE_REL_PATH: &str = "target/llamacpp/b8840/llama-server.exe";
 const LLAMA_SIDECAR_BACKENDS_JSON: &str = include_str!("../assets/llama-sidecar-backends.json");
 const TEST_HOST_PLATFORM_ENV: &str = "CODESTORY_TEST_HOST_PLATFORM";
+const AGENT_PORT_RESERVATION_GRACE: Duration = Duration::from_secs(10 * 60);
 
 pub const ZOEKT_HEALTH_BUDGET: Duration = Duration::from_millis(100);
 pub const QDRANT_HEALTH_BUDGET: Duration = Duration::from_millis(200);
@@ -279,47 +279,55 @@ impl SidecarRuntimeConfig {
         };
         let stored = read_ports_from_state(&state_file);
         let dynamic = profile == SidecarProfile::Agent && stored.is_none();
-        let dynamic_ports = dynamic.then(|| dynamic_agent_ports(&base, &namespace));
-        let zoekt_http_port = env_port("CODESTORY_ZOEKT_PORT", DEFAULT_ZOEKT_HTTP_PORT)
-            .or_else(|| stored.as_ref().map(|ports| ports.zoekt_http))
-            .or_else(|| dynamic_ports.as_ref().map(|ports| ports.zoekt_http))
-            .unwrap_or_else(|| {
-                if dynamic {
-                    dynamic_agent_port(&namespace, "zoekt")
+        let configured_ports = [
+            env_port("CODESTORY_ZOEKT_PORT", DEFAULT_ZOEKT_HTTP_PORT),
+            env_port("CODESTORY_QDRANT_HTTP_PORT", DEFAULT_QDRANT_HTTP_PORT),
+            env_port("CODESTORY_QDRANT_GRPC_PORT", DEFAULT_QDRANT_GRPC_PORT),
+            env_port("CODESTORY_EMBED_PORT", DEFAULT_EMBED_HTTP_PORT),
+        ];
+        let dynamic_ports =
+            dynamic.then(|| dynamic_agent_ports(&base, &namespace, configured_ports));
+        let dynamic_failed = dynamic_ports.as_ref().is_some_and(|ports| {
+            [
+                ports.zoekt_http,
+                ports.qdrant_http,
+                ports.qdrant_grpc,
+                ports.embed_http,
+            ]
+            .contains(&0)
+        });
+        let selected_port =
+            |configured: Option<u16>, stored: Option<u16>, dynamic: Option<u16>, default| {
+                if dynamic_failed {
+                    0
                 } else {
-                    DEFAULT_ZOEKT_HTTP_PORT
+                    configured.or(stored).or(dynamic).unwrap_or(default)
                 }
-            });
-        let qdrant_http_port = env_port("CODESTORY_QDRANT_HTTP_PORT", DEFAULT_QDRANT_HTTP_PORT)
-            .or_else(|| stored.as_ref().map(|ports| ports.qdrant_http))
-            .or_else(|| dynamic_ports.as_ref().map(|ports| ports.qdrant_http))
-            .unwrap_or_else(|| {
-                if dynamic {
-                    dynamic_agent_port(&namespace, "qdrant-http")
-                } else {
-                    DEFAULT_QDRANT_HTTP_PORT
-                }
-            });
-        let qdrant_grpc_port = env_port("CODESTORY_QDRANT_GRPC_PORT", DEFAULT_QDRANT_GRPC_PORT)
-            .or_else(|| stored.as_ref().map(|ports| ports.qdrant_grpc))
-            .or_else(|| dynamic_ports.as_ref().map(|ports| ports.qdrant_grpc))
-            .unwrap_or_else(|| {
-                if dynamic {
-                    dynamic_agent_port(&namespace, "qdrant-grpc")
-                } else {
-                    DEFAULT_QDRANT_GRPC_PORT
-                }
-            });
-        let embed_http_port = env_port("CODESTORY_EMBED_PORT", DEFAULT_EMBED_HTTP_PORT)
-            .or_else(|| stored.as_ref().map(|ports| ports.embed_http))
-            .or_else(|| dynamic_ports.as_ref().map(|ports| ports.embed_http))
-            .unwrap_or_else(|| {
-                if dynamic {
-                    dynamic_agent_port(&namespace, "embed")
-                } else {
-                    DEFAULT_EMBED_HTTP_PORT
-                }
-            });
+            };
+        let zoekt_http_port = selected_port(
+            configured_ports[0],
+            stored.as_ref().map(|ports| ports.zoekt_http),
+            dynamic_ports.as_ref().map(|ports| ports.zoekt_http),
+            DEFAULT_ZOEKT_HTTP_PORT,
+        );
+        let qdrant_http_port = selected_port(
+            configured_ports[1],
+            stored.as_ref().map(|ports| ports.qdrant_http),
+            dynamic_ports.as_ref().map(|ports| ports.qdrant_http),
+            DEFAULT_QDRANT_HTTP_PORT,
+        );
+        let qdrant_grpc_port = selected_port(
+            configured_ports[2],
+            stored.as_ref().map(|ports| ports.qdrant_grpc),
+            dynamic_ports.as_ref().map(|ports| ports.qdrant_grpc),
+            DEFAULT_QDRANT_GRPC_PORT,
+        );
+        let embed_http_port = selected_port(
+            configured_ports[3],
+            stored.as_ref().map(|ports| ports.embed_http),
+            dynamic_ports.as_ref().map(|ports| ports.embed_http),
+            DEFAULT_EMBED_HTTP_PORT,
+        );
         let root = match profile {
             SidecarProfile::Local => base.clone(),
             SidecarProfile::Agent => base.join("sidecars").join(&namespace),
@@ -402,6 +410,23 @@ impl SidecarRuntimeConfig {
             },
             labels: self.labels.clone(),
         }
+    }
+
+    pub(crate) fn ensure_ports_allocated(&self) -> Result<()> {
+        if self.profile == SidecarProfile::Agent
+            && [
+                self.layout.zoekt_http_port,
+                self.layout.qdrant_http_port,
+                self.layout.qdrant_grpc_port,
+                self.embed_http_port,
+            ]
+            .contains(&0)
+        {
+            anyhow::bail!(
+                "agent sidecar port allocation is unavailable; inspect sidecars/port-allocations.json and retry"
+            );
+        }
+        Ok(())
     }
 
     pub fn activate_embed_url_default(&self) {
@@ -641,22 +666,26 @@ fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
     })
 }
 
-fn dynamic_agent_port(namespace: &str, salt: &str) -> u16 {
-    dynamic_agent_port_excluding(namespace, salt, &BTreeSet::new())
-}
-
-fn dynamic_agent_ports(base: &Path, namespace: &str) -> SidecarPorts {
-    allocate_agent_ports_in_registry(base, namespace).unwrap_or_else(|error| {
-        warn!(
-            namespace,
-            error = %error,
-            "falling back to unlocked dynamic agent sidecar port allocation"
+fn dynamic_agent_ports(base: &Path, namespace: &str, configured: [Option<u16>; 4]) -> SidecarPorts {
+    allocate_agent_ports_in_registry(base, namespace, configured).unwrap_or_else(|error| {
+        eprintln!(
+            "CodeStory sidecar port allocation failed closed: namespace={namespace} error={error:#}"
         );
-        fallback_dynamic_agent_ports(namespace)
+        SidecarPorts {
+            zoekt_http: 0,
+            qdrant_http: 0,
+            qdrant_grpc: 0,
+            embed_http: 0,
+            embed_url: SidecarLayout::embed_base_url(0),
+        }
     })
 }
 
-fn allocate_agent_ports_in_registry(base: &Path, namespace: &str) -> Result<SidecarPorts> {
+fn allocate_agent_ports_in_registry(
+    base: &Path,
+    namespace: &str,
+    configured: [Option<u16>; 4],
+) -> Result<SidecarPorts> {
     let root = base.join("sidecars");
     std::fs::create_dir_all(&root)
         .with_context(|| format!("create sidecar port registry dir {}", root.display()))?;
@@ -672,16 +701,40 @@ fn allocate_agent_ports_in_registry(base: &Path, namespace: &str) -> Result<Side
         .with_context(|| format!("take sidecar port allocation lock {}", lock_path.display()))?;
 
     let registry_path = root.join("port-allocations.json");
-    let mut registry = read_agent_port_registry(&registry_path);
-    if let Some(ports) = registry.get(namespace) {
-        return Ok(ports.clone());
-    }
-
-    let mut reserved = reserved_registry_ports(&registry);
-    let zoekt_http = reserve_dynamic_agent_port(namespace, "zoekt", &mut reserved);
-    let qdrant_http = reserve_dynamic_agent_port(namespace, "qdrant-http", &mut reserved);
-    let qdrant_grpc = reserve_dynamic_agent_port(namespace, "qdrant-grpc", &mut reserved);
-    let embed_http = reserve_dynamic_agent_port(namespace, "embed", &mut reserved);
+    let mut registry = read_agent_port_registry(&registry_path)?;
+    let existing = registry.get(namespace).cloned();
+    let current_reservation_is_recent =
+        agent_port_reservation_is_recent(&root, namespace, now_epoch_ms())?;
+    let cleanup = prune_agent_port_registry(&root, namespace, &mut registry);
+    let mut reserved = reserved_registry_ports_excluding(&registry, namespace);
+    let zoekt_http = select_agent_port(
+        configured[0],
+        existing.as_ref().map(|ports| ports.zoekt_http),
+        namespace,
+        "zoekt",
+        &mut reserved,
+    )?;
+    let qdrant_http = select_agent_port(
+        configured[1],
+        existing.as_ref().map(|ports| ports.qdrant_http),
+        namespace,
+        "qdrant-http",
+        &mut reserved,
+    )?;
+    let qdrant_grpc = select_agent_port(
+        configured[2],
+        existing.as_ref().map(|ports| ports.qdrant_grpc),
+        namespace,
+        "qdrant-grpc",
+        &mut reserved,
+    )?;
+    let embed_http = select_agent_port(
+        configured[3],
+        existing.as_ref().map(|ports| ports.embed_http),
+        namespace,
+        "embed",
+        &mut reserved,
+    )?;
     let ports = SidecarPorts {
         zoekt_http,
         qdrant_http,
@@ -689,27 +742,245 @@ fn allocate_agent_ports_in_registry(base: &Path, namespace: &str) -> Result<Side
         embed_http,
         embed_url: SidecarLayout::embed_base_url(embed_http),
     };
-    registry.insert(namespace.to_string(), ports.clone());
-    std::fs::write(&registry_path, serde_json::to_vec_pretty(&registry)?).with_context(|| {
-        format!(
-            "write sidecar port allocation registry {}",
-            registry_path.display()
-        )
-    })?;
+    let changed = existing.as_ref() != Some(&ports);
+    if changed
+        && existing
+            .as_ref()
+            .is_some_and(|ports| current_reservation_is_recent || sidecar_ports_are_bound(ports))
+    {
+        anyhow::bail!(
+            "agent sidecar namespace {namespace} already has an active or recently reserved port allocation"
+        );
+    }
+    write_agent_port_reservation(&root, namespace)?;
+    if changed {
+        registry.insert(namespace.to_string(), ports.clone());
+    }
+    if changed || cleanup.pruned > 0 {
+        write_agent_port_registry(&registry_path, &registry)?;
+    }
+    if cleanup.pruned > 0 || cleanup.failures > 0 {
+        eprintln!(
+            "CodeStory sidecar port cleanup: pruned={} retained={} failures={}",
+            cleanup.pruned, cleanup.retained, cleanup.failures
+        );
+        for detail in &cleanup.failure_details {
+            eprintln!("CodeStory sidecar port cleanup warning: {detail}");
+        }
+        if cleanup.failures > cleanup.failure_details.len() {
+            eprintln!(
+                "CodeStory sidecar port cleanup warning: {} additional failures omitted",
+                cleanup.failures - cleanup.failure_details.len()
+            );
+        }
+    }
     Ok(ports)
 }
 
-fn read_agent_port_registry(path: &Path) -> BTreeMap<String, SidecarPorts> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|body| serde_json::from_str(&body).ok())
-        .unwrap_or_default()
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AgentPortRegistryCleanup {
+    pruned: usize,
+    retained: usize,
+    failures: usize,
+    failure_details: Vec<String>,
 }
 
-fn reserved_registry_ports(registry: &BTreeMap<String, SidecarPorts>) -> BTreeSet<u16> {
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentPortReservation {
+    reserved_at_epoch_ms: i64,
+}
+
+fn write_agent_port_reservation(root: &Path, namespace: &str) -> Result<()> {
+    let reservation = AgentPortReservation {
+        reserved_at_epoch_ms: now_epoch_ms(),
+    };
+    let bytes = serde_json::to_vec_pretty(&reservation)?;
+    codestory_workspace::atomic_file::write_bytes_atomic(
+        &agent_port_reservation_path(root, namespace),
+        "agent-port-reservation",
+        &bytes,
+    )
+    .with_context(|| format!("write agent port reservation for {namespace}"))
+}
+
+fn agent_port_reservation_is_recent(
+    root: &Path,
+    namespace: &str,
+    now_epoch_ms: i64,
+) -> Result<bool> {
+    let path = agent_port_reservation_path(root, namespace);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let reservation: AgentPortReservation =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    Ok(
+        now_epoch_ms.saturating_sub(reservation.reserved_at_epoch_ms)
+            < AGENT_PORT_RESERVATION_GRACE.as_millis() as i64,
+    )
+}
+
+fn write_agent_port_registry(path: &Path, registry: &BTreeMap<String, SidecarPorts>) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(registry)?;
+    codestory_workspace::atomic_file::write_bytes_atomic(path, "agent-port-registry", &bytes)
+        .with_context(|| format!("write sidecar port allocation registry {}", path.display()))
+}
+
+fn prune_agent_port_registry(
+    root: &Path,
+    current_namespace: &str,
+    registry: &mut BTreeMap<String, SidecarPorts>,
+) -> AgentPortRegistryCleanup {
+    let now = now_epoch_ms();
+    let mut cleanup = AgentPortRegistryCleanup::default();
+    registry.retain(|namespace, ports| {
+        if namespace == current_namespace {
+            return true;
+        }
+        match agent_port_allocation_is_retained(root, namespace, ports, now) {
+            Ok(true) => {
+                cleanup.retained += 1;
+                true
+            }
+            Ok(false) => {
+                cleanup.pruned += 1;
+                if let Err(error) =
+                    std::fs::remove_file(agent_port_reservation_path(root, namespace))
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    cleanup.failures += 1;
+                    cleanup.record_failure(format!(
+                        "namespace={namespace} failed to remove stale reservation: {error}"
+                    ));
+                }
+                false
+            }
+            Err(error) => {
+                cleanup.failures += 1;
+                cleanup.record_failure(format!(
+                    "namespace={namespace} preserved unverified allocation: {error:#}"
+                ));
+                true
+            }
+        }
+    });
+    cleanup
+}
+
+impl AgentPortRegistryCleanup {
+    fn record_failure(&mut self, detail: String) {
+        if self.failure_details.len() < 5 {
+            self.failure_details.push(detail);
+        }
+    }
+}
+
+fn agent_port_allocation_is_retained(
+    root: &Path,
+    namespace: &str,
+    ports: &SidecarPorts,
+    now_epoch_ms: i64,
+) -> Result<bool> {
+    if !is_agent_namespace_path_component(namespace) {
+        anyhow::bail!("registry namespace is not a safe agent path component");
+    }
+    let namespace_root = root.join(namespace);
+    if agent_port_reservation_is_recent(root, namespace, now_epoch_ms)? {
+        return Ok(true);
+    }
+
+    let state_path = namespace_root.join("retrieval-sidecars.json");
+    let state_bytes = match std::fs::read(&state_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(sidecar_ports_are_bound(ports));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", state_path.display()));
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&state_bytes)
+        .with_context(|| format!("parse {}", state_path.display()))?;
+    if value.get("owner").and_then(|value| value.as_str()) != Some("codestory")
+        || value.get("namespace").and_then(|value| value.as_str()) != Some(namespace)
+    {
+        anyhow::bail!("state owner or namespace does not match registry allocation");
+    }
+    let state_ports = sidecar_ports_from_value(&value)
+        .context("state does not contain a complete sidecar port allocation")?;
+    if &state_ports != ports {
+        anyhow::bail!("state ports do not match registry allocation");
+    }
+    // A valid state file still causes runtime construction to reuse these ports, even if the
+    // owner is temporarily down. Reclaim only after normal teardown removes the state contract.
+    Ok(true)
+}
+
+fn is_agent_namespace_path_component(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn sidecar_ports_are_bound(ports: &SidecarPorts) -> bool {
+    [
+        ports.zoekt_http,
+        ports.qdrant_http,
+        ports.qdrant_grpc,
+        ports.embed_http,
+    ]
+    .into_iter()
+    .any(|port| !local_port_available(port))
+}
+
+fn agent_port_reservation_path(root: &Path, namespace: &str) -> PathBuf {
+    root.join(format!(".port-allocation-{namespace}.json"))
+}
+
+fn sidecar_ports_from_value(value: &serde_json::Value) -> Option<SidecarPorts> {
+    let embed_http = value.get("embed_http_port")?.as_u64()?.try_into().ok()?;
+    Some(SidecarPorts {
+        zoekt_http: value.get("zoekt_http_port")?.as_u64()?.try_into().ok()?,
+        qdrant_http: value.get("qdrant_http_port")?.as_u64()?.try_into().ok()?,
+        qdrant_grpc: value.get("qdrant_grpc_port")?.as_u64()?.try_into().ok()?,
+        embed_http,
+        embed_url: value.get("embed_url")?.as_str().map(ToOwned::to_owned)?,
+    })
+}
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn read_agent_port_registry(path: &Path) -> Result<BTreeMap<String, SidecarPorts>> {
+    let body = match std::fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read sidecar port allocation registry {}", path.display())
+            });
+        }
+    };
+    serde_json::from_str(&body)
+        .with_context(|| format!("parse sidecar port allocation registry {}", path.display()))
+}
+
+fn reserved_registry_ports_excluding(
+    registry: &BTreeMap<String, SidecarPorts>,
+    namespace: &str,
+) -> BTreeSet<u16> {
     registry
-        .values()
-        .flat_map(|ports| {
+        .iter()
+        .filter(|(candidate, _)| candidate.as_str() != namespace)
+        .flat_map(|(_, ports)| {
             [
                 ports.zoekt_http,
                 ports.qdrant_http,
@@ -718,6 +989,22 @@ fn reserved_registry_ports(registry: &BTreeMap<String, SidecarPorts>) -> BTreeSe
             ]
         })
         .collect()
+}
+
+fn select_agent_port(
+    configured: Option<u16>,
+    existing: Option<u16>,
+    namespace: &str,
+    salt: &str,
+    reserved: &mut BTreeSet<u16>,
+) -> Result<u16> {
+    if let Some(port) = configured.or(existing) {
+        if !reserved.insert(port) {
+            anyhow::bail!("agent sidecar port {port} is already reserved");
+        }
+        return Ok(port);
+    }
+    Ok(reserve_dynamic_agent_port(namespace, salt, reserved))
 }
 
 fn reserve_dynamic_agent_port(namespace: &str, salt: &str, reserved: &mut BTreeSet<u16>) -> u16 {
@@ -758,21 +1045,6 @@ fn free_local_port() -> u16 {
         .and_then(|listener| listener.local_addr())
         .map(|addr| addr.port())
         .unwrap_or(0)
-}
-
-fn fallback_dynamic_agent_ports(namespace: &str) -> SidecarPorts {
-    let mut reserved = BTreeSet::new();
-    let zoekt_http = reserve_dynamic_agent_port(namespace, "zoekt", &mut reserved);
-    let qdrant_http = reserve_dynamic_agent_port(namespace, "qdrant-http", &mut reserved);
-    let qdrant_grpc = reserve_dynamic_agent_port(namespace, "qdrant-grpc", &mut reserved);
-    let embed_http = reserve_dynamic_agent_port(namespace, "embed", &mut reserved);
-    SidecarPorts {
-        zoekt_http,
-        qdrant_http,
-        qdrant_grpc,
-        embed_http,
-        embed_url: SidecarLayout::embed_base_url(embed_http),
-    }
 }
 
 fn fnv1a_hex(bytes: &[u8]) -> String {
@@ -1063,12 +1335,12 @@ mod tests {
     fn agent_port_registry_reuses_namespace_and_avoids_registered_ports() {
         let cache = tempdir().expect("cache");
 
-        let first =
-            allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a").expect("first");
-        let same =
-            allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a").expect("same");
-        let other =
-            allocate_agent_ports_in_registry(cache.path(), "codestory-agent-b").expect("other");
+        let first = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a", [None; 4])
+            .expect("first");
+        let same = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a", [None; 4])
+            .expect("same");
+        let other = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-b", [None; 4])
+            .expect("other");
 
         assert_eq!(first, same);
         let ports = [
@@ -1083,6 +1355,313 @@ mod tests {
         ];
         let unique: BTreeSet<_> = ports.into_iter().collect();
         assert_eq!(unique.len(), ports.len());
+    }
+
+    #[test]
+    fn agent_port_registry_refuses_recent_same_namespace_reassignment() {
+        let cache = tempdir().expect("cache");
+        let first =
+            allocate_agent_ports_in_registry(cache.path(), "same", [None; 4]).expect("first");
+        let (listeners, configured) = test_sidecar_ports();
+        drop(listeners);
+
+        allocate_agent_ports_in_registry(
+            cache.path(),
+            "same",
+            [
+                Some(configured.zoekt_http),
+                Some(configured.qdrant_http),
+                Some(configured.qdrant_grpc),
+                Some(configured.embed_http),
+            ],
+        )
+        .expect_err("recent allocation must not be reassigned");
+
+        let registry =
+            read_agent_port_registry(&cache.path().join("sidecars").join("port-allocations.json"))
+                .expect("registry");
+        assert_eq!(registry.get("same"), Some(&first));
+    }
+
+    #[test]
+    fn agent_port_registry_tracks_explicit_runtime_ports() {
+        let _lock = crate::test_support::env_lock();
+        let cache = tempdir().expect("cache");
+        let (listeners, configured) = test_sidecar_ports();
+        drop(listeners);
+        let _cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            cache.path().to_str().expect("utf8 cache"),
+        );
+        let _zoekt = EnvGuard::set("CODESTORY_ZOEKT_PORT", &configured.zoekt_http.to_string());
+        let _qdrant_http = EnvGuard::set(
+            "CODESTORY_QDRANT_HTTP_PORT",
+            &configured.qdrant_http.to_string(),
+        );
+        let _qdrant_grpc = EnvGuard::set(
+            "CODESTORY_QDRANT_GRPC_PORT",
+            &configured.qdrant_grpc.to_string(),
+        );
+        let _embed = EnvGuard::set("CODESTORY_EMBED_PORT", &configured.embed_http.to_string());
+
+        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id(
+            None,
+            SidecarProfile::Agent,
+            Some("configured"),
+        );
+        let root = cache.path().join("sidecars");
+        let registry =
+            read_agent_port_registry(&root.join("port-allocations.json")).expect("read registry");
+
+        assert_eq!(registry.get(&runtime.namespace), Some(&configured));
+        std::fs::remove_file(agent_port_reservation_path(&root, &runtime.namespace))
+            .expect("remove startup reservation");
+        write_test_sidecar_state(&root, &runtime.namespace, &configured, None);
+        let mut registry = registry;
+        let cleanup = prune_agent_port_registry(&root, "other", &mut registry);
+        assert_eq!(cleanup.retained, 1);
+        assert_eq!(cleanup.failures, 0);
+    }
+
+    fn test_sidecar_ports() -> (Vec<TcpListener>, SidecarPorts) {
+        let listeners: Vec<_> = (0..4)
+            .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port"))
+            .collect();
+        let ports: Vec<_> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().expect("local address").port())
+            .collect();
+        (
+            listeners,
+            SidecarPorts {
+                zoekt_http: ports[0],
+                qdrant_http: ports[1],
+                qdrant_grpc: ports[2],
+                embed_http: ports[3],
+                embed_url: SidecarLayout::embed_base_url(ports[3]),
+            },
+        )
+    }
+
+    fn write_test_sidecar_state(
+        root: &Path,
+        namespace: &str,
+        ports: &SidecarPorts,
+        embedding_launch: Option<serde_json::Value>,
+    ) {
+        let namespace_root = root.join(namespace);
+        std::fs::create_dir_all(&namespace_root).expect("namespace root");
+        std::fs::write(
+            namespace_root.join("retrieval-sidecars.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "owner": "codestory",
+                "namespace": namespace,
+                "zoekt_http_port": ports.zoekt_http,
+                "qdrant_http_port": ports.qdrant_http,
+                "qdrant_grpc_port": ports.qdrant_grpc,
+                "embed_http_port": ports.embed_http,
+                "embed_url": ports.embed_url,
+                "embedding_launch": embedding_launch,
+            }))
+            .expect("serialize state"),
+        )
+        .expect("write state");
+    }
+
+    #[test]
+    fn agent_port_registry_prunes_missing_state() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let (listeners, ports) = test_sidecar_ports();
+        drop(listeners);
+        let mut registry = BTreeMap::from([("stale".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert!(registry.is_empty());
+        assert_eq!(cleanup.pruned, 1);
+        assert_eq!(cleanup.failures, 0);
+    }
+
+    #[test]
+    fn agent_port_registry_preserves_live_bound_state() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let (listeners, ports) = test_sidecar_ports();
+        write_test_sidecar_state(&root, "live", &ports, None);
+        let mut registry = BTreeMap::from([("live".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert_eq!(listeners.len(), 4);
+        assert!(registry.contains_key("live"));
+        assert_eq!(cleanup.retained, 1);
+        assert_eq!(cleanup.pruned, 0);
+    }
+
+    #[test]
+    fn agent_port_registry_preserves_bound_port_without_state() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let (listeners, ports) = test_sidecar_ports();
+        let mut registry = BTreeMap::from([("ownerless".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert_eq!(listeners.len(), 4);
+        assert!(registry.contains_key("ownerless"));
+        assert_eq!(cleanup.retained, 1);
+    }
+
+    #[test]
+    fn agent_port_registry_preserves_malformed_state_fail_closed() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let namespace_root = root.join("malformed");
+        std::fs::create_dir_all(&namespace_root).expect("namespace root");
+        std::fs::write(namespace_root.join("retrieval-sidecars.json"), b"{")
+            .expect("malformed state");
+        let (_listeners, ports) = test_sidecar_ports();
+        let mut registry = BTreeMap::from([("malformed".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert!(registry.contains_key("malformed"));
+        assert_eq!(cleanup.failures, 1);
+        assert_eq!(cleanup.pruned, 0);
+    }
+
+    #[test]
+    fn agent_port_registry_preserves_unreadable_state_shape_fail_closed() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        std::fs::create_dir_all(root.join("unreadable").join("retrieval-sidecars.json"))
+            .expect("state path directory");
+        let (listeners, ports) = test_sidecar_ports();
+        drop(listeners);
+        let mut registry = BTreeMap::from([("unreadable".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert!(registry.contains_key("unreadable"));
+        assert_eq!(cleanup.failures, 1);
+    }
+
+    #[test]
+    fn agent_port_registry_rejects_traversal_namespace_without_touching_outside_file() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        std::fs::create_dir_all(&root).expect("sidecars root");
+        let sentinel = cache.path().join("outside.json");
+        std::fs::write(&sentinel, b"keep").expect("outside sentinel");
+        let (listeners, ports) = test_sidecar_ports();
+        drop(listeners);
+        let mut registry = BTreeMap::from([("../outside".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert!(registry.contains_key("../outside"));
+        assert_eq!(cleanup.failures, 1);
+        assert_eq!(std::fs::read(&sentinel).expect("outside sentinel"), b"keep");
+    }
+
+    #[test]
+    fn agent_port_registry_preserves_state_with_reused_pid_fail_closed() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let (listeners, ports) = test_sidecar_ports();
+        drop(listeners);
+        write_test_sidecar_state(
+            &root,
+            "reused",
+            &ports,
+            Some(serde_json::json!({
+                "provider": "llamacpp",
+                "launch_mode": "native_spawned",
+                "endpoint": ports.embed_url,
+                "pid": std::process::id(),
+            })),
+        );
+        let mut registry = BTreeMap::from([("reused".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert!(registry.contains_key("reused"));
+        assert_eq!(cleanup.retained, 1);
+    }
+
+    #[test]
+    fn agent_port_registry_preserves_recent_startup_reservation() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        write_agent_port_reservation(&root, "starting").expect("reservation");
+        let (_listeners, ports) = test_sidecar_ports();
+        let mut registry = BTreeMap::from([("starting".to_string(), ports)]);
+
+        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+
+        assert!(registry.contains_key("starting"));
+        assert_eq!(cleanup.retained, 1);
+    }
+
+    #[test]
+    fn agent_port_registry_compaction_is_complete_and_parseable() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        std::fs::create_dir_all(&root).expect("sidecars root");
+        let (listeners, stale_ports) = test_sidecar_ports();
+        drop(listeners);
+        let registry_path = root.join("port-allocations.json");
+        write_agent_port_registry(
+            &registry_path,
+            &BTreeMap::from([("stale".to_string(), stale_ports)]),
+        )
+        .expect("seed registry");
+
+        let current = allocate_agent_ports_in_registry(cache.path(), "current", [None; 4])
+            .expect("allocate after compaction");
+        let compacted = read_agent_port_registry(&registry_path).expect("parse compacted registry");
+
+        assert_eq!(
+            compacted,
+            BTreeMap::from([("current".to_string(), current)])
+        );
+    }
+
+    #[test]
+    fn malformed_agent_port_registry_fails_closed_in_runtime_path() {
+        let _lock = crate::test_support::env_lock();
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        std::fs::create_dir_all(&root).expect("sidecars root");
+        let registry_path = root.join("port-allocations.json");
+        std::fs::write(&registry_path, b"{").expect("malformed registry");
+        let _cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            cache.path().to_str().expect("utf8 cache"),
+        );
+        let _zoekt = EnvGuard::set("CODESTORY_ZOEKT_PORT", "invalid");
+        let _qdrant_http = EnvGuard::set("CODESTORY_QDRANT_HTTP_PORT", "invalid");
+        let _qdrant_grpc = EnvGuard::set("CODESTORY_QDRANT_GRPC_PORT", "invalid");
+        let _embed = EnvGuard::set("CODESTORY_EMBED_PORT", "invalid");
+
+        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id(
+            None,
+            SidecarProfile::Agent,
+            Some("current"),
+        );
+
+        assert_eq!(runtime.layout.zoekt_http_port, 0);
+        assert_eq!(runtime.layout.qdrant_http_port, 0);
+        assert_eq!(runtime.layout.qdrant_grpc_port, 0);
+        assert_eq!(runtime.embed_http_port, 0);
+        runtime
+            .ensure_ports_allocated()
+            .expect_err("malformed registry must block sidecar startup");
+        assert_eq!(
+            std::fs::read(&registry_path).expect("registry remains"),
+            b"{"
+        );
     }
 
     #[test]
