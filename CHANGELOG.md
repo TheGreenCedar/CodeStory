@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Standardized JSON-mode CLI failures on one versioned error envelope, including
+  argument parsing, ambiguity, smoke checks, runtime failures, and background
+  repair terminal state. Compacted MCP status by referencing canonical
+  readiness verdicts instead of cloning them across every surface, and aligned
+  operator guidance with local defaults, managed dynamic state, supported
+  accelerator cells, and host-reload boundaries.
 - Isolated CLI integration tests from user caches, install identity, plugin
   data, stdio state, sidecar port registries, and managed runtime roots. Test
   processes now share one explicit per-process state root, broker unit tests

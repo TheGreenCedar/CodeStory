@@ -16,25 +16,28 @@ use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAnswerDto,
     AgentAskRequest, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
-    CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto, EvidencePacketDto,
-    EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto, GraphArtifactDto,
-    GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode, IndexedFilesRequest,
-    NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto, PacketSufficiencyStatusDto,
-    PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit,
-    SearchMatchQualityDto, SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest,
-    SourceOccurrenceDto, SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
-    TrailDirection, TrailMode,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto, ApiError,
+    ApiErrorDetails, AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
+    CommandFailureEnvelope, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto,
+    EvidencePacketDto, EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto,
+    GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
+    IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto,
+    PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
+    ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
+    SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
+    SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
+    TrailMode,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ffi::{OsStr, OsString},
     fmt::Write as _,
     fs,
     io::{IsTerminal, Read},
     net::{TcpListener, ToSocketAddrs},
     path::{Path, PathBuf},
+    process::ExitCode,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -187,13 +190,63 @@ fn with_drill_command_duration(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    run_cli().await
+async fn main() -> ExitCode {
+    let raw_args = std::env::args_os().collect::<Vec<_>>();
+    let json = json_output_requested(&raw_args);
+    let cli = match Cli::try_parse_from(&raw_args) {
+        Ok(cli) => cli,
+        Err(error) => {
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                let _ = error.print();
+                return ExitCode::SUCCESS;
+            }
+            if json {
+                let envelope = command_failure_envelope(
+                    "invalid_arguments",
+                    "cli_arguments",
+                    error.to_string(),
+                    serde_json::json!({"kind": format!("{:?}", error.kind())}),
+                );
+                emit_command_failure(&envelope, requested_output_file(&raw_args));
+            } else {
+                let _ = error.print();
+            }
+            return ExitCode::from(2);
+        }
+    };
+
+    match run_cli(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let structured = error.downcast_ref::<StructuredCommandFailure>();
+            if json {
+                let envelope = structured
+                    .map(|failure| failure.envelope.clone())
+                    .unwrap_or_else(|| generic_command_failure(&error));
+                let output_file = structured
+                    .and_then(|failure| failure.output_file.as_deref())
+                    .or_else(|| requested_output_file(&raw_args));
+                emit_command_failure(&envelope, output_file);
+            } else {
+                if let Some(failure) = structured
+                    && let (Some(path), Some(markdown)) =
+                        (failure.output_file.as_deref(), failure.markdown.as_deref())
+                    && let Err(write_error) = fs::write(path, markdown)
+                {
+                    eprintln!("Error: failed to write {}: {write_error}", path.display());
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("Error: {}", error);
+            }
+            ExitCode::FAILURE
+        }
+    }
 }
 
-async fn run_cli() -> Result<()> {
-    let cli = Cli::parse();
-
+async fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Index(cmd) => run_index(cmd),
         Command::Ground(cmd) => run_ground(cmd),
@@ -229,6 +282,87 @@ async fn run_cli() -> Result<()> {
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::Sidecar(cmd) => run_sidecar(cmd),
     }
+}
+
+#[derive(Debug)]
+struct StructuredCommandFailure {
+    envelope: CommandFailureEnvelope,
+    output_file: Option<PathBuf>,
+    markdown: Option<String>,
+}
+
+impl std::fmt::Display for StructuredCommandFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.envelope.error.message)
+    }
+}
+
+impl std::error::Error for StructuredCommandFailure {}
+
+fn command_failure_envelope(
+    code: impl Into<String>,
+    failed_layer: impl Into<String>,
+    message: impl Into<String>,
+    context: serde_json::Value,
+) -> CommandFailureEnvelope {
+    CommandFailureEnvelope::new(ApiError::with_details(
+        code,
+        message,
+        ApiErrorDetails {
+            failed_layer: Some(failed_layer.into()),
+            project: None,
+            next_commands: Vec::new(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            readiness: None,
+        },
+    ))
+    .with_context(context)
+}
+
+fn generic_command_failure(error: &anyhow::Error) -> CommandFailureEnvelope {
+    command_failure_envelope(
+        "command_failed",
+        "command",
+        error.to_string(),
+        serde_json::json!({
+            "causes": error.chain().skip(1).map(ToString::to_string).collect::<Vec<_>>()
+        }),
+    )
+}
+
+fn json_output_requested(args: &[OsString]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == OsStr::new("--format") && pair[1] == OsStr::new("json"))
+        || args.iter().any(|arg| arg == OsStr::new("--format=json"))
+}
+
+fn requested_output_file(args: &[OsString]) -> Option<&Path> {
+    args.iter()
+        .find_map(|arg| {
+            arg.to_str()
+                .and_then(|arg| arg.strip_prefix("--output-file="))
+                .filter(|path| !path.is_empty())
+                .map(Path::new)
+        })
+        .or_else(|| {
+            args.windows(2).find_map(|pair| {
+                (pair[0] == OsStr::new("--output-file")
+                    && !pair[1].to_string_lossy().starts_with('-'))
+                .then(|| Path::new(&pair[1]))
+            })
+        })
+}
+
+fn emit_command_failure(envelope: &CommandFailureEnvelope, output_file: Option<&Path>) {
+    let json = serde_json::to_string_pretty(envelope)
+        .expect("the command failure envelope is always JSON-serializable");
+    if let Some(path) = output_file
+        && fs::write(path, format!("{json}\n")).is_ok()
+    {
+        return;
+    }
+    println!("{json}");
 }
 
 fn run_sidecar(cmd: SidecarCommand) -> Result<()> {
@@ -905,11 +1039,28 @@ fn run_smoke(cmd: SmokeCommand) -> Result<()> {
     };
     let failed = output.status == "fail";
     let markdown = render_smoke_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())?;
     if failed {
-        bail!("smoke profile {} failed", output.profile);
+        let envelope = CommandFailureEnvelope::new(ApiError::with_details(
+            "smoke_failed",
+            format!("smoke profile {} failed", output.profile),
+            ApiErrorDetails {
+                failed_layer: Some("smoke".to_string()),
+                project: Some(output.project.clone()),
+                next_commands: output.repair_hints.clone(),
+                minimum_next: output.repair_hints.iter().take(1).cloned().collect(),
+                full_repair: output.repair_hints.clone(),
+                readiness: None,
+            },
+        ))
+        .with_context(serde_json::to_value(&output).context("serialize smoke failure context")?);
+        return Err(StructuredCommandFailure {
+            envelope,
+            output_file: cmd.output_file,
+            markdown: (cmd.format != args::OutputFormat::Json).then_some(markdown),
+        }
+        .into());
     }
-    Ok(())
+    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
 fn run_ci_agent_smoke(project: &ProjectArgs) -> SmokeOutput {
@@ -10864,18 +11015,43 @@ fn resolve_target_or_emit_ambiguity(
         Err(error) => {
             if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
                 let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-                if output_file.is_some() || format == args::OutputFormat::Json {
-                    emit(
-                        format,
-                        &output,
-                        render_cli_error_markdown(&output),
-                        output_file,
-                    )?;
+                let markdown = (format != args::OutputFormat::Json)
+                    .then(|| render_cli_error_markdown(&output));
+                return Err(StructuredCommandFailure {
+                    envelope: ambiguous_command_failure(&output, &runtime.project_root),
+                    output_file: output_file.map(Path::to_path_buf),
+                    markdown,
                 }
+                .into());
             }
             Err(error)
         }
     }
+}
+
+fn ambiguous_command_failure(
+    output: &CliErrorOutput,
+    project_root: &Path,
+) -> CommandFailureEnvelope {
+    let message = cli_error_markdown_message(output).to_string();
+    CommandFailureEnvelope::new(ApiError::with_details(
+        output.error.code,
+        message,
+        ApiErrorDetails {
+            failed_layer: Some(output.error.failed_layer.to_string()),
+            project: Some(display::clean_path_string(&project_root.to_string_lossy())),
+            next_commands: output.error.next_commands.clone(),
+            minimum_next: output.error.next_commands.iter().take(1).cloned().collect(),
+            full_repair: output.error.next_commands.clone(),
+            readiness: None,
+        },
+    ))
+    .with_context(serde_json::json!({
+        "query": output.error.query,
+        "file_filter": output.error.file_filter,
+        "alternatives": output.error.alternatives,
+        "layer_notes": output.error.layer_notes,
+    }))
 }
 
 fn render_cli_error_markdown(output: &CliErrorOutput) -> String {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use codestory_contracts::api::{ApiError, ApiErrorDetails, CommandFailureEnvelope};
 use codestory_retrieval::{
     DEFAULT_AGENT_RUN_ID, SidecarProfile, SidecarRuntimeConfig,
     sidecar_runtime_for_project_with_run_id,
@@ -129,10 +130,27 @@ pub(crate) struct ReadyRepairWorkerResult {
     pub(crate) outcome: String,
     pub(crate) exit_code: Option<i32>,
     pub(crate) wait_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_envelope: Option<CommandFailureEnvelope>,
     pub(crate) stdout_tail: String,
     pub(crate) stderr_tail: String,
     pub(crate) stdout_truncated: bool,
     pub(crate) stderr_truncated: bool,
+}
+
+fn abandoned_repair_envelope(message: &str) -> CommandFailureEnvelope {
+    CommandFailureEnvelope::new(ApiError::with_details(
+        "background_repair_abandoned",
+        message,
+        ApiErrorDetails {
+            failed_layer: Some("background_repair".to_string()),
+            project: None,
+            next_commands: Vec::new(),
+            minimum_next: Vec::new(),
+            full_repair: Vec::new(),
+            readiness: None,
+        },
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -316,6 +334,9 @@ pub(crate) fn try_reserve_ready_repair(
                 "repair worker reservation owner exited before recording a terminal result"
                     .to_string(),
             ),
+            terminal_envelope: Some(abandoned_repair_envelope(
+                "repair worker reservation owner exited before recording a terminal result",
+            )),
             stdout_tail: String::new(),
             stderr_tail: String::new(),
             stdout_truncated: false,
@@ -738,6 +759,9 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
                 wait_error: Some(
                     "repair worker process exited without recording a terminal result".to_string(),
                 ),
+                terminal_envelope: Some(abandoned_repair_envelope(
+                    "repair worker process exited without recording a terminal result",
+                )),
                 stdout_tail: String::new(),
                 stderr_tail: String::new(),
                 stdout_truncated: false,
@@ -1379,6 +1403,7 @@ mod tests {
             outcome: "succeeded".to_string(),
             exit_code: Some(0),
             wait_error: None,
+            terminal_envelope: None,
             stdout_tail: "done".to_string(),
             stderr_tail: String::new(),
             stdout_truncated: false,
@@ -1495,6 +1520,9 @@ mod tests {
             outcome: "failed".to_string(),
             exit_code: Some(17),
             wait_error: None,
+            terminal_envelope: Some(CommandFailureEnvelope::new(ApiError::internal(
+                "worker failed",
+            ))),
             stdout_tail: "stdout".to_string(),
             stderr_tail: "stderr".to_string(),
             stdout_truncated: false,
@@ -1566,6 +1594,7 @@ mod tests {
             outcome: "succeeded".to_string(),
             exit_code: Some(0),
             wait_error: None,
+            terminal_envelope: None,
             stdout_tail: "success".to_string(),
             stderr_tail: String::new(),
             stdout_truncated: false,
@@ -2104,6 +2133,7 @@ mod tests {
             outcome: "failed".to_string(),
             exit_code: Some(17),
             wait_error: None,
+            terminal_envelope: None,
             stdout_tail: "terminal evidence".to_string(),
             stderr_tail: String::new(),
             stdout_truncated: false,
