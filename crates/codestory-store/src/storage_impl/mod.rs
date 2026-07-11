@@ -2446,6 +2446,119 @@ impl Storage {
         Ok(())
     }
 
+    /// Remove stale generated retrieval artifacts and their semantic projections.
+    /// Returns the number of removed projection rows.
+    pub fn prune_retrieval_artifacts_to_node_ids(
+        &mut self,
+        keep_node_ids: &[NodeId],
+        keep_dense_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS retrieval_artifact_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.retrieval_artifact_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.retrieval_artifact_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS retrieval_artifact_dense_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.retrieval_artifact_dense_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.retrieval_artifact_dense_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_dense_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS retrieval_artifact_stale (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.retrieval_artifact_stale", [])?;
+        tx.execute(
+            "INSERT INTO temp.retrieval_artifact_stale (node_id)
+             SELECT id FROM node
+             WHERE (serialized_name LIKE 'component_report:%'
+                OR canonical_id LIKE 'codestory:component_report:%')
+               AND NOT EXISTS (
+                   SELECT 1 FROM temp.retrieval_artifact_keep keep
+                   WHERE keep.node_id = node.id
+               )",
+            [],
+        )?;
+        let stale_node_ids = {
+            let mut stmt = tx.prepare("SELECT node_id FROM temp.retrieval_artifact_stale")?;
+            stmt.query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let removed_dense = tx.execute(
+            "DELETE FROM llm_symbol_doc
+             WHERE node_id IN (
+                 SELECT id FROM node
+                 WHERE serialized_name LIKE 'component_report:%'
+                    OR canonical_id LIKE 'codestory:component_report:%'
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM temp.retrieval_artifact_dense_keep keep
+                   WHERE keep.node_id = llm_symbol_doc.node_id
+               )",
+            [],
+        )?;
+        let removed_symbol = tx.execute(
+            "DELETE FROM symbol_search_doc
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM search_symbol_projection
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM symbol_summary
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM bookmark_node
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM node
+             WHERE id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute("DROP TABLE temp.retrieval_artifact_stale", [])?;
+        tx.execute("DROP TABLE temp.retrieval_artifact_dense_keep", [])?;
+        tx.execute("DROP TABLE temp.retrieval_artifact_keep", [])?;
+        tx.commit()?;
+
+        let mut cache = self.cache.nodes.write();
+        for node_id in stale_node_ids {
+            cache.remove(&NodeId(node_id));
+        }
+        drop(cache);
+        self.invalidate_grounding_snapshots()?;
+        Ok(removed_dense.saturating_add(removed_symbol))
+    }
+
     pub fn copy_retrieval_artifact_nodes_from(
         &mut self,
         source_path: &Path,
