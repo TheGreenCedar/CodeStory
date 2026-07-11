@@ -416,6 +416,30 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
 }
 
 #[test]
+fn staged_publication_identity_is_schema_backed_and_verified_before_finalization() {
+    let runtime = read("crates/codestory-runtime/src/lib.rs");
+    let store = read("crates/codestory-store/src/storage_impl/mod.rs");
+    let schema = read("crates/codestory-store/src/storage_impl/schema.rs");
+
+    assert!(
+        store.contains("pub struct IndexPublicationRecord")
+            && store.contains("pub fn database_index_publication")
+            && store.contains("pub fn put_index_publication"),
+        "publication identity should be a typed store contract with read-only and staged-write surfaces"
+    );
+    assert!(
+        schema.contains("CREATE TABLE IF NOT EXISTS index_publication"),
+        "publication identity should survive process restarts in the SQLite schema"
+    );
+    assert!(
+        runtime.contains("next_index_publication(")
+            && runtime.contains("staged.store_mut().put_index_publication(&publication)")
+            && runtime.contains("Published index generation changed before finalization"),
+        "full and incremental staging should persist and verify one publication identity before clearing compatibility fences"
+    );
+}
+
+#[test]
 fn legacy_crates_are_removed_from_the_workspace() {
     let members = workspace_members();
     for legacy in [

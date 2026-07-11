@@ -56,6 +56,14 @@ const TABLE_STATEMENTS: &[&str] = &[
         id INTEGER PRIMARY KEY CHECK (id = 1),
         started_at_epoch_ms INTEGER NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS index_publication (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+        run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+        mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+        published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+    )",
     "CREATE TABLE IF NOT EXISTS local_symbol (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,

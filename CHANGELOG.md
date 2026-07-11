@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- Added a schema-backed publication generation and run identity to every staged
+  full and incremental core database. Typed store and runtime reads now expose
+  the generation that owns the live graph, and cache finalization verifies that
+  identity before clearing the incomplete-run compatibility fence.
+
 ### Fixed
 
 - Staged incremental graph projection, removed-file cleanup, resolution,

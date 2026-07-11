@@ -43,9 +43,9 @@ use codestory_indexer::{
     CancellationToken, IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
 use codestory_store::{
-    FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
-    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
-    SymbolSummaryRecord,
+    FileInfo, GroundingEdgeKindCount, GroundingNodeRecord, IndexPublicationMode,
+    IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
+    SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc, SymbolSummaryRecord,
 };
 use codestory_workspace::{RefreshExecutionPlan, RefreshInputs, WorkspaceManifest};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -59,6 +59,7 @@ use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 mod agent;
 pub use agent::packet_step_trace_json;
@@ -9615,6 +9616,16 @@ impl AppController {
         Ok(freshness)
     }
 
+    /// Return the durable identity of the core database generation at the live path.
+    pub fn index_publication(&self) -> Result<Option<IndexPublicationRecord>, ApiError> {
+        let storage_path = self.require_storage_path()?;
+        Store::database_index_publication(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read index publication identity: {error}"
+            ))
+        })
+    }
+
     fn cached_index_freshness_from_storage(
         &self,
         root: &Path,
@@ -10527,6 +10538,26 @@ struct IndexingRunSummary {
     phase_timings: IndexingPhaseTimings,
     llm_refresh_scope: Option<HashSet<codestory_contracts::graph::NodeId>>,
     finalize_incremental_run: bool,
+    publication: IndexPublicationRecord,
+}
+
+fn next_index_publication(
+    previous: Option<&IndexPublicationRecord>,
+    mode: IndexPublicationMode,
+    run_id: &str,
+) -> Result<IndexPublicationRecord, ApiError> {
+    let generation = previous
+        .map(|publication| publication.generation)
+        .unwrap_or_default()
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("Index publication generation overflow"))?;
+    Ok(IndexPublicationRecord {
+        generation,
+        generation_id: Uuid::new_v4().to_string(),
+        run_id: run_id.to_string(),
+        mode,
+        published_at_epoch_ms: current_epoch_ms(),
+    })
 }
 
 struct IndexWriterGuard {
@@ -10593,6 +10624,14 @@ fn finish_incremental_run_marker(
     summary: &IndexingRunSummary,
     storage_path: &Path,
 ) -> Result<(), ApiError> {
+    let published = Store::database_index_publication(storage_path)
+        .map_err(|e| ApiError::internal(format!("Failed to read publication identity: {e}")))?;
+    if published.as_ref() != Some(&summary.publication) {
+        return Err(ApiError::internal(format!(
+            "Published index generation changed before finalization: expected {} run {}, observed {:?}",
+            summary.publication.generation_id, summary.publication.run_id, published
+        )));
+    }
     if !summary.finalize_incremental_run {
         return Ok(());
     }
@@ -10609,6 +10648,16 @@ fn index_full(
     events_tx: &Sender<AppEventPayload>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<IndexingRunSummary, ApiError> {
+    let previous_publication = if storage_path.exists() {
+        Store::database_index_publication(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect live publication identity: {error}"
+            ))
+        })?
+    } else {
+        None
+    };
+    let publication_run_id = Uuid::new_v4().to_string();
     let recovering_incomplete_run = if storage_path.exists() {
         match Storage::database_schema_version(storage_path) {
             Ok(version) if version > codestory_store::CURRENT_SCHEMA_VERSION => {
@@ -10741,6 +10790,23 @@ fn index_full(
             "Failed to preserve incomplete marker through staged recovery: {err}"
         )));
     }
+    let publication = match next_index_publication(
+        previous_publication.as_ref(),
+        IndexPublicationMode::Full,
+        &publication_run_id,
+    ) {
+        Ok(publication) => publication,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    if let Err(error) = staged.store_mut().put_index_publication(&publication) {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to persist staged full publication identity: {error}"
+        )));
+    }
     let staged_path = staged.path().to_path_buf();
     let publish_started = std::time::Instant::now();
     if let Err(err) = staged.publish(storage_path) {
@@ -10844,6 +10910,7 @@ fn index_full(
         },
         llm_refresh_scope: None,
         finalize_incremental_run: recovering_incomplete_run,
+        publication,
     })
 }
 
@@ -10925,6 +10992,16 @@ where
             ApiError::internal(format!("Failed to open staged incremental storage: {e}"))
         })?
     };
+    let previous_publication = match staged.store_mut().get_index_publication() {
+        Ok(publication) => publication,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(ApiError::internal(format!(
+                "Failed to read staged publication identity: {error}"
+            )));
+        }
+    };
+    let publication_run_id = Uuid::new_v4().to_string();
     let staged_result = (|| {
         staged.store_mut().begin_incremental_run().map_err(|e| {
             ApiError::internal(format!(
@@ -11026,6 +11103,23 @@ where
     if is_indexing_cancelled(cancel_token) {
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
+    }
+    let publication = match next_index_publication(
+        previous_publication.as_ref(),
+        IndexPublicationMode::Incremental,
+        &publication_run_id,
+    ) {
+        Ok(publication) => publication,
+        Err(error) => {
+            let _ = staged.discard();
+            return Err(error);
+        }
+    };
+    if let Err(error) = staged.store_mut().put_index_publication(&publication) {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to persist staged incremental publication identity: {error}"
+        )));
     }
     let staged_path = staged.path().to_path_buf();
     let publish_started = Instant::now();
@@ -11130,6 +11224,7 @@ where
         },
         llm_refresh_scope: Some(llm_refresh_scope),
         finalize_incremental_run: true,
+        publication,
     })
 }
 
@@ -16842,7 +16937,23 @@ fn build_llm_symbol_doc_text() -> String {
             phase_timings: IndexingPhaseTimings::default(),
             llm_refresh_scope: None,
             finalize_incremental_run: false,
+            publication: IndexPublicationRecord {
+                generation: 1,
+                generation_id: "test-generation".to_string(),
+                run_id: "test-run".to_string(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            },
         }
+    }
+
+    fn persisted_empty_indexing_run_summary(storage_path: &Path) -> IndexingRunSummary {
+        let summary = empty_indexing_run_summary();
+        Storage::open(storage_path)
+            .expect("open storage for publication identity")
+            .put_index_publication(&summary.publication)
+            .expect("persist test publication identity");
+        summary
     }
 
     #[test]
@@ -16857,8 +16968,9 @@ fn build_llm_symbol_doc_text() -> String {
             state.is_indexing = true;
         }
 
+        let summary = persisted_empty_indexing_run_summary(&storage_path);
         let timings = controller
-            .finish_successful_indexing(empty_indexing_run_summary(), &storage_path, true, None)
+            .finish_successful_indexing(summary, &storage_path, true, None)
             .expect("cache refresh should succeed");
 
         assert!(timings.cache_refresh_ms.is_some());
@@ -16918,6 +17030,116 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn full_and_incremental_publications_advance_one_durable_generation() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn first_value() -> i32 { 1 }\n",
+        )
+        .expect("write initial source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("first full publication");
+        let first = controller
+            .index_publication()
+            .expect("read first publication")
+            .expect("first publication identity");
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.mode, IndexPublicationMode::Full);
+
+        fs::write(
+            workspace.path().join("second.rs"),
+            "pub fn second_value() -> i32 { 2 }\n",
+        )
+        .expect("write incremental source");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental publication");
+        let second = controller
+            .index_publication()
+            .expect("read second publication")
+            .expect("second publication identity");
+        assert_eq!(second.generation, 2);
+        assert_eq!(second.mode, IndexPublicationMode::Incremental);
+        assert_ne!(second.generation_id, first.generation_id);
+        assert_ne!(second.run_id, first.run_id);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("second full publication");
+        let third = controller
+            .index_publication()
+            .expect("read third publication")
+            .expect("third publication identity");
+        assert_eq!(third.generation, 3);
+        assert_eq!(third.mode, IndexPublicationMode::Full);
+        assert_ne!(third.generation_id, second.generation_id);
+        assert_ne!(third.run_id, second.run_id);
+        assert!(third.published_at_epoch_ms >= second.published_at_epoch_ms);
+    }
+
+    #[test]
+    fn legacy_schema_18_incomplete_marker_recovers_to_first_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "pub fn legacy_value() -> i32 { 18 }\n",
+        )
+        .expect("write source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project");
+        {
+            let storage = Storage::open(&storage_path).expect("open legacy seed storage");
+            storage
+                .get_connection()
+                .execute_batch("DROP TABLE index_publication;")
+                .expect("remove post-v18 publication table");
+            storage
+                .get_connection()
+                .pragma_update(None, "user_version", 18)
+                .expect("stamp schema 18");
+            storage
+                .begin_incremental_run()
+                .expect("install legacy incomplete marker");
+        }
+
+        assert!(
+            Storage::database_index_publication(&storage_path)
+                .expect("read legacy publication")
+                .is_none()
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("recover legacy marker");
+
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("recovered schema"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        let publication = controller
+            .index_publication()
+            .expect("read recovered publication")
+            .expect("recovered publication identity");
+        assert_eq!(publication.generation, 1);
+        assert_eq!(publication.mode, IndexPublicationMode::Full);
+    }
+
+    #[test]
     fn incremental_cache_rebuild_failure_keeps_incomplete_marker() {
         let temp = tempdir().expect("create temp dir");
         let storage_path = temp.path().join("codestory.db");
@@ -16945,7 +17167,7 @@ fn build_llm_symbol_doc_text() -> String {
         }
         let controller = AppController::new();
         controller.state.lock().is_indexing = true;
-        let mut summary = empty_indexing_run_summary();
+        let mut summary = persisted_empty_indexing_run_summary(&storage_path);
         summary.finalize_incremental_run = true;
 
         let error = controller
@@ -17150,7 +17372,13 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("initial full index");
 
-        let (baseline_paths, baseline_stats, baseline_snapshots, baseline_schema) = {
+        let (
+            baseline_paths,
+            baseline_stats,
+            baseline_snapshots,
+            baseline_schema,
+            baseline_publication,
+        ) = {
             let storage = Storage::open(&storage_path).expect("open baseline storage");
             let paths = storage
                 .get_files()
@@ -17165,7 +17393,11 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("read baseline snapshot metadata");
             let schema = Storage::database_schema_version(&storage_path)
                 .expect("read baseline schema version");
-            (paths, stats, snapshots, schema)
+            let publication = storage
+                .get_index_publication()
+                .expect("read baseline publication")
+                .expect("baseline publication identity");
+            (paths, stats, snapshots, schema, publication)
         };
 
         fs::remove_file(&old_path).expect("remove old source");
@@ -17227,6 +17459,13 @@ fn build_llm_symbol_doc_text() -> String {
                 baseline_snapshots,
                 "pre-publish failure must preserve the complete old snapshot generation"
             );
+            assert_eq!(
+                storage
+                    .get_index_publication()
+                    .expect("read live publication identity"),
+                Some(baseline_publication.clone()),
+                "pre-publish failure must not advance the live generation"
+            );
             storage
                 .get_connection()
                 .execute_batch("DROP TRIGGER fail_incremental_boundary;")
@@ -17259,6 +17498,15 @@ fn build_llm_symbol_doc_text() -> String {
                     .has_incomplete_incremental_run()
                     .expect("marker after direct retry")
             );
+            let retried_publication = storage
+                .get_index_publication()
+                .expect("read retried publication")
+                .expect("retried publication identity");
+            assert_eq!(
+                retried_publication.generation,
+                baseline_publication.generation + 1
+            );
+            assert_eq!(retried_publication.mode, IndexPublicationMode::Incremental);
             return;
         }
 
@@ -17298,6 +17546,12 @@ fn build_llm_symbol_doc_text() -> String {
                     .has_ready_detail()
                     .expect("detail readiness")
             );
+            let published = storage
+                .get_index_publication()
+                .expect("read fenced publication")
+                .expect("fenced publication identity");
+            assert_eq!(published.generation, baseline_publication.generation + 1);
+            assert_eq!(published.mode, IndexPublicationMode::Incremental);
         }
 
         let recovery = AppController::new();
@@ -17349,6 +17603,15 @@ fn build_llm_symbol_doc_text() -> String {
                 .status,
             IndexFreshnessStatusDto::Fresh
         );
+        let recovered_publication = storage
+            .get_index_publication()
+            .expect("read recovered publication")
+            .expect("recovered publication identity");
+        assert_eq!(
+            recovered_publication.generation,
+            baseline_publication.generation + 2
+        );
+        assert_eq!(recovered_publication.mode, IndexPublicationMode::Full);
     }
 
     #[test]
@@ -17458,7 +17721,7 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("initial full index");
 
-        let (baseline_stats, baseline_snapshots) = {
+        let (baseline_stats, baseline_snapshots, baseline_publication) = {
             let storage = Storage::open(&storage_path).expect("open baseline storage");
             (
                 storage.get_stats().expect("baseline stats"),
@@ -17466,6 +17729,10 @@ fn build_llm_symbol_doc_text() -> String {
                     .snapshots()
                     .get_metadata()
                     .expect("baseline snapshot metadata"),
+                storage
+                    .get_index_publication()
+                    .expect("baseline publication read")
+                    .expect("baseline publication identity"),
             )
         };
         fs::write(
@@ -17517,6 +17784,12 @@ fn build_llm_symbol_doc_text() -> String {
                 .get_metadata()
                 .expect("cancelled snapshot metadata"),
             baseline_snapshots
+        );
+        assert_eq!(
+            storage
+                .get_index_publication()
+                .expect("cancelled live publication"),
+            Some(baseline_publication)
         );
         assert!(
             storage
