@@ -1855,6 +1855,7 @@ impl SearchEngine {
         Self::open_persisted_with_guard(path, guard)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_existing_or_recreate(path: &Path) -> Result<(Self, Option<anyhow::Error>)> {
         let shared_guard = PersistedSearchIndexGuard::acquire_shared(path)?;
         match Self::open_persisted_with_guard(path, shared_guard) {
@@ -1867,6 +1868,7 @@ impl SearchEngine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn recreate_persisted_from_existing(
         path: &Path,
         mut existing: Self,

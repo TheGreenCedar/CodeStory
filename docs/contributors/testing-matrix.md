@@ -35,6 +35,7 @@ Run Cargo commands serially in this repo.
 | --- | --- |
 | Docs only | `git diff --check`, `node .github/scripts/check-doc-links.mjs` |
 | Routine code | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| Concurrent publication | `cargo test -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture`; `rust-ci.yml` repeats this focused contract on Ubuntu, Windows, and macOS |
 | Release-blocking fidelity | `cargo test -p codestory-indexer --test fidelity_regression`, `cargo test -p codestory-indexer --test tictactoe_language_coverage`, `cargo test -p codestory-runtime --test retrieval_eval` |
 | Heavy repo-scale timing | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` |
 

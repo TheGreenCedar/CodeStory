@@ -8,7 +8,7 @@ pub(super) fn graph_neighborhood(
     let center = req.center_id.to_core()?;
     let graph_flags = app_graph_flags();
 
-    let storage = controller.open_storage()?;
+    let storage = controller.open_storage_read_only()?;
 
     let max_edges = req.max_edges.unwrap_or(400).min(2_000) as usize;
     let mut edges = storage
@@ -146,7 +146,7 @@ pub(super) fn graph_trail(
         max_nodes: req.max_nodes.clamp(10, 100_000) as usize,
     };
 
-    let storage = controller.open_storage()?;
+    let storage = controller.open_storage_read_only()?;
     let result = storage
         .get_trail(&config)
         .map_err(|e| ApiError::internal(format!("Failed to compute trail: {e}")))?;
@@ -257,7 +257,7 @@ pub(super) fn graph_direct_references(
         .into_iter()
         .map(Into::into)
         .collect::<Vec<_>>();
-    let storage = controller.open_storage()?;
+    let storage = controller.open_storage_read_only()?;
     let mut edges = storage
         .get_incoming_edges_for_node_id(
             root_id,

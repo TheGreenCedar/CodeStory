@@ -4319,12 +4319,16 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     }
 
     assert_fresh_freshness_counts(&last_status, "cached codestory://status after refresh");
-    assert!(
-        matches!(
-            last_status["local_refresh"]["reason"].as_str(),
-            Some("refreshed" | "already_fresh")
-        ),
+    assert_eq!(
+        last_status["local_refresh"]["state"],
+        json!("refreshed"),
         "status should stay fresh without stale cache masking after the bounded refresh: {last_status}"
+    );
+    assert!(
+        last_status["index_publication"]["generation"]
+            .as_u64()
+            .is_some(),
+        "fresh status should identify the complete publication: {last_status}"
     );
     elapsed.sort_unstable();
     let median = elapsed[elapsed.len() / 2];
@@ -4375,7 +4379,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
 }
 
 #[test]
-fn ground_tool_returns_degraded_local_refresh_when_stale_refresh_budget_expires() {
+fn ground_tool_serves_complete_publication_when_refresh_budget_expires() {
     let mut fixture = indexed_fixture();
     fixture.local_refresh_timeout_ms = Some(0);
 
@@ -4409,61 +4413,315 @@ fn ground_tool_returns_degraded_local_refresh_when_stale_refresh_budget_expires(
         "ground should return degraded local-refresh guidance before an MCP tool timeout, got {elapsed:?}: {response}"
     );
 
-    let error = assert_tool_error(&response, json!("ground-refresh-budget-expired"));
+    let result = assert_success_envelope(&response, json!("ground-refresh-budget-expired"));
+    let ground = assert_tool_success(&response, json!("ground-refresh-budget-expired"));
     assert_eq!(
-        error.pointer("/code").and_then(Value::as_str),
-        Some("codestory_tool_blocked")
+        ground.pointer("/stats/file_count").and_then(Value::as_u64),
+        Some(5),
+        "ground should serve the last complete publication: {response}"
     );
-    assert_eq!(
-        error.pointer("/tool").and_then(Value::as_str),
-        Some("ground")
-    );
-    assert_eq!(
-        error.pointer("/readiness_goal").and_then(Value::as_str),
-        Some("local_navigation")
-    );
-    assert_eq!(
-        error.pointer("/status").and_then(Value::as_str),
-        Some("repair_index")
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/state")
-            .and_then(Value::as_str),
-        Some("refreshing")
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/readiness_status")
-            .and_then(Value::as_str),
-        Some("repair_index")
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/blocks_local_surfaces")
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/reason")
-            .and_then(Value::as_str),
-        Some("refresh_timeout")
-    );
-    assert_ne!(
-        error
-            .pointer("/sidecar/retrieval_mode")
-            .and_then(Value::as_str),
-        Some("full"),
-        "local refresh degradation must not claim packet/search sidecar readiness: {error}"
+    let served_from = result
+        .pointer("/_meta/codestory_publication/served_from")
+        .and_then(Value::as_str);
+    assert!(
+        matches!(
+            served_from,
+            Some("last_complete_publication" | "complete_publication")
+        ),
+        "ground should identify the exact complete publication source: {response}"
     );
     assert!(
-        error
-            .pointer("/minimum_next")
-            .and_then(Value::as_array)
-            .is_some_and(|commands| !commands.is_empty()),
-        "blocked ground should include compact next-step guidance: {error}"
+        result
+            .pointer("/_meta/codestory_publication/publication/generation")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "served response should identify its durable publication: {response}"
     );
+    if served_from == Some("last_complete_publication") {
+        assert_eq!(
+            result
+                .pointer("/_meta/codestory_publication/refresh/state")
+                .and_then(Value::as_str),
+            Some("refreshing")
+        );
+    }
+}
+
+#[test]
+fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
+    let fixture = indexed_fixture();
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        "pub fn normalize_project(project_name: &str) -> String { format!(\"owned:{project_name}\") }\n",
+    )
+    .expect("make the published index stale");
+
+    let project_root = fs::canonicalize(fixture.workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as i64;
+    let pid = std::process::id();
+    fs::write(
+        fixture.cache_dir.path().join("local-refresh.lock"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "project_root": project_root,
+            "pid": pid,
+            "started_at_epoch_ms": now,
+            "token": format!("test:{pid}:{now}")
+        }))
+        .expect("serialize refresh lock"),
+    )
+    .expect("write refresh lock");
+    fs::write(
+        fixture.cache_dir.path().join("local-refresh-status.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "status": "refreshing",
+            "project_root": project_root,
+            "phase": "incremental_index",
+            "pid": pid,
+            "started_at_epoch_ms": now,
+            "updated_at_epoch_ms": now,
+            "last_failure_reason": null
+        }))
+        .expect("serialize refresh status"),
+    )
+    .expect("write refresh status");
+
+    let mut status_client = spawn_stdio_server(&fixture);
+    let status_response = send_json(
+        &mut status_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-status",
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        }),
+    );
+    let status = assert_tool_success(&status_response, json!("concurrent-status"));
+    assert_eq!(status["local_refresh"]["state"], json!("refreshing"));
+    assert_eq!(status["local_refresh"]["pid"], json!(pid));
+    assert_eq!(status["local_refresh"]["phase"], json!("incremental_index"));
+    assert_eq!(
+        status["local_refresh"]["blocks_local_surfaces"],
+        json!(false)
+    );
+    assert_eq!(status["allowed_surfaces"]["ground"]["allowed"], json!(true));
+    let generation = status["local_refresh"]["serving_publication"]["generation"]
+        .as_u64()
+        .expect("status serving generation");
+
+    let mut ground_client = spawn_stdio_server(&fixture);
+    let ground_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-ground",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    let ground = assert_tool_success(&ground_response, json!("concurrent-ground"));
+    assert_eq!(ground["stats"]["file_count"], json!(5));
+    let ground_result = assert_success_envelope(&ground_response, json!("concurrent-ground"));
+    assert_eq!(
+        ground_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(generation)
+    );
+
+    let symbol_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-symbol",
+            "method": "tools/call",
+            "params": {"name": "symbol", "arguments": {"query": "AppController"}}
+        }),
+    );
+    let symbol = assert_tool_success(&symbol_response, json!("concurrent-symbol"));
+    assert_eq!(symbol["node"]["display_name"], json!("AppController"));
+    let symbol_result = assert_success_envelope(&symbol_response, json!("concurrent-symbol"));
+    assert_eq!(
+        symbol_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(generation)
+    );
+
+    let root_symbols_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-root-symbols",
+            "method": "resources/read",
+            "params": {"uri": "codestory://symbols/root"}
+        }),
+    );
+    let root_symbols = json_resource_content(
+        assert_success_envelope(&root_symbols_response, json!("concurrent-root-symbols")),
+        "codestory://symbols/root",
+    );
+    assert!(
+        root_symbols
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| {
+                symbol["display_name"] == json!("AppController")
+                    || symbol["label"] == json!("AppController")
+            })),
+        "root-symbol resource should stay readable during another client's refresh: {root_symbols}"
+    );
+}
+
+#[test]
+fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
+    let mut fixture = indexed_fixture();
+    fixture.local_refresh_timeout_ms = Some(0);
+    let mut warmup_client = spawn_stdio_server(&fixture);
+    let warmup_status = send_json(
+        &mut warmup_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "warmup-generation",
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        }),
+    );
+    let old_generation = assert_tool_success(&warmup_status, json!("warmup-generation"))
+        ["index_publication"]["generation"]
+        .as_u64()
+        .expect("old complete generation");
+    drop(warmup_client);
+    thread::sleep(Duration::from_millis(25));
+    for index in 0..96 {
+        fs::write(
+            fixture
+                .workspace
+                .path()
+                .join("src")
+                .join(format!("concurrent_{index}.rs")),
+            format!("pub fn concurrent_{index}() -> usize {{ {index} }}\n"),
+        )
+        .expect("add source file for real refresh");
+    }
+
+    let mut reader_client = spawn_stdio_server(&fixture);
+    let mut writer_client = spawn_stdio_server(&fixture);
+    let writer = thread::spawn(move || {
+        let response = send_json(
+            &mut writer_client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "writer-start-refresh",
+                "method": "tools/call",
+                "params": {"name": "status", "arguments": {}}
+            }),
+        );
+        (writer_client, response)
+    });
+
+    let lock_path = fixture.cache_dir.path().join("local-refresh.lock");
+    let lock_deadline = Instant::now() + Duration::from_secs(10);
+    while !lock_path.exists() {
+        if writer.is_finished() {
+            break;
+        }
+        assert!(
+            Instant::now() < lock_deadline,
+            "writer did not acquire the local refresh lock"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let concurrent_ground = send_json(
+        &mut reader_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "reader-ground-during-lock",
+            "method": "resources/read",
+            "params": {"uri": "codestory://grounding"}
+        }),
+    );
+    let concurrent_ground = json_resource_content(
+        assert_success_envelope(&concurrent_ground, json!("reader-ground-during-lock")),
+        "codestory://grounding",
+    );
+    assert!(
+        concurrent_ground["stats"]["file_count"]
+            .as_u64()
+            .is_some_and(|count| count == 5 || count == 101),
+        "concurrent resource read observed neither complete file set: {concurrent_ground}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let new_generation = loop {
+        let status_response = send_json(
+            &mut reader_client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "reader-status",
+                "method": "tools/call",
+                "params": {"name": "status", "arguments": {}}
+            }),
+        );
+        let status = assert_tool_success(&status_response, json!("reader-status"));
+        let generation = status["index_publication"]["generation"]
+            .as_u64()
+            .expect("reader complete generation");
+        assert!(
+            generation == old_generation || generation == old_generation + 1,
+            "reader observed an unexpected publication generation: {status}"
+        );
+        let ground_response = send_json(
+            &mut reader_client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "reader-ground",
+                "method": "tools/call",
+                "params": {"name": "ground", "arguments": {"budget": "strict"}}
+            }),
+        );
+        let ground = assert_tool_success(&ground_response, json!("reader-ground"));
+        let ground_result = assert_success_envelope(&ground_response, json!("reader-ground"));
+        let ground_generation =
+            ground_result["_meta"]["codestory_publication"]["publication"]["generation"]
+                .as_u64()
+                .expect("ground response publication generation");
+        let expected_file_count = if ground_generation == old_generation {
+            5
+        } else if ground_generation == old_generation + 1 {
+            101
+        } else {
+            panic!("ground response identified an unexpected publication: {ground_result}");
+        };
+        assert!(
+            ground["stats"]["file_count"]
+                .as_u64()
+                .is_some_and(|count| count == expected_file_count),
+            "reader ground mixed publication metadata and file contents: {ground_result}"
+        );
+
+        if generation == old_generation + 1
+            && status["local_refresh"]["state"] != json!("refreshing")
+        {
+            break generation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "real refresh did not publish a new complete generation: {status}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    assert_eq!(new_generation, old_generation + 1);
+    let (_writer_client, writer_status) = writer.join().expect("join writer status client");
+    assert_tool_success(&writer_status, json!("writer-start-refresh"));
 }
 
 #[test]
@@ -4554,9 +4812,13 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     let status = json_resource_content(status_result, "codestory://status");
     assert_fresh_freshness_counts(&status, "codestory://status after local graph tool refresh");
     assert_eq!(
-        status["local_refresh"]["reason"],
+        status["local_refresh"]["state"],
         json!("refreshed"),
         "tool dispatch should have refreshed the long-lived server before status was reread: {status}"
+    );
+    assert!(
+        status["index_publication"]["generation"].as_u64().is_some(),
+        "refreshed status should identify the complete publication: {status}"
     );
     assert_eq!(
         status["readiness_lanes"]["agent_packet_search"]["status"],

@@ -61,6 +61,8 @@ pub(crate) struct LocalRefreshOutput {
     pub(crate) lock_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) serving_publication: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) changed_file_count: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -244,6 +246,7 @@ pub(crate) fn local_refresh_output(verdict: &ReadinessVerdictDto) -> LocalRefres
         updated_at_epoch_ms: None,
         lock_path: None,
         last_failure_reason: None,
+        serving_publication: None,
         changed_file_count: index
             .map(|index| index.changed_file_count)
             .unwrap_or_default(),

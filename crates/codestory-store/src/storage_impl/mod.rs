@@ -609,6 +609,41 @@ fn read_index_publication(
     }
 }
 
+fn read_complete_index_publication(
+    conn: &Connection,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let values = conn.query_row(
+        "SELECT generation, generation_id, run_id, mode, published_at_epoch_ms
+         FROM index_publication
+         WHERE id = 1
+           AND NOT EXISTS (SELECT 1 FROM incomplete_index_run WHERE id = 1)",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    );
+    match values {
+        Ok((generation, generation_id, run_id, mode, published_at_epoch_ms)) => {
+            index_publication_record_from_values(
+                generation,
+                generation_id,
+                run_id,
+                mode,
+                published_at_epoch_ms,
+            )
+            .map(Some)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn is_framework_synthetic_node(node: &Node) -> bool {
     node.canonical_id.as_deref().is_some_and(|canonical_id| {
         canonical_id.starts_with("tauri:command:")
@@ -967,6 +1002,29 @@ impl Storage {
         Self::open_with_mode(path, StorageOpenMode::Live)
     }
 
+    /// Open the current schema without migrations or write-oriented pragmas.
+    ///
+    /// Published snapshots are immutable from a reader's perspective, so
+    /// concurrent readers must not contend with a staged refresh merely by
+    /// opening the live database.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(2_500))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
+            )));
+        }
+        Ok(Self {
+            conn,
+            cache: StorageCache::default(),
+            deferred_secondary_indexes: false,
+        })
+    }
+
     /// Open a build-mode store after removing stale SQLite sidecars.
     pub fn open_build<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -1047,6 +1105,15 @@ impl Storage {
     ) -> Result<Option<IndexPublicationRecord>, StorageError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         read_index_publication(&conn)
+    }
+
+    /// Read the durable publication only when the same SQLite snapshot has no
+    /// incomplete-run fence.
+    pub fn database_complete_index_publication(
+        path: &Path,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        read_complete_index_publication(&conn)
     }
 
     pub fn copy_database_snapshot(
@@ -1415,6 +1482,12 @@ impl Storage {
     /// Return the durable identity of the currently stored core generation.
     pub fn get_index_publication(&self) -> Result<Option<IndexPublicationRecord>, StorageError> {
         read_index_publication(&self.conn)
+    }
+
+    pub fn get_complete_index_publication(
+        &self,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        read_complete_index_publication(&self.conn)
     }
 
     /// Store the identity that will describe this database once it is published.

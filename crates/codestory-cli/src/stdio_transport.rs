@@ -11,11 +11,11 @@ use codestory_contracts::api::{
     AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexedFileRoleDto, IndexedFilesRequest, ListChildrenSymbolsRequest,
-    ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
-    PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
-    ReadinessVerdictDto, SearchRepoTextMode, SearchRequest, TrailCallerScope, TrailDirection,
-    TrailMode,
+    IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto, IndexedFilesRequest,
+    ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto, NodeDetailsRequest, NodeId,
+    NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
+    ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode, SearchRequest, TrailCallerScope,
+    TrailDirection, TrailMode,
 };
 use codestory_retrieval::SidecarLayout;
 use fs4::fs_std::FileExt;
@@ -630,9 +630,75 @@ fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
                 }
             }
+            let publication_before = if stdio_tool_reads_publication(name) {
+                match runtime
+                    .project
+                    .complete_index_publication_at(&runtime.storage_path)
+                {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        let error = serde_json::json!({
+                            "code": error.code,
+                            "message": error.message,
+                            "tool": name
+                        });
+                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                    }
+                }
+            } else {
+                None
+            };
+            let mut response = handle_stdio_tool_call(runtime, &mut session.state, &request);
+            let mut served_publication = publication_before;
+            if stdio_tool_reads_publication(name) {
+                let publication_after = match runtime
+                    .project
+                    .complete_index_publication_at(&runtime.storage_path)
+                {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        let error = serde_json::json!({
+                            "code": error.code,
+                            "message": error.message,
+                            "tool": name
+                        });
+                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                    }
+                };
+                if served_publication != publication_after {
+                    response = handle_stdio_tool_call(runtime, &mut session.state, &request);
+                    let publication_after_retry = runtime
+                        .project
+                        .complete_index_publication_at(&runtime.storage_path);
+                    match publication_after_retry {
+                        Ok(publication) if publication == publication_after => {
+                            served_publication = publication_after;
+                        }
+                        Ok(_) => {
+                            let error = serde_json::json!({
+                                "code": "cache_busy",
+                                "message": "The index publication changed twice while the tool was reading. Retry against the stable publication.",
+                                "tool": name
+                            });
+                            return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                        }
+                        Err(error) => {
+                            let error = serde_json::json!({
+                                "code": error.code,
+                                "message": error.message,
+                                "tool": name
+                            });
+                            return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                        }
+                    }
+                }
+            }
+            let publication_meta =
+                stdio_served_publication_meta(&session.state, served_publication.as_ref());
             return Some(stdio_jsonrpc_tool_call_from_legacy(
                 id,
-                handle_stdio_tool_call(runtime, &mut session.state, &request),
+                response,
+                publication_meta,
             ));
         }
         _ => {
@@ -778,14 +844,55 @@ fn stdio_repair_calls_from_value(
 fn stdio_jsonrpc_tool_call_from_legacy(
     id: serde_json::Value,
     response: serde_json::Value,
+    publication_meta: Option<serde_json::Value>,
 ) -> serde_json::Value {
     if let Some(result) = response.get("result") {
-        return stdio_jsonrpc_success(id, stdio_tool_call_success(result.clone()));
+        let mut success = stdio_tool_call_success(result.clone());
+        if let Some(publication_meta) = publication_meta
+            && let Some(success) = success.as_object_mut()
+        {
+            let meta = success
+                .entry("_meta")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(meta) = meta.as_object_mut() {
+                meta.insert("codestory_publication".to_string(), publication_meta);
+            }
+        }
+        return stdio_jsonrpc_success(id, success);
     }
     if let Some(error) = response.get("error") {
         return stdio_jsonrpc_success(id, stdio_tool_call_error(error));
     }
     stdio_jsonrpc_success(id, stdio_tool_call_success(response))
+}
+
+fn stdio_tool_reads_publication(name: &str) -> bool {
+    !matches!(name, "status" | "repair_all" | "sidecar_setup")
+}
+
+fn stdio_served_publication_meta(
+    state: &StdioServerState,
+    publication: Option<&IndexPublicationDto>,
+) -> Option<serde_json::Value> {
+    let publication = publication?;
+    let status = state.status_cache.as_ref().map(|cached| &cached.value);
+    let refreshing = status
+        .and_then(|status| status.pointer("/local_refresh/state"))
+        .and_then(serde_json::Value::as_str)
+        == Some("refreshing");
+    let mut meta = serde_json::json!({
+        "served_from": if refreshing { "last_complete_publication" } else { "complete_publication" },
+        "publication": publication,
+    });
+    if refreshing {
+        meta["refresh"] = serde_json::json!({
+            "state": "refreshing",
+            "phase": status.and_then(|status| status.pointer("/local_refresh/phase")),
+            "pid": status.and_then(|status| status.pointer("/local_refresh/pid")),
+            "started_at_epoch_ms": status.and_then(|status| status.pointer("/local_refresh/started_at_epoch_ms"))
+        });
+    }
+    Some(meta)
 }
 
 fn stdio_tool_call_success(structured_content: serde_json::Value) -> serde_json::Value {
@@ -2524,9 +2631,46 @@ fn read_stdio_resource(
     state: &mut StdioServerState,
     uri: &str,
 ) -> serde_json::Value {
-    let result = match uri {
-        "codestory://status" => read_stdio_status_resource_cached(runtime, state),
-        "codestory://agent-guide" => Ok(read_stdio_agent_guide_resource(&runtime.project_root)),
+    let result = if uri == "codestory://status" {
+        read_stdio_status_resource_cached(runtime, state)
+    } else if uri == "codestory://agent-guide" {
+        Ok(read_stdio_agent_guide_resource(&runtime.project_root))
+    } else {
+        let publication_before = runtime
+            .project
+            .complete_index_publication_at(&runtime.storage_path)
+            .map_err(map_api_error);
+        publication_before.and_then(|publication_before| {
+            let mut value = read_stdio_publication_resource(runtime, uri)?;
+            let publication_after = runtime
+                .project
+                .complete_index_publication_at(&runtime.storage_path)
+                .map_err(map_api_error)?;
+            if publication_before != publication_after {
+                value = read_stdio_publication_resource(runtime, uri)?;
+                let publication_after_retry = runtime
+                    .project
+                    .complete_index_publication_at(&runtime.storage_path)
+                    .map_err(map_api_error)?;
+                if publication_after != publication_after_retry {
+                    bail!(
+                        "cache_busy: the index publication changed twice while reading {uri}; retry against the stable publication"
+                    );
+                }
+            }
+            Ok(value)
+        })
+    };
+    result
+        .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+}
+
+fn read_stdio_publication_resource(
+    runtime: &RuntimeContext,
+    uri: &str,
+) -> Result<serde_json::Value> {
+    match uri {
         "codestory://project" => runtime
             .open_project_summary()
             .map(|summary| serde_json::json!(summary)),
@@ -2543,10 +2687,7 @@ fn read_stdio_resource(
             .map(|symbols| serde_json::json!(symbols))
             .map_err(map_api_error),
         _ => read_stdio_template_resource(runtime, uri),
-    };
-    result
-        .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
-        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
+    }
 }
 
 fn read_stdio_status_resource_cached(
@@ -2566,6 +2707,69 @@ fn read_stdio_status_resource_cached(
         return Ok(cached.value.clone());
     }
 
+    let mut publication_before = runtime
+        .project
+        .complete_index_publication_at(&runtime.storage_path)
+        .map_err(map_api_error)?;
+    let mut value = read_stdio_status_resource_uncached(runtime, state)?;
+    let mut publication_after = runtime
+        .project
+        .complete_index_publication_at(&runtime.storage_path)
+        .map_err(map_api_error)?;
+    if publication_before != publication_after
+        || !stdio_status_matches_publication(&value, publication_after.as_ref())
+    {
+        let completed_refresh = value
+            .get("local_refresh")
+            .filter(|refresh| {
+                refresh.get("state").and_then(serde_json::Value::as_str) == Some("refreshed")
+            })
+            .filter(|refresh| {
+                refresh.get("reason").and_then(serde_json::Value::as_str) == Some("refreshed")
+            })
+            .cloned();
+        publication_before = publication_after;
+        value = read_stdio_status_resource_uncached(runtime, state)?;
+        publication_after = runtime
+            .project
+            .complete_index_publication_at(&runtime.storage_path)
+            .map_err(map_api_error)?;
+        if publication_before != publication_after
+            || !stdio_status_matches_publication(&value, publication_after.as_ref())
+        {
+            bail!(
+                "cache_busy: the index publication changed twice while status was reading; retry against the stable publication"
+            );
+        }
+        if let Some(completed_refresh) = completed_refresh {
+            value["local_refresh"] = completed_refresh;
+        }
+    }
+
+    let key = stdio_status_cache_key(runtime);
+    // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
+    state.status_cache = Some(StdioStatusCacheEntry {
+        key,
+        value: value.clone(),
+        cached_at: Instant::now(),
+    });
+    Ok(value)
+}
+
+fn stdio_status_matches_publication(
+    status: &serde_json::Value,
+    publication: Option<&IndexPublicationDto>,
+) -> bool {
+    let expected = publication
+        .and_then(|publication| serde_json::to_value(publication).ok())
+        .unwrap_or(serde_json::Value::Null);
+    status.get("index_publication") == Some(&expected)
+}
+
+fn read_stdio_status_resource_uncached(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+) -> Result<serde_json::Value> {
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
     let summary = inspect_runtime.open_project_summary()?;
@@ -2577,6 +2781,7 @@ fn read_stdio_status_resource_cached(
             output.state = crate::readiness::LocalRefreshState::Refreshing;
             output.blocks_local_surfaces = true;
             output.reason = Some(format!("active_ready_repair:{}", active_repair.phase));
+            crate::attach_complete_publication(&mut output, &summary);
             (summary, Some(output))
         } else {
             (summary, None)
@@ -2586,18 +2791,16 @@ fn read_stdio_status_resource_cached(
     } else {
         (summary, None)
     };
-    let key = stdio_status_cache_key(runtime);
+    let index_publication = summary
+        .publication
+        .as_ref()
+        .and_then(|publication| serde_json::to_value(publication).ok())
+        .unwrap_or(serde_json::Value::Null);
     let value = stdio_status_with_recent_sidecar_repair(
-        read_stdio_status_resource(runtime, summary, local_refresh)?,
+        read_stdio_status_resource(runtime, summary, local_refresh, index_publication)?,
         &mut state.recent_sidecar_repair,
         &runtime.project_root,
     );
-    // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
-    state.status_cache = Some(StdioStatusCacheEntry {
-        key,
-        value: value.clone(),
-        cached_at: Instant::now(),
-    });
     Ok(value)
 }
 
@@ -2696,11 +2899,12 @@ fn wait_for_stdio_local_freshness(
     summary: &ProjectSummary,
 ) -> Result<(ProjectSummary, Option<crate::readiness::LocalRefreshOutput>)> {
     let (tx, rx) = mpsc::channel();
-    let project = project.clone();
+    let worker_project = project.clone();
     thread::spawn(move || {
-        let result = RuntimeContext::new_inspect_only(&project).and_then(|inspect_runtime| {
-            crate::wait_for_local_freshness(&project, &inspect_runtime)
-        });
+        let result =
+            RuntimeContext::new_inspect_only(&worker_project).and_then(|inspect_runtime| {
+                crate::wait_for_local_freshness(&worker_project, &inspect_runtime)
+            });
         let _ = tx.send(result);
     });
 
@@ -2725,6 +2929,7 @@ fn wait_for_stdio_local_freshness(
             output.readiness_status = ReadinessStatusDto::RepairIndex;
             output.reason = Some("refresh_worker_disconnected".to_string());
             output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
+            crate::attach_complete_publication(&mut output, summary);
             Ok((summary.clone(), Some(output)))
         }
     }
@@ -2740,6 +2945,7 @@ fn stdio_local_refresh_timeout_output(
     output.reason = Some("refresh_timeout".to_string());
     output.phase = Some("incremental_index".to_string());
     output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
+    crate::attach_complete_publication(&mut output, summary);
     output
 }
 
@@ -3340,6 +3546,7 @@ fn read_stdio_status_resource(
     runtime: &RuntimeContext,
     summary: ProjectSummary,
     local_refresh: Option<crate::readiness::LocalRefreshOutput>,
+    index_publication: serde_json::Value,
 ) -> Result<serde_json::Value> {
     let retrieval = summary.retrieval.as_ref();
     let sidecar = build_stdio_status_sidecar(runtime);
@@ -3405,6 +3612,7 @@ fn read_stdio_status_resource(
         },
         "index_freshness": summary.freshness,
         "effective_index_freshness": readiness.effective_freshness,
+        "index_publication": index_publication,
         "local_refresh": readiness.local_refresh_json,
         "readiness": readiness.readiness,
         "readiness_lanes": readiness.readiness_lanes_json,
@@ -3553,36 +3761,50 @@ fn build_stdio_status_readiness(
         &sidecar.selected_agent_sidecar,
         broker.gpu_proof.as_ref(),
     );
-    let readiness = crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
-        project: &summary.root,
-        stats: &summary.stats,
-        freshness: effective_freshness.as_ref(),
-        sidecar: Some(crate::readiness::ReadinessSidecarInput {
-            profile: selected_agent_sidecar.profile.as_deref(),
-            run_id: selected_agent_sidecar.run_id.as_deref(),
-            retrieval_mode: &selected_agent_sidecar.retrieval_mode,
-            degraded_reason: selected_agent_sidecar.degraded_reason.as_deref(),
-            embedding_device_policy: Some(&selected_agent_sidecar.embedding_device_policy),
-            embedding_device_state: Some(&selected_agent_sidecar.embedding_device_state),
-            embedding_device_observation_source: Some(
-                &selected_agent_sidecar.embedding_device_observation_source,
-            ),
-            embedding_detected_provider: selected_agent_sidecar
-                .embedding_detected_provider
-                .as_deref(),
-            embedding_detected_gpu: selected_agent_sidecar.embedding_detected_gpu.as_deref(),
-            embedding_accelerator_requested: selected_agent_sidecar.embedding_accelerator_requested,
-            embedding_accelerator_request_provider: selected_agent_sidecar
-                .embedding_accelerator_request_provider
-                .as_deref(),
-            embedding_accelerator_request_device: selected_agent_sidecar
-                .embedding_accelerator_request_device
-                .as_deref(),
-            embedding_cpu_allowed: selected_agent_sidecar.embedding_cpu_allowed,
-            manifest_generation: selected_agent_sidecar.manifest_generation.as_deref(),
-            manifest_input_hash: selected_agent_sidecar.manifest_input_hash.as_deref(),
-        }),
-    });
+    let mut readiness =
+        crate::readiness::build_readiness_verdicts(crate::readiness::ReadinessInputs {
+            project: &summary.root,
+            stats: &summary.stats,
+            freshness: effective_freshness.as_ref(),
+            sidecar: Some(crate::readiness::ReadinessSidecarInput {
+                profile: selected_agent_sidecar.profile.as_deref(),
+                run_id: selected_agent_sidecar.run_id.as_deref(),
+                retrieval_mode: &selected_agent_sidecar.retrieval_mode,
+                degraded_reason: selected_agent_sidecar.degraded_reason.as_deref(),
+                embedding_device_policy: Some(&selected_agent_sidecar.embedding_device_policy),
+                embedding_device_state: Some(&selected_agent_sidecar.embedding_device_state),
+                embedding_device_observation_source: Some(
+                    &selected_agent_sidecar.embedding_device_observation_source,
+                ),
+                embedding_detected_provider: selected_agent_sidecar
+                    .embedding_detected_provider
+                    .as_deref(),
+                embedding_detected_gpu: selected_agent_sidecar.embedding_detected_gpu.as_deref(),
+                embedding_accelerator_requested: selected_agent_sidecar
+                    .embedding_accelerator_requested,
+                embedding_accelerator_request_provider: selected_agent_sidecar
+                    .embedding_accelerator_request_provider
+                    .as_deref(),
+                embedding_accelerator_request_device: selected_agent_sidecar
+                    .embedding_accelerator_request_device
+                    .as_deref(),
+                embedding_cpu_allowed: selected_agent_sidecar.embedding_cpu_allowed,
+                manifest_generation: selected_agent_sidecar.manifest_generation.as_deref(),
+                manifest_input_hash: selected_agent_sidecar.manifest_input_hash.as_deref(),
+            }),
+        });
+    if local_refresh.as_ref().is_some_and(|refresh| {
+        refresh.state == crate::readiness::LocalRefreshState::Refreshing
+            && refresh.serving_publication.is_some()
+    }) && let Some(local) = readiness
+        .iter_mut()
+        .find(|verdict| verdict.goal == ReadinessGoalDto::LocalNavigation)
+    {
+        local.status = ReadinessStatusDto::Ready;
+        local.summary = "Serving the last complete publication while a single refresh writer builds the next generation.".to_string();
+        local.minimum_next.clear();
+        local.full_repair.clear();
+    }
     let sidecar_setup = stdio_sidecar_setup_status(&runtime.project_root);
     let readiness_lanes = crate::build_readiness_lanes_for_runtime(
         runtime,
@@ -5815,6 +6037,26 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn status_response_must_match_the_current_complete_publication() {
+        let publication = IndexPublicationDto {
+            generation: 2,
+            generation_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            run_id: "run-2".to_string(),
+            mode: codestory_contracts::api::IndexPublicationModeDto::Incremental,
+            published_at_epoch_ms: 2,
+        };
+        let matching = json!({"index_publication": publication.clone()});
+        assert!(stdio_status_matches_publication(
+            &matching,
+            Some(&publication)
+        ));
+        assert!(!stdio_status_matches_publication(
+            &json!({"index_publication": null}),
+            Some(&publication)
+        ));
+    }
 
     fn base_packet_cache_key_input(question: &str) -> StdioPacketCacheKeyInput<'_> {
         StdioPacketCacheKeyInput {

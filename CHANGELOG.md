@@ -9,14 +9,22 @@
   the generation that owns the live graph, and cache finalization verifies that
   identity before clearing the incomplete-run compatibility fence.
 - Published persisted symbol-search indexes into UUID-scoped generation
-  directories selected only by the live core publication identity. Missing or
-  corrupt expected generations rebuild in place with document-count validation;
-  retention keeps the active generation plus one verified rollback, skips
-  locked readers, and preserves the legacy path for databases without an
-  identity.
+  directories selected only by the live core publication identity. Writers
+  finish and validate each search generation before publishing its core
+  database; readers never rebuild missing or corrupt generations in place.
+  Retention keeps the active generation plus one verified rollback, skips locked
+  readers, and preserves the legacy path for databases without an identity.
 
 ### Fixed
 
+- Kept project-scoped MCP reads available during a single-flight local refresh
+  by opening published SQLite generations read-only, serving the last complete
+  publication with explicit generation and refresh-owner metadata, retrying a
+  search-generation swap once at the publication boundary, and rechecking
+  freshness after acquiring the refresh lock so concurrent requests coalesce
+  instead of publishing duplicate generations. Read tool metadata is bound to
+  the exact complete publication used by the response, and max grounding no
+  longer writes missing detail snapshots into the live reader database.
 - Finalized graph-native and dense semantic documents in staged full and
   incremental databases before core publication. Post-publication cache loads
   now hydrate semantic state without rewriting live rows, and an unavailable
@@ -26,8 +34,7 @@
   deferred indexes, and both grounding snapshot tiers in a coherent SQLite
   clone before publishing the new core generation. Pre-publication failures
   and cancellation now discard staged artifacts without changing the live
-  database, schema, snapshots, or incomplete-run marker; late search or cache
-  failures keep the already-published generation fenced for staged recovery.
+  database, schema, snapshots, or incomplete-run marker.
 
 ## 0.14.3
 
