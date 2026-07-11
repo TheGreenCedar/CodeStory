@@ -370,6 +370,22 @@ def terminate_worker_pid(pid: int) -> None:
             pass
 
 
+def running_status_worker_pids(status: dict) -> set[int]:
+    operations = status.get("readiness_broker", {}).get("operations", [])
+    return {
+        operation["pid"]
+        for operation in operations
+        if isinstance(operation, dict)
+        and operation.get("status") == "running"
+        and isinstance(operation.get("pid"), int)
+    }
+
+
+def terminate_status_workers(status: dict) -> None:
+    for worker_pid in running_status_worker_pids(status):
+        terminate_worker_pid(worker_pid)
+
+
 def read_stdio_line(stdout_queue: queue.Queue[str | None], timeout_secs: int) -> str | None:
     deadline = time.monotonic() + timeout_secs
     while True:
@@ -392,6 +408,7 @@ def stdio_status(
     artifact: Path,
     timeout_secs: int,
     env: dict[str, str] | None = None,
+    cleanup_status_workers: bool = False,
 ) -> dict:
     return stdio_status_command(
         [str(cli), "serve", "--stdio", "--refresh", "none", "--project", str(project)],
@@ -399,6 +416,7 @@ def stdio_status(
         timeout_secs,
         project,
         env=env,
+        cleanup_status_workers=cleanup_status_workers,
     )
 
 
@@ -409,6 +427,7 @@ def plugin_stdio_status(
     artifact: Path,
     timeout_secs: int,
     expected_version: str,
+    cache_root: Path,
 ) -> dict:
     require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
@@ -424,9 +443,11 @@ def plugin_stdio_status(
             env={
                 **os.environ,
                 "CODESTORY_CLI": "",
+                "CODESTORY_CACHE_ROOT": str(cache_root),
                 "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
                 "PLUGIN_DATA": data,
             },
+            cleanup_status_workers=True,
         )
 
 
@@ -513,6 +534,7 @@ def plugin_stdio_handoff(
                 },
                 status_after,
             ],
+            cleanup_status_workers=True,
         )
         require_managed_plugin_handoff(status, artifact, expected_version, archive_cli)
         return status
@@ -527,6 +549,7 @@ def stdio_status_command(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     extra_requests: list[dict] | None = None,
+    cleanup_status_workers: bool = False,
 ) -> dict:
     stderr_path = artifact.with_suffix(artifact.suffix + ".stderr.txt")
     process = subprocess.Popen(
@@ -612,12 +635,20 @@ def stdio_status_command(
         if not process_terminated:
             terminate_process_tree(process)
             process_terminated = True
+        worker_pids: set[int] = set()
         for response in responses:
-            if not isinstance(response, dict) or response.get("id") != "repair":
+            if not isinstance(response, dict):
                 continue
-            worker_pid = response.get("result", {}).get("structuredContent", {}).get("pid")
-            if isinstance(worker_pid, int):
-                terminate_worker_pid(worker_pid)
+            if response.get("id") == "repair":
+                worker_pid = response.get("result", {}).get("structuredContent", {}).get("pid")
+                if isinstance(worker_pid, int):
+                    worker_pids.add(worker_pid)
+            if cleanup_status_workers:
+                status = status_from_resource_response(response)
+                if isinstance(status, dict):
+                    worker_pids.update(running_status_worker_pids(status))
+        for worker_pid in worker_pids:
+            terminate_worker_pid(worker_pid)
         try:
             process.stdin.close()
         except OSError:
@@ -917,11 +948,8 @@ def run_gate(args: argparse.Namespace) -> None:
         cli = find_cli(unpacked)
         plugin_skill = find_plugin_skill(unpacked)
         cache_root = Path(temp) / "cache"
-        proof_env = (
-            {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
-            if args.managed_plugin_handoff
-            else None
-        )
+        proof_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
+        stdio_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(Path(temp) / "stdio-cache")}
 
         summary = {
             "archive": str(archive),
@@ -947,10 +975,18 @@ def run_gate(args: argparse.Namespace) -> None:
         write_json(out_dir / "summary.json", summary)
 
         stdio_artifact = out_dir / "serve-stdio-status.json"
-        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
-        require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
-        summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
-        write_json(out_dir / "summary.json", summary)
+        if args.version_only or args.managed_plugin_handoff:
+            stdio_status_payload = stdio_status(
+                cli,
+                project,
+                stdio_artifact,
+                args.timeout_secs,
+                stdio_env,
+                cleanup_status_workers=True,
+            )
+            require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
+            summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
+            write_json(out_dir / "summary.json", summary)
 
         if args.version_only:
             return
@@ -1042,6 +1078,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             local_bootstrap_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         summary["artifacts"]["local_retrieval_bootstrap"] = str(local_bootstrap_artifact)
         write_json(out_dir / "summary.json", summary)
@@ -1066,6 +1103,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             local_index_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_retrieval_index_ready(local_index, "local_retrieval_index", local_index_artifact)
         summary["artifacts"]["local_retrieval_index"] = str(local_index_artifact)
@@ -1089,6 +1127,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             local_status_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_retrieval_full(local_status, "local_retrieval_status", local_status_artifact)
         summary["artifacts"]["local_retrieval_status"] = str(local_status_artifact)
@@ -1112,6 +1151,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             ready_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_agent_ready(ready, "ready", ready_artifact)
         summary["artifacts"]["ready"] = str(ready_artifact)
@@ -1124,6 +1164,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ["doctor", "--project", str(project), "--format", "json", "--output-file", str(doctor_artifact)],
             doctor_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_retrieval_full(doctor, "doctor", doctor_artifact)
         summary["artifacts"]["doctor"] = str(doctor_artifact)
@@ -1145,6 +1186,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             status_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_retrieval_full(status, "retrieval_status", status_artifact)
         summary["artifacts"]["retrieval_status"] = str(status_artifact)
@@ -1168,6 +1210,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             search_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_search_full(search, search_artifact)
         summary["artifacts"]["search"] = str(search_artifact)
@@ -1190,6 +1233,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             context_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_context_ready(context, context_artifact)
         summary["artifacts"]["context"] = str(context_artifact)
@@ -1214,13 +1258,26 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             packet_artifact,
             args.timeout_secs,
+            env=proof_env,
         )
         require_packet_ready(packet, packet_artifact)
         summary["artifacts"]["packet"] = str(packet_artifact)
         write_json(out_dir / "summary.json", summary)
 
-        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs)
-        require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
+        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
+        stdio_attempts = [stdio_status_payload]
+        require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
+        allowed = stdio_status_payload.get("allowed_surfaces", {})
+        if not all(allowed.get(name, {}).get("allowed") is True for name in ("packet", "search", "context")):
+            shutil.copy2(stdio_artifact, out_dir / "serve-stdio-status-initial.json")
+            stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
+            stdio_attempts.append(stdio_status_payload)
+        try:
+            require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
+        finally:
+            for status_attempt in stdio_attempts:
+                terminate_status_workers(status_attempt)
+        summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
         write_json(out_dir / "summary.json", summary)
 
         if args.plugin_root:
@@ -1232,6 +1289,7 @@ def run_gate(args: argparse.Namespace) -> None:
                 plugin_stdio_artifact,
                 args.timeout_secs,
                 args.expected_version,
+                cache_root,
             )
             require_plugin_stdio_ready(plugin_status, plugin_stdio_artifact, args.expected_version)
             summary["artifacts"]["plugin_stdio"] = str(plugin_stdio_artifact)
@@ -1285,7 +1343,10 @@ def write_fake_cli(path: Path) -> None:
             elif layer == "doctor":
                 emit({"retrieval_mode": "full"})
             elif layer == "retrieval_bootstrap":
-                emit({"project_status": {"retrieval_mode": "unavailable"}})
+                emit({
+                    "cache_root": os.environ.get("CODESTORY_CACHE_ROOT"),
+                    "project_status": {"retrieval_mode": "unavailable"},
+                })
             elif layer == "retrieval_index":
                 emit({"zoekt_stubbed": False, "qdrant_stubbed": False, "scip_stubbed": False})
             elif layer == "retrieval_status":
@@ -1322,7 +1383,11 @@ def write_fake_cli(path: Path) -> None:
                 else:
                     emit({"sufficiency": {"status": "sufficient"}, "answer": {"retrieval_version": "sidecar"}, "retrieval_trace_summary": {}})
             elif layer == "ground":
-                emit({"root": os.getcwd(), "stats": {"file_count": 1, "node_count": 1}})
+                emit({
+                    "cache_root": os.environ.get("CODESTORY_CACHE_ROOT"),
+                    "root": os.getcwd(),
+                    "stats": {"file_count": 1, "node_count": 1},
+                })
             elif layer == "serve":
                 marker = None
                 repair_attempt = None
@@ -1361,12 +1426,28 @@ def write_fake_cli(path: Path) -> None:
                         result = {"content": [{"type": "text", "text": json.dumps(repair)}], "structuredContent": repair}
                     else:
                         serve_allowed = True
+                        refresh_worker_pid = None
                         if marker is not None and not os.path.exists(marker):
-                            open(marker, "w", encoding="utf-8").write("seen")
+                            refresh_worker_pid = int(os.environ["CODESTORY_FAKE_STATUS_WORKER_PID"])
+                            open(marker, "w", encoding="utf-8").write(str(refresh_worker_pid))
                             serve_allowed = False
+                        elif marker is not None:
+                            refresh_worker_pid = int(open(marker, encoding="utf-8").read())
+                            try:
+                                os.kill(refresh_worker_pid, 0)
+                            except OSError:
+                                serve_allowed = False
                         server_executable = os.environ.get("CODESTORY_FAKE_SERVER_EXECUTABLE", sys.argv[0])
                         server_sha256 = hashlib.sha256(open(server_executable, "rb").read()).hexdigest()
                         status = {
+                            "cache_root": os.environ.get("CODESTORY_CACHE_ROOT"),
+                            "readiness_broker": {
+                                "operations": ([{
+                                    "operation_kind": "local_graph_refresh",
+                                    "pid": refresh_worker_pid,
+                                    "status": "running",
+                                }] if refresh_worker_pid else []),
+                            },
                             "server_version": "9.9.9",
                             "cli_version": "9.9.9",
                             "server_executable": server_executable,
@@ -1511,6 +1592,9 @@ def self_test() -> None:
         run_gate(args)
         assert (out_dir / "summary.json").is_file()
         stdio_artifact = read_json_file(out_dir / "serve-stdio-status.json")
+        full_cache_root = read_json_file(out_dir / "local-retrieval-bootstrap.json")["cache_root"]
+        assert Path(full_cache_root).name == "cache"
+        assert stdio_artifact["status"]["cache_root"] == full_cache_root
         status_request = next(
             entry["request"]
             for entry in stdio_artifact["transcript"]
@@ -1526,6 +1610,9 @@ def self_test() -> None:
         version_only_summary = read_json_file(version_only_out / "summary.json")
         assert version_only_summary["artifacts"].keys() == {"checksum", "version", "help", "serve_stdio"}
         assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
+        version_only_status = read_json_file(version_only_out / "serve-stdio-status.json")["status"]
+        assert Path(version_only_status["cache_root"]).name == "stdio-cache"
+        assert version_only_status["cache_root"] != full_cache_root
 
         bad_checksum = root / "BAD_SHA256SUMS.txt"
         bad_checksum.write_text(f"{'0' * 64}  {archive.name}\n", encoding="utf-8")
@@ -1556,15 +1643,31 @@ def self_test() -> None:
         delayed_stdio_args = argparse.Namespace(**vars(args))
         delayed_stdio_args.project = str(delayed_stdio_project)
         delayed_stdio_args.out_dir = str(delayed_stdio_out)
+        delayed_status_worker = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                if os.name == "nt"
+                else 0
+            ),
+            start_new_session=os.name != "nt",
+        )
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_first_blocked"
+        os.environ["CODESTORY_FAKE_STATUS_WORKER_PID"] = str(delayed_status_worker.pid)
         try:
             run_gate(delayed_stdio_args)
             delayed_stdio_status = read_json_file(delayed_stdio_out / "serve-stdio-status.json")
             delayed_status = delayed_stdio_status["status"]
             assert delayed_status["allowed_surfaces"]["packet"]["allowed"] is True
             assert (delayed_stdio_project / ".fake-serve-first-blocked-seen").is_file()
+            delayed_status_worker.wait(timeout=5)
+            assert delayed_status_worker.returncode is not None
         finally:
+            terminate_worker_pid(delayed_status_worker.pid)
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+            os.environ.pop("CODESTORY_FAKE_STATUS_WORKER_PID", None)
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "search"
         try:
@@ -1626,6 +1729,10 @@ def self_test() -> None:
                 artifact = read_json_file(exc.artifact)
                 assert artifact["server_advertised_mcp_resources"]["missing"] == ["codestory://agent-guide"]
                 assert artifact["status"]["plugin_runtime"]["cli_source"] == "direct_cli_launch"
+                hidden_cache_root = read_json_file(
+                    Path(plugin_hidden_args.out_dir) / "local-retrieval-bootstrap.json"
+                )["cache_root"]
+                assert artifact["status"]["cache_root"] == hidden_cache_root
             else:
                 raise AssertionError("hidden plugin MCP resources should fail the plugin stdio gate")
         finally:
@@ -1651,6 +1758,12 @@ def self_test() -> None:
                 transcript_response(managed_artifact, "status_after_repair")
             )
             assert managed_status_after["sidecar_setup"]["active_repair"]["attempt_id"] == "fake-attempt"
+            managed_cache_root = read_json_file(Path(managed_args.out_dir) / "managed-local-ground.json")["cache_root"]
+            assert Path(managed_cache_root).name == "cache"
+            assert managed_status_after["cache_root"] == managed_cache_root
+            managed_direct_status = read_json_file(Path(managed_args.out_dir) / "serve-stdio-status.json")["status"]
+            assert Path(managed_direct_status["cache_root"]).name == "stdio-cache"
+            assert managed_direct_status["cache_root"] != managed_cache_root
         finally:
             os.environ.pop("CODESTORY_FAKE_PLUGIN_MANAGED", None)
             os.environ.pop("CODESTORY_FAKE_PLUGIN_CLI", None)
