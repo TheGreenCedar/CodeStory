@@ -31,7 +31,9 @@
   changes to discovered files without graph collectors do not abort publication.
 - Closed packaged-proof stdio input before force-terminating the launcher so
   delegated Windows CLI processes exit and release managed binaries before
-  temporary plugin data is removed.
+  temporary plugin data is removed. Managed repair-worker cleanup now also
+  waits on the Windows process handle after terminating its process tree before
+  deleting the provisioned executable.
 - Kept the cross-platform concurrent-publication proof independent of cached
   build output so macOS runner image and Xcode updates cannot restore binaries
   linked against vanished toolchain paths.

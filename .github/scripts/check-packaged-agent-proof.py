@@ -380,16 +380,28 @@ def terminate_worker_pid(pid: int) -> None:
     if pid <= 0:
         return
     if os.name == "nt":
+        process_handle = None
+        try:
+            import ctypes
+
+            process_handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+        except (AttributeError, OSError):
+            process_handle = None
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=2,
+                timeout=10,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
+        if process_handle:
+            try:
+                ctypes.windll.kernel32.WaitForSingleObject(process_handle, 10_000)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
     else:
         try:
             os.kill(pid, signal.SIGKILL)
