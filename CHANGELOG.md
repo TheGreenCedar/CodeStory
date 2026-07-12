@@ -94,6 +94,10 @@
   report, drill, stdio cache/readiness, and profile-selection paths now reuse
   the captured runtime instead of rebuilding configuration from changed
   process environment state.
+- Isolated stdio unit-test sidecar and port-registry state from the real user
+  cache, fixed atomic JSON replacement for Windows paths beyond `MAX_PATH`, and
+  made stdio fixtures drain repair workers or fail while preserving timed-out
+  fixture state under default parallel execution.
 - Removed a plugin static test that froze exact grounding documentation copy;
   documentation remains covered by the repository link and diff checks.
 - Pinned each status summary to one SQLite read transaction, accepted it only

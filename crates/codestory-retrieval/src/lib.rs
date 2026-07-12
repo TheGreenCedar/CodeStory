@@ -60,7 +60,9 @@ pub use config::{
     sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id, user_cache_root,
 };
 #[cfg(feature = "test-support")]
-pub use config::{active_test_cache_root, with_test_cache_root};
+pub use config::{
+    active_test_cache_root, enable_automatic_test_cache_root_for_process, with_test_cache_root,
+};
 pub use embeddings::{
     BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingRuntimeProbe,
     LlamaCppEmbeddingClient, RETRIEVAL_EMBEDDING_DIM, embed_documents_for_runtime,

@@ -140,6 +140,8 @@ impl RuntimeContext {
     }
 
     fn new_with_startup(args: &ProjectArgs) -> Result<Self> {
+        #[cfg(test)]
+        codestory_retrieval::enable_automatic_test_cache_root_for_process();
         let project_root = canonicalize_project_root(&args.project)?;
         let config = crate::config::load_config(&project_root)?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());

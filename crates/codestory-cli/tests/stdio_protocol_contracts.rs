@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 struct StdioFixture {
-    workspace: TempDir,
-    cache_dir: TempDir,
+    workspace: PreservableTempDir,
+    cache_dir: PreservableTempDir,
     hash_embeddings: bool,
     latest_release_version: Option<String>,
     disable_release_probe: bool,
@@ -33,9 +33,14 @@ struct StdioServer {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    worker_roots: Vec<PathBuf>,
+    preserve_fixture_roots: Option<Arc<AtomicBool>>,
 }
 
-struct RemoveDirOnDrop(PathBuf);
+struct PreservableTempDir {
+    inner: Option<TempDir>,
+    preserve: Arc<AtomicBool>,
+}
 
 struct FakeEmbeddingEndpoint {
     url: String,
@@ -142,17 +147,290 @@ fn read_http_request_body(stream: &mut TcpStream) -> String {
     String::from_utf8(body).expect("embedding request utf8")
 }
 
-impl Drop for RemoveDirOnDrop {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+impl PreservableTempDir {
+    fn new(inner: TempDir, preserve: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: Some(inner),
+            preserve,
+        }
     }
 }
 
+impl std::ops::Deref for PreservableTempDir {
+    type Target = TempDir;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("fixture root")
+    }
+}
+
+impl Drop for PreservableTempDir {
+    fn drop(&mut self) {
+        if self.preserve.load(Ordering::Acquire)
+            && let Some(root) = self.inner.take()
+        {
+            let _ = root.keep();
+        }
+    }
+}
+
+const FIXTURE_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl Drop for StdioServer {
     fn drop(&mut self) {
+        let timed_out = !wait_for_fixture_workers(&self.worker_roots, FIXTURE_WORKER_DRAIN_TIMEOUT);
+        let timeout_cleanup = timed_out.then(|| {
+            if let Some(preserve) = self.preserve_fixture_roots.as_ref() {
+                preserve.store(true, Ordering::Release);
+            }
+            let reservations = fixture_worker_reservations(&self.worker_roots);
+            let termination = terminate_fixture_process_tree(self.child.id());
+            (reservations, termination)
+        });
+
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        if let Some((reservations, mut termination)) = timeout_cleanup {
+            let first_survivors = termination
+                .tracked_pids
+                .iter()
+                .copied()
+                .filter(|pid| process_is_running(*pid))
+                .collect::<Vec<_>>();
+            termination.attempts.extend(
+                first_survivors
+                    .iter()
+                    .map(|pid| force_terminate_process(*pid)),
+            );
+            if !first_survivors.is_empty() {
+                thread::sleep(Duration::from_millis(100));
+            }
+            let surviving_pids = termination
+                .tracked_pids
+                .iter()
+                .copied()
+                .filter(|pid| process_is_running(*pid))
+                .collect::<Vec<_>>();
+            let remaining_reservations = fixture_worker_reservations(&self.worker_roots);
+            let detail = format!(
+                "fixture-owned ready-repair workers did not drain within {:?}; preserved fixture roots; reservations={reservations:?}; termination_attempts={:?}; surviving_pids={surviving_pids:?}; remaining_reservations={remaining_reservations:?}",
+                FIXTURE_WORKER_DRAIN_TIMEOUT, termination.attempts
+            );
+            if thread::panicking() {
+                eprintln!("stdio fixture teardown failure while unwinding: {detail}");
+            } else {
+                panic!("stdio fixture teardown failure: {detail}");
+            }
+        }
     }
+}
+
+fn wait_for_fixture_workers(roots: &[PathBuf], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fixture_worker_reservations(roots).is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn fixture_worker_reservations(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut reservations = Vec::new();
+    for root in roots {
+        let mut pending = vec![root.clone()];
+        while let Some(path) = pending.pop() {
+            let Ok(children) = fs::read_dir(path) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let path = child.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.file_name().and_then(|name| name.to_str())
+                    == Some("ready-repair-enqueue.lock")
+                {
+                    reservations.push(path);
+                }
+            }
+        }
+    }
+    reservations
+}
+
+#[test]
+fn fixture_worker_wait_tracks_nested_reservations() {
+    let root = tempfile::tempdir().expect("fixture worker root");
+    let nested = root.path().join("sidecars").join("project");
+    fs::create_dir_all(&nested).expect("nested worker state");
+    let reservation = nested.join("ready-repair-enqueue.lock");
+    fs::write(&reservation, "fixture worker").expect("worker reservation");
+
+    assert!(!wait_for_fixture_workers(
+        &[root.path().to_path_buf()],
+        Duration::ZERO
+    ));
+    fs::remove_file(reservation).expect("remove worker reservation");
+    assert!(wait_for_fixture_workers(
+        &[root.path().to_path_buf()],
+        Duration::ZERO
+    ));
+}
+
+#[derive(Debug)]
+struct ProcessTreeTermination {
+    tracked_pids: Vec<u32>,
+    attempts: Vec<String>,
+}
+
+#[cfg(windows)]
+fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
+    let pid = pid.to_string();
+    let mut attempts = vec![run_taskkill(&pid, false)];
+    thread::sleep(Duration::from_millis(100));
+    for _ in 0..2 {
+        if !process_is_running(pid.parse().expect("numeric process id")) {
+            break;
+        }
+        attempts.push(run_taskkill(&pid, true));
+        thread::sleep(Duration::from_millis(100));
+    }
+    ProcessTreeTermination {
+        tracked_pids: vec![pid.parse().expect("numeric process id")],
+        attempts,
+    }
+}
+
+#[cfg(windows)]
+fn run_taskkill(pid: &str, force: bool) -> String {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", pid, "/T"]);
+    if force {
+        command.arg("/F");
+    }
+    match command.output() {
+        Ok(output) => format!(
+            "taskkill pid={pid} force={force} status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("taskkill pid={pid} force={force} failed: {error}"),
+    }
+}
+
+#[cfg(windows)]
+fn force_terminate_process(pid: u32) -> String {
+    run_taskkill(&pid.to_string(), true)
+}
+
+#[cfg(unix)]
+fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
+    let mut descendants = Vec::new();
+    collect_descendant_processes(pid, &mut descendants);
+    let mut tracked_pids = vec![pid];
+    tracked_pids.extend(descendants.iter().copied());
+    let mut attempts = tracked_pids
+        .iter()
+        .map(|pid| run_unix_kill("-TERM", *pid))
+        .collect::<Vec<_>>();
+    thread::sleep(Duration::from_millis(100));
+    for descendant in descendants.iter().rev() {
+        if process_is_running(*descendant) {
+            attempts.push(run_unix_kill("-KILL", *descendant));
+        }
+    }
+    if process_is_running(pid) {
+        attempts.push(run_unix_kill("-KILL", pid));
+    }
+    ProcessTreeTermination {
+        tracked_pids,
+        attempts,
+    }
+}
+
+#[cfg(unix)]
+fn collect_descendant_processes(parent: u32, descendants: &mut Vec<u32>) {
+    let Ok(output) = Command::new("pgrep")
+        .args(["-P", &parent.to_string()])
+        .output()
+    else {
+        return;
+    };
+    for child in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+    {
+        if descendants.contains(&child) {
+            continue;
+        }
+        descendants.push(child);
+        collect_descendant_processes(child, descendants);
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_kill(signal: &str, pid: u32) -> String {
+    match Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+    {
+        Ok(status) => format!("kill {signal} {pid}: {status}"),
+        Err(error) => format!("kill {signal} {pid} failed: {error}"),
+    }
+}
+
+#[cfg(unix)]
+fn force_terminate_process(pid: u32) -> String {
+    run_unix_kill("-KILL", pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
+    ProcessTreeTermination {
+        tracked_pids: vec![pid],
+        attempts: vec![format!(
+            "process-tree termination is unsupported on this platform for pid={pid}"
+        )],
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn force_terminate_process(pid: u32) -> String {
+    format!("forced process termination is unsupported on this platform for pid={pid}")
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    let pid = pid.to_string();
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+    else {
+        return true;
+    };
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .map(|value| value.trim().trim_matches('"'))
+            == Some(pid.as_str())
+    })
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(_pid: u32) -> bool {
+    true
 }
 
 fn write_tiny_rust_workspace(root: &Path) {
@@ -259,8 +537,15 @@ fn refresh_fixture_index(fixture: &StdioFixture) {
 }
 
 fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
-    let workspace = tempfile::tempdir().expect("workspace dir");
-    let cache_dir = tempfile::tempdir().expect("cache dir");
+    let preserve = Arc::new(AtomicBool::new(false));
+    let workspace = PreservableTempDir::new(
+        tempfile::tempdir().expect("workspace dir"),
+        Arc::clone(&preserve),
+    );
+    let cache_dir = PreservableTempDir::new(
+        tempfile::tempdir().expect("cache dir"),
+        Arc::clone(&preserve),
+    );
     write_tiny_rust_workspace(workspace.path());
 
     let mut command = test_support::cli_command();
@@ -302,8 +587,15 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
 }
 
 fn unindexed_fixture() -> StdioFixture {
-    let workspace = tempfile::tempdir().expect("workspace dir");
-    let cache_dir = tempfile::tempdir().expect("cache dir");
+    let preserve = Arc::new(AtomicBool::new(false));
+    let workspace = PreservableTempDir::new(
+        tempfile::tempdir().expect("workspace dir"),
+        Arc::clone(&preserve),
+    );
+    let cache_dir = PreservableTempDir::new(
+        tempfile::tempdir().expect("cache dir"),
+        Arc::clone(&preserve),
+    );
     write_tiny_rust_workspace(workspace.path());
 
     StdioFixture {
@@ -492,6 +784,11 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         child,
         stdin,
         stdout,
+        worker_roots: vec![
+            test_support::test_state_root(),
+            fixture.cache_dir.path().to_path_buf(),
+        ],
+        preserve_fixture_roots: Some(Arc::clone(&fixture.workspace.preserve)),
     }
 }
 
@@ -516,6 +813,8 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         child,
         stdin,
         stdout,
+        worker_roots: vec![test_support::test_state_root(), cache_root.to_path_buf()],
+        preserve_fixture_roots: None,
     }
 }
 
@@ -541,6 +840,8 @@ fn spawn_multi_project_stdio_server_with_project_network_config(cache_root: &Pat
         child,
         stdin,
         stdout,
+        worker_roots: vec![test_support::test_state_root(), cache_root.to_path_buf()],
+        preserve_fixture_roots: None,
     }
 }
 
@@ -979,7 +1280,7 @@ fn write_active_repair_status_fixture(
     fixture: &StdioFixture,
     run_id: &str,
     phase: &str,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -991,7 +1292,7 @@ fn write_abandoned_repair_status_fixture(
     fixture: &StdioFixture,
     run_id: &str,
     phase: &str,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -1004,7 +1305,7 @@ fn write_stale_live_repair_status_fixture(
     fixture: &StdioFixture,
     run_id: &str,
     phase: &str,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -1019,7 +1320,7 @@ fn write_repair_status_fixture(
     phase: &str,
     updated_at_epoch_ms: i64,
     pid: u32,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
     let sidecar = test_sidecar_runtime(&canonical_root, run_id);
@@ -1056,7 +1357,7 @@ fn write_repair_status_fixture(
         .to_string(),
     )
     .expect("write repair status fixture");
-    (status_path, RemoveDirOnDrop(status_dir))
+    status_path
 }
 
 fn test_sidecar_runtime(project: &Path, run_id: &str) -> codestory_retrieval::SidecarRuntimeConfig {
@@ -3052,7 +3353,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
 #[test]
 fn resources_read_status_reports_active_agent_repair_phase() {
     let fixture = indexed_fixture();
-    let (status_path, _cleanup) =
+    let status_path =
         write_active_repair_status_fixture(&fixture, "issue-661-proof", "Qdrant finalize");
     assert!(status_path.exists(), "repair status fixture should exist");
     let mut server = spawn_stdio_server(&fixture);
@@ -3112,7 +3413,7 @@ fn resources_read_status_reports_active_agent_repair_phase() {
 #[test]
 fn resources_read_status_reports_abandoned_agent_repair_actions() {
     let fixture = indexed_fixture();
-    let (status_path, _cleanup) =
+    let status_path =
         write_abandoned_repair_status_fixture(&fixture, "aborted-run", "Embedding documents");
     assert!(status_path.exists(), "repair status fixture should exist");
     let mut server = spawn_stdio_server(&fixture);
@@ -3368,7 +3669,7 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
 fn resources_read_status_reports_abandoned_repair_without_starting_when_policy_enabled() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("enabled".to_string());
-    let (status_path, _cleanup) = write_abandoned_repair_status_fixture(
+    let status_path = write_abandoned_repair_status_fixture(
         &fixture,
         codestory_retrieval::DEFAULT_AGENT_RUN_ID,
         "graph artifact",
@@ -3551,13 +3852,6 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
     let repair_sidecar =
         test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
-    let repair_state_dir = repair_sidecar
-        .layout
-        .state_file
-        .parent()
-        .expect("repair state dir")
-        .to_path_buf();
-    let _repair_state_cleanup = RemoveDirOnDrop(repair_state_dir);
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -3752,14 +4046,6 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
     let repair_sidecar =
         test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
-    let _repair_state_cleanup = RemoveDirOnDrop(
-        repair_sidecar
-            .layout
-            .state_file
-            .parent()
-            .expect("repair state dir")
-            .to_path_buf(),
-    );
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -3820,7 +4106,7 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
 #[test]
 fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting() {
     let fixture = indexed_fixture();
-    let (status_path, _cleanup) = write_active_repair_status_fixture(
+    let status_path = write_active_repair_status_fixture(
         &fixture,
         codestory_retrieval::DEFAULT_AGENT_RUN_ID,
         "Qdrant finalize",
@@ -3927,7 +4213,7 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
 fn tools_call_sidecar_setup_preserves_stale_live_repair_ownership() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("enabled".to_string());
-    let (status_path, _cleanup) = write_stale_live_repair_status_fixture(
+    let status_path = write_stale_live_repair_status_fixture(
         &fixture,
         codestory_retrieval::DEFAULT_AGENT_RUN_ID,
         "Embedding documents",
@@ -3967,8 +4253,7 @@ fn tools_call_sidecar_setup_preserves_stale_live_repair_ownership() {
 fn tools_call_sidecar_setup_reports_active_agent_repair_non_default_without_spawning_default() {
     let fixture = indexed_fixture();
     let run_id = "non-default-active";
-    let (status_path, _cleanup) =
-        write_active_repair_status_fixture(&fixture, run_id, "Embedding documents");
+    let status_path = write_active_repair_status_fixture(&fixture, run_id, "Embedding documents");
     assert!(status_path.exists(), "repair status fixture should exist");
     thread::sleep(Duration::from_millis(25));
     fs::write(

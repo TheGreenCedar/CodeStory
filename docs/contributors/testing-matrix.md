@@ -62,7 +62,11 @@ helper assigns a process-and-test-thread state root and explicitly isolates the
 cache, stdio cache, install identity, and plugin data. Do not serialize the
 workspace suite or clean the real user cache to make a test pass. Broker tests
 that cross a worker-thread boundary must carry their injected test cache root
-into that thread.
+into that thread. The `test-support` feature only exposes isolation controls;
+the CLI test binary explicitly activates automatic named-thread isolation.
+Stdio fixtures must drain spawned repair workers before their temporary project
+and state roots are removed. A teardown timeout terminates the process tree,
+preserves the fixture roots for diagnosis, and fails the test.
 
 Use the isolation contract as the focused regression gate:
 

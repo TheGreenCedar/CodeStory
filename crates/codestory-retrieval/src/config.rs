@@ -1612,10 +1612,29 @@ thread_local! {
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn active_test_cache_root() -> Option<PathBuf> {
-    TEST_CACHE_ROOT_OVERRIDE.with(|root| root.borrow().clone())
+    TEST_CACHE_ROOT_OVERRIDE
+        .with(|root| root.borrow().clone())
+        .or_else(|| {
+            AUTOMATIC_TEST_CACHE_ROOT_ENABLED
+                .load(std::sync::atomic::Ordering::Acquire)
+                .then(automatic_unit_test_cache_root)
+                .flatten()
+        })
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
+static AUTOMATIC_TEST_CACHE_ROOT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable named-thread cache isolation for a test binary that explicitly owns
+/// every runtime created in the current process.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn enable_automatic_test_cache_root_for_process() {
+    AUTOMATIC_TEST_CACHE_ROOT_ENABLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(any(test, feature = "test-support"))]
 fn automatic_unit_test_cache_root() -> Option<PathBuf> {
     let thread = std::thread::current();
     let name = thread.name()?;
@@ -1737,6 +1756,16 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_support_isolates_named_threads_after_explicit_activation() {
+        #[cfg(feature = "test-support")]
+        enable_automatic_test_cache_root_for_process();
+        let root = automatic_unit_test_cache_root().expect("named test thread cache root");
+        assert!(root.starts_with(std::env::temp_dir().join("codestory-unit-tests")));
+        #[cfg(feature = "test-support")]
+        assert_eq!(active_test_cache_root(), Some(root));
+    }
 
     #[test]
     fn agent_profile_default_runtime_reuses_project_shared_run() {
