@@ -10,12 +10,12 @@
 - Added parser-backed FastAPI decorator route extraction for module-scope
   receivers whose latest preceding assignment constructs an imported `FastAPI`
   or `APIRouter`, including exact handler, method, path, provenance, and
-  claim-tier metadata. Reassignment invalidates ownership. Multiline and raw
-  string routes are supported; unmatched or nested-scope receivers are not
-  labeled as FastAPI, while dynamic templates, nested path builders, ordinary
-  escaped literals, and unrelated-error lexical candidates do not become exact
-  route claims. Error-local syntax recovery stays explicitly structural and
-  low-confidence.
+  claim-tier metadata. Later assignments, imports, functions, and classes
+  invalidate shadowed ownership. Multiline and raw string routes are supported;
+  unmatched or nested-scope receivers are not labeled as FastAPI, while dynamic
+  templates, nested path builders, ordinary escaped literals, and
+  unrelated-error lexical candidates do not become exact route claims.
+  Error-local syntax recovery stays explicitly structural and low-confidence.
 - Added a schema-backed publication generation and run identity to every staged
   full and incremental core database. Typed store and runtime reads now expose
   the generation that owns the live graph, and cache finalization verifies that

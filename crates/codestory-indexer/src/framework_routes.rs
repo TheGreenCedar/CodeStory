@@ -206,12 +206,166 @@ fn module_fastapi_receiver_owned_at(
         if statement.start_byte() >= before_byte {
             break;
         }
-        apply_fastapi_import(statement, source, &mut bindings);
         if let Some(assignment) = module_assignment(statement) {
             apply_fastapi_assignment(assignment, source, &mut bindings);
+        } else {
+            invalidate_module_statement_bindings(statement, source, &mut bindings);
+            apply_fastapi_import(statement, source, &mut bindings);
         }
     }
     bindings.receivers.contains(receiver)
+}
+
+fn invalidate_module_statement_bindings(
+    statement: Node<'_>,
+    source: &str,
+    bindings: &mut FastApiBindings,
+) {
+    if node_is_star_import(statement, source) {
+        bindings.receivers.clear();
+        bindings.constructors.clear();
+        bindings.modules.clear();
+        return;
+    }
+    let mut names = HashSet::new();
+    collect_module_bound_names(statement, source, &mut names);
+    for name in names {
+        bindings.receivers.remove(&name);
+        bindings.constructors.remove(&name);
+        bindings.modules.remove(&name);
+    }
+}
+
+fn node_is_star_import(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "import_from_statement"
+        && node_text(node, source).is_some_and(|statement| {
+            statement
+                .rsplit_once(" import ")
+                .is_some_and(|(_, imported)| imported.trim() == "*")
+        })
+}
+
+fn collect_module_bound_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
+    match node.kind() {
+        "function_definition" | "class_definition" => {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|node| node_text(node, source))
+            {
+                names.insert(name);
+            }
+            return;
+        }
+        "decorated_definition" => {
+            if let Some(definition) = node.child_by_field_name("definition") {
+                collect_module_bound_names(definition, source, names);
+            }
+            return;
+        }
+        "lambda" => return,
+        "assignment" | "augmented_assignment" | "named_expression" => {
+            if let Some(target) = node.child_by_field_name("left") {
+                collect_python_binding_target(target, source, names);
+            }
+        }
+        "delete_statement" => {
+            let mut cursor = node.walk();
+            for target in node.named_children(&mut cursor) {
+                collect_python_binding_target(target, source, names);
+            }
+            return;
+        }
+        "type_alias_statement" => {
+            if let Some(target) = node.child_by_field_name("name") {
+                collect_python_binding_target(target, source, names);
+            }
+        }
+        "for_statement" => {
+            if let Some(target) = node.child_by_field_name("left") {
+                collect_python_binding_target(target, source, names);
+            }
+        }
+        "with_item" => {
+            if let Some(target) = node.child_by_field_name("alias") {
+                collect_python_binding_target(target, source, names);
+            }
+        }
+        "except_clause" => {
+            if let Some(target) = node.child_by_field_name("name") {
+                collect_python_binding_target(target, source, names);
+            }
+        }
+        "import_from_statement" => collect_import_from_bound_names(node, source, names),
+        "import_statement" => collect_import_bound_names(node, source, names),
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_module_bound_names(child, source, names);
+    }
+}
+
+fn collect_python_binding_target(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
+    if node.kind() == "identifier" {
+        if let Some(name) = node_text(node, source) {
+            names.insert(name);
+        }
+        return;
+    }
+    if matches!(node.kind(), "attribute" | "subscript") {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_python_binding_target(child, source, names);
+    }
+}
+
+fn collect_import_from_bound_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
+    let Some(statement) = node_text(node, source) else {
+        return;
+    };
+    let Some((_, imported)) = statement.rsplit_once(" import ") else {
+        return;
+    };
+    for spec in imported
+        .trim_matches(|ch: char| ch == '(' || ch == ')' || ch.is_whitespace())
+        .split(',')
+    {
+        let mut parts = spec.split_whitespace();
+        let Some(imported_name) = parts.next() else {
+            continue;
+        };
+        if imported_name == "*" {
+            continue;
+        }
+        let bound = match (parts.next(), parts.next()) {
+            (Some("as"), Some(alias)) => alias,
+            _ => imported_name,
+        };
+        names.insert(bound.to_string());
+    }
+}
+
+fn collect_import_bound_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
+    let Some(statement) = node_text(node, source) else {
+        return;
+    };
+    let Some(imported) = statement.strip_prefix("import ") else {
+        return;
+    };
+    for spec in imported.split(',') {
+        let mut parts = spec.split_whitespace();
+        let Some(module) = parts.next() else {
+            continue;
+        };
+        let bound = match (parts.next(), parts.next()) {
+            (Some("as"), Some(alias)) => alias,
+            _ => module.split('.').next().unwrap_or(module),
+        };
+        names.insert(bound.to_string());
+    }
 }
 
 fn module_assignment(node: Node<'_>) -> Option<Node<'_>> {
@@ -616,7 +770,47 @@ app = FastAPI()
 @app.get("/after-constructor-reassignment")
 async def after_constructor_reassignment(): pass
 "#;
-        for source in [nested_scopes, reassigned, constructor_reassigned] {
+        let imported_constructor_shadowed = r#"
+from fastapi import FastAPI
+from other_framework import FastAPI
+
+app = FastAPI()
+@app.get("/shadowed-import")
+async def shadowed_import(): pass
+"#;
+        let imported_module_shadowed = r#"
+import fastapi as framework
+import other_framework as framework
+
+app = framework.FastAPI()
+@app.get("/shadowed-module")
+async def shadowed_module(): pass
+"#;
+        let class_shadowed = r#"
+from fastapi import FastAPI
+
+class FastAPI: pass
+app = FastAPI()
+@app.get("/shadowed-class")
+async def shadowed_class(): pass
+"#;
+        let function_shadowed = r#"
+from fastapi import FastAPI
+
+def FastAPI(): return OtherFramework()
+app = FastAPI()
+@app.get("/shadowed-function")
+async def shadowed_function(): pass
+"#;
+        for source in [
+            nested_scopes,
+            reassigned,
+            constructor_reassigned,
+            imported_constructor_shadowed,
+            imported_module_shadowed,
+            class_shadowed,
+            function_shadowed,
+        ] {
             let result = super::super::index_file(
                 Path::new("scopes.py"),
                 source,

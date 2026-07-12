@@ -20,7 +20,8 @@ status, confidence floor, handler-link support, known gaps, and promotability.
 - Python: Django and Flask retain structural collectors. FastAPI decorators on
   source-ordered module bindings constructed from imported
   `FastAPI`/`APIRouter` constructors use a tree-sitter query for static string
-  paths and handler links. Error-local malformed-file recovery is explicitly
+  paths and handler links. Later assignment, import, function, or class bindings
+  invalidate stale ownership. Error-local malformed-file recovery is explicitly
   structural and low-confidence; unmatched receivers are not FastAPI claims.
 - Ruby/PHP/Java/C#: Rails, Laravel, Spring, ASP.NET.
 - Rust: Axum, Actix, Rocket.
