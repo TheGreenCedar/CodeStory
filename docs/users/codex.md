@@ -156,7 +156,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | Windows arm64 | Yes | No managed accelerated sidecar cell; use a proven external endpoint or explicit degraded CPU opt-in |
 | Linux x64 / arm64 | Yes | Docker Vulkan with a verified `/dev/dri` render node |
 | macOS arm64 | Yes | Native Metal |
-| macOS x64 | No release asset; managed plugin runtime unsupported | Build or provide an explicit compatible `CODESTORY_CLI` first; then use a proven external embedding endpoint or explicit degraded CPU opt-in |
+| macOS x64 | Yes | No managed accelerated sidecar cell; use a proven external embedding endpoint or explicit degraded CPU opt-in |
 
 Linux CUDA, HIP/ROCm, SYCL, and OpenVINO remain contract-only until packaging,
 launch, and live GPU evidence exist. A compatible version difference is
