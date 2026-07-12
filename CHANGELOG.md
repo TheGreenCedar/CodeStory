@@ -9,6 +9,9 @@
   background. Status now reports the in-process provisioning state, and the
   launcher hands the next request to the verified stdio runtime without a host
   restart.
+- Expanded managed-plugin provisioning, local grounding, repair handoff, and
+  proof cleanup from Windows x64 to every shipped native release asset in both
+  pre-publish and post-publish matrices.
 - Made sidecar generation GC root every current and rollback manifest across
   the shared cache scope instead of collapsing rollback evidence to one latest
   generation. Inventory now reports active, rollback, building, and reclaimable

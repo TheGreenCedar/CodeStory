@@ -158,11 +158,12 @@ def verify_archive_checksum(archive: Path, checksum_file: Path, artifact: Path) 
     require(actual == expected, "checksum", artifact, f"checksum mismatch for {archive.name}")
 
 
-def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path) -> None:
+def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path, artifact: Path) -> None:
     env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
+    results = []
     for profile, extra in (("local", []), ("agent", ["--run-id", "shared-agent"])):
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [
                     str(cli),
                     "retrieval",
@@ -173,15 +174,40 @@ def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path) -> None:
                     profile,
                     *extra,
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=20,
                 check=False,
                 env=env,
+                text=True,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    shutil.rmtree(cache_root, ignore_errors=True)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            results.append({"profile": profile, "error": str(exc)})
+            write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
+            raise RuntimeError(f"could not stop {profile} proof sidecars: {exc}") from exc
+        results.append(
+            {
+                "profile": profile,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        )
+        if result.returncode != 0:
+            write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
+            raise RuntimeError(f"{profile} proof sidecar cleanup exited {result.returncode}")
+    try:
+        remove_tree_with_retry(cache_root)
+    except OSError as exc:
+        write_json(
+            artifact,
+            {"cache_root": str(cache_root), "commands": results, "removed": False, "error": str(exc)},
+        )
+        raise
+    removed = not cache_root.exists()
+    write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": removed})
+    if not removed:
+        raise RuntimeError(f"proof cache still exists after cleanup: {cache_root}")
 
 
 def local_profile_environment(base: dict[str, str]) -> dict[str, str]:
@@ -457,8 +483,27 @@ def terminate_worker_pid(pid: int) -> None:
     else:
         try:
             os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            raise RuntimeError(f"could not terminate worker process {pid}") from exc
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if exited is not None:
+                    return
+            except ChildProcessError:
+                pass
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError as exc:
+                raise RuntimeError(f"could not prove worker process {pid} terminated") from exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"worker process {pid} did not terminate before cleanup")
+            time.sleep(0.1)
 
 
 def running_status_worker_pids(status: dict) -> set[int]:
@@ -1124,10 +1169,12 @@ def run_gate(args: argparse.Namespace) -> None:
         cli = find_cli(unpacked)
         plugin_skill = find_plugin_skill(unpacked)
         cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-proof-cache-"))
-        cleanup_stack.callback(cleanup_proof_cache, cli, project, cache_root)
+        proof_cleanup_artifact = out_dir / "proof-cache-cleanup.json"
+        cleanup_stack.callback(cleanup_proof_cache, cli, project, cache_root, proof_cleanup_artifact)
         proof_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
         stdio_cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-stdio-cache-"))
-        cleanup_stack.callback(cleanup_proof_cache, cli, project, stdio_cache_root)
+        stdio_cleanup_artifact = out_dir / "stdio-cache-cleanup.json"
+        cleanup_stack.callback(cleanup_proof_cache, cli, project, stdio_cache_root, stdio_cleanup_artifact)
         stdio_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(stdio_cache_root)}
 
         summary = {
@@ -1135,7 +1182,10 @@ def run_gate(args: argparse.Namespace) -> None:
             "cli": str(cli),
             "plugin_skill": str(plugin_skill),
             "project": str(project),
-            "artifacts": {},
+            "artifacts": {
+                "proof_cache_cleanup": str(proof_cleanup_artifact),
+                "stdio_cache_cleanup": str(stdio_cleanup_artifact),
+            },
         }
         if args.checksum_file:
             summary["artifacts"]["checksum"] = str(checksum_artifact)
@@ -1532,6 +1582,8 @@ def write_fake_cli(path: Path) -> None:
                 })
             elif layer == "retrieval_status":
                 emit({"retrieval_mode": "full"})
+            elif layer == "retrieval_down":
+                emit({"stopped": True})
             elif layer == "search":
                 emit({"retrieval_shadow": {"retrieval_mode": "full"}, "indexed_symbol_hits": [{"node_id": "1"}]})
             elif layer == "context":
@@ -1897,6 +1949,8 @@ def self_test() -> None:
         )
         run_gate(args)
         assert (out_dir / "summary.json").is_file()
+        assert read_json_file(out_dir / "proof-cache-cleanup.json")["removed"] is True
+        assert read_json_file(out_dir / "stdio-cache-cleanup.json")["removed"] is True
         stdio_artifact = read_json_file(out_dir / "serve-stdio-status.json")
         full_cache_root = read_json_file(out_dir / "local-retrieval-bootstrap.json")["cache_root"]
         assert Path(full_cache_root).name.startswith("codestory-packaged-proof-cache-")
@@ -1914,7 +1968,16 @@ def self_test() -> None:
         version_only_args.version_only = True
         run_gate(version_only_args)
         version_only_summary = read_json_file(version_only_out / "summary.json")
-        assert version_only_summary["artifacts"].keys() == {"checksum", "version", "help", "serve_stdio"}
+        assert version_only_summary["artifacts"].keys() == {
+            "checksum",
+            "version",
+            "help",
+            "serve_stdio",
+            "proof_cache_cleanup",
+            "stdio_cache_cleanup",
+        }
+        assert read_json_file(Path(version_only_args.out_dir) / "proof-cache-cleanup.json")["removed"] is True
+        assert read_json_file(Path(version_only_args.out_dir) / "stdio-cache-cleanup.json")["removed"] is True
         assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
         version_only_status = read_json_file(version_only_out / "serve-stdio-status.json")["status"]
         assert Path(version_only_status["cache_root"]).name.startswith("codestory-packaged-stdio-cache-")

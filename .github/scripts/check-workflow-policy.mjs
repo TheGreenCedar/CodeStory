@@ -16,6 +16,76 @@ const packagedPlatformPr = path.join(workflowRoot, "packaged-platform-pr.yml");
 const packagedPlatformProof = path.join(workflowRoot, "packaged-platform-proof.yml");
 const mainBranchSourceGuard = path.join(workflowRoot, "main-branch-source-guard.yml");
 
+function yamlJob(content, name) {
+  const lines = content.split(/\r?\n/u);
+  const start = lines.indexOf(`  ${name}:`);
+  if (start < 0) return [];
+  const end = lines.findIndex((line, index) => index > start && /^  \S/iu.test(line));
+  return lines.slice(start, end < 0 ? undefined : end);
+}
+
+function namedStep(job, name) {
+  const start = job.indexOf(`      - name: ${name}`);
+  if (start < 0) return [];
+  const relativeEnd = job.slice(start + 1).findIndex((line) => /^      - /u.test(line));
+  return job.slice(start, relativeEnd < 0 ? undefined : start + 1 + relativeEnd);
+}
+
+function managedPluginMatrixIsRequired(content, jobName, archiveLine) {
+  const job = yamlJob(content, jobName);
+  const step = namedStep(job, "Prove managed plugin handoff");
+  const required = [
+    "        run: >-",
+    "          python .github/scripts/check-packaged-agent-proof.py",
+    archiveLine,
+    "          --managed-plugin-handoff",
+  ];
+  return !(
+    job.length === 0 ||
+    job.some((line) => /^    (?:if|continue-on-error):/u.test(line)) ||
+    !job.includes("      fail-fast: false") ||
+    job.some((line) => /^\s+exclude:/u.test(line)) ||
+    step.length === 0 ||
+    step.some((line) => /^        (?:if|continue-on-error):/u.test(line)) ||
+    required.some((line) => !step.includes(line))
+  );
+}
+
+function requireManagedPluginStep(content, jobName, workflowName, archiveLine) {
+  if (!managedPluginMatrixIsRequired(content, jobName, archiveLine)) {
+    violations.push(`${workflowName} must run the managed plugin handoff unconditionally in every matrix cell`);
+  }
+  const policyBypasses = [
+    ["fail-fast", content.replace("      fail-fast: false\n", "")],
+    ["matrix exclude", content.replace("      matrix:\n", "      matrix:\n        exclude:\n          - os: never\n")],
+    ["job if", content.replace(`  ${jobName}:\n`, `  ${jobName}:\n    if: always()\n`)],
+    [
+      "job continue-on-error",
+      content.replace(`  ${jobName}:\n`, `  ${jobName}:\n    continue-on-error: true\n`),
+    ],
+    [
+      "step if",
+      content.replace(
+        "      - name: Prove managed plugin handoff\n",
+        "      - name: Prove managed plugin handoff\n        if: always()\n",
+      ),
+    ],
+    [
+      "step continue-on-error",
+      content.replace(
+        "      - name: Prove managed plugin handoff\n",
+        "      - name: Prove managed plugin handoff\n        continue-on-error: true\n",
+      ),
+    ],
+  ];
+  const acceptedBypasses = policyBypasses
+    .filter(([, candidate]) => managedPluginMatrixIsRequired(candidate, jobName, archiveLine))
+    .map(([name]) => name);
+  if (acceptedBypasses.length > 0) {
+    violations.push(`${workflowName} managed matrix policy accepted bypasses: ${acceptedBypasses.join(", ")}`);
+  }
+}
+
 for (const file of fs
   .readdirSync(workflowRoot)
   .filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"))) {
@@ -194,6 +264,9 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "contents: read",
     'RELEASE_RUST_TOOLCHAIN: "1.95.0"',
     "packaged-version-proof-${{ matrix.asset_target }}",
+    "packaged-managed-proof-${{ matrix.asset_target }}",
+    "- name: Prove managed plugin handoff",
+    "--archive \"target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}\"",
     "--managed-plugin-handoff",
     "scripts/install-codestory.ps1 -SelfTest",
     "--checksum-file target/release-dist/SHA256SUMS.txt",
@@ -203,18 +276,24 @@ if (!fs.existsSync(packagedPlatformProof)) {
     }
   }
   for (const row of [
-    "- os: ubuntu-latest\n            rust_target: x86_64-unknown-linux-gnu\n            asset_target: linux-x64",
-    "- os: ubuntu-24.04-arm\n            rust_target: aarch64-unknown-linux-gnu\n            asset_target: linux-arm64",
-    "- os: windows-latest\n            rust_target: x86_64-pc-windows-msvc\n            asset_target: windows-x64",
-    "- os: windows-11-arm\n            rust_target: aarch64-pc-windows-msvc\n            asset_target: windows-arm64",
-    "- os: macos-15-intel\n            rust_target: x86_64-apple-darwin\n            asset_target: macos-x64",
-    "- os: macos-15\n            rust_target: aarch64-apple-darwin\n            asset_target: macos-arm64",
+    "- os: ubuntu-latest\n            rust_target: x86_64-unknown-linux-gnu\n            asset_target: linux-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
+    "- os: ubuntu-24.04-arm\n            rust_target: aarch64-unknown-linux-gnu\n            asset_target: linux-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
+    "- os: windows-latest\n            rust_target: x86_64-pc-windows-msvc\n            asset_target: windows-x64\n            exe_suffix: \".exe\"\n            extension: zip",
+    "- os: windows-11-arm\n            rust_target: aarch64-pc-windows-msvc\n            asset_target: windows-arm64\n            exe_suffix: \".exe\"\n            extension: zip",
+    "- os: macos-15-intel\n            rust_target: x86_64-apple-darwin\n            asset_target: macos-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
+    "- os: macos-15\n            rust_target: aarch64-apple-darwin\n            asset_target: macos-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
     "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
   ]) {
     if (!content.includes(row)) {
       violations.push(`packaged-platform-proof.yml must preserve native proof block ${row.split("\n")[0]}`);
     }
   }
+  requireManagedPluginStep(
+    content,
+    "build",
+    "packaged-platform-proof.yml",
+    '          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"',
+  );
 }
 
 if (!fs.existsSync(postPublishReleaseSmoke)) {
@@ -235,6 +314,7 @@ if (!fs.existsSync(postPublishReleaseSmoke)) {
     "macos-x64",
     "macos-arm64",
     "--version-only",
+    "- name: Prove managed plugin handoff",
     "--managed-plugin-handoff",
     "scripts/install-codestory.ps1 -SelfTest",
     "--checksum-file \"${{ steps.asset.outputs.checksum }}\"",
@@ -251,7 +331,6 @@ if (!fs.existsSync(postPublishReleaseSmoke)) {
     "- os: macos-15-intel\n            asset_target: macos-x64\n            extension: tar.gz",
     "- os: macos-15\n            asset_target: macos-arm64\n            extension: tar.gz",
     "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
-    "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: >-\n          python .github/scripts/check-packaged-agent-proof.py",
   ]) {
     if (!content.includes(row)) {
       violations.push(`post-publish-release-smoke.yml must preserve native proof block ${row.split("\n")[0]}`);
@@ -260,6 +339,12 @@ if (!fs.existsSync(postPublishReleaseSmoke)) {
   if (content.includes("sha256sum")) {
     violations.push("post-publish-release-smoke.yml must use the portable Python checksum gate");
   }
+  requireManagedPluginStep(
+    content,
+    "smoke",
+    "post-publish-release-smoke.yml",
+    '          --archive "${{ steps.asset.outputs.archive }}"',
+  );
 }
 
 if (!fs.existsSync(packagedPlatformPr)) {

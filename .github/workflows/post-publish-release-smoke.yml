@@ -101,9 +101,7 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/install-codestory.ps1 -SelfTest
 
-      - name: Prove Windows managed plugin handoff
-        if: matrix.asset_target == 'windows-x64'
-        shell: pwsh
+      - name: Prove managed plugin handoff
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
           --archive "${{ steps.asset.outputs.archive }}"
