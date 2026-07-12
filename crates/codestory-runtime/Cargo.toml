@@ -3,10 +3,6 @@ name = "codestory-runtime"
 version = "0.14.3"
 edition = "2024"
 
-[features]
-default = []
-diagnostic-onnx = ["dep:ndarray", "dep:ort", "dep:tokenizers"]
-
 [dependencies]
 anyhow = { workspace = true }
 codestory-contracts = { workspace = true }
@@ -16,15 +12,12 @@ codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
 fs4 = { workspace = true }
-ndarray = { workspace = true, optional = true }
 nucleo-matcher = { workspace = true }
-ort = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tantivy = { workspace = true }
-tokenizers = { workspace = true, optional = true }
 tracing = { workspace = true }
 ureq = { workspace = true }
 uuid = { workspace = true }

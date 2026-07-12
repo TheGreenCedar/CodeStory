@@ -16,7 +16,7 @@ use codestory_contracts::api::{
     SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
     TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
 const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
@@ -78,8 +78,6 @@ pub(crate) enum Command {
     Smoke(SmokeCommand),
     #[command(about = "Agent-facing readiness and repair helpers.")]
     Agent(AgentCommand),
-    #[command(about = "Install or check local setup assets.")]
-    Setup(SetupCommand),
     #[command(about = "Prepare or inspect local cache artifacts.")]
     Cache(CacheCommand),
     #[command(about = "Find symbols and repo text evidence.")]
@@ -258,22 +256,6 @@ pub(crate) enum CompletionShell {
     Zsh,
     Fish,
     Powershell,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CliEmbeddingQuant {
-    #[value(name = "q8_0")]
-    Q8_0,
-    #[value(name = "q4_k_m")]
-    Q4KM,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CliLlamaVariant {
-    Cpu,
-    Vulkan,
 }
 
 #[derive(Args, Debug)]
@@ -911,55 +893,6 @@ pub(crate) struct RetrievalIndexCommand {
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
-    pub(crate) output_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SetupCommand {
-    #[command(subcommand)]
-    pub(crate) action: SetupAction,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum SetupAction {
-    Embeddings(SetupEmbeddingsCommand),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SetupEmbeddingsCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = CliEmbeddingQuant::Q8_0,
-        help = "Legacy compatibility selector; setup embeddings now installs diagnostic ONNX assets only."
-    )]
-    pub(crate) quant: CliEmbeddingQuant,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = CliLlamaVariant::Vulkan,
-        help = "Legacy compatibility selector; product embeddings use the llama.cpp retrieval sidecar."
-    )]
-    pub(crate) variant: CliLlamaVariant,
-    #[arg(
-        long,
-        help = "Show the diagnostic ONNX asset plan without downloading anything."
-    )]
-    pub(crate) dry_run: bool,
-    #[arg(
-        long,
-        help = "Compatibility flag; diagnostic ONNX setup never starts a server."
-    )]
-    pub(crate) no_start: bool,
-    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
-    pub(crate) format: OutputFormat,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Write command output to this file instead of stdout. The parent directory must already exist."
-    )]
     pub(crate) output_file: Option<PathBuf>,
 }
 
@@ -2963,18 +2896,6 @@ mod tests {
         let help = render_subcommand_help("doctor");
         assert!(help.contains("--format <FORMAT>"));
         assert!(help.contains("--output-file <PATH>"));
-    }
-
-    #[test]
-    fn setup_embeddings_keeps_legacy_variant_default_for_cli_compatibility() {
-        let cli = Cli::try_parse_from(["codestory-cli", "setup", "embeddings"])
-            .expect("setup embeddings should parse");
-        match cli.command {
-            Command::Setup(SetupCommand {
-                action: SetupAction::Embeddings(cmd),
-            }) => assert_eq!(cmd.variant, CliLlamaVariant::Vulkan),
-            _ => panic!("expected setup embeddings command"),
-        }
     }
 
     #[test]

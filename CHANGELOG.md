@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Removed
+
+- Removed the legacy ONNX diagnostic runtime, asset installer, setup command,
+  comparison tooling, configuration, tests, and dependencies, and restored the
+  Intel macOS CLI package/proof lane that ONNX Runtime had blocked. Legacy ONNX
+  environment variables and backend selections now fail explicitly; product
+  packet/search readiness remains exclusively tied to the llama.cpp sidecar.
+
 ### Added
 
 - Added parser-backed Express route extraction for static module-scope
@@ -12,9 +20,6 @@
   injected, chained, multi-target, and factory-returned receivers are not
   promoted, dynamic or escaped paths are excluded, and malformed-file lexical
   recovery remains structural and low-confidence.
-- Added an opt-in `diagnostic-onnx` Cargo feature for maintainers who still need
-  the legacy ONNX asset diagnostics. Default CLI builds no longer compile or
-  link ONNX Runtime, DirectML, ndarray, or tokenizer support.
 - Added parser-backed FastAPI decorator route extraction for single-target,
   module-scope receivers whose latest preceding assignment constructs an
   imported `FastAPI` or `APIRouter`, including exact handler, method, path,

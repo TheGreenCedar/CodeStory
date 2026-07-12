@@ -85,8 +85,8 @@ Check:
 - whether the symbol exists in store-backed search docs
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
-- whether dense-anchor retrieval is disabled, ONNX model/tokenizer paths are missing, sidecars are not full, or symbol docs / dense anchors are missing
-- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, `CODESTORY_EMBED_BACKEND`, or the `CODESTORY_EMBED_ONNX_*` paths changed between runs
+- whether dense-anchor retrieval is disabled, sidecars are not full, or symbol docs / dense anchors are missing
+- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, or `CODESTORY_EMBED_BACKEND` changed between runs
 - whether graph-based boosts are overwhelming lexical matches
 
 Recovery order:
@@ -104,10 +104,7 @@ Recovery order:
    `retrieval_mode: "full"` before trusting packet/search evidence.
 6. If `doctor` reports missing or unreachable embeddings, repair the llama.cpp
    sidecar path with `codestory-cli retrieval bootstrap` and
-   `codestory-cli retrieval index --project . --refresh full`. Use
-   `codestory-cli setup embeddings --project .` only for explicit ONNX
-   diagnostics; it does not start sidecars or create the product retrieval
-   manifest.
+   `codestory-cli retrieval index --project . --refresh full`.
 7. If semantic retrieval is still the only failing part, inspect the reported degraded-state reason before touching lexical ranking or CLI rendering.
 
 ## If Cold Indexing Is Slow
@@ -137,7 +134,7 @@ Check:
   and `retrieval status`
 - whether `CODESTORY_EMBED_BACKEND=llamacpp` and the local
   `CODESTORY_EMBED_LLAMACPP_URL` endpoint match the manifest embedding backend
-- whether an ONNX, hash, or other diagnostic comparison is clearly labeled and
+- whether a hash or other diagnostic comparison is clearly labeled and
   excluded from agent-facing sidecar evidence
 
 Recovery order:

@@ -118,14 +118,6 @@ Put `cache_dir` in user home `.codestory.toml` or pass `--cache-dir`.
 
 Product sidecar setup: [Retrieval sidecars ops](../ops/retrieval-sidecars.md).
 
-Legacy managed embeddings (diagnostic only):
-
-```sh
-codestory-cli setup embeddings --project <repo> --dry-run --format json
-```
-
-Does not prove agent packet/search readiness.
-
 ## Environment overrides
 
 | Variable | Purpose |

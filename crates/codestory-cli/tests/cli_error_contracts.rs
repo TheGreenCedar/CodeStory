@@ -284,7 +284,6 @@ fn top_level_help_names_command_purposes() {
             "smoke",
             "Run a machine-readable smoke profile for CI and agent images.",
         ),
-        ("setup", "Install or check local setup assets."),
         ("cache", "Prepare or inspect local cache artifacts."),
         ("symbol", "Inspect a symbol by query or id."),
         (
@@ -299,6 +298,30 @@ fn top_level_help_names_command_purposes() {
             "top-level help should show {command:?} purpose {purpose:?}, not only command names:\n{help_text}"
         );
     }
+}
+
+#[test]
+fn removed_setup_embeddings_command_is_rejected() {
+    let help = test_support::cli_command()
+        .arg("--help")
+        .output()
+        .expect("run top-level help");
+    assert!(help.status.success());
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(!stdout.contains("setup"), "{stdout}");
+    assert!(!stdout.contains("embeddings"), "{stdout}");
+
+    let output = test_support::cli_command()
+        .args(["setup", "embeddings"])
+        .output()
+        .expect("run removed setup command");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand 'setup'"),
+        "{stderr}"
+    );
 }
 
 #[test]

@@ -3269,13 +3269,6 @@ function semanticRuntimeLocality(output) {
       locality_evidence: "semantic retrieval unavailable; no embedding runtime was used",
     };
   }
-  if (backend === "onnx") {
-    return {
-      local_only: true,
-      locality_kind: "local_model_files",
-      locality_evidence: "semantic backend is onnx",
-    };
-  }
   if (backend === "llamacpp") {
     const endpoint = doctorEnvironmentValue(output, "CODESTORY_EMBED_LLAMACPP_URL");
     if (!endpoint) {

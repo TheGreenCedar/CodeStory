@@ -223,8 +223,7 @@ Embedding throughput is optimized for the local embedding path:
 - product sidecar embeddings use `CODESTORY_EMBED_BACKEND=llamacpp` and the
   local `CODESTORY_EMBED_LLAMACPP_URL` endpoint; the manifest must record
   `llamacpp:bge-base-en-v1.5`
-- ONNX and hash embedding paths are historical or diagnostic lanes unless a
-  future spec promotes them with fresh sidecar-quality evidence
+- ONNX rows are historical records only; hash embeddings remain diagnostic
 
 Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md). Architecture explains the lifecycle; the testing log owns time-specific numbers because caches, backends, and workstation state drift.
 

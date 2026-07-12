@@ -124,6 +124,5 @@ contributors only, not the normal user install path.
 - [files](references/files.md)
 - [affected](references/affected.md)
 - [bookmark](references/bookmark.md)
-- [setup](references/setup.md)
 - [retrieval-rollout](references/retrieval-rollout.md)
 - [serve](references/serve.md)
