@@ -90,6 +90,16 @@
   after live mutation and before backup cleanup proves retry recovery and
   artifact cleanup. Promotion-scoped locking prevents healthy backups from
   being mistaken for abandoned crash recovery state by concurrent readers.
+- Added parser-backed Fastify route extraction for direct verbs, including
+  `TRACE`, and static `route({ method, url, handler })` objects on
+  source-ordered, module-scope
+  receivers constructed from explicit ESM or CommonJS `fastify` bindings.
+  JavaScript, TypeScript, and TSX accept ordinary static strings and
+  substitution-free templates, invalidate ownership after reassignment or
+  shadowing, and avoid handler edges for wrapped or inline handlers. Dynamic
+  paths and methods, method arrays, escaped literals, nested builders, and
+  nested, injected, factory-returned, or unsupported receivers are excluded;
+  malformed-file recovery remains error-local structural evidence.
 - Added parser-backed Express route extraction for static module-scope
   registrations on source-ordered app and router bindings constructed from
   explicit `express` imports or `require("express")`. JavaScript, TypeScript,

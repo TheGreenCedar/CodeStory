@@ -169,6 +169,19 @@ limited to direct names that graph resolution can match. Mounted prefixes,
 nested or injected receivers, factory returns, and runtime middleware behavior
 remain outside this claim tier; malformed-file line recovery is structural.
 
+Fastify direct verb calls, including `TRACE`, and
+`route({ method, url, handler })` registrations use the same JavaScript,
+TypeScript, and TSX parser-backed boundary when the
+module-scope receiver was constructed from an explicit `fastify` ESM or
+CommonJS binding. Source-ordered reassignment, shadowing, or unsupported
+construction invalidates receiver ownership. Exact claims require one static
+method and path; dynamic or escaped strings, method arrays, nested builders,
+and nested, injected, or factory-returned receivers are excluded. Direct
+identifier and member handlers can retain probable edges, while wrapped and
+inline handlers do not gain name-based edges. Plugin prefixes, schema behavior,
+and runtime middleware semantics remain heuristic; malformed-file recovery is
+structural and error-local.
+
 ## Expansion Checklist
 
 Before adding a parser-backed language or widening a public claim:

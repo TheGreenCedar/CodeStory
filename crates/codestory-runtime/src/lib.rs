@@ -496,11 +496,18 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fastify",
         language: "javascript/typescript",
         status: "partial",
-        coverage_evidence: "validated_by_indexer_regression",
+        coverage_evidence: "tree_sitter_query_regression",
         confidence_floor: "heuristic",
-        handler_link_support: "probable_when_handler_name_resolves",
-        unsupported_patterns: &["plugin prefixes and schema-only route declarations are partial"],
-        known_gaps: &["register() prefix propagation is not modeled"],
+        handler_link_support: "probable_for_direct_handler_names_when_graph_resolution_succeeds",
+        unsupported_patterns: &[
+            "nested, injected, factory-returned, chained, and multi-target receivers are not promoted",
+            "dynamic paths, method arrays, and nested route builders are not promoted",
+            "inline and wrapped handlers do not produce name-based handler links",
+        ],
+        known_gaps: &[
+            "register() prefix propagation is not modeled",
+            "schema and runtime middleware semantics are not evaluated",
+        ],
         promotable: true,
     },
     FrameworkRouteCoverageEntry {
@@ -13259,6 +13266,17 @@ mod tests {
         assert_eq!(express.confidence_floor, "heuristic");
         assert!(
             express
+                .handler_link_support
+                .contains("direct_handler_names")
+        );
+        let fastify = coverage
+            .iter()
+            .find(|entry| entry.framework == "fastify")
+            .expect("Fastify coverage");
+        assert_eq!(fastify.coverage_evidence, "tree_sitter_query_regression");
+        assert_eq!(fastify.confidence_floor, "heuristic");
+        assert!(
+            fastify
                 .handler_link_support
                 .contains("direct_handler_names")
         );
