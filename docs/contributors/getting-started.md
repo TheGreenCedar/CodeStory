@@ -284,6 +284,11 @@ Read these pages first:
 - `index --refresh auto`: chooses full on an empty cache and incremental after that
 - `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
 - `drill`: defaults to `--refresh full` so report bundles are mechanically fresh
-- `drill --jobs N` and `drill-suite --jobs N`: only use workers with `--refresh none`; refresh/indexing runs stay serialized
+- `drill`: sends its question and explicit anchors through one packet batch and
+  writes packet-backed JSON, Markdown, and summary artifacts
+- claim/source-truth scoring is evaluation-only: run
+  `node scripts/score-drill-ledger.mjs <drill-report.json> <ledger.json>`; the
+  production drill command does not own a second readiness or scoring contract
+- `drill-suite --jobs N`: only uses workers with `--refresh none`; refresh/indexing runs stay serialized
 - use `--refresh full` after deleting the cache directory, after schema-affecting changes, or when stale state is suspected
 - delegated child worktree lanes: verify the Git proof target in [Delegated Worktree Proof Target](#delegated-worktree-proof-target) before cache rehydrate, readiness, or sidecar proof

@@ -8,7 +8,7 @@
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
+    AgentPacketDto, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
     NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
     ReadinessStatusDto, ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
@@ -1908,56 +1908,6 @@ pub(crate) struct DrillAnchorOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillVerificationChecklistItemOutput {
-    pub(crate) item: String,
-    pub(crate) allowed_classifications: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillAnswerQualityContractOutput {
-    pub(crate) code_story_only_draft_required: bool,
-    pub(crate) source_truth_verification_required: bool,
-    pub(crate) pass_condition: String,
-    pub(crate) score_inputs: Vec<String>,
-    pub(crate) correction_buckets: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillClaimLedgerEntryOutput {
-    pub(crate) id: String,
-    pub(crate) claim: String,
-    pub(crate) expected_evidence: Vec<String>,
-    pub(crate) source_truth_files: Vec<String>,
-    pub(crate) pre_verification_confidence: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) classification: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) changed_after_source_read: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) correction_note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillClaimLedgerScoringOutput {
-    pub(crate) status: String,
-    pub(crate) pending_claim_count: u32,
-    pub(crate) correct: u32,
-    pub(crate) partial: u32,
-    pub(crate) misleading: u32,
-    pub(crate) unsupported: u32,
-    pub(crate) material_revision_count: u32,
-    pub(crate) score_formula: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillClaimLedgerOutput {
-    pub(crate) template_version: u32,
-    pub(crate) instructions: Vec<String>,
-    pub(crate) claims: Vec<DrillClaimLedgerEntryOutput>,
-    pub(crate) scoring: DrillClaimLedgerScoringOutput,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummaryStatsOutput {
     pub(crate) files: u32,
     pub(crate) nodes: u32,
@@ -2134,11 +2084,7 @@ pub(crate) struct DrillOutput {
     pub(crate) execution_boundaries: Vec<DrillExecutionBoundaryOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
-    pub(crate) evidence_packet: EvidencePacketDto,
-    pub(crate) answer_quality_contract: DrillAnswerQualityContractOutput,
-    pub(crate) claim_ledger_template: DrillClaimLedgerOutput,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) verification_checklist: Vec<DrillVerificationChecklistItemOutput>,
+    pub(crate) evidence_packet: AgentPacketDto,
     pub(crate) next_commands: Vec<String>,
 }
 
