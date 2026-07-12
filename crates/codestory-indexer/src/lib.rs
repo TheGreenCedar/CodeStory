@@ -16983,6 +16983,50 @@ fn append_framework_routes(
         }
     }
 
+    if matches!(language_config.language_name, "javascript" | "typescript") {
+        let lexical_express = routes
+            .extract_if(.., |route| route.framework == "express")
+            .collect::<Vec<_>>();
+        let dialect = match path.extension().and_then(|extension| extension.to_str()) {
+            Some(extension) if extension.eq_ignore_ascii_case("tsx") => {
+                framework_routes::JavaScriptDialect::Tsx
+            }
+            _ if language_config.language_name == "typescript" => {
+                framework_routes::JavaScriptDialect::TypeScript
+            }
+            _ => framework_routes::JavaScriptDialect::JavaScript,
+        };
+        let parser_routes = framework_routes::collect_javascript_express_routes(
+            &language_config.language,
+            dialect,
+            tree,
+            source,
+        )?;
+        let parser_keys = parser_routes
+            .iter()
+            .map(|route| (route.method.clone(), route.path.clone()))
+            .collect::<HashSet<_>>();
+        routes.extend(parser_routes);
+
+        if tree.root_node().has_error() {
+            routes.extend(
+                lexical_express
+                    .into_iter()
+                    .filter(|route| {
+                        !parser_keys.contains(&(route.method.clone(), route.path.clone()))
+                            && framework_routes::allow_javascript_express_lexical_fallback(
+                                tree, source, route,
+                            )
+                    })
+                    .map(|route| {
+                        route
+                            .with_confidence("heuristic")
+                            .with_claim_evidence("lexical_fallback", "structural")
+                    }),
+            );
+        }
+    }
+
     for route in routes {
         let route_node = framework_route_node(file_id, &route);
         let route_node_id = route_node.id;
@@ -22176,7 +22220,9 @@ pub fn build() {
     #[test]
     fn test_typescript_framework_routes_index_express_react_and_sveltekit() -> Result<()> {
         let code = r#"
+import express from "express";
 import { Route } from "react-router-dom";
+const app = express();
 app.get("/users", listUsers);
 export function listUsers() {
     return [];
@@ -22208,8 +22254,8 @@ export function Screen() {
             .canonical_id
             .as_deref()
             .expect("express route canonical id");
-        assert!(express_canonical_id.contains(r#""extraction_provenance":"ast_indexed""#));
-        assert!(express_canonical_id.contains(r#""extraction:ast_indexed""#));
+        assert!(express_canonical_id.contains(r#""extraction_provenance":"tree_sitter_query""#));
+        assert!(express_canonical_id.contains(r#""claim_tier":"parser_backed""#));
         let handler = result
             .nodes
             .iter()

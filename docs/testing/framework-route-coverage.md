@@ -13,8 +13,11 @@ These bullets list extractor coverage or tracked fixture targets, not full
 framework parity; use `summary.framework_route_coverage` for per-framework
 status, confidence floor, handler-link support, known gaps, and promotability.
 
-- JavaScript/TypeScript: Express, React Router, SvelteKit, Next.js,
-  Remix, Fastify, Koa, Hono, NestJS.
+- JavaScript/TypeScript: Express module-scope route calls on source-ordered app
+  and router bindings constructed from explicit `express` imports or
+  `require("express")` use a tree-sitter query. React Router, SvelteKit,
+  Next.js, Remix, Fastify, Koa, Hono, and NestJS retain their existing
+  collectors.
 - Astro/Vue: Astro and Nuxt file-convention routes, plus Vue Router object
   routes.
 - Python: Django and Flask retain structural collectors. FastAPI decorators on
@@ -76,6 +79,18 @@ FastAPI route metadata records `claim_tier=parser_backed` with
   assignments, including `app = router = FastAPI()`, are not promoted.
   Factory-returned, injected, and nested-scope routers are not labeled as
   FastAPI until receiver-specific provenance is resolved.
+
+Express route metadata records `claim_tier=parser_backed` with
+`extraction_provenance=tree_sitter_query` for static quoted paths and
+substitution-free template literals. The route remains `confidence=heuristic`:
+the parser proves the registration syntax and receiver construction, not
+mounted prefixes, middleware behavior, or runtime dispatch. Direct handler
+names can produce the existing probable graph edge when resolution succeeds;
+inline, nested-call, and middleware-array handlers do not produce handler
+claims. Dynamic and escaped paths, direct `require("express")()` construction,
+chained or multi-target bindings, and nested, injected, or factory-returned
+receivers are not promoted. Error-local lexical recovery stays
+`claim_tier=structural` and `extraction_provenance=lexical_fallback`.
 
 ## Verification Playbook
 

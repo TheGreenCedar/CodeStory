@@ -20,6 +20,34 @@ const PYTHON_FASTAPI_QUERY: &str = r#"
 
 static PYTHON_FASTAPI_COMPILED_QUERY: OnceLock<Result<Query, String>> = OnceLock::new();
 
+const JAVASCRIPT_EXPRESS_QUERY: &str = r#"
+(call_expression
+  function: (member_expression
+    object: (identifier) @receiver
+    property: (property_identifier) @method)
+  arguments: (arguments) @arguments) @route
+"#;
+
+static JAVASCRIPT_EXPRESS_COMPILED_QUERY: OnceLock<Result<Query, String>> = OnceLock::new();
+static TYPESCRIPT_EXPRESS_COMPILED_QUERY: OnceLock<Result<Query, String>> = OnceLock::new();
+static TSX_EXPRESS_COMPILED_QUERY: OnceLock<Result<Query, String>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+pub(super) enum JavaScriptDialect {
+    JavaScript,
+    TypeScript,
+    Tsx,
+}
+
+#[derive(Default)]
+struct ExpressBindings {
+    constructors: HashSet<String>,
+    router_constructors: HashSet<String>,
+    modules: HashSet<String>,
+    receivers: HashSet<String>,
+    require_shadowed: bool,
+}
+
 #[derive(Default)]
 struct FastApiBindings {
     constructors: HashSet<String>,
@@ -110,6 +138,632 @@ pub(super) fn collect_python_fastapi_routes(
     }
 
     Ok(routes)
+}
+
+pub(super) fn collect_javascript_express_routes(
+    language: &Language,
+    dialect: JavaScriptDialect,
+    tree: &Tree,
+    source: &str,
+) -> Result<Vec<FrameworkRoute>> {
+    let cache = match dialect {
+        JavaScriptDialect::JavaScript => &JAVASCRIPT_EXPRESS_COMPILED_QUERY,
+        JavaScriptDialect::TypeScript => &TYPESCRIPT_EXPRESS_COMPILED_QUERY,
+        JavaScriptDialect::Tsx => &TSX_EXPRESS_COMPILED_QUERY,
+    };
+    let query = cache
+        .get_or_init(|| {
+            Query::new(language, JAVASCRIPT_EXPRESS_QUERY).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|message| anyhow!(message.clone()))?;
+    let capture_names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
+    let mut routes = Vec::new();
+
+    while {
+        matches.advance();
+        matches.get().is_some()
+    } {
+        let Some(query_match) = matches.get() else {
+            continue;
+        };
+        let mut receiver = None;
+        let mut method = None;
+        let mut arguments = None;
+        let mut route_node = None;
+        for capture in query_match.captures {
+            let name = capture_names
+                .get(capture.index as usize)
+                .copied()
+                .unwrap_or_default();
+            match name {
+                "receiver" => receiver = node_text(capture.node, source),
+                "method" => method = node_text(capture.node, source),
+                "arguments" => arguments = Some(capture.node),
+                "route" => route_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(receiver), Some(method), Some(arguments), Some(route_node)) =
+            (receiver, method, arguments, route_node)
+        else {
+            continue;
+        };
+        if !matches!(
+            method.as_str(),
+            "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+        ) || !javascript_route_is_module_statement(route_node)
+            || !module_express_receiver_owned_at(tree, source, &receiver, route_node.start_byte())
+        {
+            continue;
+        }
+        let mut argument_cursor = arguments.walk();
+        let values = arguments
+            .named_children(&mut argument_cursor)
+            .filter(|node| node.kind() != "comment")
+            .collect::<Vec<_>>();
+        let Some(path) = values
+            .first()
+            .copied()
+            .and_then(|node| javascript_static_string(node, source))
+        else {
+            continue;
+        };
+        let handler = values
+            .get(1)
+            .copied()
+            .filter(|node| matches!(node.kind(), "identifier" | "member_expression"))
+            .and_then(|node| node_text(node, source));
+        routes.push(
+            FrameworkRoute::new(
+                "express",
+                method.to_ascii_uppercase(),
+                path,
+                handler,
+                route_node.start_position().row as u32 + 1,
+                "heuristic",
+            )
+            .with_claim_evidence("tree_sitter_query", "parser_backed"),
+        );
+    }
+
+    Ok(routes)
+}
+
+pub(super) fn allow_javascript_express_lexical_fallback(
+    tree: &Tree,
+    source: &str,
+    route: &FrameworkRoute,
+) -> bool {
+    let Some(line) = source.lines().nth(route.line.saturating_sub(1) as usize) else {
+        return false;
+    };
+    let Some((receiver, argument)) = javascript_route_receiver_and_argument(line, &route.method)
+    else {
+        return false;
+    };
+    if !matches!(argument.chars().next(), Some('\'' | '"')) || route.raw_path.contains('\\') {
+        return false;
+    }
+    syntax_error_near_line(tree.root_node(), route.line)
+        && javascript_line_is_module_scope(tree, line, route.line)
+        && javascript_byte_is_code(source, source_byte_at_line(source, route.line))
+        && module_express_receiver_owned_at(
+            tree,
+            source,
+            receiver,
+            source_byte_at_line(source, route.line),
+        )
+}
+
+fn javascript_byte_is_code(source: &str, target: usize) -> bool {
+    let mut chars = source.char_indices().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    let mut line_comment = false;
+    while let Some((index, ch)) = chars.next() {
+        if index >= target {
+            return quote.is_none() && !block_comment && !line_comment;
+        }
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                chars.next();
+                block_comment = false;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '/' {
+            match chars.peek().map(|(_, next)| *next) {
+                Some('/') => {
+                    chars.next();
+                    line_comment = true;
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    block_comment = true;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+        }
+    }
+    quote.is_none() && !block_comment && !line_comment
+}
+
+fn javascript_route_is_module_statement(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|node| {
+        node.kind() == "expression_statement"
+            && node.parent().is_some_and(|node| node.kind() == "program")
+    })
+}
+
+fn javascript_line_is_module_scope(tree: &Tree, line: &str, line_number: u32) -> bool {
+    let mut node = node_at_line_start(tree, line, line_number);
+    while let Some(current) = node {
+        if matches!(current.kind(), "string" | "template_string" | "comment") {
+            return false;
+        }
+        if matches!(
+            current.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "arrow_function"
+                | "class_declaration"
+                | "method_definition"
+        ) {
+            return false;
+        }
+        node = current.parent();
+    }
+    true
+}
+
+fn javascript_route_receiver_and_argument<'a>(
+    line: &'a str,
+    method: &str,
+) -> Option<(&'a str, &'a str)> {
+    let needle = format!(".{}(", method.to_ascii_lowercase());
+    let (receiver, argument) = line.trim_start().split_once(&needle)?;
+    (!receiver.is_empty()
+        && receiver
+            .chars()
+            .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
+    .then_some((receiver, argument.trim_start()))
+}
+
+fn javascript_static_string(node: Node<'_>, source: &str) -> Option<String> {
+    let text = node.utf8_text(source.as_bytes()).ok()?.trim();
+    match node.kind() {
+        "string" => {
+            let quote = text.chars().next()?;
+            (matches!(quote, '\'' | '"')
+                && text.ends_with(quote)
+                && text.len() >= 2
+                && !text[1..text.len() - 1].contains('\\'))
+            .then(|| text[1..text.len() - 1].to_string())
+        }
+        "template_string" => {
+            let mut cursor = node.walk();
+            (!node
+                .named_children(&mut cursor)
+                .any(|child| child.kind() == "template_substitution")
+                && text.starts_with('`')
+                && text.ends_with('`')
+                && text.len() >= 2
+                && !text[1..text.len() - 1].contains('\\'))
+            .then(|| text[1..text.len() - 1].to_string())
+        }
+        _ => None,
+    }
+}
+
+fn module_express_receiver_owned_at(
+    tree: &Tree,
+    source: &str,
+    receiver: &str,
+    before_byte: usize,
+) -> bool {
+    let mut bindings = ExpressBindings::default();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.start_byte() >= before_byte {
+            break;
+        }
+        apply_express_module_statement(statement, source, &mut bindings);
+    }
+    bindings.receivers.contains(receiver)
+}
+
+fn apply_express_module_statement(
+    statement: Node<'_>,
+    source: &str,
+    bindings: &mut ExpressBindings,
+) {
+    if statement.kind() == "import_statement" {
+        apply_express_import(statement, source, bindings);
+        return;
+    }
+
+    let mut declarators = Vec::new();
+    collect_nodes_of_kind(statement, "variable_declarator", &mut declarators);
+    if !declarators.is_empty() {
+        for declarator in declarators {
+            apply_express_declarator(declarator, source, bindings);
+        }
+        return;
+    }
+
+    if matches!(
+        statement.kind(),
+        "function_declaration" | "class_declaration"
+    ) && let Some(name) = statement
+        .child_by_field_name("name")
+        .and_then(|node| node_text(node, source))
+    {
+        invalidate_express_binding(&name, bindings);
+        return;
+    }
+
+    let mut names = HashSet::new();
+    collect_javascript_written_names(statement, source, &mut names);
+    for name in names {
+        invalidate_express_binding(&name, bindings);
+    }
+}
+
+fn apply_express_import(node: Node<'_>, source: &str, bindings: &mut ExpressBindings) {
+    let source_module = node
+        .child_by_field_name("source")
+        .and_then(|node| javascript_static_string(node, source));
+    let Some(clause) = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "import_clause")
+    else {
+        return;
+    };
+    if node_has_direct_anonymous_token(node, &["type", "typeof"])
+        || node_has_direct_anonymous_token(clause, &["type", "typeof"])
+    {
+        return;
+    }
+    let imported_bindings = javascript_import_local_bindings(clause, source);
+    for name in &imported_bindings {
+        invalidate_express_binding(name, bindings);
+    }
+    if source_module.as_deref() != Some("express") {
+        return;
+    }
+
+    let mut cursor = clause.walk();
+    for child in clause.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                if let Some(name) = node_text(child, source) {
+                    bindings.constructors.insert(name);
+                }
+            }
+            "namespace_import" => {
+                if let Some(name) = last_identifier(child, source) {
+                    bindings.modules.insert(name);
+                }
+            }
+            "named_imports" => {
+                let mut import_cursor = child.walk();
+                for specifier in child.named_children(&mut import_cursor) {
+                    if specifier.kind() != "import_specifier" {
+                        continue;
+                    }
+                    if node_has_direct_anonymous_token(specifier, &["type", "typeof"]) {
+                        continue;
+                    }
+                    let imported = specifier
+                        .child_by_field_name("name")
+                        .and_then(|node| node_text(node, source));
+                    let local = specifier
+                        .child_by_field_name("alias")
+                        .and_then(|node| node_text(node, source))
+                        .or_else(|| imported.clone());
+                    if imported.as_deref() == Some("Router")
+                        && let Some(local) = local
+                    {
+                        bindings.router_constructors.insert(local);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_express_declarator(node: Node<'_>, source: &str, bindings: &mut ExpressBindings) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let mut names = HashSet::new();
+    collect_javascript_binding_names(name_node, source, &mut names);
+    for name in &names {
+        invalidate_express_binding(name, bindings);
+    }
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+
+    if expression_is_express_require(value, source, bindings) {
+        if name_node.kind() == "identifier"
+            && let Some(name) = node_text(name_node, source)
+        {
+            bindings.constructors.insert(name);
+        } else if name_node.kind() == "object_pattern" {
+            bindings
+                .router_constructors
+                .extend(commonjs_router_bindings(name_node, source));
+        }
+        return;
+    }
+
+    if names.len() != 1 || name_node.kind() != "identifier" {
+        return;
+    }
+    let Some(name) = names.into_iter().next() else {
+        return;
+    };
+    if expression_constructs_express_receiver(value, source, bindings) {
+        bindings.receivers.insert(name);
+    }
+}
+
+fn expression_is_express_require(node: Node<'_>, source: &str, bindings: &ExpressBindings) -> bool {
+    if bindings.require_shadowed || node.kind() != "call_expression" {
+        return false;
+    }
+    node.child_by_field_name("function")
+        .and_then(|node| node_text(node, source))
+        .as_deref()
+        == Some("require")
+        && node
+            .child_by_field_name("arguments")
+            .and_then(|arguments| arguments.named_child(0))
+            .and_then(|argument| javascript_static_string(argument, source))
+            .as_deref()
+            == Some("express")
+}
+
+fn expression_constructs_express_receiver(
+    node: Node<'_>,
+    source: &str,
+    bindings: &ExpressBindings,
+) -> bool {
+    if node.kind() != "call_expression" {
+        return false;
+    }
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    match function.kind() {
+        "identifier" => node_text(function, source).is_some_and(|name| {
+            bindings.constructors.contains(&name) || bindings.router_constructors.contains(&name)
+        }),
+        "member_expression" => {
+            let object = function
+                .child_by_field_name("object")
+                .and_then(|node| node_text(node, source));
+            let property = function
+                .child_by_field_name("property")
+                .and_then(|node| node_text(node, source));
+            object.is_some_and(|name| {
+                bindings.constructors.contains(&name) || bindings.modules.contains(&name)
+            }) && property.as_deref() == Some("Router")
+        }
+        _ => false,
+    }
+}
+
+fn invalidate_express_binding(name: &str, bindings: &mut ExpressBindings) {
+    bindings.constructors.remove(name);
+    bindings.router_constructors.remove(name);
+    bindings.modules.remove(name);
+    bindings.receivers.remove(name);
+    if name == "require" {
+        bindings.require_shadowed = true;
+    }
+}
+
+fn collect_nodes_of_kind<'tree>(node: Node<'tree>, kind: &str, out: &mut Vec<Node<'tree>>) {
+    if node.kind() == kind {
+        out.push(node);
+        return;
+    }
+    if !matches!(
+        node.kind(),
+        "export_statement" | "lexical_declaration" | "variable_declaration"
+    ) {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_nodes_of_kind(child, kind, out);
+    }
+}
+
+fn collect_javascript_binding_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            if let Some(name) = node_text(node, source) {
+                names.insert(name);
+            }
+        }
+        "pair_pattern" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                collect_javascript_binding_names(value, source, names);
+            }
+        }
+        "assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_javascript_binding_names(left, source, names);
+            }
+        }
+        "rest_pattern" => {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                collect_javascript_binding_names(argument, source, names);
+            }
+        }
+        "object_pattern" | "array_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_javascript_binding_names(child, source, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn javascript_import_local_bindings(node: Node<'_>, source: &str) -> HashSet<String> {
+    let mut bindings = HashSet::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                if let Some(name) = node_text(child, source) {
+                    bindings.insert(name);
+                }
+            }
+            "namespace_import" => {
+                if let Some(name) = last_identifier(child, source) {
+                    bindings.insert(name);
+                }
+            }
+            "named_imports" => {
+                let mut import_cursor = child.walk();
+                for specifier in child.named_children(&mut import_cursor) {
+                    if specifier.kind() != "import_specifier" {
+                        continue;
+                    }
+                    if node_has_direct_anonymous_token(specifier, &["type", "typeof"]) {
+                        continue;
+                    }
+                    let local = specifier
+                        .child_by_field_name("alias")
+                        .or_else(|| specifier.child_by_field_name("name"))
+                        .and_then(|node| node_text(node, source));
+                    if let Some(local) = local {
+                        bindings.insert(local);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    bindings
+}
+
+fn collect_javascript_written_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
+    if matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "class_declaration"
+            | "class"
+    ) {
+        return;
+    }
+    if node.kind() == "assignment_expression" {
+        if let Some(left) = node.child_by_field_name("left") {
+            collect_javascript_binding_names(left, source, names);
+        }
+        return;
+    }
+    if node.kind() == "for_in_statement"
+        && let Some(left) = node.child_by_field_name("left")
+        && !matches!(left.kind(), "lexical_declaration" | "variable_declaration")
+    {
+        collect_javascript_binding_names(left, source, names);
+    }
+    if node.kind() == "variable_declarator" {
+        if node.parent().is_some_and(|declaration| {
+            declaration.kind() == "variable_declaration"
+                && node_has_direct_anonymous_token(declaration, &["var"])
+        }) && let Some(name) = node.child_by_field_name("name")
+        {
+            collect_javascript_binding_names(name, source, names);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_javascript_written_names(child, source, names);
+    }
+}
+
+fn last_identifier(node: Node<'_>, source: &str) -> Option<String> {
+    let mut result = None;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier" {
+            result = node_text(child, source);
+        } else if let Some(identifier) = last_identifier(child, source) {
+            result = Some(identifier);
+        }
+    }
+    result
+}
+
+fn node_has_direct_anonymous_token(node: Node<'_>, expected: &[&str]) -> bool {
+    (0..node.child_count()).any(|index| {
+        node.child(index)
+            .is_some_and(|child| !child.is_named() && expected.contains(&child.kind()))
+    })
+}
+
+fn commonjs_router_bindings(node: Node<'_>, source: &str) -> HashSet<String> {
+    let mut bindings = HashSet::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "shorthand_property_identifier_pattern" => {
+                if node_text(child, source).as_deref() == Some("Router") {
+                    bindings.insert("Router".to_string());
+                }
+            }
+            "pair_pattern" => {
+                let key = child
+                    .child_by_field_name("key")
+                    .and_then(|node| node_text(node, source));
+                if key.as_deref() != Some("Router") {
+                    continue;
+                }
+                if let Some(value) = child.child_by_field_name("value") {
+                    collect_javascript_binding_names(value, source, &mut bindings);
+                }
+            }
+            _ => {}
+        }
+    }
+    bindings
 }
 
 pub(super) fn allow_python_fastapi_lexical_fallback(
@@ -558,6 +1212,508 @@ mod tests {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .expect("python grammar");
         parser.parse(source, None).expect("python tree")
+    }
+
+    fn parse_javascript(language: &Language, source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser.set_language(language).expect("javascript grammar");
+        parser.parse(source, None).expect("javascript tree")
+    }
+
+    #[test]
+    fn test_express_query_fixture_matrix_and_line_scan_comparison() -> Result<()> {
+        let source = r#"
+import express from "express";
+const app = express();
+
+app.get("/simple", simple);
+
+app.post(
+  "/multiline",
+  multiline,
+);
+
+app.put(`/static-template`, update);
+app.patch(`/dynamic/${itemId}`, dynamic);
+app.get("/prefix" + suffix, concatenated);
+app.delete(buildPath("/nested-path"), nested);
+app.options("/wrapped", wrap(handler));
+
+router.get("/unowned", unowned);
+
+const example = `
+app.head("/string-only", documented);
+`;
+
+// app.get("/comment-only", commented);
+/* app.post("/block-comment", commented); */
+"#;
+        let expected = HashSet::from([
+            ("GET".to_string(), "/simple".to_string()),
+            ("POST".to_string(), "/multiline".to_string()),
+            ("PUT".to_string(), "/static-template".to_string()),
+            ("OPTIONS".to_string(), "/wrapped".to_string()),
+        ]);
+        let lexical =
+            super::super::collect_framework_routes(Path::new("routes.ts"), "typescript", source)
+                .into_iter()
+                .filter(|route| route.framework == "express")
+                .map(|route| (route.method, route.path))
+                .collect::<HashSet<_>>();
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let parser_routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+        )?;
+        let parser = parser_routes
+            .iter()
+            .map(|route| (route.method.clone(), route.path.clone()))
+            .collect::<HashSet<_>>();
+
+        let lexical_tp = lexical.intersection(&expected).count();
+        let lexical_fp = lexical.difference(&expected).count();
+        let lexical_fn = expected.difference(&lexical).count();
+        let parser_tp = parser.intersection(&expected).count();
+        let parser_fp = parser.difference(&expected).count();
+        let parser_fn = expected.difference(&parser).count();
+        eprintln!(
+            "express route matrix: line_scan tp={lexical_tp} fp={lexical_fp} fn={lexical_fn}; tree_sitter_query tp={parser_tp} fp={parser_fp} fn={parser_fn}"
+        );
+
+        assert_eq!((parser_tp, parser_fp, parser_fn), (4, 0, 0));
+        assert!(lexical_fp > 0 || lexical_fn > 0);
+        assert!(parser_routes.iter().all(|route| {
+            route.extraction_provenance == "tree_sitter_query"
+                && route.claim_tier == "parser_backed"
+                && route.confidence == "heuristic"
+        }));
+        assert_eq!(
+            parser_routes
+                .iter()
+                .find(|route| route.path == "/wrapped")
+                .and_then(|route| route.handler.as_deref()),
+            None,
+            "nested handlers must not become name-based handler claims"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_query_uses_separate_javascript_typescript_and_tsx_grammars() -> Result<()> {
+        let cases = [
+            (
+                tree_sitter_javascript::LANGUAGE.into(),
+                JavaScriptDialect::JavaScript,
+            ),
+            (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                JavaScriptDialect::TypeScript,
+            ),
+            (
+                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                JavaScriptDialect::Tsx,
+            ),
+        ];
+        for (language, dialect) in cases {
+            let source = r#"
+import express from "express";
+const app = express();
+app.get("/health", health);
+"#;
+            let tree = parse_javascript(&language, source);
+            let routes = collect_javascript_express_routes(&language, dialect, &tree, source)?;
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].path, "/health");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_indexes_javascript_jsx_typescript_and_tsx_surfaces() -> Result<()> {
+        let cases = [
+            ("routes.js", "js", "const marker = 'js';"),
+            (
+                "routes.jsx",
+                "jsx",
+                "export const View = () => <main>jsx</main>;",
+            ),
+            ("routes.ts", "ts", "const marker: string = 'ts';"),
+            (
+                "routes.tsx",
+                "tsx",
+                "export const View = () => <main>tsx</main>;",
+            ),
+        ];
+        for (path, extension, extra) in cases {
+            let source = format!(
+                r#"
+import express from "express";
+const app = express();
+app.get("/health", health);
+function health() {{ return true; }}
+{extra}
+"#
+            );
+            let result = super::super::index_file(
+                Path::new(path),
+                &source,
+                &super::super::get_language_for_ext(extension).expect("language config"),
+                None,
+                None,
+            )?;
+            let route = result
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.canonical_id
+                        .as_deref()
+                        .is_some_and(|value| value.contains(r#""framework":"express""#))
+                })
+                .unwrap_or_else(|| panic!("missing Express route for {path}"));
+            let metadata = route.canonical_id.as_deref().expect("route metadata");
+            assert!(metadata.contains(r#""extraction_provenance":"tree_sitter_query""#));
+            assert!(metadata.contains(r#""claim_tier":"parser_backed""#));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_receiver_ownership_rejects_unowned_shadowed_and_nested_calls() -> Result<()> {
+        let source = r#"
+import express from "express";
+const app = express();
+const server = express();
+app.get("/owned", owned);
+server.get("/inline", () => {
+  const server = otherFramework();
+});
+app = otherFramework();
+app.get("/shadowed", shadowed);
+
+const conditional = express();
+if (flag) {
+  conditional = otherFramework();
+}
+conditional.get("/conditionally-shadowed", conditionalHandler);
+
+const unrelated = otherFramework();
+unrelated.get("/unrelated", unrelatedHandler);
+
+function register(app) {
+  const nested = express();
+  const server = otherFramework();
+  app.get("/injected", injected);
+}
+
+server.get("/still-owned", stillOwned);
+nested.get("/not-module-owned", notModuleOwned);
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+        )?;
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.path.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["/owned", "/inline", "/still-owned"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_query_ignores_hand_scanner_state_with_unrelated_tree_error() -> Result<()> {
+        let source = r#"
+import express from "express";
+const pattern = /"/;
+const app = express();
+app.get("/after-regex", handler);
+broken = (
+"#;
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let tree = parse_javascript(&language, source);
+        assert!(tree.root_node().has_error());
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::JavaScript,
+            &tree,
+            source,
+        )?;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/after-regex");
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_property_assignment_does_not_invalidate_receiver() -> Result<()> {
+        let source = r#"
+import express from "express";
+const app = express();
+app.locals.title = "CodeStory";
+app.get("/after-property-write", handler);
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+        )?;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/after-property-write");
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_shadowed_commonjs_require_is_not_provenance() -> Result<()> {
+        let source = r#"
+const require = fakeRequire;
+const express = require("express");
+const app = express();
+app.get("/fake-require", handler);
+"#;
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let tree = parse_javascript(&language, source);
+        assert!(!tree.root_node().has_error());
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::JavaScript,
+            &tree,
+            source,
+        )?;
+        assert!(routes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_block_local_declaration_preserves_outer_receiver_but_assignment_does_not()
+    -> Result<()> {
+        let source = r#"
+import express from "express";
+const app = express();
+{
+  const app = otherFramework();
+  app.get("/block-local", localHandler);
+}
+app.get("/outer", outerHandler);
+
+const server = express();
+if (flag) {
+  server = otherFramework();
+}
+server.get("/assigned", assignedHandler);
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+        )?;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/outer");
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_function_scoped_var_and_loop_target_invalidate_module_receivers() -> Result<()>
+    {
+        let source = r#"
+import express from "express";
+var app = express();
+if (flag) {
+  var/*comment*/ app = otherFramework();
+}
+app.get("/var-redeclared", handler);
+
+var newlineApp = express();
+if (flag) {
+  var
+  newlineApp = otherFramework();
+}
+newlineApp.get("/newline-var-redeclared", handler);
+
+const server = express();
+for (server of candidates) {
+  consume(server);
+}
+server.get("/loop-assigned", handler);
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+        )?;
+        assert!(routes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_type_only_imports_are_not_runtime_provenance() -> Result<()> {
+        let cases = [
+            r#"
+import type express from "express";
+const app = express();
+app.get("/type-default", handler);
+"#,
+            r#"
+import { type Router } from "express";
+const router = Router();
+router.get("/type-router", handler);
+"#,
+            r#"
+import/*comment*/ type express from "express";
+const app = express();
+app.get("/commented-type-default", handler);
+"#,
+            r#"
+import
+type express from "express";
+const app = express();
+app.get("/newline-type-default", handler);
+"#,
+            r#"
+import { type/*comment*/ Router } from "express";
+const router = Router();
+router.get("/commented-type-router", handler);
+"#,
+            r#"
+import {
+  type Router
+} from "express";
+const router = Router();
+router.get("/newline-type-router", handler);
+"#,
+            r#"
+import typeof express from "express";
+const app = express();
+app.get("/typeof-default", handler);
+"#,
+            r#"
+import/*comment*/ typeof express from "express";
+const app = express();
+app.get("/commented-typeof-default", handler);
+"#,
+        ];
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        for source in cases {
+            let tree = parse_javascript(&language, source);
+            assert!(!tree.root_node().has_error(), "invalid fixture: {source}");
+            let routes = collect_javascript_express_routes(
+                &language,
+                JavaScriptDialect::TypeScript,
+                &tree,
+                source,
+            )?;
+            assert!(routes.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_named_import_invalidates_only_local_alias() -> Result<()> {
+        let source = r#"
+import express from "express";
+const app = express();
+import { app as externalApp } from "./external.js";
+app.get("/still-owned", handler);
+externalApp.get("/external", externalHandler);
+"#;
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let tree = parse_javascript(&language, source);
+        assert!(!tree.root_node().has_error());
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::JavaScript,
+            &tree,
+            source,
+        )?;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/still-owned");
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_commonjs_and_router_constructor_provenance() -> Result<()> {
+        let source = r#"
+const express = require("express");
+const app = express();
+const router = express.Router();
+const { Router: ExpressRouter } = require("express");
+const aliasedRouter = ExpressRouter();
+app.get("/app", appHandler);
+router.post("/router", routerHandler);
+aliasedRouter.patch("/aliased-router", aliasedHandler);
+"#;
+        let language: Language = tree_sitter_javascript::LANGUAGE.into();
+        let tree = parse_javascript(&language, source);
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::JavaScript,
+            &tree,
+            source,
+        )?;
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| route.path.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["/app", "/router", "/aliased-router"])
+        );
+
+        let named_router_source = r#"
+import { Router as ExpressRouter } from "express";
+const router = ExpressRouter();
+router.get("/named-router", handler);
+"#;
+        let typescript: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&typescript, named_router_source);
+        let routes = collect_javascript_express_routes(
+            &typescript,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            named_router_source,
+        )?;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/named-router");
+        Ok(())
+    }
+
+    #[test]
+    fn test_express_malformed_template_does_not_restore_string_content_as_a_route() -> Result<()> {
+        let source = r#"
+import express from "express";
+const app = express();
+const example = `
+app.get("/string-only", documented);
+"#;
+        let result = super::super::index_file(
+            Path::new("broken.ts"),
+            source,
+            &super::super::get_language_for_ext("ts").expect("typescript config"),
+            None,
+            None,
+        )?;
+        assert!(result.nodes.iter().all(|node| {
+            !node
+                .canonical_id
+                .as_deref()
+                .is_some_and(|value| value.contains(r#""framework":"express""#))
+        }));
+        Ok(())
     }
 
     #[test]

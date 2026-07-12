@@ -396,14 +396,18 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "express",
         language: "javascript/typescript",
         status: "partial",
-        coverage_evidence: "validated_by_indexer_regression",
+        coverage_evidence: "tree_sitter_query_regression",
         confidence_floor: "heuristic",
-        handler_link_support: "probable_when_handler_name_resolves",
+        handler_link_support: "probable_for_direct_handler_names_when_graph_resolution_succeeds",
         unsupported_patterns: &[
-            "router composition and middleware arrays may need source review",
-            "handler linking is name-based unless graph resolution confirms the target",
+            "nested, injected, factory-returned, chained, and multi-target receivers are not promoted",
+            "dynamic paths and middleware arrays do not produce handler claims",
+            "inline and nested-call handlers do not produce name-based handler links",
         ],
-        known_gaps: &["mounted app prefixes are not globally propagated"],
+        known_gaps: &[
+            "mounted app and router prefixes are not globally propagated",
+            "direct require('express')() construction is not promoted",
+        ],
         promotable: true,
     },
     FrameworkRouteCoverageEntry {
@@ -12658,6 +12662,17 @@ mod tests {
                 && !entry.unsupported_patterns.is_empty()
                 && !entry.known_gaps.is_empty()
         }));
+        let express = coverage
+            .iter()
+            .find(|entry| entry.framework == "express")
+            .expect("express coverage");
+        assert_eq!(express.coverage_evidence, "tree_sitter_query_regression");
+        assert_eq!(express.confidence_floor, "heuristic");
+        assert!(
+            express
+                .handler_link_support
+                .contains("direct_handler_names")
+        );
         assert!(
             coverage
                 .iter()
