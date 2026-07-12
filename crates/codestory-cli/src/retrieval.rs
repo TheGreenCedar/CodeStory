@@ -266,7 +266,7 @@ fn ensure_retrieval_index_embedding_policy(sidecar: &SidecarRuntimeConfig) -> Re
 
 fn prepare_retrieval_index_embedding_env(profile: CliSidecarProfile) {
     if matches!(profile, CliSidecarProfile::Agent) {
-        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+        crate::embedding_config::prepare_bundled_llamacpp_client_env_defaults();
     }
 }
 

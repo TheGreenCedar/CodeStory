@@ -55,7 +55,6 @@ pub(crate) struct RuntimeContext {
     pub(crate) project_root: PathBuf,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
-    pub(crate) managed_embeddings_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -98,14 +97,14 @@ impl std::fmt::Display for AmbiguousTargetError {
 impl std::error::Error for AmbiguousTargetError {}
 
 impl RuntimeContext {
-    /// Open runtime services for a command that may use managed embeddings.
+    /// Open runtime services with the caller's embedding configuration.
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
         Self::new_with_startup(args)
     }
 
     /// Open runtime services for agent-facing packet/search commands.
     pub(crate) fn new_agent_sidecar(args: &ProjectArgs) -> Result<Self> {
-        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+        crate::embedding_config::prepare_bundled_llamacpp_client_env_defaults();
         Self::new(args)
     }
 
@@ -118,8 +117,6 @@ impl RuntimeContext {
         let project_root = canonicalize_project_root(&args.project)?;
         let cache_override = trusted_cache_override(&project_root, args.cache_dir.as_deref())?;
         let cache_root = cache_root_for_project(&project_root, cache_override.as_deref())?;
-        let managed_embeddings_root =
-            crate::managed_embeddings::runtime_managed_root(cache_override.as_deref())?;
         let storage_path = cache_root.join("codestory.db");
         let runtime = Runtime::new();
         let events = runtime.events();
@@ -133,7 +130,6 @@ impl RuntimeContext {
             project_root,
             cache_root,
             storage_path,
-            managed_embeddings_root,
         })
     }
 
@@ -790,10 +786,6 @@ mod tests {
         "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_PORT",
         "CODESTORY_EMBED_LLAMACPP_URL",
-        "CODESTORY_EMBED_ONNX_MODEL",
-        "CODESTORY_EMBED_ONNX_TOKENIZER",
-        "CODESTORY_EMBED_ONNX_PROVIDER",
-        "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
         "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE",
         "CODESTORY_SEMANTIC_DOC_MAX_TOKENS",
         "CODESTORY_STORED_VECTOR_ENCODING",
@@ -834,23 +826,6 @@ mod tests {
         }
     }
 
-    fn write_fake_managed_onnx_assets(root: &Path) {
-        let model = root.join("assets").join("model.onnx");
-        let tokenizer = root.join("assets").join("tokenizer.json");
-        fs::create_dir_all(model.parent().expect("model parent")).expect("create model dir");
-        fs::write(&model, b"model").expect("write model");
-        fs::write(&tokenizer, b"tokenizer").expect("write tokenizer");
-        fs::write(
-            root.join("manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "onnx_model_path": model.to_string_lossy().replace('\\', "/"),
-                "onnx_tokenizer_path": tokenizer.to_string_lossy().replace('\\', "/"),
-            }))
-            .expect("manifest json"),
-        )
-        .expect("write manifest");
-    }
-
     #[test]
     fn project_config_cache_dir_is_rejected_before_runtime_paths() {
         let _env_lock = crate::config::config_env_test_lock();
@@ -878,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn home_config_cache_dir_resolves_storage_and_managed_embeddings_under_same_root() {
+    fn home_config_cache_dir_resolves_storage_under_trusted_root() {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
@@ -893,7 +868,6 @@ mod tests {
             format!("cache_dir = {:?}\n", cache.to_string_lossy()),
         )
         .expect("write home config");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
         unsafe {
             env::set_var("USERPROFILE", &home);
         }
@@ -906,27 +880,10 @@ mod tests {
 
         assert_eq!(runtime.cache_root, cache);
         assert_eq!(runtime.storage_path, cache.join("codestory.db"));
-        assert_eq!(
-            runtime.managed_embeddings_root,
-            cache.join("managed-embeddings")
-        );
-        for name in [
-            "CODESTORY_EMBED_BACKEND",
-            "CODESTORY_EMBED_ONNX_MODEL",
-            "CODESTORY_EMBED_ONNX_TOKENIZER",
-            "CODESTORY_EMBED_ONNX_PROVIDER",
-            "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
-        ] {
-            assert_eq!(
-                env::var(name).ok(),
-                None,
-                "runtime context must not promote managed ONNX assets via {name}"
-            );
-        }
     }
 
     #[test]
-    fn cli_cache_dir_overrides_home_config_for_storage_and_managed_embeddings() {
+    fn cli_cache_dir_overrides_home_config_for_storage() {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
@@ -942,7 +899,6 @@ mod tests {
             format!("cache_dir = {:?}\n", home_cache.to_string_lossy()),
         )
         .expect("write home config");
-        write_fake_managed_onnx_assets(&cli_cache.join("managed-embeddings"));
         unsafe {
             env::set_var("USERPROFILE", &home);
         }
@@ -955,67 +911,16 @@ mod tests {
 
         assert_eq!(runtime.cache_root, cli_cache);
         assert_eq!(runtime.storage_path, cli_cache.join("codestory.db"));
-        assert_eq!(
-            runtime.managed_embeddings_root,
-            cli_cache.join("managed-embeddings")
-        );
     }
 
     #[test]
-    fn inspect_only_runtime_does_not_mutate_embedding_env_when_managed_assets_exist() {
+    fn agent_sidecar_runtime_defaults_to_bundled_llamacpp() {
         let _env_lock = crate::config::config_env_test_lock();
         let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("repo");
         let cache = temp.path().join("cache");
         fs::create_dir_all(&project).expect("create project");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
-
-        RuntimeContext::new_inspect_only(&ProjectArgs {
-            project,
-            cache_dir: Some(cache),
-        })
-        .expect("runtime context");
-
-        for name in MANAGED_ENV_VARS {
-            assert_eq!(
-                env::var(name).ok(),
-                None,
-                "inspect-only runtime must not set {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn default_runtime_does_not_promote_managed_onnx_assets() {
-        let _env_lock = crate::config::config_env_test_lock();
-        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
-        let temp = tempdir().expect("temp dir");
-        let project = temp.path().join("repo");
-        let cache = temp.path().join("cache");
-        fs::create_dir_all(&project).expect("create project");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
-
-        RuntimeContext::new(&ProjectArgs {
-            project,
-            cache_dir: Some(cache),
-        })
-        .expect("runtime context");
-
-        assert_eq!(env::var("CODESTORY_EMBED_BACKEND").ok(), None);
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_MODEL").ok(), None);
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").ok(), None);
-    }
-
-    #[test]
-    fn agent_sidecar_runtime_defaults_prevent_managed_onnx_autostart() {
-        let _env_lock = crate::config::config_env_test_lock();
-        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
-        let temp = tempdir().expect("temp dir");
-        let project = temp.path().join("repo");
-        let cache = temp.path().join("cache");
-        fs::create_dir_all(&project).expect("create project");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
 
         RuntimeContext::new_agent_sidecar(&ProjectArgs {
             project: project.clone(),
@@ -1041,8 +946,6 @@ mod tests {
             Some(expected_url.as_str())
         );
         assert_ne!(expected_url, "http://127.0.0.1:8080/v1/embeddings");
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_MODEL").ok(), None);
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").ok(), None);
     }
 
     #[test]
@@ -1057,7 +960,7 @@ mod tests {
             );
         }
 
-        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+        crate::embedding_config::prepare_bundled_llamacpp_client_env_defaults();
 
         assert_eq!(
             env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),

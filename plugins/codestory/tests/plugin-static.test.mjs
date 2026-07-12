@@ -61,9 +61,11 @@ function releaseAssetForPlatform(version) {
         ? "linux-x64"
         : process.platform === "linux" && process.arch === "arm64"
           ? "linux-arm64"
-          : process.platform === "darwin" && process.arch === "arm64"
-            ? "macos-arm64"
-            : null;
+          : process.platform === "darwin" && process.arch === "x64"
+            ? "macos-x64"
+            : process.platform === "darwin" && process.arch === "arm64"
+              ? "macos-arm64"
+              : null;
   assert.ok(target, `unsupported test platform: ${process.platform}-${process.arch}`);
   const archiveBase = `codestory-cli-v${version}-${target}`;
   const archiveName = `${archiveBase}.${target.startsWith("windows-") ? "zip" : "tar.gz"}`;

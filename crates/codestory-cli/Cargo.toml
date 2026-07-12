@@ -9,10 +9,6 @@ readme = "../../README.md"
 keywords = ["code-search", "grounding", "cli", "agents"]
 categories = ["command-line-utilities", "development-tools"]
 
-[features]
-default = []
-diagnostic-onnx = ["codestory-runtime/diagnostic-onnx"]
-
 [dependencies]
 codestory-contracts = { workspace = true }
 codestory-retrieval = { workspace = true }

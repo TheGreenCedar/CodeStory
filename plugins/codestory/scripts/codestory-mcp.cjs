@@ -445,6 +445,7 @@ function assetTarget() {
   if (platform === 'win32' && arch === 'arm64') return 'windows-arm64';
   if (platform === 'linux' && arch === 'x64') return 'linux-x64';
   if (platform === 'linux' && arch === 'arm64') return 'linux-arm64';
+  if (platform === 'darwin' && arch === 'x64') return 'macos-x64';
   if (platform === 'darwin' && arch === 'arm64') return 'macos-arm64';
   return null;
 }

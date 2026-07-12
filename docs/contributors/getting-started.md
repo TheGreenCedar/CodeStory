@@ -122,7 +122,6 @@ instead of `cargo run`:
 
 ```sh
 cargo build --release -p codestory-cli
-./target/release/codestory-cli setup embeddings --project . --dry-run
 ./target/release/codestory-cli index --project . --refresh auto
 ./target/release/codestory-cli ready --project . --goal local
 ./target/release/codestory-cli ground --project . --why
@@ -144,12 +143,6 @@ The plugin source-build setup fallback accepts `CODESTORY_REPO_URL` and
 `CODESTORY_REPO_REF` when you need a specific source artifact. Without an
 explicit ref, setup fetches and builds the remote default branch.
 
-This loop proves the local CLI and diagnostic ONNX asset path are wired, but
-it is not product packet/search sidecar setup. Treat `setup embeddings
---dry-run` as an asset-plan check only. It should not start an embedding server,
-write a product retrieval manifest, or make agent-facing retrieval evidence
-trustworthy by itself.
-
 Read commands default to `--refresh none`. If a read command says the cache is
 empty, either run `index --refresh full` first or rerun the read command with an
 explicit refresh mode. Agent-facing `packet` and `search` evidence require full
@@ -167,9 +160,8 @@ work. Prepare the managed full-sidecar path before debugging ranking quality:
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
 - embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` and local llama.cpp sidecar settings
 
-Hash embeddings, ONNX-only flows, and lexical-only switches are diagnostic or
-historical comparison modes only; they are not valid agent-facing retrieval
-setup.
+Hash embeddings and lexical-only switches are diagnostic modes only; they are
+not valid agent-facing retrieval setup.
 
 After bootstrap, run a target-repo sidecar index before using packet/search:
 

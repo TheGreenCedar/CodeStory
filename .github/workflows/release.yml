@@ -144,18 +144,19 @@ jobs:
             target/release-assets/codestory-cli-v${VERSION}-*.zip
             target/release-assets/SHA256SUMS.txt
           )
-          if [ "${#assets[@]}" -ne 6 ]; then
-            echo "::error::Expected five binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
+          if [ "${#assets[@]}" -ne 7 ]; then
+            echo "::error::Expected six binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
           cat > target/release-assets/proof-boundaries.md <<'EOF'
           ## Platform proof boundaries
 
-          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS arm64.
+          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS x64/arm64.
 
           - Windows x64 managed install, local ground, and repair handoff are acceptance-smoked; this is not full sidecar or GPU proof.
           - Apple Silicon packaging is acceptance-smoked, while live managed Metal endpoint survival remains open in #887.
+          - Intel macOS packaging is acceptance-smoked; it does not make Apple Silicon Metal claims.
           - Windows arm64 ships a CLI asset but has no managed native accelerated embedding cell.
           - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
           - Older-glibc compatibility is unproven; execution on the current hosted Ubuntu runner does not establish it.

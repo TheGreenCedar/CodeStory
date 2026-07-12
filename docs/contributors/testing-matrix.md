@@ -121,7 +121,7 @@ the active plugin runtime plus observed and missing server-advertised MCP
 resources. This proves the installed plugin launcher advertises the resources;
 it is not Codex host/model visibility proof.
 
-Packaged acceptance uses the same five native hosted-runner cells before and
+Packaged acceptance uses the same six native hosted-runner cells before and
 after publication. Pull requests that change release, packaging, installer, or
 plugin-launch surfaces call the same read-only reusable packaged-proof workflow
 as the release, so the native matrix is reviewed before publication without
@@ -133,11 +133,13 @@ granting release permissions to pull-request code:
 | Linux arm64 | `ubuntu-24.04-arm` | Version, help, and stdio shape |
 | Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, local ground, and repair handoff |
 | Windows arm64 | `windows-11-arm` | Version, help, and stdio shape |
+| macOS x64 | `macos-15-intel` | Version, help, and stdio shape |
 | macOS arm64 | `macos-15` | Version, help, and stdio shape |
 
 The Windows managed handoff proves that the packaged CLI can be installed by
 the plugin, serve status, use the local graph, and publish a background repair
-reservation. It does not prove full sidecars or GPU execution. macOS arm64
+reservation. It does not prove full sidecars or GPU execution. macOS x64
+package execution does not make Apple Silicon acceleration claims. macOS arm64
 package execution does not close #887; live managed Metal endpoint survival
 still needs reporter or equivalent Apple Silicon hardware evidence. Current
 Ubuntu execution does not prove older-glibc compatibility.

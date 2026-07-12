@@ -77,12 +77,12 @@ Layer repair should follow the first failing layer, not a broad rebuild:
 | Zoekt lexical sidecar | `retrieval status` mode/degraded reason, selected profile/port, ownership, and Zoekt health text | Rerun bootstrap for the selected profile; for managed Agent state, do not assume or free the Local default port |
 | Qdrant dense sidecar | Qdrant health, collection name, point count, dense-anchor count, backend/dimension fields | Fix Qdrant/model/backend state; move the Qdrant cache aside only if repeated health checks fail |
 | SCIP graph artifacts | `scip_unavailable`, graph artifact hash/path, manifest contract | Rerun `retrieval index --refresh full`; inspect SCIP cache paths if it repeats |
-| Embedding endpoint | `CODESTORY_EMBED_LLAMACPP_URL`, managed embeddings probe, model/backend/dimension fields | Start or reconfigure llama.cpp, then rerun retrieval index/status |
+| Embedding endpoint | `CODESTORY_EMBED_LLAMACPP_URL`, sidecar health, model/backend/dimension fields | Start or reconfigure llama.cpp, then rerun retrieval index/status |
 | Manifest contract | `manifest_contract`, source root, input hash, generation, schema, graph hash, counts, lane provenance | Rerun `retrieval index --project <repo> --refresh full` |
 
 A legacy semantic diagnostic warning against `127.0.0.1:8080` is not by itself a
 packet/search blocker when `doctor` reports `sidecar_retrieval: mode=full` and
-the managed embeddings probe succeeds against the configured endpoint. Keep the
+the sidecar health probe succeeds against the configured endpoint. Keep the
 warning in the evidence bundle; do not treat it as proof that a separate
 runtime fix has landed.
 
@@ -341,7 +341,7 @@ Cache-root and profile layout:
 
 | Scope | Location |
 |-------|----------|
-| Explicit override | `CODESTORY_CACHE_ROOT` wins for CLI, managed embeddings, broker, and sidecar state |
+| Explicit override | `CODESTORY_CACHE_ROOT` wins for CLI, broker, and sidecar state |
 | Windows default | `%LOCALAPPDATA%\codestory\codestory\cache` |
 | macOS default | `~/Library/Caches/dev.codestory.codestory` |
 | Linux default | `$XDG_CACHE_HOME/codestory`, normally `~/.cache/codestory` |
@@ -352,9 +352,7 @@ Cache-root and profile layout:
 Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
 `target/retrieval-models` are accepted only after pinned size and SHA-256
 verification by the setup wrapper. Remove that model directory to uninstall the
-downloaded GGUF. Diagnostic ONNX assets from `setup embeddings` are separate,
-are not promoted into product runtime defaults, and do not substitute for
-llama.cpp sidecar retrieval.
+downloaded GGUF.
 
 ## Operator troubleshooting
 

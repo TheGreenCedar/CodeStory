@@ -11,9 +11,16 @@ const cliPath = process.platform === "win32"
   ? join(repoRoot, "target", "release", "codestory-cli.exe")
   : join(repoRoot, "target", "release", "codestory-cli");
 
-const args = new Set(process.argv.slice(2));
+const argv = process.argv.slice(2);
+const args = new Set(argv);
+const allowedArgs = new Set(["--help", "-h", "--quick", "--no-refresh", "--fail-on-gap"]);
+const unknownArgs = argv.filter((arg) => !allowedArgs.has(arg));
+if (unknownArgs.length > 0) {
+  console.error(`Unknown argument${unknownArgs.length === 1 ? "" : "s"}: ${unknownArgs.join(", ")}`);
+  process.exit(2);
+}
 if (args.has("--help") || args.has("-h")) {
-  console.log(`Usage: node scripts/codestory-manual-friction-check.mjs [--quick] [--no-refresh] [--setup-embeddings] [--fail-on-gap]
+  console.log(`Usage: node scripts/codestory-manual-friction-check.mjs [--quick] [--no-refresh] [--fail-on-gap]
 
 Runs the CodeStory skill-first manual-friction harness across ../Sourcetrail,
 ../rootandruntime, and this repo. The gap list is seeded from the three manual
@@ -26,9 +33,6 @@ and writes a JSON report under target/autoresearch/.`);
 const quick = args.has("--quick");
 const refreshFull = !quick && !args.has("--no-refresh");
 const failOnGap = args.has("--fail-on-gap");
-const setupEmbeddings =
-  args.has("--setup-embeddings") ||
-  process.env.CODESTORY_MANUAL_FRICTION_SETUP_EMBEDDINGS === "1";
 
 const repos = [
   resolve(repoRoot, "..", "Sourcetrail"),
@@ -50,7 +54,6 @@ const report = {
   cli_path: cliPath,
   mode: quick ? "quick" : "full",
   refresh_full: refreshFull,
-  setup_embeddings: setupEmbeddings,
   repos: [],
   gaps: [],
 };
@@ -370,16 +373,6 @@ if (!existsSync(cliPath)) {
     { cli_path: cliPath },
   );
 } else {
-  if (setupEmbeddings) {
-    const setup = runCli(["setup", "embeddings", "--project", repoRoot, "--format", "json"], {
-      timeoutMs: 600_000,
-    });
-    report.setup_embeddings_transcript = compactTranscript(setup);
-    if (setup.status !== 0) {
-      addGap("all", "embedding_setup_failed", 0, "managed embedding setup failed", compactTranscript(setup));
-    }
-  }
-
   for (const repoPath of repos) {
     const repoName = basename(repoPath);
     const repoReport = {

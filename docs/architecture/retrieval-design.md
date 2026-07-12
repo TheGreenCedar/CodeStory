@@ -23,8 +23,8 @@ with `retrieval_mode=full`.
 
 Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
 `unavailable`, stale manifests, stub markers, disabled sidecars, hash vectors,
-ONNX-only paths, old env aliases, and `CODESTORY_RETRIEVAL=0` fail closed for
-agent-facing packet/search.
+removed ONNX configuration, old env aliases, and `CODESTORY_RETRIEVAL=0` fail
+closed for agent-facing packet/search.
 
 ## Ownership
 

@@ -38,6 +38,9 @@ jobs:
           - os: windows-11-arm
             asset_target: windows-arm64
             extension: zip
+          - os: macos-15-intel
+            asset_target: macos-x64
+            extension: tar.gz
           - os: macos-15
             asset_target: macos-arm64
             extension: tar.gz
