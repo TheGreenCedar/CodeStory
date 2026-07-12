@@ -892,6 +892,35 @@ fn read_sidecar_state(path: &Path) -> Option<SidecarStateFile> {
         .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
 }
 
+pub(crate) fn embedding_launch_metadata_for_runtime(
+    runtime: &SidecarRuntimeConfig,
+) -> Option<EmbeddingLaunchMetadata> {
+    let state = read_sidecar_state(&runtime.layout.state_file)?;
+    (state.owner == "codestory"
+        && state.namespace == runtime.namespace
+        && state.profile == runtime.profile.as_str()
+        && state.run_id.as_deref() == runtime.run_id.as_deref()
+        && state.embed_http_port == runtime.embed_http_port
+        && state.embed_url == SidecarLayout::embed_base_url(runtime.embed_http_port))
+    .then_some(state.embedding_launch)
+    .flatten()
+}
+
+pub(crate) fn live_native_embedding_launch_metadata_for_runtime(
+    runtime: &SidecarRuntimeConfig,
+) -> Result<Option<EmbeddingLaunchMetadata>> {
+    if crate::config::embedding_server_launch_mode_for_runtime(runtime)?
+        != crate::config::EmbeddingServerLaunchMode::NativeSpawned
+    {
+        return Ok(None);
+    }
+    let launch = embedding_launch_metadata_for_runtime(runtime)
+        .context("native embedding runtime state has no matching launch metadata")?;
+    ensure_native_embedding_launch_identity(&launch)
+        .context("validate live native embedding launch identity")?;
+    Ok(Some(launch))
+}
+
 fn enrich_status_with_semantic_doc_stats(
     mut report: RetrievalStatusReport,
     storage: &Store,

@@ -29,6 +29,14 @@
   and the current runtime log proves positive offload for the requested
   accelerator provider and device. Device inventory alone no longer permits a
   long semantic rebuild.
+- Made current-generation promotion validate the SQLite lexical shard, SCIP
+  revision and graph artifacts, exact Qdrant collection point count and
+  semantic smoke, configured/observed embedding-runtime identity, and either
+  a fresh timed embedding smoke with exact runtime/log-backed accelerator proof
+  or an explicit CPU policy against one candidate. Native and Docker identity
+  must remain live and unchanged across the smoke and final probes. Any
+  component failure or crash before pointer replacement now leaves both current
+  and rollback generations untouched.
 - Made sidecar generation GC root every current and rollback manifest across
   the shared cache scope instead of collapsing rollback evidence to one latest
   generation. Inventory now reports active, rollback, building, and reclaimable

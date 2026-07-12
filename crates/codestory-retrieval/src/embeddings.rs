@@ -591,19 +591,12 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
         crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed => None,
         crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => unreachable!(),
     };
-    let container_identity_before = if launch_mode
-        == crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed
-    {
-        let identity = running_embedding_container_identity(runtime)?;
-        if state.embedding_container_identity.as_deref() != Some(identity.as_str()) {
-            bail!(
-                "gpu_unverified: running embedding container does not match persisted runtime identity"
-            );
-        }
-        Some(identity)
-    } else {
-        None
-    };
+    let container_identity_before =
+        if launch_mode == crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed {
+            Some(ensure_persisted_running_embedding_container_identity_from_state(runtime, &state)?)
+        } else {
+            None
+        };
     let probe = probe_product_embedding_runtime_with_timeout(runtime, ACCELERATOR_SMOKE_TIMEOUT);
     let text = if launch_mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned {
         let after_state = exact_embedding_runtime_state(runtime)?;
@@ -629,7 +622,10 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
         if after_state != state {
             bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
         }
-        let after = running_embedding_container_identity(runtime)?;
+        let after = ensure_persisted_running_embedding_container_identity_from_state(
+            runtime,
+            &after_state,
+        )?;
         if container_identity_before.as_deref() != Some(after.as_str()) {
             bail!("gpu_unverified: embedding container identity changed during accelerator smoke");
         }
@@ -694,6 +690,37 @@ pub(crate) fn running_embedding_container_identity(
         bail!("gpu_unverified: embedding container identity is unavailable");
     }
     validate_running_embedding_container_identity(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub(crate) fn ensure_persisted_running_embedding_container_identity(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<String> {
+    let state = exact_embedding_runtime_state(runtime)?;
+    ensure_persisted_running_embedding_container_identity_from_state(runtime, &state)
+}
+
+fn ensure_persisted_running_embedding_container_identity_from_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    state: &ExactEmbeddingRuntimeState,
+) -> Result<String> {
+    let identity = running_embedding_container_identity(runtime)?;
+    validate_persisted_running_embedding_container_identity(
+        state.embedding_container_identity.as_deref(),
+        &identity,
+    )?;
+    Ok(identity)
+}
+
+fn validate_persisted_running_embedding_container_identity(
+    persisted: Option<&str>,
+    running: &str,
+) -> Result<()> {
+    if persisted != Some(running) {
+        bail!(
+            "gpu_unverified: running embedding container does not match persisted runtime identity"
+        );
+    }
+    Ok(())
 }
 
 fn validate_running_embedding_container_identity(output: &str) -> Result<String> {
@@ -2097,6 +2124,28 @@ mod tests {
                 .expect_err("stopped container must fail")
                 .to_string()
                 .contains("not running")
+        );
+    }
+
+    #[test]
+    fn running_container_identity_must_match_persisted_runtime_identity() {
+        let persisted = "container-a|2026-07-12T00:00:00Z|true";
+        validate_persisted_running_embedding_container_identity(Some(persisted), persisted)
+            .expect("exact persisted running identity");
+        assert!(
+            validate_persisted_running_embedding_container_identity(
+                Some(persisted),
+                "container-b|2026-07-12T00:01:00Z|true",
+            )
+            .expect_err("replacement container must fail persisted identity proof")
+            .to_string()
+            .contains("does not match persisted")
+        );
+        assert!(
+            validate_persisted_running_embedding_container_identity(None, persisted)
+                .expect_err("missing persisted identity must fail")
+                .to_string()
+                .contains("does not match persisted")
         );
     }
 
