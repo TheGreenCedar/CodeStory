@@ -109,17 +109,6 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
         ) -> i32;
     }
 
-    let replacement = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let replaced = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-
     for attempt in 0..REPLACE_ATTEMPTS {
         if !destination.exists() {
             match fs::rename(source, destination) {
@@ -135,6 +124,38 @@ fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
                 Err(_) => {}
             }
         }
+
+        // `ReplaceFileW` does not add the extended-length prefix that Rust's
+        // filesystem APIs apply internally. Canonicalization supplies that
+        // form so isolated test and user cache paths can exceed MAX_PATH.
+        let (replacement_path, replaced_path) =
+            match (fs::canonicalize(source), fs::canonicalize(destination)) {
+                (Ok(replacement), Ok(replaced)) => (replacement, replaced),
+                (source_result, destination_result) => {
+                    if !source.exists() && destination.exists() {
+                        return Ok(());
+                    }
+                    let error = source_result
+                        .err()
+                        .or_else(|| destination_result.err())
+                        .expect("one canonical path failed");
+                    if attempt + 1 == REPLACE_ATTEMPTS {
+                        return Err(error);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+            };
+        let replacement = replacement_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let replaced = replaced_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
 
         // SAFETY: both path buffers are null-terminated and remain alive for the call.
         let result = unsafe {
@@ -253,5 +274,21 @@ mod tests {
         assert!(error.to_string().contains("publish"));
         drop(exclusive_reader);
         assert_eq!(fs::read(&path).expect("read old file"), b"old");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_replaces_existing_file_beyond_max_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let long = "segment".repeat(12);
+        let parent = dir.path().join(&long).join(&long).join(&long);
+        fs::create_dir_all(&parent).expect("long parent");
+        let path = parent.join("state.json");
+        assert!(path.as_os_str().encode_wide().count() > 260);
+        fs::write(&path, b"old").expect("old file");
+
+        write_bytes_atomic(&path, "state", b"new").expect("atomic long-path write");
+
+        assert_eq!(fs::read(&path).expect("read new file"), b"new");
     }
 }
