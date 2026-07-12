@@ -417,7 +417,7 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
 }
 
 #[test]
-fn staged_publication_identity_is_schema_backed_and_verified_before_finalization() {
+fn staged_publication_identity_and_fence_are_complete_before_publication() {
     let runtime = read("crates/codestory-runtime/src/lib.rs");
     let store = read("crates/codestory-store/src/storage_impl/mod.rs");
     let schema = read("crates/codestory-store/src/storage_impl/schema.rs");
@@ -435,8 +435,12 @@ fn staged_publication_identity_is_schema_backed_and_verified_before_finalization
     assert!(
         runtime.contains("next_index_publication(")
             && runtime.contains("staged.store_mut().put_index_publication(&publication)")
-            && runtime.contains("Published index generation changed before finalization"),
-        "full and incremental staging should persist and verify one publication identity before clearing compatibility fences"
+            && runtime
+                .matches("staged.store_mut().finish_incremental_run()")
+                .count()
+                >= 2
+            && runtime.matches("staged.publish(storage_path)").count() >= 2,
+        "full and incremental staging should persist publication identity and clear compatibility fences before publishing"
     );
 }
 

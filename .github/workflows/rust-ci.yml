@@ -122,3 +122,9 @@ jobs:
 
       - name: Prove multi-project embedding endpoint isolation
         run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts multi_project_stdio_keeps_project_embedding_endpoints_isolated_across_a_b_a -- --nocapture
+
+      - name: Prove publication transition failure and cancellation semantics
+        run: cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture
+
+      - name: Prove staged database recovery after process abort
+        run: cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture
