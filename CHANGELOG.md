@@ -56,6 +56,10 @@
   retrieval tasks through allowed project-scoped local graph surfaces, and
   repairs sidecars only when the task actually requires the blocked surface.
   Local navigation remains explicitly weaker than full packet/search proof.
+- Added a test-only hook qualification matrix for orientation, ownership, call
+  flow, change impact, broad retrieval, blocked-deep fallback, and non-repo
+  suppression, including an executable comparison with the former generic
+  status-first behavior and representative recorded agent drill traces.
 - Replaced generic status-only lifecycle guidance with compact repository-task
   routing for orientation, symbol ownership, call flow, change impact, and broad
   questions. Prompt hooks no longer echo user text, suppress non-repository

@@ -1,0 +1,133 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "slug": "orientation",
+      "prompt": "List the languages and major areas in this repository.",
+      "route": "Repository orientation",
+      "required_surfaces": ["ground", "files"]
+    },
+    {
+      "slug": "symbol_lookup",
+      "prompt": "Where is RequestContext defined?",
+      "route": "Symbol ownership",
+      "required_surfaces": ["symbol", "definition"]
+    },
+    {
+      "slug": "call_flow",
+      "prompt": "Who calls RequestContext::open?",
+      "route": "Call flow",
+      "required_surfaces": ["symbol", "callers", "callees", "trace"]
+    },
+    {
+      "slug": "change_impact",
+      "prompt": "Review crates/codestory-runtime/src/lib.rs and identify affected tests.",
+      "route": "Review/change impact",
+      "required_surfaces": ["affected", "symbols", "traces"]
+    },
+    {
+      "slug": "snake_case_change",
+      "prompt": "Fix the refresh_index race.",
+      "route": "Review/change impact",
+      "required_surfaces": ["affected", "symbols", "traces"]
+    },
+    {
+      "slug": "camel_case_change",
+      "prompt": "Refactor routeForPrompt.",
+      "route": "Review/change impact",
+      "required_surfaces": ["affected", "symbols", "traces"]
+    },
+    {
+      "slug": "broad_architecture_full",
+      "prompt": "Explain the broad architecture of this codebase.",
+      "route": "Broad question",
+      "required_surfaces": ["packet"]
+    },
+    {
+      "slug": "broad_architecture_blocked",
+      "prompt": "Explain the codebase architecture when packet/search is blocked.",
+      "route": "Broad question",
+      "required_surfaces": ["ground", "symbol", "trace"],
+      "forbidden_surfaces": ["sidecar_setup"]
+    },
+    {
+      "slug": "non_repository_review",
+      "prompt": "Can you review this restaurant?",
+      "suppressed": true
+    },
+    {
+      "slug": "ambiguous_compiler",
+      "prompt": "Tell me about compiler design.",
+      "suppressed": true
+    },
+    {
+      "slug": "camel_case_chatter",
+      "prompt": "I bought an iPhone.",
+      "suppressed": true
+    },
+    {
+      "slug": "snake_case_chatter",
+      "prompt": "Please update my social_security_number.",
+      "suppressed": true
+    },
+    {
+      "slug": "issue_workflow",
+      "prompt": "Create an issue for the hook initiative.",
+      "suppressed": true
+    }
+  ],
+  "drills": [
+    {
+      "slug": "live_orientation",
+      "prompt": "List the languages and major areas in this repository.",
+      "route": "Repository orientation",
+      "evidence_source": "Codex parent saga live MCP trace for issue 965 on 2026-07-12",
+      "surface_trace": ["status", "ground", "files"],
+      "status_reused": true,
+      "repair_attempted": false
+    },
+    {
+      "slug": "live_symbol_lookup",
+      "prompt": "Where is RuntimeContext defined?",
+      "route": "Symbol ownership",
+      "evidence_source": "Codex parent saga live MCP trace for issue 965 on 2026-07-12",
+      "surface_trace": ["status", "symbol", "definition"],
+      "status_reused": true,
+      "repair_attempted": false
+    },
+    {
+      "slug": "live_call_flow",
+      "prompt": "Who calls wait_for_local_freshness?",
+      "route": "Call flow",
+      "evidence_source": "Codex parent saga live MCP trace for issue 965 on 2026-07-12",
+      "surface_trace": ["status", "symbol", "callers", "callees"],
+      "status_reused": true,
+      "repair_attempted": false
+    },
+    {
+      "slug": "live_change_impact",
+      "prompt": "Review the changed hook files and identify affected tests.",
+      "route": "Review/change impact",
+      "evidence_source": "Codex parent saga live MCP trace for issue 965 on 2026-07-12",
+      "surface_trace": ["status", "affected"],
+      "affected_paths": [
+        "plugins/codestory/hooks/codestory-activate.cjs",
+        "plugins/codestory/tests/plugin-static.test.mjs"
+      ],
+      "affected_outcome": "both paths matched; plugin-static.test.mjs was impacted",
+      "status_reused": true,
+      "repair_attempted": false
+    },
+    {
+      "slug": "live_blocked_broad",
+      "prompt": "Explain the AppController codebase architecture while packet/search is blocked.",
+      "route": "Broad question",
+      "evidence_source": "Codex parent saga live MCP trace for issue 965 on 2026-07-12",
+      "status_outcome": "packet/search blocked: retrieval_manifest_missing",
+      "surface_trace": ["status", "ground", "symbol", "trace", "source"],
+      "blocked_surfaces": ["packet", "search"],
+      "status_reused": true,
+      "repair_attempted": false
+    }
+  ]
+}
