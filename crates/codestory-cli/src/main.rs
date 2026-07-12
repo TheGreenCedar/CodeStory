@@ -2487,26 +2487,29 @@ pub(crate) fn wait_for_local_freshness(
     let refresh_started_at_epoch_ms = lock.started_at_epoch_ms();
     let refresh_pid = lock.pid();
     let refresh_phase = "incremental_index";
-    local_refresh_status::write_local_refresh_status(
-        &inspect_runtime.cache_root,
+    if !lock.write_status(
         &inspect_runtime.project_root,
         "refreshing",
         refresh_phase,
-        refresh_started_at_epoch_ms,
-        refresh_pid,
         None,
-    )?;
+    )? {
+        anyhow::bail!("local refresh ownership changed before indexing");
+    }
+    let heartbeat = local_refresh_status::LocalRefreshHeartbeat::start(
+        &lock,
+        &inspect_runtime.project_root,
+        refresh_phase,
+    );
 
     let index_runtime = RuntimeContext::new(project)?;
-    match index_runtime.ensure_open(args::RefreshMode::Incremental) {
+    let refresh_result = index_runtime.ensure_open(args::RefreshMode::Incremental);
+    heartbeat.stop();
+    match refresh_result {
         Ok(opened) => {
-            let _ = local_refresh_status::write_local_refresh_status(
-                &inspect_runtime.cache_root,
+            let _ = lock.write_status(
                 &inspect_runtime.project_root,
                 "refreshed",
                 refresh_phase,
-                refresh_started_at_epoch_ms,
-                refresh_pid,
                 None,
             );
             let mut output = local_refresh_output_from_summary(&opened.summary);
@@ -2526,13 +2529,10 @@ pub(crate) fn wait_for_local_freshness(
         }
         Err(error) => {
             let error_text = error.to_string();
-            let _ = local_refresh_status::write_local_refresh_status(
-                &inspect_runtime.cache_root,
+            let _ = lock.write_status(
                 &inspect_runtime.project_root,
                 "failed",
                 refresh_phase,
-                refresh_started_at_epoch_ms,
-                refresh_pid,
                 Some(error_text.clone()),
             );
             let mut output = local_refresh_output_from_summary(&summary);

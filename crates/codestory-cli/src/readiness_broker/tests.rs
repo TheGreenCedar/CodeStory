@@ -1174,6 +1174,10 @@ fn reconcile_before_enqueue_cleans_stale_local_refresh() {
     );
     assert!(!cache.path().join("local-refresh-status.json").exists());
     assert!(!cache.path().join("local-refresh.lock").exists());
+    assert!(
+        cache.path().join("local-refresh-state.guard").exists(),
+        "compatibility cleanup must preserve the persistent guard inode"
+    );
 }
 
 #[test]
@@ -1258,6 +1262,49 @@ fn reconcile_before_enqueue_reports_live_stale_local_refresh_without_cleanup() {
         reconciliation.unresolved_orphan_reason.as_deref(),
         Some("local_refresh_cleanup_blocked:live_status_heartbeat_stale")
     );
+}
+
+#[test]
+fn reconcile_before_enqueue_preserves_renewed_live_local_refresh_owner() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let old = now_epoch_ms() - 180_000;
+    fs::write(
+        cache.path().join("local-refresh-status.json"),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "status": "refreshing",
+            "project_root": clean_path_text(project.path()),
+            "phase": "incremental_index",
+            "pid": std::process::id(),
+            "owner_token": "renewed-live",
+            "started_at_epoch_ms": old,
+            "updated_at_epoch_ms": now_epoch_ms(),
+            "last_failure_reason": null
+        }))
+        .expect("status json"),
+    )
+    .expect("write renewed local refresh status");
+    fs::write(
+        cache.path().join("local-refresh.lock"),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "project_root": clean_path_text(project.path()),
+            "pid": std::process::id(),
+            "started_at_epoch_ms": old,
+            "token": "renewed-live"
+        }))
+        .expect("lock json"),
+    )
+    .expect("write renewed local refresh lock");
+
+    let reconciliation =
+        reconcile_before_enqueue(project.path(), cache.path(), Some("shared-agent"), "9.9.9");
+
+    assert!(reconciliation.local_refresh_cleanups.is_empty());
+    assert_ne!(reconciliation.status, "orphan_unresolved");
+    assert!(cache.path().join("local-refresh-status.json").exists());
+    assert!(cache.path().join("local-refresh.lock").exists());
 }
 
 #[test]
