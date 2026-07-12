@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- Renewed live local-refresh ownership during long incremental indexing, with
+  token, PID, and process-start checks that prevent stale workers from
+  overwriting changed ownership or terminal status.
 - Kept packaged local-retrieval proof commands in the local default runtime
   namespace so the cross-platform gate validates a real local handoff before
   exercising agent readiness.
