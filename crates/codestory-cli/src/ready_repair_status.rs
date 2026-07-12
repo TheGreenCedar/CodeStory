@@ -128,6 +128,8 @@ pub(crate) struct ReadyRepairWorkerResult {
     pub(crate) started_at_epoch_ms: i64,
     pub(crate) finished_at_epoch_ms: i64,
     pub(crate) outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_retry_fingerprint: Option<String>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) wait_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +331,7 @@ pub(crate) fn try_reserve_ready_repair(
                 .unwrap_or(stale.started_at_epoch_ms),
             finished_at_epoch_ms: now_epoch_ms(),
             outcome: "abandoned".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: None,
             wait_error: Some(
                 "repair worker reservation owner exited before recording a terminal result"
@@ -755,6 +758,7 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
                 started_at_epoch_ms: status.started_at_epoch_ms,
                 finished_at_epoch_ms: now,
                 outcome: "abandoned".to_string(),
+                auto_retry_fingerprint: None,
                 exit_code: None,
                 wait_error: Some(
                     "repair worker process exited without recording a terminal result".to_string(),
@@ -1401,6 +1405,7 @@ mod tests {
             started_at_epoch_ms: 100,
             finished_at_epoch_ms: 200,
             outcome: "succeeded".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(0),
             wait_error: None,
             terminal_envelope: None,
@@ -1518,6 +1523,7 @@ mod tests {
             started_at_epoch_ms: 100,
             finished_at_epoch_ms: 200,
             outcome: "failed".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(17),
             wait_error: None,
             terminal_envelope: Some(CommandFailureEnvelope::new(ApiError::internal(
@@ -1592,6 +1598,7 @@ mod tests {
             started_at_epoch_ms: status.started_at_epoch_ms,
             finished_at_epoch_ms: 200,
             outcome: "succeeded".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(0),
             wait_error: None,
             terminal_envelope: None,
@@ -1979,6 +1986,63 @@ mod tests {
     }
 
     #[test]
+    fn stale_live_repair_with_exact_identity_is_never_terminated_by_age() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar_with_run_id(state.path(), "shared-agent");
+        let status_path = ready_repair_status_path(&sidecar);
+        fs::create_dir_all(status_path.parent().expect("repair status parent")).expect("state dir");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .expect("long-lived child");
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("long-lived child");
+        let pid = child.id();
+        let process_start_identity =
+            recorded_process_start_identity(pid).expect("child process start identity");
+        let old = now_epoch_ms() - READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64 - 60_000;
+        let status = ReadyRepairStatus {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            status: "repairing".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("shared-agent".to_string()),
+            namespace: sidecar.namespace.clone(),
+            compose_project: sidecar.compose_project.clone(),
+            phase: "Embedding documents".to_string(),
+            pid,
+            attempt_id: Some("stale-live-attempt".to_string()),
+            process_start_identity: Some(process_start_identity),
+            started_at_epoch_ms: old,
+            updated_at_epoch_ms: old,
+        };
+        fs::write(
+            &status_path,
+            serde_json::to_string(&status).expect("status json"),
+        )
+        .expect("write stale live status");
+
+        assert_eq!(
+            read_stale_live_ready_repair_status(&status_path, project.path(), now_epoch_ms()),
+            Some(status),
+            "heartbeat age must remain diagnostic while exact process ownership is live"
+        );
+        assert_eq!(
+            read_abandoned_ready_repair_status(&status_path, project.path(), now_epoch_ms()),
+            None,
+            "age alone must never abandon a live exact-identity owner"
+        );
+        assert!(child.try_wait().expect("probe child").is_none());
+        child.kill().expect("stop probe child");
+        child.wait().expect("reap probe child");
+    }
+
+    #[test]
     fn dead_pid_repair_lock_is_reclaimable_immediately() {
         let project = tempfile::tempdir().expect("project");
         let state = tempfile::tempdir().expect("state");
@@ -2131,6 +2195,7 @@ mod tests {
             started_at_epoch_ms: status.started_at_epoch_ms,
             finished_at_epoch_ms: now + 1,
             outcome: "failed".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(17),
             wait_error: None,
             terminal_envelope: None,

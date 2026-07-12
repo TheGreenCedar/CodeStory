@@ -145,7 +145,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | Status shows `runtime_update.state=available` | Current compatible surfaces keep working; reload when convenient if `restart_recommended=true` |
 | Status shows `repair_setup` | The active runtime could not start or prove compatibility; follow `recommended_next_calls` |
 | Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
-| Packet/search blocked | Follow `recommended_next_calls`; status reads do not spawn repair, so explicit MCP repair is required when recommended; see [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
+| Packet/search blocked | Follow `recommended_next_calls`. Status reads are observational. A grounding/project tool activation starts or attaches local refresh and automatically enqueues agent repair only when the installed sidecar policy is already enabled; otherwise explicit MCP confirmation/repair remains required. See [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | Status/grounding call times out | If status remains visible, reread it and follow its bounded blocker/next call; do not kill or restart managed MCP for index or sidecar readiness. Reload only for host transport/registration failure, plugin/config replacement, or a runtime update whose status says `restart_recommended=true` |
 
 ### Managed platform matrix
