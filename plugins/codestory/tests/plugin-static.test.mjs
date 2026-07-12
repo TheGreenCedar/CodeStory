@@ -20,6 +20,12 @@ const {
   uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
+const { emitGenericUserPromptPolicy } = require(join(
+  pluginRoot,
+  "tests",
+  "fixtures",
+  "hook-generic-baseline.cjs",
+));
 
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
@@ -3189,68 +3195,123 @@ test("hook routing is stateless across repeated and parallel processes", async (
   }
 });
 
-test("hook routes repository prompts and suppresses non-repository chatter", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-route-matrix-"));
+test("hook qualification records emitted routes and observed drill surfaces", async (t) => {
+  const fixture = JSON.parse(await readFile(
+    join(pluginRoot, "tests", "fixtures", "hook-route-qualification.json"),
+    "utf8",
+  ));
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-qualification-"));
+  const surfacePatterns = new Map([
+    ["status", /\bstatus\b/u],
+    ["ground", /\bground\b/u],
+    ["files", /\buse files\b/u],
+    ["symbol", /\bsymbols?\b/u],
+    ["definition", /\bdefinition\b/u],
+    ["callers", /\bcallers\b/u],
+    ["callees", /\bcallees\b/u],
+    ["trace", /\btraces?\b/u],
+    ["trail", /\btrails?\b/u],
+    ["affected", /\baffected\b/u],
+    ["packet", /\bpacket\b/u],
+    ["search", /\bsearch\b/u],
+    ["sidecar_setup", /\bsidecar_setup\b/u],
+  ]);
+  const record = (output) => {
+    const context = output.hookSpecificOutput?.additionalContext || "";
+    const routeInstruction = context.match(/^Route: (.+)$/mu)?.[1] || "";
+    const surfaceText = routeInstruction || context;
+    return {
+      suppressed: !context,
+      route: routeInstruction.match(/^([^:]+):/u)?.[1] || null,
+      instructed_surfaces: [...surfacePatterns]
+        .filter(([, pattern]) => pattern.test(surfaceText))
+        .map(([surface]) => surface),
+    };
+  };
+  const failures = (actual, expected) => {
+    const result = [];
+    if (actual.suppressed !== Boolean(expected.suppressed)) result.push("suppression");
+    if (!expected.suppressed && actual.route !== expected.route) result.push("route");
+    for (const surface of expected.required_surfaces || []) {
+      const normalized = { symbols: "symbol", traces: "trace" }[surface] || surface;
+      if (!actual.instructed_surfaces.includes(normalized)) result.push(`missing:${surface}`);
+    }
+    for (const surface of expected.forbidden_surfaces || []) {
+      if (actual.instructed_surfaces.includes(surface)) result.push(`forbidden:${surface}`);
+    }
+    return result;
+  };
 
   try {
-    const prompts = [
-      ["Give me a broad architecture review of this codebase", /Route: Broad question/u],
-      ["Who calls RuntimeContext::open?", /Route: Call flow/u],
-      ["Explain who calls RuntimeContext::open across the architecture", /Route: Call flow/u],
-      ["Where is RuntimeContext defined?", /Route: Symbol ownership/u],
-      ["Explain where RuntimeContext is defined in this codebase", /Route: Symbol ownership/u],
-      ["Review the changed files and tell me what tests are affected", /Route: Review\/change impact/u],
-      ["Review this PR", /Route: Review\/change impact/u],
-      ["Run cargo test", /Route: Repository orientation/u],
-      ["Run npm test", /Route: Repository orientation/u],
-      ["Fix the refresh_index race", /Route: Review\/change impact/u],
-      ["Refactor routeForPrompt", /Route: Review\/change impact/u],
-      ["Use CodeStory", /Route: Repository orientation/u],
-      ["Rebase this branch onto dev", /Route: Review\/change impact/u],
-      ["Fix function", /Route: Review\/change impact/u],
-      ["Refactor method", /Route: Review\/change impact/u],
-      ["Review class changes", /Route: Review\/change impact/u],
-      ["How does CodeStory grounding work?", /Route: Broad question/u],
-      ["Show the current branch", /Route: Repository orientation/u],
-      ["List the languages in this repository", /Route: Repository orientation/u],
-    ];
-    for (const [prompt, expected] of prompts) {
-      const output = runCodexHook({
+    const cases = fixture.cases.map((entry) => {
+      const currentOutput = runCodexHook({
         hook_event_name: "UserPromptSubmit",
-        prompt,
+        prompt: entry.prompt,
         cwd: repoRoot,
       }, { PLUGIN_DATA: dataDir, PATH: "" });
-      const context = output.hookSpecificOutput.additionalContext;
-      assert.match(context, expected);
+      const context = currentOutput.hookSpecificOutput?.additionalContext || "";
       assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
-      assert.equal(context.includes(prompt), false);
+      assert.equal(context.includes(entry.prompt), false);
       assert.doesNotMatch(context, /hook output truncated/u);
+      const current = record(currentOutput);
+      const baseline = record(emitGenericUserPromptPolicy(entry.prompt));
+      return {
+        slug: entry.slug,
+        current,
+        baseline,
+        current_failures: failures(current, entry),
+        baseline_failures: failures(baseline, entry),
+      };
+    });
+
+    const requiredTraceSurfaces = {
+      "Repository orientation": ["ground", "files"],
+      "Symbol ownership": ["symbol", "definition"],
+      "Call flow": ["symbol", "callers", "callees"],
+      "Review/change impact": ["affected"],
+      "Broad question": ["ground", "symbol", "trace"],
+    };
+    for (const drill of fixture.drills) {
+      const emitted = record(runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        prompt: drill.prompt,
+        cwd: repoRoot,
+      }, { PLUGIN_DATA: dataDir, PATH: "" }));
+      const sourceIndex = drill.surface_trace.indexOf("source");
+      const graphIndex = drill.surface_trace.findIndex((surface) =>
+        ["ground", "symbol", "callers", "callees", "trace", "trail", "affected"].includes(surface));
+      assert.equal(emitted.route, drill.route);
+      assert.equal(drill.surface_trace[0], "status");
+      assert.equal(drill.status_reused, true);
+      assert.ok(drill.evidence_source.includes("live MCP trace"));
+      assert.ok(requiredTraceSurfaces[drill.route].every((surface) =>
+        drill.surface_trace.includes(surface)), drill.evidence_source);
+      if (sourceIndex >= 0) assert.ok(graphIndex > 0 && sourceIndex > graphIndex, drill.evidence_source);
+      if (drill.blocked_surfaces) {
+        assert.ok(drill.blocked_surfaces.every((surface) => drill.status_outcome.includes(surface)));
+      }
+      if (drill.affected_paths) {
+        assert.deepEqual(drill.affected_paths, [
+          "plugins/codestory/hooks/codestory-activate.cjs",
+          "plugins/codestory/tests/plugin-static.test.mjs",
+        ]);
+        assert.match(drill.affected_outcome, /both paths matched/u);
+      }
+      assert.equal(drill.surface_trace.includes("sidecar_setup"), false);
+      assert.equal(drill.repair_attempted, false);
     }
 
-    for (const prompt of [
-      "Thanks, that answers it.",
-      "Can you review this restaurant?",
-      "Explain the egg method.",
-      "I registered for semester classes.",
-      "Tell me about compiler design.",
-      "What is the movie runtime?",
-      "I bought an iPhone.",
-      "Search for eBay.",
-      "Please update my social_security_number.",
-      "Help me build a birdhouse.",
-      "Explain liver function tests.",
-      "Organize my grocery list.",
-      "Create an issue for the hook initiative.",
-      "What is the status of issue #963?",
-      "Update issue #897.",
-    ]) {
-      const chatter = runCodexHook({
-        hook_event_name: "UserPromptSubmit",
-        prompt,
-        cwd: repoRoot,
-      }, { PLUGIN_DATA: dataDir, PATH: "" });
-      assert.equal(Object.hasOwn(chatter, "hookSpecificOutput"), false);
-    }
+    t.diagnostic(JSON.stringify({
+      cases,
+      drills: fixture.drills.map(({ slug, evidence_source, surface_trace }) => ({
+        slug,
+        evidence_source,
+        observed_surfaces: surface_trace,
+      })),
+    }));
+    assert.deepEqual(cases.flatMap(({ slug, current_failures }) =>
+      current_failures.map((failure) => `${slug}:${failure}`)), []);
+    assert.deepEqual(cases.filter(({ baseline_failures }) => baseline_failures.length === 0), []);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
