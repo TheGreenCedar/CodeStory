@@ -49,7 +49,9 @@ use codestory_store::{
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
     SymbolSummaryRecord,
 };
-use codestory_workspace::{RefreshExecutionPlan, RefreshInputs, WorkspaceManifest};
+use codestory_workspace::{
+    RefreshExecutionPlan, RefreshInputs, WorkspaceInventoryOutcome, WorkspaceManifest,
+};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
 use parking_lot::Mutex;
@@ -3656,20 +3658,10 @@ fn index_freshness_from_storage(
         stored_files,
         inventory: Default::default(),
     };
-    let plan = match workspace
-        .build_execution_plan_bounded(&refresh_inputs, INDEX_FRESHNESS_CURRENT_FILE_CAP)
+    let refresh = match workspace
+        .build_execution_outcome_bounded(&refresh_inputs, INDEX_FRESHNESS_CURRENT_FILE_CAP)
     {
-        Ok(Some(plan)) => plan,
-        Ok(None) => {
-            return not_checked_index_freshness(
-                format!(
-                    "current workspace inventory exceeds bounded freshness cap (>{})",
-                    INDEX_FRESHNESS_CURRENT_FILE_CAP
-                ),
-                indexed_file_count,
-                started_at,
-            );
-        }
+        Ok(refresh) => refresh,
         Err(error) => {
             return not_checked_index_freshness(
                 format!("failed to check workspace inventory: {error}"),
@@ -3678,6 +3670,27 @@ fn index_freshness_from_storage(
             );
         }
     };
+    if refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+        let detail = refresh
+            .inventory_issues
+            .first()
+            .map(|issue| format!("{}: {}", issue.path.display(), issue.message));
+        return not_checked_index_freshness(
+            match detail {
+                Some(detail) => format!(
+                    "current workspace inventory is {:?}: {detail}",
+                    refresh.inventory_outcome
+                ),
+                None => format!(
+                    "current workspace inventory is {:?} (>{})",
+                    refresh.inventory_outcome, INDEX_FRESHNESS_CURRENT_FILE_CAP
+                ),
+            },
+            indexed_file_count,
+            started_at,
+        );
+    }
+    let plan = refresh.plan;
 
     let mut changed_file_count = 0u32;
     let mut new_file_count = 0u32;
@@ -12908,6 +12921,57 @@ mod tests {
         let retry = index_freshness_from_storage(project.path(), &workspace, &storage);
         assert_eq!(retry.status, IndexFreshnessStatusDto::Stale);
         assert_eq!(retry.changed_file_count, 1);
+    }
+
+    #[test]
+    fn incomplete_workspace_inventory_is_not_reported_as_removed_files() {
+        let project = tempdir().expect("project");
+        let source_path = project.path().join("stored.rs");
+        let manifest = serde_json::json!({
+            "name": "repo",
+            "version": 1,
+            "source_groups": [{
+                "id": Uuid::new_v4(),
+                "language": "Rust",
+                "standard": "Default",
+                "source_paths": ["unreadable"],
+                "exclude_patterns": [],
+                "include_paths": [],
+                "defines": {},
+                "language_specific": "Other"
+            }]
+        });
+        fs::write(
+            project.path().join("codestory_project.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert stored file");
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::NotChecked);
+        assert_eq!(freshness.removed_file_count, 0);
+        assert!(
+            freshness
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Unreadable")),
+            "unexpected freshness reason: {:?}",
+            freshness.reason
+        );
     }
 
     struct HybridTestEnv {

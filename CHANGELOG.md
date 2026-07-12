@@ -18,6 +18,11 @@
   dense evidence are not cut off by static allowances or query-shape ordering.
   The first blocking stage deadline now also survives later deadline and
   marginal-gain exits, keeping incomplete retrieval fail closed and uncached.
+- Made workspace inventory completeness explicit across complete, partial,
+  unreadable, and bounded discovery. Traversal failures are retained instead of
+  becoming apparent deletions; incremental planning removes stored projections
+  only after a complete inventory, while freshness and cache validation fail
+  closed when absence cannot be proven.
 - Renewed live local-refresh ownership during long incremental indexing, with
   token, PID, and process-start checks that prevent stale workers from
   overwriting changed ownership or terminal status.

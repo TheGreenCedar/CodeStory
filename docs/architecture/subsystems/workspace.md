@@ -8,6 +8,7 @@
 - optional `codestory_workspace.json` member loading for monorepo sessions
 - source-group and ignore configuration
 - file discovery under the workspace root
+- explicit complete, partial, unreadable, and bounded inventory outcomes
 - refresh inputs and refresh-plan computation
 
 ## Entry Points
@@ -15,6 +16,7 @@
 - `crates/codestory-workspace/src/lib.rs`
 - `WorkspaceManifest::open`
 - `WorkspaceManifest::source_files`
+- `WorkspaceManifest::source_inventory`
 - `WorkspaceManifest::full_refresh_execution_plan`
 - `WorkspaceManifest::build_execution_plan`
 
@@ -43,3 +45,4 @@ Each member becomes a synthetic source group rooted at that path. Discovery stil
 - workspace begins depending on store or runtime crates
 - refresh planning requires live SQLite handles instead of inventory inputs
 - discovery returns paths that are not stable for downstream indexing
+- traversal failures are discarded or an incomplete inventory schedules deletion

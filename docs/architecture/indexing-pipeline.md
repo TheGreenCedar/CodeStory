@@ -91,7 +91,8 @@ The indexer does not know whether the store is staged or live.
 `crates/codestory-workspace/src/lib.rs` decides which files belong in the run:
 
 - `source_files` walks the configured source groups from the workspace manifest, follows directories, applies exclude globs, sorts the result, and removes duplicates
-- `build_refresh_plan` compares discovered files against stored inventory
+- `source_inventory` retains whether that walk was complete, partial, unreadable, or stopped by its candidate bound, plus any traversal failures
+- `build_refresh_plan` compares discovered files against stored inventory and only plans stored-file deletion from a complete inventory
 
 For incremental work, a file is reindexed when:
 
@@ -99,7 +100,10 @@ For incremental work, a file is reindexed when:
 - its modification time is newer than the stored row
 - it exists in the store but is marked as not indexed
 
-Files that disappeared from discovery are collected into `files_to_remove`.
+Files that disappeared from a complete discovery are collected into
+`files_to_remove`. Partial, unreadable, and bounded inventories retain observed
+files for safe reindexing but never infer deletion from absence. Runtime
+freshness reports those incomplete inventories as `not_checked`.
 
 ### 4. The indexer prepares file work
 
