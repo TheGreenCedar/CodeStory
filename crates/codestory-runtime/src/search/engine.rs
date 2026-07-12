@@ -1238,6 +1238,56 @@ impl LlamaCppEndpoint {
         format!("http://{}:{}{}", self.host, self.port, self.path)
     }
 
+    fn display_url(&self) -> String {
+        let host = self
+            .host
+            .rsplit_once('@')
+            .map_or(self.host.as_str(), |(_, host)| host);
+        let path = self
+            .path
+            .split_once('#')
+            .map_or(self.path.as_str(), |(path, _)| path);
+        let path = path.split_once('?').map_or(path, |(path, _)| path);
+        format!("http://{host}:{}{path}", self.port)
+    }
+
+    fn redact_error_text(&self, text: &str) -> String {
+        let mut redacted = text.replace(&self.url(), &self.display_url());
+        if let Some((userinfo, host)) = self.host.rsplit_once('@') {
+            redacted = redacted
+                .replace(&self.host, host)
+                .replace(userinfo, "[redacted]");
+            if let Some((username, password)) = userinfo.split_once(':') {
+                for secret in [username, password] {
+                    if !secret.is_empty() {
+                        redacted = redacted.replace(secret, "[redacted]");
+                    }
+                }
+            }
+        }
+        if let Some((_, query_and_fragment)) = self.path.split_once('?') {
+            redacted = redacted.replace(query_and_fragment, "[redacted]");
+            for pair in query_and_fragment
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .split('&')
+            {
+                if let Some((_, value)) = pair.split_once('=')
+                    && !value.is_empty()
+                {
+                    redacted = redacted.replace(value, "[redacted]");
+                }
+            }
+        }
+        if let Some((_, fragment)) = self.path.split_once('#')
+            && !fragment.is_empty()
+        {
+            redacted = redacted.replace(fragment, "[redacted]");
+        }
+        redacted
+    }
+
     fn ensure_reachable(&self) -> Result<()> {
         match ureq::get(&self.url())
             .timeout(Duration::from_millis(750))
@@ -1245,8 +1295,9 @@ impl LlamaCppEndpoint {
         {
             Ok(_) | Err(ureq::Error::Status(_, _)) => Ok(()),
             Err(error) => Err(anyhow!(
-                "failed to connect to llama.cpp endpoint {}: {error}",
-                self.url()
+                "failed to connect to llama.cpp endpoint {}: {}",
+                self.display_url(),
+                self.redact_error_text(&error.to_string())
             )),
         }
     }
@@ -1289,30 +1340,39 @@ fn post_json_to_http_endpoint(
     request: &JsonValue,
 ) -> Result<JsonValue> {
     let body = serde_json::to_string(request).context("failed to serialize llama.cpp request")?;
+    let endpoint_url = endpoint.url();
+    let display_url = endpoint.display_url();
     let agent = ureq::builder().redirects(0).build();
     let response = codestory_retrieval::outbound_http::read_bytes(
         agent
-            .post(&endpoint.url())
+            .post(&endpoint_url)
             .timeout(Duration::from_secs(300))
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
             .send_bytes(body.as_bytes()),
     )
-    .with_context(|| format!("llama.cpp embeddings request to {} failed", endpoint.url()))?;
+    .map_err(|error| {
+        anyhow!(
+            "llama.cpp embeddings request to {display_url} failed: {}",
+            endpoint.redact_error_text(&error.to_string())
+        )
+    })?;
     if !(200..300).contains(&response.status) {
         let response_body = String::from_utf8_lossy(&response.body);
         bail!(
             "llama.cpp embeddings endpoint {} returned HTTP {}: {}",
-            endpoint.url(),
+            display_url,
             response.status,
-            codestory_retrieval::outbound_http::truncate_http_body(&response_body)
+            codestory_retrieval::outbound_http::truncate_http_body(
+                &endpoint.redact_error_text(&response_body)
+            )
         );
     }
 
     serde_json::from_slice(&response.body).with_context(|| {
         format!(
             "failed to parse JSON response from llama.cpp endpoint {}",
-            endpoint.url()
+            display_url
         )
     })
 }
@@ -3063,8 +3123,12 @@ mod tests {
         let (url, handle) = run_one_fake_embedding_server(
             "302 Found",
             "Location: http://127.0.0.1:9/redirected\r\n",
-            "redirected".to_string(),
+            "redirect-secret query-secret".to_string(),
         )?;
+        let url = format!(
+            "{}?token=query-secret#fragment-secret",
+            url.replacen("http://", "http://user:redirect-secret@", 1)
+        );
         let endpoint = LlamaCppEndpoint::parse(&url)?;
 
         let error = post_json_to_http_endpoint(
@@ -3074,7 +3138,68 @@ mod tests {
         .expect_err("embedding POST must not follow redirects");
         handle.join().expect("fake embedding server should finish");
 
-        assert!(error.to_string().contains("HTTP 302"), "{error:#}");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("HTTP 302"), "{rendered}");
+        assert!(rendered.contains(&endpoint.display_url()), "{rendered}");
+        for secret in ["redirect-secret", "query-secret", "fragment-secret"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn llamacpp_runtime_transport_errors_redact_endpoint_secrets() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        let endpoint = LlamaCppEndpoint::parse(&format!(
+            "http://user:transport-secret@{addr}/v1/embeddings?token=query-secret#fragment-secret"
+        ))?;
+
+        let errors = [
+            endpoint.ensure_reachable().expect_err("endpoint is closed"),
+            post_json_to_http_endpoint(
+                &endpoint,
+                &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
+            )
+            .expect_err("endpoint is closed"),
+        ];
+
+        for error in errors {
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains(&endpoint.display_url()), "{rendered}");
+            for secret in ["transport-secret", "query-secret", "fragment-secret"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn llamacpp_invalid_json_error_redacts_endpoint_secrets() -> Result<()> {
+        let (url, handle) = run_one_fake_embedding_server(
+            "200 OK",
+            "",
+            "invalid json-secret query-secret fragment-secret".to_string(),
+        )?;
+        let url = format!(
+            "{}?token=query-secret#fragment-secret",
+            url.replacen("http://", "http://user:json-secret@", 1)
+        );
+        let endpoint = LlamaCppEndpoint::parse(&url)?;
+
+        let error = post_json_to_http_endpoint(
+            &endpoint,
+            &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
+        )
+        .expect_err("response is not JSON");
+        handle.join().expect("fake embedding server should finish");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains(&endpoint.display_url()), "{rendered}");
+        for secret in ["json-secret", "query-secret", "fragment-secret"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
         Ok(())
     }
 

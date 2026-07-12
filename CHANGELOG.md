@@ -44,9 +44,11 @@
   socket-level HTTP and chunked-body parsers with the existing shared `ureq`
   response path. Embedding POSTs do not follow redirects, require an explicit
   2xx response, read successful batch bodies beyond `ureq`'s 10 MiB text limit,
-  and preserve endpoint validation, redacted display URLs, bounded error bodies,
-  response counts, and embedding-dimension checks. Removed the unused search
-  snapshot harness and helpers that were referenced only by that harness.
+  and redact endpoint userinfo, query values, and fragments from runtime
+  reachability, transport, status-body, and JSON diagnostics. Endpoint
+  validation, bounded error bodies, response counts, and embedding-dimension
+  checks remain intact. Removed the unused search snapshot harness and helpers
+  that were referenced only by that harness.
 - Finalized graph-native and dense semantic documents in staged full and
   incremental databases before core publication. Post-publication cache loads
   now hydrate semantic state without rewriting live rows, and an unavailable
