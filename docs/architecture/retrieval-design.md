@@ -66,6 +66,26 @@ back to `workspace_id`; `canonical_root_hash` is only a local broker snapshot
 locator. The 0.14 migration records these identities without renaming existing
 namespace or artifact paths.
 
+Repository identity schema 2 lowercases only the remote host, normalizes an
+omitted port to that scheme's effective default, and preserves the transport
+scheme, repository path case, and meaningful ports. SCP spellings normalize to
+SSH while preserving absolute versus home-relative paths; unqualified local
+remotes fail closed. HTTPS, SSH, Git, and unknown schemes remain distinct.
+Project identity schema 3 hashes canonical workspace paths from native OS
+bytes/code units rather than a lossy UTF-8 rendering. Existing paths are
+compared by filesystem file identity; only missing paths use platform lexical
+rules. On Windows that fallback normalizes separators and dot segments and uses
+ordinal Unicode ignore-case;
+because the target does not exist, it cannot observe a future directory's
+case-sensitivity flag. A schema-1 repository id is never inferred from the
+current remote spelling alone; migration requires persisted provenance.
+
+The schema-2/schema-3 contract is exposed through
+`inspect_repository_identity_v2` and `project_identity_v3`. Existing
+repository-v1/project-v2 broker, repair, and sidecar entrypoints remain
+unchanged until the parent identity migration can move their persisted state
+and ownership checks together.
+
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
 dense-anchor rows, semantic file-role metadata, sidecar schema version, Zoekt
 version pin, embedding backend, embedding dimension, semantic policy version,

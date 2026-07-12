@@ -52,6 +52,14 @@
 
 ### Changed
 
+- Added staged repository-v2/project-v3 identity contracts that preserve
+  transport schemes, effective and non-default remote ports, and case-sensitive
+  repository paths, distinguish absolute and home-relative SCP paths, reject
+  ambiguous local remotes, hash canonical workspace paths without lossy UTF-8
+  conversion, and never guess schema-1 ownership without persisted provenance.
+  A shared path comparator uses full filesystem identity for existing paths and
+  normalized platform lexical rules only for missing paths; current persisted
+  v1/v2 consumers stay unchanged until the coordinated identity migration.
 - Grounding skill guidance now reuses current status, routes blocked deep
   retrieval tasks through allowed project-scoped local graph surfaces, and
   repairs sidecars only when the task actually requires the blocked surface.
