@@ -57,6 +57,7 @@ use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
 const STDIO_RECENT_REPAIR_TTL: Duration = Duration::from_secs(30);
 const STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES: usize = 32 * 1024;
 const STDIO_READY_REPAIR_RESERVATION_HEARTBEAT: Duration = Duration::from_secs(5);
@@ -2712,53 +2713,63 @@ fn read_stdio_status_resource_cached(
         return Ok(cached.value.clone());
     }
 
-    let mut publication_before = runtime
-        .project
-        .complete_index_publication_at(&runtime.storage_path)
-        .map_err(map_api_error)?;
-    let mut value = read_stdio_status_resource_uncached(runtime, state)?;
-    let mut publication_after = runtime
-        .project
-        .complete_index_publication_at(&runtime.storage_path)
-        .map_err(map_api_error)?;
-    if publication_before != publication_after
-        || !stdio_status_matches_publication(&value, publication_after.as_ref())
-    {
-        let completed_refresh = value
-            .get("local_refresh")
-            .filter(|refresh| {
-                refresh.get("state").and_then(serde_json::Value::as_str) == Some("refreshed")
-            })
-            .filter(|refresh| {
-                refresh.get("reason").and_then(serde_json::Value::as_str) == Some("refreshed")
-            })
-            .cloned();
-        publication_before = publication_after;
-        value = read_stdio_status_resource_uncached(runtime, state)?;
-        publication_after = runtime
+    let mut completed_refresh = None;
+    for attempt in 1..=STDIO_STATUS_PUBLICATION_ATTEMPTS {
+        let publication_before = runtime
             .project
             .complete_index_publication_at(&runtime.storage_path)
             .map_err(map_api_error)?;
-        if publication_before != publication_after
-            || !stdio_status_matches_publication(&value, publication_after.as_ref())
+        let mut value = read_stdio_status_resource_uncached(runtime, state)?;
+        completed_refresh = completed_refresh.or_else(|| {
+            value
+                .get("local_refresh")
+                .filter(|refresh| {
+                    refresh.get("reason").and_then(serde_json::Value::as_str) == Some("refreshed")
+                })
+                .cloned()
+        });
+        let publication_after = runtime
+            .project
+            .complete_index_publication_at(&runtime.storage_path)
+            .map_err(map_api_error)?;
+        let cache_key = stdio_status_cache_key_with_publication(
+            runtime,
+            &stdio_publication_fingerprint(publication_after.as_ref()),
+        );
+        if publication_before == publication_after
+            && stdio_status_matches_publication(&value, publication_after.as_ref())
         {
+            if let Some(refresh) = completed_refresh
+                .as_ref()
+                .filter(|refresh| stdio_refresh_matches_publication(refresh, &value))
+            {
+                value["local_refresh"] = refresh.clone();
+            }
+            state.status_cache = Some(StdioStatusCacheEntry {
+                key: cache_key,
+                value: value.clone(),
+                cached_at: Instant::now(),
+            });
+            return Ok(value);
+        }
+        state.status_cache = None;
+        if attempt == STDIO_STATUS_PUBLICATION_ATTEMPTS {
+            let status_generation = value
+                .pointer("/index_publication/generation")
+                .and_then(serde_json::Value::as_u64);
             bail!(
-                "cache_busy: the index publication changed twice while status was reading; retry against the stable publication"
+                "cache_busy: status could not observe one stable complete publication after {STDIO_STATUS_PUBLICATION_ATTEMPTS} attempts (before={:?}, status={status_generation:?}, after={:?})",
+                publication_before
+                    .as_ref()
+                    .map(|publication| publication.generation),
+                publication_after
+                    .as_ref()
+                    .map(|publication| publication.generation)
             );
         }
-        if let Some(completed_refresh) = completed_refresh {
-            value["local_refresh"] = completed_refresh;
-        }
+        thread::sleep(Duration::from_millis(5));
     }
-
-    let key = stdio_status_cache_key(runtime);
-    // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
-    state.status_cache = Some(StdioStatusCacheEntry {
-        key,
-        value: value.clone(),
-        cached_at: Instant::now(),
-    });
-    Ok(value)
+    unreachable!("status publication attempt loop always returns or errors")
 }
 
 fn stdio_status_matches_publication(
@@ -2769,6 +2780,13 @@ fn stdio_status_matches_publication(
         .and_then(|publication| serde_json::to_value(publication).ok())
         .unwrap_or(serde_json::Value::Null);
     status.get("index_publication") == Some(&expected)
+}
+
+fn stdio_refresh_matches_publication(
+    refresh: &serde_json::Value,
+    status: &serde_json::Value,
+) -> bool {
+    refresh.get("serving_publication") == status.get("index_publication")
 }
 
 fn read_stdio_status_resource_uncached(
@@ -2969,15 +2987,48 @@ fn stdio_project_args(runtime: &RuntimeContext) -> args::ProjectArgs {
     }
 }
 
+fn stdio_complete_publication_fingerprint(runtime: &RuntimeContext) -> String {
+    match runtime
+        .project
+        .complete_index_publication_at(&runtime.storage_path)
+    {
+        Ok(publication) => stdio_publication_fingerprint(publication.as_ref()),
+        Err(error) => format!("error:{error:?}"),
+    }
+}
+
+fn stdio_publication_fingerprint(publication: Option<&IndexPublicationDto>) -> String {
+    publication.map_or_else(
+        || "missing".to_string(),
+        |publication| {
+            format!(
+                "{}:{}:{}:{}",
+                publication.generation,
+                publication.generation_id,
+                publication.run_id,
+                publication.published_at_epoch_ms
+            )
+        },
+    )
+}
+
 fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
+    // Opening SQLite can touch WAL/SHM metadata, so read publication before the
+    // helper fingerprints storage.
+    let publication = stdio_complete_publication_fingerprint(runtime);
+    stdio_status_cache_key_with_publication(runtime, &publication)
+}
+
+fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication: &str) -> String {
     let layout = SidecarLayout::from_env_for_project(&runtime.project_root);
     let marker_path = stdio_dirty_marker_env_path(&runtime.project_root);
     [
         format!("project:{}", runtime.project_root.display()),
         format!("storage:{}", runtime.storage_path.display()),
+        format!("complete_publication:{publication}"),
         format!(
             "storage_state:{}",
-            stdio_storage_fingerprint(&runtime.storage_path)
+            stdio_path_fingerprint(&runtime.storage_path)
         ),
         format!(
             "sidecar_state:{}",
@@ -6063,6 +6114,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn status_cache_publication_fingerprint_includes_durable_identity() {
+        let publication = |generation| IndexPublicationDto {
+            generation,
+            generation_id: format!("generation-{generation}"),
+            run_id: format!("run-{generation}"),
+            mode: codestory_contracts::api::IndexPublicationModeDto::Incremental,
+            published_at_epoch_ms: generation as i64,
+        };
+        let first = publication(1);
+        let second = publication(2);
+        assert_ne!(
+            stdio_publication_fingerprint(Some(&first)),
+            stdio_publication_fingerprint(Some(&second))
+        );
+        assert_eq!(stdio_publication_fingerprint(None), "missing");
+    }
+
+    #[test]
+    fn completed_refresh_is_reused_only_for_the_same_publication() {
+        let refresh = json!({"serving_publication": {"generation": 2}});
+        assert!(stdio_refresh_matches_publication(
+            &refresh,
+            &json!({"index_publication": {"generation": 2}})
+        ));
+        assert!(!stdio_refresh_matches_publication(
+            &refresh,
+            &json!({"index_publication": {"generation": 3}})
+        ));
+    }
+
     fn base_packet_cache_key_input(question: &str) -> StdioPacketCacheKeyInput<'_> {
         StdioPacketCacheKeyInput {
             storage_fingerprint: "snapshot-a".to_string(),
@@ -7683,7 +7765,7 @@ starting sidecar setup
     }
 
     #[test]
-    fn stdio_status_cache_key_tracks_wal_changes() {
+    fn stdio_status_cache_key_uses_publication_instead_of_volatile_wal_metadata() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
         let runtime = crate::runtime::RuntimeContext::new_inspect_only(&crate::args::ProjectArgs {
@@ -7694,19 +7776,23 @@ starting sidecar setup
         std::fs::create_dir_all(runtime.storage_path.parent().expect("storage parent"))
             .expect("create storage parent");
         std::fs::write(&runtime.storage_path, b"db").expect("write db");
-        let clean = stdio_status_cache_key(&runtime);
+        let publication = "2:generation-2:run-2:200";
+        let clean = stdio_status_cache_key_with_publication(&runtime, publication);
 
         let wal_path = runtime.storage_path.with_extension("db-wal");
         std::fs::write(&wal_path, b"incomplete-marker-frame").expect("write marker WAL frame");
-        let incomplete = stdio_status_cache_key(&runtime);
-        assert_ne!(clean, incomplete, "WAL write must bust cached fresh status");
+        let incomplete = stdio_status_cache_key_with_publication(&runtime, publication);
+        assert_eq!(
+            clean, incomplete,
+            "observer-induced WAL metadata must not invalidate a durable publication key"
+        );
 
         std::fs::write(&wal_path, b"incomplete-marker-frame-cleared")
             .expect("write marker-clear WAL frame");
-        let finished = stdio_status_cache_key(&runtime);
-        assert_ne!(
+        let finished = stdio_status_cache_key_with_publication(&runtime, publication);
+        assert_eq!(
             incomplete, finished,
-            "marker clear must bust cached stale status"
+            "publication identity, not volatile WAL metadata, owns status invalidation"
         );
     }
 }

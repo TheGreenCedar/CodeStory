@@ -4678,6 +4678,12 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             generation == old_generation || generation == old_generation + 1,
             "reader observed an unexpected publication generation: {status}"
         );
+        let expected_status_file_count = if generation == old_generation { 5 } else { 101 };
+        assert_eq!(
+            status["index_freshness"]["indexed_file_count"],
+            json!(expected_status_file_count),
+            "status mixed publication metadata and summary contents: {status}"
+        );
         let ground_response = send_json(
             &mut reader_client,
             json!({
