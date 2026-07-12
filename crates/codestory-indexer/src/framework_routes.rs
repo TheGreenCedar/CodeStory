@@ -379,26 +379,39 @@ fn module_assignment(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn apply_fastapi_assignment(node: Node<'_>, source: &str, bindings: &mut FastApiBindings) {
-    if let Some(receiver) = node
-        .child_by_field_name("left")
-        .filter(|node| node.kind() == "identifier")
-        .and_then(|node| node_text(node, source))
+    let mut targets = HashSet::new();
+    collect_assignment_binding_targets(node, source, &mut targets);
+    let constructs_fastapi = assignment_constructs_fastapi(node, source, bindings);
+    for target in &targets {
+        bindings.receivers.remove(target);
+        bindings.constructors.remove(target);
+        bindings.modules.remove(target);
+    }
+    if constructs_fastapi
+        && targets.len() == 1
+        && let Some(receiver) = targets.into_iter().next()
     {
-        let constructs_fastapi = assignment_constructs_fastapi(node, source, bindings);
-        bindings.receivers.remove(&receiver);
-        bindings.constructors.remove(&receiver);
-        bindings.modules.remove(&receiver);
-        if constructs_fastapi {
-            bindings.receivers.insert(receiver);
-        }
+        bindings.receivers.insert(receiver);
+    }
+}
+
+fn collect_assignment_binding_targets(node: Node<'_>, source: &str, targets: &mut HashSet<String>) {
+    if let Some(left) = node.child_by_field_name("left") {
+        collect_python_binding_target(left, source, targets);
+    }
+    if let Some(right) = node.child_by_field_name("right")
+        && right.kind() == "assignment"
+    {
+        collect_assignment_binding_targets(right, source, targets);
     }
 }
 
 fn assignment_constructs_fastapi(node: Node<'_>, source: &str, bindings: &FastApiBindings) -> bool {
-    if node.kind() == "assignment"
-        && let Some(call) = node
-            .child_by_field_name("right")
-            .filter(|node| node.kind() == "call")
+    let mut value = node.child_by_field_name("right");
+    while let Some(assignment) = value.filter(|node| node.kind() == "assignment") {
+        value = assignment.child_by_field_name("right");
+    }
+    if let Some(call) = value.filter(|node| node.kind() == "call")
         && let Some(function) = call.child_by_field_name("function")
     {
         return match function.kind() {
@@ -802,6 +815,37 @@ app = FastAPI()
 @app.get("/shadowed-function")
 async def shadowed_function(): pass
 "#;
+        let tuple_reassigned = r#"
+from fastapi import FastAPI
+
+app = FastAPI()
+app, other = OtherFramework(), None
+@app.get("/after-tuple-reassignment")
+async def after_tuple_reassignment(): pass
+"#;
+        let nested_destructuring_reassigned = r#"
+from fastapi import FastAPI
+
+app = FastAPI()
+(app, (other,)) = (OtherFramework(), (None,))
+@app.get("/after-nested-reassignment")
+async def after_nested_reassignment(): pass
+"#;
+        let chained_reassigned = r#"
+from fastapi import APIRouter
+
+router = APIRouter()
+app = router = OtherFramework()
+@router.get("/after-chained-reassignment")
+async def after_chained_reassignment(): pass
+"#;
+        let chained_fastapi_construction = r#"
+from fastapi import FastAPI
+
+app = router = FastAPI()
+@app.get("/ambiguous-chained-construction")
+async def ambiguous_chained_construction(): pass
+"#;
         for source in [
             nested_scopes,
             reassigned,
@@ -810,6 +854,10 @@ async def shadowed_function(): pass
             imported_module_shadowed,
             class_shadowed,
             function_shadowed,
+            tuple_reassigned,
+            nested_destructuring_reassigned,
+            chained_reassigned,
+            chained_fastapi_construction,
         ] {
             let result = super::super::index_file(
                 Path::new("scopes.py"),
