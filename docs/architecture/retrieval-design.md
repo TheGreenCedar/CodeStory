@@ -94,8 +94,10 @@ and ownership checks together.
 
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
 dense-anchor rows, semantic file-role metadata, sidecar schema version, lexical
-version pin, embedding backend, embedding dimension, semantic policy version,
-dense reason counts, and SCIP artifact contract inputs.
+version pin, embedding backend, configured profile/model/pooling/normalization
+contract, embedding dimension, semantic policy version, dense reason counts,
+and SCIP artifact contract inputs. Endpoint ports are deliberately excluded:
+they route the retained runtime but do not identify the model or its vectors.
 
 `retrieval index --refresh auto` should reuse an unchanged healthy generation.
 If inputs match but health is not `full`, CodeStory rebuilds the unhealthy
@@ -106,6 +108,21 @@ transaction to hash stored symbol/semantic inputs and update the current
 manifest together. Graph or semantic input drift during a build therefore
 leaves the previous current manifest untouched without holding the write lock
 during workspace discovery.
+
+The publication path has one mandatory validation gate immediately before its
+short input/pointer transaction. The candidate manifest must bind the expected
+SQLite lexical shard, SCIP revision and graph artifacts, Qdrant generation
+collection with an exact point count and semantic smoke, llama.cpp runtime
+identity and dimension, and the configured model/profile contract. Native
+managed launches must also expose a matching model path and launch fingerprint;
+Docker launches must retain the same persisted running-container identity
+across the final probes. Accelerator-required policy reruns a bounded embedding
+request at promotion and binds its timing and current runtime log to the exact
+requested provider and device; explicit CPU policy needs a CPU policy
+observation. External accelerator endpoints cannot borrow local runtime logs.
+Device inventory and manual assertions are diagnostic, not promotion proof. A
+failed component check or crash before pointer replacement leaves current and
+rollback unchanged.
 
 Generation cleanup is a reachability pass. Every canonical generation named by
 a readable current manifest or active/rollback retention marker in the shared

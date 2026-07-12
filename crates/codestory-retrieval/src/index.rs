@@ -467,22 +467,18 @@ pub fn finalize_index_for_runtime_with_progress(
     manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
 
     with_finalize_progress(&mut progress, "manifest write", || {
-        finalize_manifest_after_health_check(
+        persist_finalized_manifest(
             project_root,
             storage_path,
             &retention_context,
-            &layout,
-            &qdrant_client,
-            project_id,
-            &collection,
             &sidecar_input,
+            project_id,
             manifest,
             degraded_modes,
             SidecarStubFlags {
                 qdrant_stubbed,
                 scip_stubbed,
             },
-            &embedding_device,
         )
     })
 }
@@ -705,68 +701,6 @@ fn update_precise_semantic_import_status(
     Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finalize_manifest_after_health_check(
-    project_root: &Path,
-    storage_path: &Path,
-    retention_context: &GenerationRetentionContext<'_>,
-    layout: &SidecarLayout,
-    qdrant_client: &QdrantClient,
-    project_id: String,
-    collection: &str,
-    sidecar_input: &SidecarInputFingerprint,
-    manifest: RetrievalIndexManifest,
-    degraded_modes: Vec<String>,
-    stub_flags: SidecarStubFlags,
-    embedding_device: &crate::embeddings::EmbeddingDeviceReadiness,
-) -> Result<FinalizeIndexOutcome> {
-    let generation = manifest
-        .sidecar_generation
-        .as_deref()
-        .context("mandatory sidecar manifest is missing its generation")?;
-    if !crate::lexical_index::shard_matches_lexical_input(
-        &layout.lexical_data_dir,
-        generation,
-        sidecar_input.lexical_file_count,
-        &sidecar_input.lexical_hash,
-        &sidecar_input.hash,
-    ) {
-        bail!("mandatory SQLite lexical shard is incomplete for {project_id}");
-    }
-    let status = probe_sidecar_health_for_runtime(
-        layout,
-        &project_id,
-        Some(manifest.clone()),
-        embedding_device,
-        retention_context.runtime,
-    );
-    if status.retrieval_mode != "full" {
-        bail!(
-            "mandatory sidecar generation did not reach full mode for {project_id}: {} {:?}",
-            status.retrieval_mode,
-            status.degraded_reason
-        );
-    }
-    if qdrant_ready_point_count(qdrant_client, collection, sidecar_input.projection_count).is_none()
-    {
-        bail!(
-            "mandatory Qdrant semantic collection incomplete for {project_id}: expected at least {} generated points",
-            sidecar_input.projection_count
-        );
-    }
-
-    persist_finalized_manifest(
-        project_root,
-        storage_path,
-        retention_context,
-        sidecar_input,
-        project_id,
-        manifest,
-        degraded_modes,
-        stub_flags,
-    )
-}
-
 #[allow(dead_code)] // Phase 2 cache keys
 pub fn query_fingerprint(query: &str) -> String {
     let digest = Sha256::digest(query.as_bytes());
@@ -869,18 +803,42 @@ fn qdrant_ready_point_count(
     collection: &str,
     expected_points: i64,
 ) -> Option<u64> {
+    qdrant_ready_point_count_with(collection, expected_points, || {
+        qdrant_client.count_points_exact(collection)
+    })
+}
+
+fn qdrant_candidate_point_count(
+    qdrant_client: &QdrantClient,
+    collection: &str,
+    expected_points: i64,
+) -> Option<u64> {
+    qdrant_candidate_point_count_with(expected_points, || {
+        qdrant_ready_point_count(qdrant_client, collection, expected_points)
+    })
+}
+
+fn qdrant_candidate_point_count_with(
+    expected_points: i64,
+    count_points: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    (expected_points > 0).then(count_points).flatten()
+}
+
+fn qdrant_ready_point_count_with(
+    collection: &str,
+    expected_points: i64,
+    count_points: impl FnOnce() -> Result<u64>,
+) -> Option<u64> {
     let expected_points = u64::try_from(expected_points).ok()?;
-    if expected_points == 0 {
-        return Some(0);
-    }
-    match qdrant_client.count_points_exact(collection) {
-        Ok(actual) if actual >= expected_points => Some(actual),
+    match count_points() {
+        Ok(actual) if actual == expected_points => Some(actual),
         Ok(actual) => {
             warn!(
                 collection = %collection,
                 expected_points,
                 actual_points = actual,
-                "Qdrant generated collection is incomplete"
+                "Qdrant generated collection point count does not match its candidate input"
             );
             None
         }
@@ -915,28 +873,42 @@ fn persist_finalized_manifest(
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
     let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    promote_retrieval_manifest(&mut storage, sidecar_input, &manifest, |storage| {
-        let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
-            storage,
-            project_root,
-            &project_id,
-            &embedding_backend,
-            embedding_dim,
-            &retention_context.runtime.embedding,
-            lexical_source,
-        )?;
-        if let Some(reason) = manifest_unavailable_reason_for_runtime(
-            &project_id,
-            storage,
-            &manifest,
-            retention_context.runtime,
-        ) {
-            bail!(
-                "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
-            );
-        }
-        Ok(current_input)
-    })?;
+    promote_retrieval_manifest(
+        &mut storage,
+        sidecar_input,
+        &manifest,
+        |storage| {
+            let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
+                storage,
+                project_root,
+                &project_id,
+                &embedding_backend,
+                embedding_dim,
+                &retention_context.runtime.embedding,
+                lexical_source,
+            )?;
+            if let Some(reason) = manifest_unavailable_reason_for_runtime(
+                &project_id,
+                storage,
+                &manifest,
+                retention_context.runtime,
+            ) {
+                bail!(
+                    "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
+                );
+            }
+            Ok(current_input)
+        },
+        || {
+            validate_candidate_generation(
+                project_root,
+                &project_id,
+                sidecar_input,
+                &manifest,
+                retention_context,
+            )
+        },
+    )?;
 
     let (generation_retention_plan, generation_retention) =
         retain_published_generations(storage_path, retention_context, &project_id, &manifest);
@@ -976,7 +948,9 @@ fn promote_retrieval_manifest(
     expected: &SidecarInputFingerprint,
     manifest: &RetrievalIndexManifest,
     current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
+    validate_candidate: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    validate_candidate()?;
     let mut publication = storage
         .write_transaction()
         .context("lock sidecar input and manifest publication")?;
@@ -989,6 +963,284 @@ fn promote_retrieval_manifest(
     publication
         .finish()
         .context("commit retrieval manifest publication")
+}
+
+#[derive(Clone)]
+struct CandidateGenerationEvidence {
+    lexical_matches: bool,
+    scip_revision: Option<String>,
+    scip_graph: bool,
+    qdrant_points: Option<u64>,
+    qdrant_semantic: bool,
+    qdrant_zero_dense_policy: bool,
+    embedding_device: crate::embeddings::EmbeddingDeviceReadiness,
+    embedding_accelerator_smoke_elapsed_ms: Option<u64>,
+    embedding_launch_before: Option<crate::health::EmbeddingLaunchMetadata>,
+    embedding_launch_after: Option<crate::health::EmbeddingLaunchMetadata>,
+    expected_embedding_launch: Option<crate::health::EmbeddingLaunchMetadata>,
+    embedding_container_identity_required: bool,
+    embedding_container_identity_before: Option<String>,
+    embedding_container_identity_after: Option<String>,
+    retrieval_mode: String,
+    degraded_reason: Option<String>,
+}
+
+fn validate_candidate_generation_evidence(
+    project_id: &str,
+    sidecar_input: &SidecarInputFingerprint,
+    manifest: &RetrievalIndexManifest,
+    runtime: &SidecarRuntimeConfig,
+    evidence: &CandidateGenerationEvidence,
+) -> Result<()> {
+    let expected_embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
+    let expected_embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+        .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
+    if !manifest_matches_sidecar_input(
+        manifest,
+        sidecar_input,
+        &expected_embedding_backend,
+        expected_embedding_dim,
+    ) {
+        bail!("mandatory candidate manifest does not match its sidecar generation input");
+    }
+    if !evidence.lexical_matches {
+        bail!("mandatory candidate generation component failed validation: lexical");
+    }
+    if manifest.scip_revision.is_none()
+        || manifest.scip_revision != evidence.scip_revision
+        || !evidence.scip_graph
+    {
+        bail!("mandatory candidate generation component failed validation: scip");
+    }
+    let zero_dense_candidate = sidecar_input.projection_count == 0
+        && sidecar_input.dense_projection_count == 0
+        && sidecar_input.semantic_policy_version.as_deref()
+            == Some(crate::generation::SEMANTIC_POLICY_VERSION);
+    let qdrant_valid = if zero_dense_candidate {
+        evidence.qdrant_points.is_none()
+            && evidence.qdrant_semantic
+            && evidence.qdrant_zero_dense_policy
+    } else {
+        evidence.qdrant_points.is_some()
+            && evidence.qdrant_semantic
+            && !evidence.qdrant_zero_dense_policy
+    };
+    if !qdrant_valid {
+        bail!("mandatory candidate generation component failed validation: qdrant");
+    }
+    let container_identity_valid = if evidence.embedding_container_identity_required {
+        matches!(
+            (
+                evidence.embedding_container_identity_before.as_deref(),
+                evidence.embedding_container_identity_after.as_deref(),
+            ),
+            (Some(before), Some(after)) if before == after
+        )
+    } else {
+        evidence.embedding_container_identity_before.is_none()
+            && evidence.embedding_container_identity_after.is_none()
+    };
+    let native_launch_stable = match (
+        evidence.embedding_launch_before.as_ref(),
+        evidence.embedding_launch_after.as_ref(),
+    ) {
+        (Some(before), Some(after)) => before == after,
+        (None, None) => true,
+        _ => false,
+    };
+    if !crate::embeddings::manifest_embedding_backend_is_product(
+        manifest.embedding_backend.as_deref(),
+    ) || !embedding_launch_matches_runtime(
+        runtime,
+        evidence.embedding_launch_after.as_ref(),
+        evidence.expected_embedding_launch.as_ref(),
+    ) || !native_launch_stable
+        || !container_identity_valid
+    {
+        bail!("mandatory candidate generation component failed validation: embedding_runtime");
+    }
+    let runtime_cpu_allowed = runtime
+        .embedding
+        .device_policy
+        .eq_ignore_ascii_case("allow_cpu");
+    let device_policy_valid = if evidence.embedding_device.cpu_allowed && runtime_cpu_allowed {
+        evidence.embedding_device.full_retrieval_allowed
+            && evidence.embedding_device.observation_source == "cpu_policy"
+            && evidence.embedding_accelerator_smoke_elapsed_ms.is_none()
+    } else if !evidence.embedding_device.cpu_allowed && !runtime_cpu_allowed {
+        evidence.embedding_accelerator_smoke_elapsed_ms.is_some()
+            && evidence.embedding_device.accelerator_requested
+            && evidence.embedding_device.observed_state == "accelerated"
+            && matches!(
+                evidence.embedding_device.observation_source,
+                "sidecar_log" | "native_log"
+            )
+    } else {
+        false
+    };
+    if !device_policy_valid {
+        bail!("mandatory candidate generation component failed validation: accelerator_proof");
+    }
+    if evidence.retrieval_mode != "full" {
+        bail!(
+            "mandatory candidate generation did not reach full mode for {project_id}: {} {:?}",
+            evidence.retrieval_mode,
+            evidence.degraded_reason
+        );
+    }
+    Ok(())
+}
+
+fn embedding_launch_matches_runtime(
+    runtime: &SidecarRuntimeConfig,
+    observed: Option<&crate::health::EmbeddingLaunchMetadata>,
+    expected: Option<&crate::health::EmbeddingLaunchMetadata>,
+) -> bool {
+    let native = runtime
+        .embedding
+        .server_launch
+        .as_deref()
+        .is_some_and(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "native" | "native_spawned"
+            )
+        });
+    if !native {
+        return true;
+    }
+    let (Some(observed), Some(expected)) = (observed, expected) else {
+        return false;
+    };
+    let Some(model_path) = observed.model_path.as_deref() else {
+        return false;
+    };
+    let profile = normalize_embedding_model_token(&runtime.embedding.profile);
+    let model_file = Path::new(model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(normalize_embedding_model_token)
+        .unwrap_or_default();
+    !profile.is_empty()
+        && model_file.contains(&profile)
+        && observed.launch_mode == expected.launch_mode
+        && observed.endpoint == expected.endpoint
+        && observed.launch_fingerprint_sha256 == expected.launch_fingerprint_sha256
+        && observed.executable_path == expected.executable_path
+        && observed.model_path == expected.model_path
+        && observed.requested_device == expected.requested_device
+}
+
+fn normalize_embedding_model_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn validate_candidate_generation(
+    project_root: &Path,
+    project_id: &str,
+    sidecar_input: &SidecarInputFingerprint,
+    manifest: &RetrievalIndexManifest,
+    context: &GenerationRetentionContext<'_>,
+) -> Result<()> {
+    let generation = manifest
+        .sidecar_generation
+        .as_deref()
+        .context("mandatory sidecar manifest is missing its generation")?;
+    let scip_dir = context.layout.scip_project_dir(generation);
+    let embedding_server_launch_mode =
+        crate::config::embedding_server_launch_mode_for_runtime(context.runtime)?;
+    let embedding_container_identity_required = embedding_server_launch_mode
+        == crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed;
+    let embedding_launch_before =
+        crate::sidecar::live_native_embedding_launch_metadata_for_runtime(context.runtime)
+            .context("validate native embedding identity before final probes")?;
+    let embedding_container_identity_before = embedding_container_identity_required
+        .then(|| {
+            crate::embeddings::ensure_persisted_running_embedding_container_identity(
+                context.runtime,
+            )
+        })
+        .transpose()
+        .context("validate candidate embedding container identity before final probes")?;
+    let qdrant_client = QdrantClient::for_runtime(context.runtime)?;
+    let qdrant_points = qdrant_candidate_point_count(
+        &qdrant_client,
+        &manifest.qdrant_collection,
+        sidecar_input.projection_count,
+    );
+    if sidecar_input.projection_count > 0 {
+        ensure_qdrant_semantic_smoke(project_id, &manifest.qdrant_collection, &qdrant_client)?;
+    }
+    let embedding_accelerator_smoke =
+        crate::embeddings::ensure_embedding_accelerator_smoke_for_runtime(context.runtime)
+            .context("validate candidate embedding accelerator with a fresh timed smoke")?;
+    let embedding_device = embedding_accelerator_smoke
+        .as_ref()
+        .map(|smoke| smoke.device.clone())
+        .unwrap_or_else(|| {
+            crate::embeddings::embedding_device_readiness_for_runtime(context.runtime)
+        });
+    let status = probe_sidecar_health_for_runtime(
+        context.layout,
+        project_id,
+        Some(manifest.clone()),
+        &embedding_device,
+        context.runtime,
+    );
+    let embedding_container_identity_after = embedding_container_identity_required
+        .then(|| {
+            crate::embeddings::ensure_persisted_running_embedding_container_identity(
+                context.runtime,
+            )
+        })
+        .transpose()
+        .context("validate candidate embedding container identity after final probes")?;
+    let embedding_launch_after =
+        crate::sidecar::live_native_embedding_launch_metadata_for_runtime(context.runtime)
+            .context("validate native embedding identity after final probes")?;
+    let evidence = CandidateGenerationEvidence {
+        lexical_matches: crate::lexical_index::shard_matches_lexical_input(
+            &context.layout.lexical_data_dir,
+            generation,
+            sidecar_input.lexical_file_count,
+            &sidecar_input.lexical_hash,
+            &sidecar_input.hash,
+        ),
+        scip_revision: read_scip_revision(&scip_dir),
+        scip_graph: status.scip.capabilities.graph,
+        qdrant_points,
+        qdrant_semantic: status.qdrant.capabilities.semantic,
+        qdrant_zero_dense_policy: sidecar_input.projection_count == 0
+            && sidecar_input.dense_projection_count == 0
+            && status.qdrant.status == crate::health::ComponentStatus::Healthy
+            && status.qdrant.degraded_reason.is_none()
+            && status.qdrant.capabilities.semantic,
+        embedding_device,
+        embedding_accelerator_smoke_elapsed_ms: embedding_accelerator_smoke
+            .map(|smoke| smoke.elapsed_ms),
+        embedding_launch_before,
+        embedding_launch_after,
+        expected_embedding_launch: crate::compose::expected_native_embedding_launch_metadata(
+            project_root,
+            context.runtime,
+        )?,
+        embedding_container_identity_required,
+        embedding_container_identity_before,
+        embedding_container_identity_after,
+        retrieval_mode: status.retrieval_mode,
+        degraded_reason: status.degraded_reason,
+    };
+    validate_candidate_generation_evidence(
+        project_id,
+        sidecar_input,
+        manifest,
+        context.runtime,
+        &evidence,
+    )
 }
 
 fn retain_published_generations(
@@ -1140,7 +1392,7 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         .context("hash lexical symbol input")?;
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v5");
+    hash_part(&mut hasher, "codestory-sidecar-input-v6");
     hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
     hash_part(&mut hasher, &SIDECAR_SCHEMA_VERSION.to_string());
@@ -1149,6 +1401,34 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
     hash_part(&mut hasher, &lexical.hash);
     hash_part(&mut hasher, embedding_backend);
     hash_part(&mut hasher, &embedding_dim.to_string());
+    hash_part(&mut hasher, &embedding.profile);
+    hash_part(&mut hasher, embedding.model_id.as_deref().unwrap_or(""));
+    hash_part(&mut hasher, embedding.pooling.as_deref().unwrap_or(""));
+    hash_part(
+        &mut hasher,
+        &embedding
+            .layer_norm
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    hash_part(
+        &mut hasher,
+        &embedding
+            .truncate_dim
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    hash_part(
+        &mut hasher,
+        &embedding
+            .expected_dim
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    );
+    hash_part(
+        &mut hasher,
+        embedding.server_launch.as_deref().unwrap_or(""),
+    );
     hash_part(&mut hasher, embedding.query_prefix.as_deref().unwrap_or(""));
     hash_part(
         &mut hasher,
@@ -1452,6 +1732,7 @@ mod tests {
 
     #[test]
     fn finalize_index_fails_before_publication_without_runtime_or_artifacts() {
+        let _env = crate::test_support::env_lock();
         let project = TempDir::new().expect("project dir");
         let storage_dir = TempDir::new().expect("storage dir");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -1553,6 +1834,34 @@ mod tests {
     }
 
     #[test]
+    fn qdrant_candidate_point_count_requires_an_exact_verified_collection() {
+        let mut zero_count_calls = 0usize;
+        assert_eq!(
+            qdrant_candidate_point_count_with(0, || {
+                zero_count_calls += 1;
+                Some(0)
+            }),
+            None
+        );
+        assert_eq!(
+            zero_count_calls, 0,
+            "zero-dense candidates must not query an intentionally absent collection"
+        );
+        assert_eq!(
+            qdrant_candidate_point_count_with(2, || {
+                qdrant_ready_point_count_with("exact", 2, || Ok(2))
+            }),
+            Some(2)
+        );
+        assert_eq!(
+            qdrant_candidate_point_count_with(2, || {
+                qdrant_ready_point_count_with("missing", 2, || anyhow::bail!("collection missing"))
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn project_qdrant_repair_noops_without_manifest() {
         let project = TempDir::new().expect("project dir");
         let storage_dir = TempDir::new().expect("storage dir");
@@ -1569,6 +1878,7 @@ mod tests {
 
     #[test]
     fn project_qdrant_repair_uses_selected_runtime_layout() {
+        let _env = crate::test_support::env_lock();
         let project = TempDir::new().expect("project dir");
         let storage_dir = TempDir::new().expect("storage dir");
         let sidecar_dir = TempDir::new().expect("sidecar dir");
@@ -1823,12 +2133,16 @@ mod tests {
 
     #[test]
     fn manifest_promotion_rejects_same_count_content_drift_and_preserves_current() {
+        let _env = crate::test_support::env_lock();
         let project = TempDir::new().expect("project dir");
         std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
             .expect("project file");
         let storage_dir = TempDir::new().expect("storage dir");
         let storage_path = storage_dir.path().join("codestory.db");
         let mut storage = Store::open(&storage_path).expect("open store");
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.embedding.server_launch = None;
+        runtime.embedding.device_policy = "accelerator_required".into();
         storage
             .insert_nodes_batch(&[Node {
                 id: NodeId(1),
@@ -1861,13 +2175,14 @@ mod tests {
         storage
             .upsert_llm_symbol_docs_batch(&[doc.clone()])
             .expect("first doc");
-        let first = compute_sidecar_input_fingerprint(
+        let first = compute_sidecar_input_fingerprint_for_runtime(
             &storage,
             &storage_path,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &runtime.embedding,
         )
         .expect("first fingerprint");
         let old_manifest = retrieval_manifest_for_sidecar(
@@ -1887,13 +2202,14 @@ mod tests {
             .upsert_llm_symbol_docs_batch(&[doc])
             .expect("second doc");
         drop(concurrent);
-        let second = compute_sidecar_input_fingerprint(
+        let second = compute_sidecar_input_fingerprint_for_runtime(
             &storage,
             &storage_path,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &runtime.embedding,
         )
         .expect("second fingerprint");
 
@@ -1913,27 +2229,32 @@ mod tests {
         );
         rejected_manifest.built_at_epoch_ms += 1;
         let lexical_source = lexical_source_input(project.path()).expect("lexical source");
-        let rejected =
-            promote_retrieval_manifest(&mut storage, &first, &rejected_manifest, |snapshot| {
+        let rejected = promote_retrieval_manifest(
+            &mut storage,
+            &first,
+            &rejected_manifest,
+            |snapshot| {
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),
                     "proj",
                     crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
                     crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-                    &crate::config::SidecarRuntimeConfig::local().embedding,
+                    &runtime.embedding,
                     lexical_source,
                 )
-            });
+            },
+            || Ok(()),
+        );
         assert!(rejected.is_err());
         assert_eq!(
             storage
                 .get_retrieval_index_manifest("proj")
                 .expect("current manifest"),
-            Some(old_manifest)
+            Some(old_manifest.clone())
         );
 
-        let new_manifest = retrieval_manifest_for_sidecar(
+        let mut new_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &second.hash),
             &crate::generation::sidecar_qdrant_collection("proj", &second.hash),
@@ -1941,18 +2262,360 @@ mod tests {
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             &second,
         );
-        let lexical_source = lexical_source_input(project.path()).expect("lexical source");
-        promote_retrieval_manifest(&mut storage, &second, &new_manifest, |snapshot| {
-            compute_sidecar_input_fingerprint_with_lexical_source(
-                snapshot,
-                project.path(),
-                "proj",
-                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-                &crate::config::SidecarRuntimeConfig::local().embedding,
-                lexical_source,
+        new_manifest.scip_revision = Some("graph-test".into());
+        let passing = CandidateGenerationEvidence {
+            lexical_matches: true,
+            scip_revision: new_manifest.scip_revision.clone(),
+            scip_graph: true,
+            qdrant_points: Some(second.projection_count as u64),
+            qdrant_semantic: true,
+            qdrant_zero_dense_policy: false,
+            embedding_device: crate::embeddings::EmbeddingDeviceReadiness {
+                requested_policy: "accelerator_required",
+                observed_state: "accelerated",
+                observation_source: "native_log",
+                detected_provider: Some("test".into()),
+                detected_gpu: Some("test accelerator".into()),
+                accelerator_requested: true,
+                accelerator_request_provider: Some("test".into()),
+                accelerator_request_device: None,
+                cpu_allowed: false,
+                full_retrieval_allowed: true,
+                degraded_reason: None,
+            },
+            embedding_accelerator_smoke_elapsed_ms: Some(12),
+            embedding_launch_before: None,
+            embedding_launch_after: None,
+            expected_embedding_launch: None,
+            embedding_container_identity_required: false,
+            embedding_container_identity_before: None,
+            embedding_container_identity_after: None,
+            retrieval_mode: "full".into(),
+            degraded_reason: None,
+        };
+        let mut zero_dense_input = second.clone();
+        zero_dense_input.hash = "zero-dense-candidate".into();
+        zero_dense_input.projection_count = 0;
+        zero_dense_input.dense_projection_count = 0;
+        zero_dense_input.dense_reason_counts_json = "{}".into();
+        let mut zero_dense_manifest = retrieval_manifest_for_sidecar(
+            "proj",
+            &sidecar_generation_id("proj", &zero_dense_input.hash),
+            &crate::generation::sidecar_qdrant_collection("proj", &zero_dense_input.hash),
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &zero_dense_input,
+        );
+        zero_dense_manifest.scip_revision = Some("graph-test".into());
+        let mut zero_dense_evidence = passing.clone();
+        zero_dense_evidence.scip_revision = zero_dense_manifest.scip_revision.clone();
+        zero_dense_evidence.qdrant_points = None;
+        zero_dense_evidence.qdrant_zero_dense_policy = true;
+        validate_candidate_generation_evidence(
+            "proj",
+            &zero_dense_input,
+            &zero_dense_manifest,
+            &runtime,
+            &zero_dense_evidence,
+        )
+        .expect("zero-dense policy accepts an intentionally absent Qdrant collection");
+
+        let mut missing_nonzero_collection = passing.clone();
+        missing_nonzero_collection.qdrant_points = None;
+        validate_candidate_generation_evidence(
+            "proj",
+            &second,
+            &new_manifest,
+            &runtime,
+            &missing_nonzero_collection,
+        )
+        .expect_err("a missing nonzero Qdrant collection must reject promotion");
+
+        let mut cpu_runtime = runtime.clone();
+        cpu_runtime.embedding.device_policy = "allow_cpu".into();
+        let cpu_input = compute_sidecar_input_fingerprint_for_runtime(
+            &storage,
+            &storage_path,
+            project.path(),
+            "proj",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &cpu_runtime.embedding,
+        )
+        .expect("cpu-policy fingerprint");
+        let mut cpu_manifest = retrieval_manifest_for_sidecar(
+            "proj",
+            &sidecar_generation_id("proj", &cpu_input.hash),
+            &crate::generation::sidecar_qdrant_collection("proj", &cpu_input.hash),
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &cpu_input,
+        );
+        cpu_manifest.scip_revision = Some("graph-test".into());
+        let mut cpu_evidence = passing.clone();
+        cpu_evidence.scip_revision = cpu_manifest.scip_revision.clone();
+        cpu_evidence.embedding_device = crate::embeddings::EmbeddingDeviceReadiness {
+            requested_policy: "cpu_allowed",
+            observed_state: "cpu",
+            observation_source: "cpu_policy",
+            detected_provider: None,
+            detected_gpu: None,
+            accelerator_requested: false,
+            accelerator_request_provider: None,
+            accelerator_request_device: None,
+            cpu_allowed: true,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        };
+        cpu_evidence.embedding_accelerator_smoke_elapsed_ms = None;
+        validate_candidate_generation_evidence(
+            "proj",
+            &cpu_input,
+            &cpu_manifest,
+            &cpu_runtime,
+            &cpu_evidence,
+        )
+        .expect("explicit CPU policy remains valid");
+        let mut replaced_container = passing.clone();
+        replaced_container.embedding_container_identity_required = true;
+        replaced_container.embedding_container_identity_before =
+            Some("container-a|start-a|true".into());
+        replaced_container.embedding_container_identity_after =
+            Some("container-b|start-b|true".into());
+        let replaced_error = validate_candidate_generation_evidence(
+            "proj",
+            &second,
+            &new_manifest,
+            &runtime,
+            &replaced_container,
+        )
+        .expect_err("container replacement during final probes must reject promotion");
+        assert!(replaced_error.to_string().contains("embedding_runtime"));
+        let mut stable_container = replaced_container;
+        stable_container.embedding_container_identity_after =
+            stable_container.embedding_container_identity_before.clone();
+        validate_candidate_generation_evidence(
+            "proj",
+            &second,
+            &new_manifest,
+            &runtime,
+            &stable_container,
+        )
+        .expect("one persisted running container identity remains valid across final probes");
+        let mut native_runtime = runtime.clone();
+        native_runtime.embedding.server_launch = Some("native_spawned".into());
+        let native_input = compute_sidecar_input_fingerprint_for_runtime(
+            &storage,
+            &storage_path,
+            project.path(),
+            "proj",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &native_runtime.embedding,
+        )
+        .expect("native fingerprint");
+        let mut native_manifest = retrieval_manifest_for_sidecar(
+            "proj",
+            &sidecar_generation_id("proj", &native_input.hash),
+            &crate::generation::sidecar_qdrant_collection("proj", &native_input.hash),
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &native_input,
+        );
+        native_manifest.scip_revision = Some("graph-test".into());
+        let mut wrong_native_model = passing.clone();
+        wrong_native_model.scip_revision = native_manifest.scip_revision.clone();
+        let expected_native_launch = crate::health::EmbeddingLaunchMetadata {
+            provider: "test".into(),
+            launch_mode: "native_spawned".into(),
+            endpoint: crate::config::SidecarLayout::embed_base_url(native_runtime.embed_http_port),
+            pid: None,
+            spawned_at_epoch_ms: None,
+            launch_args: Vec::new(),
+            launch_fingerprint_sha256: Some("expected-fingerprint".into()),
+            executable_source: None,
+            executable_path: Some("llama-server".into()),
+            model_path: Some("bge-base-en-v1.5.gguf".into()),
+            requested_device: None,
+        };
+        let mut stale_native_launch = expected_native_launch.clone();
+        stale_native_launch.launch_fingerprint_sha256 = Some("stale-fingerprint".into());
+        wrong_native_model.embedding_launch_before = Some(stale_native_launch.clone());
+        wrong_native_model.embedding_launch_after = Some(stale_native_launch);
+        wrong_native_model.expected_embedding_launch = Some(expected_native_launch.clone());
+        let native_error = validate_candidate_generation_evidence(
+            "proj",
+            &native_input,
+            &native_manifest,
+            &native_runtime,
+            &wrong_native_model,
+        )
+        .expect_err("wrong native model must fail");
+        assert!(native_error.to_string().contains("embedding_runtime"));
+        let mut replaced_native = passing.clone();
+        replaced_native.scip_revision = native_manifest.scip_revision.clone();
+        replaced_native.embedding_launch_before = Some(expected_native_launch.clone());
+        let mut replacement_launch = expected_native_launch.clone();
+        replacement_launch.pid = Some(4242);
+        replacement_launch.spawned_at_epoch_ms = Some(456);
+        replaced_native.embedding_launch_after = Some(replacement_launch);
+        replaced_native.expected_embedding_launch = Some(expected_native_launch);
+        let replacement_error = validate_candidate_generation_evidence(
+            "proj",
+            &native_input,
+            &native_manifest,
+            &native_runtime,
+            &replaced_native,
+        )
+        .expect_err("native launch replacement across final probes must fail");
+        assert!(replacement_error.to_string().contains("embedding_runtime"));
+        let mut rollback_manifest = old_manifest.clone();
+        let rollback_hash = "verified-rollback-input";
+        rollback_manifest.sidecar_input_hash = Some(rollback_hash.into());
+        rollback_manifest.sidecar_generation = Some(sidecar_generation_id("proj", rollback_hash));
+        rollback_manifest.qdrant_collection =
+            crate::generation::sidecar_qdrant_collection("proj", rollback_hash);
+        rollback_manifest.built_at_epoch_ms -= 1;
+        let state_file = storage_dir.path().join("state/retrieval-sidecars.json");
+        let marker = GenerationRetentionMarker::next(
+            "workspace",
+            old_manifest.clone(),
+            Some(VerifiedRollbackManifest {
+                manifest: rollback_manifest,
+                verified_at_epoch_ms: 123,
+            }),
+            123,
+        )
+        .expect("retention marker");
+        write_retention_marker(&state_file, &marker).expect("write retention marker");
+        let marker_before = read_retention_marker(&state_file, "workspace")
+            .expect("read marker")
+            .expect("marker exists");
+
+        for component in [
+            "lexical",
+            "scip",
+            "qdrant",
+            "embedding_runtime",
+            "accelerator_proof",
+        ] {
+            let mut failing = passing.clone();
+            let mut candidate_input = second.clone();
+            let mut candidate_runtime = runtime.clone();
+            match component {
+                "lexical" => failing.lexical_matches = false,
+                "scip" => failing.scip_revision = Some("wrong-revision".into()),
+                "qdrant" => failing.qdrant_points = None,
+                "embedding_runtime" => {
+                    candidate_runtime.embedding.model_id = Some("different-768d-model".into());
+                    candidate_input = compute_sidecar_input_fingerprint_for_runtime(
+                        &storage,
+                        &storage_path,
+                        project.path(),
+                        "proj",
+                        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                        crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                        &candidate_runtime.embedding,
+                    )
+                    .expect("mismatched model fingerprint");
+                    assert_ne!(candidate_input.hash, second.hash);
+                }
+                "accelerator_proof" => failing.embedding_accelerator_smoke_elapsed_ms = None,
+                _ => unreachable!(),
+            }
+            let rejected = promote_retrieval_manifest(
+                &mut storage,
+                &candidate_input,
+                &new_manifest,
+                |_| Ok(candidate_input.clone()),
+                || {
+                    validate_candidate_generation_evidence(
+                        "proj",
+                        &candidate_input,
+                        &new_manifest,
+                        &candidate_runtime,
+                        &failing,
+                    )
+                },
             )
-        })
+            .expect_err("component failure must reject promotion");
+            assert!(
+                rejected.to_string().contains(component)
+                    || component == "embedding_runtime"
+                        && rejected.to_string().contains("does not match")
+            );
+            assert_eq!(
+                storage
+                    .get_retrieval_index_manifest("proj")
+                    .expect("current manifest"),
+                Some(old_manifest.clone()),
+                "{component} failure changed current"
+            );
+            assert_eq!(
+                read_retention_marker(&state_file, "workspace")
+                    .expect("read marker")
+                    .expect("marker exists"),
+                marker_before,
+                "{component} failure changed rollback"
+            );
+        }
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = promote_retrieval_manifest(
+                &mut storage,
+                &second,
+                &new_manifest,
+                |_| Ok(second.clone()),
+                || {
+                    validate_candidate_generation_evidence(
+                        "proj",
+                        &second,
+                        &new_manifest,
+                        &runtime,
+                        &passing,
+                    )?;
+                    panic!("simulated crash before candidate promotion")
+                },
+            );
+        }));
+        assert!(crashed.is_err());
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")
+                .expect("current manifest after crash"),
+            Some(old_manifest.clone())
+        );
+        assert_eq!(
+            read_retention_marker(&state_file, "workspace")
+                .expect("read marker")
+                .expect("marker exists"),
+            marker_before
+        );
+        let lexical_source = lexical_source_input(project.path()).expect("lexical source");
+        promote_retrieval_manifest(
+            &mut storage,
+            &second,
+            &new_manifest,
+            |snapshot| {
+                compute_sidecar_input_fingerprint_with_lexical_source(
+                    snapshot,
+                    project.path(),
+                    "proj",
+                    crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                    crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                    &runtime.embedding,
+                    lexical_source,
+                )
+            },
+            || {
+                validate_candidate_generation_evidence(
+                    "proj",
+                    &second,
+                    &new_manifest,
+                    &runtime,
+                    &passing,
+                )
+            },
+        )
         .expect("unchanged input promotes manifest");
         assert_eq!(
             storage
