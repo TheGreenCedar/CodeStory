@@ -1730,6 +1730,78 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
     );
     assert_eq!(first_snapshot["root"], first_again["root"]);
     assert_ne!(first_snapshot["root"], second_snapshot["root"]);
+
+    let status_request = |id: &str, project: &Path| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": project}
+        })
+    };
+    let read_status = |server: &mut StdioServer, id: &str, project: &Path| {
+        let response = send_json(server, status_request(id, project));
+        json_resource_content(
+            assert_success_envelope(&response, json!(id)),
+            "codestory://status",
+        )
+    };
+    let first_status = read_status(&mut server, "multi-first-status", first.path());
+    let second_status = read_status(&mut server, "multi-second-status", second.path());
+    let first_status_again = read_status(&mut server, "multi-first-status-again", first.path());
+    for (status, expected_root) in [
+        (&first_status, &first_root),
+        (&second_status, &second_root),
+        (&first_status_again, &first_root),
+    ] {
+        assert_eq!(
+            fs::canonicalize(
+                status["project_root"]
+                    .as_str()
+                    .expect("status project root")
+            )
+            .expect("canonical status project root"),
+            *expected_root,
+            "status crossed project roots: {status}"
+        );
+        assert!(
+            status["readiness_broker"]["operations"]
+                .as_array()
+                .is_some_and(|operations| operations.iter().all(|operation| {
+                    operation["workspace_root"].as_str().is_none_or(|root| {
+                        fs::canonicalize(root).is_ok_and(|observed| observed == *expected_root)
+                    })
+                })),
+            "readiness operation crossed project roots: {status}"
+        );
+    }
+    assert_ne!(first_status["storage_path"], second_status["storage_path"]);
+    assert_ne!(
+        first_status["readiness_broker"]["identity"]["workspace_id"],
+        second_status["readiness_broker"]["identity"]["workspace_id"]
+    );
+    assert_ne!(
+        first_status["sidecar_retrieval"]["ownership"]["labels"]["dev.codestory.workspace_id"],
+        second_status["sidecar_retrieval"]["ownership"]["labels"]["dev.codestory.workspace_id"]
+    );
+    assert_eq!(
+        first_status["sidecar_retrieval"]["ownership"]["profile"],
+        second_status["sidecar_retrieval"]["ownership"]["profile"],
+        "multi-project routing changed sidecar profile"
+    );
+    for pointer in [
+        "/project_root",
+        "/storage_path",
+        "/readiness_broker/identity/workspace_id",
+        "/sidecar_retrieval/ownership/labels/dev.codestory.workspace_id",
+        "/sidecar_retrieval/ownership/profile",
+    ] {
+        assert_eq!(
+            first_status.pointer(pointer),
+            first_status_again.pointer(pointer),
+            "A/B/A status identity drifted at {pointer}"
+        );
+    }
 }
 
 #[test]

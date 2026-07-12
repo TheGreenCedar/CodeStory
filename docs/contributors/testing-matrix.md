@@ -134,16 +134,20 @@ granting release permissions to pull-request code:
 
 | Asset | Native runner | Required packaged proof |
 | --- | --- | --- |
-| Linux x64 | `ubuntu-latest` | Version, help, stdio shape, managed provisioning, local ground, repair handoff, cleanup, and the full-sidecar agent proof |
-| Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, local ground, repair handoff, and cleanup |
-| Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, local ground, repair handoff, and cleanup |
-| Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, local ground, repair handoff, and cleanup |
-| macOS x64 | `macos-15-intel` | Version, help, stdio shape, managed provisioning, local ground, repair handoff, and cleanup |
-| macOS arm64 | `macos-15` | Version, help, stdio shape, managed provisioning, local ground, repair handoff, and cleanup |
+| Linux x64 | `ubuntu-latest` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, and the full-sidecar agent proof |
+| Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
+| Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
+| Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
+| macOS x64 | `macos-15-intel` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
+| macOS arm64 | `macos-15` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 
-The managed handoff on every native runner proves that the packaged CLI can be
-installed by the plugin, serve status, use the local graph, publish a background
-repair reservation, and clean up its proof-owned processes and cache. It does
+The managed convergence proof on every native runner uses an isolated project
+with a complete publication, then introduces source drift while leaving the
+sidecar manifest absent. It proves that managed status is observational,
+`ground` serves a complete publication and owns activation, one shared-agent
+attempt reaches durable terminal evidence, a newer local generation is
+published, and packet/search remain blocked without verified accelerator smoke.
+The terminal repair may be a fail-closed result on hosted hardware; this does
 not prove full sidecars or GPU execution. macOS x64
 package execution does not make Apple Silicon acceleration claims. macOS arm64
 package execution does not close #887; live managed Metal endpoint survival
