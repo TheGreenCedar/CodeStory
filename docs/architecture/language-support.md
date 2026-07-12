@@ -150,9 +150,11 @@ Framework route extraction has its own confidence labels in
 language can have parser-backed graph support while a framework remains partial
 or heuristic. A route claim needs fixture or real-repo route evidence, not just a
 language parser. FastAPI decorator routes are parser-backed only when a
-tree-sitter query captures a static string path and its decorated handler;
-syntax-error line-scan recovery remains structural evidence and dynamic path
-expressions do not become exact route claims.
+tree-sitter query captures a static string path and decorated handler on a
+receiver locally constructed from an imported `FastAPI` or `APIRouter`.
+Imported but unowned receivers and error-local line-scan recovery remain
+structural evidence. Dynamic paths and ordinary escaped literals do not become
+exact route claims.
 
 ## Expansion Checklist
 

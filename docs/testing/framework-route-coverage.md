@@ -17,9 +17,11 @@ status, confidence floor, handler-link support, known gaps, and promotability.
   Remix, Fastify, Koa, Hono, NestJS.
 - Astro/Vue: Astro and Nuxt file-convention routes, plus Vue Router object
   routes.
-- Python: Django and Flask retain structural collectors. FastAPI decorators use
-  a tree-sitter query for static string paths and handler links; malformed-file
-  lexical recovery is explicitly structural and low-confidence.
+- Python: Django and Flask retain structural collectors. FastAPI decorators on
+  locally constructed `FastAPI`/`APIRouter` receivers use a tree-sitter query
+  for static string paths and handler links. Imported but unowned receivers and
+  error-local malformed-file recovery are explicitly structural and
+  low-confidence.
 - Ruby/PHP/Java/C#: Rails, Laravel, Spring, ASP.NET.
 - Rust: Axum, Actix, Rocket.
 - Go: Gin, Chi, Echo, Fiber as text-only partial route extraction until Go
@@ -67,7 +69,11 @@ be checked with `files --path <fragment>` or a fresh index.
 FastAPI route metadata records `claim_tier=parser_backed` with
 `extraction_provenance=tree_sitter_query`. Its syntax-error fallback records
 `claim_tier=structural`, `extraction_provenance=lexical_fallback`, and
-`confidence=heuristic`; it must not be promoted as parser-backed evidence.
+`confidence=heuristic`; imported receivers without a local constructor record
+`tree_sitter_query_unowned` at the structural tier. Keyword `path=` arguments,
+ordinary escaped string literals, and `head`, `options`, `api_route`, and
+`websocket` decorators are not exact route claims in this slice. Factory-returned
+or injected routers remain structural until receiver provenance is resolved.
 
 ## Verification Playbook
 

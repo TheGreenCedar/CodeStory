@@ -16970,6 +16970,9 @@ fn append_framework_routes(
                     .into_iter()
                     .filter(|route| {
                         !parser_keys.contains(&(route.method.clone(), route.path.clone()))
+                            && framework_routes::allow_python_fastapi_lexical_fallback(
+                                tree, source, route,
+                            )
                     })
                     .map(|route| {
                         route

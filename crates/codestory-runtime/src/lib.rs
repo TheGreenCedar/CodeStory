@@ -194,19 +194,28 @@ fn route_endpoint_extraction_score_adjustment(canonical_id: Option<&str>) -> f32
         return 0.0;
     };
 
-    if canonical
-        .provenance
-        .iter()
-        .any(|entry| entry == "extraction:ast_indexed")
-    {
+    if canonical.provenance.iter().any(|entry| {
+        matches!(
+            entry.as_str(),
+            "extraction:ast_indexed" | "extraction:tree_sitter_query"
+        )
+    }) {
         return 0.025;
+    }
+    if canonical.provenance.iter().any(|entry| {
+        matches!(
+            entry.as_str(),
+            "extraction:text_only" | "extraction:lexical_fallback"
+        )
+    }) {
+        return -0.025;
     }
     if canonical
         .provenance
         .iter()
-        .any(|entry| entry == "extraction:text_only")
+        .any(|entry| entry == "extraction:tree_sitter_query_unowned")
     {
-        return -0.025;
+        return -0.01;
     }
     0.0
 }
@@ -544,10 +553,14 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         framework: "fastapi",
         language: "python",
         status: "partial",
-        coverage_evidence: "validated_by_indexer_regression",
-        confidence_floor: "decorator",
-        handler_link_support: "not_claimed",
-        unsupported_patterns: &["router prefixes and dependency-driven routing are partial"],
+        coverage_evidence: "validated_by_tree_sitter_query_regression",
+        confidence_floor: "heuristic",
+        handler_link_support: "probable_for_decorated_handler",
+        unsupported_patterns: &[
+            "path= keyword arguments and escaped non-raw string literals are not exact routes",
+            "head/options/api_route/websocket decorators are not indexed",
+            "factory-returned or injected router receivers without local construction stay structural",
+        ],
         known_gaps: &["include_router prefix propagation is not modeled"],
         promotable: true,
     },
@@ -12657,6 +12670,32 @@ mod tests {
                 .filter(|entry| entry.language == "go")
                 .all(|entry| entry.handler_link_support == "not_claimed_text_only")
         );
+        let fastapi = coverage
+            .iter()
+            .find(|entry| entry.framework == "fastapi")
+            .expect("FastAPI coverage entry");
+        assert_eq!(
+            fastapi.coverage_evidence,
+            "validated_by_tree_sitter_query_regression"
+        );
+        assert_eq!(
+            fastapi.handler_link_support,
+            "probable_for_decorated_handler"
+        );
+        assert_eq!(fastapi.confidence_floor, "heuristic");
+        for unsupported in [
+            "path= keyword arguments",
+            "head/options/api_route/websocket",
+            "without local construction stay structural",
+        ] {
+            assert!(
+                fastapi
+                    .unsupported_patterns
+                    .iter()
+                    .any(|pattern| pattern.contains(unsupported)),
+                "FastAPI coverage should record {unsupported}"
+            );
+        }
     }
 
     #[test]
@@ -15551,12 +15590,42 @@ fn build_llm_symbol_doc_text() -> String {
                     start_line: Some(8),
                     ..Default::default()
                 },
+                Node {
+                    id: CoreNodeId(25),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    file_node_id: Some(CoreNodeId(20)),
+                    canonical_id: Some(route_canonical_id("tree_sitter_query")),
+                    start_line: Some(4),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(26),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    file_node_id: Some(CoreNodeId(20)),
+                    canonical_id: Some(route_canonical_id("lexical_fallback")),
+                    start_line: Some(5),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(27),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "GET /api/users".to_string(),
+                    file_node_id: Some(CoreNodeId(20)),
+                    canonical_id: Some(route_canonical_id("tree_sitter_query_unowned")),
+                    start_line: Some(6),
+                    ..Default::default()
+                },
             ])
             .expect("insert route nodes");
         let node_names = HashMap::from([
             (CoreNodeId(22), "GET /api/users".to_string()),
             (CoreNodeId(23), "GET /api/users".to_string()),
             (CoreNodeId(24), "plain_handler".to_string()),
+            (CoreNodeId(25), "GET /api/users".to_string()),
+            (CoreNodeId(26), "GET /api/users".to_string()),
+            (CoreNodeId(27), "GET /api/users".to_string()),
         ]);
 
         let ast = AppController::build_search_hit(&storage, &node_names, CoreNodeId(22), 1.0)
@@ -15565,6 +15634,14 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("text-only route hit");
         let normal = AppController::build_search_hit(&storage, &node_names, CoreNodeId(24), 1.0)
             .expect("normal hit");
+        let tree_sitter =
+            AppController::build_search_hit(&storage, &node_names, CoreNodeId(25), 1.0)
+                .expect("tree-sitter route hit");
+        let lexical_fallback =
+            AppController::build_search_hit(&storage, &node_names, CoreNodeId(26), 1.0)
+                .expect("lexical fallback route hit");
+        let unowned = AppController::build_search_hit(&storage, &node_names, CoreNodeId(27), 1.0)
+            .expect("unowned query route hit");
 
         assert!(
             ast.score > text_only.score,
@@ -15572,6 +15649,10 @@ fn build_llm_symbol_doc_text() -> String {
         );
         assert!(ast.score > normal.score);
         assert!(text_only.score < normal.score);
+        assert_eq!(tree_sitter.score, ast.score);
+        assert_eq!(lexical_fallback.score, text_only.score);
+        assert!(unowned.score < normal.score);
+        assert!(unowned.score > lexical_fallback.score);
         assert_eq!(normal.score, 1.0);
 
         let mut hits = [text_only, ast.clone()];
