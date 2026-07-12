@@ -90,6 +90,11 @@ impl RetrievalCache {
         }
     }
 
+    pub fn remove(&mut self, key: &RetrievalCacheKey) {
+        self.entries.remove(key);
+        self.order.retain(|existing| existing != key);
+    }
+
     pub fn merge_delta_from(&mut self, baseline: &RetrievalCache, other: RetrievalCache) {
         let RetrievalCache { entries, order, .. } = other;
         for key in order {

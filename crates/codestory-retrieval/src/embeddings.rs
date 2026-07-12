@@ -66,6 +66,10 @@ impl LlamaCppEmbeddingClient {
     }
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_query_with_timeout(text, HTTP_TIMEOUT)
+    }
+
+    pub fn embed_query_with_timeout(&self, text: &str, timeout: Duration) -> Result<Vec<f32>> {
         let prefix = self.config.query_prefix.as_deref().unwrap_or_else(|| {
             if self.is_llamacpp() {
                 BGE_QUERY_PREFIX_DEFAULT
@@ -73,7 +77,7 @@ impl LlamaCppEmbeddingClient {
                 ""
             }
         });
-        self.embed_prepared(&format!("{prefix}{text}"))
+        self.embed_prepared_with_timeout(&format!("{prefix}{text}"), timeout)
     }
 
     pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -151,12 +155,12 @@ impl LlamaCppEmbeddingClient {
         )
     }
 
-    fn embed_prepared(&self, prepared: &str) -> Result<Vec<f32>> {
+    fn embed_prepared_with_timeout(&self, prepared: &str, timeout: Duration) -> Result<Vec<f32>> {
         if prepared.trim().is_empty() {
             bail!("cannot embed empty text");
         }
         if self.is_llamacpp() {
-            llamacpp_embed_with_timeout(&[prepared.to_string()], &self.config, HTTP_TIMEOUT)?
+            llamacpp_embed_with_timeout(&[prepared.to_string()], &self.config, timeout)?
                 .pop()
                 .ok_or_else(|| anyhow!("llama.cpp returned no embedding vector"))
         } else {
@@ -1312,6 +1316,30 @@ mod tests {
         assert_eq!(vectors[0], vec![1.0, 0.0, 0.0]);
         assert_eq!(vectors[1], vec![0.0, 1.0, 0.0]);
         assert!(request.contains("retained-model-id"), "{request}");
+        Ok(())
+    }
+
+    #[test]
+    fn query_embedding_honors_request_deadline_timeout() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("embedding server address")
+        );
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept embedding request");
+            thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+        let client = LlamaCppEmbeddingClient::new(&llama_client_config(url))?;
+        let started = Instant::now();
+
+        client
+            .embed_query_with_timeout("deadline", Duration::from_millis(20))
+            .expect_err("request deadline should stop a stalled embedding response");
+
+        assert!(started.elapsed() < Duration::from_millis(150));
+        server.join().expect("embedding server thread");
         Ok(())
     }
 

@@ -9,18 +9,21 @@ use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::planner::{PlannedStage, RetrievalStageKind};
 use crate::query_features::{QueryFeatures, classify_query};
 use crate::ranker::rank_candidates;
-use crate::sidecar_search::SidecarSearch;
+use crate::sidecar_search::{SearchExecutionContext, SidecarSearch};
 use anyhow::{Result, bail};
 use codestory_store::RetrievalIndexManifest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
-const BROAD_STAGE_WORKER_LIMIT: usize = 16;
-static BROAD_STAGE_WORKERS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+const STAGE_WORKER_LIMIT: usize = 16;
+const STAGE_WAIT_POLL: Duration = Duration::from_millis(5);
+const MAX_RETRIEVAL_BUDGET_MS: u64 = 120_000;
+static STAGE_WORKER_POOL: OnceLock<StageWorkerPool> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Trace for one retrieval stage.
@@ -31,6 +34,12 @@ pub struct StageTrace {
     pub stage: RetrievalStageKind,
     pub budget_ms: u64,
     pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub admission_wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ms: Option<u64>,
     pub candidates_added: usize,
     pub marginal_gain: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,10 +49,27 @@ pub struct StageTrace {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stub_reason: Option<String>,
+    #[serde(default)]
+    pub completion_status: StageCompletionStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageCompletionStatus {
+    #[default]
+    Completed,
+    PendingAfterDeadline,
+    CancelledBeforeStart,
+    CompletedLate,
+    Skipped,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,13 +134,24 @@ impl<'a> QueryExecutor<'a> {
             );
         }
 
-        if let Some(manifest) = self.manifest.as_ref() {
+        if !self.cancelled.load(Ordering::Acquire)
+            && let Some(manifest) = self.manifest.as_ref()
+        {
             let key = RetrievalCacheKey::from_manifest(manifest, fingerprint.clone());
             if let Some(cached) = self.cache.get(&key) {
+                let cached = cached.to_vec();
+                if self.cancelled.load(Ordering::Acquire) {
+                    return Ok(cancelled_query_result(
+                        features,
+                        mode,
+                        request_started,
+                        "cancelled",
+                    ));
+                }
                 return Ok(QueryResult {
                     query: features.raw_query.clone(),
                     features,
-                    hits: cached.to_vec(),
+                    hits: cached,
                     trace: QueryTrace {
                         retrieval_mode: mode.as_str().into(),
                         degraded_reason: None,
@@ -134,15 +171,18 @@ impl<'a> QueryExecutor<'a> {
             if is_broad_query(features.shape) && budget < planned_budget_ms {
                 scale_stage_budgets(&mut plan.stages, budget);
             }
-            plan.total_budget_ms = budget;
+            plan.total_budget_ms = budget.min(MAX_RETRIEVAL_BUDGET_MS);
         }
+        plan.total_budget_ms = plan.total_budget_ms.min(MAX_RETRIEVAL_BUDGET_MS);
 
         let started = Instant::now();
-        let deadline = started + Duration::from_millis(plan.total_budget_ms);
+        let deadline = started
+            .checked_add(Duration::from_millis(plan.total_budget_ms))
+            .unwrap_or(started);
         let mut candidates = Vec::new();
         let mut stage_traces = Vec::new();
 
-        let cancel_reason = self.run_stage_sequence(
+        let mut cancel_reason = self.run_stage_sequence(
             &features,
             &plan.stages,
             &mut candidates,
@@ -158,11 +198,25 @@ impl<'a> QueryExecutor<'a> {
         let ranked = rank_candidates(&features, candidates);
         let hits = ranked;
 
+        if self.cancelled.load(Ordering::Acquire) {
+            cancel_reason = Some("cancelled".into());
+        } else if Instant::now() >= deadline && cancel_reason.is_none() {
+            cancel_reason = Some("deadline".into());
+        }
+
         if cancel_reason.is_none()
+            && !self.cancelled.load(Ordering::Acquire)
+            && Instant::now() < deadline
             && let Some(manifest) = self.manifest.as_ref()
         {
             let key = RetrievalCacheKey::from_manifest(manifest, fingerprint);
-            self.cache.insert(key, hits.clone());
+            if !self.cancelled.load(Ordering::Acquire) {
+                self.cache.insert(key.clone(), hits.clone());
+                if self.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    self.cache.remove(&key);
+                    cancel_reason = Some(cancellation_reason(&self.cancelled).into());
+                }
+            }
         }
 
         Ok(QueryResult {
@@ -226,13 +280,22 @@ impl<'a> QueryExecutor<'a> {
         stage: &PlannedStage,
         features: &QueryFeatures,
         anchors: &[CandidateHit],
+        context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
         let query = &features.raw_query;
         match stage.kind {
-            RetrievalStageKind::Stage0ScipAnchor => sidecars.scip_anchor(query, stage.top_k),
-            RetrievalStageKind::Stage1Lexical => sidecars.lexical_search(query, stage.top_k),
-            RetrievalStageKind::Stage1bQdrantSemantic => sidecars.qdrant_search(query, stage.top_k),
-            RetrievalStageKind::Stage2ScipExpand => sidecars.scip_expand(anchors, stage.top_k),
+            RetrievalStageKind::Stage0ScipAnchor => {
+                sidecars.scip_anchor_with_context(query, stage.top_k, context)
+            }
+            RetrievalStageKind::Stage1Lexical => {
+                sidecars.lexical_search_with_context(query, stage.top_k, context)
+            }
+            RetrievalStageKind::Stage1bQdrantSemantic => {
+                sidecars.qdrant_search_with_context(query, stage.top_k, context)
+            }
+            RetrievalStageKind::Stage2ScipExpand => {
+                sidecars.scip_expand_with_context(anchors, stage.top_k, context)
+            }
             RetrievalStageKind::Stage3RepoTextFallback => {
                 bail!("repo-text diagnostic stage is unsupported in mandatory sidecar retrieval")
             }
@@ -244,33 +307,88 @@ impl<'a> QueryExecutor<'a> {
         stage: &PlannedStage,
         features: &QueryFeatures,
         anchors: &[CandidateHit],
+        request_deadline: Instant,
     ) -> Result<StageRun> {
-        if !is_broad_query(features.shape) {
-            return Self::run_stage(self.sidecars.as_ref(), stage, features, anchors)
-                .map(StageRun::Completed);
-        }
-
         let stage = stage.clone();
-        let timeout_ms = stage.budget_ms.max(1);
+        let stage_deadline = request_deadline.min(
+            Instant::now()
+                .checked_add(Duration::from_millis(stage.budget_ms.max(1)))
+                .unwrap_or(request_deadline),
+        );
         let features = features.clone();
         let anchors = anchors.to_vec();
         let sidecars = Arc::clone(&self.sidecars);
-        let (sender, receiver) = mpsc::channel();
-        let Some(permit) = BroadStageWorkerPermit::try_acquire() else {
-            return Ok(StageRun::TimedOut("stage_worker_limit"));
+        let stage_cancelled = Arc::new(AtomicBool::new(false));
+        let context = SearchExecutionContext::new(
+            stage_deadline,
+            Arc::clone(&self.cancelled),
+            Arc::clone(&stage_cancelled),
+        );
+        let admission_started = Instant::now();
+        let Some((permit, admission_wait_ms)) =
+            stage_worker_pool().acquire(stage_deadline, self.cancelled.as_ref())
+        else {
+            stage_cancelled.store(true, Ordering::Release);
+            return Ok(StageRun::Cancelled {
+                reason: cancellation_reason(&self.cancelled),
+                admission_wait_ms: admission_started.elapsed().as_millis() as u64,
+                queue_wait_ms: None,
+                execution_ms: None,
+                completion_status: StageCompletionStatus::CancelledBeforeStart,
+            });
         };
-        // ponytail: global cap; use a worker pool if broad-stage timeout volume matters.
-        std::thread::spawn(move || {
-            let _permit = permit;
-            let result = Self::run_stage(sidecars.as_ref(), &stage, &features, &anchors);
-            let _ = sender.send(result);
-        });
+        let state = Arc::new(StageJobState::default());
+        let (sender, receiver) = mpsc::channel();
+        let queued_at = Instant::now();
+        let job = StageJob {
+            queued_at,
+            state: Arc::clone(&state),
+            task: Box::new(move || {
+                Self::run_stage(sidecars.as_ref(), &stage, &features, &anchors, &context)
+            }),
+            sender,
+            _permit: permit,
+        };
+        stage_worker_pool()
+            .sender
+            .send(job)
+            .map_err(|_| anyhow::anyhow!("retrieval stage worker pool disconnected"))?;
 
-        match receiver.recv_timeout(Duration::from_millis(timeout_ms)) {
-            Ok(result) => result.map(StageRun::Completed),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(StageRun::TimedOut("stage_deadline")),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("sidecar stage worker disconnected")
+        loop {
+            if self.cancelled.load(Ordering::Acquire) || Instant::now() >= stage_deadline {
+                stage_cancelled.store(true, Ordering::Release);
+                return Ok(cancelled_stage_run(
+                    cancellation_reason(&self.cancelled),
+                    admission_wait_ms,
+                    &state,
+                ));
+            }
+            let remaining = stage_deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining.min(STAGE_WAIT_POLL)) {
+                Ok(completion) => {
+                    let late = completion.finished_at >= stage_deadline
+                        || self.cancelled.load(Ordering::Acquire);
+                    if late {
+                        stage_cancelled.store(true, Ordering::Release);
+                        return Ok(StageRun::Cancelled {
+                            reason: cancellation_reason(&self.cancelled),
+                            admission_wait_ms,
+                            queue_wait_ms: Some(completion.queue_wait_ms),
+                            execution_ms: Some(completion.execution_ms),
+                            completion_status: StageCompletionStatus::CompletedLate,
+                        });
+                    }
+                    return completion.result.map(|hits| StageRun::Completed {
+                        hits,
+                        admission_wait_ms,
+                        queue_wait_ms: Some(completion.queue_wait_ms),
+                        execution_ms: Some(completion.execution_ms),
+                    });
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("sidecar stage worker disconnected")
+                }
             }
         }
     }
@@ -290,12 +408,12 @@ impl<'a> QueryExecutor<'a> {
             if self.cancelled.load(Ordering::Relaxed) {
                 return Ok(Some("cancelled".into()));
             }
-            if !is_broad_query(features.shape) && Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return Ok(Some("deadline".into()));
             }
 
             if should_skip_after_exact_symbol_anchor(stage, features, candidates) {
-                stage_traces.push(stage_trace(
+                let mut trace = stage_trace(
                     stage,
                     0,
                     0,
@@ -303,11 +421,13 @@ impl<'a> QueryExecutor<'a> {
                     Some("exact_symbol_anchor".into()),
                     false,
                     None,
-                ));
+                );
+                trace.completion_status = StageCompletionStatus::Skipped;
+                stage_traces.push(trace);
                 continue;
             }
             if should_skip_zero_dense_stage(stage, self.manifest.as_ref()) {
-                stage_traces.push(stage_trace(
+                let mut trace = stage_trace(
                     stage,
                     0,
                     0,
@@ -315,28 +435,47 @@ impl<'a> QueryExecutor<'a> {
                     Some("zero_dense_anchors".into()),
                     false,
                     None,
-                ));
+                );
+                trace.completion_status = StageCompletionStatus::Skipped;
+                stage_traces.push(trace);
                 continue;
             }
 
             let stage_started = Instant::now();
             let before_score = candidate_mass(candidates);
-            let mut stage_hits = match self.run_stage_bounded(stage, features, candidates)? {
-                StageRun::Completed(hits) => hits,
-                StageRun::TimedOut(reason) => {
-                    stage_traces.push(stage_trace(
-                        stage,
-                        stage.budget_ms,
-                        0,
-                        0.0,
-                        Some(reason.into()),
-                        false,
-                        None,
-                    ));
-                    cancel_reason.get_or_insert_with(|| reason.into());
-                    continue;
-                }
-            };
+            let (mut stage_hits, admission_wait_ms, queue_wait_ms, execution_ms) =
+                match self.run_stage_bounded(stage, features, candidates, deadline)? {
+                    StageRun::Completed {
+                        hits,
+                        admission_wait_ms,
+                        queue_wait_ms,
+                        execution_ms,
+                    } => (hits, admission_wait_ms, queue_wait_ms, execution_ms),
+                    StageRun::Cancelled {
+                        reason,
+                        admission_wait_ms,
+                        queue_wait_ms,
+                        execution_ms,
+                        completion_status,
+                    } => {
+                        let mut trace = stage_trace(
+                            stage,
+                            stage_started.elapsed().as_millis() as u64,
+                            0,
+                            0.0,
+                            Some(reason.into()),
+                            false,
+                            None,
+                        );
+                        trace.admission_wait_ms = admission_wait_ms;
+                        trace.queue_wait_ms = queue_wait_ms;
+                        trace.execution_ms = execution_ms;
+                        trace.completion_status = completion_status;
+                        stage_traces.push(trace);
+                        cancel_reason.get_or_insert_with(|| reason.into());
+                        continue;
+                    }
+                };
             annotate_stage_provenance(stage, &mut stage_hits);
             let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_hits);
             let added = merge_candidates(candidates, stage_hits);
@@ -347,7 +486,7 @@ impl<'a> QueryExecutor<'a> {
                 ((after_score - before_score) / before_score).max(0.0)
             };
 
-            stage_traces.push(stage_trace(
+            let mut trace = stage_trace(
                 stage,
                 stage_started.elapsed().as_millis() as u64,
                 added,
@@ -355,7 +494,11 @@ impl<'a> QueryExecutor<'a> {
                 None,
                 stage_degraded,
                 stub_reason,
-            ));
+            );
+            trace.admission_wait_ms = admission_wait_ms;
+            trace.queue_wait_ms = queue_wait_ms;
+            trace.execution_ms = execution_ms;
+            stage_traces.push(trace);
 
             if let Some(threshold) = options.stop_marginal_gain_threshold {
                 if marginal_gain < threshold && !candidates.is_empty() {
@@ -372,27 +515,212 @@ impl<'a> QueryExecutor<'a> {
     }
 }
 
-enum StageRun {
-    Completed(Vec<CandidateHit>),
-    TimedOut(&'static str),
-}
-
-struct BroadStageWorkerPermit;
-
-impl BroadStageWorkerPermit {
-    fn try_acquire() -> Option<Self> {
-        BROAD_STAGE_WORKERS_IN_FLIGHT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < BROAD_STAGE_WORKER_LIMIT).then_some(current + 1)
-            })
-            .ok()
-            .map(|_| Self)
+fn cancelled_query_result(
+    features: QueryFeatures,
+    mode: RetrievalDegradedMode,
+    started: Instant,
+    reason: &str,
+) -> QueryResult {
+    QueryResult {
+        query: features.raw_query.clone(),
+        features,
+        hits: Vec::new(),
+        trace: QueryTrace {
+            retrieval_mode: mode.as_str().into(),
+            degraded_reason: None,
+            total_budget_ms: 0,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            cancel_reason: Some(reason.into()),
+            cache_hit: false,
+            stages: Vec::new(),
+        },
     }
 }
 
-impl Drop for BroadStageWorkerPermit {
+enum StageRun {
+    Completed {
+        hits: Vec<CandidateHit>,
+        admission_wait_ms: u64,
+        queue_wait_ms: Option<u64>,
+        execution_ms: Option<u64>,
+    },
+    Cancelled {
+        reason: &'static str,
+        admission_wait_ms: u64,
+        queue_wait_ms: Option<u64>,
+        execution_ms: Option<u64>,
+        completion_status: StageCompletionStatus,
+    },
+}
+
+#[derive(Default)]
+struct StageJobState {
+    started: AtomicBool,
+    queue_wait_ms: AtomicU64,
+}
+
+struct StageCompletion {
+    result: Result<Vec<CandidateHit>>,
+    queue_wait_ms: u64,
+    execution_ms: u64,
+    finished_at: Instant,
+}
+
+struct StageJob {
+    queued_at: Instant,
+    state: Arc<StageJobState>,
+    task: Box<dyn FnOnce() -> Result<Vec<CandidateHit>> + Send>,
+    sender: mpsc::Sender<StageCompletion>,
+    _permit: StageAdmissionPermit,
+}
+
+struct StageWorkerPool {
+    sender: mpsc::SyncSender<StageJob>,
+    admission: Arc<StageAdmission>,
+}
+
+struct StageAdmission {
+    in_flight: Mutex<usize>,
+    available: Condvar,
+    capacity: usize,
+}
+
+struct StageAdmissionPermit {
+    admission: Arc<StageAdmission>,
+}
+
+impl Drop for StageAdmissionPermit {
     fn drop(&mut self) {
-        BROAD_STAGE_WORKERS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        let mut in_flight = self
+            .admission
+            .in_flight
+            .lock()
+            .expect("stage admission lock");
+        *in_flight = in_flight.saturating_sub(1);
+        self.admission.available.notify_one();
+    }
+}
+
+impl StageWorkerPool {
+    fn new(worker_limit: usize, queue_capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<StageJob>(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..worker_limit {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("codestory-retrieval-{index}"))
+                .spawn(move || stage_worker_loop(&receiver))
+                .expect("spawn bounded retrieval stage worker");
+        }
+        Self {
+            sender,
+            admission: Arc::new(StageAdmission {
+                in_flight: Mutex::new(0),
+                available: Condvar::new(),
+                capacity: worker_limit.saturating_add(queue_capacity),
+            }),
+        }
+    }
+
+    fn acquire(
+        &self,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+    ) -> Option<(StageAdmissionPermit, u64)> {
+        let started = Instant::now();
+        let mut in_flight = self
+            .admission
+            .in_flight
+            .lock()
+            .expect("stage admission lock");
+        loop {
+            if cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return None;
+            }
+            if *in_flight < self.admission.capacity {
+                *in_flight += 1;
+                return Some((
+                    StageAdmissionPermit {
+                        admission: Arc::clone(&self.admission),
+                    },
+                    started.elapsed().as_millis() as u64,
+                ));
+            }
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(STAGE_WAIT_POLL);
+            let (guard, _) = self
+                .admission
+                .available
+                .wait_timeout(in_flight, wait)
+                .expect("stage admission wait");
+            in_flight = guard;
+        }
+    }
+}
+
+fn stage_worker_pool() -> &'static StageWorkerPool {
+    STAGE_WORKER_POOL.get_or_init(|| StageWorkerPool::new(STAGE_WORKER_LIMIT, STAGE_WORKER_LIMIT))
+}
+
+fn stage_worker_loop(receiver: &Mutex<mpsc::Receiver<StageJob>>) {
+    loop {
+        let job = match receiver.lock().expect("stage queue lock").recv() {
+            Ok(job) => job,
+            Err(_) => return,
+        };
+        let queue_wait_ms = job.queued_at.elapsed().as_millis() as u64;
+        job.state
+            .queue_wait_ms
+            .store(queue_wait_ms, Ordering::Release);
+        job.state.started.store(true, Ordering::Release);
+        let started = Instant::now();
+        let result = catch_unwind(AssertUnwindSafe(job.task))
+            .map_err(|_| anyhow::anyhow!("retrieval stage worker panicked"))
+            .and_then(|result| result);
+        let completion = StageCompletion {
+            result,
+            queue_wait_ms,
+            execution_ms: started.elapsed().as_millis() as u64,
+            finished_at: Instant::now(),
+        };
+        if job.sender.send(completion).is_err() {
+            tracing::debug!(
+                late_completion = true,
+                "discarded late retrieval stage result"
+            );
+        }
+    }
+}
+
+fn cancellation_reason(cancelled: &AtomicBool) -> &'static str {
+    if cancelled.load(Ordering::Acquire) {
+        "cancelled"
+    } else {
+        "stage_deadline"
+    }
+}
+
+fn cancelled_stage_run(
+    reason: &'static str,
+    admission_wait_ms: u64,
+    state: &StageJobState,
+) -> StageRun {
+    let started = state.started.load(Ordering::Acquire);
+    StageRun::Cancelled {
+        reason,
+        admission_wait_ms,
+        queue_wait_ms: if started {
+            Some(state.queue_wait_ms.load(Ordering::Acquire))
+        } else {
+            None
+        },
+        execution_ms: None,
+        completion_status: if started {
+            StageCompletionStatus::PendingAfterDeadline
+        } else {
+            StageCompletionStatus::CancelledBeforeStart
+        },
     }
 }
 
@@ -444,12 +772,16 @@ fn stage_trace(
         stage: stage.kind,
         budget_ms: stage.budget_ms,
         elapsed_ms,
+        admission_wait_ms: 0,
+        queue_wait_ms: None,
+        execution_ms: None,
         candidates_added,
         marginal_gain,
         cancel_reason,
         cache_hit: false,
         degraded,
         stub_reason,
+        completion_status: StageCompletionStatus::Completed,
     }
 }
 
@@ -742,6 +1074,12 @@ mod tests {
         assert!(cache.get(&key).is_some());
 
         let mut cancelled_cache = RetrievalCache::new();
+        let cancelled_key =
+            RetrievalCacheKey::from_manifest(&manifest, query_fingerprint("startup"));
+        cancelled_cache.insert(
+            cancelled_key,
+            vec![CandidateHit::lexical_stub("stale-cancelled.rs", 1.0)],
+        );
         let cancelled = cancellation_flag();
         cancelled.store(true, Ordering::Relaxed);
         let mut executor = QueryExecutor {
@@ -754,7 +1092,11 @@ mod tests {
         };
         let result = executor.execute("startup", Some(800)).expect("query");
         assert_eq!(result.trace.cancel_reason.as_deref(), Some("cancelled"));
-        assert_eq!(cancelled_cache.len(), 0);
+        assert!(
+            result.hits.is_empty(),
+            "cancelled requests must not serve cache"
+        );
+        assert_eq!(cancelled_cache.len(), 1);
     }
 
     #[test]
@@ -1328,16 +1670,20 @@ mod tests {
             cancelled: cancellation_flag(),
             mode_override: Some(RetrievalDegradedMode::Full),
         };
-        let result = executor.execute("EventProcessor", Some(1)).expect("query");
+        let result = executor.execute("EventProcessor", Some(10)).expect("query");
 
-        assert_eq!(result.trace.cancel_reason.as_deref(), Some("deadline"));
+        assert!(matches!(
+            result.trace.cancel_reason.as_deref(),
+            Some("deadline" | "stage_deadline")
+        ));
         assert!(
-            result
-                .trace
-                .stages
-                .iter()
-                .any(|stage| stage.stage == RetrievalStageKind::Stage0ScipAnchor),
-            "first non-broad stage should complete before sequence deadline check: {:?}",
+            result.trace.stages.is_empty()
+                || result
+                    .trace
+                    .stages
+                    .iter()
+                    .any(|stage| stage.stage == RetrievalStageKind::Stage0ScipAnchor),
+            "a started non-broad stage should be bounded by the same stage deadline as broad work: {:?}",
             result.trace.stages
         );
         assert!(
@@ -1576,6 +1922,253 @@ mod tests {
         };
         let result = executor.execute("anything", Some(500)).expect("partial ok");
         assert_eq!(result.trace.cancel_reason.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn executor_caps_untrusted_total_budget_before_instant_arithmetic() {
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(MockSidecarSearch::default()),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor
+            .execute("EventProcessor", Some(u64::MAX))
+            .expect("huge budget should be capped");
+
+        assert_eq!(result.trace.total_budget_ms, MAX_RETRIEVAL_BUDGET_MS);
+    }
+
+    #[test]
+    fn cancellation_after_last_stage_marks_result_and_suppresses_cache_write() {
+        struct CancelOnReturn {
+            cancelled: Arc<AtomicBool>,
+        }
+
+        impl SidecarSearch for CancelOnReturn {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                self.cancelled.store(true, Ordering::Release);
+                Ok(vec![CandidateHit::with_source(
+                    "src/late.rs",
+                    Some("EventProcessor".into()),
+                    1.0,
+                    CandidateSource::Scip,
+                )])
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let cancelled = cancellation_flag();
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(CancelOnReturn {
+                cancelled: Arc::clone(&cancelled),
+            }),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled,
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor
+            .execute("EventProcessor", Some(500))
+            .expect("query");
+
+        assert_eq!(result.trace.cancel_reason.as_deref(), Some("cancelled"));
+        assert!(
+            result.hits.is_empty(),
+            "cancelled stage hits must be discarded"
+        );
+        assert!(cache.is_empty());
+    }
+
+    struct CooperativeCancellationSidecars;
+
+    impl CooperativeCancellationSidecars {
+        fn wait_for_cancellation(
+            &self,
+            context: &SearchExecutionContext,
+        ) -> Result<Vec<CandidateHit>> {
+            while !context.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            context.check_cancelled()?;
+            unreachable!("cancelled contexts return an error")
+        }
+    }
+
+    impl SidecarSearch for CooperativeCancellationSidecars {
+        fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_expand(
+            &self,
+            _anchors: &[CandidateHit],
+            _limit: usize,
+        ) -> Result<Vec<CandidateHit>> {
+            Ok(Vec::new())
+        }
+
+        fn scip_anchor_with_context(
+            &self,
+            _query: &str,
+            _limit: usize,
+            context: &SearchExecutionContext,
+        ) -> Result<Vec<CandidateHit>> {
+            self.wait_for_cancellation(context)
+        }
+    }
+
+    #[test]
+    fn active_stage_cancellation_returns_promptly_and_is_not_cached() {
+        let cancelled = cancellation_flag();
+        let request_cancelled = Arc::clone(&cancelled);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let mut cache = RetrievalCache::new();
+            let mut executor = QueryExecutor {
+                sidecars: Arc::new(CooperativeCancellationSidecars),
+                cache: &mut cache,
+                manifest: Some(sample_manifest()),
+                file_roles: Arc::new(HashMap::new()),
+                cancelled: request_cancelled,
+                mode_override: Some(RetrievalDegradedMode::Full),
+            };
+            let result = executor
+                .execute("EventProcessor", Some(500))
+                .expect("cancelled work remains diagnostic");
+            (result, cache.len())
+        });
+        std::thread::sleep(Duration::from_millis(15));
+        cancelled.store(true, Ordering::Release);
+        let (result, cache_len) = handle.join().expect("query worker");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "cancellation should not wait for the original stage budget"
+        );
+        assert_eq!(result.trace.cancel_reason.as_deref(), Some("cancelled"));
+        assert_eq!(cache_len, 0, "cancelled results must not be cached");
+        assert!(result.trace.stages.iter().any(|stage| {
+            stage.cancel_reason.as_deref() == Some("cancelled")
+                && match stage.completion_status {
+                    StageCompletionStatus::PendingAfterDeadline => stage.execution_ms.is_none(),
+                    StageCompletionStatus::CompletedLate => stage.execution_ms.is_some(),
+                    _ => false,
+                }
+        }));
+    }
+
+    #[test]
+    fn timeout_storm_cannot_exceed_worker_and_queue_capacity() {
+        let pool = StageWorkerPool::new(1, 1);
+        let cancelled = AtomicBool::new(false);
+        let (first, _) = pool
+            .acquire(Instant::now() + Duration::from_secs(1), &cancelled)
+            .expect("first admission");
+        let (second, _) = pool
+            .acquire(Instant::now() + Duration::from_secs(1), &cancelled)
+            .expect("queued admission");
+        for _ in 0..32 {
+            assert!(
+                pool.acquire(Instant::now() + Duration::from_millis(1), &cancelled)
+                    .is_none(),
+                "one active worker plus one queued job must bound caller admission"
+            );
+        }
+        drop(first);
+        assert!(
+            pool.acquire(Instant::now() + Duration::from_secs(1), &cancelled)
+                .is_some()
+        );
+        drop(second);
+    }
+
+    #[test]
+    fn incomplete_stage_metrics_do_not_invent_queue_or_execution_duration() {
+        let queued = StageJobState::default();
+        let before_start = cancelled_stage_run("stage_deadline", 7, &queued);
+        assert!(matches!(
+            before_start,
+            StageRun::Cancelled {
+                admission_wait_ms: 7,
+                queue_wait_ms: None,
+                execution_ms: None,
+                completion_status: StageCompletionStatus::CancelledBeforeStart,
+                ..
+            }
+        ));
+
+        queued.queue_wait_ms.store(11, Ordering::Release);
+        queued.started.store(true, Ordering::Release);
+        let executing = cancelled_stage_run("stage_deadline", 3, &queued);
+        assert!(matches!(
+            executing,
+            StageRun::Cancelled {
+                admission_wait_ms: 3,
+                queue_wait_ms: Some(11),
+                execution_ms: None,
+                completion_status: StageCompletionStatus::PendingAfterDeadline,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stage_worker_survives_panicking_job() {
+        let pool = StageWorkerPool::new(1, 1);
+        let cancelled = AtomicBool::new(false);
+        for should_panic in [true, false] {
+            let (permit, _) = pool
+                .acquire(Instant::now() + Duration::from_secs(1), &cancelled)
+                .expect("job admission");
+            let (sender, receiver) = mpsc::channel();
+            pool.sender
+                .send(StageJob {
+                    queued_at: Instant::now(),
+                    state: Arc::new(StageJobState::default()),
+                    task: Box::new(move || {
+                        assert!(!should_panic, "intentional worker panic");
+                        Ok(Vec::new())
+                    }),
+                    sender,
+                    _permit: permit,
+                })
+                .expect("submit job");
+            let completion = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker completion");
+            assert_eq!(completion.result.is_err(), should_panic);
+        }
     }
 
     #[test]

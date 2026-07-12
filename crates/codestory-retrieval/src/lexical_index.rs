@@ -6,6 +6,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const LEXICAL_INDEX_VERSION: &str = "sqlite-fts5-v1";
 pub const LEXICAL_INDEX_FILE: &str = "lexical-index.sqlite3";
@@ -286,12 +287,52 @@ pub fn lexical_shard_coverage(
     .coverage)
 }
 
+#[cfg(test)]
 pub fn search_lexical_index(
     shard_dir: &Path,
     expected_sidecar_input_hash: &str,
     query: &str,
     limit: usize,
 ) -> Result<Vec<LexicalHit>> {
+    search_lexical_index_with_cancel(shard_dir, expected_sidecar_input_hash, query, limit, || {
+        false
+    })
+}
+
+pub fn search_lexical_index_with_cancel<F>(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    query: &str,
+    limit: usize,
+    cancelled: F,
+) -> Result<Vec<LexicalHit>>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(cancelled);
+    let result = search_lexical_index_with_cancel_inner(
+        shard_dir,
+        expected_sidecar_input_hash,
+        query,
+        limit,
+        Arc::clone(&cancelled),
+    );
+    if result.is_err() && cancelled() {
+        bail!("lexical search cancelled");
+    }
+    result
+}
+
+fn search_lexical_index_with_cancel_inner(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    query: &str,
+    limit: usize,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<Vec<LexicalHit>> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -300,12 +341,15 @@ pub fn search_lexical_index(
     };
     let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
     let connection = open_read_only(&index_path)?;
+    let progress_cancelled = Arc::clone(&cancelled);
+    connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
     let _metadata = validate_open_database(
         &connection,
         project_id,
         expected_sidecar_input_hash,
         None,
         false,
+        cancelled.as_ref(),
     )?;
     let tokens = lexical_query_tokens(query);
     if tokens.is_empty() {
@@ -328,10 +372,13 @@ pub fn search_lexical_index(
         [],
         |row| row.get::<_, u32>(0).map(|count| count as usize),
     )?;
-    let token_frequencies = tokens
-        .iter()
-        .map(|token| fts_document_frequency(&connection, token))
-        .collect::<Result<Vec<_>>>()?;
+    let mut token_frequencies = Vec::with_capacity(tokens.len());
+    for token in &tokens {
+        if cancelled() {
+            bail!("lexical search cancelled");
+        }
+        token_frequencies.push(fts_document_frequency(&connection, token)?);
+    }
     let token_weights = token_frequencies
         .iter()
         .zip(tokens.iter())
@@ -372,7 +419,10 @@ pub fn search_lexical_index(
     })?;
 
     let mut hits = Vec::new();
-    for row in rows {
+    for (index, row) in rows.enumerate() {
+        if index % 64 == 0 && cancelled() {
+            bail!("lexical search cancelled");
+        }
         let document = row?;
         let normalized_path = normalize_lexical_text(&document.path);
         let normalized_content = normalize_lexical_text(&document.content);
@@ -394,6 +444,9 @@ pub fn search_lexical_index(
                 start_line: document.start_line,
             });
         }
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
     }
     hits.sort_by(|left, right| {
         right
@@ -562,6 +615,7 @@ fn validate_lexical_database(
         expected_sidecar_input_hash,
         expected_lexical,
         quick_check,
+        &|| false,
     )
 }
 
@@ -571,7 +625,11 @@ fn validate_open_database(
     expected_sidecar_input_hash: &str,
     expected_lexical: Option<(u32, &str)>,
     quick_check: bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
     let schema_version: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if schema_version != 1 {
         bail!("lexical SQLite shard schema version is not current");
@@ -673,7 +731,12 @@ fn validate_open_database(
          ORDER BY d.id",
     )?;
     let mut rows = rows.query([])?;
+    let mut row_index = 0_usize;
     while let Some(row) = rows.next()? {
+        if row_index.is_multiple_of(64) && cancelled() {
+            bail!("lexical search cancelled");
+        }
+        row_index += 1;
         let path: String = row.get(0)?;
         let content: String = row.get(1)?;
         let fts_path: Option<String> = row.get(2)?;
@@ -683,6 +746,9 @@ fn validate_open_database(
         {
             bail!("lexical SQLite shard FTS rows do not match immutable documents");
         }
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
     }
     Ok(metadata)
 }
@@ -1102,6 +1168,7 @@ pub(crate) fn make_test_file_writable(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn build(project: &Path, data: &Path, generation: &str, input: &str) -> PathBuf {
@@ -1136,6 +1203,34 @@ mod tests {
                 .is_empty()
         );
         assert!(search_lexical_index(&shard_a, "wrong-input", "handler", 8).is_err());
+    }
+
+    #[test]
+    fn sqlite_lexical_search_interrupts_the_sqlite_vm() {
+        let project = TempDir::new().expect("project");
+        std::fs::create_dir_all(project.path().join("src")).expect("src");
+        for index in 0..256 {
+            std::fs::write(
+                project.path().join(format!("src/{index}.rs")),
+                "fn cancellation_needle() {}",
+            )
+            .expect("source");
+        }
+        let data = TempDir::new().expect("data");
+        let shard = build(project.path(), data.path(), "cancel", "input");
+        let polls = Arc::new(AtomicUsize::new(0));
+        let search_polls = Arc::clone(&polls);
+
+        let error = search_lexical_index_with_cancel(&shard, "input", "needle", 8, move || {
+            search_polls.fetch_add(1, Ordering::Relaxed) > 20
+        })
+        .expect_err("SQLite execution should observe cancellation");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(
+            polls.load(Ordering::Relaxed) > 20,
+            "the progress handler must poll inside SQLite beyond Rust loop checkpoints"
+        );
     }
 
     #[test]

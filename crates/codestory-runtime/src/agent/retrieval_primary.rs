@@ -326,7 +326,7 @@ pub(crate) fn sidecar_result_rejection_reason(
 
 fn sidecar_blocking_cancel_reason(query_result: &QueryResult) -> Option<&str> {
     match query_result.trace.cancel_reason.as_deref() {
-        Some("deadline" | "stage_deadline" | "stage_worker_limit" | "cancelled") => {
+        Some("deadline" | "stage_deadline" | "cancelled") => {
             query_result.trace.cancel_reason.as_deref()
         }
         _ => None,
@@ -1207,13 +1207,30 @@ fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
             stage: stage.stage.label().to_string(),
             deadline_ms: u32::try_from(stage.budget_ms).ok(),
             elapsed_ms: u32::try_from(stage.elapsed_ms).unwrap_or(u32::MAX),
+            admission_wait_ms: u32::try_from(stage.admission_wait_ms).ok(),
+            queue_wait_ms: stage.queue_wait_ms.and_then(|ms| u32::try_from(ms).ok()),
+            execution_ms: stage.execution_ms.and_then(|ms| u32::try_from(ms).ok()),
             candidates_added: u32::try_from(stage.candidates_added).unwrap_or(u32::MAX),
             marginal_gain: stage.marginal_gain,
             cancel_reason: stage.cancel_reason.clone(),
             cache_hit: stage.cache_hit,
-            sidecar_latency_ms: stage.stage.sidecar_latency_ms(stage.elapsed_ms),
+            sidecar_latency_ms: stage
+                .execution_ms
+                .and_then(|ms| stage.stage.sidecar_latency_ms(ms)),
             degraded: stage.degraded,
             stub_reason: stage.stub_reason.clone(),
+            completion_status: match stage.completion_status {
+                codestory_retrieval::StageCompletionStatus::Completed => "completed",
+                codestory_retrieval::StageCompletionStatus::PendingAfterDeadline => {
+                    "pending_after_deadline"
+                }
+                codestory_retrieval::StageCompletionStatus::CancelledBeforeStart => {
+                    "cancelled_before_start"
+                }
+                codestory_retrieval::StageCompletionStatus::CompletedLate => "completed_late",
+                codestory_retrieval::StageCompletionStatus::Skipped => "skipped",
+            }
+            .into(),
         })
         .collect()
 }
@@ -1905,12 +1922,16 @@ mod tests {
                     stage: RetrievalStageKind::Stage1Lexical,
                     budget_ms: 120,
                     elapsed_ms: 20,
+                    admission_wait_ms: 0,
+                    queue_wait_ms: Some(1),
+                    execution_ms: Some(19),
                     candidates_added: 2,
                     marginal_gain: 0.4,
                     cancel_reason: None,
                     cache_hit: false,
                     degraded: false,
                     stub_reason: None,
+                    completion_status: codestory_retrieval::StageCompletionStatus::Completed,
                 }],
             },
         });
@@ -2539,12 +2560,7 @@ mod tests {
     fn sidecar_result_rejects_blocking_cancel_reasons_even_with_resolved_hits() {
         use codestory_retrieval::{CandidateSource, classify_query};
 
-        for reason in [
-            "deadline",
-            "stage_deadline",
-            "stage_worker_limit",
-            "cancelled",
-        ] {
+        for reason in ["deadline", "stage_deadline", "cancelled"] {
             let candidate = CandidateHit::with_source(
                 "src/handler.rs",
                 Some("handler".into()),
