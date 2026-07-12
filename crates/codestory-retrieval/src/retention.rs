@@ -343,9 +343,13 @@ pub fn plan_generation_retention_with_qdrant_collections(
     let mut errors = protection.errors.clone();
     let mut blocked = Vec::new();
     let mut builders = BTreeMap::<String, BundleBuilder>::new();
-    if direct_directory_exists_or_missing(&layout.zoekt_data_dir, "Zoekt data root", &mut errors) {
+    if direct_directory_exists_or_missing(
+        &layout.lexical_data_dir,
+        "Lexical data root",
+        &mut errors,
+    ) {
         discover_generation_dirs(
-            &layout.zoekt_data_dir.join("shards"),
+            &layout.lexical_data_dir.join("shards"),
             project_id,
             ArtifactKind::Lexical,
             &mut builders,
@@ -1172,7 +1176,7 @@ mod tests {
     fn manifest(project_id: &str, suffix: &str, built_at_epoch_ms: i64) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
             project_id: project_id.into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: format!("codestory_{project_id}_{suffix}"),
             scip_revision: Some(format!("graph-{suffix}")),
             built_at_epoch_ms,
@@ -1198,10 +1202,9 @@ mod tests {
 
     fn layout(root: &Path) -> SidecarLayout {
         SidecarLayout {
-            zoekt_http_port: 9,
             qdrant_http_port: 9,
             qdrant_grpc_port: 10,
-            zoekt_data_dir: root.join("zoekt"),
+            lexical_data_dir: root.join("lexical"),
             qdrant_data_dir: root.join("qdrant"),
             scip_artifacts_root: root.join("scip"),
             state_file: root.join("retrieval-sidecars.json"),
@@ -1210,7 +1213,7 @@ mod tests {
 
     fn write_bundle(layout: &SidecarLayout, project_id: &str, suffix: &str, sizes: [usize; 3]) {
         let generation = format!("{project_id}-{suffix}");
-        let lexical = layout.zoekt_data_dir.join("shards").join(&generation);
+        let lexical = layout.lexical_data_dir.join("shards").join(&generation);
         let scip = layout.scip_artifacts_root.join(&generation);
         let qdrant = layout
             .qdrant_data_dir
@@ -1333,7 +1336,7 @@ mod tests {
         );
         assert!(
             layout
-                .zoekt_data_dir
+                .lexical_data_dir
                 .join("shards")
                 .join(format!("{project}-{active}"))
                 .is_dir()
@@ -1409,7 +1412,7 @@ mod tests {
         let root = tempdir().expect("root");
         let layout = layout(root.path());
         let project = "repo-v1-project";
-        let shards = layout.zoekt_data_dir.join("shards");
+        let shards = layout.lexical_data_dir.join("shards");
         std::fs::create_dir_all(shards.join(format!("{project}-not-hex"))).expect("malformed");
         std::fs::write(
             shards.join(format!("{project}-dddddddddddddddd")),
@@ -1451,7 +1454,7 @@ mod tests {
         assert!(remover.removed_collections.is_empty());
         assert!(
             layout
-                .zoekt_data_dir
+                .lexical_data_dir
                 .join("shards")
                 .join(format!("{project}-{stale}"))
                 .is_dir()
@@ -1485,7 +1488,7 @@ mod tests {
         let outside = tempdir().expect("outside");
         let layout = layout(root.path());
         let project = "repo-v1-project";
-        let shards = layout.zoekt_data_dir.join("shards");
+        let shards = layout.lexical_data_dir.join("shards");
         std::fs::create_dir_all(&shards).expect("shards");
         std::fs::write(outside.path().join("keep"), "outside").expect("outside file");
         symlink(
@@ -1513,8 +1516,8 @@ mod tests {
         let project = "repo-v1-project";
         let generation = format!("{project}-cccccccccccccccc");
         std::fs::create_dir_all(outside.path().join(&generation)).expect("outside generation");
-        std::fs::create_dir_all(&layout.zoekt_data_dir).expect("zoekt parent");
-        symlink(outside.path(), layout.zoekt_data_dir.join("shards")).expect("linked root");
+        std::fs::create_dir_all(&layout.lexical_data_dir).expect("lexical parent");
+        symlink(outside.path(), layout.lexical_data_dir.join("shards")).expect("linked root");
         let protection = RetentionProtectionScan {
             authoritative_active: vec![manifest(project, "aaaaaaaaaaaaaaaa", 1)],
             ..RetentionProtectionScan::default()

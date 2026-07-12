@@ -1234,10 +1234,9 @@ mod tests {
         SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 6070,
                 qdrant_http_port: 6333,
                 qdrant_grpc_port: 6334,
-                zoekt_data_dir: root.join("zoekt"),
+                lexical_data_dir: root.join("lexical"),
                 qdrant_data_dir: root.join("qdrant"),
                 scip_artifacts_root: root.join("scip"),
                 state_file: root.join(&namespace).join("retrieval-sidecars.json"),

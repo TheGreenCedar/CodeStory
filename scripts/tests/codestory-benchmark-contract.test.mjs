@@ -69,14 +69,13 @@ test("benchmark contract rejects diagnostic sidecar downgrades", () => {
     CODESTORY_RETRIEVAL: "1",
     CODESTORY_RETRIEVAL_SHADOW: "1",
     CODESTORY_QDRANT_ENABLED: "0",
-    CODESTORY_ZOEKT_ENABLED: "false",
     CODESTORY_RETRIEVAL_REAL_EMBEDDINGS: "0",
     CODESTORY_RETRIEVAL_COMPOSE_PROFILE: "stub",
     CODESTORY_EMBED_BACKEND: "hash",
   };
 
   const blockers = unsupportedSidecarContractRequests(env);
-  assert.equal(blockers.length, 6);
+  assert.equal(blockers.length, 5);
   assert.throws(() => benchmarkChildEnv(env), /Qdrant sidecar is mandatory/);
 });
 

@@ -37,6 +37,14 @@ pub fn write_bytes_atomic(path: &Path, stem: &str, content: &[u8]) -> Result<()>
     )
 }
 
+/// Publish a fully written temporary file with the same cross-platform replacement semantics as
+/// [`write_file_atomic`]. The caller owns validation and must place the temporary file beside the
+/// destination so the replacement stays on one filesystem.
+pub fn publish_existing_file_atomic(temp_path: &Path, path: &Path) -> Result<()> {
+    replace_file(temp_path, path).with_context(|| format!("publish {}", path.display()))?;
+    sync_parent_directory(path).with_context(|| format!("sync parent of {}", path.display()))
+}
+
 pub fn write_file_atomic(
     path: &Path,
     stem: &str,
@@ -65,7 +73,8 @@ pub fn write_file_atomic(
     result
 }
 
-fn create_unique_temp_file(path: &Path, stem: &str) -> Result<(PathBuf, File)> {
+/// Reserve a collision-free temporary file beside `path` using create-new semantics.
+pub fn create_unique_temp_file(path: &Path, stem: &str) -> Result<(PathBuf, File)> {
     loop {
         let temp_path = atomic_temp_path(path, stem);
         match OpenOptions::new()
@@ -252,6 +261,22 @@ mod tests {
             fs::read(&path).expect("read after validation error"),
             b"old"
         );
+    }
+
+    #[test]
+    fn unique_temp_creation_skips_stale_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let next = TEMP_COUNTER.load(Ordering::Relaxed);
+        let stale = path.with_file_name(format!(".state.{}.{}.tmp", std::process::id(), next));
+        fs::write(&stale, b"stale").expect("stale collision");
+
+        let (created, file) = create_unique_temp_file(&path, "state").expect("unique temp");
+        drop(file);
+
+        assert_ne!(created, stale);
+        assert_eq!(fs::read(stale).expect("stale preserved"), b"stale");
+        assert!(created.is_file());
     }
 
     #[cfg(windows)]

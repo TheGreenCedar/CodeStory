@@ -2063,10 +2063,9 @@ mod tests {
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.path().join("zoekt"),
+                lexical_data_dir: root.path().join("lexical"),
                 qdrant_data_dir: root.path().join("qdrant"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
@@ -2114,10 +2113,9 @@ mod tests {
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.path().join("zoekt"),
+                lexical_data_dir: root.path().join("lexical"),
                 qdrant_data_dir: root.path().join("qdrant"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),

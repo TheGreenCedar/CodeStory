@@ -1,13 +1,12 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
     QDRANT_HEALTH_BUDGET, SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarProfile,
-    SidecarRuntimeConfig, ZOEKT_HEALTH_BUDGET, default_sidecar_image_pins, retrieval_command,
+    SidecarRuntimeConfig, default_sidecar_image_pins, retrieval_command,
 };
 use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
 use crate::qdrant_client::QdrantClient;
 use crate::scip_client::{ScipAvailability, ScipClient};
-use crate::zoekt_client::ZoektClient;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -131,7 +130,8 @@ pub struct RetrievalStatusReport {
     pub embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_launch: Option<EmbeddingLaunchMetadata>,
-    pub zoekt: ComponentHealth,
+    #[serde(alias = "zoekt")]
+    pub lexical: ComponentHealth,
     pub qdrant: ComponentHealth,
     pub scip: ComponentHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -226,10 +226,10 @@ fn manifest_contract_report(
     let mut lanes = vec![
         RetrievalManifestLaneProvenance {
             lane: "lexical".into(),
-            producer: manifest.zoekt_version.clone(),
+            producer: manifest.lexical_version.clone(),
             provenance: format!("sidecar_generation:{generation}"),
             count: None,
-            status: component_status_label(&report.zoekt),
+            status: component_status_label(&report.lexical),
         },
         RetrievalManifestLaneProvenance {
             lane: "symbol_docs".into(),
@@ -331,7 +331,7 @@ fn graph_hash_label(manifest: &codestory_store::RetrievalIndexManifest) -> Strin
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfrastructureHealth {
-    pub zoekt_reachable: bool,
+    pub lexical_ready: bool,
     pub qdrant_reachable: bool,
     pub embed_reachable: bool,
     pub embedding_device_policy: String,
@@ -348,7 +348,7 @@ pub struct InfrastructureHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_accelerator_request_device: Option<String>,
     pub embedding_cpu_allowed: bool,
-    pub zoekt_detail: String,
+    pub lexical_detail: String,
     pub qdrant_detail: String,
     pub embed_detail: String,
 }
@@ -409,7 +409,7 @@ pub fn unavailable_status_report_with_embedding_device(
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch: None,
-        zoekt: unavailable_component("zoekt", &reason),
+        lexical: unavailable_component("lexical", &reason),
         qdrant: unavailable_component("qdrant", &reason),
         scip: unavailable_component("scip", &reason),
         manifest_contract: None,
@@ -417,7 +417,7 @@ pub fn unavailable_status_report_with_embedding_device(
     }
 }
 
-/// Zoekt + Qdrant + embedding reachability without a project collection (used during bootstrap).
+/// Local lexical storage plus Qdrant and embedding reachability before a project generation.
 pub fn probe_infrastructure_health(layout: &SidecarLayout) -> InfrastructureHealth {
     let embedding_device = crate::embeddings::embedding_device_readiness();
     probe_infrastructure_health_with_embedding_device(layout, &embedding_device)
@@ -427,12 +427,11 @@ pub fn probe_infrastructure_health_with_embedding_device(
     layout: &SidecarLayout,
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> InfrastructureHealth {
-    let zoekt_probe = ZoektClient::new(layout).health_probe();
     let qdrant_client = QdrantClient::new(layout);
     let qdrant_probe = qdrant_client.list_collections_probe();
     let embed_probe = crate::embeddings::probe_product_embedding_runtime();
     InfrastructureHealth {
-        zoekt_reachable: zoekt_probe.reachable,
+        lexical_ready: layout.lexical_data_dir.is_dir(),
         qdrant_reachable: qdrant_probe.reachable,
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
@@ -446,19 +445,23 @@ pub fn probe_infrastructure_health_with_embedding_device(
             .clone(),
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
-        zoekt_detail: zoekt_probe.detail,
+        lexical_detail: format!(
+            "project-local SQLite FTS root {}",
+            layout.lexical_data_dir.display()
+        ),
         qdrant_detail: qdrant_probe.detail,
         embed_detail: embed_probe.detail,
     }
 }
 
-fn zoekt_capabilities(
+fn lexical_capabilities(
     layout: &SidecarLayout,
     sidecar_generation: &str,
     sidecar_input_hash: &str,
 ) -> SidecarCapabilities {
-    let shard_dir = crate::zoekt_index::shard_dir_for(&layout.zoekt_data_dir, sidecar_generation);
-    if !crate::zoekt_index::shard_has_lexical_index(&shard_dir, sidecar_input_hash) {
+    let shard_dir =
+        crate::lexical_index::shard_dir_for(&layout.lexical_data_dir, sidecar_generation);
+    if !crate::lexical_index::shard_has_lexical_index(&shard_dir, sidecar_input_hash) {
         return SidecarCapabilities::NONE;
     }
     SidecarCapabilities {
@@ -642,36 +645,58 @@ pub fn probe_sidecar_health_for_runtime(
     }
 
     let manifest = manifest.expect("manifest validation returned above");
-    let zoekt_client = ZoektClient::new(layout);
-    let zoekt_probe = zoekt_client.health_probe();
     let sidecar_generation = manifest_sidecar_generation(&manifest);
     let sidecar_input_hash = manifest
         .sidecar_input_hash
         .as_deref()
         .expect("manifest contract validation requires sidecar_input_hash");
-    let zoekt_capabilities = zoekt_capabilities(layout, sidecar_generation, sidecar_input_hash);
-    let zoekt_stub = zoekt_probe.reachable && !zoekt_capabilities.lexical;
-    let zoekt = ComponentHealth {
-        name: "zoekt".into(),
-        status: if !zoekt_probe.reachable {
-            ComponentStatus::Unavailable
-        } else if zoekt_stub {
-            ComponentStatus::Degraded
-        } else if zoekt_probe.latency_ms <= ZOEKT_HEALTH_BUDGET.as_millis() as u64 {
-            ComponentStatus::Healthy
-        } else {
-            ComponentStatus::Degraded
+    let lexical_started = std::time::Instant::now();
+    let lexical_coverage = crate::lexical_index::lexical_shard_coverage(
+        &layout.lexical_data_dir,
+        sidecar_generation,
+        sidecar_input_hash,
+    );
+    let lexical_capabilities = lexical_capabilities(layout, sidecar_generation, sidecar_input_hash);
+    let lexical = match lexical_coverage {
+        Ok(coverage)
+            if lexical_capabilities.lexical
+                && coverage.discovered_files > 0
+                && coverage.indexed_files == 0 =>
+        {
+            ComponentHealth {
+                name: "lexical".into(),
+                status: ComponentStatus::Degraded,
+                latency_ms: Some(lexical_started.elapsed().as_millis() as u64),
+                detail: coverage.detail(),
+                degraded_reason: Some("lexical_source_coverage_empty".into()),
+                capabilities: SidecarCapabilities::NONE,
+            }
+        }
+        Ok(coverage) if lexical_capabilities.lexical => ComponentHealth {
+            name: "lexical".into(),
+            status: ComponentStatus::Healthy,
+            latency_ms: Some(lexical_started.elapsed().as_millis() as u64),
+            detail: coverage.detail(),
+            degraded_reason: (!coverage.complete())
+                .then(|| "lexical_source_coverage_incomplete".into()),
+            capabilities: lexical_capabilities,
         },
-        latency_ms: Some(zoekt_probe.latency_ms),
-        detail: zoekt_probe.detail,
-        degraded_reason: if !zoekt_probe.reachable {
-            Some("zoekt_unreachable".into())
-        } else if zoekt_stub {
-            Some("zoekt_stub".into())
-        } else {
-            None
+        Ok(coverage) => ComponentHealth {
+            name: "lexical".into(),
+            status: ComponentStatus::Degraded,
+            latency_ms: Some(lexical_started.elapsed().as_millis() as u64),
+            detail: coverage.detail(),
+            degraded_reason: Some("lexical_shard_invalid".into()),
+            capabilities: SidecarCapabilities::NONE,
         },
-        capabilities: zoekt_capabilities,
+        Err(error) => ComponentHealth {
+            name: "lexical".into(),
+            status: ComponentStatus::Unavailable,
+            latency_ms: Some(lexical_started.elapsed().as_millis() as u64),
+            detail: error.to_string(),
+            degraded_reason: Some("lexical_shard_unavailable".into()),
+            capabilities: SidecarCapabilities::NONE,
+        },
     };
 
     let current_embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
@@ -772,7 +797,7 @@ pub fn probe_sidecar_health_for_runtime(
         capabilities: scip_capabilities,
     };
 
-    let (mode, degraded_reason) = crate::mode::derive_degraded_mode(&zoekt, &qdrant, &scip);
+    let (mode, degraded_reason) = crate::mode::derive_degraded_mode(&lexical, &qdrant, &scip);
 
     RetrievalStatusReport {
         retrieval_mode: mode.as_str().into(),
@@ -798,7 +823,7 @@ pub fn probe_sidecar_health_for_runtime(
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch: None,
-        zoekt,
+        lexical,
         qdrant,
         scip,
         manifest_contract: None,
@@ -839,8 +864,8 @@ fn zero_dense_qdrant_health(
 mod tests {
     use super::*;
     use crate::config::SidecarLayout;
+    use crate::lexical_index::{build_lexical_shard, lexical_input_fingerprint, shard_dir_for};
     use crate::test_support::retrieval_manifest_fixture;
-    use crate::zoekt_index::{build_zoekt_shard, lexical_input_fingerprint, shard_dir_for};
     use tempfile::TempDir;
 
     struct EnvGuard {
@@ -913,11 +938,11 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_unavailable_when_zoekt_down() {
+    fn status_reports_unavailable_when_lexical_down() {
         let layout = SidecarLayout::from_env();
         let report = probe_sidecar_health(&layout, "testproject", None);
-        assert_eq!(report.zoekt.name, "zoekt");
-        if report.zoekt.status == ComponentStatus::Unavailable {
+        assert_eq!(report.lexical.name, "lexical");
+        if report.lexical.status == ComponentStatus::Unavailable {
             assert_eq!(report.retrieval_mode, "unavailable");
         }
     }
@@ -927,7 +952,7 @@ mod tests {
         let layout = SidecarLayout::from_env();
         let manifest = codestory_store::RetrievalIndexManifest {
             project_id: "testproject".into(),
-            zoekt_version: "zoekt-real-v1".into(),
+            lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             qdrant_collection: QdrantClient::collection_name("testproject"),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,
@@ -957,7 +982,7 @@ mod tests {
             report.degraded_reason.as_deref(),
             Some("sidecar_manifest_generation_contract_missing")
         );
-        assert_eq!(report.zoekt.capabilities, SidecarCapabilities::NONE);
+        assert_eq!(report.lexical.capabilities, SidecarCapabilities::NONE);
         assert_eq!(report.qdrant.capabilities, SidecarCapabilities::NONE);
         assert_eq!(report.scip.capabilities, SidecarCapabilities::NONE);
     }
@@ -968,28 +993,94 @@ mod tests {
         std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("write source");
         let data = TempDir::new().expect("data");
         let mut layout = SidecarLayout::from_env();
-        layout.zoekt_data_dir = data.path().to_path_buf();
+        layout.lexical_data_dir = data.path().to_path_buf();
         let manifest = retrieval_manifest_fixture("testproject", "test-input");
         let generation = manifest.sidecar_generation.as_deref().expect("generation");
         let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
-        build_zoekt_shard(
+        build_lexical_shard(
             project.path(),
             None,
-            &layout.zoekt_data_dir,
+            &layout.lexical_data_dir,
             generation,
             &fingerprint,
             "test-input",
         )
         .expect("build shard");
-        std::fs::write(
-            shard_dir_for(&layout.zoekt_data_dir, generation).join("lexical-index.jsonl"),
-            b"{not-json}\n",
-        )
-        .expect("corrupt shard");
+        let index = shard_dir_for(&layout.lexical_data_dir, generation)
+            .join(crate::lexical_index::LEXICAL_INDEX_FILE);
+        crate::lexical_index::make_test_file_writable(&index);
+        std::fs::write(index, b"not sqlite").expect("corrupt shard");
 
         let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
 
-        assert!(!report.zoekt.capabilities.lexical);
+        assert!(!report.lexical.capabilities.lexical);
+        assert_ne!(report.retrieval_mode, "full");
+    }
+
+    #[test]
+    fn partial_lexical_coverage_stays_usable_and_reports_diagnostic() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn alpha() {}").expect("source");
+        std::fs::write(project.path().join("oversized.rs"), vec![b'x'; 1_000_001])
+            .expect("oversized");
+        let data = TempDir::new().expect("data");
+        let mut layout = SidecarLayout::from_env();
+        layout.lexical_data_dir = data.path().to_path_buf();
+        let manifest = retrieval_manifest_fixture("testproject", "test-input");
+        let generation = manifest.sidecar_generation.as_deref().expect("generation");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        build_lexical_shard(
+            project.path(),
+            None,
+            &layout.lexical_data_dir,
+            generation,
+            &fingerprint,
+            "test-input",
+        )
+        .expect("build shard");
+
+        let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
+
+        assert_eq!(report.lexical.status, ComponentStatus::Healthy);
+        assert!(report.lexical.capabilities.lexical);
+        assert_eq!(
+            report.lexical.degraded_reason.as_deref(),
+            Some("lexical_source_coverage_incomplete")
+        );
+        assert!(report.lexical.detail.contains("omitted_oversized=1"));
+    }
+
+    #[test]
+    fn all_omitted_lexical_sources_cannot_report_full_readiness() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("large.rs"), vec![b'x'; 1_000_001]).expect("oversized");
+        std::fs::write(project.path().join("invalid.rs"), [0xff, 0xfe, 0xfd])
+            .expect("invalid utf-8");
+        let data = TempDir::new().expect("data");
+        let mut layout = SidecarLayout::from_env();
+        layout.lexical_data_dir = data.path().to_path_buf();
+        let manifest = retrieval_manifest_fixture("testproject", "test-input");
+        let generation = manifest.sidecar_generation.as_deref().expect("generation");
+        let fingerprint = lexical_input_fingerprint(project.path(), None).expect("fingerprint");
+        assert_eq!(fingerprint.file_count, 0);
+        build_lexical_shard(
+            project.path(),
+            None,
+            &layout.lexical_data_dir,
+            generation,
+            &fingerprint,
+            "test-input",
+        )
+        .expect("build empty shard");
+
+        let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
+
+        assert_eq!(report.lexical.status, ComponentStatus::Degraded);
+        assert!(!report.lexical.capabilities.lexical);
+        assert_eq!(
+            report.lexical.degraded_reason.as_deref(),
+            Some("lexical_source_coverage_empty")
+        );
         assert_ne!(report.retrieval_mode, "full");
     }
 
@@ -1109,10 +1200,9 @@ mod tests {
         );
         let root = TempDir::new().expect("temp dir");
         let layout = SidecarLayout {
-            zoekt_http_port: 16070,
             qdrant_http_port: 16333,
             qdrant_grpc_port: 16334,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("retrieval-sidecars.json"),
@@ -1141,7 +1231,7 @@ mod tests {
     fn manifest_contract_reports_core_fields_and_lane_provenance() {
         let manifest = codestory_store::RetrievalIndexManifest {
             project_id: "testproject".into(),
-            zoekt_version: "zoekt-real-v1".into(),
+            lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             qdrant_collection: "codestory_testproject_hash".into(),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,
@@ -1184,8 +1274,8 @@ mod tests {
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             embedding_launch: None,
-            zoekt: ComponentHealth {
-                name: "zoekt".into(),
+            lexical: ComponentHealth {
+                name: "lexical".into(),
                 status: ComponentStatus::Healthy,
                 latency_ms: Some(1),
                 detail: "ok".into(),
@@ -1246,7 +1336,7 @@ mod tests {
         assert_eq!(contract.lanes.len(), 5);
         assert!(contract.lanes.iter().any(|lane| {
             lane.lane == "lexical"
-                && lane.producer == "zoekt-real-v1"
+                && lane.producer == crate::lexical_index::LEXICAL_INDEX_VERSION
                 && lane.provenance == "sidecar_generation:testproject-input"
         }));
         assert!(contract.lanes.iter().any(|lane| {

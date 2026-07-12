@@ -2153,7 +2153,7 @@ mod packet_tests {
             cancel_reason: None,
             cache_hit: false,
             stage_timings: vec![RetrievalStageTimingDto {
-                stage: "stage1_zoekt_lexical".to_string(),
+                stage: "stage1_lexical".to_string(),
                 deadline_ms: Some(120),
                 elapsed_ms: 18,
                 candidates_added: 3,
@@ -2170,7 +2170,7 @@ mod packet_tests {
                 line: Some(12),
                 symbol_name: Some("extension_service".to_string()),
                 score: 0.9,
-                source: "zoekt".to_string(),
+                source: "lexical".to_string(),
                 resolution: Some("node_unresolved".to_string()),
                 admission_status: Some("unresolved".to_string()),
                 loss_reason: Some("node_unresolved".to_string()),
@@ -2192,8 +2192,8 @@ mod packet_tests {
         let value = serde_json::to_value(&shadow).expect("serialize");
         assert_eq!(value["retrieval_mode"], "full");
         assert_eq!(value["retrieval_total_ms"], 42);
-        assert_eq!(value["stage_timings"][0]["stage"], "stage1_zoekt_lexical");
-        assert_eq!(value["candidates"][0]["source"], "zoekt");
+        assert_eq!(value["stage_timings"][0]["stage"], "stage1_lexical");
+        assert_eq!(value["candidates"][0]["source"], "lexical");
         assert_eq!(value["candidates"][0]["line"], 12);
         assert_eq!(value["candidates"][0]["resolution"], "node_unresolved");
         assert_eq!(value["candidates"][0]["admission_status"], "unresolved");

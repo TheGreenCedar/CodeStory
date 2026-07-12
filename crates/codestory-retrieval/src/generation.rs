@@ -2,7 +2,7 @@ use codestory_contracts::graph::NodeKind;
 use codestory_store::{LlmSymbolDoc, RetrievalIndexManifest, Store};
 use std::collections::BTreeMap;
 
-pub const SIDECAR_SCHEMA_VERSION: i32 = 2;
+pub const SIDECAR_SCHEMA_VERSION: i32 = 3;
 pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";
@@ -28,6 +28,7 @@ pub fn manifest_has_current_sidecar_contract(
     let expected_generation = sidecar_generation_id(project_id, hash);
     let expected_collection = sidecar_qdrant_collection(project_id, hash);
     !hash.trim().is_empty()
+        && manifest.lexical_version == crate::lexical_index::LEXICAL_INDEX_VERSION
         && manifest.sidecar_schema_version == Some(SIDECAR_SCHEMA_VERSION)
         && manifest.sidecar_generation.as_deref() == Some(expected_generation.as_str())
         && manifest.qdrant_collection == expected_collection
@@ -377,7 +378,7 @@ mod tests {
     fn manifest(project_id: &str, hash: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
             project_id: project_id.into(),
-            zoekt_version: "zoekt-real-v1".into(),
+            lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             qdrant_collection: sidecar_qdrant_collection(project_id, hash),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 123,

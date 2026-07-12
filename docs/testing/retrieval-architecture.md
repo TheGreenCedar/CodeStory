@@ -2,7 +2,7 @@
 
 **Audience:** Evidence record — not an install guide.
 
-Sidecar-primary packet retrieval (Zoekt lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
+Sidecar-primary packet retrieval (project-local SQLite FTS lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
 `codestory-retrieval` and integrated in `codestory-runtime`. Production packet paths use
 generic symbol/path roles; benchmark-only probe catalogs remain behind test-only eval harness hooks.
 Sidecar retrieval is mandatory for current evidence; `CODESTORY_RETRIEVAL=0` is treated as a
@@ -152,7 +152,7 @@ Non-claims:
 
 | Layer | Location | Role |
 |-------|----------|------|
-| Sidecar clients | `crates/codestory-retrieval/` (`zoekt_client`, `qdrant_client`, `scip_client`, `health`) | HTTP probes, staged search, timeouts |
+| Retrieval clients | `crates/codestory-retrieval/` (`lexical_client`, `qdrant_client`, `scip_client`, `health`) | SQLite FTS candidate selection, HTTP probes, staged search, timeouts |
 | Planner / executor / ranker | `codestory-retrieval` (`planner`, `executor`, `ranker`, `query_features`, `mode`) | Repo-agnostic staged plan, deadlines, degraded modes |
 | Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, mandatory real sidecar artifact paths, and derived status `manifest_contract` provenance |
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |

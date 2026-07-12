@@ -49,7 +49,7 @@ fn run_down(project: &std::path::Path, extra_args: &[&str]) {
 }
 
 fn assert_digest_image_pins(json: &Value) {
-    for field in ["qdrant", "zoekt", "embed"] {
+    for field in ["qdrant", "embed"] {
         let image = json[field]
             .as_str()
             .unwrap_or_else(|| panic!("sidecar_images.{field} should be a string: {json}"));
@@ -251,11 +251,7 @@ fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
         "agent namespace should carry the run id: {namespace}"
     );
     assert_eq!(state["run_id"].as_str(), Some("contract-a"));
-    assert!(
-        state["zoekt_http_port"]
-            .as_u64()
-            .is_some_and(|port| port > 0)
-    );
+    assert!(state.get("lexical_http_port").is_none());
     assert!(
         state["qdrant_http_port"]
             .as_u64()
@@ -271,7 +267,6 @@ fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
             .as_u64()
             .is_some_and(|port| port > 0)
     );
-    assert_ne!(state["zoekt_http_port"].as_u64(), Some(6070));
     assert_ne!(state["qdrant_http_port"].as_u64(), Some(6333));
     assert_ne!(state["qdrant_grpc_port"].as_u64(), Some(6334));
     assert_ne!(state["embed_http_port"].as_u64(), Some(8080));
@@ -297,10 +292,7 @@ fn agent_profile_bootstrap_status_and_down_are_project_isolated() {
     let ownership = &status["ownership"];
     assert_eq!(ownership["profile"].as_str(), Some("agent"));
     assert_eq!(ownership["namespace"].as_str(), Some(namespace));
-    assert_eq!(
-        ownership["ports"]["zoekt_http"].as_u64(),
-        state["zoekt_http_port"].as_u64()
-    );
+    assert!(ownership["ports"].get("lexical_http").is_none());
     let state_path =
         std::path::PathBuf::from(ownership["state_file"].as_str().expect("state file"));
     assert!(state_path.is_file(), "state file should exist before down");

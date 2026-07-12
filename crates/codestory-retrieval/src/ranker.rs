@@ -52,7 +52,7 @@ pub fn rank_candidates(
         ) {
             let strong_token_hits = strong_query_token_hits(candidate, &query_tokens);
             candidate.score += (strong_token_hits as f32) * 0.06;
-            if candidate.source == CandidateSource::Zoekt && strong_token_hits >= 3 {
+            if candidate.source == CandidateSource::Lexical && strong_token_hits >= 3 {
                 candidate.score += 0.08;
             }
         }
@@ -151,7 +151,7 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let has_lexical = matches!(candidate.source, CandidateSource::Zoekt)
+    let has_lexical = matches!(candidate.source, CandidateSource::Lexical)
         || candidate_has_provenance(candidate, "lexical_source");
     let has_semantic = matches!(candidate.source, CandidateSource::Qdrant)
         || candidate_has_provenance(candidate, "dense_anchor")
@@ -347,7 +347,7 @@ fn file_role_sort_rank(candidate: &CandidateHit) -> u8 {
 
 fn source_sort_rank(candidate: &CandidateHit) -> u8 {
     match candidate.source {
-        CandidateSource::Zoekt => 0,
+        CandidateSource::Lexical => 0,
         CandidateSource::Scip => 1,
         CandidateSource::Qdrant => 2,
         CandidateSource::Legacy => 3,
@@ -414,7 +414,7 @@ fn strong_query_token_hits(candidate: &CandidateHit, query_tokens: &[String]) ->
 fn cap_dense_below_strong_lexical_source(candidates: &mut [CandidateHit], query_tokens: &[String]) {
     let Some((anchor_hits, anchor_score)) = candidates
         .iter()
-        .filter(|candidate| candidate.source == CandidateSource::Zoekt)
+        .filter(|candidate| candidate.source == CandidateSource::Lexical)
         .filter(|candidate| {
             matches!(
                 effective_file_role(candidate),
@@ -596,7 +596,7 @@ mod tests {
     fn ranker_does_not_use_repo_name_features() {
         let features = classify_query("handler");
         let mut hit = CandidateHit::lexical_stub("src/handler.rs", 0.8);
-        hit.source = CandidateSource::Zoekt;
+        hit.source = CandidateSource::Lexical;
         hit.file_role = Some(FileRole::Source);
         let ranked = rank_candidates(&features, vec![hit]);
         let rf = ranked[0].rank_features.as_ref().expect("features");
@@ -649,8 +649,8 @@ mod tests {
         let features = classify_query("layout styles for dashboard");
         let mut structural = CandidateHit::lexical_stub("src/ui/layout.css", 0.9);
         let mut graph = CandidateHit::lexical_stub("src/app/dashboard.rs", 0.55);
-        structural.source = CandidateSource::Zoekt;
-        graph.source = CandidateSource::Zoekt;
+        structural.source = CandidateSource::Lexical;
+        graph.source = CandidateSource::Lexical;
         let ranked = rank_candidates(&features, vec![structural, graph]);
         assert_eq!(ranked[0].file_path, "src/app/dashboard.rs");
     }
@@ -660,9 +660,9 @@ mod tests {
         let features = classify_query("primary button layout css class");
         let mut structural = CandidateHit::lexical_stub("src/ui/primary.css", 0.7);
         structural.symbol_name = Some("primary".to_string());
-        structural.source = CandidateSource::Zoekt;
+        structural.source = CandidateSource::Lexical;
         let mut graph = CandidateHit::lexical_stub("src/ui/components.rs", 0.72);
-        graph.source = CandidateSource::Zoekt;
+        graph.source = CandidateSource::Lexical;
         let ranked = rank_candidates(&features, vec![structural, graph]);
         assert_eq!(ranked[0].file_path, "src/ui/primary.css");
     }
@@ -672,8 +672,8 @@ mod tests {
         let features = classify_query("UserService class method");
         let mut structural = CandidateHit::lexical_stub("schema/users.sql", 0.99);
         let mut graph = CandidateHit::lexical_stub("src/user_service.rs", 0.8);
-        structural.source = CandidateSource::Zoekt;
-        graph.source = CandidateSource::Zoekt;
+        structural.source = CandidateSource::Lexical;
+        graph.source = CandidateSource::Lexical;
         let ranked = rank_candidates(&features, vec![structural, graph]);
         assert_eq!(ranked[0].file_path, "src/user_service.rs");
     }
@@ -682,7 +682,7 @@ mod tests {
     fn ranker_drops_phantom_hits_by_default() {
         let features = classify_query("search pipeline");
         let candidates = vec![
-            CandidateHit::with_source("zoekt:search", None, 0.9, CandidateSource::Zoekt),
+            CandidateHit::with_source("lexical:search", None, 0.9, CandidateSource::Lexical),
             CandidateHit::lexical_stub("crates/core/search.rs", 0.7),
         ];
         let ranked = rank_candidates(&features, candidates);
@@ -697,7 +697,7 @@ mod tests {
             "crates/runtime/src/index.rs",
             Some("codestory::IndexManifest".into()),
             0.55,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         exact.file_role = Some(FileRole::Source);
         let mut semantic = CandidateHit::with_source(
@@ -734,7 +734,7 @@ mod tests {
             "workspace/app/src/event_processor.rs",
             Some("EventProcessor".into()),
             0.72,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
 
         let ranked = rank_candidates(&features, vec![semantic_test, colocated_test, source]);
@@ -760,13 +760,13 @@ mod tests {
             "crates/runtime/src/search/engine.rs",
             Some("EmbeddingRuntime::test_runtime".into()),
             0.99,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         let production = CandidateHit::with_source(
             "crates/runtime/src/services.rs",
             Some("IndexService::run_indexing_blocking".into()),
             0.72,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
 
         let ranked = rank_candidates(&features, vec![test_helper, production]);
@@ -790,7 +790,7 @@ mod tests {
             "workspace/app/src/event_processor.rs",
             Some("EventProcessor".into()),
             0.72,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
 
         let ranked = rank_candidates(&features, vec![source, semantic_test]);
@@ -811,7 +811,7 @@ mod tests {
             "crates/codestory-cli/src/output.rs",
             Some("append_search_evidence_packet".into()),
             0.92,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         source.file_role = Some(FileRole::Source);
         let mut dense_dto = CandidateHit::with_source(
@@ -839,7 +839,7 @@ mod tests {
             "crates/codestory-runtime/src/agent/packet_evidence.rs",
             Some("decorate_search_hit_evidence".into()),
             0.82,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         source.file_role = Some(FileRole::Source);
         let dense_distractors = [
@@ -890,7 +890,7 @@ mod tests {
             "src/service.rs",
             Some("ExtensionService".into()),
             0.85,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         fused.provenance = vec![
             "lexical_source".into(),

@@ -7627,7 +7627,7 @@ starting sidecar setup
         let storage_fingerprint = "sqlite-and-wal-stable".to_string();
         let manifest = codestory_retrieval::RetrievalIndexManifest {
             project_id: "project-a".into(),
-            zoekt_version: "zoekt-real-v1".into(),
+            lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
             qdrant_collection: "codestory_project_a_hash_a".into(),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,

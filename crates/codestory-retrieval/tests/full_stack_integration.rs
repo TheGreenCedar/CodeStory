@@ -126,7 +126,7 @@ fn full_mode_fixture_produces_resolvable_hits() {
         "expected full mode, got {} ({:?})",
         status.retrieval_mode, status.degraded_reason
     );
-    assert!(status.zoekt.capabilities.lexical);
+    assert!(status.lexical.capabilities.lexical);
     assert!(status.qdrant.capabilities.semantic);
     assert!(status.scip.capabilities.graph);
 
@@ -143,8 +143,8 @@ fn full_mode_fixture_produces_resolvable_hits() {
         result
             .hits
             .iter()
-            .any(|hit| hit.file_path.contains("lib.rs") && !hit.file_path.starts_with("zoekt:")),
-        "expected repo-relative zoekt/scip hit, got {:?}",
+            .any(|hit| hit.file_path.contains("lib.rs") && !hit.file_path.starts_with("lexical:")),
+        "expected repo-relative lexical/scip hit, got {:?}",
         result.hits
     );
 

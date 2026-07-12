@@ -38,20 +38,20 @@ impl RetrievalDegradedMode {
         matches!(self, Self::Full)
     }
 
-    pub fn runs_zoekt_stage(self) -> bool {
+    pub fn runs_lexical_stage(self) -> bool {
         matches!(self, Self::Full)
     }
 }
 
 pub fn derive_degraded_mode(
-    zoekt: &ComponentHealth,
+    lexical: &ComponentHealth,
     qdrant: &ComponentHealth,
     scip: &ComponentHealth,
 ) -> (RetrievalDegradedMode, Option<String>) {
-    if zoekt.status != ComponentStatus::Healthy || !zoekt.capabilities.lexical {
+    if lexical.status != ComponentStatus::Healthy || !lexical.capabilities.lexical {
         return (
             RetrievalDegradedMode::Unavailable,
-            mandatory_failure_reason(zoekt, "zoekt"),
+            mandatory_failure_reason(lexical, "lexical"),
         );
     }
     if qdrant.status != ComponentStatus::Healthy || !qdrant.capabilities.semantic {
@@ -104,11 +104,11 @@ mod tests {
     #[test]
     fn matrix_rows_match_design_doc() {
         let production = crate::capabilities::SidecarCapabilities::production_stack();
-        let zoekt_up = component("zoekt", ComponentStatus::Healthy, None, production);
+        let lexical_up = component("lexical", ComponentStatus::Healthy, None, production);
         let qdrant_up = component("qdrant", ComponentStatus::Healthy, None, production);
         let scip_up = component("scip", ComponentStatus::Healthy, None, production);
         assert_eq!(
-            derive_degraded_mode(&zoekt_up, &qdrant_up, &scip_up).0,
+            derive_degraded_mode(&lexical_up, &qdrant_up, &scip_up).0,
             RetrievalDegradedMode::Full
         );
 
@@ -119,7 +119,7 @@ mod tests {
             SidecarCapabilities::NONE,
         );
         assert_eq!(
-            derive_degraded_mode(&zoekt_up, &qdrant_up, &scip_down).0,
+            derive_degraded_mode(&lexical_up, &qdrant_up, &scip_down).0,
             RetrievalDegradedMode::NoScip
         );
 
@@ -130,22 +130,22 @@ mod tests {
             SidecarCapabilities::NONE,
         );
         assert_eq!(
-            derive_degraded_mode(&zoekt_up, &qdrant_down, &scip_up).0,
+            derive_degraded_mode(&lexical_up, &qdrant_down, &scip_up).0,
             RetrievalDegradedMode::NoSemantic
         );
         assert_eq!(
-            derive_degraded_mode(&zoekt_up, &qdrant_down, &scip_down).0,
+            derive_degraded_mode(&lexical_up, &qdrant_down, &scip_down).0,
             RetrievalDegradedMode::LexicalOnly
         );
 
-        let zoekt_down = component(
-            "zoekt",
+        let lexical_down = component(
+            "lexical",
             ComponentStatus::Unavailable,
-            Some("zoekt_unreachable"),
+            Some("lexical_unreachable"),
             SidecarCapabilities::NONE,
         );
         assert_eq!(
-            derive_degraded_mode(&zoekt_down, &qdrant_up, &scip_up).0,
+            derive_degraded_mode(&lexical_down, &qdrant_up, &scip_up).0,
             RetrievalDegradedMode::Unavailable
         );
     }
@@ -157,10 +157,10 @@ mod tests {
             semantic: false,
             graph: false,
         };
-        let zoekt_stub = component(
-            "zoekt",
+        let lexical_stub = component(
+            "lexical",
             ComponentStatus::Degraded,
-            Some("zoekt_stub"),
+            Some("lexical_stub"),
             lexical_only,
         );
         let qdrant_stub = component(
@@ -176,7 +176,7 @@ mod tests {
             SidecarCapabilities::NONE,
         );
         assert_ne!(
-            derive_degraded_mode(&zoekt_stub, &qdrant_stub, &scip_stub).0,
+            derive_degraded_mode(&lexical_stub, &qdrant_stub, &scip_stub).0,
             RetrievalDegradedMode::Full
         );
     }

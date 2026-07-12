@@ -26,6 +26,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+const LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT: usize = 4_096;
+const LEGACY_ZOEKT_HTTP_PORT: u16 = 6070;
+const LEGACY_ZOEKT_IMAGE_PIN: &str = "sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff";
 #[cfg(not(windows))]
 const NATIVE_EMBEDDING_STOP_WAIT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
@@ -57,7 +60,6 @@ pub struct SidecarStateFile {
     pub compose_project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    pub zoekt_http_port: u16,
     pub qdrant_http_port: u16,
     pub qdrant_grpc_port: u16,
     #[serde(default = "default_embed_http_port")]
@@ -86,7 +88,8 @@ pub struct SidecarStateFile {
     pub embedding_launch: Option<EmbeddingLaunchMetadata>,
     #[serde(default = "default_sidecar_image_pins")]
     pub sidecar_images: SidecarImagePins,
-    pub zoekt_data_dir: String,
+    #[serde(rename = "zoekt_data_dir", alias = "lexical_data_dir")]
+    pub lexical_data_dir: String,
     pub qdrant_data_dir: String,
     pub scip_artifacts_root: String,
     #[serde(default)]
@@ -122,6 +125,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
 ) -> Result<SidecarStateFile> {
     runtime.ensure_ports_allocated()?;
     let layout = &runtime.layout;
+    cleanup_owned_legacy_zoekt(layout)?;
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let state = SidecarStateFile {
@@ -131,7 +135,6 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
         namespace: runtime.namespace.clone(),
         compose_project: runtime.compose_project.clone(),
         run_id: runtime.run_id.clone(),
-        zoekt_http_port: layout.zoekt_http_port,
         qdrant_http_port: layout.qdrant_http_port,
         qdrant_grpc_port: layout.qdrant_grpc_port,
         embed_http_port: runtime.embed_http_port,
@@ -147,14 +150,24 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch,
         sidecar_images: default_sidecar_image_pins(),
-        zoekt_data_dir: layout.zoekt_data_dir.display().to_string(),
+        lexical_data_dir: layout.lexical_data_dir.display().to_string(),
         qdrant_data_dir: layout.qdrant_data_dir.display().to_string(),
         scip_artifacts_root: layout.scip_artifacts_root.display().to_string(),
         compose_file: compose_file.map(|path| path.display().to_string()),
         cleanup_command: runtime.cleanup_command.clone(),
         started_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
-    let json = serde_json::to_vec_pretty(&state).context("serialize sidecar state")?;
+    let mut value = serde_json::to_value(&state).context("serialize sidecar state")?;
+    let object = value
+        .as_object_mut()
+        .context("sidecar state must serialize as an object")?;
+    object.insert("zoekt_http_port".into(), LEGACY_ZOEKT_HTTP_PORT.into());
+    object
+        .get_mut("sidecar_images")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("sidecar image pins must serialize as an object")?
+        .insert("zoekt".into(), LEGACY_ZOEKT_IMAGE_PIN.into());
+    let json = serde_json::to_vec_pretty(&value).context("serialize sidecar state")?;
     codestory_workspace::atomic_file::write_bytes_atomic(
         &layout.state_file,
         "retrieval-sidecars",
@@ -162,6 +175,70 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     )
     .context("write retrieval-sidecars.json")?;
     Ok(state)
+}
+
+fn cleanup_owned_legacy_zoekt(layout: &SidecarLayout) -> Result<()> {
+    let Ok(raw) = std::fs::read_to_string(&layout.state_file) else {
+        return Ok(());
+    };
+    let Ok(state) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+    if state.get("owner").and_then(|value| value.as_str()) != Some("codestory") {
+        return Ok(());
+    }
+    let legacy_root = layout.lexical_data_dir.with_file_name("zoekt");
+    let legacy_state_matches = state
+        .get("zoekt_data_dir")
+        .and_then(|value| value.as_str())
+        .is_some_and(|path| Path::new(path) == legacy_root);
+    let current_state_matches = state
+        .get("lexical_data_dir")
+        .or_else(|| state.get("zoekt_data_dir"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|path| Path::new(path) == layout.lexical_data_dir);
+    if !legacy_state_matches && !current_state_matches {
+        return Ok(());
+    }
+    let mut remaining = LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT;
+    if !remove_tree_bounded(&legacy_root, &mut remaining)? {
+        eprintln!(
+            "CodeStory legacy Zoekt cleanup reached its {}-entry limit; remaining owned data will be retried",
+            LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT
+        );
+    }
+    Ok(())
+}
+
+fn remove_tree_bounded(path: &Path, remaining: &mut usize) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    if *remaining == 0 {
+        return Ok(false);
+    }
+    *remaining -= 1;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("remove legacy Zoekt artifact {}", path.display()))?;
+        return Ok(true);
+    }
+    let mut complete = true;
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("read legacy Zoekt directory {}", path.display()))?
+    {
+        if !remove_tree_bounded(&entry?.path(), remaining)? {
+            complete = false;
+            break;
+        }
+    }
+    if complete {
+        std::fs::remove_dir(path)
+            .with_context(|| format!("remove empty legacy Zoekt directory {}", path.display()))?;
+    }
+    Ok(complete)
 }
 
 /// Returns true when a sidecar state file matches the runtime identity used for reuse/handoff.
@@ -1059,10 +1136,9 @@ mod tests {
         SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.path().join("zoekt"),
+                lexical_data_dir: root.path().join("lexical"),
                 qdrant_data_dir: root.path().join("qdrant"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("retrieval-sidecars.json"),
@@ -1182,12 +1258,60 @@ mod tests {
 
         let state = read_sidecar_state(&runtime.layout.state_file).expect("parse state");
         assert!(sidecar_state_matches_runtime(&state, &runtime));
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&runtime.layout.state_file).expect("read state"))
+                .expect("state json");
+        assert_eq!(
+            raw.get("zoekt_http_port").and_then(|value| value.as_u64()),
+            Some(u64::from(LEGACY_ZOEKT_HTTP_PORT))
+        );
+        assert!(raw.get("zoekt_data_dir").is_some());
+        assert_eq!(
+            raw.pointer("/sidecar_images/zoekt")
+                .and_then(|value| value.as_str()),
+            Some(LEGACY_ZOEKT_IMAGE_PIN)
+        );
         assert!(
             std::fs::read_dir(root.path())
                 .expect("read root")
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
         );
+    }
+
+    #[test]
+    fn upgrade_removes_only_state_proven_owned_legacy_zoekt_data() {
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        let legacy = root.path().join("zoekt");
+        std::fs::create_dir_all(legacy.join("shards/generation")).expect("legacy dirs");
+        std::fs::write(legacy.join("shards/generation/index"), "legacy").expect("legacy file");
+        std::fs::write(
+            &runtime.layout.state_file,
+            serde_json::to_vec(&serde_json::json!({
+                "owner": "codestory",
+                "zoekt_data_dir": legacy,
+            }))
+            .expect("state json"),
+        )
+        .expect("state");
+
+        cleanup_owned_legacy_zoekt(&runtime.layout).expect("cleanup");
+
+        assert!(!legacy.exists());
+
+        std::fs::create_dir_all(&legacy).expect("foreign legacy");
+        std::fs::write(
+            &runtime.layout.state_file,
+            serde_json::to_vec(&serde_json::json!({
+                "owner": "someone-else",
+                "zoekt_data_dir": legacy,
+            }))
+            .expect("foreign state json"),
+        )
+        .expect("foreign state");
+        cleanup_owned_legacy_zoekt(&runtime.layout).expect("skip foreign");
+        assert!(legacy.exists());
     }
 
     fn native_embedding_launch_fixture() -> EmbeddingLaunchMetadata {
@@ -1866,7 +1990,7 @@ mod tests {
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: project_id.clone(),
-                zoekt_version: "zoekt-real-v1".into(),
+                lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
                 qdrant_collection: sidecar_qdrant_collection(&project_id, &input.hash),
                 scip_revision: Some("graph-test".into()),
                 built_at_epoch_ms: indexed_mtime,

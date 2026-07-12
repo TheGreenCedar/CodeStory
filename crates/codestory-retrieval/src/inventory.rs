@@ -545,7 +545,7 @@ fn remove_safe_candidate(
 
     if let Some(state) = candidate.state.as_ref() {
         for path in [
-            &state.zoekt_data_dir,
+            &state.lexical_data_dir,
             &state.qdrant_data_dir,
             &state.scip_artifacts_root,
         ] {
@@ -763,7 +763,7 @@ fn inventory_entry(
         reasons.push(format!("missing required GGUF {}", model.required_gguf));
     }
     if state.is_some_and(|state| {
-        !Path::new(&state.zoekt_data_dir).exists()
+        !Path::new(&state.lexical_data_dir).exists()
             || !Path::new(&state.qdrant_data_dir).exists()
             || !Path::new(&state.scip_artifacts_root).exists()
     }) {
@@ -1057,7 +1057,6 @@ mod tests {
             namespace: namespace.to_string(),
             compose_project: namespace.to_string(),
             run_id: Some("test".to_string()),
-            zoekt_http_port: 21001,
             qdrant_http_port: 21002,
             qdrant_grpc_port: 21003,
             embed_http_port: 21004,
@@ -1073,7 +1072,7 @@ mod tests {
             embedding_cpu_allowed: false,
             embedding_launch: None,
             sidecar_images: crate::config::default_sidecar_image_pins(),
-            zoekt_data_dir: root.join("zoekt").display().to_string(),
+            lexical_data_dir: root.join("lexical").display().to_string(),
             qdrant_data_dir: root.join("qdrant").display().to_string(),
             scip_artifacts_root: root.join("scip").display().to_string(),
             compose_file: None,
@@ -1086,7 +1085,7 @@ mod tests {
     }
 
     fn create_state_dirs(state: &SidecarStateFile) {
-        std::fs::create_dir_all(&state.zoekt_data_dir).expect("zoekt dir");
+        std::fs::create_dir_all(&state.lexical_data_dir).expect("lexical dir");
         std::fs::create_dir_all(&state.qdrant_data_dir).expect("qdrant dir");
         std::fs::create_dir_all(&state.scip_artifacts_root).expect("scip dir");
     }
@@ -1453,7 +1452,7 @@ mod tests {
             !stale_path.exists(),
             "safe stale state file should be removed"
         );
-        assert!(!Path::new(&stale.zoekt_data_dir).exists());
+        assert!(!Path::new(&stale.lexical_data_dir).exists());
         assert!(!Path::new(&stale.qdrant_data_dir).exists());
         assert!(!Path::new(&stale.scip_artifacts_root).exists());
         assert!(live_path.exists(), "live state file must stay blocked");
@@ -1614,7 +1613,7 @@ mod tests {
             blocked
                 .removed_paths
                 .iter()
-                .any(|path| path.contains("zoekt")),
+                .any(|path| path.contains("lexical")),
             "partial successes should stay visible: {blocked:?}"
         );
         assert!(Path::new(&state.qdrant_data_dir).exists());

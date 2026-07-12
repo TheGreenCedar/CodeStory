@@ -360,7 +360,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
 }
 
 fn infrastructure_ready(health: &InfrastructureHealth) -> bool {
-    health.zoekt_reachable && health.qdrant_reachable && health.embed_reachable
+    health.lexical_ready && health.qdrant_reachable && health.embed_reachable
 }
 
 fn with_bootstrap_progress<T>(
@@ -461,8 +461,12 @@ fn docker_compose_up(
             layout.qdrant_data_dir.display()
         )
     })?;
-    std::fs::create_dir_all(&layout.zoekt_data_dir)
-        .with_context(|| format!("create Zoekt data dir {}", layout.zoekt_data_dir.display()))?;
+    std::fs::create_dir_all(&layout.lexical_data_dir).with_context(|| {
+        format!(
+            "create lexical data dir {}",
+            layout.lexical_data_dir.display()
+        )
+    })?;
 
     let workdir = repo_root
         .or_else(|| compose_file.parent().and_then(|p| p.parent()))
@@ -470,7 +474,6 @@ fn docker_compose_up(
 
     let mut command = docker_compose_command()?;
     let compose_profile = retrieval_compose_profile();
-    remove_container_if_present("codestory-zoekt-stub")?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let accelerator_request = crate::embeddings::embedding_accelerator_request();
     let vulkan_override = maybe_write_vulkan_compose_override(
@@ -478,19 +481,14 @@ fn docker_compose_up(
         Path::new(LINUX_VULKAN_RENDER_NODE),
         vulkan_compose_override_requested(launch_mode, accelerator_request.as_ref()),
     )?;
-    command
-        .arg("compose")
-        .arg("-p")
-        .arg(&runtime.compose_project)
-        .arg("-f")
-        .arg(compose_file);
-    if let Some(override_file) = vulkan_override.as_ref() {
-        command.arg("-f").arg(override_file);
-    }
-    command.arg("up").arg("-d");
-    if force_recreate {
-        command.arg("--force-recreate");
-    }
+    append_docker_compose_up_args(
+        &mut command,
+        runtime,
+        compose_file,
+        vulkan_override.as_deref(),
+        launch_mode,
+        force_recreate,
+    );
     command
         .current_dir(workdir)
         .env(
@@ -504,11 +502,6 @@ fn docker_compose_up(
         .env(
             "CODESTORY_QDRANT_GRPC_PORT",
             layout.qdrant_grpc_port.to_string(),
-        )
-        .env("CODESTORY_ZOEKT_PORT", layout.zoekt_http_port.to_string())
-        .env(
-            "CODESTORY_ZOEKT_DATA_DIR",
-            docker_bind_path(&layout.zoekt_data_dir),
         )
         .env(
             "CODESTORY_EMBED_MODEL_DIR",
@@ -564,8 +557,6 @@ fn docker_compose_up(
             .env_remove("LLAMA_ARG_DEVICE")
             .env_remove("LLAMA_ARG_N_GPU_LAYERS");
     }
-    command.args(docker_compose_services_for_launch_mode(launch_mode));
-
     let output = command.output().context("spawn docker compose")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -576,6 +567,30 @@ fn docker_compose_up(
         );
     }
     Ok(())
+}
+
+fn append_docker_compose_up_args(
+    command: &mut Command,
+    runtime: &SidecarRuntimeConfig,
+    compose_file: &Path,
+    override_file: Option<&Path>,
+    launch_mode: EmbeddingServerLaunchMode,
+    force_recreate: bool,
+) {
+    command
+        .arg("compose")
+        .arg("-p")
+        .arg(&runtime.compose_project)
+        .arg("-f")
+        .arg(compose_file);
+    if let Some(override_file) = override_file {
+        command.arg("-f").arg(override_file);
+    }
+    command.arg("up").arg("-d").arg("--remove-orphans");
+    if force_recreate {
+        command.arg("--force-recreate");
+    }
+    command.args(docker_compose_services_for_launch_mode(launch_mode));
 }
 
 fn maybe_write_vulkan_compose_override(
@@ -685,9 +700,10 @@ fn compose_down_environment(state: &SidecarStateFile) -> Vec<(&'static str, Stri
             "CODESTORY_QDRANT_DATA_DIR",
             docker_bind_path(Path::new(&state.qdrant_data_dir)),
         ),
+        // Migration-only: old compose files require this interpolation while `down` parses them.
         (
             "CODESTORY_ZOEKT_DATA_DIR",
-            docker_bind_path(Path::new(&state.zoekt_data_dir)),
+            docker_bind_path(Path::new(&state.lexical_data_dir)),
         ),
         // Compose requires this variable while parsing the file. `down` does not
         // access the model mount, so an existing owned data path is sufficient.
@@ -708,7 +724,7 @@ fn docker_compose_services_for_launch_mode(
     match mode {
         EmbeddingServerLaunchMode::DockerComposeEmbed => &[],
         EmbeddingServerLaunchMode::NativeSpawned | EmbeddingServerLaunchMode::ExternalEndpoint => {
-            &["qdrant", "zoekt"]
+            &["qdrant"]
         }
     }
 }
@@ -1656,31 +1672,6 @@ fn native_embedding_breakaway_denied(error: &std::io::Error) -> bool {
     }
 }
 
-fn remove_container_if_present(name: &str) -> Result<()> {
-    let inspect = Command::new("docker")
-        .args(["container", "inspect", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("inspect docker container {name}"))?;
-    if !inspect.success() {
-        return Ok(());
-    }
-    let output = Command::new("docker")
-        .args(["rm", "-f", name])
-        .output()
-        .with_context(|| format!("remove stale docker container {name}"))?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "failed to remove stale docker container {name} (exit {:?}):\n{stdout}{stderr}",
-            output.status.code()
-        );
-    }
-    Ok(())
-}
-
 fn docker_bind_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let without_verbatim = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
@@ -1793,7 +1784,7 @@ fn wait_for_infrastructure(
     let poll = Duration::from_millis(500);
     let mut last = probe_infrastructure_health(layout);
     while started.elapsed() < timeout {
-        if last.zoekt_reachable && last.qdrant_reachable && last.embed_reachable {
+        if last.lexical_ready && last.qdrant_reachable && last.embed_reachable {
             return Ok(last);
         }
         thread::sleep(poll);
@@ -1811,10 +1802,9 @@ mod tests {
         SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.join("zoekt"),
+                lexical_data_dir: root.join("lexical"),
                 qdrant_data_dir: root.join("qdrant"),
                 scip_artifacts_root: root.join("scip"),
                 state_file: root.join("retrieval-sidecars.json"),
@@ -1834,16 +1824,14 @@ mod tests {
     fn compose_down_restores_required_interpolation_environment() {
         let root = tempdir().expect("root");
         let qdrant_data_dir = root.path().join("qdrant");
-        let zoekt_data_dir = root.path().join("zoekt");
         let state: SidecarStateFile = serde_json::from_value(serde_json::json!({
             "owner": "codestory",
             "profile": "agent",
             "namespace": "codestory-agent-test",
             "compose_project": "codestory-agent-test",
-            "zoekt_http_port": 16070,
             "qdrant_http_port": 16333,
             "qdrant_grpc_port": 16334,
-            "zoekt_data_dir": zoekt_data_dir,
+            "lexical_data_dir": root.path().join("lexical"),
             "qdrant_data_dir": qdrant_data_dir,
             "scip_artifacts_root": root.path().join("scip"),
             "cleanup_command": "codestory-cli retrieval down",
@@ -1864,7 +1852,7 @@ mod tests {
         );
         assert_eq!(
             environment.get("CODESTORY_ZOEKT_DATA_DIR"),
-            Some(&docker_bind_path(Path::new(&state.zoekt_data_dir)))
+            Some(&docker_bind_path(Path::new(&state.lexical_data_dir)))
         );
         assert_eq!(
             environment.get("CODESTORY_EMBED_MODEL_DIR"),
@@ -2010,7 +1998,6 @@ mod tests {
         assert!(contents.contains("dev.codestory.artifact_scope_id"));
         for image in [
             crate::config::QDRANT_IMAGE_PIN,
-            crate::config::ZOEKT_WEBSERVER_IMAGE_PIN,
             crate::config::LLAMACPP_SERVER_IMAGE_PIN,
         ] {
             assert!(
@@ -2060,18 +2047,53 @@ mod tests {
     }
 
     #[test]
-    fn native_launch_mode_limits_compose_to_qdrant_and_zoekt() {
+    fn native_launch_mode_limits_compose_to_qdrant() {
         assert_eq!(
             docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::NativeSpawned),
-            &["qdrant", "zoekt"]
+            &["qdrant"]
         );
         assert_eq!(
             docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::ExternalEndpoint),
-            &["qdrant", "zoekt"]
+            &["qdrant"]
         );
         assert!(
             docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::DockerComposeEmbed)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn compose_up_removes_services_deleted_from_the_compose_file() {
+        let root = tempdir().expect("root");
+        let runtime = compose_test_runtime(root.path());
+        let mut command = Command::new("docker");
+
+        append_docker_compose_up_args(
+            &mut command,
+            &runtime,
+            Path::new("retrieval-compose.yml"),
+            None,
+            EmbeddingServerLaunchMode::NativeSpawned,
+            false,
+        );
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "compose",
+                "-p",
+                "test",
+                "-f",
+                "retrieval-compose.yml",
+                "up",
+                "-d",
+                "--remove-orphans",
+                "qdrant",
+            ]
         );
     }
 

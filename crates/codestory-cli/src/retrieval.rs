@@ -350,7 +350,7 @@ fn sidecar_runtime_mismatch(
 ) -> Option<String> {
     let same_paths = indexed.profile == default.profile
         && indexed.namespace == default.namespace
-        && indexed.layout.zoekt_data_dir == default.layout.zoekt_data_dir
+        && indexed.layout.lexical_data_dir == default.layout.lexical_data_dir
         && indexed.layout.qdrant_data_dir == default.layout.qdrant_data_dir
         && indexed.layout.scip_artifacts_root == default.layout.scip_artifacts_root
         && indexed.layout.state_file == default.layout.state_file;
@@ -365,11 +365,11 @@ fn sidecar_runtime_mismatch(
 
 pub(crate) fn format_sidecar_runtime(runtime: &SidecarRuntimeConfig) -> String {
     format!(
-        "profile={} namespace={} state={} zoekt={} qdrant={} scip={}",
+        "profile={} namespace={} state={} lexical={} qdrant={} scip={}",
         runtime.profile.as_str(),
         runtime.namespace,
         runtime.layout.state_file.display(),
-        runtime.layout.zoekt_data_dir.display(),
+        runtime.layout.lexical_data_dir.display(),
         runtime.layout.qdrant_data_dir.display(),
         runtime.layout.scip_artifacts_root.display()
     )
@@ -400,7 +400,6 @@ fn preflight_output(output_file: Option<&std::path::Path>) -> Result<()> {
 struct RetrievalIndexOutput<'a> {
     manifest: &'a RetrievalIndexManifest,
     degraded_modes: &'a [String],
-    zoekt_stubbed: bool,
     qdrant_stubbed: bool,
     scip_stubbed: bool,
     generation_retention_plan: &'a codestory_retrieval::GenerationRetentionPlan,
@@ -415,16 +414,15 @@ fn emit_retrieval_index(
     let payload = RetrievalIndexOutput {
         manifest: &outcome.manifest,
         degraded_modes: &outcome.degraded_modes,
-        zoekt_stubbed: outcome.zoekt_stubbed,
         qdrant_stubbed: outcome.qdrant_stubbed,
         scip_stubbed: outcome.scip_stubbed,
         generation_retention_plan: &outcome.generation_retention_plan,
         generation_retention: &outcome.generation_retention,
     };
     let markdown = format!(
-        "# Retrieval index\n\n- project_id: `{}`\n- zoekt_version: `{}`\n- qdrant_collection: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n- retention_retained_bytes: {}\n- retention_reclaimable_bytes: {}\n- retention_removed_bytes: {}\n- retention_remaining_reclaimable_bytes: {}\n- retention_pruning_suppressed: {}\n",
+        "# Retrieval index\n\n- project_id: `{}`\n- lexical_version: `{}`\n- qdrant_collection: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n- retention_retained_bytes: {}\n- retention_reclaimable_bytes: {}\n- retention_removed_bytes: {}\n- retention_remaining_reclaimable_bytes: {}\n- retention_pruning_suppressed: {}\n",
         payload.manifest.project_id,
-        payload.manifest.zoekt_version,
+        payload.manifest.lexical_version,
         payload.manifest.qdrant_collection,
         payload.manifest.scip_revision,
         payload.degraded_modes,
@@ -463,10 +461,10 @@ fn emit_retrieval_query(
 struct RetrievalBootstrapOutput<'a> {
     compose_started: bool,
     compose_file: Option<&'a str>,
-    zoekt_reachable: bool,
+    lexical_ready: bool,
     qdrant_reachable: bool,
     embed_reachable: bool,
-    zoekt_detail: &'a str,
+    lexical_detail: &'a str,
     qdrant_detail: &'a str,
     embed_detail: &'a str,
     storage_repair: &'a codestory_retrieval::QdrantStorageRepairReport,
@@ -492,10 +490,10 @@ fn emit_retrieval_bootstrap(
     let payload = RetrievalBootstrapOutput {
         compose_started: report.compose_started,
         compose_file: compose_path.as_deref(),
-        zoekt_reachable: report.infrastructure.zoekt_reachable,
+        lexical_ready: report.infrastructure.lexical_ready,
         qdrant_reachable: report.infrastructure.qdrant_reachable,
         embed_reachable: report.infrastructure.embed_reachable,
-        zoekt_detail: &report.infrastructure.zoekt_detail,
+        lexical_detail: &report.infrastructure.lexical_detail,
         qdrant_detail: &report.infrastructure.qdrant_detail,
         embed_detail: &report.infrastructure.embed_detail,
         storage_repair: &report.storage_repair,
@@ -546,16 +544,14 @@ fn emit_retrieval_bootstrap(
         })
         .unwrap_or_default();
     let sidecar_images_note = format!(
-        "\n- sidecar_images: qdrant=`{}` zoekt=`{}` embed=`{}`",
-        payload.sidecar_state.sidecar_images.qdrant,
-        payload.sidecar_state.sidecar_images.zoekt,
-        payload.sidecar_state.sidecar_images.embed
+        "\n- sidecar_images: qdrant=`{}` embed=`{}`",
+        payload.sidecar_state.sidecar_images.qdrant, payload.sidecar_state.sidecar_images.embed
     );
     let markdown = format!(
-        "# Retrieval bootstrap\n\n- compose_started: {}\n- zoekt_reachable: {} ({})\n- qdrant_reachable: {} ({})\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
+        "# Retrieval bootstrap\n\n- compose_started: {}\n- lexical_ready: {} ({})\n- qdrant_reachable: {} ({})\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
         payload.compose_started,
-        payload.zoekt_reachable,
-        payload.zoekt_detail,
+        payload.lexical_ready,
+        payload.lexical_detail,
         payload.qdrant_reachable,
         payload.qdrant_detail,
         payload.embed_reachable,
@@ -643,12 +639,11 @@ fn emit_retrieval_status(
         .as_ref()
         .map(|ownership| {
             format!(
-                "- ownership: owner=`{}` profile=`{}` namespace=`{}` cleanup=`{}` ports=zoekt:{} qdrant:{} grpc:{} embed:{}\n",
+                "- ownership: owner=`{}` profile=`{}` namespace=`{}` cleanup=`{}` ports=qdrant:{} grpc:{} embed:{}\n",
                 ownership.owner,
                 ownership.profile,
                 ownership.namespace,
                 ownership.cleanup_command,
-                ownership.ports.zoekt_http,
                 ownership.ports.qdrant_http,
                 ownership.ports.qdrant_grpc,
                 ownership.ports.embed_http,
@@ -656,8 +651,8 @@ fn emit_retrieval_status(
         })
         .unwrap_or_default();
     let sidecar_images_note = format!(
-        "- sidecar_images: qdrant=`{}` zoekt=`{}` embed=`{}`\n",
-        report.sidecar_images.qdrant, report.sidecar_images.zoekt, report.sidecar_images.embed
+        "- sidecar_images: qdrant=`{}` embed=`{}`\n",
+        report.sidecar_images.qdrant, report.sidecar_images.embed
     );
     let broker_note = format!(
         "- readiness_broker: project_id={} persistence={} operations={} gpu_proof={}\n",
@@ -671,7 +666,7 @@ fn emit_retrieval_status(
             .unwrap_or("unknown")
     );
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}{}- zoekt: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -694,9 +689,9 @@ fn emit_retrieval_status(
         ownership_note,
         sidecar_images_note,
         broker_note,
-        report.zoekt.status,
-        report.zoekt.detail,
-        report.zoekt.capabilities.lexical,
+        report.lexical.status,
+        report.lexical.detail,
+        report.lexical.capabilities.lexical,
         report.qdrant.status,
         report.qdrant.detail,
         report.qdrant.capabilities.semantic,
@@ -936,7 +931,7 @@ mod tests {
         assert!(message.contains("profile=local"));
         assert!(message.contains("profile=agent"));
         assert!(message.contains("namespace=codestory-agent"));
-        assert!(message.contains("zoekt="));
+        assert!(message.contains("lexical="));
         assert!(sidecar_runtime_mismatch(&local, &local).is_none());
     }
 

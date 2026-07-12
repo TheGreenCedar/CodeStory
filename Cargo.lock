@@ -533,6 +533,7 @@ dependencies = [
  "codestory-workspace",
  "directories",
  "fs4",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

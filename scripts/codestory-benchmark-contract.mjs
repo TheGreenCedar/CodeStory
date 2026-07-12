@@ -5,7 +5,6 @@ const RETRIEVAL_ENV_KEYS = [
   "CODESTORY_RETRIEVAL",
   "CODESTORY_RETRIEVAL_SHADOW",
   "CODESTORY_QDRANT_ENABLED",
-  "CODESTORY_ZOEKT_ENABLED",
   "CODESTORY_RETRIEVAL_REAL_EMBEDDINGS",
   "CODESTORY_RETRIEVAL_COMPOSE_PROFILE",
   "CODESTORY_EMBED_BACKEND",
@@ -35,9 +34,6 @@ function unsupportedSidecarContractRequests(env = process.env) {
   }
   if (env.CODESTORY_QDRANT_ENABLED === "0" || env.CODESTORY_QDRANT_ENABLED === "false") {
     blockers.push("CODESTORY_QDRANT_ENABLED=0 is unsupported; Qdrant sidecar is mandatory");
-  }
-  if (env.CODESTORY_ZOEKT_ENABLED === "0" || env.CODESTORY_ZOEKT_ENABLED === "false") {
-    blockers.push("CODESTORY_ZOEKT_ENABLED=0 is unsupported; Zoekt sidecar is mandatory");
   }
   if (
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === "0" ||

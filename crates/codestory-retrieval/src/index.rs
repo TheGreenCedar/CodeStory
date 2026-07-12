@@ -1,4 +1,4 @@
-use crate::config::{SidecarLayout, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, dir_size_bytes};
+use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
 #[cfg(test)]
 use crate::generation::manifest_unavailable_reason;
 use crate::generation::{
@@ -6,6 +6,9 @@ use crate::generation::{
     manifest_unavailable_reason_for_runtime, sidecar_generation_id,
 };
 use crate::health::probe_sidecar_health_for_runtime;
+use crate::lexical_index::{
+    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, build_lexical_shard, lexical_input_fingerprint,
+};
 use crate::qdrant_client::{QDRANT_INDEX_UPSERT_BATCH_SIZE, QdrantClient, QdrantUpsertPoint};
 use crate::retention::{
     FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
@@ -18,8 +21,6 @@ use crate::scip_index::{
     SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
     import_precise_semantic_scip_artifact,
 };
-use crate::zoekt_client::ZoektClient;
-use crate::zoekt_index::{LexicalInputFingerprint, build_zoekt_shard, lexical_input_fingerprint};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store, SymbolSearchDoc};
@@ -34,7 +35,6 @@ pub struct FinalizeIndexOutcome {
     pub project_id: String,
     pub manifest: RetrievalIndexManifest,
     pub degraded_modes: Vec<String>,
-    pub zoekt_stubbed: bool,
     pub qdrant_stubbed: bool,
     pub scip_stubbed: bool,
     pub generation_retention_plan: GenerationRetentionPlan,
@@ -62,13 +62,18 @@ pub(crate) struct SidecarInputFingerprint {
     pub(crate) dense_reason_counts_json: String,
     pub(crate) lexical_file_count: u32,
     pub(crate) lexical_hash: String,
+    pub(crate) lexical_coverage: crate::lexical_index::LexicalCoverage,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarStubFlags {
-    zoekt_stubbed: bool,
     qdrant_stubbed: bool,
     scip_stubbed: bool,
+}
+
+struct LexicalGenerationOutcome {
+    version: String,
+    rebuilt_fingerprint: Option<LexicalInputFingerprint>,
 }
 
 struct GenerationRetentionContext<'a> {
@@ -229,19 +234,8 @@ pub fn finalize_index_for_runtime_with_progress(
         .context("lock sidecar generation publication and retention")?;
     layout.ensure_data_dirs()?;
     let degraded_modes = Vec::new();
-    let zoekt_stubbed = false;
     let qdrant_stubbed = false;
     let scip_stubbed = false;
-
-    let zoekt_client = ZoektClient::new(&layout);
-    let zoekt_probe = zoekt_client.health_probe();
-    if !zoekt_probe.reachable {
-        bail!(
-            "Zoekt sidecar is mandatory and must be reachable at {} before indexing {project_id}: {}",
-            layout.zoekt_base_url(),
-            zoekt_probe.detail
-        );
-    }
 
     let qdrant_client = QdrantClient::for_runtime(runtime)?;
     let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
@@ -316,10 +310,10 @@ pub fn finalize_index_for_runtime_with_progress(
                             manifest,
                             degraded_modes,
                             SidecarStubFlags {
-                                zoekt_stubbed,
                                 qdrant_stubbed,
                                 scip_stubbed,
                             },
+                            None,
                         );
                     }
                 }
@@ -340,10 +334,10 @@ pub fn finalize_index_for_runtime_with_progress(
                     previous.clone(),
                     degraded_modes,
                     SidecarStubFlags {
-                        zoekt_stubbed,
                         qdrant_stubbed,
                         scip_stubbed,
                     },
+                    None,
                 );
             }
             warn!(
@@ -376,9 +370,9 @@ pub fn finalize_index_for_runtime_with_progress(
         &embedding_device,
         runtime,
     );
-    let zoekt_ready = existing_status.zoekt.capabilities.lexical
-        && crate::zoekt_index::shard_matches_lexical_input(
-            &layout.zoekt_data_dir,
+    let lexical_ready = existing_status.lexical.capabilities.lexical
+        && crate::lexical_index::shard_matches_lexical_input(
+            &layout.lexical_data_dir,
             &generation,
             sidecar_input.lexical_file_count,
             &sidecar_input.lexical_hash,
@@ -391,7 +385,7 @@ pub fn finalize_index_for_runtime_with_progress(
     };
     let scip_ready = existing_status.scip.capabilities.graph;
 
-    if zoekt_ready && qdrant_ready_points.is_some() && scip_ready {
+    if lexical_ready && qdrant_ready_points.is_some() && scip_ready {
         update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
         manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
         let status = probe_sidecar_health_for_runtime(
@@ -417,16 +411,16 @@ pub fn finalize_index_for_runtime_with_progress(
                 manifest,
                 degraded_modes,
                 SidecarStubFlags {
-                    zoekt_stubbed,
                     qdrant_stubbed,
                     scip_stubbed,
                 },
+                None,
             );
         }
     }
 
-    let zoekt_version = with_finalize_progress(&mut progress, "lexical sidecar", || {
-        ensure_zoekt_generation(
+    let lexical_outcome = with_finalize_progress(&mut progress, "lexical sidecar", || {
+        ensure_lexical_generation(
             project_root,
             storage_path,
             &layout,
@@ -434,9 +428,10 @@ pub fn finalize_index_for_runtime_with_progress(
             &LexicalInputFingerprint {
                 file_count: sidecar_input.lexical_file_count,
                 hash: sidecar_input.lexical_hash.clone(),
+                coverage: sidecar_input.lexical_coverage.clone(),
             },
             &sidecar_input.hash,
-            zoekt_ready,
+            lexical_ready,
         )
     })?;
 
@@ -463,7 +458,7 @@ pub fn finalize_index_for_runtime_with_progress(
     })?;
     update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
 
-    manifest.zoekt_version = zoekt_version;
+    manifest.lexical_version = lexical_outcome.version;
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
     manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
 
@@ -480,11 +475,11 @@ pub fn finalize_index_for_runtime_with_progress(
             manifest,
             degraded_modes,
             SidecarStubFlags {
-                zoekt_stubbed,
                 qdrant_stubbed,
                 scip_stubbed,
             },
             &embedding_device,
+            lexical_outcome.rebuilt_fingerprint.as_ref(),
         )
     })
 }
@@ -498,48 +493,52 @@ fn with_finalize_progress<T>(
     action()
 }
 
-fn ensure_zoekt_generation(
+fn ensure_lexical_generation(
     project_root: &Path,
     storage_path: &Path,
     layout: &SidecarLayout,
     generation: &str,
     expected: &LexicalInputFingerprint,
     sidecar_input_hash: &str,
-    mut zoekt_ready: bool,
-) -> Result<String> {
-    if zoekt_ready {
-        info!(sidecar_generation = %generation, "Zoekt lexical shard reused");
+    mut lexical_ready: bool,
+) -> Result<LexicalGenerationOutcome> {
+    let mut rebuilt_fingerprint = None;
+    if lexical_ready {
+        info!(sidecar_generation = %generation, "SQLite lexical shard reused");
     } else {
-        match build_zoekt_shard(
+        match build_lexical_shard(
             project_root,
             Some(storage_path),
-            &layout.zoekt_data_dir,
+            &layout.lexical_data_dir,
             generation,
             expected,
             sidecar_input_hash,
         ) {
-            Ok(true) => {
-                zoekt_ready = true;
-                info!(sidecar_generation = %generation, "Zoekt lexical shard built");
+            Ok(rebuilt) => {
+                lexical_ready = true;
+                rebuilt_fingerprint = Some(rebuilt);
+                info!(sidecar_generation = %generation, "SQLite lexical shard built");
             }
-            Ok(false) => {
-                warn!(sidecar_generation = %generation, "Zoekt shard build produced no files");
+            Err(error) => {
+                bail!("mandatory SQLite lexical shard build failed for {generation}: {error}")
             }
-            Err(error) => bail!("mandatory Zoekt shard build failed for {generation}: {error}"),
         }
     }
-    if !zoekt_ready
-        || !crate::zoekt_index::shard_matches_lexical_input(
-            &layout.zoekt_data_dir,
+    if !lexical_ready
+        || !crate::lexical_index::shard_matches_lexical_input(
+            &layout.lexical_data_dir,
             generation,
             expected.file_count,
             &expected.hash,
             sidecar_input_hash,
         )
     {
-        bail!("mandatory Zoekt lexical shard is incomplete for {generation}");
+        bail!("mandatory SQLite lexical shard is incomplete for {generation}");
     }
-    Ok(ZOEKT_REAL_VERSION_PIN.to_string())
+    Ok(LexicalGenerationOutcome {
+        version: LEXICAL_INDEX_VERSION.to_string(),
+        rebuilt_fingerprint,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -720,19 +719,20 @@ fn finalize_manifest_after_health_check(
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
     embedding_device: &crate::embeddings::EmbeddingDeviceReadiness,
+    rebuilt_lexical_input: Option<&LexicalInputFingerprint>,
 ) -> Result<FinalizeIndexOutcome> {
     let generation = manifest
         .sidecar_generation
         .as_deref()
         .context("mandatory sidecar manifest is missing its generation")?;
-    if !crate::zoekt_index::shard_matches_lexical_input(
-        &layout.zoekt_data_dir,
+    if !crate::lexical_index::shard_matches_lexical_input(
+        &layout.lexical_data_dir,
         generation,
         sidecar_input.lexical_file_count,
         &sidecar_input.lexical_hash,
         &sidecar_input.hash,
     ) {
-        bail!("mandatory Zoekt lexical shard is incomplete for {project_id}");
+        bail!("mandatory SQLite lexical shard is incomplete for {project_id}");
     }
     let status = probe_sidecar_health_for_runtime(
         layout,
@@ -765,6 +765,7 @@ fn finalize_manifest_after_health_check(
         manifest,
         degraded_modes,
         stub_flags,
+        rebuilt_lexical_input,
     )
 }
 
@@ -778,6 +779,24 @@ fn ensure_lexical_input_unchanged(
         bail!("lexical input changed before sidecar manifest publication");
     }
     Ok(())
+}
+
+fn ensure_lexical_freshness_for_publication(
+    project_root: &Path,
+    storage_path: &Path,
+    expected: &SidecarInputFingerprint,
+    rebuilt: Option<&LexicalInputFingerprint>,
+) -> Result<()> {
+    if let Some(rebuilt) = rebuilt {
+        if rebuilt.file_count == expected.lexical_file_count
+            && rebuilt.hash == expected.lexical_hash
+            && rebuilt.coverage == expected.lexical_coverage
+        {
+            return Ok(());
+        }
+        bail!("rebuilt lexical fingerprint does not match sidecar input");
+    }
+    ensure_lexical_input_unchanged(project_root, storage_path, expected)
 }
 
 #[allow(dead_code)] // Phase 2 cache keys
@@ -828,7 +847,7 @@ fn retrieval_manifest_for_sidecar(
 ) -> RetrievalIndexManifest {
     RetrievalIndexManifest {
         project_id: project_id.to_string(),
-        zoekt_version: ZOEKT_REAL_VERSION_PIN.to_string(),
+        lexical_version: LEXICAL_INDEX_VERSION.to_string(),
         qdrant_collection: collection.to_string(),
         scip_revision: None,
         built_at_epoch_ms: Utc::now().timestamp_millis(),
@@ -866,8 +885,8 @@ fn sidecar_disk_bytes(
     scip_dir: &Path,
 ) -> Option<i64> {
     Some(
-        dir_size_bytes(&crate::zoekt_index::shard_dir_for(
-            &layout.zoekt_data_dir,
+        dir_size_bytes(&crate::lexical_index::shard_dir_for(
+            &layout.lexical_data_dir,
             generation,
         ))
         .saturating_add(dir_size_bytes(
@@ -918,6 +937,7 @@ fn persist_finalized_manifest(
     mut manifest: RetrievalIndexManifest,
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
+    rebuilt_lexical_input: Option<&LexicalInputFingerprint>,
 ) -> Result<FinalizeIndexOutcome> {
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
     manifest.degraded_modes_json =
@@ -933,7 +953,12 @@ fn persist_finalized_manifest(
             "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
         );
     }
-    ensure_lexical_input_unchanged(project_root, storage_path, sidecar_input)?;
+    ensure_lexical_freshness_for_publication(
+        project_root,
+        storage_path,
+        sidecar_input,
+        rebuilt_lexical_input,
+    )?;
     storage
         .upsert_retrieval_index_manifest(&manifest)
         .context("persist retrieval_index_manifest")?;
@@ -944,7 +969,7 @@ fn persist_finalized_manifest(
 
     info!(
         project_id = %project_id,
-        zoekt_version = %manifest.zoekt_version,
+        lexical_version = %manifest.lexical_version,
         qdrant_collection = %manifest.qdrant_collection,
         sidecar_generation = ?manifest.sidecar_generation,
         degraded_modes = ?degraded_modes,
@@ -955,7 +980,6 @@ fn persist_finalized_manifest(
         project_id,
         manifest,
         degraded_modes,
-        zoekt_stubbed: stub_flags.zoekt_stubbed,
         qdrant_stubbed: stub_flags.qdrant_stubbed,
         scip_stubbed: stub_flags.scip_stubbed,
         generation_retention_plan,
@@ -1095,7 +1119,7 @@ pub(crate) fn compute_sidecar_input_fingerprint_for_runtime(
     hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
     hash_part(&mut hasher, &SIDECAR_SCHEMA_VERSION.to_string());
-    hash_part(&mut hasher, ZOEKT_REAL_VERSION_PIN);
+    hash_part(&mut hasher, LEXICAL_INDEX_VERSION);
     hash_part(&mut hasher, &lexical.file_count.to_string());
     hash_part(&mut hasher, &lexical.hash);
     hash_part(&mut hasher, embedding_backend);
@@ -1173,6 +1197,7 @@ pub(crate) fn compute_sidecar_input_fingerprint_for_runtime(
         dense_reason_counts_json,
         lexical_file_count: lexical.file_count,
         lexical_hash: lexical.hash,
+        lexical_coverage: lexical.coverage,
     })
 }
 
@@ -1401,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_index_fails_without_mandatory_sidecar_artifacts() {
+    fn finalize_index_fails_before_publication_without_runtime_or_artifacts() {
         let project = TempDir::new().expect("project dir");
         let storage_dir = TempDir::new().expect("storage dir");
         let storage_path = storage_dir.path().join("codestory.db");
@@ -1411,9 +1436,10 @@ mod tests {
         }
         let error = finalize_index(project.path(), &storage_path)
             .expect_err("empty stores cannot satisfy mandatory sidecar indexing");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("mandatory"),
-            "expected mandatory-sidecar error, got {error:#}"
+            message.contains("mandatory") || message.contains("embedding_device_unverified"),
+            "expected a pre-publication retrieval trust-gate error, got {error:#}"
         );
     }
 
@@ -1434,6 +1460,47 @@ mod tests {
         .expect("progress wrapper should return action result");
 
         assert_eq!(&*phases.borrow(), &["lexical sidecar"]);
+    }
+
+    #[test]
+    fn just_built_lexical_fingerprint_skips_only_the_redundant_final_scan() {
+        let expected = SidecarInputFingerprint {
+            hash: "sidecar".into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: None,
+            graph_artifact_hash: "graph".into(),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: "lexical".into(),
+            lexical_coverage: Default::default(),
+        };
+        let rebuilt = LexicalInputFingerprint {
+            file_count: 0,
+            hash: "lexical".into(),
+            coverage: Default::default(),
+        };
+        let root = TempDir::new().expect("root");
+        let missing = root.path().join("missing");
+
+        ensure_lexical_freshness_for_publication(
+            &missing,
+            Path::new("missing.db"),
+            &expected,
+            Some(&rebuilt),
+        )
+        .expect("matching just-built fingerprint avoids a third scan");
+        assert!(
+            ensure_lexical_freshness_for_publication(
+                &missing,
+                Path::new("missing.db"),
+                &expected,
+                None,
+            )
+            .is_err(),
+            "reused shards must retain the final freshness scan"
+        );
     }
 
     #[test]
@@ -1533,6 +1600,7 @@ mod tests {
             dense_reason_counts_json: "{}".into(),
             lexical_file_count: 1,
             lexical_hash: "lexical".into(),
+            lexical_coverage: Default::default(),
         };
         let collection = QdrantClient::collection_name_for_generation(&project_id, &input.hash);
         let manifest = retrieval_manifest_for_sidecar(
@@ -1557,10 +1625,9 @@ mod tests {
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 9,
                 qdrant_http_port: 9,
                 qdrant_grpc_port: 10,
-                zoekt_data_dir: sidecar_dir.path().join("selected-zoekt"),
+                lexical_data_dir: sidecar_dir.path().join("selected-lexical"),
                 qdrant_data_dir: sidecar_dir.path().join("selected-qdrant"),
                 scip_artifacts_root: sidecar_dir.path().join("selected-scip"),
                 state_file: sidecar_dir.path().join("selected-state.json"),
@@ -1580,7 +1647,7 @@ mod tests {
                 .expect("repair")
                 .expect("manifest-backed repair");
 
-        assert!(runtime.layout.zoekt_data_dir.is_dir());
+        assert!(runtime.layout.lexical_data_dir.is_dir());
         assert!(runtime.layout.qdrant_data_dir.is_dir());
         assert!(runtime.layout.scip_artifacts_root.is_dir());
         assert_eq!(repair.qdrant_collection, collection);
@@ -1606,6 +1673,7 @@ mod tests {
             dense_reason_counts_json: "{\"public_api\":42}".into(),
             lexical_file_count: 3,
             lexical_hash: "lexical".into(),
+            lexical_coverage: Default::default(),
         };
         let generation = sidecar_generation_id(project_id, &input.hash);
         let collection = QdrantClient::collection_name_for_generation(project_id, &input.hash);

@@ -3069,10 +3069,10 @@ fn ensure_ready_repair_embed_liveness_with_probe(
     let smoke = probe();
     if !smoke.reachable {
         bail!(
-            "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; zoekt_reachable={} ({}); qdrant_reachable={} ({})",
+            "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; lexical_ready={} ({}); qdrant_reachable={} ({})",
             smoke.detail,
-            infrastructure.zoekt_reachable,
-            infrastructure.zoekt_detail,
+            infrastructure.lexical_ready,
+            infrastructure.lexical_detail,
             infrastructure.qdrant_reachable,
             infrastructure.qdrant_detail
         );
@@ -3210,7 +3210,7 @@ fn ensure_ready_repair_full_sidecar(
         reason,
         report.embedding_device_state,
         report.embedding_device_observation_source,
-        ready_repair_component_detail(&report.zoekt),
+        ready_repair_component_detail(&report.lexical),
         ready_repair_component_detail(&report.qdrant),
         ready_repair_component_detail(&report.scip)
     )
@@ -13404,8 +13404,8 @@ mod tests {
             embedding_accelerator_request_device: Some("Vulkan0".into()),
             embedding_cpu_allowed: false,
             embedding_launch: None,
-            zoekt: ready_repair_test_component(
-                "zoekt",
+            lexical: ready_repair_test_component(
+                "lexical",
                 codestory_retrieval::ComponentStatus::Unavailable,
                 "retrieval_manifest_missing",
             ),
@@ -13435,7 +13435,7 @@ mod tests {
     fn ready_repair_final_snapshot_preserves_embed_smoke_proof() {
         let final_status = ready_repair_test_report("full", None);
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
@@ -13447,7 +13447,7 @@ mod tests {
             embedding_accelerator_request_provider: Some("vulkan".into()),
             embedding_accelerator_request_device: Some("Vulkan0".into()),
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
@@ -13520,7 +13520,7 @@ mod tests {
         assert!(message.contains("retrieval manifest was not persisted"));
         assert!(message.contains("embedding_device_state=accelerated"));
         assert!(message.contains("observation_source=native_log"));
-        assert!(message.contains("zoekt=Unavailable"));
+        assert!(message.contains("lexical=Unavailable"));
         assert!(message.contains("qdrant=Unavailable"));
         assert!(message.contains("scip=Unavailable"));
     }
@@ -13528,7 +13528,7 @@ mod tests {
     #[test]
     fn ready_repair_embed_liveness_blocks_before_semantic_smoke() {
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: false,
             embedding_device_policy: "accelerator_required".into(),
@@ -13540,7 +13540,7 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail:
                 "llama.cpp embeddings unavailable: http://127.0.0.1:55280/v1/embeddings: Connection Failed"
@@ -13566,7 +13566,7 @@ mod tests {
     #[test]
     fn ready_repair_blocks_unknown_embedding_device_before_indexing() {
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
@@ -13578,7 +13578,7 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
@@ -13611,10 +13611,9 @@ mod tests {
         let sidecar = codestory_retrieval::SidecarRuntimeConfig {
             project_identity: None,
             layout: codestory_retrieval::SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.path().join("zoekt"),
+                lexical_data_dir: root.path().join("lexical"),
                 qdrant_data_dir: root.path().join("qdrant"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
@@ -13632,7 +13631,7 @@ mod tests {
         fs::create_dir_all(state_dir).expect("create state dir");
         let log_path = state_dir.join("llama-server-native.log");
         let stale = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
@@ -13644,7 +13643,7 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
@@ -13710,7 +13709,7 @@ mod tests {
         let downgraded = apply_sidecar_profile_handoff(
             status,
             Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
                     .to_string(),
             ),
         );
@@ -13719,7 +13718,7 @@ mod tests {
         assert_eq!(
             downgraded.degraded_reason.as_deref(),
             Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
             )
         );
     }
@@ -13815,7 +13814,7 @@ mod tests {
             run_id: Some("run".to_string()),
             retrieval_mode: "unavailable".to_string(),
             degraded_reason: Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
                     .to_string(),
             ),
             embedding_device_policy: "accelerator_required".to_string(),

@@ -3047,7 +3047,7 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
     manifest_embedding_dim: output?.manifest?.embedding_dim ?? null,
     sidecar_generation: output?.manifest?.sidecar_generation ?? null,
     qdrant_collection: output?.manifest?.qdrant_collection ?? null,
-    zoekt_capabilities: output?.zoekt?.capabilities ?? null,
+    lexical_capabilities: output?.lexical?.capabilities ?? null,
     qdrant_capabilities: output?.qdrant?.capabilities ?? null,
     scip_capabilities: output?.scip?.capabilities ?? null,
     stdout_tail: result.status === "pass" ? null : trimTail(result.stdout),

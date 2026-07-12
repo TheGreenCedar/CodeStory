@@ -213,7 +213,7 @@ impl<'a> QueryExecutor<'a> {
             } else {
                 probe_sidecar_health(layout, &manifest.project_id, Some(manifest.clone()))
             };
-            return derive_degraded_mode(&report.zoekt, &report.qdrant, &report.scip);
+            return derive_degraded_mode(&report.lexical, &report.qdrant, &report.scip);
         }
         (
             RetrievalDegradedMode::LexicalOnly,
@@ -230,7 +230,7 @@ impl<'a> QueryExecutor<'a> {
         let query = &features.raw_query;
         match stage.kind {
             RetrievalStageKind::Stage0ScipAnchor => sidecars.scip_anchor(query, stage.top_k),
-            RetrievalStageKind::Stage1ZoektLexical => sidecars.zoekt_search(query, stage.top_k),
+            RetrievalStageKind::Stage1Lexical => sidecars.lexical_search(query, stage.top_k),
             RetrievalStageKind::Stage1bQdrantSemantic => sidecars.qdrant_search(query, stage.top_k),
             RetrievalStageKind::Stage2ScipExpand => sidecars.scip_expand(anchors, stage.top_k),
             RetrievalStageKind::Stage3RepoTextFallback => {
@@ -617,7 +617,6 @@ mod tests {
     use crate::test_support::retrieval_manifest_fixture;
     use codestory_store::RetrievalIndexManifest;
     use std::collections::HashMap;
-    use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -625,7 +624,7 @@ mod tests {
     fn sample_manifest() -> RetrievalIndexManifest {
         RetrievalIndexManifest {
             project_id: "testproj".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_testproj".into(),
             scip_revision: Some("rev1".into()),
             built_at_epoch_ms: 0,
@@ -652,13 +651,13 @@ mod tests {
     #[test]
     fn executor_runs_stages_with_mock_sidecars() {
         let mock = MockSidecarSearch {
-            zoekt: Mutex::new(HashMap::from([(
+            lexical: Mutex::new(HashMap::from([(
                 "ExtensionService".into(),
                 vec![CandidateHit::with_source(
                     "src/service.rs",
                     Some("ExtensionService".into()),
                     0.9,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )],
             )])),
             qdrant: Mutex::new(HashMap::from([(
@@ -714,13 +713,13 @@ mod tests {
     #[test]
     fn executor_caches_only_complete_query_results() {
         let mock = Arc::new(MockSidecarSearch {
-            zoekt: Mutex::new(HashMap::from([(
+            lexical: Mutex::new(HashMap::from([(
                 "startup".into(),
                 vec![CandidateHit::with_source(
                     "src/startup.rs",
                     Some("startup".into()),
                     0.9,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )],
             )])),
             ..Default::default()
@@ -840,8 +839,7 @@ mod tests {
 
     #[test]
     fn executor_resolve_mode_probes_live_sidecar_layout_instead_of_env_default() {
-        let mut layout = SidecarLayout::from_env();
-        layout.zoekt_http_port = unused_local_port();
+        let layout = SidecarLayout::from_env();
         let manifest = retrieval_manifest_fixture("testproj", "cafebabedeadbeef");
         let sidecars = Arc::new(TrackingSidecars {
             layout,
@@ -861,7 +859,7 @@ mod tests {
 
         assert_eq!(sidecars.layout_calls.load(Ordering::Relaxed), 1);
         assert_eq!(mode, RetrievalDegradedMode::Unavailable);
-        assert_eq!(reason.as_deref(), Some("zoekt_unreachable"));
+        assert_eq!(reason.as_deref(), Some("lexical_shard_unavailable"));
     }
 
     #[test]
@@ -918,7 +916,7 @@ mod tests {
                 .stages
                 .iter()
                 .any(|stage| stage.stage == RetrievalStageKind::Stage1bQdrantSemantic),
-            "semantic stage should run after empty SCIP/Zoekt stages: {:?}",
+            "semantic stage should run after empty SCIP/Lexical stages: {:?}",
             result.trace.stages
         );
         assert!(
@@ -933,16 +931,16 @@ mod tests {
 
     #[test]
     fn broad_query_stage_deadline_preserves_later_sidecar_contribution() {
-        struct SlowZoektSidecars;
+        struct SlowLexicalSidecars;
 
-        impl SidecarSearch for SlowZoektSidecars {
-            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+        impl SidecarSearch for SlowLexicalSidecars {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 std::thread::sleep(Duration::from_millis(200));
                 Ok(vec![CandidateHit::with_source(
                     "src/slow_lexical.rs",
                     Some("SlowLexical".into()),
                     0.99,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )])
             }
 
@@ -970,7 +968,7 @@ mod tests {
 
         let mut cache = RetrievalCache::new();
         let mut executor = QueryExecutor {
-            sidecars: Arc::new(SlowZoektSidecars),
+            sidecars: Arc::new(SlowLexicalSidecars),
             cache: &mut cache,
             manifest: Some(sample_manifest()),
             file_roles: Arc::new(HashMap::new()),
@@ -987,7 +985,7 @@ mod tests {
 
         assert!(
             started.elapsed() < Duration::from_millis(190),
-            "slow Zoekt must not consume the whole broad-query path: {:?}",
+            "slow Lexical must not consume the whole broad-query path: {:?}",
             result.trace.stages
         );
         assert_eq!(
@@ -996,10 +994,10 @@ mod tests {
         );
         assert!(
             result.trace.stages.iter().any(|stage| {
-                stage.stage == RetrievalStageKind::Stage1ZoektLexical
+                stage.stage == RetrievalStageKind::Stage1Lexical
                     && stage.cancel_reason.as_deref() == Some("stage_deadline")
             }),
-            "Zoekt overrun should be explicit in stage provenance: {:?}",
+            "Lexical overrun should be explicit in stage provenance: {:?}",
             result.trace.stages
         );
         assert!(
@@ -1007,7 +1005,7 @@ mod tests {
                 stage.stage == RetrievalStageKind::Stage1bQdrantSemantic
                     && stage.candidates_added > 0
             }),
-            "Qdrant must still contribute after Zoekt overrun: {:?}",
+            "Qdrant must still contribute after Lexical overrun: {:?}",
             result.trace.stages
         );
         assert!(
@@ -1023,7 +1021,7 @@ mod tests {
                 .hits
                 .iter()
                 .all(|hit| hit.file_path != "src/slow_lexical.rs"),
-            "timed-out Zoekt hits must not merge late into this query: {:?}",
+            "timed-out Lexical hits must not merge late into this query: {:?}",
             result.hits
         );
     }
@@ -1033,12 +1031,12 @@ mod tests {
         struct SlowScipExpandSidecars;
 
         impl SidecarSearch for SlowScipExpandSidecars {
-            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(vec![CandidateHit::with_source(
                     "src/lexical.rs",
                     Some("LexicalAnchor".into()),
                     0.7,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )])
             }
 
@@ -1129,7 +1127,7 @@ mod tests {
         struct DenseAnchorExpandSidecars;
 
         impl SidecarSearch for DenseAnchorExpandSidecars {
-            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(Vec::new())
             }
 
@@ -1211,13 +1209,13 @@ mod tests {
         struct SlowLexicalUsefulSidecars;
 
         impl SidecarSearch for SlowLexicalUsefulSidecars {
-            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 std::thread::sleep(Duration::from_millis(350));
                 Ok(vec![CandidateHit::with_source(
                     "crates/codestory-cli/src/output.rs",
                     Some("append_search_evidence_packet".into()),
                     0.92,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )])
             }
 
@@ -1271,7 +1269,7 @@ mod tests {
         assert_eq!(result.trace.cancel_reason, None);
         assert!(
             result.trace.stages.iter().any(|stage| {
-                stage.stage == RetrievalStageKind::Stage1ZoektLexical
+                stage.stage == RetrievalStageKind::Stage1Lexical
                     && stage.candidates_added == 1
                     && stage.cancel_reason.is_none()
             }),
@@ -1289,12 +1287,12 @@ mod tests {
         struct SlowScipAnchorSidecars;
 
         impl SidecarSearch for SlowScipAnchorSidecars {
-            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(vec![CandidateHit::with_source(
                     "src/late_lexical.rs",
                     Some("LateLexical".into()),
                     0.99,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )])
             }
 
@@ -1347,7 +1345,7 @@ mod tests {
                 .trace
                 .stages
                 .iter()
-                .all(|stage| stage.stage != RetrievalStageKind::Stage1ZoektLexical),
+                .all(|stage| stage.stage != RetrievalStageKind::Stage1Lexical),
             "later non-broad stages must not start after total budget is spent: {:?}",
             result.trace.stages
         );
@@ -1366,7 +1364,7 @@ mod tests {
         struct SlowDenseSymbolSidecars;
 
         impl SidecarSearch for SlowDenseSymbolSidecars {
-            fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(Vec::new())
             }
 
@@ -1459,13 +1457,13 @@ mod tests {
                     CandidateSource::Qdrant,
                 )],
             )])),
-            zoekt: Mutex::new(HashMap::from([(
+            lexical: Mutex::new(HashMap::from([(
                 "how does startup sequence work".into(),
                 vec![CandidateHit::with_source(
                     "src/lexical.rs",
                     Some("LexicalAnchor".into()),
                     0.7,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )],
             )])),
             ..Default::default()
@@ -1513,13 +1511,13 @@ mod tests {
         );
         graph_hit.scip_hop_distance = Some(1);
         let mock = MockSidecarSearch {
-            zoekt: Mutex::new(HashMap::from([(
+            lexical: Mutex::new(HashMap::from([(
                 query.into(),
                 vec![CandidateHit::with_source(
                     "src/service.rs",
                     Some("ExtensionService".into()),
                     0.70,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )],
             )])),
             qdrant: Mutex::new(HashMap::from([(
@@ -1583,15 +1581,15 @@ mod tests {
     #[test]
     fn executor_enriches_file_role_before_ranking() {
         let mock = MockSidecarSearch {
-            zoekt: Mutex::new(HashMap::from([(
+            lexical: Mutex::new(HashMap::from([(
                 "startup".into(),
                 vec![
-                    CandidateHit::with_source("src/main.rs", None, 0.55, CandidateSource::Zoekt),
+                    CandidateHit::with_source("src/main.rs", None, 0.55, CandidateSource::Lexical),
                     CandidateHit::with_source(
                         "src\\boot_test.rs",
                         None,
                         0.80,
-                        CandidateSource::Zoekt,
+                        CandidateSource::Lexical,
                     ),
                 ],
             )])),
@@ -1634,13 +1632,13 @@ mod tests {
     #[test]
     fn executor_infers_file_role_when_storage_lookup_misses() {
         let mock = MockSidecarSearch {
-            zoekt: Mutex::new(HashMap::from([(
+            lexical: Mutex::new(HashMap::from([(
                 "startup".into(),
                 vec![CandidateHit::with_source(
                     "fixtures/generated/boot_test.rs",
                     None,
                     0.80,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )],
             )])),
             ..Default::default()
@@ -1672,7 +1670,7 @@ mod tests {
             Some(&self.layout)
         }
 
-        fn zoekt_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+        fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
             Ok(Vec::new())
         }
 
@@ -1693,21 +1691,16 @@ mod tests {
         }
     }
 
-    fn unused_local_port() -> u16 {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind free port");
-        listener.local_addr().expect("local addr").port()
-    }
-
     #[test]
     fn executor_does_not_use_repo_text_diagnostic_for_natural_language_queries() {
         let mock = MockSidecarSearch {
-            zoekt: Mutex::new(HashMap::from([(
+            lexical: Mutex::new(HashMap::from([(
                 "how does startup sequence work".into(),
                 vec![CandidateHit::with_source(
                     "src/main.rs",
                     None,
                     0.7,
-                    CandidateSource::Zoekt,
+                    CandidateSource::Lexical,
                 )],
             )])),
             ..Default::default()

@@ -98,7 +98,7 @@ impl Options {
             queries = vec![
                 "retrieval manifest freshness".into(),
                 "symbol_search_doc component_report".into(),
-                "lexical_source zoekt client".into(),
+                "lexical_source sqlite fts client".into(),
             ];
         }
         Ok(Self {

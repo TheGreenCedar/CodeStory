@@ -1702,6 +1702,7 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     for column in [
+        "zoekt_version",
         "precise_semantic_import_status",
         "precise_semantic_import_reason",
         "precise_semantic_import_revision",
@@ -1709,11 +1710,32 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
     ] {
         assert!(columns.iter().any(|existing| existing == column));
     }
+    assert!(!columns.iter().any(|existing| existing == "lexical_version"));
     let manifest = storage
         .get_retrieval_index_manifest("proj")?
         .expect("manifest survives repair");
     assert_eq!(manifest.project_id, "proj");
+    assert_eq!(manifest.lexical_version, "zoekt");
     assert_eq!(manifest.precise_semantic_import_status, None);
+
+    drop(storage);
+    let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn current_schema_keeps_v19_manifest_column_rollback_compatible() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v19-manifest-rollback-contract");
+    let _ = std::fs::remove_file(&db_path);
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, 19);
+    let columns = storage
+        .conn
+        .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(columns.iter().any(|column| column == "zoekt_version"));
+    assert!(!columns.iter().any(|column| column == "lexical_version"));
 
     drop(storage);
     let _ = std::fs::remove_file(&db_path);
@@ -1728,7 +1750,7 @@ fn live_open_preserves_correct_v18_manifest_precise_semantic_values() -> Result<
         let mut storage = Storage::open(&db_path)?;
         storage.upsert_retrieval_index_manifest(&RetrievalIndexManifest {
             project_id: "proj".into(),
-            zoekt_version: "zoekt".into(),
+            lexical_version: "zoekt".into(),
             qdrant_collection: "collection".into(),
             scip_revision: None,
             built_at_epoch_ms: 1,

@@ -1,6 +1,6 @@
 # Retrieval sidecars operations
 
-Local Zoekt, Qdrant, SCIP, and llama.cpp sidecars back agent `packet`, `search`,
+Project-local SQLite FTS, Qdrant, SCIP, and llama.cpp back agent `packet`, `search`,
 and `context`. They are required for `agent_packet_search` infrastructure
 readiness: `retrieval status` must report `retrieval_mode: "full"` before those
 surfaces can claim full sidecar retrieval.
@@ -27,7 +27,7 @@ Promotion checks: [`retrieval-architecture.md`](../testing/retrieval-architectur
 
 ```mermaid
 flowchart LR
-    cli[codestory-cli] --> zoekt["Zoekt at profile-selected localhost port"]
+    cli[codestory-cli] --> lexical["Project-local SQLite FTS shard"]
     cli --> qdrant["Qdrant at profile-selected localhost ports"]
     cli --> scip[SCIP artifacts in user cache]
     cli --> embed[llama.cpp embedding endpoint]
@@ -74,7 +74,7 @@ Layer repair should follow the first failing layer, not a broad rebuild:
 |---------------|---------------------|--------------|
 | Active runtime or plugin adapter | `codestory://status` fields, `server_executable`, `cli_version`, `plugin_runtime`, `allowed_surfaces` | Reload or reinstall the active CLI/plugin runtime, then reread status |
 | Core SQLite graph | `doctor` cache/index checks and indexed file counts | Follow status `recommended_next_calls`; CLI transcript: `codestory-cli ready --goal local --repair --project <repo> --format json` |
-| Zoekt lexical sidecar | `retrieval status` mode/degraded reason, selected profile/port, ownership, and Zoekt health text | Rerun bootstrap for the selected profile; for managed Agent state, do not assume or free the Local default port |
+| SQLite lexical shard | `retrieval status` lexical coverage, generation/input binding, and shard health | Rerun `retrieval index --refresh full`; old JSONL shards are rebuilt, not queried |
 | Qdrant dense sidecar | Qdrant health, collection name, point count, dense-anchor count, backend/dimension fields | Fix Qdrant/model/backend state; move the Qdrant cache aside only if repeated health checks fail |
 | SCIP graph artifacts | `scip_unavailable`, graph artifact hash/path, manifest contract | Rerun `retrieval index --refresh full`; inspect SCIP cache paths if it repeats |
 | Embedding endpoint | `CODESTORY_EMBED_LLAMACPP_URL`, sidecar health, model/backend/dimension fields | Start or reconfigure llama.cpp, then rerun retrieval index/status |
@@ -107,18 +107,19 @@ Attach these artifacts to issues or PRs that claim readiness repair:
 ### Prerequisites
 
 - Rust toolchain with `cargo`, or an already-built `codestory-cli` binary.
-- Docker Desktop or Docker Engine for automated Qdrant, Zoekt, and llama.cpp
+- Docker Desktop or Docker Engine for automated Qdrant and llama.cpp
   sidecars.
 - Node.js 18+ if you need `scripts/setup-retrieval-env.mjs` to fetch or verify
   the pinned GGUF.
-- For manual Local profile only, the default localhost ports are Zoekt `6070`,
-  Qdrant HTTP `6333`, Qdrant gRPC `6334`, and llama.cpp embeddings `8080`.
+- For manual Local profile only, the default localhost ports are Qdrant HTTP
+  `6333`, Qdrant gRPC `6334`, and llama.cpp embeddings `8080`; lexical search
+  has no service port.
   Managed Agent profiles allocate or reuse namespace-specific ports; read them
   from status rather than assuming the Local defaults.
 - GGUF embedding model available through `CODESTORY_EMBED_MODEL_DIR`, or fetched
   with the setup wrapper.
 
-Manual sidecar setup is allowed only when equivalent local Zoekt, Qdrant, and
+Manual sidecar setup is allowed only when equivalent local Qdrant and
 llama.cpp services are already healthy. Agent-facing retrieval is invalid until
 the CLI status proof below reports `full`.
 
@@ -138,7 +139,6 @@ explicit override or persisted Agent state selects a port.
 | `CODESTORY_EMBED_DEVICE_STATE` | Optional diagnostic assertion for observed device state: `accelerated`, `cpu`, or unset/unknown; it does not satisfy broker GPU proof |
 | `CODESTORY_EMBED_ALLOW_CPU` | Set to `1` only when intentional CPU-backed retrieval is acceptable on this machine |
 | `CODESTORY_EMBED_DEVICE_POLICY` | Optional policy alias; set `allow_cpu` instead of `CODESTORY_EMBED_ALLOW_CPU=1` when CPU mode is intentional |
-| `CODESTORY_ZOEKT_PORT` | Override Zoekt HTTP port when `6070` is unavailable |
 | `CODESTORY_QDRANT_HTTP_PORT` | Override Qdrant HTTP port when `6333` is unavailable |
 | `CODESTORY_QDRANT_GRPC_PORT` | Override Qdrant gRPC port when `6334` is unavailable |
 
@@ -246,7 +246,7 @@ The proof is the final status JSON:
 
 Under `graph_first_v1`, a generation can be full with zero dense anchors. In
 that case Qdrant is reported as policy-skipped instead of probing a missing
-collection. That is still full mode only when Zoekt, SCIP, and the manifest
+collection. That is still full mode only when SQLite lexical, SCIP, and the manifest
 contract are complete.
 
 ### Non-full status actions
@@ -257,11 +257,13 @@ closed and must not claim sidecar-backed evidence.
 | Status or condition | Meaning | Operator action |
 |---------------------|---------|-----------------|
 | `retrieval_manifest_missing` | Sidecars may be running, but no finalized manifest proves this workspace | Run `retrieval index --project <repo> --refresh full`, then rerun status |
-| `unavailable` or Zoekt down | Lexical sidecar is unavailable | Inspect the selected profile, namespace, port, and ownership in status; rerun bootstrap, then rerun index/status |
+| `unavailable` or lexical shard invalid | SQLite lexical shard is missing, malformed, or stale | Rerun retrieval index, then inspect lexical coverage and generation/input binding in status |
+| `lexical_source_coverage_incomplete` | The indexed lexical subset remains usable, while oversized or unreadable paths are named diagnostically | Inspect the bounded path samples; fix file access or size only when the omitted paths matter |
+| `lexical_source_coverage_empty` | Files were discovered but every source was oversized or unreadable, so lexical retrieval is unavailable | Fix at least one relevant source input, then rerun retrieval index/status |
 | `no_semantic`, `lexical_only`, or Qdrant down when dense anchors are expected | Semantic sidecar is unavailable or stale | Fix Qdrant/model/backend, rerun bootstrap and retrieval index, then rerun status |
 | `no_scip` | Graph artifacts are missing or stale | Rerun retrieval index; inspect SCIP artifact paths if it repeats |
 | Obsolete, stale, or partial manifest | Source, schema, graph, symbol-doc, dense-anchor, or backend contract drifted | Rerun `retrieval index --project <repo> --refresh full` |
-| `full` with dense anchors `0` | Valid graph-first policy skip | No Qdrant repair needed; verify Zoekt, SCIP, and manifest contract fields |
+| `full` with dense anchors `0` | Valid graph-first policy skip | No Qdrant repair needed; verify SQLite lexical, SCIP, and manifest contract fields |
 
 Traces must include `retrieval_mode` and `degraded_reason`. A non-`full` mode is
 not an answer-quality claim and not a product packet/search success.
@@ -345,8 +347,8 @@ Cache-root and profile layout:
 | Windows default | `%LOCALAPPDATA%\codestory\codestory\cache` |
 | macOS default | `~/Library/Caches/dev.codestory.codestory` |
 | Linux default | `$XDG_CACHE_HOME/codestory`, normally `~/.cache/codestory` |
-| Local profile | `<cache>/{zoekt,qdrant,scip,retrieval-sidecars.json}` with configurable Local ports |
-| Managed Agent profile | `<cache>/sidecars/<namespace>/{zoekt,qdrant,scip,retrieval-sidecars.json}` with dynamic or persisted ports |
+| Local profile | `<cache>/{lexical,qdrant,scip,retrieval-sidecars.json}` with configurable Qdrant/embed ports |
+| Managed Agent profile | `<cache>/sidecars/<namespace>/{lexical,qdrant,scip,retrieval-sidecars.json}` with dynamic or persisted Qdrant/embed ports |
 | Agent port registry | `<cache>/sidecars/port-allocations.json` |
 
 Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
@@ -363,9 +365,11 @@ sidecar-layer symptoms during ops work:
 | Symptom | Likely cause | Action |
 |---------|--------------|--------|
 | `retrieval up` port in use | Stale process, container, or namespace ownership | Read selected profile/namespace ownership and cleanup command from status; run only the bounded cleanup for that state, then rerun bootstrap |
-| Zoekt unhealthy or unreachable | Server not started, wrong profile-selected port, or shard missing | Rerun bootstrap for the selected profile and rerun retrieval index; do not assume port `6070` for managed Agent state |
+| SQLite lexical shard unavailable | Shard missing, malformed, or stale | Rerun retrieval index and inspect the lexical readiness detail |
+| `lexical_source_coverage_incomplete` with lexical capability present | Partial source coverage; indexed files remain queryable | Inspect the omitted/unreadable path samples and repair only relevant inputs |
+| `lexical_source_coverage_empty` | Every discovered source was omitted; the empty shard is diagnostic only | Fix source size/access and rebuild before claiming retrieval readiness |
 | Qdrant unhealthy | Wrong image tag, stale collection, volume permissions, or model/backend mismatch | Rerun bootstrap; if repeated, move the Qdrant cache aside and rebuild |
-| Qdrant unavailable while dense-anchor count is `0` | Expected graph-first policy skip | Verify Zoekt, SCIP, and manifest contract fields |
+| Qdrant unavailable while dense-anchor count is `0` | Expected graph-first policy skip | Verify SQLite lexical, SCIP, and manifest contract fields |
 | SCIP `scip_unavailable` | Graph artifacts missing | Rerun retrieval index and inspect the SCIP cache path |
 | Smoke latency is high | Cold cache or oversized fixture | Retry once; then inspect tier envelope evidence |
 
@@ -378,7 +382,7 @@ sidecar implementation, CI policy, retention behavior, or promotion gates.
 
 | Dependency | Pin policy | Pinned identity | Notes |
 |------------|------------|-----------------|-------|
-| Zoekt real | `COMPOSE_PROFILES=real` plus digest-pinned image | `zoekt-20250506123554`; `sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff` | Lexical shards still live under the sidecar generation |
+| SQLite lexical | Bundled `rusqlite`/SQLite FTS5 | `sqlite-fts5-v1` | One immutable `lexical-index.sqlite3` per sidecar generation; no daemon |
 | Qdrant | Digest-pinned container image | `qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae` | HTTP `6333`, gRPC `6334` |
 | llama.cpp embed | Digest-pinned container image | `ghcr.io/ggml-org/llama.cpp:server@sha256:f16ca66f3ba316b7a7a16003ddfa88d29c3404fbe86550da086736864c11574c` | Used only when the embedding launch mode is Docker Compose |
 | SCIP | CodeStory graph artifact emitter | `graph-<hash>` | Generated local graph artifacts under the sidecar generation |
@@ -434,7 +438,7 @@ and failed explicit refreshes still fail closed.
 
 Finalization writes new generations instead of mutating the active generation:
 
-- Zoekt shard: `zoekt/shards/<sidecar-generation>/`
+- SQLite lexical shard: `lexical/shards/<sidecar-generation>/lexical-index.sqlite3`
 - Qdrant collection: `codestory_<project-id>_<input-hash-prefix>`
 - SCIP artifacts: `scip/<sidecar-generation>/`
 

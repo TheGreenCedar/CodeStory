@@ -131,7 +131,7 @@ test("packet latency telemetry preserves retrieval shadow cache diagnostics", ()
           retrieval_total_ms: 7,
           cache_hit: true,
           stage_timings: [
-            { stage: "stage1_zoekt_lexical", elapsed_ms: 2, cache_hit: false },
+            { stage: "stage1_lexical", elapsed_ms: 2, cache_hit: false },
             { stage: "stage2_semantic_vector", elapsed_ms: 1, cache_hit: true },
           ],
           candidate_count: 4,

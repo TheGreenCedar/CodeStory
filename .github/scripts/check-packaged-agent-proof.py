@@ -307,7 +307,15 @@ def require_help(output: str, artifact: Path) -> None:
 
 def require_retrieval_index_ready(payload: object, layer: str, artifact: Path) -> None:
     require(isinstance(payload, dict), layer, artifact, "retrieval index output is not a JSON object")
-    for field in ["zoekt_stubbed", "qdrant_stubbed", "scip_stubbed"]:
+    manifest = payload.get("manifest")
+    lexical_version = manifest.get("lexical_version") if isinstance(manifest, dict) else None
+    require(
+        lexical_version == "sqlite-fts5-v1",
+        layer,
+        artifact,
+        f"manifest.lexical_version is {lexical_version!r}, expected 'sqlite-fts5-v1'",
+    )
+    for field in ["qdrant_stubbed", "scip_stubbed"]:
         value = payload.get(field)
         require(value is False, layer, artifact, f"{field} is {value!r}, expected False")
 
@@ -420,7 +428,7 @@ def terminate_worker_pid(pid: int) -> None:
         process_handle = None
         open_error = 0
         try:
-            process_handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+            process_handle = ctypes.windll.kernel32.OpenProcess(0x00100001, False, pid)
             if not process_handle:
                 open_error = ctypes.windll.kernel32.GetLastError()
         except (AttributeError, OSError):
@@ -437,7 +445,11 @@ def terminate_worker_pid(pid: int) -> None:
             pass
         if process_handle:
             try:
-                require_windows_process_exit(process_handle, pid)
+                try:
+                    require_windows_process_exit(process_handle, pid)
+                except RuntimeError:
+                    ctypes.windll.kernel32.TerminateProcess(process_handle, 1)
+                    require_windows_process_exit(process_handle, pid)
             finally:
                 ctypes.windll.kernel32.CloseHandle(process_handle)
         elif open_error != 87:
@@ -1433,7 +1445,11 @@ def write_fake_cli(path: Path) -> None:
                     "project_status": {"retrieval_mode": "unavailable"},
                 })
             elif layer == "retrieval_index":
-                emit({"zoekt_stubbed": False, "qdrant_stubbed": False, "scip_stubbed": False})
+                emit({
+                    "manifest": {"lexical_version": "sqlite-fts5-v1"},
+                    "qdrant_stubbed": False,
+                    "scip_stubbed": False,
+                })
             elif layer == "retrieval_status":
                 emit({"retrieval_mode": "full"})
             elif layer == "search":
