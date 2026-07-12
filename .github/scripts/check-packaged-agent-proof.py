@@ -158,11 +158,218 @@ def verify_archive_checksum(archive: Path, checksum_file: Path, artifact: Path) 
     require(actual == expected, "checksum", artifact, f"checksum mismatch for {archive.name}")
 
 
-def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path) -> None:
+def proof_environment(base: dict[str, str]) -> dict[str, str]:
+    env = dict(base)
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        env["CODESTORY_QDRANT_USER"] = f"{os.getuid()}:{os.getgid()}"
+        env["CODESTORY_QDRANT_SNAPSHOTS_PATH"] = "/qdrant/storage/snapshots"
+    return env
+
+
+def validated_proof_compose_state(cache_root: Path, project: Path, read_state) -> tuple[Path, dict] | None:
+    if cache_root.is_symlink() or project.is_symlink():
+        raise RuntimeError("proof cache and project roots must not be symlinks")
+    cache_root = cache_root.resolve(strict=True)
+    project = project.resolve(strict=True)
+    state_file = cache_root / "retrieval-sidecars.json"
+    if state_file.is_symlink():
+        raise RuntimeError(f"proof sidecar state must not be a symlink: {state_file}")
+    if not state_file.exists():
+        return None
+    if not state_file.is_file():
+        raise RuntimeError(f"proof sidecar state is not a regular file: {state_file}")
+    state = read_state(state_file)
+    if not isinstance(state, dict):
+        raise TypeError(f"proof sidecar state is not an object: {state_file}")
+    expected_identity = {
+        "owner": "codestory",
+        "profile": "local",
+        "namespace": "codestory",
+        "compose_project": "codestory",
+    }
+    for name, expected in expected_identity.items():
+        if state.get(name) != expected:
+            raise RuntimeError(f"proof sidecar state {name} does not match {expected!r}: {state_file}")
+    state = dict(state)
+    for name, expected in (("qdrant_data_dir", cache_root / "qdrant"),):
+        value = state.get(name)
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"proof sidecar state {name} is not a path string: {state_file}")
+        observed = Path(value)
+        expected = expected.resolve(strict=True)
+        if observed != expected or observed.is_symlink() or observed.resolve(strict=True) != expected:
+            raise RuntimeError(f"proof sidecar state {name} escaped its cache root: {state_file}")
+    lexical_expected = cache_root / "lexical"
+    lexical_value = state.get("lexical_data_dir")
+    if lexical_value is None:
+        lexical_value = state.get("zoekt_data_dir")
+    if not isinstance(lexical_value, str) or not lexical_value:
+        raise TypeError(f"proof sidecar state lexical_data_dir or legacy zoekt_data_dir is not a path string: {state_file}")
+    observed = Path(lexical_value)
+    if observed != lexical_expected or observed.is_symlink():
+        raise RuntimeError(f"proof sidecar state lexical_data_dir escaped its cache root: {state_file}")
+    if observed.exists() and observed.resolve(strict=True) != lexical_expected:
+        raise RuntimeError(f"proof sidecar state lexical_data_dir escaped its cache root: {state_file}")
+    state["lexical_data_dir"] = str(lexical_expected)
+    compose_value = state.get("compose_file")
+    if not isinstance(compose_value, str) or not compose_value:
+        raise TypeError(f"proof sidecar compose_file is not a path string: {state_file}")
+    compose_file = Path(compose_value)
+    if compose_file.is_symlink() or not compose_file.is_file():
+        raise RuntimeError(f"proof sidecar compose file is not a regular canonical file: {compose_file}")
+    allowed_compose_files = set()
+    for candidate in (
+        project / "docker" / "retrieval-compose.yml",
+        cache_root / "retrieval-compose.yml",
+    ):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        canonical_candidate = candidate.resolve(strict=True)
+        if candidate == canonical_candidate:
+            allowed_compose_files.add(canonical_candidate)
+    canonical_compose_file = compose_file.resolve(strict=True)
+    if compose_file != canonical_compose_file or canonical_compose_file not in allowed_compose_files:
+        raise RuntimeError(f"proof sidecar compose file is outside the allowed roots: {compose_file}")
+    return state_file, state
+
+
+def cleanup_proof_compose(
+    cache_root: Path,
+    project: Path,
+    env: dict[str, str],
+    results: list[dict],
+    run,
+    read_state,
+) -> None:
+    try:
+        validated = validated_proof_compose_state(cache_root, project, read_state)
+    except Exception as exc:
+        results.append(
+            {
+                "kind": "compose_state_validation",
+                "state_file": str(cache_root / "retrieval-sidecars.json"),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        raise RuntimeError(f"proof-owned Compose state validation failed: {exc}") from exc
+    if validated is None:
+        return
+    state_file, state = validated
+    compose_env = {
+        **env,
+        "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
+        "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
+        "CODESTORY_EMBED_MODEL_DIR": state["qdrant_data_dir"],
+    }
+    command = [
+        "docker",
+        "compose",
+        "-p",
+        state["compose_project"],
+        "-f",
+        state["compose_file"],
+        "down",
+        "--remove-orphans",
+    ]
+    try:
+        result = run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+            env=compose_env,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        results.append({"kind": "compose_down", "state_file": str(state_file), "error": str(exc)})
+        raise RuntimeError(f"could not stop proof-owned Compose sidecars: {exc}") from exc
+    results.append(
+        {
+            "kind": "compose_down",
+            "state_file": str(state_file),
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"proof-owned Compose cleanup exited {result.returncode}")
+
+
+def capture_proof_compose_diagnostics(
+    cache_root: Path,
+    project: Path,
+    env: dict[str, str],
+    artifact: Path,
+    run=subprocess.run,
+    read_state=read_json_file,
+) -> None:
+    payload = {"state_file": str(cache_root / "retrieval-sidecars.json"), "commands": []}
+    try:
+        validated = validated_proof_compose_state(cache_root, project, read_state)
+        if validated is None:
+            payload["error"] = "proof-owned Compose state is absent"
+            write_json(artifact, payload)
+            return
+        _, state = validated
+        compose_env = {
+            **env,
+            "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
+            "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
+            "CODESTORY_EMBED_MODEL_DIR": state["qdrant_data_dir"],
+        }
+        base = ["docker", "compose", "-p", state["compose_project"], "-f", state["compose_file"]]
+        for kind, extra in (
+            ("compose_ps", ["ps", "--all"]),
+            ("qdrant_logs", ["logs", "--no-color", "--tail", "200", "qdrant"]),
+        ):
+            try:
+                result = run(
+                    [*base, *extra],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=20,
+                    check=False,
+                    env=compose_env,
+                    text=True,
+                )
+                payload["commands"].append(
+                    {
+                        "kind": kind,
+                        "returncode": result.returncode,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                payload["commands"].append({"kind": kind, "error": f"{type(exc).__name__}: {exc}"})
+    except Exception as exc:
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    write_json(artifact, payload)
+
+
+def cleanup_proof_cache(
+    cli: Path,
+    project: Path,
+    cache_root: Path,
+    artifact: Path,
+    run=subprocess.run,
+    read_state=read_json_file,
+) -> None:
     env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
+    results = []
+    try:
+        cleanup_proof_compose(cache_root, project, env, results, run, read_state)
+    except Exception as exc:
+        write_json(
+            artifact,
+            {"cache_root": str(cache_root), "commands": results, "removed": False, "error": str(exc)},
+        )
+        raise
     for profile, extra in (("local", []), ("agent", ["--run-id", "shared-agent"])):
         try:
-            subprocess.run(
+            result = run(
                 [
                     str(cli),
                     "retrieval",
@@ -173,15 +380,62 @@ def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path) -> None:
                     profile,
                     *extra,
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=20,
                 check=False,
                 env=env,
+                text=True,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    shutil.rmtree(cache_root, ignore_errors=True)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            results.append({"profile": profile, "error": str(exc)})
+            write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
+            raise RuntimeError(f"could not stop {profile} proof sidecars: {exc}") from exc
+        results.append(
+            {
+                "kind": "retrieval_down",
+                "profile": profile,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        )
+        if result.returncode != 0:
+            write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
+            raise RuntimeError(f"{profile} proof sidecar cleanup exited {result.returncode}")
+    try:
+        remove_tree_with_retry(cache_root)
+    except OSError as exc:
+        write_json(
+            artifact,
+            {"cache_root": str(cache_root), "commands": results, "removed": False, "error": str(exc)},
+        )
+        raise
+    removed = not cache_root.exists()
+    write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": removed})
+    if not removed:
+        raise RuntimeError(f"proof cache still exists after cleanup: {cache_root}")
+
+
+def cleanup_proof_cache_on_exit(
+    cli: Path,
+    project: Path,
+    cache_root: Path,
+    artifact: Path,
+    run=subprocess.run,
+    read_state=read_json_file,
+):
+    def cleanup(exc_type, exc, traceback) -> bool:
+        try:
+            cleanup_proof_cache(cli, project, cache_root, artifact, run, read_state)
+        except Exception as cleanup_exc:
+            if exc is None:
+                raise
+            if hasattr(exc, "add_note"):
+                exc.add_note(f"proof cleanup also failed: {type(cleanup_exc).__name__}: {cleanup_exc}")
+        return False
+
+    return cleanup
 
 
 def local_profile_environment(base: dict[str, str]) -> dict[str, str]:
@@ -415,66 +669,170 @@ def terminate_process_tree(process: subprocess.Popen[str]) -> None:
         process.kill()
 
 
-def require_windows_process_exit(process_handle, pid: int, timeout_ms: int = 10_000) -> None:
-    wait_result = ctypes.windll.kernel32.WaitForSingleObject(process_handle, timeout_ms)
-    if wait_result != 0:
-        raise RuntimeError(f"worker process {pid} did not terminate before cleanup (wait result {wait_result})")
+def windows_process_api():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
 
 
-def terminate_worker_pid(pid: int) -> None:
-    if pid <= 0:
+def windows_last_error(kernel32) -> int:
+    return int(getattr(kernel32, "last_error", ctypes.get_last_error()))
+
+
+def require_windows_process_exit(process_handle, pid: int, timeout_ms: int = 10_000, kernel32=None) -> None:
+    kernel32 = kernel32 or windows_process_api()
+    wait_result = kernel32.WaitForSingleObject(process_handle, timeout_ms)
+    if wait_result == 0:
         return
-    if os.name == "nt":
+    if wait_result == 0xFFFFFFFF:
+        raise RuntimeError(f"could not wait for worker process {pid} (Windows error {windows_last_error(kernel32)})")
+    raise RuntimeError(f"worker process {pid} did not terminate before cleanup (wait result {wait_result})")
+
+
+def terminate_worker_pid(
+    pid: int,
+    diagnostics: dict | None = None,
+    *,
+    kernel32=None,
+    run=subprocess.run,
+    platform: str | None = None,
+) -> None:
+    diagnostics = diagnostics if diagnostics is not None else {}
+    platform = platform or os.name
+    diagnostics.update({"pid": pid, "platform": platform, "attempts": []})
+    if pid <= 0:
+        diagnostics["status"] = "invalid_pid"
+        return
+    if platform == "nt":
+        kernel32 = kernel32 or windows_process_api()
         process_handle = None
         open_error = 0
         try:
-            process_handle = ctypes.windll.kernel32.OpenProcess(0x00100001, False, pid)
+            process_handle = kernel32.OpenProcess(0x00100001, False, pid)
             if not process_handle:
-                open_error = ctypes.windll.kernel32.GetLastError()
+                open_error = windows_last_error(kernel32)
         except (AttributeError, OSError):
             process_handle = None
+        diagnostics["attempts"].append(
+            {"kind": "open_process", "success": bool(process_handle), "windows_error": open_error}
+        )
+        if not process_handle:
+            if open_error == 87:
+                diagnostics["status"] = "already_exited"
+                return
+            raise RuntimeError(
+                f"could not open worker process {pid} for termination proof (Windows error {open_error})"
+            )
+        taskkill_evidence = "not run"
         try:
-            subprocess.run(
+            taskkill = run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=10,
                 check=False,
+                text=True,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        if process_handle:
+            taskkill_evidence = (
+                f"exit={taskkill.returncode} stdout={taskkill.stdout.strip()!r} stderr={taskkill.stderr.strip()!r}"
+            )
+            diagnostics["attempts"].append(
+                {
+                    "kind": "taskkill",
+                    "returncode": taskkill.returncode,
+                    "stdout": taskkill.stdout,
+                    "stderr": taskkill.stderr,
+                }
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            taskkill_evidence = f"{type(exc).__name__}: {exc}"
+            diagnostics["attempts"].append({"kind": "taskkill", "error": taskkill_evidence})
+        try:
             try:
+                require_windows_process_exit(process_handle, pid, kernel32=kernel32)
+                diagnostics["status"] = "terminated_after_taskkill"
+            except RuntimeError as wait_error:
+                diagnostics["attempts"].append({"kind": "initial_wait", "error": str(wait_error)})
+                terminated = bool(kernel32.TerminateProcess(process_handle, 1))
+                terminate_error = 0 if terminated else windows_last_error(kernel32)
+                diagnostics["attempts"].append(
+                    {"kind": "terminate_process", "success": terminated, "windows_error": terminate_error}
+                )
+                if not terminated:
+                    try:
+                        require_windows_process_exit(process_handle, pid, timeout_ms=0, kernel32=kernel32)
+                    except RuntimeError:
+                        raise RuntimeError(
+                            f"could not terminate worker process {pid} (Windows error {terminate_error}; "
+                            f"taskkill {taskkill_evidence}; initial wait: {wait_error})"
+                        ) from wait_error
                 try:
-                    require_windows_process_exit(process_handle, pid)
-                except RuntimeError:
-                    ctypes.windll.kernel32.TerminateProcess(process_handle, 1)
-                    require_windows_process_exit(process_handle, pid)
-            finally:
-                ctypes.windll.kernel32.CloseHandle(process_handle)
-        elif open_error != 87:
-            raise RuntimeError(f"could not prove worker process {pid} terminated")
+                    require_windows_process_exit(process_handle, pid, timeout_ms=30_000, kernel32=kernel32)
+                    diagnostics["status"] = "terminated_after_direct_termination"
+                except RuntimeError as final_wait_error:
+                    diagnostics["attempts"].append({"kind": "final_wait", "error": str(final_wait_error)})
+                    raise RuntimeError(
+                        f"worker process {pid} remained alive after direct termination; "
+                        f"taskkill {taskkill_evidence}; initial wait: {wait_error}; final wait: {final_wait_error}"
+                    ) from final_wait_error
+        finally:
+            kernel32.CloseHandle(process_handle)
     else:
         try:
             os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        except ProcessLookupError:
+            diagnostics["status"] = "already_exited"
+            return
+        except PermissionError as exc:
+            raise RuntimeError(f"could not terminate worker process {pid}") from exc
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                if exited is not None:
+                    diagnostics["status"] = "terminated"
+                    return
+            except ChildProcessError:
+                pass
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                diagnostics["status"] = "terminated"
+                return
+            except PermissionError as exc:
+                raise RuntimeError(f"could not prove worker process {pid} terminated") from exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"worker process {pid} did not terminate before cleanup")
+            time.sleep(0.1)
 
 
-def running_status_worker_pids(status: dict) -> set[int]:
-    operations = status.get("readiness_broker", {}).get("operations", [])
-    return {
-        operation["pid"]
-        for operation in operations
-        if isinstance(operation, dict)
-        and operation.get("status") == "running"
-        and isinstance(operation.get("pid"), int)
+def proof_started_repair_workers(responses: list[dict]) -> list[dict]:
+    responses_by_id = {response.get("id"): response for response in responses if isinstance(response, dict)}
+    repair = responses_by_id.get("repair", {}).get("result", {}).get("structuredContent", {})
+    if not isinstance(repair, dict) or repair.get("status") != "started":
+        return []
+    pid = repair.get("pid")
+    attempt_id = repair.get("attempt_id")
+    if not isinstance(pid, int) or not isinstance(attempt_id, str) or not attempt_id:
+        return []
+    status = status_from_resource_response(responses_by_id.get("status_after_repair", {}))
+    if not isinstance(status, dict):
+        return []
+    setup = status.get("sidecar_setup", {})
+    observed_attempts = {
+        (setup.get("active_repair") or {}).get("attempt_id"),
+        (setup.get("last_worker_result") or {}).get("attempt_id"),
     }
-
-
-def terminate_status_workers(status: dict) -> None:
-    for worker_pid in running_status_worker_pids(status):
-        terminate_worker_pid(worker_pid)
+    if attempt_id not in observed_attempts:
+        return []
+    return [{"pid": pid, "attempt_id": attempt_id, "source": "proof_started_repair_response"}]
 
 
 def read_stdio_line(stdout_queue: queue.Queue[str | None], timeout_secs: int) -> str | None:
@@ -531,13 +889,13 @@ def plugin_stdio_status(
             project,
             layer="plugin_stdio",
             cwd=project,
-            env={
+            env=proof_environment({
                 **os.environ,
                 "CODESTORY_CLI": "",
                 "CODESTORY_CACHE_ROOT": str(cache_root),
                 "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
                 "PLUGIN_DATA": data,
-            },
+            }),
             cleanup_status_workers=True,
         )
 
@@ -605,14 +963,14 @@ def plugin_stdio_handoff(
             project,
             layer="managed_plugin_handoff",
             cwd=project,
-            env={
+            env=proof_environment({
                 **os.environ,
                 "CODESTORY_CLI": "",
                 "CODESTORY_CACHE_ROOT": str(cache_root),
                 "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
                 "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH": str(policy_path),
                 "PLUGIN_DATA": str(plugin_data),
-            },
+            }),
             extra_requests=[
                 {
                     "jsonrpc": "2.0",
@@ -810,20 +1168,19 @@ def stdio_status_command(
             except subprocess.TimeoutExpired:
                 terminate_process_tree(process)
             process_terminated = True
-        worker_pids: set[int] = set()
-        for response in responses:
-            if not isinstance(response, dict):
-                continue
-            if response.get("id") == "repair":
-                worker_pid = response.get("result", {}).get("structuredContent", {}).get("pid")
-                if isinstance(worker_pid, int):
-                    worker_pids.add(worker_pid)
-            if cleanup_status_workers:
-                status = status_from_resource_response(response)
-                if isinstance(status, dict):
-                    worker_pids.update(running_status_worker_pids(status))
-        for worker_pid in worker_pids:
-            terminate_worker_pid(worker_pid)
+        worker_cleanup_artifact = artifact.with_name(f"{artifact.stem}-worker-cleanup.json")
+        worker_cleanup = []
+        owned_workers = proof_started_repair_workers(responses) if cleanup_status_workers else []
+        for worker in owned_workers:
+            evidence = dict(worker)
+            worker_cleanup.append(evidence)
+            try:
+                terminate_worker_pid(worker["pid"], evidence)
+            except Exception as exc:
+                evidence["error"] = f"{type(exc).__name__}: {exc}"
+                write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
+                raise
+            write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
         if process.poll() is None:
             process.kill()
             process.wait(timeout=2)
@@ -1124,10 +1481,12 @@ def run_gate(args: argparse.Namespace) -> None:
         cli = find_cli(unpacked)
         plugin_skill = find_plugin_skill(unpacked)
         cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-proof-cache-"))
-        cleanup_stack.callback(cleanup_proof_cache, cli, project, cache_root)
-        proof_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
+        proof_cleanup_artifact = out_dir / "proof-cache-cleanup.json"
+        cleanup_stack.push(cleanup_proof_cache_on_exit(cli, project, cache_root, proof_cleanup_artifact))
+        proof_env = proof_environment({**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)})
         stdio_cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-stdio-cache-"))
-        cleanup_stack.callback(cleanup_proof_cache, cli, project, stdio_cache_root)
+        stdio_cleanup_artifact = out_dir / "stdio-cache-cleanup.json"
+        cleanup_stack.push(cleanup_proof_cache_on_exit(cli, project, stdio_cache_root, stdio_cleanup_artifact))
         stdio_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(stdio_cache_root)}
 
         summary = {
@@ -1135,7 +1494,10 @@ def run_gate(args: argparse.Namespace) -> None:
             "cli": str(cli),
             "plugin_skill": str(plugin_skill),
             "project": str(project),
-            "artifacts": {},
+            "artifacts": {
+                "proof_cache_cleanup": str(proof_cleanup_artifact),
+                "stdio_cache_cleanup": str(stdio_cleanup_artifact),
+            },
         }
         if args.checksum_file:
             summary["artifacts"]["checksum"] = str(checksum_artifact)
@@ -1260,28 +1622,35 @@ def run_gate(args: argparse.Namespace) -> None:
         write_json(out_dir / "summary.json", summary)
 
         local_index_artifact = out_dir / "local-retrieval-index.json"
-        local_index = run_command(
-            cli,
-            "local_retrieval_index",
-            [
-                "retrieval",
-                "index",
-                "--project",
-                str(project),
-                "--profile",
-                "local",
-                "--refresh",
-                "full",
-                "--format",
-                "json",
-                "--output-file",
-                str(local_index_artifact),
-            ],
-            local_index_artifact,
-            args.timeout_secs,
-            env=local_env,
-        )
-        require_retrieval_index_ready(local_index, "local_retrieval_index", local_index_artifact)
+        try:
+            local_index = run_command(
+                cli,
+                "local_retrieval_index",
+                [
+                    "retrieval",
+                    "index",
+                    "--project",
+                    str(project),
+                    "--profile",
+                    "local",
+                    "--refresh",
+                    "full",
+                    "--format",
+                    "json",
+                    "--output-file",
+                    str(local_index_artifact),
+                ],
+                local_index_artifact,
+                args.timeout_secs,
+                env=local_env,
+            )
+            require_retrieval_index_ready(local_index, "local_retrieval_index", local_index_artifact)
+        except GateFailure:
+            compose_diagnostics_artifact = out_dir / "local-retrieval-compose-diagnostics.json"
+            capture_proof_compose_diagnostics(cache_root, project, local_env, compose_diagnostics_artifact)
+            summary["artifacts"]["local_retrieval_compose_diagnostics"] = str(compose_diagnostics_artifact)
+            write_json(out_dir / "summary.json", summary)
+            raise
         summary["artifacts"]["local_retrieval_index"] = str(local_index_artifact)
         write_json(out_dir / "summary.json", summary)
 
@@ -1440,20 +1809,13 @@ def run_gate(args: argparse.Namespace) -> None:
         summary["artifacts"]["packet"] = str(packet_artifact)
         write_json(out_dir / "summary.json", summary)
 
-        stdio_attempts = []
-        try:
+        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
+        require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
+        allowed = stdio_status_payload.get("allowed_surfaces", {})
+        if not all(allowed.get(name, {}).get("allowed") is True for name in ("packet", "search", "context")):
+            shutil.copy2(stdio_artifact, out_dir / "serve-stdio-status-initial.json")
             stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
-            stdio_attempts.append(stdio_status_payload)
-            require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
-            allowed = stdio_status_payload.get("allowed_surfaces", {})
-            if not all(allowed.get(name, {}).get("allowed") is True for name in ("packet", "search", "context")):
-                shutil.copy2(stdio_artifact, out_dir / "serve-stdio-status-initial.json")
-                stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
-                stdio_attempts.append(stdio_status_payload)
-            require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
-        finally:
-            for status_attempt in stdio_attempts:
-                terminate_status_workers(status_attempt)
+        require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
         summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
         write_json(out_dir / "summary.json", summary)
 
@@ -1532,6 +1894,8 @@ def write_fake_cli(path: Path) -> None:
                 })
             elif layer == "retrieval_status":
                 emit({"retrieval_mode": "full"})
+            elif layer == "retrieval_down":
+                emit({"stopped": True})
             elif layer == "search":
                 emit({"retrieval_shadow": {"retrieval_mode": "full"}, "indexed_symbol_hits": [{"node_id": "1"}]})
             elif layer == "context":
@@ -1784,6 +2148,10 @@ def write_fake_plugin_launcher(plugin_root: Path) -> None:
 
 def self_test() -> None:
     base_environment = {"KEEP": "value", "CODESTORY_SIDECAR_PROFILE": "agent"}
+    owned_environment = proof_environment(base_environment)
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        assert owned_environment["CODESTORY_QDRANT_USER"] == f"{os.getuid()}:{os.getgid()}"
+        assert owned_environment["CODESTORY_QDRANT_SNAPSHOTS_PATH"] == "/qdrant/storage/snapshots"
     local_environment = local_profile_environment(base_environment)
     assert local_environment["KEEP"] == "value"
     assert local_environment["CODESTORY_SIDECAR_PROFILE"] == "local"
@@ -1854,21 +2222,303 @@ def self_test() -> None:
         assert unclassified_attempts == 1
 
         if os.name == "nt":
-            process_handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, os.getpid())
+            kernel32 = windows_process_api()
+            process_handle = kernel32.OpenProcess(0x00100000, False, os.getpid())
             assert process_handle
             try:
                 try:
-                    require_windows_process_exit(process_handle, os.getpid(), timeout_ms=0)
+                    require_windows_process_exit(process_handle, os.getpid(), timeout_ms=0, kernel32=kernel32)
                 except RuntimeError:
                     pass
                 else:
                     raise AssertionError("an unterminated worker must remain a cleanup failure")
             finally:
-                ctypes.windll.kernel32.CloseHandle(process_handle)
+                kernel32.CloseHandle(process_handle)
+
+            class FakeKernel32:
+                def __init__(self, waits, *, handle=123, terminate=True, last_error=5):
+                    self.waits = list(waits)
+                    self.handle = handle
+                    self.terminate = terminate
+                    self.last_error = last_error
+
+                def OpenProcess(self, _access, _inherit, _pid):
+                    return self.handle
+
+                def WaitForSingleObject(self, _handle, _timeout):
+                    return self.waits.pop(0)
+
+                def TerminateProcess(self, _handle, _exit_code):
+                    return self.terminate
+
+                def CloseHandle(self, _handle):
+                    return True
+
+            failed_wait = FakeKernel32([0xFFFFFFFF], last_error=6)
+            try:
+                require_windows_process_exit(123, 42, timeout_ms=0, kernel32=failed_wait)
+            except RuntimeError as exc:
+                assert "Windows error 6" in str(exc)
+            else:
+                raise AssertionError("WAIT_FAILED must remain a cleanup failure")
+
+            open_failure = FakeKernel32([], handle=None, last_error=5)
+            open_diagnostics = {}
+            try:
+                terminate_worker_pid(
+                    42,
+                    open_diagnostics,
+                    kernel32=open_failure,
+                    run=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 128, "", "not found"),
+                    platform="nt",
+                )
+            except RuntimeError as exc:
+                assert "Windows error 5" in str(exc)
+            else:
+                raise AssertionError("OpenProcess access failure must remain fail closed")
+            assert open_diagnostics["attempts"] == [
+                {"kind": "open_process", "success": False, "windows_error": 5}
+            ]
+
+            async_exit = FakeKernel32([258, 0])
+            async_diagnostics = {}
+
+            def timed_out_taskkill(*_args, **_kwargs):
+                raise subprocess.TimeoutExpired("taskkill", 10)
+
+            terminate_worker_pid(
+                42,
+                async_diagnostics,
+                kernel32=async_exit,
+                run=timed_out_taskkill,
+                platform="nt",
+            )
+            assert async_diagnostics["status"] == "terminated_after_direct_termination"
+            assert "TimeoutExpired" in async_diagnostics["attempts"][1]["error"]
+
+            terminate_failure = FakeKernel32([258, 258], terminate=False, last_error=5)
+            terminate_diagnostics = {}
+            try:
+                terminate_worker_pid(
+                    42,
+                    terminate_diagnostics,
+                    kernel32=terminate_failure,
+                    run=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", "denied"),
+                    platform="nt",
+                )
+            except RuntimeError as exc:
+                assert "Windows error 5" in str(exc)
+            else:
+                raise AssertionError("TerminateProcess failure must remain fail closed")
+            assert terminate_diagnostics["attempts"][1]["returncode"] == 1
+            assert terminate_diagnostics["attempts"][-1]["success"] is False
 
         stage = root / "pkg" / "codestory-cli-v9.9.9-test"
         stage.mkdir(parents=True)
         write_fake_cli(stage)
+        fake_cli = find_cli(stage)
+        compose_file = root / "docker" / "retrieval-compose.yml"
+        compose_file.parent.mkdir()
+        compose_file.write_text("services: {}\n", encoding="utf-8")
+
+        def write_proof_compose_state(cache_root: Path, overrides: dict | None = None) -> Path:
+            cache_root.mkdir()
+            (cache_root / "qdrant").mkdir()
+            (cache_root / "lexical").mkdir()
+            state = {
+                "owner": "codestory",
+                "profile": "local",
+                "namespace": "codestory",
+                "compose_project": "codestory",
+                "compose_file": str(compose_file),
+                "qdrant_data_dir": str(cache_root / "qdrant"),
+                "lexical_data_dir": str(cache_root / "lexical"),
+            }
+            state.update(overrides or {})
+            state_file = cache_root / "retrieval-sidecars.json"
+            write_json(state_file, state)
+            return state_file
+
+        compose_cleanup_root = root / "compose-cleanup"
+        write_proof_compose_state(compose_cleanup_root)
+        compose_cleanup_artifact = root / "compose-cleanup.json"
+        compose_calls = []
+
+        def successful_compose_cleanup(command, **kwargs):
+            if command[0] == "docker":
+                compose_calls.append((command, kwargs["env"]))
+                return subprocess.CompletedProcess(command, 0, "stopped", "")
+            return subprocess.run(command, **kwargs)
+
+        cleanup_proof_cache(
+            fake_cli,
+            root,
+            compose_cleanup_root,
+            compose_cleanup_artifact,
+            successful_compose_cleanup,
+        )
+        assert not compose_cleanup_root.exists()
+        assert compose_calls[0][0][-2:] == ["down", "--remove-orphans"]
+        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"] == "codestory"
+        compose_cleanup = read_json_file(compose_cleanup_artifact)
+        assert compose_cleanup["removed"] is True
+        assert compose_cleanup["commands"][0]["kind"] == "compose_down"
+
+        optional_lexical_root = root / "compose-cleanup-optional-lexical"
+        write_proof_compose_state(optional_lexical_root, {"lexical_data_dir": None})
+        optional_lexical_artifact = root / "compose-cleanup-optional-lexical.json"
+        try:
+            cleanup_proof_cache(fake_cli, root, optional_lexical_root, optional_lexical_artifact)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("missing canonical and legacy lexical ownership must fail closed")
+        assert read_json_file(optional_lexical_artifact)["commands"][0]["kind"] == "compose_state_validation"
+        remove_tree_with_retry(optional_lexical_root)
+
+        legacy_lexical_root = root / "compose-cleanup-legacy-lexical"
+        write_proof_compose_state(
+            legacy_lexical_root,
+            {"lexical_data_dir": None, "zoekt_data_dir": str(legacy_lexical_root / "lexical")},
+        )
+        cleanup_proof_cache(
+            fake_cli,
+            root,
+            legacy_lexical_root,
+            root / "compose-cleanup-legacy-lexical.json",
+            successful_compose_cleanup,
+        )
+
+        failed_compose_root = root / "compose-cleanup-failed"
+        write_proof_compose_state(failed_compose_root)
+        failed_compose_artifact = root / "compose-cleanup-failed.json"
+
+        def failed_compose_cleanup(command, **kwargs):
+            if command[0] == "docker":
+                return subprocess.CompletedProcess(command, 17, "", "forced failure")
+            return subprocess.run(command, **kwargs)
+
+        try:
+            cleanup_proof_cache(
+                fake_cli,
+                root,
+                failed_compose_root,
+                failed_compose_artifact,
+                failed_compose_cleanup,
+            )
+        except RuntimeError as exc:
+            assert "Compose cleanup exited 17" in str(exc)
+        else:
+            raise AssertionError("failed proof-owned Compose cleanup must remain fail-closed")
+        assert failed_compose_root.exists()
+        assert read_json_file(failed_compose_artifact)["removed"] is False
+        remove_tree_with_retry(failed_compose_root)
+
+        masked_failure_root = root / "compose-cleanup-primary-failure"
+        write_proof_compose_state(masked_failure_root)
+        masked_failure_artifact = root / "compose-cleanup-primary-failure.json"
+        primary_artifact = root / "primary-failure.json"
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.push(
+                    cleanup_proof_cache_on_exit(
+                        fake_cli,
+                        root,
+                        masked_failure_root,
+                        masked_failure_artifact,
+                        failed_compose_cleanup,
+                    )
+                )
+                raise GateFailure("primary", primary_artifact, "primary gate failed")
+        except GateFailure as exc:
+            assert exc.layer == "primary"
+            assert any("proof cleanup also failed" in note for note in getattr(exc, "__notes__", []))
+        else:
+            raise AssertionError("proof cleanup must not mask the primary gate failure")
+        assert read_json_file(masked_failure_artifact)["removed"] is False
+        remove_tree_with_retry(masked_failure_root)
+
+        altered_compose_file = root / "altered-compose.yml"
+        altered_compose_file.write_text("services: {}\n", encoding="utf-8")
+        altered_qdrant = root / "altered-qdrant"
+        altered_qdrant.mkdir()
+        validation_cases = [
+            ("project", {"compose_project": "not-codestory"}),
+            ("file", {"compose_file": str(altered_compose_file)}),
+            ("path", {"qdrant_data_dir": str(altered_qdrant)}),
+            ("lexical-path", {"lexical_data_dir": str(altered_qdrant)}),
+            ("non-string", {"namespace": 7}),
+            ("lexical-non-string", {"lexical_data_dir": 7}),
+        ]
+        for label, overrides in validation_cases:
+            cache_root = root / f"compose-validation-{label}"
+            write_proof_compose_state(cache_root, overrides)
+            artifact = root / f"compose-validation-{label}.json"
+            try:
+                cleanup_proof_cache(fake_cli, root, cache_root, artifact)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"altered proof Compose {label} must fail closed")
+            validation = read_json_file(artifact)
+            assert validation["removed"] is False
+            assert validation["commands"][0]["kind"] == "compose_state_validation"
+            assert validation["commands"][0]["error"]
+            remove_tree_with_retry(cache_root)
+
+        malformed_root = root / "compose-validation-malformed"
+        malformed_state = write_proof_compose_state(malformed_root)
+        malformed_state.write_text("{", encoding="utf-8")
+        malformed_artifact = root / "compose-validation-malformed.json"
+        try:
+            cleanup_proof_cache(fake_cli, root, malformed_root, malformed_artifact)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("malformed proof Compose state must fail closed")
+        assert "JSONDecodeError" in read_json_file(malformed_artifact)["commands"][0]["error"]
+        remove_tree_with_retry(malformed_root)
+
+        unreadable_root = root / "compose-validation-unreadable"
+        write_proof_compose_state(unreadable_root)
+        unreadable_artifact = root / "compose-validation-unreadable.json"
+
+        def unreadable_state(_path):
+            raise PermissionError("forced unreadable state")
+
+        try:
+            cleanup_proof_cache(
+                fake_cli,
+                root,
+                unreadable_root,
+                unreadable_artifact,
+                read_state=unreadable_state,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("unreadable proof Compose state must fail closed")
+        assert "PermissionError" in read_json_file(unreadable_artifact)["commands"][0]["error"]
+        remove_tree_with_retry(unreadable_root)
+
+        symlink_root = root / "compose-validation-symlink"
+        symlink_root.mkdir()
+        (symlink_root / "qdrant").mkdir()
+        (symlink_root / "lexical").mkdir()
+        symlink_target = root / "compose-validation-symlink-target.json"
+        write_json(symlink_target, {"owner": "codestory"})
+        (symlink_root / "retrieval-sidecars.json").symlink_to(symlink_target)
+        symlink_artifact = root / "compose-validation-symlink.json"
+        try:
+            cleanup_proof_cache(fake_cli, root, symlink_root, symlink_artifact)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("symlinked proof Compose state must fail closed")
+        assert "symlink" in read_json_file(symlink_artifact)["commands"][0]["error"]
+        remove_tree_with_retry(symlink_root)
+        symlink_target.unlink()
+
         skill = stage / PLUGIN_SKILL_RELATIVE
         skill.parent.mkdir(parents=True)
         skill.write_text("name: codestory-grounding\n", encoding="utf-8")
@@ -1897,6 +2547,8 @@ def self_test() -> None:
         )
         run_gate(args)
         assert (out_dir / "summary.json").is_file()
+        assert read_json_file(out_dir / "proof-cache-cleanup.json")["removed"] is True
+        assert read_json_file(out_dir / "stdio-cache-cleanup.json")["removed"] is True
         stdio_artifact = read_json_file(out_dir / "serve-stdio-status.json")
         full_cache_root = read_json_file(out_dir / "local-retrieval-bootstrap.json")["cache_root"]
         assert Path(full_cache_root).name.startswith("codestory-packaged-proof-cache-")
@@ -1914,7 +2566,16 @@ def self_test() -> None:
         version_only_args.version_only = True
         run_gate(version_only_args)
         version_only_summary = read_json_file(version_only_out / "summary.json")
-        assert version_only_summary["artifacts"].keys() == {"checksum", "version", "help", "serve_stdio"}
+        assert version_only_summary["artifacts"].keys() == {
+            "checksum",
+            "version",
+            "help",
+            "serve_stdio",
+            "proof_cache_cleanup",
+            "stdio_cache_cleanup",
+        }
+        assert read_json_file(Path(version_only_args.out_dir) / "proof-cache-cleanup.json")["removed"] is True
+        assert read_json_file(Path(version_only_args.out_dir) / "stdio-cache-cleanup.json")["removed"] is True
         assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
         version_only_status = read_json_file(version_only_out / "serve-stdio-status.json")["status"]
         assert Path(version_only_status["cache_root"]).name.startswith("codestory-packaged-stdio-cache-")
@@ -1968,8 +2629,7 @@ def self_test() -> None:
             delayed_status = delayed_stdio_status["status"]
             assert delayed_status["allowed_surfaces"]["packet"]["allowed"] is True
             assert (delayed_stdio_project / ".fake-serve-first-blocked-seen").is_file()
-            delayed_status_worker.wait(timeout=5)
-            assert delayed_status_worker.returncode is not None
+            assert delayed_status_worker.poll() is None
         finally:
             terminate_worker_pid(delayed_status_worker.pid)
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
@@ -2002,8 +2662,7 @@ def self_test() -> None:
                 assert "serve-stdio-status.json" in str(exc.artifact)
             else:
                 raise AssertionError("timed-out stdio readiness retry should fail the gate")
-            retry_timeout_worker.wait(timeout=5)
-            assert retry_timeout_worker.returncode is not None
+            assert retry_timeout_worker.poll() is None
         finally:
             terminate_worker_pid(retry_timeout_worker.pid)
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
@@ -2099,6 +2758,17 @@ def self_test() -> None:
                 transcript_response(managed_artifact, "status_after_repair")
             )
             assert managed_status_after["sidecar_setup"]["active_repair"]["attempt_id"] == "fake-attempt"
+            worker_cleanup = read_json_file(
+                Path(managed_args.out_dir) / "managed-plugin-handoff-worker-cleanup.json"
+            )["workers"]
+            assert worker_cleanup[0]["source"] == "proof_started_repair_response"
+            assert worker_cleanup[0]["attempt_id"] == "fake-attempt"
+            assert worker_cleanup[0]["status"] in {
+                "already_exited",
+                "terminated",
+                "terminated_after_taskkill",
+                "terminated_after_direct_termination",
+            }
             managed_cache_root = read_json_file(Path(managed_args.out_dir) / "managed-local-ground.json")["cache_root"]
             assert Path(managed_cache_root).name.startswith("codestory-packaged-proof-cache-")
             assert managed_status_after["cache_root"] == managed_cache_root

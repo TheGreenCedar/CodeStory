@@ -9,6 +9,21 @@
   background. Status now reports the in-process provisioning state, and the
   launcher hands the next request to the verified stdio runtime without a host
   restart.
+- Expanded managed-plugin provisioning, local grounding, repair handoff, and
+  proof cleanup from Windows x64 to every shipped native release asset in both
+  pre-publish and post-publish matrices. Linux proof containers now write
+  bind-mounted Qdrant data as the proof owner, keep Qdrant snapshots inside that
+  owned mount, and capture Compose/Qdrant diagnostics before cleanup on failure.
+  Cleanup explicitly stops the proof-owned local Compose namespace before
+  verifying cache removal and preserves the original gate failure if cleanup
+  also fails.
+- Stopped new sidecar state from emitting removed Zoekt path, port, and image
+  keys. State now writes `lexical_data_dir`, accepts `zoekt_data_dir` only while
+  reading legacy state, and keeps legacy cleanup bounded to state that proves
+  ownership of the old Zoekt directory. Legacy retrieval state remains readable
+  and the next owned sidecar publication rewrites it in canonical form;
+  rebuilding remains the fail-closed recovery when legacy state does not match
+  the current cache.
 - Made sidecar generation GC root every current and rollback manifest across
   the shared cache scope instead of collapsing rollback evidence to one latest
   generation. Inventory now reports active, rollback, building, and reclaimable

@@ -27,26 +27,32 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             asset_target: linux-x64
             exe_suffix: ""
+            extension: tar.gz
           - os: ubuntu-24.04-arm
             rust_target: aarch64-unknown-linux-gnu
             asset_target: linux-arm64
             exe_suffix: ""
+            extension: tar.gz
           - os: windows-latest
             rust_target: x86_64-pc-windows-msvc
             asset_target: windows-x64
             exe_suffix: ".exe"
+            extension: zip
           - os: windows-11-arm
             rust_target: aarch64-pc-windows-msvc
             asset_target: windows-arm64
             exe_suffix: ".exe"
+            extension: zip
           - os: macos-15-intel
             rust_target: x86_64-apple-darwin
             asset_target: macos-x64
             exe_suffix: ""
+            extension: tar.gz
           - os: macos-15
             rust_target: aarch64-apple-darwin
             asset_target: macos-arm64
             exe_suffix: ""
+            extension: tar.gz
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -177,12 +183,10 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/install-codestory.ps1 -SelfTest
 
-      - name: Prove Windows managed plugin handoff
-        if: matrix.asset_target == 'windows-x64'
-        shell: pwsh
+      - name: Prove managed plugin handoff
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
-          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.zip"
+          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"
           --checksum-file target/release-dist/SHA256SUMS.txt
           --expected-version "${{ inputs.version }}"
           --project "${{ github.workspace }}"
@@ -190,8 +194,8 @@ jobs:
           --managed-plugin-handoff
           --out-dir target/packaged-managed-proof
 
-      - name: Upload Windows managed plugin proof
-        if: always() && matrix.asset_target == 'windows-x64'
+      - name: Upload managed plugin proof
+        if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: packaged-managed-proof-${{ matrix.asset_target }}
