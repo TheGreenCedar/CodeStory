@@ -2518,6 +2518,7 @@ pub(crate) fn wait_for_local_freshness(
                 output.blocks_local_surfaces = true;
                 output.reason = Some("refresh_did_not_reach_fresh".to_string());
             }
+            attach_complete_publication(&mut output, &opened.summary);
             Ok((opened.summary, Some(output)))
         }
         Err(error) => {

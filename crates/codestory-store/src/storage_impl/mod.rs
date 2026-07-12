@@ -293,6 +293,35 @@ pub struct Storage {
     deferred_secondary_indexes: bool,
 }
 
+/// One coherent read view of a live SQLite store.
+///
+/// Publication replaces the live database in place. Grouping related reads in
+/// one transaction prevents a reader from combining rows from two generations.
+pub struct StorageReadSnapshot<'a> {
+    storage: &'a Storage,
+    active: bool,
+}
+
+impl StorageReadSnapshot<'_> {
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+
+    pub fn finish(mut self) -> Result<(), StorageError> {
+        self.storage.conn.execute_batch("COMMIT")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for StorageReadSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.storage.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 /// Opening mode for a SQLite store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageOpenMode {
@@ -1022,6 +1051,14 @@ impl Storage {
             conn,
             cache: StorageCache::default(),
             deferred_secondary_indexes: false,
+        })
+    }
+
+    pub fn read_snapshot(&self) -> Result<StorageReadSnapshot<'_>, StorageError> {
+        self.conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        Ok(StorageReadSnapshot {
+            storage: self,
+            active: true,
         })
     }
 

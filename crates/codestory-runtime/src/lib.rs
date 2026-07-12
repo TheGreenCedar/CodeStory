@@ -8555,7 +8555,16 @@ impl AppController {
         storage_path: PathBuf,
     ) -> Result<ProjectSummary, ApiError> {
         let storage = open_storage_for_read(&storage_path)?;
-        let summary = self.project_summary_from_storage(&root, &storage_path, &storage)?;
+        let snapshot = storage.read_snapshot().map_err(|error| {
+            ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
+        })?;
+        let summary =
+            self.project_summary_from_storage(&root, &storage_path, snapshot.storage())?;
+        snapshot.finish().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to finish project summary snapshot: {error}"
+            ))
+        })?;
 
         {
             let mut s = self.state.lock();
