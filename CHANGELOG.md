@@ -8,6 +8,11 @@
   promotion fail closed when any graph, semantic, or lexical input changes
   during a build. Filesystem input is hashed before locking SQLite; final stored
   input validation and pointer replacement commit in one immediate transaction.
+- Let each runnable retrieval stage consume unused request-budget time while
+  reserving planned time for later stages, so SCIP anchor, lexical, graph, and
+  dense evidence are not cut off by static allowances or query-shape ordering.
+  The first blocking stage deadline now also survives later deadline and
+  marginal-gain exits, keeping incomplete retrieval fail closed and uncached.
 - Renewed live local-refresh ownership during long incremental indexing, with
   token, PID, and process-start checks that prevent stale workers from
   overwriting changed ownership or terminal status.
