@@ -56,6 +56,12 @@
   retrieval tasks through allowed project-scoped local graph surfaces, and
   repairs sidecars only when the task actually requires the blocked surface.
   Local navigation remains explicitly weaker than full packet/search proof.
+- Replaced generic status-only lifecycle guidance with compact repository-task
+  routing for orientation, symbol ownership, call flow, change impact, and broad
+  questions. Prompt hooks no longer echo user text, suppress non-repository
+  chatter, prefer allowed local graph surfaces when deep retrieval is blocked,
+  and reserve sidecar repair for tasks that require packet/search. Routing is
+  stateless so concurrent and resumed agent tasks cannot suppress one another.
 
 ### Fixed
 

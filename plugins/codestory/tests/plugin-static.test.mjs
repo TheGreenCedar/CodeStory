@@ -2232,8 +2232,8 @@ test("startup hook records active project without runtime bootstrap", async () =
     const output = JSON.parse(result.stdout);
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY SESSION GROUNDING ACTIVE/u);
-    assert.match(context, /CodeStory MCP startup path/u);
+    assert.match(context, /CODESTORY SESSION ROUTING ACTIVE/u);
+    assert.match(context, /Task router: orientation/u);
     assert.match(context, /tool_search/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
@@ -2466,6 +2466,27 @@ function runCodexHook(input, env) {
   return JSON.parse(result.stdout);
 }
 
+async function runCodexHookAsync(input, env) {
+  const child = spawn(process.execPath, [join(pluginRoot, "hooks", "codestory-activate.cjs")], {
+    env: {
+      ...process.env,
+      COPILOT_PLUGIN_DATA: "",
+      ...env,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(JSON.stringify(input));
+  const [status] = await once(child, "close");
+  assert.equal(status, 0, stderr);
+  return JSON.parse(stdout);
+}
+
 test("hook emits MCP activation guidance without running CLI", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-mcp-guidance-"));
   const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-unused-cli-"));
@@ -2486,10 +2507,14 @@ test("hook emits MCP activation guidance without running CLI", async () => {
 
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY REQUEST GROUNDING ACTIVE/u);
-    assert.match(context, /CodeStory MCP startup path/u);
+    assert.match(context, /CODESTORY REQUEST ROUTING ACTIVE/u);
+    assert.match(context, /Route: Symbol ownership/u);
     assert.match(context, /codestory mcp ground status packet search/u);
-    assert.match(context, /Do not treat hook text as grounding evidence/u);
+    assert.match(context, /absolute repository cwd/u);
+    assert.match(context, /local graph surfaces before source/u);
+    assert.match(context, /Repair only when packet\/search is required/u);
+    assert.match(context, /Hook text routes; only live MCP or verified source is evidence/u);
+    assert.doesNotMatch(context, /CodeStory hook output truncated/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
     assert.doesNotMatch(context, /packet ok/u);
@@ -2500,36 +2525,157 @@ test("hook emits MCP activation guidance without running CLI", async () => {
   }
 });
 
-test("hook dedupes repeated request prompts without storing prompt text", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-prompt-dedupe-"));
+test("hook routing is stateless across repeated and parallel processes", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-stateless-"));
+  const input = {
+    hook_event_name: "UserPromptSubmit",
+    prompt: "Where is RefreshMode defined?",
+    cwd: repoRoot,
+  };
 
   try {
-    const first = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is RefreshMode defined?",
-      cwd: repoRoot,
-    }, { PLUGIN_DATA: dataDir, PATH: "" });
-    const second = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is RefreshMode defined?",
-      cwd: repoRoot,
-    }, { PLUGIN_DATA: dataDir, PATH: "" });
-    const third = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is strict_sidecar_status defined?",
-      cwd: repoRoot,
-    }, { PLUGIN_DATA: dataDir, PATH: "" });
+    const serial = [runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" }), runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" })];
+    const parallel = await Promise.all(Array.from({ length: 6 }, () => runCodexHookAsync(input, {
+      CODEX_THREAD_ID: "shared-task",
+      PLUGIN_DATA: dataDir,
+      PATH: "",
+    })));
+    for (const output of [...serial, ...parallel]) {
+      assert.match(output.hookSpecificOutput.additionalContext, /Route: Symbol ownership/u);
+      assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /Where is RefreshMode defined/u);
+    }
+    await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
 
-    assert.match(first.hookSpecificOutput.additionalContext, /Where is RefreshMode defined?/u);
-    assert.equal(Object.hasOwn(second, "hookSpecificOutput"), false);
-    assert.match(third.hookSpecificOutput.additionalContext, /Where is strict_sidecar_status defined?/u);
-    const stateText = await readFile(join(dataDir, ".codestory-hook-output-state.json"), "utf8");
-    const promptHash = createHash("sha256")
-      .update("Where is RefreshMode defined?")
-      .digest("hex")
-      .slice(0, 16);
-    assert.match(stateText, new RegExp(promptHash, "u"));
-    assert.doesNotMatch(stateText, /Where is RefreshMode defined/u);
+test("hook routes repository prompts and suppresses non-repository chatter", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-route-matrix-"));
+
+  try {
+    const prompts = [
+      ["Give me a broad architecture review of this codebase", /Route: Broad question/u],
+      ["Who calls RuntimeContext::open?", /Route: Call flow/u],
+      ["Explain who calls RuntimeContext::open across the architecture", /Route: Call flow/u],
+      ["Where is RuntimeContext defined?", /Route: Symbol ownership/u],
+      ["Explain where RuntimeContext is defined in this codebase", /Route: Symbol ownership/u],
+      ["Review the changed files and tell me what tests are affected", /Route: Review\/change impact/u],
+      ["Review this PR", /Route: Review\/change impact/u],
+      ["Run cargo test", /Route: Repository orientation/u],
+      ["Run npm test", /Route: Repository orientation/u],
+      ["Fix the refresh_index race", /Route: Review\/change impact/u],
+      ["Refactor routeForPrompt", /Route: Review\/change impact/u],
+      ["Use CodeStory", /Route: Repository orientation/u],
+      ["Rebase this branch onto dev", /Route: Review\/change impact/u],
+      ["Fix function", /Route: Review\/change impact/u],
+      ["Refactor method", /Route: Review\/change impact/u],
+      ["Review class changes", /Route: Review\/change impact/u],
+      ["How does CodeStory grounding work?", /Route: Broad question/u],
+      ["Show the current branch", /Route: Repository orientation/u],
+      ["List the languages in this repository", /Route: Repository orientation/u],
+    ];
+    for (const [prompt, expected] of prompts) {
+      const output = runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        prompt,
+        cwd: repoRoot,
+      }, { PLUGIN_DATA: dataDir, PATH: "" });
+      const context = output.hookSpecificOutput.additionalContext;
+      assert.match(context, expected);
+      assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
+      assert.equal(context.includes(prompt), false);
+      assert.doesNotMatch(context, /hook output truncated/u);
+    }
+
+    for (const prompt of [
+      "Thanks, that answers it.",
+      "Can you review this restaurant?",
+      "Explain the egg method.",
+      "I registered for semester classes.",
+      "Tell me about compiler design.",
+      "What is the movie runtime?",
+      "I bought an iPhone.",
+      "Search for eBay.",
+      "Please update my social_security_number.",
+      "Help me build a birdhouse.",
+      "Explain liver function tests.",
+      "Organize my grocery list.",
+      "Create an issue for the hook initiative.",
+      "What is the status of issue #963?",
+      "Update issue #897.",
+    ]) {
+      const chatter = runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        prompt,
+        cwd: repoRoot,
+      }, { PLUGIN_DATA: dataDir, PATH: "" });
+      assert.equal(Object.hasOwn(chatter, "hookSpecificOutput"), false);
+    }
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("suppressed hook events write no active or thread state", async () => {
+  for (const input of [
+    { hook_event_name: "UserPromptSubmit", prompt: "Can you review this restaurant?", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Explain the egg method.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "I registered for semester classes.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Tell me about compiler design.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "What is the movie runtime?", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "I bought an iPhone.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Search for eBay.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Please update my social_security_number.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Help me build a birdhouse.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Explain liver function tests.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Organize my grocery list.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Update issue #897.", cwd: repoRoot },
+    { hook_event_name: "GoalLoopHeartbeat", cwd: repoRoot },
+  ]) {
+    const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-no-state-"));
+    try {
+      const output = runCodexHook(input, {
+        CODEX_THREAD_ID: "suppressed-task",
+        PLUGIN_DATA: dataDir,
+        PATH: "",
+      });
+      assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
+      await assert.rejects(access(join(dataDir, ".codestory-active")), /ENOENT/u);
+      await assert.rejects(access(threadActiveStatePath(dataDir, "suppressed-task")), /ENOENT/u);
+      await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("compact and resume session starts re-inject complete bounded routing", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-reinject-"));
+  const longCwd = `C:\\${"very-long-directory\\".repeat(200)}repo`;
+  try {
+    for (const source of ["compact", "resume", "compact"]) {
+      const output = runCodexHook({
+        hook_event_name: "SessionStart",
+        source,
+        cwd: longCwd,
+      }, { PLUGIN_DATA: dataDir, PATH: "" });
+      const context = output.hookSpecificOutput.additionalContext;
+      assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
+      assert.match(context, /absolute repository cwd/u);
+      assert.match(context, /codestory mcp ground status packet search/u);
+      assert.doesNotMatch(context, /truncated/u);
+      assert.equal(context.endsWith("tools."), true);
+    }
+    const promptContext = runCodexHook({
+      hook_event_name: "UserPromptSubmit",
+      prompt: "Where is RuntimeContext defined?",
+      cwd: longCwd,
+    }, { PLUGIN_DATA: dataDir, PATH: "" }).hookSpecificOutput.additionalContext;
+    assert.ok(promptContext.length <= 900, `hook output was ${promptContext.length} characters`);
+    assert.match(promptContext, /absolute repository cwd/u);
+    assert.doesNotMatch(promptContext, /truncated/u);
+    assert.equal(promptContext.endsWith("evidence."), true);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2597,7 +2743,7 @@ test("hook script executes under Codex home module scope", async () => {
         },
         input: JSON.stringify({
           hook_event_name: "UserPromptSubmit",
-          prompt: "Explain hook loading.",
+          prompt: "Explain CodeStory hook loading.",
           cwd: repoRoot,
         }),
         encoding: "utf8",
@@ -2608,7 +2754,7 @@ test("hook script executes under Codex home module scope", async () => {
     assert.doesNotMatch(result.stderr, /require is not defined/u);
     assert.match(
       JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-      /CODESTORY REQUEST GROUNDING ACTIVE/u,
+      /CODESTORY REQUEST ROUTING ACTIVE/u,
     );
   } finally {
     await rm(codexHome, { recursive: true, force: true });

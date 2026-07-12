@@ -1,79 +1,70 @@
-const fs = require('fs');
-const path = require('path');
+const MCP_RESOURCE_TEXT = 'If CodeStory MCP tools are hidden and tool_search is available, query "codestory mcp ground status packet search", then use the loaded tools.';
 
-const SKILL_PATH = path.join(__dirname, '..', 'skills', 'codestory-grounding', 'SKILL.md');
-const MAX_PROMPT_CHARS = 600;
-const MCP_RESOURCE_TEXT = 'If mcp__codestory tools are not initially visible and tool_search is available, query "codestory mcp ground status packet search", then use the loaded CodeStory MCP tools before manual source reads.';
-
-const FALLBACK = `CODESTORY BACKGROUND GROUNDING ACTIVE
-
-Before reading source files, making source claims, planning edits, choosing tests, or reviewing changes in a repository:
-
-1. Confirm the target is a repository workspace before grounding it. In huge or mixed folders, stop CodeStory grounding if status, ready, or ground reports no repo, no supported files, or zero indexed files; do not inject or summarize empty ground output.
-2. If the CodeStory MCP server is live, call status with the target repository's absolute path first and pass that same project to every CodeStory tool. ${MCP_RESOURCE_TEXT} Report hidden tool actions truthfully; do not synthesize a hook substitute for live MCP tools.
-3. Use server_version, server_executable, allowed_surfaces, and retrieval_mode from status as runtime truth.
-4. Use local graph surfaces only when their own allowed_surfaces entry allows them.
-5. Use packet, search, or context confidently when that surface is allowed and retrieval_mode=full.
-6. If MCP is unavailable, CodeStory grounding is unavailable in this host. Use ordinary source inspection, report the MCP blocker, and reserve CLI commands for maintainer/debug transcripts only.
-
-Do this without waiting for the user to mention CodeStory.`;
-
-function skillBody() {
-  try {
-    return fs.readFileSync(SKILL_PATH, 'utf8').replace(/^---[\s\S]*?---\s*/, '').trim();
-  } catch (e) {
-    return null;
-  }
+function normalizePrompt(prompt) {
+  return String(prompt || '').replace(/\s+/g, ' ').trim();
 }
 
-function compactPrompt(prompt) {
-  const text = String(prompt || '').replace(/\s+/g, ' ').trim();
-  if (text.length <= MAX_PROMPT_CHARS) return text;
-  return `${text.slice(0, MAX_PROMPT_CHARS)}...`;
+function routeForPrompt(prompt) {
+  const normalized = normalizePrompt(prompt);
+  const text = normalized.toLowerCase();
+  if (!text) return null;
+  if (/^(?:thanks?|thank you|ok(?:ay)?|got it|sounds good|never ?mind)[.!?]*$/u.test(text)) {
+    return null;
+  }
+  const explicitRepositoryIntent = /\b(?:codestory|repo(?:sitory)?|codebase|source code|source files?|pull request|worktree|mcp|grounding|git|commit|rebase|cherry-pick|merge conflict|current branch|this branch|feature branch|branch (?:name|head)|code review|changed files?|diff|build (?:the )?(?:code|repo|repository|project)|unit tests?|integration tests?|test suite|test files?|callers?|callees?|crates?)\b|\b(?:review|fix|update|merge)\b[^.!?]*\bpr\b|\bpr\b[^.!?]*\b(?:review|changes?|diff)\b|\b(?:cargo|npm|pnpm|yarn|go) test\b|\bpytest\b|\bdotnet test\b|\bwhere is [a-z_$][\w$]* (?:defined|implemented)\b|(?:^|[\s"'`])(?:src|crates|plugins|scripts|tests?|docs?)[/\\][\w./\\-]+|(?:^|[\s"'`])[\w./\\-]+\.(?:rs|js|cjs|mjs|ts|tsx|jsx|py|go|cs|cpp|c|h|toml|json|ya?ml|md)(?:\b|$)/u;
+  const codeShapedIdentifier = /\b[a-z][a-z\d]*_[a-z\d_]+\b|\b[a-z]+[A-Z][A-Za-z\d]*\b/u.test(normalized);
+  const identifierIntent = codeShapedIdentifier && /\b(?:fix|refactor|review|change|edit|debug|implement|test|define|defined|definition|trace|trail|caller|callee|invokes?|called by)\b|\b(?:where is|who calls)\b/u.test(text);
+  const qualifiedIdentifier = /[A-Za-z_$][\w$]*::[A-Za-z_$][\w$]*/u.test(normalized);
+  const codeChangeIntent = /\b(?:fix|refactor|review|change|edit|debug|implement|test)\b[^.!?]*\b(?:function|method|class|module|runtime|compiler|plugin|hook|symbol)s?\b/u.test(text);
+  const repositoryIntent = explicitRepositoryIntent.test(text) || identifierIntent || qualifiedIdentifier || codeChangeIntent;
+  if (
+    !repositoryIntent
+    && /\b(?:create|open|close|assign|organize|triage|label|comment on|update|status of)\b[^.!?]*\b(?:issue|initiative|epic|project (?:board|item))\b/u.test(text)
+  ) return null;
+  if (!repositoryIntent) return null;
+
+  if (/\b(?:caller|callee|call path|call flow|trace|trail|invokes?|called by)\b|\bwho calls\b/u.test(text)) {
+    return 'Call flow: use symbol, then callers/callees or trace/trail; use snippet only after the graph selects a concrete target.';
+  }
+  if (
+    /\b(?:diff|changed files?|edit|refactor|bug|fix|impact|tests? should|affected|rebase|cherry-pick|merge)\b/u.test(text)
+    || /\breview\b[^.!?]*\b(?:diff|changes?|pull request)\b/u.test(text)
+    || /\b(?:review\b[^.!?]*\bpr|pr\b[^.!?]*\breview)\b/u.test(text)
+  ) {
+    return 'Review/change impact: use affected only with explicit git-changed paths, then inspect relevant symbols or traces; affected is planning evidence, not proof.';
+  }
+  if (/\b(?:where is|defined|definition|owns?|ownership|symbol|class|function|method)\b/u.test(text)) {
+    return 'Symbol ownership: use symbol, then definition; add callers/callees only when the question asks for flow.';
+  }
+  if (/\b(?:whole|entire|broad|architecture|subsystem|data flow|how does|how do|explain|codebase review)\b/u.test(text)) {
+    return 'Broad question: use packet only when status allows it and retrieval_mode=full; otherwise use ground, then focused symbol/trace evidence before source.';
+  }
+  return 'Repository orientation: use ground; use files only for language, role, path, or coverage questions.';
 }
 
 function eventHeader(event, input = {}) {
   if (event === 'UserPromptSubmit') {
-    const prompt = compactPrompt(input.prompt);
+    const route = routeForPrompt(input.prompt);
+    if (!route) return '';
     return [
-      'CODESTORY REQUEST GROUNDING ACTIVE',
+      'CODESTORY REQUEST ROUTING ACTIVE',
       '',
-      'Use CodeStory before source files for this user prompt.',
-      MCP_RESOURCE_TEXT,
-      prompt ? `Prompt: ${prompt}` : 'Prompt: unavailable from hook input.',
+      `Route: ${route}`,
       '',
     ].join('\n');
   }
 
-  const source = input.source ? ` (${input.source})` : '';
   return [
-    `CODESTORY SESSION GROUNDING ACTIVE${source}`,
+    'CODESTORY SESSION ROUTING ACTIVE',
     '',
-    'Keep CodeStory ambient in this session. Before source reads, claims, edits, reviews, or test choices, check CodeStory status and use allowed grounding surfaces first.',
-    MCP_RESOURCE_TEXT,
+    'For repository work, use the codestory-grounding skill and call status once for the explicit project.',
+    'Task router: orientation -> ground/files; symbol -> symbol/definition; flow -> callers/callees/trace; review/change -> affected with explicit paths plus focused graph evidence; broad -> packet only when allowed/full.',
     '',
   ].join('\n');
 }
 
-function getCodeStoryInstructions(event = 'SessionStart', input = {}) {
-  const body = skillBody();
-  if (!body) return `${eventHeader(event, input)}${FALLBACK}`;
-
-  return `${eventHeader(event, input)}CODESTORY BACKGROUND GROUNDING RULES
-
-Use CodeStory proactively for repository grounding. Do not wait for the user to call it by name.
-Before manually opening source files, first call status with the target repository's absolute path when MCP is live. Pass that same project to every CodeStory tool call; the server is multi-project and has no global workspace binding. When CodeStory is not initially model-visible, use host deferred discovery/tool_search to load the registered CodeStory MCP. When MCP is unavailable, CodeStory grounding is unavailable in this host; use ordinary source inspection and report the MCP blocker.
-For broad user requests, prefer a packet tied to the user's actual question. For concrete symbols, files, or routes, use search/context/trail/snippet. For no request context, use a compact ground snapshot only after confirming the target repo is indexable.
-Avoid no-op grounding context in huge or non-code folders.
-When retrieval sidecars are full and allowed, use packet, search, and context confidently.
-Use status recommended_next_calls as the setup path once a repository target is known: call MCP sidecar_setup with the same project and action=repair when recommended, then call project-scoped status again.
-
-${body}`;
-}
-
 module.exports = {
-  FALLBACK,
-  compactPrompt,
+  MCP_RESOURCE_TEXT,
   eventHeader,
-  getCodeStoryInstructions,
+  routeForPrompt,
 };

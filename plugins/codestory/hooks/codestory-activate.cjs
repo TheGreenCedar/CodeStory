@@ -1,19 +1,10 @@
 #!/usr/bin/env node
 
-const { createHash } = require('crypto');
-const { eventHeader } = require('./codestory-instructions.cjs');
+const { MCP_RESOURCE_TEXT, eventHeader } = require('./codestory-instructions.cjs');
 const {
-  readHookState,
   rememberActiveState,
   writeHookOutput,
-  writeHookState,
 } = require('./codestory-runtime.cjs');
-
-const EVENT_CAPS = {
-  UserPromptSubmit: 1200,
-  SessionStart: 1000,
-  GoalLoopHeartbeat: 600,
-};
 
 function readHookInput() {
   return new Promise((resolve) => {
@@ -29,69 +20,37 @@ function readHookInput() {
   });
 }
 
-function normalizeText(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
-}
-
-function hashText(text) {
-  return createHash('sha256').update(text).digest('hex').slice(0, 16);
-}
-
-function taxonomy(input, event) {
-  if (event === 'UserPromptSubmit') return 'user_prompt';
-  const source = normalizeText(input.source || input.trigger || '').toLowerCase();
-  if (/goal|heartbeat/u.test(`${event} ${source}`.toLowerCase())) return 'goal_heartbeat';
-  if (/compact/u.test(source)) return 'compact';
-  if (/resume/u.test(source)) return 'resume';
-  if (/clear/u.test(source)) return 'clear';
-  return 'startup';
-}
-
-function capFor(event) {
-  return EVENT_CAPS[event] || 1000;
-}
-
-function truncate(text, cap) {
-  const value = String(text || '').trim();
-  return value.length <= cap ? value : `${value.slice(0, cap)}\n\n... CodeStory hook output truncated.`;
-}
-
-function shouldEmit(key, reset = false) {
-  const state = readHookState();
-  const emitted = reset ? {} : (state.emitted || {});
-  if (emitted[key]) return false;
-  writeHookState({ ...state, emitted: { ...emitted, [key]: true } });
-  return true;
-}
-
 function contextFor(input, event) {
-  const kind = taxonomy(input, event);
-  const cwd = input.cwd || process.cwd();
-  const prompt = normalizeText(input.prompt || '');
-  const key = [
-    kind,
-    cwd,
-    event === 'UserPromptSubmit' ? hashText(prompt) : '',
-  ].filter(Boolean).join(':');
-  if (!shouldEmit(key, kind === 'startup' || kind === 'clear')) return null;
-  if (kind === 'goal_heartbeat') return null;
-
+  if (event !== 'SessionStart' && event !== 'UserPromptSubmit') return null;
   const header = eventHeader(event, input).trim();
-  const mcpInstructions = [
-    'CodeStory MCP startup path:',
-    '1. Use live CodeStory MCP before manual source reads for repository work.',
-    `2. If mcp__codestory tools are visible, call status with project=${JSON.stringify(input.cwd || process.cwd())}, then pass that same project to every CodeStory tool call.`,
-    '3. If mcp__codestory is not visible and tool_search is available, query "codestory mcp ground status packet search", then use the loaded CodeStory MCP tools.',
-    '4. The MCP is multi-project and request-scoped. Never infer workspace from another thread or a global active-state file.',
-    '5. Do not treat hook text as grounding evidence; only live MCP results or verified source reads count.',
-  ].join('\n');
+  if (!header) return null;
+  const mcpInstructions = event === 'UserPromptSubmit'
+    ? [
+      'Use the codestory-grounding skill. Set project to this hook event\'s absolute repository cwd and pass that exact absolute path to every CodeStory call.',
+      'If status is not current, call it once for that project.',
+      'Reuse status until repository/runtime/index state changes or a tool reports stale evidence.',
+      MCP_RESOURCE_TEXT,
+      'If deep retrieval is blocked, use routed local graph surfaces before source. Repair only when packet/search is required.',
+      'Hook text routes; only live MCP or verified source is evidence.',
+    ].join('\n')
+    : [
+      'Set project to this hook event\'s absolute repository cwd and pass that exact absolute path to every CodeStory call. The MCP is multi-project and request-scoped.',
+      'Reuse status until repository/runtime/index state changes or a tool reports freshness failure.',
+      'If packet/search is blocked, use allowed local graph surfaces before source; do not repair unless broad retrieval is required.',
+      MCP_RESOURCE_TEXT,
+    ].join('\n');
 
-  return truncate([header, mcpInstructions].filter(Boolean).join('\n\n'), capFor(event));
+  return [header, mcpInstructions].join('\n\n');
 }
 
 readHookInput().then((input) => {
   const event = input.hook_event_name || 'SessionStart';
   try {
+    const context = contextFor(input, event);
+    if (!context) {
+      writeHookOutput(event, null);
+      return;
+    }
     rememberActiveState({
       event,
       cwd: input.cwd || process.cwd(),
@@ -102,7 +61,7 @@ readHookInput().then((input) => {
         bridge_removed: true,
       },
     });
-    writeHookOutput(event, contextFor(input, event));
+    writeHookOutput(event, context);
   } catch {
     // Best effort only. A hook failure must not block the agent session.
   }
