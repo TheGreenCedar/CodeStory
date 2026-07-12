@@ -123,6 +123,13 @@ pub struct LexicalHit {
     pub score: f32,
 }
 
+pub(crate) struct LexicalSourceInput {
+    hasher: Sha256,
+    file_count: u32,
+    coverage: LexicalCoverage,
+}
+
+#[cfg(test)]
 pub fn lexical_input_fingerprint(
     project_root: &Path,
     storage_path: Option<&Path>,
@@ -138,6 +145,38 @@ pub fn lexical_input_fingerprint(
         file_count,
         hash: finish_lexical_documents_hash(hasher, &coverage),
         coverage,
+    })
+}
+
+pub(crate) fn lexical_source_input(project_root: &Path) -> Result<LexicalSourceInput> {
+    let mut hasher = lexical_documents_hasher();
+    let mut file_count = 0_u32;
+    let coverage = scan_lexical_documents(project_root, None, &mut |document| {
+        hash_lexical_document(&mut hasher, document);
+        file_count = file_count.saturating_add(1);
+        Ok(())
+    })?;
+    Ok(LexicalSourceInput {
+        hasher,
+        file_count,
+        coverage,
+    })
+}
+
+pub(crate) fn finish_lexical_input_for_store(
+    mut source: LexicalSourceInput,
+    project_root: &Path,
+    storage: &Store,
+) -> Result<LexicalInputFingerprint> {
+    scan_symbol_documents_from_store(project_root, storage, &mut |document| {
+        hash_lexical_document(&mut source.hasher, document);
+        source.file_count = source.file_count.saturating_add(1);
+        Ok(())
+    })?;
+    Ok(LexicalInputFingerprint {
+        file_count: source.file_count,
+        hash: finish_lexical_documents_hash(source.hasher, &source.coverage),
+        coverage: source.coverage,
     })
 }
 
@@ -845,6 +884,14 @@ fn scan_symbol_documents(
         return Ok(());
     };
     let storage = Store::open(storage_path).context("open storage for lexical symbol docs")?;
+    scan_symbol_documents_from_store(project_root, &storage, visit)
+}
+
+fn scan_symbol_documents_from_store(
+    project_root: &Path,
+    storage: &Store,
+    visit: &mut dyn FnMut(&LexicalDocument) -> Result<()>,
+) -> Result<()> {
     let mut after = None;
     loop {
         let batch = storage

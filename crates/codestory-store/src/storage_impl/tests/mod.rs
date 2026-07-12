@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::OptionalExtension;
 
 #[test]
 fn file_role_classification_ignores_materialized_repo_cache_prefix() {
@@ -35,6 +36,49 @@ fn unique_temp_db_path(label: &str) -> PathBuf {
         "codestory-store-{label}-{}-{stamp}.sqlite",
         std::process::id()
     ))
+}
+
+#[test]
+fn write_transaction_commits_or_rolls_back_as_one_unit() {
+    let path = unique_temp_db_path("write-transaction");
+    let mut storage = Storage::open(&path).expect("open storage");
+
+    {
+        let mut transaction = storage.write_transaction().expect("begin transaction");
+        transaction
+            .storage_mut()
+            .conn
+            .execute("CREATE TABLE publication_probe (value INTEGER)", [])
+            .expect("create rollback probe");
+    }
+    assert!(
+        storage
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'publication_probe'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .expect("query rollback probe")
+            .is_none()
+    );
+
+    let mut transaction = storage.write_transaction().expect("begin transaction");
+    transaction
+        .storage_mut()
+        .conn
+        .execute("CREATE TABLE publication_probe (value INTEGER)", [])
+        .expect("create commit probe");
+    transaction.finish().expect("commit transaction");
+    assert!(
+        storage
+            .conn
+            .execute("DROP TABLE publication_probe", [])
+            .is_ok()
+    );
+    drop(storage);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

@@ -404,6 +404,12 @@ pub struct StorageReadSnapshot<'a> {
     active: bool,
 }
 
+/// One exclusive write view used when validation and publication must commit together.
+pub struct StorageWriteTransaction<'a> {
+    storage: &'a mut Storage,
+    active: bool,
+}
+
 impl StorageReadSnapshot<'_> {
     pub fn storage(&self) -> &Storage {
         self.storage
@@ -417,6 +423,30 @@ impl StorageReadSnapshot<'_> {
 }
 
 impl Drop for StorageReadSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.storage.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+impl StorageWriteTransaction<'_> {
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+
+    pub fn storage_mut(&mut self) -> &mut Storage {
+        self.storage
+    }
+
+    pub fn finish(mut self) -> Result<(), StorageError> {
+        self.storage.conn.execute_batch("COMMIT")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for StorageWriteTransaction<'_> {
     fn drop(&mut self) {
         if self.active {
             let _ = self.storage.conn.execute_batch("ROLLBACK");
@@ -1161,6 +1191,14 @@ impl Storage {
     pub fn read_snapshot(&self) -> Result<StorageReadSnapshot<'_>, StorageError> {
         self.conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
         Ok(StorageReadSnapshot {
+            storage: self,
+            active: true,
+        })
+    }
+
+    pub fn write_transaction(&mut self) -> Result<StorageWriteTransaction<'_>, StorageError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        Ok(StorageWriteTransaction {
             storage: self,
             active: true,
         })

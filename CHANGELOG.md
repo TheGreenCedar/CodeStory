@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Made sidecar generation fingerprinting snapshot-coherent and current-manifest
+  promotion fail closed when any graph, semantic, or lexical input changes
+  during a build. Filesystem input is hashed before locking SQLite; final stored
+  input validation and pointer replacement commit in one immediate transaction.
 - Renewed live local-refresh ownership during long incremental indexing, with
   token, PID, and process-start checks that prevent stale workers from
   overwriting changed ownership or terminal status.

@@ -100,6 +100,12 @@ dense reason counts, and SCIP artifact contract inputs.
 `retrieval index --refresh auto` should reuse an unchanged healthy generation.
 If inputs match but health is not `full`, CodeStory rebuilds the unhealthy
 component and persists the manifest only after the full stack is healthy.
+Generation fingerprint reads use one SQLite snapshot. Promotion hashes source
+files before taking the database lock, then takes an immediate SQLite write
+transaction to hash stored symbol/semantic inputs and update the current
+manifest together. Graph or semantic input drift during a build therefore
+leaves the previous current manifest untouched without holding the write lock
+during workspace discovery.
 
 ## AST-First Semantic Contract
 
