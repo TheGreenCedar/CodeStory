@@ -17,7 +17,12 @@ status, confidence floor, handler-link support, known gaps, and promotability.
   Remix, Fastify, Koa, Hono, NestJS.
 - Astro/Vue: Astro and Nuxt file-convention routes, plus Vue Router object
   routes.
-- Python: Django, Flask, FastAPI.
+- Python: Django and Flask retain structural collectors. FastAPI decorators on
+  source-ordered module bindings constructed from imported
+  `FastAPI`/`APIRouter` constructors use a tree-sitter query for static string
+  paths and handler links. Later assignment, import, function, or class bindings
+  invalidate stale ownership. Error-local malformed-file recovery is explicitly
+  structural and low-confidence; unmatched receivers are not FastAPI claims.
 - Ruby/PHP/Java/C#: Rails, Laravel, Spring, ASP.NET.
 - Rust: Axum, Actix, Rocket.
 - Go: Gin, Chi, Echo, Fiber as text-only partial route extraction until Go
@@ -61,6 +66,16 @@ be checked with `files --path <fragment>` or a fresh index.
   annotation, C# attribute, or Rust attribute.
 - `heuristic`: route comes from text/tree-sitter pattern matching and needs
   source review before claiming handler parity.
+
+FastAPI route metadata records `claim_tier=parser_backed` with
+`extraction_provenance=tree_sitter_query`. Its syntax-error fallback records
+`claim_tier=structural`, `extraction_provenance=lexical_fallback`, and
+  `confidence=heuristic`. Keyword `path=` arguments, ordinary escaped string
+  literals, and `head`, `options`, `api_route`, and `websocket` decorators are not
+  exact route claims in this slice. Chained or multi-target constructor
+  assignments, including `app = router = FastAPI()`, are not promoted.
+  Factory-returned, injected, and nested-scope routers are not labeled as
+  FastAPI until receiver-specific provenance is resolved.
 
 ## Verification Playbook
 

@@ -35,6 +35,7 @@ use tree_sitter_graph::{ExecutionConfig, NoCancellation, Variables};
 mod cache;
 pub mod cancellation;
 pub mod compilation_database;
+mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
 pub mod resolution;
@@ -14597,6 +14598,7 @@ struct FrameworkRoute {
     confidence: &'static str,
     source_convention: &'static str,
     extraction_provenance: &'static str,
+    claim_tier: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14645,11 +14647,28 @@ impl FrameworkRoute {
             confidence,
             source_convention: confidence,
             extraction_provenance: "line_scan",
+            claim_tier: "structural",
         }
     }
 
     fn with_extraction_provenance(mut self, extraction_provenance: &'static str) -> Self {
         self.extraction_provenance = extraction_provenance;
+        self
+    }
+
+    fn with_claim_evidence(
+        mut self,
+        extraction_provenance: &'static str,
+        claim_tier: &'static str,
+    ) -> Self {
+        self.extraction_provenance = extraction_provenance;
+        self.claim_tier = claim_tier;
+        self
+    }
+
+    fn with_confidence(mut self, confidence: &'static str) -> Self {
+        self.confidence = confidence;
+        self.source_convention = confidence;
         self
     }
 }
@@ -16685,9 +16704,11 @@ fn framework_route_canonical_id(route: &FrameworkRoute) -> String {
             "confidence": route.confidence,
             "source_convention": route.source_convention,
             "extraction_provenance": route.extraction_provenance,
+            "claim_tier": route.claim_tier,
             "provenance": [
                 format!("framework:{}", route.framework),
                 format!("extraction:{}", route.extraction_provenance),
+                format!("claim_tier:{}", route.claim_tier),
             ],
         })
     )
@@ -16916,14 +16937,53 @@ struct FrameworkRouteSinks<'a> {
 
 fn append_framework_routes(
     path: &Path,
-    language_name: &str,
+    language_config: &LanguageConfig,
+    tree: &Tree,
     source: &str,
     file_id: NodeId,
     flags: IndexFeatureFlags,
     sinks: &mut FrameworkRouteSinks<'_>,
-) {
-    for route in collect_framework_routes(path, language_name, source) {
-        let route = route.with_extraction_provenance("ast_indexed");
+) -> Result<()> {
+    let mut routes = collect_framework_routes(path, language_config.language_name, source)
+        .into_iter()
+        .map(|route| route.with_extraction_provenance("ast_indexed"))
+        .collect::<Vec<_>>();
+
+    if language_config.language_name == "python" {
+        let lexical_fastapi = routes
+            .extract_if(.., |route| route.framework == "fastapi")
+            .collect::<Vec<_>>();
+        let parser_routes = framework_routes::collect_python_fastapi_routes(
+            &language_config.language,
+            tree,
+            source,
+        )?;
+        let parser_keys = parser_routes
+            .iter()
+            .map(|route| (route.method.clone(), route.path.clone()))
+            .collect::<HashSet<_>>();
+        routes.extend(parser_routes);
+
+        if tree.root_node().has_error() {
+            routes.extend(
+                lexical_fastapi
+                    .into_iter()
+                    .filter(|route| {
+                        !parser_keys.contains(&(route.method.clone(), route.path.clone()))
+                            && framework_routes::allow_python_fastapi_lexical_fallback(
+                                tree, source, route,
+                            )
+                    })
+                    .map(|route| {
+                        route
+                            .with_confidence("heuristic")
+                            .with_claim_evidence("lexical_fallback", "structural")
+                    }),
+            );
+        }
+    }
+
+    for route in routes {
         let route_node = framework_route_node(file_id, &route);
         let route_node_id = route_node.id;
         sinks
@@ -16977,6 +17037,7 @@ fn append_framework_routes(
         call_edge.id = EdgeId(generate_edge_id_for_edge(&call_edge, flags));
         sinks.result_edges.push(call_edge);
     }
+    Ok(())
 }
 
 fn find_framework_route_handler(
@@ -18596,7 +18657,8 @@ pub fn index_file(
     );
     append_framework_routes(
         path,
-        language_config.language_name,
+        language_config,
+        &tree,
         source,
         file_id,
         flags,
@@ -18608,7 +18670,7 @@ pub fn index_file(
             edge_keys: &mut edge_keys,
             callsite_ordinals: &mut callsite_ordinals,
         },
-    );
+    )?;
 
     if language_config.language_name == "rust" {
         apply_rust_receiver_call_hints(&tree, source, &mut unique_nodes);
