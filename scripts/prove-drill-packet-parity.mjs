@@ -115,12 +115,13 @@ function main() {
       project: { type: "string", default: repoRoot },
       question: { type: "string" },
       anchor: { type: "string", multiple: true },
+      "run-id": { type: "string" },
       "output-dir": { type: "string" },
     },
     strict: true,
   });
   if (!values.question || !values.anchor?.length || !values["output-dir"]) {
-    throw new Error("usage: prove-drill-packet-parity.mjs --question <text> --anchor <symbol> [--anchor <symbol>] --output-dir <dir> [--cli <path>] [--project <repo>]");
+    throw new Error("usage: prove-drill-packet-parity.mjs --question <text> --anchor <symbol> [--anchor <symbol>] --output-dir <dir> [--run-id <agent-run>] [--cli <path>] [--project <repo>]");
   }
 
   const project = path.resolve(values.project);
@@ -138,17 +139,19 @@ function main() {
   };
 
   try {
-    const statusArgs = ["retrieval", "status", "--project", project, "--profile", "local", "--format", "json"];
+    const agentSelection = ["--profile", "agent"];
+    if (values["run-id"]) agentSelection.push("--run-id", values["run-id"]);
+    const statusArgs = ["retrieval", "status", "--project", project, ...agentSelection, "--format", "json"];
     const beforeStatus = parseJson(runCli(values.cli, statusArgs, transcript, "retrieval-status-before"), "retrieval status before");
     evidence.readiness = { retrieval_mode: beforeStatus.retrieval_mode, degraded_reason: beforeStatus.degraded_reason ?? null, manifest_contract: beforeStatus.manifest_contract ?? null };
     if (beforeStatus.retrieval_mode !== "full") {
       throw new FullSidecarBlockedError(`full-sidecar proof blocked: retrieval_mode=${beforeStatus.retrieval_mode ?? "missing"}; degraded_reason=${beforeStatus.degraded_reason ?? "missing"}`);
     }
 
-    const packetArgs = ["packet", "--project", project, "--question", values.question, "--budget", "standard", "--refresh", "none", "--format", "json"];
+    const packetArgs = ["packet", "--project", project, ...agentSelection, "--question", values.question, "--budget", "standard", "--refresh", "none", "--format", "json"];
     for (const anchor of anchors) packetArgs.push("--extra-probe", anchor);
     const packet = parseJson(runCli(values.cli, packetArgs, transcript, "packet"), "packet");
-    const drillArgs = ["drill", "--project", project, "--question", values.question, "--anchors", anchors.join(","), "--output-dir", drillDir, "--refresh", "none", "--format", "json"];
+    const drillArgs = ["drill", "--project", project, ...agentSelection, "--question", values.question, "--anchors", anchors.join(","), "--output-dir", drillDir, "--refresh", "none", "--format", "json"];
     runCli(values.cli, drillArgs, transcript, "drill");
     const afterStatus = parseJson(runCli(values.cli, statusArgs, transcript, "retrieval-status-after"), "retrieval status after");
     const report = parseJson(readFileSync(path.join(drillDir, "drill-report.json")), "drill report");

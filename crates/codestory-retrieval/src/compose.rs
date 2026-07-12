@@ -2610,6 +2610,12 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
         );
+        assert!(
+            launch
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--log-verbosity" && pair[1] == "4")
+        );
         let metadata = embedding_launch_metadata(
             &launch,
             &runtime,
