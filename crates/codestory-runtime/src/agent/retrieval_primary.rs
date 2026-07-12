@@ -1194,7 +1194,7 @@ fn non_source_markdown_candidate_unresolved(
     resolution_label: &str,
 ) -> bool {
     resolution_label == "node_unresolved"
-        && candidate.source == CandidateSource::Zoekt
+        && candidate.source == CandidateSource::Lexical
         && candidate.symbol_name.is_none()
         && candidate.file_path.to_ascii_lowercase().ends_with(".md")
 }
@@ -1516,7 +1516,7 @@ fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBrea
         .as_ref()
         .map(|features| (features.lexical, features.semantic, features.scip_distance))
         .unwrap_or_else(|| match candidate.source {
-            CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
+            CandidateSource::Lexical => (candidate.score, 0.0, 0.0),
             CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
             CandidateSource::Scip => (0.0, 0.0, candidate.score),
             CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
@@ -1539,7 +1539,7 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
         return candidate.provenance.clone();
     }
     let label = match candidate.source {
-        CandidateSource::Zoekt => "lexical_source",
+        CandidateSource::Lexical => "lexical_source",
         CandidateSource::Qdrant => "dense_anchor",
         CandidateSource::Scip => "graph_neighbor",
         CandidateSource::Legacy => "legacy",
@@ -1589,7 +1589,7 @@ mod tests {
     fn retrieval_cache_key_for_test(query_fingerprint: &str) -> RetrievalCacheKey {
         RetrievalCacheKey {
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -1902,7 +1902,7 @@ mod tests {
                 cancel_reason: None,
                 cache_hit: false,
                 stages: vec![StageTrace {
-                    stage: RetrievalStageKind::Stage1ZoektLexical,
+                    stage: RetrievalStageKind::Stage1Lexical,
                     budget_ms: 120,
                     elapsed_ms: 20,
                     candidates_added: 2,
@@ -1916,7 +1916,7 @@ mod tests {
         });
         assert_eq!(shadow.retrieval_mode, "full");
         assert_eq!(shadow.stage_timings.len(), 1);
-        assert_eq!(shadow.stage_timings[0].stage, "stage1_zoekt_lexical");
+        assert_eq!(shadow.stage_timings[0].stage, "stage1_lexical");
         assert_eq!(shadow.candidates.len(), 2);
         assert_eq!(shadow.would_rank, vec!["src/a.rs", "src/b.rs"]);
     }
@@ -1927,7 +1927,7 @@ mod tests {
             "src/service.rs",
             Some("ExtensionService".into()),
             0.91,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         candidate.provenance = vec![
             "lexical_source".into(),
@@ -1964,7 +1964,7 @@ mod tests {
             "src/service.rs",
             Some("Service".into()),
             0.78,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         candidate.provenance = vec!["lexical_source".into()];
         let ranked = rank_candidates(&classify_query("explain service startup"), vec![candidate]);
@@ -2132,7 +2132,7 @@ mod tests {
                         "docs/tasks/form-validation/marking.md",
                         None,
                         0.9,
-                        CandidateSource::Zoekt,
+                        CandidateSource::Lexical,
                     ),
                     CandidateHit::with_source(
                         "src/forms/validation.html",
@@ -2178,7 +2178,7 @@ mod tests {
                         "src/noise.rs",
                         Some("CommandExec".into()),
                         0.8,
-                        CandidateSource::Zoekt,
+                        CandidateSource::Lexical,
                     ),
                 ],
                 trace: QueryTrace {
@@ -2417,7 +2417,7 @@ mod tests {
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: project_id.into(),
-                zoekt_version: "zoekt-real-v1".into(),
+                lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
                 qdrant_collection,
                 scip_revision: Some("graph-test".into()),
                 built_at_epoch_ms,
@@ -2549,7 +2549,7 @@ mod tests {
                 "src/handler.rs",
                 Some("handler".into()),
                 0.9,
-                CandidateSource::Zoekt,
+                CandidateSource::Lexical,
             );
             let resolved_hit = search_hit_for_candidate(&candidate);
             let result = QueryResult {
@@ -2678,7 +2678,7 @@ mod tests {
                 "src/handler.rs",
                 Some("handler".into()),
                 0.9,
-                CandidateSource::Zoekt,
+                CandidateSource::Lexical,
             )],
             trace: QueryTrace {
                 retrieval_mode: "full".into(),

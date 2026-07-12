@@ -13,7 +13,7 @@ pub fn retrieval_manifest_fixture(
 ) -> RetrievalIndexManifest {
     RetrievalIndexManifest {
         project_id: project_id.into(),
-        zoekt_version: "zoekt-real-v1".into(),
+        lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
         qdrant_collection: crate::generation::sidecar_qdrant_collection(
             project_id,
             sidecar_input_hash,

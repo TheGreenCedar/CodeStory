@@ -501,10 +501,9 @@ mod tests {
     fn anchor_search_scores_all_matches_before_truncating() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -550,10 +549,9 @@ mod tests {
     fn qualified_anchor_search_admits_crate_matching_terminal_definition() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -608,10 +606,9 @@ mod tests {
     fn health_rejects_marker_without_symbol_index() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -636,10 +633,9 @@ mod tests {
     fn imported_proof_contract_is_diagnostic_not_graph_health() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -694,10 +690,9 @@ mod tests {
     fn imported_contract_without_proofs_fails_closed() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -730,10 +725,9 @@ mod tests {
     fn unknown_evidence_source_fails_closed() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -768,10 +762,9 @@ mod tests {
     fn stale_scip_import_fails_closed_without_candidates() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),

@@ -20,6 +20,8 @@ mod generation;
 mod health;
 mod index;
 mod inventory;
+mod lexical_client;
+mod lexical_index;
 mod mode;
 pub mod outbound_http;
 mod planner;
@@ -33,8 +35,6 @@ mod scip_client;
 mod scip_index;
 mod sidecar;
 mod sidecar_search;
-mod zoekt_client;
-mod zoekt_index;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -51,13 +51,13 @@ pub use compose::{
 };
 pub use config::{
     DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
-    DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, EmbeddingEndpointOrigin,
-    EmbeddingRuntimeConfig, EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN, RetrievalRuntimeConfig,
-    SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile,
-    SidecarRuntimeConfig, SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
-    ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN, default_sidecar_image_pins,
-    embedding_server_launch_mode, embedding_server_launch_mode_for_runtime, sidecar_runtime_auto,
-    sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id, user_cache_root,
+    DEFAULT_QDRANT_HTTP_PORT, EmbeddingEndpointOrigin, EmbeddingRuntimeConfig,
+    EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN, RetrievalRuntimeConfig, SidecarImagePins,
+    SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile, SidecarRuntimeConfig,
+    SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
+    default_sidecar_image_pins, embedding_server_launch_mode,
+    embedding_server_launch_mode_for_runtime, sidecar_runtime_auto, sidecar_runtime_for_project,
+    sidecar_runtime_for_project_with_run_id, user_cache_root,
 };
 #[cfg(feature = "test-support")]
 pub use config::{
@@ -89,6 +89,8 @@ pub use inventory::{
     SidecarInventoryEntry, SidecarInventoryReport, SidecarInventoryState, sidecar_gc_apply,
     sidecar_gc_apply_with_storage, sidecar_inventory, sidecar_inventory_with_storage,
 };
+pub use lexical_client::LexicalClient;
+pub use lexical_index::LEXICAL_INDEX_VERSION;
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
@@ -119,6 +121,5 @@ pub use sidecar::{
     strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
-pub use zoekt_client::ZoektClient;
 
 pub use codestory_store::RetrievalIndexManifest;

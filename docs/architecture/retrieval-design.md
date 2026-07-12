@@ -6,7 +6,7 @@ with `retrieval_mode=full`.
 
 `full` means all of the following are true for the same generation:
 
-- Zoekt lexical shard exists, matches the current lexical input hash, and
+- The project-local SQLite FTS lexical shard exists, matches the current lexical input hash, and
   answers smoke queries against source files plus generated graph-native symbol
   docs and component-report virtual docs.
 - Qdrant collection exists, has at least the manifest dense-anchor projection
@@ -38,7 +38,7 @@ closed for agent-facing packet/search.
 
 ## Mode Matrix
 
-| Zoekt | Qdrant | SCIP | Dense anchors | Mode | Product behavior |
+| SQLite lexical | Qdrant | SCIP | Dense anchors | Mode | Product behavior |
 |-------|--------|------|---------------|------|------------------|
 | up | up | up | >0 | `full` | Serve packet/search evidence |
 | up | skipped by policy | up | 0 | `full` | Serve graph/lexical packet/search evidence; dense stage is explicitly skipped |
@@ -93,7 +93,7 @@ unchanged until the parent identity migration can move their persisted state
 and ownership checks together.
 
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
-dense-anchor rows, semantic file-role metadata, sidecar schema version, Zoekt
+dense-anchor rows, semantic file-role metadata, sidecar schema version, lexical
 version pin, embedding backend, embedding dimension, semantic policy version,
 dense reason counts, and SCIP artifact contract inputs.
 

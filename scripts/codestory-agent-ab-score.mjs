@@ -509,7 +509,7 @@ function loadPacketGateBaselineRows(sourcePath) {
 const transientSidecarFailurePatterns = [
   /\bretrieval_unavailable\b/i,
   /\bqdrant_unreachable\b/i,
-  /\bzoekt_unreachable\b/i,
+  /\blexical_(?:shard_unavailable|source_coverage_incomplete)\b/i,
   /\bscip_unreachable\b/i,
   /sidecar retrieval .* unavailable/i,
   /sidecar retrieval .* failed/i,

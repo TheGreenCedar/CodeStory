@@ -5,7 +5,6 @@
   "version": 1,
   "env": {
     "shadow_mode": "CODESTORY_RETRIEVAL_SHADOW",
-    "zoekt": "CODESTORY_ZOEKT_ENABLED",
     "qdrant": "CODESTORY_QDRANT_ENABLED"
   },
   "baseline_artifact_dir": "target/agent-benchmark/baseline-pre-retrieval",

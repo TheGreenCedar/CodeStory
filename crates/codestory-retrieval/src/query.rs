@@ -352,7 +352,7 @@ fn resolve_batch_mode(
             embedding_device,
             runtime,
         );
-        return derive_degraded_mode(&report.zoekt, &report.qdrant, &report.scip);
+        return derive_degraded_mode(&report.lexical, &report.qdrant, &report.scip);
     }
     (
         RetrievalDegradedMode::LexicalOnly,
@@ -367,7 +367,7 @@ mod tests {
     use crate::index::finalize_index;
     use crate::sidecar_search::SidecarSearch;
     use crate::test_support::retrieval_manifest_fixture;
-    use crate::{QdrantClient, SidecarLayout, ZoektClient};
+    use crate::{QdrantClient, SidecarLayout};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -430,7 +430,7 @@ mod tests {
         }
 
         impl SidecarSearch for CountingSidecars {
-            fn zoekt_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(self.record(query))
             }
 
@@ -547,13 +547,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live Qdrant, Zoekt, and embedding sidecars; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
+    #[ignore = "requires live Qdrant and embedding sidecars; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
     fn integration_query_against_fixture_manifest() {
         let layout = SidecarLayout::from_env();
         if !QdrantClient::new(&layout)
             .list_collections_probe()
             .reachable
-            || !ZoektClient::new(&layout).health_probe().reachable
         {
             return;
         }
@@ -678,7 +677,7 @@ mod tests {
             storage
                 .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                     project_id,
-                    zoekt_version: "zoekt-real-v1".into(),
+                    lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
                     qdrant_collection: "codestory_legacy".into(),
                     scip_revision: Some("graph-test".into()),
                     built_at_epoch_ms: 1,

@@ -1,4 +1,4 @@
-# CodeStory retrieval sidecars (Qdrant + Zoekt).
+# CodeStory retrieval sidecars (Qdrant + llama.cpp).
 # Pins must match docs/ops/retrieval-sidecars.md and crates/codestory-retrieval/src/config.rs.
 #
 # Start via:
@@ -29,27 +29,6 @@ services:
       - type: bind
         source: ${CODESTORY_QDRANT_DATA_DIR:?set CODESTORY_QDRANT_DATA_DIR}
         target: /qdrant/storage
-
-  # Zoekt webserver (mount index dir populated by `retrieval index`).
-  zoekt:
-    image: sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff
-    container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-zoekt
-    restart: unless-stopped
-    labels:
-      dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}
-      dev.codestory.profile: ${CODESTORY_SIDECAR_PROFILE:-local}
-      dev.codestory.namespace: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}
-      dev.codestory.project_id: ${CODESTORY_PROJECT_ID:-}
-      dev.codestory.workspace_id: ${CODESTORY_WORKSPACE_ID:-}
-      dev.codestory.artifact_scope_id: ${CODESTORY_ARTIFACT_SCOPE_ID:-}
-      dev.codestory.project_identity_schema_version: ${CODESTORY_PROJECT_IDENTITY_SCHEMA_VERSION:-}
-      dev.codestory.workspace_root: ${CODESTORY_WORKSPACE_ROOT:-}
-    ports:
-      - "127.0.0.1:${CODESTORY_ZOEKT_PORT:-6070}:6070"
-    volumes:
-      - type: bind
-        source: ${CODESTORY_ZOEKT_DATA_DIR:?set CODESTORY_ZOEKT_DATA_DIR}
-        target: /data/index
 
   # BAAI/bge-base-en-v1.5 embeddings via llama.cpp OpenAI-compatible API (768-dim).
   # Model GGUF must exist under CODESTORY_EMBED_MODEL_DIR (see setup-retrieval-env.mjs).

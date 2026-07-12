@@ -231,7 +231,7 @@ function printPrereqReport(opts) {
   }
 
   console.log("\nAutomated:");
-  console.log("  - Docker Compose: Qdrant + Zoekt webserver + llama.cpp embed service");
+  console.log("  - Docker Compose: Qdrant + llama.cpp embed service");
   console.log("  - codestory retrieval bootstrap (cache dirs, sidecar state, health wait)");
   console.log("  - codestory retrieval status --project <path>");
   if (opts.withHoldoutClone) {
@@ -250,8 +250,7 @@ function printPrereqReport(opts) {
       `  docker run -d --name codestory-qdrant -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 ` +
         `-v "${path.join(cacheRoot, "qdrant")}:/qdrant/storage" qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae`,
     );
-    console.log("\nZoekt without compose:");
-    console.log("  run sourcegraph/zoekt-webserver on 127.0.0.1:6070 with the CodeStory shard directory mounted");
+    console.log("\nLexical search needs no service; CodeStory stores project-local SQLite FTS shards.");
   }
 
   return failed;

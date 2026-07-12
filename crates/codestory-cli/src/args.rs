@@ -734,7 +734,7 @@ pub(crate) enum RetrievalAction {
     Up(RetrievalSidecarStateCommand),
     /// Remove local sidecar state file (does not stop external processes).
     Down(RetrievalSidecarStateCommand),
-    /// Probe Zoekt, Qdrant, and SCIP availability for the project.
+    /// Validate the lexical shard plus Qdrant and SCIP availability for the project.
     Status(RetrievalStatusCommand),
     /// List owned sidecar namespaces and dry-run cleanup eligibility.
     Inventory(RetrievalInventoryCommand),
@@ -812,7 +812,7 @@ pub(crate) struct RetrievalBootstrapCommand {
         long,
         value_name = "SECS",
         default_value_t = 90,
-        help = "Seconds to wait for Zoekt and Qdrant HTTP probes (0 = no wait)."
+        help = "Seconds to wait for Qdrant and embedding HTTP probes (0 = no wait)."
     )]
     pub(crate) wait_secs: u64,
     #[arg(

@@ -83,6 +83,19 @@
   A shared path comparator uses full filesystem identity for existing paths and
   normalized platform lexical rules only for missing paths; current persisted
   v1/v2 consumers stay unchanged until the coordinated identity migration.
+- Replaced the faux Zoekt JSONL full-corpus scan and health-only webserver with
+  one immutable, project-generation-local SQLite FTS5 shard. Queries now bound
+  candidate selection in SQLite before applying the existing lexical scorer;
+  one Unicode-aware CamelCase/acronym normalization feeds both stages, and
+  routine readiness/search opens verify document-to-FTS row binding;
+  canonical workspace discovery records oversized and unreadable coverage as
+  a diagnostic without disabling a non-empty indexed subset, while all-omitted
+  source sets fail closed. Legacy JSONL generations rebuild instead of serving
+  through a second engine, Compose removes orphaned Zoekt containers, and
+  status, telemetry, artifacts, and configuration now name the implementation
+  truthfully as lexical. Packaged proof now validates the SQLite lexical
+  manifest directly and force-terminates stuck Windows proof workers before
+  cleanup.
 - Grounding skill guidance now reuses current status, routes blocked deep
   retrieval tasks through allowed project-scoped local graph surfaces, and
   repairs sidecars only when the task actually requires the blocked surface.

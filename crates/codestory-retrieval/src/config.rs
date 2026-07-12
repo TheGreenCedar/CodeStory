@@ -8,12 +8,6 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Phase 2 lexical shard pin (local index + optional Zoekt webserver).
-pub const ZOEKT_REAL_VERSION_PIN: &str = "zoekt-20250506123554";
-
-/// Zoekt webserver image for `COMPOSE_PROFILES=real`.
-pub const ZOEKT_WEBSERVER_IMAGE_PIN: &str = "sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff";
-
 /// Qdrant container image pin for local dev and CI smoke.
 pub const QDRANT_IMAGE_PIN: &str =
     "qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae";
@@ -25,19 +19,16 @@ pub const LLAMACPP_SERVER_IMAGE_PIN: &str = "ghcr.io/ggml-org/llama.cpp:server@s
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarImagePins {
     pub qdrant: String,
-    pub zoekt: String,
     pub embed: String,
 }
 
 pub fn default_sidecar_image_pins() -> SidecarImagePins {
     SidecarImagePins {
         qdrant: QDRANT_IMAGE_PIN.into(),
-        zoekt: ZOEKT_WEBSERVER_IMAGE_PIN.into(),
         embed: LLAMACPP_SERVER_IMAGE_PIN.into(),
     }
 }
 
-pub const DEFAULT_ZOEKT_HTTP_PORT: u16 = 6070;
 pub const DEFAULT_QDRANT_HTTP_PORT: u16 = 6333;
 pub const DEFAULT_QDRANT_GRPC_PORT: u16 = 6334;
 pub const DEFAULT_EMBED_HTTP_PORT: u16 = 8080;
@@ -57,7 +48,6 @@ const RUNTIME_ENV_KEYS: &[&str] = &[
     "CODESTORY_AGENT_RUN",
     "CI",
     "GITHUB_ACTIONS",
-    "CODESTORY_ZOEKT_PORT",
     "CODESTORY_QDRANT_HTTP_PORT",
     "CODESTORY_QDRANT_GRPC_PORT",
     "CODESTORY_EMBED_PORT",
@@ -97,7 +87,6 @@ const RUNTIME_ENV_KEYS: &[&str] = &[
     "CODESTORY_SUMMARY_TIMEOUT_SECS",
 ];
 
-pub const ZOEKT_HEALTH_BUDGET: Duration = Duration::from_millis(100);
 pub const QDRANT_HEALTH_BUDGET: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,10 +163,9 @@ fn llama_sidecar_backend_manifest() -> LlamaSidecarBackendManifest {
 
 #[derive(Debug, Clone)]
 pub struct SidecarLayout {
-    pub zoekt_http_port: u16,
     pub qdrant_http_port: u16,
     pub qdrant_grpc_port: u16,
-    pub zoekt_data_dir: PathBuf,
+    pub lexical_data_dir: PathBuf,
     pub qdrant_data_dir: PathBuf,
     pub scip_artifacts_root: PathBuf,
     pub state_file: PathBuf,
@@ -310,7 +298,6 @@ impl EmbeddingServerLaunchMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SidecarPorts {
-    pub zoekt_http: u16,
     pub qdrant_http: u16,
     pub qdrant_grpc: u16,
     pub embed_http: u16,
@@ -527,7 +514,6 @@ impl SidecarRuntimeConfig {
         let stored = read_ports_from_state(&state_file);
         let dynamic = profile == SidecarProfile::Agent && stored.is_none();
         let configured_ports = [
-            env_port(defaults, "CODESTORY_ZOEKT_PORT", DEFAULT_ZOEKT_HTTP_PORT),
             env_port(
                 defaults,
                 "CODESTORY_QDRANT_HTTP_PORT",
@@ -543,13 +529,7 @@ impl SidecarRuntimeConfig {
         let dynamic_ports =
             dynamic.then(|| dynamic_agent_ports(&base, &namespace, configured_ports));
         let dynamic_failed = dynamic_ports.as_ref().is_some_and(|ports| {
-            [
-                ports.zoekt_http,
-                ports.qdrant_http,
-                ports.qdrant_grpc,
-                ports.embed_http,
-            ]
-            .contains(&0)
+            [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http].contains(&0)
         });
         let selected_port =
             |configured: Option<u16>, stored: Option<u16>, dynamic: Option<u16>, default| {
@@ -559,26 +539,20 @@ impl SidecarRuntimeConfig {
                     configured.or(stored).or(dynamic).unwrap_or(default)
                 }
             };
-        let zoekt_http_port = selected_port(
-            configured_ports[0],
-            stored.as_ref().map(|ports| ports.zoekt_http),
-            dynamic_ports.as_ref().map(|ports| ports.zoekt_http),
-            DEFAULT_ZOEKT_HTTP_PORT,
-        );
         let qdrant_http_port = selected_port(
-            configured_ports[1],
+            configured_ports[0],
             stored.as_ref().map(|ports| ports.qdrant_http),
             dynamic_ports.as_ref().map(|ports| ports.qdrant_http),
             DEFAULT_QDRANT_HTTP_PORT,
         );
         let qdrant_grpc_port = selected_port(
-            configured_ports[2],
+            configured_ports[1],
             stored.as_ref().map(|ports| ports.qdrant_grpc),
             dynamic_ports.as_ref().map(|ports| ports.qdrant_grpc),
             DEFAULT_QDRANT_GRPC_PORT,
         );
         let embed_http_port = selected_port(
-            configured_ports[3],
+            configured_ports[2],
             stored.as_ref().map(|ports| ports.embed_http),
             dynamic_ports.as_ref().map(|ports| ports.embed_http),
             DEFAULT_EMBED_HTTP_PORT,
@@ -588,10 +562,9 @@ impl SidecarRuntimeConfig {
             SidecarProfile::Agent => base.join("sidecars").join(&namespace),
         };
         let layout = SidecarLayout {
-            zoekt_http_port,
             qdrant_http_port,
             qdrant_grpc_port,
-            zoekt_data_dir: root.join("zoekt"),
+            lexical_data_dir: root.join("lexical"),
             qdrant_data_dir: root.join("qdrant"),
             scip_artifacts_root: root.join("scip"),
             state_file: state_file.clone(),
@@ -663,7 +636,6 @@ impl SidecarRuntimeConfig {
             state_file: self.layout.state_file.display().to_string(),
             cleanup_command: self.cleanup_command.clone(),
             ports: SidecarPorts {
-                zoekt_http: self.layout.zoekt_http_port,
                 qdrant_http: self.layout.qdrant_http_port,
                 qdrant_grpc: self.layout.qdrant_grpc_port,
                 embed_http: self.embed_http_port,
@@ -677,7 +649,6 @@ impl SidecarRuntimeConfig {
     pub(crate) fn ensure_ports_allocated(&self) -> Result<()> {
         if self.profile == SidecarProfile::Agent
             && [
-                self.layout.zoekt_http_port,
                 self.layout.qdrant_http_port,
                 self.layout.qdrant_grpc_port,
                 self.embed_http_port,
@@ -726,10 +697,6 @@ impl SidecarRuntimeConfig {
 }
 
 impl SidecarLayout {
-    pub fn zoekt_base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.zoekt_http_port)
-    }
-
     pub fn qdrant_base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.qdrant_http_port)
     }
@@ -740,7 +707,7 @@ impl SidecarLayout {
 
     pub fn ensure_data_dirs(&self) -> Result<()> {
         for dir in [
-            &self.zoekt_data_dir,
+            &self.lexical_data_dir,
             &self.qdrant_data_dir,
             &self.scip_artifacts_root,
         ] {
@@ -1149,7 +1116,6 @@ fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
     let value =
         serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()?;
     Some(SidecarPorts {
-        zoekt_http: value.get("zoekt_http_port")?.as_u64()?.try_into().ok()?,
         qdrant_http: value.get("qdrant_http_port")?.as_u64()?.try_into().ok()?,
         qdrant_grpc: value.get("qdrant_grpc_port")?.as_u64()?.try_into().ok()?,
         embed_http: value
@@ -1165,13 +1131,12 @@ fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
     })
 }
 
-fn dynamic_agent_ports(base: &Path, namespace: &str, configured: [Option<u16>; 4]) -> SidecarPorts {
+fn dynamic_agent_ports(base: &Path, namespace: &str, configured: [Option<u16>; 3]) -> SidecarPorts {
     allocate_agent_ports_in_registry(base, namespace, configured).unwrap_or_else(|error| {
         eprintln!(
             "CodeStory sidecar port allocation failed closed: namespace={namespace} error={error:#}"
         );
         SidecarPorts {
-            zoekt_http: 0,
             qdrant_http: 0,
             qdrant_grpc: 0,
             embed_http: 0,
@@ -1183,7 +1148,7 @@ fn dynamic_agent_ports(base: &Path, namespace: &str, configured: [Option<u16>; 4
 fn allocate_agent_ports_in_registry(
     base: &Path,
     namespace: &str,
-    configured: [Option<u16>; 4],
+    configured: [Option<u16>; 3],
 ) -> Result<SidecarPorts> {
     let root = base.join("sidecars");
     std::fs::create_dir_all(&root)
@@ -1206,36 +1171,28 @@ fn allocate_agent_ports_in_registry(
         agent_port_reservation_is_recent(&root, namespace, now_epoch_ms())?;
     let cleanup = prune_agent_port_registry(&root, namespace, &mut registry);
     let mut reserved = reserved_registry_ports_excluding(&registry, namespace);
-    let zoekt_http = select_agent_port(
-        configured[0],
-        existing.as_ref().map(|ports| ports.zoekt_http),
-        namespace,
-        "zoekt",
-        &mut reserved,
-    )?;
     let qdrant_http = select_agent_port(
-        configured[1],
+        configured[0],
         existing.as_ref().map(|ports| ports.qdrant_http),
         namespace,
         "qdrant-http",
         &mut reserved,
     )?;
     let qdrant_grpc = select_agent_port(
-        configured[2],
+        configured[1],
         existing.as_ref().map(|ports| ports.qdrant_grpc),
         namespace,
         "qdrant-grpc",
         &mut reserved,
     )?;
     let embed_http = select_agent_port(
-        configured[3],
+        configured[2],
         existing.as_ref().map(|ports| ports.embed_http),
         namespace,
         "embed",
         &mut reserved,
     )?;
     let ports = SidecarPorts {
-        zoekt_http,
         qdrant_http,
         qdrant_grpc,
         embed_http,
@@ -1425,14 +1382,9 @@ fn is_agent_namespace_path_component(namespace: &str) -> bool {
 }
 
 fn sidecar_ports_are_bound(ports: &SidecarPorts) -> bool {
-    [
-        ports.zoekt_http,
-        ports.qdrant_http,
-        ports.qdrant_grpc,
-        ports.embed_http,
-    ]
-    .into_iter()
-    .any(|port| !local_port_available(port))
+    [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http]
+        .into_iter()
+        .any(|port| !local_port_available(port))
 }
 
 fn agent_port_reservation_path(root: &Path, namespace: &str) -> PathBuf {
@@ -1442,7 +1394,6 @@ fn agent_port_reservation_path(root: &Path, namespace: &str) -> PathBuf {
 fn sidecar_ports_from_value(value: &serde_json::Value) -> Option<SidecarPorts> {
     let embed_http = value.get("embed_http_port")?.as_u64()?.try_into().ok()?;
     Some(SidecarPorts {
-        zoekt_http: value.get("zoekt_http_port")?.as_u64()?.try_into().ok()?,
         qdrant_http: value.get("qdrant_http_port")?.as_u64()?.try_into().ok()?,
         qdrant_grpc: value.get("qdrant_grpc_port")?.as_u64()?.try_into().ok()?,
         embed_http,
@@ -1479,14 +1430,7 @@ fn reserved_registry_ports_excluding(
     registry
         .iter()
         .filter(|(candidate, _)| candidate.as_str() != namespace)
-        .flat_map(|(_, ports)| {
-            [
-                ports.zoekt_http,
-                ports.qdrant_http,
-                ports.qdrant_grpc,
-                ports.embed_http,
-            ]
-        })
+        .flat_map(|(_, ports)| [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http])
         .collect()
 }
 
@@ -1785,7 +1729,6 @@ mod tests {
         assert_eq!(first.run_id, second.run_id);
         assert_eq!(first.namespace, second.namespace);
         assert_eq!(first.layout.state_file, second.layout.state_file);
-        assert_eq!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
         assert_eq!(
             first.layout.qdrant_http_port,
             second.layout.qdrant_http_port
@@ -1858,7 +1801,6 @@ mod tests {
         assert_eq!(first.run_id.as_deref(), Some("review-fix"));
         assert_eq!(first.namespace, second.namespace);
         assert_eq!(first.layout.state_file, second.layout.state_file);
-        assert_eq!(first.layout.zoekt_http_port, second.layout.zoekt_http_port);
         assert_eq!(
             first.layout.qdrant_http_port,
             second.layout.qdrant_http_port
@@ -1885,7 +1827,6 @@ mod tests {
         std::fs::write(
             &first.layout.state_file,
             r#"{
-  "zoekt_http_port": 31001,
   "qdrant_http_port": 31002,
   "qdrant_grpc_port": 31003,
   "embed_http_port": 31004,
@@ -1900,7 +1841,6 @@ mod tests {
             Some("persisted"),
         );
 
-        assert_eq!(second.layout.zoekt_http_port, 31001);
         assert_eq!(second.layout.qdrant_http_port, 31002);
         assert_eq!(second.layout.qdrant_grpc_port, 31003);
         assert_eq!(second.embed_http_port, 31004);
@@ -1910,20 +1850,18 @@ mod tests {
     fn agent_port_registry_reuses_namespace_and_avoids_registered_ports() {
         let cache = tempdir().expect("cache");
 
-        let first = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a", [None; 4])
+        let first = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a", [None; 3])
             .expect("first");
-        let same = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a", [None; 4])
+        let same = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-a", [None; 3])
             .expect("same");
-        let other = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-b", [None; 4])
+        let other = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-b", [None; 3])
             .expect("other");
 
         assert_eq!(first, same);
         let ports = [
-            first.zoekt_http,
             first.qdrant_http,
             first.qdrant_grpc,
             first.embed_http,
-            other.zoekt_http,
             other.qdrant_http,
             other.qdrant_grpc,
             other.embed_http,
@@ -1936,7 +1874,7 @@ mod tests {
     fn agent_port_registry_refuses_recent_same_namespace_reassignment() {
         let cache = tempdir().expect("cache");
         let first =
-            allocate_agent_ports_in_registry(cache.path(), "same", [None; 4]).expect("first");
+            allocate_agent_ports_in_registry(cache.path(), "same", [None; 3]).expect("first");
         let (listeners, configured) = test_sidecar_ports();
         drop(listeners);
 
@@ -1944,7 +1882,6 @@ mod tests {
             cache.path(),
             "same",
             [
-                Some(configured.zoekt_http),
                 Some(configured.qdrant_http),
                 Some(configured.qdrant_grpc),
                 Some(configured.embed_http),
@@ -1968,7 +1905,6 @@ mod tests {
             "CODESTORY_CACHE_ROOT",
             cache.path().to_str().expect("utf8 cache"),
         );
-        let _zoekt = EnvGuard::set("CODESTORY_ZOEKT_PORT", &configured.zoekt_http.to_string());
         let _qdrant_http = EnvGuard::set(
             "CODESTORY_QDRANT_HTTP_PORT",
             &configured.qdrant_http.to_string(),
@@ -1999,7 +1935,7 @@ mod tests {
     }
 
     fn test_sidecar_ports() -> (Vec<TcpListener>, SidecarPorts) {
-        let listeners: Vec<_> = (0..4)
+        let listeners: Vec<_> = (0..3)
             .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port"))
             .collect();
         let ports: Vec<_> = listeners
@@ -2009,11 +1945,10 @@ mod tests {
         (
             listeners,
             SidecarPorts {
-                zoekt_http: ports[0],
-                qdrant_http: ports[1],
-                qdrant_grpc: ports[2],
-                embed_http: ports[3],
-                embed_url: SidecarLayout::embed_base_url(ports[3]),
+                qdrant_http: ports[0],
+                qdrant_grpc: ports[1],
+                embed_http: ports[2],
+                embed_url: SidecarLayout::embed_base_url(ports[2]),
             },
         )
     }
@@ -2031,7 +1966,6 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "owner": "codestory",
                 "namespace": namespace,
-                "zoekt_http_port": ports.zoekt_http,
                 "qdrant_http_port": ports.qdrant_http,
                 "qdrant_grpc_port": ports.qdrant_grpc,
                 "embed_http_port": ports.embed_http,
@@ -2068,7 +2002,7 @@ mod tests {
 
         let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
 
-        assert_eq!(listeners.len(), 4);
+        assert_eq!(listeners.len(), 3);
         assert!(registry.contains_key("live"));
         assert_eq!(cleanup.retained, 1);
         assert_eq!(cleanup.pruned, 0);
@@ -2083,7 +2017,7 @@ mod tests {
 
         let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
 
-        assert_eq!(listeners.len(), 4);
+        assert_eq!(listeners.len(), 3);
         assert!(registry.contains_key("ownerless"));
         assert_eq!(cleanup.retained, 1);
     }
@@ -2193,7 +2127,7 @@ mod tests {
         )
         .expect("seed registry");
 
-        let current = allocate_agent_ports_in_registry(cache.path(), "current", [None; 4])
+        let current = allocate_agent_ports_in_registry(cache.path(), "current", [None; 3])
             .expect("allocate after compaction");
         let compacted = read_agent_port_registry(&registry_path).expect("parse compacted registry");
 
@@ -2215,7 +2149,6 @@ mod tests {
             "CODESTORY_CACHE_ROOT",
             cache.path().to_str().expect("utf8 cache"),
         );
-        let _zoekt = EnvGuard::set("CODESTORY_ZOEKT_PORT", "invalid");
         let _qdrant_http = EnvGuard::set("CODESTORY_QDRANT_HTTP_PORT", "invalid");
         let _qdrant_grpc = EnvGuard::set("CODESTORY_QDRANT_GRPC_PORT", "invalid");
         let _embed = EnvGuard::set("CODESTORY_EMBED_PORT", "invalid");
@@ -2226,7 +2159,6 @@ mod tests {
             Some("current"),
         );
 
-        assert_eq!(runtime.layout.zoekt_http_port, 0);
         assert_eq!(runtime.layout.qdrant_http_port, 0);
         assert_eq!(runtime.layout.qdrant_grpc_port, 0);
         assert_eq!(runtime.embed_http_port, 0);
@@ -2359,7 +2291,7 @@ mod tests {
         let cache = tempdir().expect("cache");
         let poison_cache = tempdir().expect("poison cache");
         let _cache = EnvGuard::remove("CODESTORY_CACHE_ROOT");
-        let _zoekt = EnvGuard::remove("CODESTORY_ZOEKT_PORT");
+        let _qdrant = EnvGuard::remove("CODESTORY_QDRANT_HTTP_PORT");
         let _endpoint = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let retained = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
             None,
@@ -2371,7 +2303,7 @@ mod tests {
             "CODESTORY_CACHE_ROOT",
             poison_cache.path().to_str().expect("utf8 poison cache"),
         );
-        let _zoekt = EnvGuard::set("CODESTORY_ZOEKT_PORT", "39999");
+        let _qdrant = EnvGuard::set("CODESTORY_QDRANT_HTTP_PORT", "39999");
         let _endpoint = EnvGuard::set(
             "CODESTORY_EMBED_LLAMACPP_URL",
             "http://127.0.0.1:39998/v1/embeddings",
@@ -2381,7 +2313,7 @@ mod tests {
         let selected = retained.with_profile_and_run_id(None, SidecarProfile::Local, None);
         let selected_agent = retained.with_profile_and_run_id(None, SidecarProfile::Agent, None);
 
-        assert_eq!(selected.layout.zoekt_http_port, DEFAULT_ZOEKT_HTTP_PORT);
+        assert_eq!(selected.layout.qdrant_http_port, DEFAULT_QDRANT_HTTP_PORT);
         assert_eq!(
             selected.layout.state_file,
             cache.path().join("retrieval-sidecars.json")

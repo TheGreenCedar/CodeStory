@@ -572,10 +572,9 @@ mod tests {
 
     fn offline_test_layout(qdrant_data: &tempfile::TempDir) -> SidecarLayout {
         SidecarLayout {
-            zoekt_http_port: 6070,
             qdrant_http_port: 1,
             qdrant_grpc_port: 1,
-            zoekt_data_dir: qdrant_data.path().join("zoekt"),
+            lexical_data_dir: qdrant_data.path().join("lexical"),
             qdrant_data_dir: qdrant_data.path().to_path_buf(),
             scip_artifacts_root: qdrant_data.path().join("scip"),
             state_file: qdrant_data.path().join("state.json"),

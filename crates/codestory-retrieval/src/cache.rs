@@ -9,7 +9,8 @@ use std::collections::{HashMap, VecDeque};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RetrievalCacheKey {
     pub project_id: String,
-    pub zoekt_version: String,
+    #[serde(alias = "zoekt_version")]
+    pub lexical_version: String,
     pub qdrant_collection: String,
     pub scip_revision: Option<String>,
     pub sidecar_generation: Option<String>,
@@ -26,7 +27,7 @@ impl RetrievalCacheKey {
     ) -> Self {
         Self {
             project_id: manifest.project_id.clone(),
-            zoekt_version: manifest.zoekt_version.clone(),
+            lexical_version: manifest.lexical_version.clone(),
             qdrant_collection: manifest.qdrant_collection.clone(),
             scip_revision: manifest.scip_revision.clone(),
             sidecar_generation: manifest.sidecar_generation.clone(),
@@ -125,7 +126,7 @@ mod tests {
         let mut cache = RetrievalCache::new();
         let key = RetrievalCacheKey {
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -146,7 +147,7 @@ mod tests {
         let mut cache = RetrievalCache::with_capacity(1);
         let first = RetrievalCacheKey {
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -185,7 +186,7 @@ mod tests {
     fn merge_delta_from_does_not_replay_snapshot_entries() {
         let first = RetrievalCacheKey {
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -236,7 +237,7 @@ mod tests {
     fn cache_key_tracks_sidecar_generation_contract() {
         let base = RetrievalIndexManifest {
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc_hash_a".into(),
             scip_revision: Some("scip-a".into()),
             built_at_epoch_ms: 0,
