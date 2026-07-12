@@ -16987,6 +16987,9 @@ fn append_framework_routes(
         let lexical_express = routes
             .extract_if(.., |route| route.framework == "express")
             .collect::<Vec<_>>();
+        let lexical_fastify = routes
+            .extract_if(.., |route| route.framework == "fastify")
+            .collect::<Vec<_>>();
         let dialect = match path.extension().and_then(|extension| extension.to_str()) {
             Some(extension) if extension.eq_ignore_ascii_case("tsx") => {
                 framework_routes::JavaScriptDialect::Tsx
@@ -17015,6 +17018,36 @@ fn append_framework_routes(
                     .filter(|route| {
                         !parser_keys.contains(&(route.method.clone(), route.path.clone()))
                             && framework_routes::allow_javascript_express_lexical_fallback(
+                                tree, source, route,
+                            )
+                    })
+                    .map(|route| {
+                        route
+                            .with_confidence("heuristic")
+                            .with_claim_evidence("lexical_fallback", "structural")
+                    }),
+            );
+        }
+
+        let parser_routes = framework_routes::collect_javascript_fastify_routes(
+            &language_config.language,
+            dialect,
+            tree,
+            source,
+        )?;
+        let parser_keys = parser_routes
+            .iter()
+            .map(|route| (route.method.clone(), route.path.clone()))
+            .collect::<HashSet<_>>();
+        routes.extend(parser_routes);
+
+        if tree.root_node().has_error() {
+            routes.extend(
+                lexical_fastify
+                    .into_iter()
+                    .filter(|route| {
+                        !parser_keys.contains(&(route.method.clone(), route.path.clone()))
+                            && framework_routes::allow_javascript_fastify_lexical_fallback(
                                 tree, source, route,
                             )
                     })
