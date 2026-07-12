@@ -693,9 +693,11 @@ fn normalize_windows_lexical_path(path: &Path) -> Vec<u16> {
         .as_os_str()
         .encode_wide()
         .map(|unit| {
-            (unit == u16::from(b'/'))
-                .then_some(u16::from(b'\\'))
-                .unwrap_or(unit)
+            if unit == u16::from(b'/') {
+                u16::from(b'\\')
+            } else {
+                unit
+            }
         })
         .collect::<Vec<_>>();
     let separator = u16::from(b'\\');
