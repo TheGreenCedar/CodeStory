@@ -5,6 +5,10 @@ is the first and canonical runtime truth. Call it before `ground`, `files`,
 `packet`, or `search`, and pass the same project to every tool. The server has no
 global workspace binding.
 
+Reuse a status result until repository, runtime, or index state changes, or a
+tool reports stale evidence or a freshness failure. A blocked sidecar-backed
+surface does not invalidate an allowed local graph route.
+
 ## Status Fields
 
 | Status field | Meaning | Agent action |
@@ -43,8 +47,10 @@ provisions from `github_release` when needed, and records the launch source in
 `plugin_runtime`. If the managed runtime cannot spawn or be provisioned, the
 adapter stays up with `repair_setup` diagnostics instead of closing transport.
 
-If project-scoped `status` reports a repairable state, run the MCP
-`recommended_next_calls` loop: call `sidecar_setup` with the same `project` and
-`action=repair` when recommended, then call `status` again before local
-navigation, packet, search, or context. Do not ask the human to install the binary unless network,
+If project-scoped `status` reports a repairable state and the task requires the
+blocked surface, run the MCP `recommended_next_calls` loop: call
+`sidecar_setup` with the same `project` and `action=repair` when recommended,
+then call `status` again before using that surface. When an allowed local graph
+surface satisfies the task, use it without repairing packet/search/context and
+do not represent local navigation as full retrieval proof. Do not ask the human to install the binary unless network,
 permissions, host reload, or release assets block the repair.

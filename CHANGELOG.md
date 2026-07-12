@@ -50,6 +50,13 @@
   Retention keeps the active generation plus one verified rollback, skips locked
   readers, and preserves the legacy path for databases without an identity.
 
+### Changed
+
+- Grounding skill guidance now reuses current status, routes blocked deep
+  retrieval tasks through allowed project-scoped local graph surfaces, and
+  repairs sidecars only when the task actually requires the blocked surface.
+  Local navigation remains explicitly weaker than full packet/search proof.
+
 ### Fixed
 
 - Corrected the Codex managed-platform guide to list the restored macOS x64 CLI

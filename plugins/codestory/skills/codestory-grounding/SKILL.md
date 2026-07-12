@@ -36,9 +36,12 @@ When the plugin MCP server is available:
 
 1. Resolve `<target-workspace>` explicitly.
 2. Call `status` with `project=<target-workspace>` — field meanings in [status-contract](references/status-contract.md). If `mcp__codestory__*` tools are not initially visible and tool_search is available, query `codestory mcp ground status packet search`, then use the loaded CodeStory MCP tools.
-3. Obey `allowed_surfaces` and `retrieval_mode`.
-4. Call the allowed surface that fits the task; preserve cited anchors in answers.
-5. Follow project-scoped `recommended_next_calls` from status when setup or repair is needed.
+3. Reuse that status result until repository, runtime, or index state changes, or
+   a tool reports stale/freshness failure.
+4. Obey `allowed_surfaces` and `retrieval_mode`.
+5. Call the allowed surface that fits the task; preserve cited anchors in answers.
+6. Follow project-scoped `recommended_next_calls` only when the task requires a
+   blocked surface or setup is otherwise necessary.
 
 If the skill is visible but no `mcp__codestory` tools are exposed, call it a
 plugin MCP visibility failure. Unscoped resources cannot identify the caller's
@@ -55,12 +58,15 @@ MCP tools were not visible.
 | Trace: "Who calls this?" | `callers`, `callees`, `trace`, or `trail --story --hide-speculative`. |
 | Impact: "What might this change touch?" | `affected` with changed files from git; planning hints only, not proof. |
 | Broad question | `packet`, `search`, or `context` only when allowed and `retrieval_mode=full`. |
-| Blocked surface | Follow `recommended_next_calls` from status; normally call MCP `sidecar_setup` with the same `project` and `action=repair`, then call project-scoped `status` again. |
+| Blocked packet/search/context, local route available | Do not repair. Route by task through allowed `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trace`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`, then use focused source only for remaining evidence gaps. |
+| Blocked surface required by the task | Follow `recommended_next_calls`; normally call MCP `sidecar_setup` with the same `project` and `action=repair`, then call project-scoped `status` again. |
 
 ## Evidence Rules
 
 - Treat CodeStory output as evidence, not omniscience.
 - Preserve cited file, symbol, trail, and snippet anchors in user-facing claims.
+- Local graph output is navigation evidence. It does not prove full
+  packet/search readiness or substitute for sidecar-backed evidence claims.
 - When `packet` reports `sufficient` with no `follow_up_commands`, answer from the packet.
 - When `packet` reports `partial`, run named follow-up commands before proof claims.
 - `retrieval_mode=full` is infrastructure eligibility, not answer-quality proof;
@@ -85,8 +91,8 @@ Supported agent repair is MCP-only:
 1. Call `status` with `project=<target-workspace>`.
 2. Inspect `readiness_broker` and `sidecar_setup`; status reads report state
    but do not start repairs.
-3. If `recommended_next_calls` says so and the `mcp__codestory__sidecar_setup`
-   tool is visible, call MCP `sidecar_setup` with
+3. If the task requires the blocked surface, `recommended_next_calls` says so,
+   and the `mcp__codestory__sidecar_setup` tool is visible, call MCP `sidecar_setup` with
    `project=<target-workspace>, action=repair`.
 4. Call `status` again with the same project.
 5. Use only the surfaces allowed by the refreshed status.

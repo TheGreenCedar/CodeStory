@@ -169,6 +169,31 @@ test("agent-facing guidance does not send agents to CLI fallback repair", async 
   }
 });
 
+test("grounding guidance preserves local graph fallback and repair boundaries", async () => {
+  const skill = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
+    "utf8",
+  );
+  const statusContract = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "references", "status-contract.md"),
+    "utf8",
+  );
+  const guidance = `${skill}\n${statusContract}`;
+
+  for (const surface of [
+    "ground", "files", "symbol", "definition", "callers", "callees",
+    "trace", "trail", "references", "snippet", "affected", "symbols",
+    "get_node", "neighbors", "shortest_path", "query_subgraph",
+  ]) {
+    assert.equal(guidance.includes(`\`${surface}\``), true, surface);
+  }
+  assert.match(guidance, /Reuse (?:that |a )?status result until repository, runtime, or index state changes/u);
+  assert.match(guidance, /task requires (?:a |the )?blocked surface/u);
+  assert.match(guidance, /Local graph output is navigation evidence/u);
+  assert.match(guidance, /does not prove full\s+packet\/search readiness/u);
+  assert.match(statusContract, /use it without repairing packet\/search\/context/u);
+});
+
 test("plugin package version tracks the codestory-cli release version", async () => {
   const cliManifest = await readFile(
     join(repoRoot, "crates", "codestory-cli", "Cargo.toml"),
