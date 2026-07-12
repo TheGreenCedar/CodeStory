@@ -1225,6 +1225,19 @@ function acquireManagedCliLock(root, purpose, waitMs = 0, options = {}) {
   }
 }
 
+async function acquireManagedCliLockAsync(root, purpose, waitMs) {
+  const deadline = Date.now() + waitMs;
+  let waited = false;
+  while (true) {
+    const lock = acquireManagedCliLock(root, purpose, 0);
+    if (lock) return { ...lock, waited: waited || lock.waited };
+    waited = true;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await sleep(Math.min(50, remaining));
+  }
+}
+
 function managedCliFailureCode(error) {
   return String(error?.message || error || 'unknown_failure').match(/^[a-z0-9_]+/iu)?.[0] || 'unknown_failure';
 }
@@ -1455,7 +1468,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
 
   const root = managedCliRoot(dataDir, true);
   const versionDir = path.join(root, version);
-  const lock = acquireManagedCliLock(root, `provision:${version}`, managedCliLockWaitMs);
+  const lock = await acquireManagedCliLockAsync(root, `provision:${version}`, managedCliLockWaitMs);
   if (!lock) throw new Error('managed_cli_publish_locked');
   if (lock.waited) warnings.push('managed_cli_publication:waiter');
   if (lock.reclaimed) warnings.push('managed_cli_publication:reclaimed_lock');
@@ -1533,7 +1546,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
   }
 }
 
-async function resolveManagedCli(dataDir, version, warnings) {
+async function resolveManagedCli(dataDir, version, warnings, options = {}) {
   if (!dataDir || !version) return null;
   try {
     managedCliRoot(dataDir);
@@ -1546,6 +1559,7 @@ async function resolveManagedCli(dataDir, version, warnings) {
     const existing = verifyPublishedManagedCli(versionDir, version);
     if (existing.verified) return existing.resolved;
   }
+  if (options.provision === false) return null;
   try {
     return await provisionManagedCli(dataDir, version, warnings);
   } catch (error) {
@@ -1556,7 +1570,7 @@ async function resolveManagedCli(dataDir, version, warnings) {
   return null;
 }
 
-async function resolveCli() {
+async function resolveCli(options = {}) {
   const version = pluginVersion();
   const warnings = [];
   if (process.env.CODESTORY_CLI) {
@@ -1578,7 +1592,7 @@ async function resolveCli() {
     };
   }
 
-  const managed = await resolveManagedCli(pluginDataDir(), version, warnings);
+  const managed = await resolveManagedCli(pluginDataDir(), version, warnings, options);
   if (managed && managed.warning) warnings.push(managed.warning);
   if (managed && managed.path) {
     return { source: 'managed', version, warnings, ...managed };
@@ -2315,6 +2329,7 @@ function pluginRuntimeForResolved(resolved) {
 
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : launchCwd;
+  const managedProvisioning = reason === 'managed_cli_provisioning';
   const managedProvisionFailed = String(reason || '').startsWith('managed_cli_provision_failed:');
   const managedProvisionNext = [
     'Restart/reload the Codex host/app and read codestory://status; managed CLI provisioning will retry release asset downloads.',
@@ -2462,8 +2477,10 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
       hasReadinessBroker: true,
     }),
     runtime_boundary: {
-      restart_required_for_runtime_change: true,
-      message: 'A running MCP server keeps using the CLI process it was launched with; plugin refresh, managed runtime provisioning, or CODESTORY_CLI changes require a host reload/restart and fresh codestory://status readback.',
+      restart_required_for_runtime_change: !managedProvisioning,
+      message: managedProvisioning
+        ? 'Managed CLI provisioning is running in this launcher; the next request after verified publication hands off to the real stdio runtime.'
+        : 'A running MCP server keeps using the CLI process it was launched with; plugin refresh or CODESTORY_CLI changes require a host reload/restart and fresh codestory://status readback.',
     },
     warnings: plugin.warnings,
     project_root: projectRoot,
@@ -2769,24 +2786,94 @@ function failOpenSidecarSetupResult(request, status = null) {
 function runFailOpenMcp(status, options = {}) {
   const currentStatus = () => (typeof status === 'function' ? status() : status);
   let handoff = null;
+  let initializeRequest = null;
+  let initializedNotification = null;
+  let runtimeReadyNotified = false;
+  let stdinEnded = false;
+  const delegatedRequestIds = new Set();
+  let handoffFailureHandled = false;
+  const notifyRuntimeReady = () => {
+    if (!initializedNotification || runtimeReadyNotified) return;
+    if (
+      typeof options.shouldHandoff === 'function' &&
+      !options.shouldHandoff(currentStatus())
+    ) return;
+    runtimeReadyNotified = true;
+    process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })}\n`);
+    process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/resources/list_changed' })}\n`);
+    process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/prompts/list_changed' })}\n`);
+  };
   const maybeHandoff = () => {
     if (handoff || typeof options.startRuntime !== 'function') {
       return handoff;
     }
     const liveStatus = currentStatus();
-    if (!liveStatus.project_root || liveStatus.degraded_reason !== 'project_root_recovered_after_launch') {
+    const shouldHandoff = typeof options.shouldHandoff === 'function'
+      ? options.shouldHandoff(liveStatus)
+      : liveStatus.project_root && liveStatus.degraded_reason === 'project_root_recovered_after_launch';
+    if (!shouldHandoff) {
       return null;
     }
     handoff = options.startRuntime(liveStatus);
-    handoff.stdout?.pipe(process.stdout);
+    handoffFailureHandled = false;
+    const failHandoff = (reason, details = {}) => {
+      if (handoffFailureHandled) return;
+      handoffFailureHandled = true;
+      handoff = null;
+      if (typeof options.onRuntimeFailure !== 'function') {
+        process.exit(details.code || 1);
+        return;
+      }
+      for (const id of delegatedRequestIds) {
+        process.stdout.write(`${JSON.stringify(jsonrpcError(JSON.parse(id), -32000, reason))}\n`);
+      }
+      delegatedRequestIds.clear();
+      options.onRuntimeFailure({ reason, ...details });
+    };
+    if (handoff.stdout) {
+      let stdout = '';
+      let suppressInitialize = Boolean(initializeRequest);
+      handoff.stdout.setEncoding('utf8');
+      handoff.stdout.on('data', (chunk) => {
+        stdout += chunk;
+        const lines = stdout.split(/\r?\n/u);
+        stdout = lines.pop() || '';
+        for (const output of lines) {
+          if (!output) continue;
+          let parsed = null;
+          try {
+            parsed = JSON.parse(output);
+          } catch {
+            // Non-JSON output remains visible instead of hiding a runtime failure.
+          }
+          if (suppressInitialize && parsed?.id === initializeRequest.id) {
+            suppressInitialize = false;
+            continue;
+          }
+          if (parsed?.id !== undefined) delegatedRequestIds.delete(JSON.stringify(parsed.id));
+          process.stdout.write(`${output}\n`);
+        }
+      });
+    }
     handoff.stderr?.pipe(process.stderr);
-    handoff.on('exit', (code, signal) => {
-      if (signal) process.kill(process.pid, signal);
-      process.exit(code || 0);
+    handoff.on('close', (code, signal) => {
+      if (signal || code) {
+        failHandoff('CodeStory stdio handoff exited before completing the request.', { code, signal });
+        return;
+      }
+      process.exit(0);
     });
     handoff.on('error', (error) => {
-      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32000, `CodeStory stdio handoff failed: ${error.message}`))}\n`);
+      failHandoff(`CodeStory stdio handoff failed: ${error.message}`, { error });
     });
+    if (initializeRequest) {
+      handoff.stdin.write(`${JSON.stringify(initializeRequest)}\n`);
+      handoff.stdin.write(`${JSON.stringify(initializedNotification || {
+        jsonrpc: '2.0',
+        method: 'notifications/initialized',
+      })}\n`);
+    }
+    if (stdinEnded) handoff.stdin.end();
     return handoff;
   };
   const tools = [{
@@ -2841,9 +2928,22 @@ function runFailOpenMcp(status, options = {}) {
         process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
         continue;
       }
-      const delegated = maybeHandoff();
+      if (request.method === 'notifications/initialized') {
+        initializedNotification = request;
+        notifyRuntimeReady();
+        continue;
+      }
+      if (request.method === 'initialize' && request.id !== undefined) {
+        initializeRequest = request;
+      }
+      const delegated = request.method === 'initialize' ? null : maybeHandoff();
       if (delegated) {
-        delegated.stdin.write(`${line}\n`);
+        if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
+        try {
+          delegated.stdin.write(`${line}\n`);
+        } catch (error) {
+          process.stdout.write(`${JSON.stringify(jsonrpcError(request.id ?? null, -32000, `CodeStory stdio handoff failed: ${error.message}`))}\n`);
+        }
         continue;
       }
       if (request.id === undefined) continue;
@@ -2852,13 +2952,19 @@ function runFailOpenMcp(status, options = {}) {
         const liveStatus = currentStatus();
         response = jsonrpcResult(request.id, {
           protocolVersion: request.params?.protocolVersion || '2024-11-05',
-          capabilities: { tools: {}, resources: {} },
+          capabilities: {
+            tools: { listChanged: true },
+            resources: { subscribe: false, listChanged: true },
+            prompts: { listChanged: true },
+          },
           serverInfo: { name: 'codestory', version: resolvedVersionForStatus(liveStatus) },
         });
       } else if (request.method === 'tools/list') {
         response = jsonrpcResult(request.id, { tools });
       } else if (request.method === 'resources/list') {
         response = jsonrpcResult(request.id, { resources });
+      } else if (request.method === 'prompts/list') {
+        response = jsonrpcResult(request.id, { prompts: [] });
       } else if (request.method === 'resources/read') {
         const uri = request.params?.uri;
         if (uri === 'codestory://status') {
@@ -2880,6 +2986,11 @@ function runFailOpenMcp(status, options = {}) {
       process.stdout.write(`${JSON.stringify(response)}\n`);
     }
   });
+  process.stdin.on('end', () => {
+    stdinEnded = true;
+    handoff?.stdin.end();
+  });
+  return { notifyRuntimeReady };
 }
 
 function resolvedVersionForStatus(status) {
@@ -2964,7 +3075,65 @@ async function main() {
   if (await handleBootstrapStatusCommand(process.argv)) return;
   handleSidecarPolicyCommand(process.argv);
   const runtimeCwd = releasePluginCacheCwd();
-  const resolved = await resolveCli();
+  const installed = await resolveCli({ provision: false });
+  if (
+    installed.source === 'managed_unavailable' &&
+    process.env.CODESTORY_PLUGIN_DISABLE_PROVISION !== '1'
+  ) {
+    let ready = null;
+    let diagnostic = null;
+    let status = fallbackDiagnostic(installed, probeResolvedCli(installed), 'managed_cli_provisioning', {
+      projectRoot: null,
+      projectRootSource: 'request_argument',
+      summary: 'CodeStory managed CLI provisioning is running in the background.',
+      minimumNext: ['Read codestory://status again while managed CLI provisioning continues.'],
+      fullRepair: ['Read codestory://status again while managed CLI provisioning continues.'],
+    });
+    setImmediate(() => {
+      resolveCli().then((resolved) => {
+        const probe = probeResolvedCli(resolved);
+        const reason = failOpenReasonForProbe(resolved, probe);
+        resolved.managedCliRetention = managedCliRetentionReport(resolved, probe, { dryRun: Boolean(reason) });
+        rememberLaunch(resolved, runtimeCwd);
+        if (reason) {
+          status = fallbackDiagnostic(resolved, probe, reason, {
+            projectRoot: null,
+            projectRootSource: 'request_argument',
+          });
+          return;
+        }
+        ready = resolved;
+        diagnostic?.notifyRuntimeReady();
+      }).catch((error) => {
+        status = fallbackDiagnostic(installed, probeResolvedCli(installed), `launcher_error:${error.message}`, {
+          projectRoot: null,
+          projectRootSource: 'request_argument',
+        });
+      });
+    });
+    diagnostic = runFailOpenMcp(() => status, {
+      shouldHandoff: () => Boolean(ready),
+      startRuntime: () => spawnStdioRuntime(ready, runtimeCwd, ['pipe', 'pipe', 'pipe']),
+      onRuntimeFailure: (failure) => {
+        const failed = ready;
+        ready = null;
+        const reason = failure.error ? 'managed_cli_handoff_unspawnable' : 'runtime_stdio_child_exit';
+        status = fallbackDiagnostic(failed, {
+          status: failure.code ?? null,
+          error: failure.error?.message || failure.reason,
+          version: failed.cliVersion || failed.version,
+          stdout: '',
+          stderr: '',
+        }, reason, {
+          projectRoot: null,
+          projectRootSource: 'request_argument',
+          summary: 'CodeStory managed CLI provisioning completed, but the stdio runtime failed during handoff.',
+        });
+      },
+    });
+    return;
+  }
+  const resolved = installed;
   const probe = probeResolvedCli(resolved);
   const failOpenReason = failOpenReasonForProbe(resolved, probe);
   if (failOpenReason) {
@@ -3059,6 +3228,7 @@ if (require.main === module) {
       quarantineManagedCliVersion,
       releaseManagedCliLock,
       resolveManagedCli,
+      runFailOpenMcp,
       managedCliRetentionReport,
       managedCliVersionEntries,
       removeManagedCliVersion,

@@ -49,8 +49,11 @@ There are three separate steps:
 2. `/plugins` refresh or, on Windows,
    `codex.cmd plugin add codestory@TheGreenCedar` updates the installed plugin
    package.
-3. A fresh Codex host session starts the new MCP adapter and lets it provision
-   the matching managed CLI. The adapter itself is projectless; tool requests
+3. A fresh Codex host session starts the new MCP adapter. When the matching
+   managed CLI is missing, diagnostic status is available immediately while
+   the existing single-flight installer provisions it in the background; the
+   next request after verification is handed to the real runtime without a
+   host restart. The adapter itself is projectless; tool requests
    are routed by their required `project` argument, so other Codex tasks can use
    other repositories at the same time.
 

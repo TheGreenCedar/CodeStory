@@ -27,7 +27,10 @@ The adapter prefers a checksummed plugin-managed CLI and starts one projectless
 MCP runtime. Every tool call carries its repository root, so concurrent Codex
 tasks can use different projects without rebinding or restarting the server. It can provision from
 GitHub release `SHA256SUMS.txt`, honor `CODESTORY_CLI` as a local-dev override,
-and stay up with diagnostic `codestory://status` when managed setup fails.
+and open diagnostic `codestory://status` immediately while a missing exact
+version is provisioned in the background. The next request after verified
+publication is handed to the real stdio runtime; terminal setup failures remain
+available through the same diagnostic MCP.
 Ambient `PATH` binaries are reported as diagnostics only; installed plugin
 runtime does not launch them.
 

@@ -211,14 +211,14 @@ function fakeProbeChild(response, options = {}) {
   return child;
 }
 
-async function writeReleaseFixture(releaseDir, version) {
+async function writeReleaseFixture(releaseDir, version, writeCli = writeFakeCli) {
   const { archiveBase, archiveName } = releaseAssetForPlatform(version);
   const stageDir = join(releaseDir, archiveBase);
   const cliName = process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli";
   const cliPath = join(stageDir, cliName);
   const archivePath = join(releaseDir, archiveName);
   await mkdir(stageDir, { recursive: true });
-  await writeFakeCli(cliPath);
+  await writeCli(cliPath);
   await writeArchiveFixture(archivePath, `${archiveBase}/${cliName}`, await readFile(cliPath));
   const archiveSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
   const sumsPath = join(releaseDir, "SHA256SUMS.txt");
@@ -235,7 +235,18 @@ function spawnLauncher(launcher, env) {
   let stderr = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "codestory://status" } })}\n`);
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "codestory://status" } })}\n`);
+  const runtimeMetadata = env.PLUGIN_DATA && join(env.PLUGIN_DATA, ".codestory-mcp-runtime.json");
+  const handoffPoll = runtimeMetadata && setInterval(() => {
+    try {
+      if (JSON.parse(fs.readFileSync(runtimeMetadata, "utf8")).source !== "managed") return;
+      clearInterval(handoffPoll);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`);
+    } catch {
+      // Provisioning has not published runtime metadata yet.
+    }
+  }, 10);
+  child.once("close", () => clearInterval(handoffPoll));
   const completed = once(child, "close").then(([status, signal]) => ({ status, signal, stdout, stderr }));
   return { child, completed };
 }
@@ -268,6 +279,24 @@ async function writeFakeCli(cliPath) {
     `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`,
     "utf8",
   );
+  await chmod(cliPath, 0o755);
+}
+
+async function writeLifecycleCli(cliPath) {
+  const script = [
+    "const fs=require('fs');",
+    "const args=process.argv.slice(1);",
+    "if(args[0]==='--version'){console.log('codestory-cli '+process.env.TEST_CODESTORY_VERSION);process.exit(0)}",
+    "if(args[0]!=='serve')process.exit(2);",
+    "let initialized=false;let notified=false;let input='';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});",
+  ].join("");
+  if (process.platform === "win32") {
+    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
+    return;
+  }
+  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
   await chmod(cliPath, 0o755);
 }
 
@@ -2681,7 +2710,6 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
 });
 
 test("mcp launcher fails open when managed cli probe fails", async () => {
-  const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-managed-"));
   const cliDir = join(dataDir, "codestory-cli", version);
@@ -2718,20 +2746,45 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       "utf8",
     );
 
-    const result = spawnSync(process.execPath, [launcher], {
+    const child = spawn(process.execPath, [launcher], {
       env: {
+        ...process.env,
         PLUGIN_DATA: dataDir,
         CODESTORY_PLUGIN_RELEASE_DIR: join(dataDir, "missing-release"),
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
-      input,
-      encoding: "utf8",
-      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
     });
-
-    assert.equal(result.status, 0, result.stderr);
-    const response = JSON.parse(result.stdout.trim());
+    const completed = once(child, "close");
+    let buffer = "";
+    const responses = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/u);
+      buffer = lines.pop() || "";
+      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
+    });
+    child.stdin.write(input);
+    const firstDeadline = Date.now() + 2000;
+    while (Date.now() < firstDeadline && responses.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const firstReason = JSON.parse(responses[0].result.contents[0].text).degraded_reason;
+    assert.equal([
+      "managed_cli_provisioning",
+      "managed_cli_provision_failed:managed_cli_asset_fetch_failed",
+    ].includes(firstReason), true);
+    if (firstReason === "managed_cli_provisioning") {
+      await waitForPath(join(dataDir, ".codestory-mcp-runtime.json"));
+      child.stdin.end(input.replace('"status"', '"terminal"'));
+    } else {
+      child.stdin.end();
+    }
+    const [exitCode] = await completed;
+    assert.equal(exitCode, 0);
+    const response = responses.find((entry) => entry.id === "terminal") || responses[0];
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(
       status.readiness[0].repair_reason,
@@ -2876,17 +2929,13 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
       "utf8",
     );
 
-    const result = spawnSync(process.execPath, [launcher], {
-      env: {
-        ...process.env,
-        CODESTORY_CLI: "",
-        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
-        PLUGIN_DATA: dataDir,
-        TEST_OUT: outFile,
-        TEST_CODESTORY_VERSION: version,
-      },
-      encoding: "utf8",
+    const launched = spawnLauncher(launcher, {
+      CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+      PLUGIN_DATA: dataDir,
+      TEST_OUT: outFile,
+      TEST_CODESTORY_VERSION: version,
     });
+    const result = await launched.completed;
 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
@@ -2915,6 +2964,258 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
   }
+});
+
+test("mcp launcher serves diagnostics while managed provisioning runs, then hands off", { timeout: 30000 }, async () => {
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-background-provision-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-background-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const outFile = join(dataDir, "runtime.json");
+  let child;
+  let server;
+  let releaseAssets = () => {};
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version, writeLifecycleCli);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    const assetGate = new Promise((resolve) => { releaseAssets = resolve; });
+    server = createServer(async (request, response) => {
+      await assetGate;
+      const body = assets.get(request.url);
+      if (!body) return response.writeHead(404).end();
+      response.writeHead(200).end(body);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    child = spawn(process.execPath, [launcher], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: "",
+        CODESTORY_PLUGIN_RELEASE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: outFile,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const completed = once(child, "close");
+    let buffered = "";
+    const responses = [];
+    const waiters = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      const lines = buffered.split(/\r?\n/u);
+      buffered = lines.pop() || "";
+      for (const line of lines.filter(Boolean)) {
+        const response = JSON.parse(line);
+        if (waiters.length) waiters.shift()(response); else responses.push(response);
+      }
+    });
+    const nextResponse = () => responses.shift() || Promise.race([
+      new Promise((resolve) => waiters.push(resolve)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for diagnostic MCP")), 2000)),
+    ]);
+    const request = async (message) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+      return nextResponse();
+    };
+
+    const initialized = await request({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    });
+    assert.equal(initialized.result.serverInfo.name, "codestory");
+    assert.equal(initialized.result.capabilities.tools.listChanged, true);
+    assert.equal(initialized.result.capabilities.prompts.listChanged, true);
+    const statusResponse = await request({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "resources/read",
+      params: { uri: "codestory://status" },
+    });
+    const status = JSON.parse(statusResponse.result.contents[0].text);
+    assert.equal(status.degraded_reason, "managed_cli_provisioning");
+    assert.equal(status.runtime_boundary.restart_required_for_runtime_change, false);
+
+    releaseAssets();
+    const runtimeMetadata = join(dataDir, ".codestory-mcp-runtime.json");
+    await waitForPath(runtimeMetadata);
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const metadata = JSON.parse(await readFile(runtimeMetadata, "utf8"));
+      if (metadata.source === "managed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(JSON.parse(await readFile(runtimeMetadata, "utf8")).source, "managed");
+    assert.equal(
+      responses.some((response) => response.method === "notifications/tools/list_changed"),
+      false,
+    );
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    const notificationDeadline = Date.now() + 2000;
+    while (
+      Date.now() < notificationDeadline &&
+      !responses.some((response) => response.method === "notifications/tools/list_changed")
+    ) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(
+      responses.some((response) => response.method === "notifications/tools/list_changed"),
+      true,
+    );
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" })}\n`);
+    let handedOff = null;
+    const handoffDeadline = Date.now() + 2000;
+    while (Date.now() < handoffDeadline && !handedOff) {
+      try {
+        handedOff = JSON.parse(await readFile(outFile, "utf8"));
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    assert.ok(handedOff);
+    assert.equal(handedOff.initialized, true);
+    assert.equal(handedOff.notified, true);
+    assert.deepEqual(handedOff.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "resources/list" })}\n`);
+    const failureDeadline = Date.now() + 2000;
+    while (Date.now() < failureDeadline && !responses.some((response) => response.id === 4)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(responses.filter((response) => response.id === 4).length, 1);
+    assert.deepEqual(responses.find((response) => response.id === 4)?.result.resources, []);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "resources/read",
+      params: { uri: "codestory://status" },
+    })}\n`);
+    const recoveryDeadline = Date.now() + 2000;
+    while (Date.now() < recoveryDeadline && !responses.some((response) => response.id === 5)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const recoveredStatus = responses.find((response) => response.id === 5);
+    assert.equal(
+      JSON.parse(recoveredStatus.result.contents[0].text).degraded_reason,
+      "runtime_stdio_child_exit",
+    );
+    child.stdin.end();
+    assert.equal((await completed)[0], 0);
+    child = null;
+  } finally {
+    releaseAssets();
+    if (child) child.kill("SIGKILL");
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed publication waiter keeps diagnostic MCP responsive", { timeout: 15000 }, async () => {
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-responsive-waiter-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-responsive-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  let publisher;
+  let waiter;
+  let server;
+  let releaseAssets = () => {};
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    const gate = new Promise((resolve) => { releaseAssets = resolve; });
+    server = createServer(async (request, response) => {
+      await gate;
+      response.writeHead(200).end(assets.get(request.url));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const env = {
+      ...process.env,
+      CODESTORY_CLI: "",
+      CODESTORY_PLUGIN_RELEASE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+      PLUGIN_DATA: dataDir,
+      TEST_CODESTORY_VERSION: version,
+    };
+    publisher = spawn(process.execPath, [launcher], { env, stdio: ["pipe", "pipe", "pipe"] });
+    publisher.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } })}\n`);
+    await waitForPath(join(dataDir, "codestory-cli", ".retention-lock", "owner.json"));
+
+    waiter = spawn(process.execPath, [launcher], { env, stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    waiter.stdout.setEncoding("utf8");
+    waiter.stdout.on("data", (chunk) => { output += chunk; });
+    waiter.stdin.write([
+      JSON.stringify({ jsonrpc: "2.0", id: 2, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+      JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/read", params: { uri: "codestory://status" } }),
+      "",
+    ].join("\n"));
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && !output.split(/\r?\n/u).some((line) => {
+      if (!line) return false;
+      return JSON.parse(line).id === 3;
+    })) await new Promise((resolve) => setTimeout(resolve, 10));
+    const statusResponse = output.split(/\r?\n/u).filter(Boolean)
+      .map((line) => JSON.parse(line)).find((response) => response.id === 3);
+    assert.ok(statusResponse, output);
+    assert.equal(JSON.parse(statusResponse.result.contents[0].text).degraded_reason, "managed_cli_provisioning");
+  } finally {
+    releaseAssets();
+    for (const child of [publisher, waiter]) {
+      if (child && child.exitCode === null) child.kill("SIGKILL");
+    }
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    "const {EventEmitter}=require('node:events');",
+    "const {PassThrough}=require('node:stream');",
+    "let failed=false;",
+    "const status=()=>({plugin_runtime:{plugin_version:'test'},degraded_reason:failed?'managed_cli_handoff_unspawnable':'managed_cli_provisioning',recommended_next_calls:[]});",
+    "run(status,{shouldHandoff:()=>!failed,startRuntime:()=>{const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();process.nextTick(()=>child.emit('error',new Error('synthetic spawn error')));return child},onRuntimeFailure:()=>{failed=true}});",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  const completed = once(child, "close");
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stdin.write([
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    "",
+  ].join("\n"));
+  const errorDeadline = Date.now() + 2000;
+  while (Date.now() < errorDeadline && !output.split(/\r?\n/u).filter(Boolean)
+    .map((line) => JSON.parse(line)).some((response) => response.id === 2)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  child.stdin.end(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  })}\n`);
+  assert.equal((await completed)[0], 0);
+  const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(responses.find((response) => response.id === 2)?.error.code, -32000);
+  const status = JSON.parse(responses.find((response) => response.id === 3).result.contents[0].text);
+  assert.equal(status.degraded_reason, "managed_cli_handoff_unspawnable");
 });
 
 test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {
@@ -3315,7 +3616,6 @@ test("release asset downloader enforces a total body deadline", async () => {
 });
 
 test("mcp launcher keeps managed provision failures primary", async () => {
-  const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-fail-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-empty-release-"));
@@ -3328,7 +3628,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
   }) + "\n";
 
   try {
-    const result = spawnSync(process.execPath, [launcher], {
+    const child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         CODESTORY_CLI: "",
@@ -3337,13 +3637,32 @@ test("mcp launcher keeps managed provision failures primary", async () => {
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
-      input,
-      encoding: "utf8",
-      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
     });
-
-    assert.equal(result.status, 0, result.stderr);
-    const response = JSON.parse(result.stdout.trim());
+    const completed = once(child, "close");
+    let buffer = "";
+    const responses = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/u);
+      buffer = lines.pop() || "";
+      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
+    });
+    child.stdin.write(input);
+    const firstDeadline = Date.now() + 2000;
+    while (Date.now() < firstDeadline && responses.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const first = JSON.parse(responses[0].result.contents[0].text);
+    if (first.degraded_reason === "managed_cli_provisioning") {
+      await waitForPath(join(dataDir, ".codestory-mcp-runtime.json"));
+      child.stdin.end(input.replace('"id":1', '"id":2'));
+    } else {
+      child.stdin.end();
+    }
+    assert.equal((await completed)[0], 0);
+    const response = responses.find((entry) => entry.id === 2) || responses[0];
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(status.degraded_reason, "managed_cli_provision_failed:managed_cli_asset_fetch_failed");
     assert.doesNotMatch(JSON.stringify(status), new RegExp(releaseDir.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));

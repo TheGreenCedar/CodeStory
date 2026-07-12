@@ -678,48 +678,125 @@ def stdio_status_command(
     stderr_thread.start()
     responses: list[dict] = []
     process_terminated = False
+    failure_pending = False
+    failure_extra: dict | None = None
+
+    def stdio_fail(message: str, extra: dict | None = None) -> None:
+        nonlocal failure_pending, failure_extra
+        failure_pending = True
+        failure_extra = extra
+        fail(layer, artifact, message)
+
+    def read_correlated_response(expected_id: str | int, entry: dict, phase: str) -> dict:
+        deadline = time.monotonic() + timeout_secs
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                entry["timed_out"] = True
+                stdio_fail(f"stdio MCP {phase} timed out after {timeout_secs}s", {"timed_out": True})
+            try:
+                line = read_stdio_line(stdout_queue, remaining)
+            except subprocess.TimeoutExpired:
+                entry["timed_out"] = True
+                stdio_fail(f"stdio MCP {phase} timed out after {timeout_secs}s", {"timed_out": True})
+            if line is None:
+                stdio_fail(f"stdio MCP server closed during {phase}")
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError as exc:
+                entry["invalid_line"] = line
+                stdio_fail(f"stdio MCP {phase} emitted invalid JSON: {exc}", {"invalid_line": line})
+            if not isinstance(response, dict):
+                entry["invalid_response"] = response
+                stdio_fail(f"stdio MCP {phase} emitted a non-object response", {"invalid_response": response})
+            if response.get("jsonrpc") != "2.0":
+                entry["invalid_response"] = response
+                stdio_fail(f"stdio MCP {phase} response has invalid jsonrpc envelope", {"invalid_response": response})
+            if "method" in response:
+                method = response.get("method")
+                if isinstance(method, str) and method.startswith("notifications/") and "id" not in response:
+                    transcript.append({"notification": response})
+                    continue
+                entry["unexpected_server_message"] = response
+                stdio_fail(f"stdio MCP {phase} emitted an unexpected server request", {"unexpected_server_message": response})
+            if response.get("id") != expected_id:
+                entry["unexpected_response"] = response
+                stdio_fail(
+                    f"stdio MCP {phase} returned id {response.get('id')!r}, expected {expected_id!r}",
+                    {"unexpected_response": response},
+                )
+            if ("result" in response) == ("error" in response):
+                entry["invalid_response"] = response
+                stdio_fail(f"stdio MCP {phase} response must contain exactly one of result or error", {"invalid_response": response})
+            return response
+
     try:
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": "initialize",
+            "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "packaged-proof", "version": "1"}},
+        }
+        initialize_entry = {"request": initialize}
+        transcript.append(initialize_entry)
+        process.stdin.write(json.dumps(initialize) + "\n")
+        process.stdin.flush()
+        initialize_response = read_correlated_response("initialize", initialize_entry, "initialize")
+        initialize_entry["response"] = initialize_response
+        responses.append(initialize_response)
+        initialize_result = initialize_response.get("result")
+        if "error" in initialize_response:
+            stdio_fail(f"stdio MCP initialize failed: {initialize_response.get('error')}")
+        if not isinstance(initialize_result, dict):
+            stdio_fail("stdio MCP initialize missing result")
+        if initialize_result.get("protocolVersion") != initialize["params"]["protocolVersion"]:
+            stdio_fail(f"stdio MCP initialize protocol is {initialize_result.get('protocolVersion')!r}")
+        if not isinstance(initialize_result.get("capabilities"), dict):
+            stdio_fail("stdio MCP initialize missing capabilities")
+        if not isinstance(initialize_result["capabilities"].get("tools"), dict):
+            stdio_fail("stdio MCP initialize capabilities.tools must be an object")
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        transcript.append({"request": initialized})
+        process.stdin.write(json.dumps(initialized) + "\n")
+        process.stdin.flush()
+
+        list_changed = initialize_result.get("capabilities", {}).get("tools", {}).get("listChanged")
+        if list_changed is True:
+            publication_deadline = time.monotonic() + timeout_secs
+            while True:
+                remaining = publication_deadline - time.monotonic()
+                if remaining <= 0:
+                    stdio_fail(f"stdio MCP runtime publication timed out after {timeout_secs}s", {"timed_out": True})
+                try:
+                    notification_line = read_stdio_line(stdout_queue, remaining)
+                except subprocess.TimeoutExpired:
+                    stdio_fail(f"stdio MCP runtime publication timed out after {timeout_secs}s", {"timed_out": True})
+                if notification_line is None:
+                    stdio_fail("stdio MCP server closed before runtime publication")
+                try:
+                    notification = json.loads(notification_line)
+                except json.JSONDecodeError as exc:
+                    stdio_fail(f"stdio MCP runtime publication emitted invalid JSON: {exc}", {"invalid_line": notification_line})
+                if not isinstance(notification, dict):
+                    stdio_fail("stdio MCP runtime publication emitted a non-object message", {"invalid_response": notification})
+                method = notification.get("method")
+                if (
+                    notification.get("jsonrpc") != "2.0"
+                    or "id" in notification
+                    or not isinstance(method, str)
+                    or not method.startswith("notifications/")
+                ):
+                    stdio_fail("stdio MCP runtime publication emitted an unexpected message", {"unexpected_response": notification})
+                transcript.append({"notification": notification})
+                if method == "notifications/tools/list_changed":
+                    break
+
         for request in requests:
             entry = {"request": request}
             transcript.append(entry)
             process.stdin.write(json.dumps(request) + "\n")
             process.stdin.flush()
-            try:
-                line = read_stdio_line(stdout_queue, timeout_secs)
-            except subprocess.TimeoutExpired:
-                entry["timed_out"] = True
-                terminate_process_tree(process)
-                process_terminated = True
-                stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
-                write_stdio_artifact(
-                    artifact,
-                    transcript,
-                    "".join(stdout_lines),
-                    stderr_path,
-                    {"timed_out": True, "timeout_secs": timeout_secs},
-                )
-                fail(layer, artifact, f"stdio MCP request timed out after {timeout_secs}s")
-            if line is None:
-                terminate_process_tree(process)
-                process_terminated = True
-                stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
-                write_stdio_artifact(artifact, transcript, "".join(stdout_lines), stderr_path)
-                fail(layer, artifact, "stdio MCP server closed before responding")
-            try:
-                response = json.loads(line)
-            except json.JSONDecodeError as exc:
-                entry["invalid_line"] = line
-                terminate_process_tree(process)
-                process_terminated = True
-                stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
-                write_stdio_artifact(
-                    artifact,
-                    transcript,
-                    "".join(stdout_lines),
-                    stderr_path,
-                    {"invalid_line": line},
-                )
-                fail(layer, artifact, f"stdio MCP server emitted invalid JSON: {exc}")
+            response = read_correlated_response(request["id"], entry, f"request {request['id']}")
             entry["response"] = response
             responses.append(response)
     finally:
@@ -750,8 +827,11 @@ def stdio_status_command(
         if process.poll() is None:
             process.kill()
             process.wait(timeout=2)
-        stdout_thread.join(timeout=0.2)
-        stderr_thread.join(timeout=0.2)
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        if failure_pending:
+            stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
+            write_stdio_artifact(artifact, transcript, "".join(stdout_lines), stderr_path, failure_extra)
 
     stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
     responses_by_id = {response.get("id"): response for response in responses if isinstance(response, dict)}
@@ -1503,7 +1583,25 @@ def write_fake_cli(path: Path) -> None:
                     if fail == "serve_timeout":
                         time.sleep(60)
                         continue
-                    if request.get("method") == "tools/list":
+                    if request.get("method") == "notifications/initialized":
+                        if os.environ.get("CODESTORY_FAKE_LIST_CHANGED") == "1":
+                            for method in (
+                                "notifications/tools/list_changed",
+                                "notifications/resources/list_changed",
+                                "notifications/prompts/list_changed",
+                            ):
+                                print(json.dumps({"jsonrpc": "2.0", "method": method}), flush=True)
+                        continue
+                    if request.get("method") == "initialize":
+                        result = {
+                            "protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
+                            "capabilities": {
+                                "tools": {"listChanged": os.environ.get("CODESTORY_FAKE_LIST_CHANGED") == "1"},
+                                "resources": {"listChanged": False},
+                            },
+                            "serverInfo": {"name": "codestory", "version": "9.9.9"},
+                        }
+                    elif request.get("method") == "tools/list":
                         result = {"tools": [{"name": "packet"}, {"name": "search"}, {"name": "context"}, {"name": "sidecar_setup"}]}
                     elif request.get("method") == "resources/list":
                         resources = [{"uri": "codestory://status", "name": "CodeStory runtime status"}]
@@ -1578,7 +1676,30 @@ def write_fake_cli(path: Path) -> None:
                             },
                         }
                         result = {"contents": [{"uri": "codestory://status", "mimeType": "application/json", "text": json.dumps(status)}]}
-                    print(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": result}), flush=True)
+                    response_id = request.get("id")
+                    initialize_mode = os.environ.get("CODESTORY_FAKE_INITIALIZE_MODE")
+                    if request.get("method") == "initialize" and initialize_mode == "non_object":
+                        print(json.dumps([]), flush=True)
+                        continue
+                    if request.get("method") == "initialize" and initialize_mode == "wrong_id":
+                        response_id = "wrong-initialize"
+                    if request.get("method") == "initialize" and initialize_mode == "error":
+                        print(json.dumps({"jsonrpc": "2.0", "id": response_id, "error": {"code": -32000, "message": "synthetic initialize error"}}), flush=True)
+                        continue
+                    if request.get("method") == "initialize" and initialize_mode == "malformed_tools":
+                        result["capabilities"]["tools"] = []
+                    if request.get("method") == "initialize" and initialize_mode == "malformed_jsonrpc":
+                        print("synthetic protocol stderr", file=sys.stderr, flush=True)
+                    if request.get("method") == "tools/list" and initialize_mode == "out_of_order":
+                        response_id = "resources"
+                    if request.get("method") == "tools/list" and initialize_mode == "server_request_collision":
+                        print(json.dumps({"jsonrpc": "2.0", "id": response_id, "method": "sampling/createMessage", "params": {}}), flush=True)
+                        continue
+                    if request.get("method") == "tools/list" and initialize_mode == "malformed_method":
+                        print(json.dumps({"jsonrpc": "2.0", "method": 42}), flush=True)
+                        continue
+                    jsonrpc = "1.0" if request.get("method") == "initialize" and initialize_mode == "malformed_jsonrpc" else "2.0"
+                    print(json.dumps({"jsonrpc": jsonrpc, "id": response_id, "result": result}), flush=True)
             else:
                 raise SystemExit(f"unknown fake layer: {layer}")
             '''
@@ -1966,6 +2087,7 @@ def self_test() -> None:
             stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli")
         )
         os.environ["CODESTORY_FAKE_PLUGIN_MANAGED"] = "1"
+        os.environ["CODESTORY_FAKE_LIST_CHANGED"] = "1"
         try:
             run_gate(managed_args)
             managed_summary = read_json_file(Path(managed_args.out_dir) / "summary.json")
@@ -1985,6 +2107,7 @@ def self_test() -> None:
             assert managed_direct_status["cache_root"] != managed_cache_root
         finally:
             os.environ.pop("CODESTORY_FAKE_PLUGIN_MANAGED", None)
+            os.environ.pop("CODESTORY_FAKE_LIST_CHANGED", None)
             os.environ.pop("CODESTORY_FAKE_PLUGIN_CLI", None)
 
         policy_timeout_artifact = root / "policy-timeout" / "managed-plugin-handoff.json"
@@ -2064,6 +2187,52 @@ def self_test() -> None:
                 raise AssertionError("fallback fake context should fail the gate")
         finally:
             os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
+
+        fake_cli = stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli")
+        numeric_id_artifact = root / "stdio-numeric-id.json"
+        stdio_status_command(
+            [str(fake_cli), "serve", "--stdio", "--refresh", "none", "--project", str(project)],
+            numeric_id_artifact,
+            2,
+            project,
+            extra_requests=[{"jsonrpc": "2.0", "id": 1, "method": "resources/list"}],
+        )
+        numeric_id_payload = read_json_file(numeric_id_artifact)
+        assert any(
+            entry.get("request", {}).get("id") == 1
+            and entry.get("response", {}).get("id") == 1
+            for entry in numeric_id_payload["transcript"]
+        )
+
+        for mode in (
+            "wrong_id",
+            "error",
+            "out_of_order",
+            "non_object",
+            "server_request_collision",
+            "malformed_jsonrpc",
+            "malformed_method",
+            "malformed_tools",
+        ):
+            protocol_artifact = root / f"stdio-{mode}.json"
+            try:
+                stdio_status(
+                    fake_cli,
+                    project,
+                    protocol_artifact,
+                    2,
+                    {**os.environ, "CODESTORY_FAKE_INITIALIZE_MODE": mode},
+                )
+            except GateFailure as exc:
+                assert exc.layer == "serve_stdio"
+                assert exc.artifact == protocol_artifact
+                assert protocol_artifact.is_file()
+                protocol_stderr = protocol_artifact.with_suffix(protocol_artifact.suffix + ".stderr.txt")
+                assert protocol_stderr.is_file()
+                if mode == "malformed_jsonrpc":
+                    assert "synthetic protocol stderr" in protocol_stderr.read_text(encoding="utf-8")
+            else:
+                raise AssertionError(f"{mode} stdio response must fail correlation")
 
         os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_timeout"
         timeout_args = argparse.Namespace(**vars(args))
