@@ -188,6 +188,14 @@ inventory, and operator assertions are diagnostic only. Require
 `meaningful_accelerator_work_proven=true`, allowed packet/search surfaces, and
 `retrieval_mode=full` before trusting acceleration-backed readiness.
 
+Agent repair now runs that proof before long semantic indexing. The timed smoke
+uses the same embedding endpoint and runtime configuration as the rebuild, and
+the current runtime log must show positive offload for the requested provider
+and device. A reachable endpoint or device inventory without both pieces stops
+with `gpu_unverified` instead of remaining in a long `repairing` state.
+Accelerator-required external endpoints intentionally remain unverified because
+CodeStory does not own their runtime log or process identity.
+
 The old failure pattern is `accelerator_request_provider=vulkan`,
 `accelerator_request_device=Vulkan0`, Docker/Colima embed launch, and
 `accelerator_request_unobserved`. That is a stale or pre-release runtime for

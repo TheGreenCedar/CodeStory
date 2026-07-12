@@ -42,6 +42,7 @@ const NATIVE_LLAMA_LOG_READ_TAIL_BYTES: u64 = 512 * 1024;
 const NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES: u64 = 256 * 1024;
 const RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_EMBED_DEVICE_OBSERVATION_POLL: Duration = Duration::from_millis(250);
+const ACCELERATOR_SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -214,6 +215,12 @@ pub struct EmbeddingRuntimeProbe {
     pub elapsed_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EmbeddingAcceleratorSmoke {
+    pub elapsed_ms: u64,
+    pub device: EmbeddingDeviceReadiness,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingDeviceReadiness {
     pub requested_policy: &'static str,
@@ -245,6 +252,16 @@ struct NativeEmbeddingDeviceStateFile {
 struct NativeEmbeddingDeviceLaunch {
     executable_path: Option<String>,
     requested_device: Option<String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct ExactEmbeddingRuntimeState {
+    namespace: String,
+    embed_url: String,
+    embedding_accelerator_request_provider: Option<String>,
+    embedding_accelerator_request_device: Option<String>,
+    embedding_launch: Option<crate::health::EmbeddingLaunchMetadata>,
+    embedding_container_identity: Option<String>,
 }
 
 /// Stable id stored on retrieval manifest rows (backend + model family).
@@ -385,12 +402,21 @@ fn embedding_device_readiness_with_observed_state(
 fn observe_sidecar_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    if crate::config::embedding_server_launch_mode_for_runtime(runtime)
+    let (text, source) = if crate::config::embedding_server_launch_mode_for_runtime(runtime)
         .ok()
         .is_some_and(|mode| mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned)
     {
         return observe_native_embedding_device_state(runtime);
+    } else {
+        (read_container_embedding_log(runtime)?, "sidecar_log")
+    };
+    match observed_embedding_device_state_from_text(&text) {
+        "unknown" => None,
+        state => Some(EmbeddingDeviceObservation { state, source }),
     }
+}
+
+fn read_container_embedding_log(runtime: &crate::config::SidecarRuntimeConfig) -> Option<String> {
     let output = Command::new("docker")
         .args([
             "logs",
@@ -400,21 +426,13 @@ fn observe_sidecar_embedding_device_state(
         ])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    match observed_embedding_device_state_from_text(&text) {
-        "unknown" => None,
-        state => Some(EmbeddingDeviceObservation {
-            state,
-            source: "sidecar_log",
-        }),
-    }
+    output.status.success().then(|| {
+        format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 fn observe_native_embedding_device_state(
@@ -544,6 +562,246 @@ fn native_embedding_log_current_launch(text: &str) -> &str {
     text.rfind(NATIVE_LLAMA_LOG_START_MARKER)
         .map(|offset| &text[offset..])
         .unwrap_or(text)
+}
+
+pub fn ensure_embedding_accelerator_smoke_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<Option<EmbeddingAcceleratorSmoke>> {
+    let before = embedding_device_readiness_for_runtime(runtime);
+    if before.cpu_allowed {
+        return Ok(None);
+    }
+    let launch_mode = crate::config::embedding_server_launch_mode_for_runtime(runtime)?;
+    if launch_mode == crate::config::EmbeddingServerLaunchMode::ExternalEndpoint {
+        bail!(
+            "gpu_unverified: external embedding endpoints do not expose CodeStory-owned runtime log offload proof"
+        );
+    }
+    let state = exact_embedding_runtime_state(runtime)?;
+    let request = embedding_accelerator_request_from_runtime_state(&state)?;
+    let native_launch_before = match launch_mode {
+        crate::config::EmbeddingServerLaunchMode::NativeSpawned => {
+            let launch = state.embedding_launch.clone().ok_or_else(|| {
+                anyhow!("gpu_unverified: native embedding runtime state has no launch identity")
+            })?;
+            crate::sidecar::ensure_native_embedding_launch_identity(&launch)
+                .context("gpu_unverified: validate native embedding launch before smoke")?;
+            Some(launch)
+        }
+        crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed => None,
+        crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => unreachable!(),
+    };
+    let container_identity_before = if launch_mode
+        == crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed
+    {
+        let identity = running_embedding_container_identity(runtime)?;
+        if state.embedding_container_identity.as_deref() != Some(identity.as_str()) {
+            bail!(
+                "gpu_unverified: running embedding container does not match persisted runtime identity"
+            );
+        }
+        Some(identity)
+    } else {
+        None
+    };
+    let probe = probe_product_embedding_runtime_with_timeout(runtime, ACCELERATOR_SMOKE_TIMEOUT);
+    let text = if launch_mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned {
+        let after_state = exact_embedding_runtime_state(runtime)?;
+        if after_state != state {
+            bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
+        }
+        let after = after_state.embedding_launch.ok_or_else(|| {
+            anyhow!("gpu_unverified: native embedding launch identity disappeared during smoke")
+        })?;
+        if native_launch_before.as_ref() != Some(&after) {
+            bail!("gpu_unverified: native embedding launch identity changed during smoke");
+        }
+        crate::sidecar::ensure_native_embedding_launch_identity(&after)
+            .context("gpu_unverified: validate native embedding launch after smoke")?;
+        read_native_embedding_log_tail(
+            &native_embedding_log_path(runtime),
+            NATIVE_LLAMA_LOG_READ_TAIL_BYTES,
+        )
+        .ok()
+        .map(|text| native_embedding_log_current_launch(&text).to_string())
+    } else {
+        let after_state = exact_embedding_runtime_state(runtime)?;
+        if after_state != state {
+            bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
+        }
+        let after = running_embedding_container_identity(runtime)?;
+        if container_identity_before.as_deref() != Some(after.as_str()) {
+            bail!("gpu_unverified: embedding container identity changed during accelerator smoke");
+        }
+        read_container_embedding_log(runtime)
+    };
+    let log_proven = text
+        .as_deref()
+        .is_some_and(|text| runtime_log_proves_requested_accelerator(text, &request));
+    let mut device = embedding_device_readiness_for_runtime(runtime);
+    if log_proven {
+        device.observed_state = "accelerated";
+        device.observation_source =
+            if launch_mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned {
+                "native_log"
+            } else {
+                "sidecar_log"
+            };
+        device.full_retrieval_allowed = true;
+        device.degraded_reason = None;
+    }
+    device.accelerator_requested = true;
+    device.accelerator_request_provider = Some(request.provider.clone());
+    device.accelerator_request_device = request.device.clone();
+    evaluate_embedding_accelerator_smoke(probe, device, log_proven)
+}
+
+fn probe_product_embedding_runtime_with_timeout(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    timeout: Duration,
+) -> EmbeddingRuntimeProbe {
+    let started = Instant::now();
+    let result = LlamaCppEmbeddingClient::new(&runtime.embedding)
+        .and_then(|client| client.embed_query_with_timeout("codestory accelerator smoke", timeout));
+    let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    match result {
+        Ok(vector) => EmbeddingRuntimeProbe {
+            reachable: true,
+            detail: format!("llamacpp embeddings reachable dim={}", vector.len()),
+            elapsed_ms,
+        },
+        Err(error) => EmbeddingRuntimeProbe {
+            reachable: false,
+            detail: format!("llamacpp embeddings unavailable: {error}"),
+            elapsed_ms,
+        },
+    }
+}
+
+pub(crate) fn running_embedding_container_identity(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<String> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}",
+            &format!("{}-embed", runtime.compose_project),
+        ])
+        .output()
+        .context("gpu_unverified: inspect embedding container identity")?;
+    if !output.status.success() {
+        bail!("gpu_unverified: embedding container identity is unavailable");
+    }
+    validate_running_embedding_container_identity(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn validate_running_embedding_container_identity(output: &str) -> Result<String> {
+    let identity = output.trim().to_string();
+    if identity.is_empty() || !identity.ends_with("|true") {
+        bail!("gpu_unverified: embedding container is not running");
+    }
+    Ok(identity)
+}
+
+fn exact_embedding_runtime_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<ExactEmbeddingRuntimeState> {
+    let state: ExactEmbeddingRuntimeState =
+        serde_json::from_slice(&std::fs::read(&runtime.layout.state_file).with_context(|| {
+            format!(
+                "gpu_unverified: read exact embedding runtime state {}",
+                runtime.layout.state_file.display()
+            )
+        })?)
+        .context("gpu_unverified: parse exact embedding runtime state")?;
+    if state.namespace != runtime.namespace || state.embed_url != runtime.embedding.endpoint {
+        bail!(
+            "gpu_unverified: embedding runtime state does not match selected namespace and endpoint"
+        );
+    }
+    Ok(state)
+}
+
+fn embedding_accelerator_request_from_runtime_state(
+    state: &ExactEmbeddingRuntimeState,
+) -> Result<EmbeddingAcceleratorRequest> {
+    let provider = state
+        .embedding_accelerator_request_provider
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!("gpu_unverified: embedding runtime state has no requested provider")
+        })?;
+    let device = state
+        .embedding_accelerator_request_device
+        .clone()
+        .or_else(|| {
+            state
+                .embedding_launch
+                .as_ref()
+                .and_then(|launch| launch.requested_device.clone())
+        });
+    Ok(EmbeddingAcceleratorRequest {
+        provider,
+        device,
+        n_gpu_layers: String::new(),
+    })
+}
+
+fn evaluate_embedding_accelerator_smoke(
+    probe: EmbeddingRuntimeProbe,
+    device: EmbeddingDeviceReadiness,
+    log_proven: bool,
+) -> Result<Option<EmbeddingAcceleratorSmoke>> {
+    if device.cpu_allowed {
+        return Ok(None);
+    }
+    let elapsed_ms = probe.elapsed_ms.ok_or_else(|| {
+        anyhow!("gpu_unverified: embedding smoke produced no bounded timing evidence")
+    })?;
+    if !probe.reachable || !log_proven || device.observed_state != "accelerated" {
+        bail!(
+            "gpu_unverified: embedding smoke failed before long semantic indexing: reachable={} elapsed_ms={} runtime_log_offload={} requested_provider={} requested_device={}",
+            probe.reachable,
+            elapsed_ms,
+            log_proven,
+            device
+                .accelerator_request_provider
+                .as_deref()
+                .unwrap_or("none"),
+            device
+                .accelerator_request_device
+                .as_deref()
+                .unwrap_or("none")
+        );
+    }
+    Ok(Some(EmbeddingAcceleratorSmoke { elapsed_ms, device }))
+}
+
+fn runtime_log_proves_requested_accelerator(
+    text: &str,
+    request: &EmbeddingAcceleratorRequest,
+) -> bool {
+    let text = text.to_ascii_lowercase();
+    let positive_offload = text
+        .lines()
+        .any(|line| line_reports_gpu_offload(line) == Some(true));
+    let provider = request.provider.to_ascii_lowercase();
+    let provider_seen = text.contains(&provider)
+        || crate::config::selected_llama_sidecar_backend(&request.provider).is_some_and(
+            |backend| {
+                backend
+                    .log_markers
+                    .iter()
+                    .any(|marker| text.contains(&marker.to_ascii_lowercase()))
+            },
+        );
+    let device_seen = request
+        .device
+        .as_deref()
+        .is_none_or(|device| text.contains(&device.to_ascii_lowercase()));
+    positive_offload && provider_seen && device_seen
 }
 
 pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
@@ -1641,6 +1899,7 @@ mod tests {
         );
         assert_eq!(request.provider, "vulkan");
         assert_eq!(request.device.as_deref(), Some("Vulkan0"));
+
         assert_eq!(request.n_gpu_layers, "99");
     }
 
@@ -1778,6 +2037,154 @@ mod tests {
                 "{provider} without offload marker is inconclusive"
             );
         }
+    }
+
+    #[test]
+    fn accelerator_smoke_requires_requested_device_offload_and_timing() {
+        let request = EmbeddingAcceleratorRequest {
+            provider: "vulkan".into(),
+            device: Some("Vulkan0".into()),
+            n_gpu_layers: "99".into(),
+        };
+        assert!(runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\nusing device Vulkan0\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\nusing device Vulkan1\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\nusing device Vulkan0\noffloaded 0/13 layers to GPU\n",
+            &request,
+        ));
+
+        let device = EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "native_log",
+            detected_provider: Some("amd".into()),
+            detected_gpu: Some("AMD GPU".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("vulkan".into()),
+            accelerator_request_device: Some("Vulkan0".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        };
+        let error = evaluate_embedding_accelerator_smoke(
+            EmbeddingRuntimeProbe {
+                reachable: true,
+                detail: "reachable".into(),
+                elapsed_ms: None,
+            },
+            device,
+            true,
+        )
+        .expect_err("missing timing must not verify accelerator work");
+        assert!(error.to_string().contains("gpu_unverified"));
+    }
+
+    #[test]
+    fn container_identity_requires_running_state() {
+        assert_eq!(
+            validate_running_embedding_container_identity("abc|2026-07-12T00:00:00Z|true\n")
+                .expect("running identity"),
+            "abc|2026-07-12T00:00:00Z|true"
+        );
+        assert!(
+            validate_running_embedding_container_identity("abc|2026-07-12T00:00:00Z|false")
+                .expect_err("stopped container must fail")
+                .to_string()
+                .contains("not running")
+        );
+    }
+
+    #[test]
+    fn accelerator_smoke_fails_closed_before_rebuild_when_log_is_unproven() {
+        let device = EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "native_device_list",
+            detected_provider: Some("amd".into()),
+            detected_gpu: Some("AMD GPU".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("vulkan".into()),
+            accelerator_request_device: Some("Vulkan0".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        };
+        let error = evaluate_embedding_accelerator_smoke(
+            EmbeddingRuntimeProbe {
+                reachable: true,
+                detail: "reachable".into(),
+                elapsed_ms: Some(12),
+            },
+            device,
+            false,
+        )
+        .expect_err("inventory plus a reachable endpoint is not GPU proof");
+        let message = error.to_string();
+        assert!(message.contains("gpu_unverified"));
+        assert!(message.contains("runtime_log_offload=false"));
+    }
+
+    #[test]
+    fn accelerator_smoke_request_is_bound_to_selected_runtime_state() {
+        let root = tempfile::tempdir().expect("runtime state dir");
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.namespace = "agent-proof".into();
+        runtime.layout.state_file = root.path().join("retrieval-sidecars.json");
+        runtime.embedding.endpoint = "http://127.0.0.1:39001/v1/embeddings".into();
+        std::fs::write(
+            &runtime.layout.state_file,
+            serde_json::json!({
+                "namespace": runtime.namespace,
+                "embed_url": runtime.embedding.endpoint,
+                "embedding_accelerator_request_provider": "vulkan",
+                "embedding_accelerator_request_device": "Vulkan0"
+            })
+            .to_string(),
+        )
+        .expect("write runtime state");
+
+        let state = exact_embedding_runtime_state(&runtime).expect("matching runtime state");
+        let request =
+            embedding_accelerator_request_from_runtime_state(&state).expect("persisted request");
+        assert_eq!(request.provider, "vulkan");
+        assert_eq!(request.device.as_deref(), Some("Vulkan0"));
+
+        let mut missing_provider = state;
+        missing_provider.embedding_accelerator_request_provider = None;
+        assert!(
+            embedding_accelerator_request_from_runtime_state(&missing_provider)
+                .expect_err("launch provider is not an accelerator request")
+                .to_string()
+                .contains("no requested provider")
+        );
+
+        runtime.namespace = "other-agent".into();
+        let error = exact_embedding_runtime_state(&runtime)
+            .expect_err("cross-namespace state must fail closed");
+        assert!(error.to_string().contains("gpu_unverified"));
+    }
+
+    #[test]
+    fn accelerator_smoke_reports_external_runtime_proof_boundary() {
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.embedding.server_launch = Some("external_endpoint".into());
+        runtime.embedding.endpoint = "http://127.0.0.1:39002/v1/embeddings".into();
+        runtime.embedding.endpoint_origin =
+            crate::config::EmbeddingEndpointOrigin::TrustedProjectConfig;
+        runtime.embedding.device_policy = "accelerator_required".into();
+
+        let error = ensure_embedding_accelerator_smoke_for_runtime(&runtime)
+            .expect_err("external endpoint has no CodeStory-owned runtime log proof");
+        let message = error.to_string();
+        assert!(message.contains("gpu_unverified"));
+        assert!(message.contains("external embedding endpoints"));
+        assert!(!message.contains("docker"));
     }
 
     #[test]

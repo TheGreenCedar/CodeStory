@@ -64,12 +64,14 @@ pub use config::{
     active_test_cache_root, enable_automatic_test_cache_root_for_process, with_test_cache_root,
 };
 pub use embeddings::{
-    BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingRuntimeProbe,
-    LlamaCppEmbeddingClient, RETRIEVAL_EMBEDDING_DIM, embed_documents_for_runtime,
-    embed_query_for_runtime, embedding_backend_label, embedding_backend_label_for_runtime,
-    embedding_runtime_id, embedding_runtime_id_for_runtime, ensure_product_embedding_backend,
-    ensure_product_embedding_backend_for_runtime, probe_product_embedding_runtime,
-    probe_product_embedding_runtime_for_runtime, qdrant_vector_dim,
+    BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingAcceleratorSmoke,
+    EmbeddingDeviceReadiness, EmbeddingRuntimeProbe, LlamaCppEmbeddingClient,
+    RETRIEVAL_EMBEDDING_DIM, embed_documents_for_runtime, embed_query_for_runtime,
+    embedding_backend_label, embedding_backend_label_for_runtime, embedding_runtime_id,
+    embedding_runtime_id_for_runtime, ensure_embedding_accelerator_smoke_for_runtime,
+    ensure_product_embedding_backend, ensure_product_embedding_backend_for_runtime,
+    probe_product_embedding_runtime, probe_product_embedding_runtime_for_runtime,
+    qdrant_vector_dim,
 };
 pub use executor::{
     QueryExecutor, QueryResult, QueryTrace, StageCompletionStatus, StageTrace, cancellation_flag,

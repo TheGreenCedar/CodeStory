@@ -246,6 +246,10 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     ensure_retrieval_index_embedding_policy(&sidecar)?;
+    if sidecar.profile == SidecarProfile::Agent {
+        codestory_retrieval::ensure_embedding_accelerator_smoke_for_runtime(&sidecar)
+            .context("retrieval index GPU pre-repair gate")?;
+    }
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
     let outcome =
         finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar).or_else(|error| {

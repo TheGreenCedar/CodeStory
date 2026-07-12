@@ -227,6 +227,15 @@ Plain `codestory-cli index` builds the core SQLite code index only. It can make
 local navigation usable, but it does not generate sidecar artifacts or prove
 packet/search readiness.
 
+Before an Agent-profile semantic rebuild starts, CodeStory sends one small
+embedding request through the selected sidecar runtime. Accelerator-required
+policy proceeds only when the request has bounded timing and the current
+runtime log proves positive offload for the requested provider and device;
+otherwise it exits early with `gpu_unverified`. CPU-allowed policy remains an
+explicit degraded path. Accelerator-required external endpoints also remain
+`gpu_unverified` because CodeStory cannot bind their provider-owned runtime logs
+to the request; use a CodeStory-managed runtime for verified accelerator proof.
+
 Run the full sidecar path for the target workspace:
 
 ```sh

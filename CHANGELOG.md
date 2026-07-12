@@ -24,6 +24,11 @@
   and the next owned sidecar publication rewrites it in canonical form;
   rebuilding remains the fail-closed recovery when legacy state does not match
   the current cache.
+- Made agent sidecar rebuilds fail fast with `gpu_unverified` unless a tiny
+  embedding request against the selected runtime completes with bounded timing
+  and the current runtime log proves positive offload for the requested
+  accelerator provider and device. Device inventory alone no longer permits a
+  long semantic rebuild.
 - Made sidecar generation GC root every current and rollback manifest across
   the shared cache scope instead of collapsing rollback evidence to one latest
   generation. Inventory now reports active, rollback, building, and reclaimable

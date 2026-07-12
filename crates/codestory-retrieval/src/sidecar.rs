@@ -165,6 +165,20 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     Ok(state)
 }
 
+pub(crate) fn persist_embedding_container_identity(path: &Path, identity: &str) -> Result<()> {
+    let mut value: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path).with_context(|| format!("read sidecar state {}", path.display()))?,
+    )
+    .with_context(|| format!("parse sidecar state {}", path.display()))?;
+    value
+        .as_object_mut()
+        .context("sidecar state must be an object")?
+        .insert("embedding_container_identity".into(), identity.into());
+    let json = serde_json::to_vec_pretty(&value).context("serialize sidecar state")?;
+    codestory_workspace::atomic_file::write_bytes_atomic(path, "retrieval-sidecars", &json)
+        .context("persist embedding container identity")
+}
+
 fn cleanup_owned_legacy_zoekt(layout: &SidecarLayout) -> Result<()> {
     let Ok(raw) = std::fs::read_to_string(&layout.state_file) else {
         return Ok(());
@@ -1237,6 +1251,36 @@ mod tests {
         let root = TempDir::new().expect("root");
         let runtime = test_runtime(&root);
         sidecar_up_with_runtime(&runtime, None).expect("initial state");
+        persist_embedding_container_identity(
+            &runtime.layout.state_file,
+            "container-id|2026-07-12T00:00:00Z|true",
+        )
+        .expect("persist initial container identity");
+        let initial_raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&runtime.layout.state_file).expect("read initial state"),
+        )
+        .expect("initial state json");
+        assert_eq!(
+            initial_raw
+                .get("embedding_container_identity")
+                .and_then(|value| value.as_str()),
+            Some("container-id|2026-07-12T00:00:00Z|true")
+        );
+        persist_embedding_container_identity(
+            &runtime.layout.state_file,
+            "recreated-id|2026-07-12T00:01:00Z|true",
+        )
+        .expect("replace recreated container identity");
+        let refreshed_raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&runtime.layout.state_file).expect("read refreshed state"),
+        )
+        .expect("refreshed state json");
+        assert_eq!(
+            refreshed_raw
+                .get("embedding_container_identity")
+                .and_then(|value| value.as_str()),
+            Some("recreated-id|2026-07-12T00:01:00Z|true")
+        );
         sidecar_up_with_runtime(&runtime, None).expect("replacement state");
 
         let state = read_sidecar_state(&runtime.layout.state_file).expect("parse state");
@@ -1248,6 +1292,7 @@ mod tests {
         assert!(raw.get("zoekt_data_dir").is_none());
         assert!(raw.get("zoekt_http_port").is_none());
         assert!(raw.pointer("/sidecar_images/zoekt").is_none());
+        assert!(raw.get("embedding_container_identity").is_none());
         assert!(
             std::fs::read_dir(root.path())
                 .expect("read root")

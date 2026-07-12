@@ -344,6 +344,11 @@ pub fn bootstrap_sidecars_with_runtime_progress(
         }
     }
 
+    if compose_started && launch_mode == EmbeddingServerLaunchMode::DockerComposeEmbed {
+        let identity = crate::embeddings::running_embedding_container_identity(runtime)?;
+        crate::sidecar::persist_embedding_container_identity(&layout.state_file, &identity)?;
+    }
+
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
         &layout,
