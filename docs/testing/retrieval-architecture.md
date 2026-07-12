@@ -171,6 +171,12 @@ wait separately, report execution duration only after completion, and classify
 completed, skipped, cancelled-before-start, pending-after-deadline, and
 observed-late work. Post-return completions are logged and discarded. Any cancelled or late
 result remains diagnostic and is never inserted into the retrieval cache.
+Each runnable stage may use elapsed request slack after reserving the planned budgets of later
+stages, and the final planned stage may use whatever request budget remains. This keeps every lane
+bounded without stranding time in static allowances. Traces report each effective deadline, and
+the total request deadline still bounds cancellation and cache eligibility. Once a stage records
+a blocking deadline, later request-deadline or marginal-gain exits retain that first reason so
+partial results cannot become packet-eligible or cacheable.
 
 **Modes:** See the canonical
 [mode matrix](../architecture/retrieval-design.md#mode-matrix). Only `full` may

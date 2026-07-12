@@ -404,12 +404,12 @@ impl<'a> QueryExecutor<'a> {
     ) -> Result<Option<String>> {
         let mut low_gain_streak = 0u32;
         let mut cancel_reason = None;
-        for stage in stages {
+        for (index, stage) in stages.iter().enumerate() {
             if self.cancelled.load(Ordering::Relaxed) {
                 return Ok(Some("cancelled".into()));
             }
             if Instant::now() >= deadline {
-                return Ok(Some("deadline".into()));
+                return Ok(Some(cancel_reason.unwrap_or_else(|| "deadline".into())));
             }
 
             if should_skip_after_exact_symbol_anchor(stage, features, candidates) {
@@ -441,10 +441,27 @@ impl<'a> QueryExecutor<'a> {
                 continue;
             }
 
+            let mut stage = stage.clone();
+            let remaining_budget_ms = u64::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+            .max(1);
+            let later_stage_reserve_ms = stages[index + 1..]
+                .iter()
+                .map(|stage| stage.budget_ms)
+                .sum::<u64>();
+            stage.budget_ms = stage
+                .budget_ms
+                .max(remaining_budget_ms.saturating_sub(later_stage_reserve_ms))
+                .min(remaining_budget_ms);
+
             let stage_started = Instant::now();
             let before_score = candidate_mass(candidates);
             let (mut stage_hits, admission_wait_ms, queue_wait_ms, execution_ms) =
-                match self.run_stage_bounded(stage, features, candidates, deadline)? {
+                match self.run_stage_bounded(&stage, features, candidates, deadline)? {
                     StageRun::Completed {
                         hits,
                         admission_wait_ms,
@@ -459,7 +476,7 @@ impl<'a> QueryExecutor<'a> {
                         completion_status,
                     } => {
                         let mut trace = stage_trace(
-                            stage,
+                            &stage,
                             stage_started.elapsed().as_millis() as u64,
                             0,
                             0.0,
@@ -476,7 +493,7 @@ impl<'a> QueryExecutor<'a> {
                         continue;
                     }
                 };
-            annotate_stage_provenance(stage, &mut stage_hits);
+            annotate_stage_provenance(&stage, &mut stage_hits);
             let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_hits);
             let added = merge_candidates(candidates, stage_hits);
             let after_score = candidate_mass(candidates);
@@ -487,7 +504,7 @@ impl<'a> QueryExecutor<'a> {
             };
 
             let mut trace = stage_trace(
-                stage,
+                &stage,
                 stage_started.elapsed().as_millis() as u64,
                 added,
                 marginal_gain,
@@ -504,7 +521,9 @@ impl<'a> QueryExecutor<'a> {
                 if marginal_gain < threshold && !candidates.is_empty() {
                     low_gain_streak += 1;
                     if low_gain_streak >= options.stop_after_low_gain_streak {
-                        return Ok(Some("marginal_gain".into()));
+                        return Ok(Some(
+                            cancel_reason.unwrap_or_else(|| "marginal_gain".into()),
+                        ));
                     }
                 } else {
                     low_gain_streak = 0;
@@ -1159,6 +1178,17 @@ mod tests {
             .collect();
         assert!(skipped.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
         assert!(skipped.contains(&RetrievalStageKind::Stage2ScipExpand));
+        let skipped_final = result
+            .trace
+            .stages
+            .iter()
+            .find(|stage| stage.stage == RetrievalStageKind::Stage1bQdrantSemantic)
+            .expect("skipped final stage");
+        assert_eq!(skipped_final.budget_ms, 120);
+        assert_eq!(
+            skipped_final.completion_status,
+            StageCompletionStatus::Skipped
+        );
     }
 
     #[test]
@@ -1465,6 +1495,166 @@ mod tests {
     }
 
     #[test]
+    fn graph_stage_uses_remaining_total_budget_across_query_orders() {
+        struct LateUsefulGraphSidecars;
+
+        impl SidecarSearch for LateUsefulGraphSidecars {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(110));
+                Ok(vec![CandidateHit::with_source(
+                    "src/lexical.rs",
+                    Some("LiveSidecarSearch".into()),
+                    0.7,
+                    CandidateSource::Lexical,
+                )])
+            }
+
+            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(vec![CandidateHit::with_source(
+                    "src/dense.rs",
+                    Some("ReadinessInputs".into()),
+                    0.8,
+                    CandidateSource::Qdrant,
+                )])
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(70));
+                Ok(vec![CandidateHit::with_source(
+                    "src/scip_anchor.rs",
+                    Some("RuntimeAnchor".into()),
+                    0.75,
+                    CandidateSource::Scip,
+                )])
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                std::thread::sleep(Duration::from_millis(220));
+                Ok(vec![CandidateHit::with_source(
+                    "src/graph_neighbor.rs",
+                    Some("PackagedAgentReadiness".into()),
+                    0.9,
+                    CandidateSource::Scip,
+                )])
+            }
+        }
+
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(LateUsefulGraphSidecars),
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let result = executor
+            .execute(
+                "Explain how LiveSidecarSearch validates packaged agent readiness",
+                Some(1_000),
+            )
+            .expect("query");
+
+        assert_eq!(
+            result.features.shape,
+            crate::query_features::QueryShape::Mixed
+        );
+        assert_eq!(result.trace.cancel_reason, None);
+        for kind in [
+            RetrievalStageKind::Stage1Lexical,
+            RetrievalStageKind::Stage1bQdrantSemantic,
+        ] {
+            let stage = result
+                .trace
+                .stages
+                .iter()
+                .find(|stage| stage.stage == kind)
+                .expect("completed anchor stage");
+            assert_eq!(stage.completion_status, StageCompletionStatus::Completed);
+            assert!(stage.candidates_added > 0);
+        }
+        let graph = result
+            .trace
+            .stages
+            .iter()
+            .find(|stage| stage.stage == RetrievalStageKind::Stage2ScipExpand)
+            .expect("graph stage");
+        assert_eq!(graph.completion_status, StageCompletionStatus::Completed);
+        assert!(
+            graph.budget_ms > 180,
+            "graph stage should receive prior stage slack: {graph:?}"
+        );
+        assert!(result.hits.iter().any(|hit| {
+            hit.file_path == "src/graph_neighbor.rs"
+                && hit.provenance.iter().any(|value| value == "graph_neighbor")
+        }));
+
+        let result = executor
+            .execute("RuntimeContext", Some(1_000))
+            .expect("query");
+        assert_eq!(
+            result.features.shape,
+            crate::query_features::QueryShape::SymbolLike
+        );
+        assert_eq!(result.trace.cancel_reason, None);
+        for (kind, static_budget) in [
+            (RetrievalStageKind::Stage0ScipAnchor, 40),
+            (RetrievalStageKind::Stage1Lexical, 80),
+            (RetrievalStageKind::Stage2ScipExpand, 180),
+        ] {
+            let stage = result
+                .trace
+                .stages
+                .iter()
+                .find(|stage| stage.stage == kind)
+                .expect("reserve-expanded stage");
+            assert_eq!(stage.completion_status, StageCompletionStatus::Completed);
+            assert!(
+                stage.budget_ms > static_budget,
+                "stage should borrow slack while preserving later reserves: {stage:?}"
+            );
+        }
+        let graph_index = result
+            .trace
+            .stages
+            .iter()
+            .position(|stage| stage.stage == RetrievalStageKind::Stage2ScipExpand)
+            .expect("graph stage");
+        let dense_index = result
+            .trace
+            .stages
+            .iter()
+            .position(|stage| stage.stage == RetrievalStageKind::Stage1bQdrantSemantic)
+            .expect("dense stage");
+        assert!(graph_index < dense_index);
+        let graph = &result.trace.stages[graph_index];
+        assert_eq!(graph.completion_status, StageCompletionStatus::Completed);
+        assert!(
+            graph.budget_ms > 180,
+            "graph stage should borrow slack while reserving dense time: {graph:?}"
+        );
+        assert_eq!(
+            result.trace.stages[dense_index].completion_status,
+            StageCompletionStatus::Completed
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/graph_neighbor.rs")
+        );
+        let cached = executor
+            .execute("RuntimeContext", Some(1_000))
+            .expect("cache");
+        assert!(cached.trace.cache_hit);
+        assert!(cached.trace.stages.is_empty());
+    }
+
+    #[test]
     fn broad_query_expands_dense_anchors_before_ranking_window() {
         struct DenseAnchorExpandSidecars;
 
@@ -1625,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn non_broad_queries_stop_between_stages_after_total_deadline() {
+    fn non_broad_stage_deadline_remains_blocking_after_later_stages() {
         struct SlowScipAnchorSidecars;
 
         impl SidecarSearch for SlowScipAnchorSidecars {
@@ -1643,13 +1833,24 @@ mod tests {
             }
 
             fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
-                std::thread::sleep(Duration::from_millis(30));
                 Ok(vec![CandidateHit::with_source(
                     "src/anchor.rs",
                     Some("OtherAnchor".into()),
                     0.7,
                     CandidateSource::Scip,
                 )])
+            }
+
+            fn scip_anchor_with_context(
+                &self,
+                query: &str,
+                limit: usize,
+                context: &SearchExecutionContext,
+            ) -> Result<Vec<CandidateHit>> {
+                while !context.is_cancelled() {
+                    std::hint::spin_loop();
+                }
+                self.scip_anchor(query, limit)
             }
 
             fn scip_expand(
@@ -1672,10 +1873,11 @@ mod tests {
         };
         let result = executor.execute("EventProcessor", Some(10)).expect("query");
 
-        assert!(matches!(
-            result.trace.cancel_reason.as_deref(),
-            Some("deadline" | "stage_deadline")
-        ));
+        assert!(
+            result.trace.cancel_reason.as_deref() == Some("stage_deadline"),
+            "request deadline should remain fail-closed: {:?}",
+            result.trace
+        );
         assert!(
             result.trace.stages.is_empty()
                 || result
@@ -1688,21 +1890,14 @@ mod tests {
         );
         assert!(
             result
-                .trace
-                .stages
-                .iter()
-                .all(|stage| stage.stage != RetrievalStageKind::Stage1Lexical),
-            "later non-broad stages must not start after total budget is spent: {:?}",
-            result.trace.stages
-        );
-        assert!(
-            result
                 .hits
                 .iter()
-                .all(|hit| hit.file_path != "src/late_lexical.rs"),
-            "late lexical hit should not be collected after sequence deadline: {:?}",
+                .all(|hit| hit.file_path != "src/anchor.rs"),
+            "timed-out anchor hit must not merge late into the partial query: {:?}",
             result.hits
         );
+        drop(executor);
+        assert!(cache.is_empty(), "partial query must remain uncached");
     }
 
     #[test]
