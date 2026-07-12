@@ -7,6 +7,14 @@
 - Renewed live local-refresh ownership during long incremental indexing, with
   token, PID, and process-start checks that prevent stale workers from
   overwriting changed ownership or terminal status.
+- Replaced permanent Agent sidecar port reservations with renewable,
+  namespace-scoped owner leases. Allocation and renewal serialize under the
+  registry lock, reclaim expired or missing owners only when ports are free,
+  recover a malformed compact registry from atomic per-namespace lease records,
+  and prune inactive history plus empty namespace directories so long-running
+  caches remain bounded. Each immutable runtime retains its owner token and
+  must present it on renewal, while long bootstrap phases keep the lease alive
+  with a bounded heartbeat. Owner tokens, not PIDs alone, establish identity.
 - Kept packaged local-retrieval proof commands in the local default runtime
   namespace so the cross-platform gate validates a real local handoff before
   exercising agent readiness.

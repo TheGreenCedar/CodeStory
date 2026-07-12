@@ -21,6 +21,7 @@ rusqlite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ureq = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

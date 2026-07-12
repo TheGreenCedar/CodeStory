@@ -38,7 +38,12 @@ pub const NATIVE_LLAMA_MANAGED_CACHE_REL_PATH: &str =
 pub const NATIVE_LLAMA_SOURCE_CACHE_REL_PATH: &str = "target/llamacpp/b8840/llama-server.exe";
 const LLAMA_SIDECAR_BACKENDS_JSON: &str = include_str!("../assets/llama-sidecar-backends.json");
 const TEST_HOST_PLATFORM_ENV: &str = "CODESTORY_TEST_HOST_PLATFORM";
-const AGENT_PORT_RESERVATION_GRACE: Duration = Duration::from_secs(10 * 60);
+const AGENT_PORT_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
+const AGENT_PORT_REGISTRY_SCHEMA_VERSION: u32 = 2;
+#[cfg(test)]
+const PORT_LEASE_ABORT_BASE_ENV: &str = "CODESTORY_TEST_PORT_LEASE_ABORT_BASE";
+#[cfg(test)]
+const PORT_LEASE_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PORT_LEASE_ABORT_SENTINEL";
 const RUNTIME_ENV_KEYS: &[&str] = &[
     "CODESTORY_RETRIEVAL_PROFILE",
     "CODESTORY_SIDECAR_PROFILE",
@@ -334,6 +339,52 @@ pub struct SidecarRuntimeConfig {
     pub embedding: EmbeddingRuntimeConfig,
     pub retrieval: RetrievalRuntimeConfig,
     pub summary: SummaryRuntimeConfig,
+    #[doc(hidden)]
+    pub port_lease_owner_id: Option<AgentPortLeaseOwnerToken>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentPortLeaseOwnerToken(String);
+
+impl std::fmt::Debug for AgentPortLeaseOwnerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
+}
+
+pub(crate) struct AgentPortLeaseHeartbeat {
+    stop: Option<std::sync::mpsc::SyncSender<()>>,
+    worker: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl AgentPortLeaseHeartbeat {
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.stop_worker();
+        self.join_worker()
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.try_send(());
+        }
+    }
+
+    fn join_worker(&mut self) -> Result<()> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("agent sidecar port lease heartbeat panicked"))?
+    }
+}
+
+impl Drop for AgentPortLeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop_worker();
+        let _ = self.join_worker();
+    }
 }
 
 impl SidecarLayout {
@@ -512,7 +563,6 @@ impl SidecarRuntimeConfig {
                 .join("retrieval-sidecars.json"),
         };
         let stored = read_ports_from_state(&state_file);
-        let dynamic = profile == SidecarProfile::Agent && stored.is_none();
         let configured_ports = [
             env_port(
                 defaults,
@@ -526,11 +576,20 @@ impl SidecarRuntimeConfig {
             ),
             env_port(defaults, "CODESTORY_EMBED_PORT", DEFAULT_EMBED_HTTP_PORT),
         ];
-        let dynamic_ports =
-            dynamic.then(|| dynamic_agent_ports(&base, &namespace, configured_ports));
-        let dynamic_failed = dynamic_ports.as_ref().is_some_and(|ports| {
-            [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http].contains(&0)
+        let requested_ports = std::array::from_fn(|index| {
+            configured_ports[index].or_else(|| {
+                stored.as_ref().map(|ports| match index {
+                    0 => ports.qdrant_http,
+                    1 => ports.qdrant_grpc,
+                    _ => ports.embed_http,
+                })
+            })
         });
+        let agent_allocation = (profile == SidecarProfile::Agent)
+            .then(|| dynamic_agent_ports(&base, &namespace, requested_ports));
+        let dynamic_failed = agent_allocation
+            .as_ref()
+            .is_some_and(AgentPortAllocation::failed);
         let selected_port =
             |configured: Option<u16>, stored: Option<u16>, dynamic: Option<u16>, default| {
                 if dynamic_failed {
@@ -542,19 +601,25 @@ impl SidecarRuntimeConfig {
         let qdrant_http_port = selected_port(
             configured_ports[0],
             stored.as_ref().map(|ports| ports.qdrant_http),
-            dynamic_ports.as_ref().map(|ports| ports.qdrant_http),
+            agent_allocation
+                .as_ref()
+                .map(|allocation| allocation.ports.qdrant_http),
             DEFAULT_QDRANT_HTTP_PORT,
         );
         let qdrant_grpc_port = selected_port(
             configured_ports[1],
             stored.as_ref().map(|ports| ports.qdrant_grpc),
-            dynamic_ports.as_ref().map(|ports| ports.qdrant_grpc),
+            agent_allocation
+                .as_ref()
+                .map(|allocation| allocation.ports.qdrant_grpc),
             DEFAULT_QDRANT_GRPC_PORT,
         );
         let embed_http_port = selected_port(
             configured_ports[2],
             stored.as_ref().map(|ports| ports.embed_http),
-            dynamic_ports.as_ref().map(|ports| ports.embed_http),
+            agent_allocation
+                .as_ref()
+                .map(|allocation| allocation.ports.embed_http),
             DEFAULT_EMBED_HTTP_PORT,
         );
         let root = match profile {
@@ -610,6 +675,10 @@ impl SidecarRuntimeConfig {
         let embedding = embedding_runtime_config(embed_http_port, defaults, overrides);
         let retrieval = retrieval_runtime_config(defaults, overrides);
         let summary = summary_runtime_config(defaults, overrides);
+        let port_lease_owner_id = agent_allocation
+            .as_ref()
+            .filter(|allocation| !allocation.failed())
+            .map(|allocation| AgentPortLeaseOwnerToken(allocation.owner_id.clone()));
         Self {
             project_identity,
             layout,
@@ -623,6 +692,7 @@ impl SidecarRuntimeConfig {
             embedding,
             retrieval,
             summary,
+            port_lease_owner_id,
         }
     }
 
@@ -659,7 +729,79 @@ impl SidecarRuntimeConfig {
                 "agent sidecar port allocation is unavailable; inspect sidecars/port-allocations.json and retry"
             );
         }
+        if self.profile == SidecarProfile::Agent {
+            let owner_id = self
+                .port_lease_owner_id
+                .as_ref()
+                .map(|token| token.0.as_str())
+                .context("agent sidecar runtime has no port lease owner token")?;
+            let cache_root = self
+                .layout
+                .state_file
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .context("agent sidecar state path has no cache root")?;
+            renew_agent_port_lease(
+                cache_root,
+                &self.namespace,
+                owner_id,
+                &self.ownership().ports,
+            )?;
+        }
         Ok(())
+    }
+
+    pub(crate) fn start_port_lease_heartbeat(&self) -> Result<AgentPortLeaseHeartbeat> {
+        self.start_port_lease_heartbeat_with_interval(AGENT_PORT_LEASE_TTL / 3)
+    }
+
+    fn start_port_lease_heartbeat_with_interval(
+        &self,
+        interval: Duration,
+    ) -> Result<AgentPortLeaseHeartbeat> {
+        self.ensure_ports_allocated()?;
+        if self.profile != SidecarProfile::Agent {
+            return Ok(AgentPortLeaseHeartbeat {
+                stop: None,
+                worker: None,
+            });
+        }
+        let base = self
+            .layout
+            .state_file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("agent sidecar state path has no cache root")?
+            .to_path_buf();
+        let namespace = self.namespace.clone();
+        let owner_id = self
+            .port_lease_owner_id
+            .as_ref()
+            .map(|token| token.0.clone())
+            .context("agent sidecar runtime has no port lease owner token")?;
+        let ports = self.ownership().ports;
+        let (stop, stopped) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("codestory-port-lease-heartbeat".into())
+            .spawn(move || {
+                loop {
+                    match stopped.recv_timeout(interval) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Ok(());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            renew_agent_port_lease(&base, &namespace, &owner_id, &ports)?;
+                        }
+                    }
+                }
+            })
+            .context("spawn agent sidecar port lease heartbeat")?;
+        Ok(AgentPortLeaseHeartbeat {
+            stop: Some(stop),
+            worker: Some(worker),
+        })
     }
 
     pub fn with_profile_and_run_id(
@@ -1028,8 +1170,12 @@ fn agent_namespace_prefix(project_root: &Path) -> String {
 }
 
 fn latest_agent_run_id(project_root: &Path) -> Option<String> {
+    latest_agent_run_id_in_cache(project_root, &user_cache_root())
+}
+
+fn latest_agent_run_id_in_cache(project_root: &Path, cache_root: &Path) -> Option<String> {
     let prefix = agent_namespace_prefix(project_root);
-    let sidecars_root = user_cache_root().join("sidecars");
+    let sidecars_root = cache_root.join("sidecars");
     let entries = std::fs::read_dir(sidecars_root).ok()?;
     let mut newest: Option<(std::time::SystemTime, String)> = None;
     for entry in entries.flatten() {
@@ -1115,6 +1261,10 @@ fn normalized_label_component(value: &str) -> Option<String> {
 fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
     let value =
         serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()?;
+    sidecar_ports_from_value(&value)
+}
+
+fn sidecar_ports_from_value(value: &serde_json::Value) -> Option<SidecarPorts> {
     Some(SidecarPorts {
         qdrant_http: value.get("qdrant_http_port")?.as_u64()?.try_into().ok()?,
         qdrant_grpc: value.get("qdrant_grpc_port")?.as_u64()?.try_into().ok()?,
@@ -1131,25 +1281,94 @@ fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
     })
 }
 
-fn dynamic_agent_ports(base: &Path, namespace: &str, configured: [Option<u16>; 3]) -> SidecarPorts {
+fn dynamic_agent_ports(
+    base: &Path,
+    namespace: &str,
+    configured: [Option<u16>; 3],
+) -> AgentPortAllocation {
     allocate_agent_ports_in_registry(base, namespace, configured).unwrap_or_else(|error| {
         eprintln!(
             "CodeStory sidecar port allocation failed closed: namespace={namespace} error={error:#}"
         );
-        SidecarPorts {
-            qdrant_http: 0,
-            qdrant_grpc: 0,
-            embed_http: 0,
-            embed_url: SidecarLayout::embed_base_url(0),
+        AgentPortAllocation {
+            ports: SidecarPorts {
+                qdrant_http: 0,
+                qdrant_grpc: 0,
+                embed_http: 0,
+                embed_url: SidecarLayout::embed_base_url(0),
+            },
+            owner_id: String::new(),
         }
     })
+}
+
+#[derive(Debug, Clone)]
+struct AgentPortAllocation {
+    ports: SidecarPorts,
+    owner_id: String,
+}
+
+impl AgentPortAllocation {
+    fn failed(&self) -> bool {
+        self.owner_id.is_empty()
+            || [
+                self.ports.qdrant_http,
+                self.ports.qdrant_grpc,
+                self.ports.embed_http,
+            ]
+            .contains(&0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentPortOwner {
+    id: String,
+    process_id: u32,
+    created_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentPortLease {
+    namespace: String,
+    owner: AgentPortOwner,
+    acquired_at_epoch_ms: i64,
+    renewed_at_epoch_ms: i64,
+    expires_at_epoch_ms: i64,
+    ports: SidecarPorts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentPortRegistry {
+    schema_version: u32,
+    leases: BTreeMap<String, AgentPortLease>,
+}
+
+impl Default for AgentPortRegistry {
+    fn default() -> Self {
+        Self {
+            schema_version: AGENT_PORT_REGISTRY_SCHEMA_VERSION,
+            leases: BTreeMap::new(),
+        }
+    }
 }
 
 fn allocate_agent_ports_in_registry(
     base: &Path,
     namespace: &str,
     configured: [Option<u16>; 3],
-) -> Result<SidecarPorts> {
+) -> Result<AgentPortAllocation> {
+    allocate_agent_ports_in_registry_at(base, namespace, configured, now_epoch_ms())
+}
+
+fn allocate_agent_ports_in_registry_at(
+    base: &Path,
+    namespace: &str,
+    configured: [Option<u16>; 3],
+    now: i64,
+) -> Result<AgentPortAllocation> {
+    if !is_agent_namespace_path_component(namespace) {
+        anyhow::bail!("agent namespace is not a safe path component");
+    }
     let root = base.join("sidecars");
     std::fs::create_dir_all(&root)
         .with_context(|| format!("create sidecar port registry dir {}", root.display()))?;
@@ -1165,32 +1384,44 @@ fn allocate_agent_ports_in_registry(
         .with_context(|| format!("take sidecar port allocation lock {}", lock_path.display()))?;
 
     let registry_path = root.join("port-allocations.json");
-    let mut registry = read_agent_port_registry(&registry_path)?;
-    let existing = registry.get(namespace).cloned();
-    let current_reservation_is_recent =
-        agent_port_reservation_is_recent(&root, namespace, now_epoch_ms())?;
-    let cleanup = prune_agent_port_registry(&root, namespace, &mut registry);
-    let mut reserved = reserved_registry_ports_excluding(&registry, namespace);
+    let mut registry = read_agent_port_registry(&root, &registry_path)?;
+    let cleanup = prune_agent_port_registry(&root, namespace, &mut registry, now);
+    let existing = registry.leases.get(namespace).cloned();
+    let state_ports = if existing.is_none() {
+        owned_sidecar_state_ports(&root, namespace)?
+    } else {
+        None
+    };
+    let mut reserved = reserved_registry_ports_excluding(&registry.leases, namespace);
     let qdrant_http = select_agent_port(
         configured[0],
-        existing.as_ref().map(|ports| ports.qdrant_http),
+        existing.as_ref().map(|lease| lease.ports.qdrant_http),
         namespace,
         "qdrant-http",
         &mut reserved,
+        state_ports
+            .as_ref()
+            .is_some_and(|ports| Some(ports.qdrant_http) == configured[0]),
     )?;
     let qdrant_grpc = select_agent_port(
         configured[1],
-        existing.as_ref().map(|ports| ports.qdrant_grpc),
+        existing.as_ref().map(|lease| lease.ports.qdrant_grpc),
         namespace,
         "qdrant-grpc",
         &mut reserved,
+        state_ports
+            .as_ref()
+            .is_some_and(|ports| Some(ports.qdrant_grpc) == configured[1]),
     )?;
     let embed_http = select_agent_port(
         configured[2],
-        existing.as_ref().map(|ports| ports.embed_http),
+        existing.as_ref().map(|lease| lease.ports.embed_http),
         namespace,
         "embed",
         &mut reserved,
+        state_ports
+            .as_ref()
+            .is_some_and(|ports| Some(ports.embed_http) == configured[2]),
     )?;
     let ports = SidecarPorts {
         qdrant_http,
@@ -1198,22 +1429,58 @@ fn allocate_agent_ports_in_registry(
         embed_http,
         embed_url: SidecarLayout::embed_base_url(embed_http),
     };
-    let changed = existing.as_ref() != Some(&ports);
-    if changed
-        && existing
-            .as_ref()
-            .is_some_and(|ports| current_reservation_is_recent || sidecar_ports_are_bound(ports))
+    let owner = match existing.as_ref() {
+        Some(lease) if lease.ports != ports => {
+            if lease_is_live(&root, lease, now)? {
+                anyhow::bail!("agent sidecar namespace {namespace} already has a live port lease");
+            }
+            new_agent_port_owner(now)
+        }
+        Some(lease) => match read_agent_port_owner(&root, namespace)? {
+            Some(owner) if owner.id == lease.owner.id => owner,
+            Some(_) | None if sidecar_state_owns_ports(&root, namespace, &lease.ports)? => {
+                new_agent_port_owner(now)
+            }
+            Some(_) | None if sidecar_ports_are_bound(&lease.ports) => {
+                anyhow::bail!(
+                    "agent sidecar namespace {namespace} has bound ports without matching lease ownership"
+                );
+            }
+            Some(_) | None => new_agent_port_owner(now),
+        },
+        None => new_agent_port_owner(now),
+    };
+    let continued_lease = existing
+        .as_ref()
+        .filter(|lease| lease.owner.id == owner.id && lease.ports == ports);
+    let acquired_at_epoch_ms = continued_lease.map_or(now, |lease| lease.acquired_at_epoch_ms);
+    let renewed_at_epoch_ms =
+        continued_lease.map_or(now, |lease| now.max(lease.renewed_at_epoch_ms));
+    let lease = AgentPortLease {
+        namespace: namespace.to_string(),
+        owner: owner.clone(),
+        acquired_at_epoch_ms,
+        renewed_at_epoch_ms,
+        expires_at_epoch_ms: lease_expiry(renewed_at_epoch_ms),
+        ports: ports.clone(),
+    };
+    write_agent_port_owner(&root, namespace, &owner)?;
+    write_agent_port_lease(&root, &lease)?;
+    #[cfg(test)]
+    if std::env::var_os(PORT_LEASE_ABORT_BASE_ENV).as_deref() == Some(base.as_os_str()) {
+        let sentinel = std::env::var_os(PORT_LEASE_ABORT_SENTINEL_ENV)
+            .context("port lease abort sentinel is missing")?;
+        std::fs::write(sentinel, b"lease-persisted")?;
+        std::process::abort();
+    }
+    registry.leases.insert(namespace.to_string(), lease);
+    write_agent_port_registry(&registry_path, &registry)?;
+    if let Err(error) =
+        remove_file_if_present(&legacy_agent_port_reservation_path(&root, namespace))
     {
-        anyhow::bail!(
-            "agent sidecar namespace {namespace} already has an active or recently reserved port allocation"
+        eprintln!(
+            "CodeStory sidecar port cleanup warning: namespace={namespace} failed to remove legacy reservation: {error}"
         );
-    }
-    write_agent_port_reservation(&root, namespace)?;
-    if changed {
-        registry.insert(namespace.to_string(), ports.clone());
-    }
-    if changed || cleanup.pruned > 0 {
-        write_agent_port_registry(&registry_path, &registry)?;
     }
     if cleanup.pruned > 0 || cleanup.failures > 0 {
         eprintln!(
@@ -1230,7 +1497,10 @@ fn allocate_agent_ports_in_registry(
             );
         }
     }
-    Ok(ports)
+    Ok(AgentPortAllocation {
+        ports,
+        owner_id: owner.id,
+    })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1241,44 +1511,52 @@ struct AgentPortRegistryCleanup {
     failure_details: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct AgentPortReservation {
-    reserved_at_epoch_ms: i64,
+fn new_agent_port_owner(now: i64) -> AgentPortOwner {
+    AgentPortOwner {
+        id: uuid::Uuid::new_v4().to_string(),
+        process_id: std::process::id(),
+        created_at_epoch_ms: now,
+    }
 }
 
-fn write_agent_port_reservation(root: &Path, namespace: &str) -> Result<()> {
-    let reservation = AgentPortReservation {
-        reserved_at_epoch_ms: now_epoch_ms(),
-    };
-    let bytes = serde_json::to_vec_pretty(&reservation)?;
+fn lease_expiry(now: i64) -> i64 {
+    now.saturating_add(AGENT_PORT_LEASE_TTL.as_millis() as i64)
+}
+
+fn write_agent_port_owner(root: &Path, namespace: &str, owner: &AgentPortOwner) -> Result<()> {
+    std::fs::create_dir_all(root.join(namespace))
+        .with_context(|| format!("create agent sidecar namespace {namespace}"))?;
+    let bytes = serde_json::to_vec_pretty(owner)?;
     codestory_workspace::atomic_file::write_bytes_atomic(
-        &agent_port_reservation_path(root, namespace),
-        "agent-port-reservation",
+        &agent_port_owner_path(root, namespace),
+        "agent-port-owner",
         &bytes,
     )
-    .with_context(|| format!("write agent port reservation for {namespace}"))
+    .with_context(|| format!("write agent port owner for {namespace}"))
 }
 
-fn agent_port_reservation_is_recent(
-    root: &Path,
-    namespace: &str,
-    now_epoch_ms: i64,
-) -> Result<bool> {
-    let path = agent_port_reservation_path(root, namespace);
+fn read_agent_port_owner(root: &Path, namespace: &str) -> Result<Option<AgentPortOwner>> {
+    let path = agent_port_owner_path(root, namespace);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
-    let reservation: AgentPortReservation =
+    let owner: AgentPortOwner =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    Ok(
-        now_epoch_ms.saturating_sub(reservation.reserved_at_epoch_ms)
-            < AGENT_PORT_RESERVATION_GRACE.as_millis() as i64,
-    )
+    Ok(Some(owner))
 }
 
-fn write_agent_port_registry(path: &Path, registry: &BTreeMap<String, SidecarPorts>) -> Result<()> {
+fn write_agent_port_lease(root: &Path, lease: &AgentPortLease) -> Result<()> {
+    let path = agent_port_lease_path(root, &lease.namespace);
+    std::fs::create_dir_all(path.parent().context("agent port lease has no parent")?)
+        .with_context(|| format!("create sidecar port lease dir for {}", lease.namespace))?;
+    let bytes = serde_json::to_vec_pretty(lease)?;
+    codestory_workspace::atomic_file::write_bytes_atomic(&path, "agent-port-lease", &bytes)
+        .with_context(|| format!("write sidecar port lease {}", path.display()))
+}
+
+fn write_agent_port_registry(path: &Path, registry: &AgentPortRegistry) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(registry)?;
     codestory_workspace::atomic_file::write_bytes_atomic(path, "agent-port-registry", &bytes)
         .with_context(|| format!("write sidecar port allocation registry {}", path.display()))
@@ -1287,28 +1565,50 @@ fn write_agent_port_registry(path: &Path, registry: &BTreeMap<String, SidecarPor
 fn prune_agent_port_registry(
     root: &Path,
     current_namespace: &str,
-    registry: &mut BTreeMap<String, SidecarPorts>,
+    registry: &mut AgentPortRegistry,
+    now: i64,
 ) -> AgentPortRegistryCleanup {
-    let now = now_epoch_ms();
     let mut cleanup = AgentPortRegistryCleanup::default();
-    registry.retain(|namespace, ports| {
+    registry.leases.retain(|namespace, lease| {
         if namespace == current_namespace {
             return true;
         }
-        match agent_port_allocation_is_retained(root, namespace, ports, now) {
+        match lease_is_live(root, lease, now) {
             Ok(true) => {
                 cleanup.retained += 1;
                 true
             }
             Ok(false) => {
                 cleanup.pruned += 1;
-                if let Err(error) =
-                    std::fs::remove_file(agent_port_reservation_path(root, namespace))
+                if let Err(error) = std::fs::remove_file(agent_port_lease_path(root, namespace))
                     && error.kind() != std::io::ErrorKind::NotFound
                 {
                     cleanup.failures += 1;
                     cleanup.record_failure(format!(
                         "namespace={namespace} failed to remove stale reservation: {error}"
+                    ));
+                }
+                if let Err(error) = std::fs::remove_file(agent_port_owner_path(root, namespace))
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    cleanup.failures += 1;
+                    cleanup.record_failure(format!(
+                        "namespace={namespace} failed to remove stale owner: {error}"
+                    ));
+                }
+                if let Err(error) =
+                    std::fs::remove_file(legacy_agent_port_reservation_path(root, namespace))
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    cleanup.failures += 1;
+                    cleanup.record_failure(format!(
+                        "namespace={namespace} failed to remove legacy reservation: {error}"
+                    ));
+                }
+                if let Err(error) = remove_empty_agent_namespace_dir(root, namespace) {
+                    cleanup.failures += 1;
+                    cleanup.record_failure(format!(
+                        "namespace={namespace} failed to remove empty namespace directory: {error}"
                     ));
                 }
                 false
@@ -1333,45 +1633,80 @@ impl AgentPortRegistryCleanup {
     }
 }
 
-fn agent_port_allocation_is_retained(
-    root: &Path,
-    namespace: &str,
-    ports: &SidecarPorts,
-    now_epoch_ms: i64,
-) -> Result<bool> {
+fn lease_is_live(root: &Path, lease: &AgentPortLease, now: i64) -> Result<bool> {
+    let namespace = &lease.namespace;
     if !is_agent_namespace_path_component(namespace) {
         anyhow::bail!("registry namespace is not a safe agent path component");
     }
-    let namespace_root = root.join(namespace);
-    if agent_port_reservation_is_recent(root, namespace, now_epoch_ms)? {
+    let owner = read_agent_port_owner(root, namespace)?;
+    let owner_matches = owner
+        .as_ref()
+        .is_some_and(|owner| owner.id == lease.owner.id);
+    if owner_matches && lease.expires_at_epoch_ms > now {
         return Ok(true);
     }
+    Ok(sidecar_ports_are_bound(&lease.ports))
+}
 
-    let state_path = namespace_root.join("retrieval-sidecars.json");
-    let state_bytes = match std::fs::read(&state_path) {
+fn sidecar_state_owns_ports(root: &Path, namespace: &str, ports: &SidecarPorts) -> Result<bool> {
+    Ok(owned_sidecar_state_ports(root, namespace)?
+        .as_ref()
+        .is_some_and(|state_ports| same_port_numbers(state_ports, ports)))
+}
+
+fn owned_sidecar_state_ports(root: &Path, namespace: &str) -> Result<Option<SidecarPorts>> {
+    let path = root.join(namespace).join("retrieval-sidecars.json");
+    let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(sidecar_ports_are_bound(ports));
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("read {}", state_path.display()));
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
-    let value: serde_json::Value = serde_json::from_slice(&state_bytes)
-        .with_context(|| format!("parse {}", state_path.display()))?;
-    if value.get("owner").and_then(|value| value.as_str()) != Some("codestory")
-        || value.get("namespace").and_then(|value| value.as_str()) != Some(namespace)
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    if value.get("owner").and_then(serde_json::Value::as_str) != Some("codestory")
+        || value.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace)
     {
-        anyhow::bail!("state owner or namespace does not match registry allocation");
+        return Ok(None);
     }
-    let state_ports = sidecar_ports_from_value(&value)
-        .context("state does not contain a complete sidecar port allocation")?;
-    if &state_ports != ports {
-        anyhow::bail!("state ports do not match registry allocation");
+    let state_ports =
+        sidecar_ports_from_value(&value).context("sidecar state has incomplete ports")?;
+    Ok(Some(state_ports))
+}
+
+fn renew_agent_port_lease(
+    base: &Path,
+    namespace: &str,
+    owner_id: &str,
+    ports: &SidecarPorts,
+) -> Result<()> {
+    let root = base.join("sidecars");
+    let lock_path = root.join("port-allocations.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open sidecar port allocation lock {}", lock_path.display()))?;
+    FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("take sidecar port allocation lock {}", lock_path.display()))?;
+    let registry_path = root.join("port-allocations.json");
+    let mut registry = read_agent_port_registry(&root, &registry_path)?;
+    let lease = registry
+        .leases
+        .get_mut(namespace)
+        .with_context(|| format!("agent sidecar namespace {namespace} has no port lease"))?;
+    let owner = read_agent_port_owner(&root, namespace)?
+        .with_context(|| format!("agent sidecar namespace {namespace} has no port owner"))?;
+    if lease.owner.id != owner_id || owner.id != owner_id || !same_port_numbers(&lease.ports, ports)
+    {
+        anyhow::bail!("agent sidecar namespace {namespace} port lease ownership changed");
     }
-    // A valid state file still causes runtime construction to reuse these ports, even if the
-    // owner is temporarily down. Reclaim only after normal teardown removes the state contract.
-    Ok(true)
+    let now = now_epoch_ms().max(lease.renewed_at_epoch_ms);
+    lease.renewed_at_epoch_ms = now;
+    lease.expires_at_epoch_ms = lease_expiry(now);
+    write_agent_port_lease(&root, lease)?;
+    write_agent_port_registry(&registry_path, &registry)
 }
 
 fn is_agent_namespace_path_component(namespace: &str) -> bool {
@@ -1387,18 +1722,46 @@ fn sidecar_ports_are_bound(ports: &SidecarPorts) -> bool {
         .any(|port| !local_port_available(port))
 }
 
-fn agent_port_reservation_path(root: &Path, namespace: &str) -> PathBuf {
+fn same_port_numbers(left: &SidecarPorts, right: &SidecarPorts) -> bool {
+    left.qdrant_http == right.qdrant_http
+        && left.qdrant_grpc == right.qdrant_grpc
+        && left.embed_http == right.embed_http
+}
+
+fn agent_port_owner_path(root: &Path, namespace: &str) -> PathBuf {
+    root.join(namespace).join("port-owner.json")
+}
+
+fn agent_port_lease_path(root: &Path, namespace: &str) -> PathBuf {
+    root.join("port-leases").join(format!("{namespace}.json"))
+}
+
+fn legacy_agent_port_reservation_path(root: &Path, namespace: &str) -> PathBuf {
     root.join(format!(".port-allocation-{namespace}.json"))
 }
 
-fn sidecar_ports_from_value(value: &serde_json::Value) -> Option<SidecarPorts> {
-    let embed_http = value.get("embed_http_port")?.as_u64()?.try_into().ok()?;
-    Some(SidecarPorts {
-        qdrant_http: value.get("qdrant_http_port")?.as_u64()?.try_into().ok()?,
-        qdrant_grpc: value.get("qdrant_grpc_port")?.as_u64()?.try_into().ok()?,
-        embed_http,
-        embed_url: value.get("embed_url")?.as_str().map(ToOwned::to_owned)?,
-    })
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn remove_empty_agent_namespace_dir(root: &Path, namespace: &str) -> Result<()> {
+    let path = root.join(namespace);
+    match std::fs::remove_dir(&path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 fn now_epoch_ms() -> i64 {
@@ -1409,28 +1772,183 @@ fn now_epoch_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn read_agent_port_registry(path: &Path) -> Result<BTreeMap<String, SidecarPorts>> {
+fn read_agent_port_registry(root: &Path, path: &Path) -> Result<AgentPortRegistry> {
     let body = match std::fs::read_to_string(path) {
         Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return recover_agent_port_registry(root, false);
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("read sidecar port allocation registry {}", path.display())
             });
         }
     };
-    serde_json::from_str(&body)
-        .with_context(|| format!("parse sidecar port allocation registry {}", path.display()))
+    if let Ok(registry) = serde_json::from_str::<AgentPortRegistry>(&body) {
+        if registry.schema_version != AGENT_PORT_REGISTRY_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported sidecar port registry schema {}",
+                registry.schema_version
+            );
+        }
+        validate_agent_port_registry(&registry)?;
+        let reconciled = reconcile_agent_port_registry(root, registry.clone())?;
+        if reconciled != registry {
+            write_agent_port_registry(path, &reconciled)?;
+        }
+        return Ok(reconciled);
+    }
+    if let Ok(legacy) = serde_json::from_str::<BTreeMap<String, SidecarPorts>>(&body) {
+        let now = now_epoch_ms();
+        let leases = legacy
+            .into_iter()
+            .map(|(namespace, ports)| {
+                let owner = AgentPortOwner {
+                    id: format!("legacy-{namespace}"),
+                    process_id: 0,
+                    created_at_epoch_ms: now,
+                };
+                (
+                    namespace.clone(),
+                    AgentPortLease {
+                        namespace,
+                        owner,
+                        acquired_at_epoch_ms: 0,
+                        renewed_at_epoch_ms: 0,
+                        expires_at_epoch_ms: 0,
+                        ports,
+                    },
+                )
+            })
+            .collect();
+        let registry = AgentPortRegistry {
+            schema_version: AGENT_PORT_REGISTRY_SCHEMA_VERSION,
+            leases,
+        };
+        validate_agent_port_registry(&registry)?;
+        return reconcile_agent_port_registry(root, registry);
+    }
+    let recovered = recover_agent_port_registry(root, true).with_context(|| {
+        format!(
+            "recover malformed sidecar port allocation registry {}",
+            path.display()
+        )
+    })?;
+    write_agent_port_registry(path, &recovered)?;
+    Ok(recovered)
+}
+
+fn reconcile_agent_port_registry(
+    root: &Path,
+    mut registry: AgentPortRegistry,
+) -> Result<AgentPortRegistry> {
+    for (namespace, recovered) in recover_agent_port_registry(root, false)?.leases {
+        match registry.leases.get(&namespace) {
+            None => {
+                registry.leases.insert(namespace, recovered);
+            }
+            Some(current) if current == &recovered => {}
+            Some(current) if recovered.renewed_at_epoch_ms > current.renewed_at_epoch_ms => {
+                registry.leases.insert(namespace, recovered);
+            }
+            Some(_) => anyhow::bail!(
+                "compact registry disagrees with atomic lease record for namespace {namespace}"
+            ),
+        }
+    }
+    validate_agent_port_registry(&registry)?;
+    Ok(registry)
+}
+
+fn recover_agent_port_registry(root: &Path, require_evidence: bool) -> Result<AgentPortRegistry> {
+    let mut registry = AgentPortRegistry::default();
+    let lease_root = root.join("port-leases");
+    let entries = match std::fs::read_dir(&lease_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !require_evidence => {
+            return Ok(registry);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("malformed registry has no lease records for safe recovery");
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {}", lease_root.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in {}", lease_root.display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())
+            .with_context(|| format!("read sidecar port lease {}", entry.path().display()))?;
+        let lease: AgentPortLease = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse sidecar port lease {}", entry.path().display()))?;
+        if agent_port_lease_path(root, &lease.namespace) != entry.path() {
+            anyhow::bail!("sidecar port lease filename does not match namespace");
+        }
+        if registry
+            .leases
+            .insert(lease.namespace.clone(), lease)
+            .is_some()
+        {
+            anyhow::bail!("duplicate sidecar port lease namespace");
+        }
+    }
+    if require_evidence && registry.leases.is_empty() {
+        anyhow::bail!("malformed registry has no valid lease records for safe recovery");
+    }
+    validate_agent_port_registry(&registry)?;
+    Ok(registry)
+}
+
+fn validate_agent_port_registry(registry: &AgentPortRegistry) -> Result<()> {
+    let mut ports = BTreeSet::new();
+    for (namespace, lease) in &registry.leases {
+        if namespace != &lease.namespace || !is_agent_namespace_path_component(namespace) {
+            anyhow::bail!("sidecar port lease namespace is invalid");
+        }
+        if lease.owner.id.is_empty() {
+            anyhow::bail!("sidecar port lease owner identity is empty");
+        }
+        let legacy_zero_timestamps = lease.owner.process_id == 0
+            && lease.acquired_at_epoch_ms == 0
+            && lease.renewed_at_epoch_ms == 0
+            && lease.expires_at_epoch_ms == 0;
+        if !legacy_zero_timestamps
+            && (lease.acquired_at_epoch_ms < 0
+                || lease.renewed_at_epoch_ms < lease.acquired_at_epoch_ms
+                || lease.expires_at_epoch_ms <= lease.renewed_at_epoch_ms)
+        {
+            anyhow::bail!("sidecar port lease timestamps are invalid");
+        }
+        for port in [
+            lease.ports.qdrant_http,
+            lease.ports.qdrant_grpc,
+            lease.ports.embed_http,
+        ] {
+            if port == 0 || !ports.insert(port) {
+                anyhow::bail!("sidecar port registry contains invalid or duplicate ports");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reserved_registry_ports_excluding(
-    registry: &BTreeMap<String, SidecarPorts>,
+    registry: &BTreeMap<String, AgentPortLease>,
     namespace: &str,
 ) -> BTreeSet<u16> {
     registry
         .iter()
         .filter(|(candidate, _)| candidate.as_str() != namespace)
-        .flat_map(|(_, ports)| [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http])
+        .flat_map(|(_, lease)| {
+            [
+                lease.ports.qdrant_http,
+                lease.ports.qdrant_grpc,
+                lease.ports.embed_http,
+            ]
+        })
         .collect()
 }
 
@@ -1440,10 +1958,17 @@ fn select_agent_port(
     namespace: &str,
     salt: &str,
     reserved: &mut BTreeSet<u16>,
+    state_owns_port: bool,
 ) -> Result<u16> {
     if let Some(port) = configured.or(existing) {
+        if port == 0 {
+            anyhow::bail!("agent sidecar port 0 cannot be leased");
+        }
         if !reserved.insert(port) {
             anyhow::bail!("agent sidecar port {port} is already reserved");
+        }
+        if existing != Some(port) && !state_owns_port && !local_port_available(port) {
+            anyhow::bail!("agent sidecar port {port} is already bound without matching ownership");
         }
         return Ok(port);
     }
@@ -1810,7 +2335,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_profile_reuses_persisted_state_ports_before_registry() {
+    fn agent_profile_reuses_persisted_state_ports_with_matching_lease() {
         let _lock = crate::test_support::env_lock();
         let project = tempdir().expect("project");
         let _cache = EnvGuard::set(
@@ -1826,12 +2351,13 @@ mod tests {
             .expect("state dir");
         std::fs::write(
             &first.layout.state_file,
-            r#"{
-  "qdrant_http_port": 31002,
-  "qdrant_grpc_port": 31003,
-  "embed_http_port": 31004,
-  "embed_url": "http://127.0.0.1:31004/v1/embeddings"
-}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "qdrant_http_port": first.layout.qdrant_http_port,
+                "qdrant_grpc_port": first.layout.qdrant_grpc_port,
+                "embed_http_port": first.embed_http_port,
+                "embed_url": SidecarLayout::embed_base_url(first.embed_http_port),
+            }))
+            .expect("state json"),
         )
         .expect("state file");
 
@@ -1841,9 +2367,15 @@ mod tests {
             Some("persisted"),
         );
 
-        assert_eq!(second.layout.qdrant_http_port, 31002);
-        assert_eq!(second.layout.qdrant_grpc_port, 31003);
-        assert_eq!(second.embed_http_port, 31004);
+        assert_eq!(
+            second.layout.qdrant_http_port,
+            first.layout.qdrant_http_port
+        );
+        assert_eq!(
+            second.layout.qdrant_grpc_port,
+            first.layout.qdrant_grpc_port
+        );
+        assert_eq!(second.embed_http_port, first.embed_http_port);
     }
 
     #[test]
@@ -1857,81 +2389,190 @@ mod tests {
         let other = allocate_agent_ports_in_registry(cache.path(), "codestory-agent-b", [None; 3])
             .expect("other");
 
-        assert_eq!(first, same);
+        assert_eq!(first.ports, same.ports);
+        assert_eq!(first.owner_id, same.owner_id);
         let ports = [
-            first.qdrant_http,
-            first.qdrant_grpc,
-            first.embed_http,
-            other.qdrant_http,
-            other.qdrant_grpc,
-            other.embed_http,
+            first.ports.qdrant_http,
+            first.ports.qdrant_grpc,
+            first.ports.embed_http,
+            other.ports.qdrant_http,
+            other.ports.qdrant_grpc,
+            other.ports.embed_http,
         ];
         let unique: BTreeSet<_> = ports.into_iter().collect();
         assert_eq!(unique.len(), ports.len());
     }
 
     #[test]
-    fn agent_port_registry_refuses_recent_same_namespace_reassignment() {
+    fn healthy_owner_renews_lease_without_changing_identity() {
         let cache = tempdir().expect("cache");
-        let first =
-            allocate_agent_ports_in_registry(cache.path(), "same", [None; 3]).expect("first");
-        let (listeners, configured) = test_sidecar_ports();
-        drop(listeners);
-
-        allocate_agent_ports_in_registry(
-            cache.path(),
-            "same",
-            [
-                Some(configured.qdrant_http),
-                Some(configured.qdrant_grpc),
-                Some(configured.embed_http),
-            ],
-        )
-        .expect_err("recent allocation must not be reassigned");
-
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "same", [None; 3], 100)
+            .expect("first");
+        let renewed = allocate_agent_ports_in_registry_at(cache.path(), "same", [None; 3], 200)
+            .expect("renewed");
+        let root = cache.path().join("sidecars");
         let registry =
-            read_agent_port_registry(&cache.path().join("sidecars").join("port-allocations.json"))
-                .expect("registry");
-        assert_eq!(registry.get("same"), Some(&first));
+            read_agent_port_registry(&root, &root.join("port-allocations.json")).expect("registry");
+        let lease = registry.leases.get("same").expect("lease");
+
+        assert_eq!(first.owner_id, renewed.owner_id);
+        assert_eq!(lease.acquired_at_epoch_ms, 100);
+        assert_eq!(lease.renewed_at_epoch_ms, 200);
+        assert_eq!(lease.expires_at_epoch_ms, lease_expiry(200));
     }
 
     #[test]
-    fn agent_port_registry_tracks_explicit_runtime_ports() {
-        let _lock = crate::test_support::env_lock();
+    fn stale_runtime_cannot_renew_successor_owner_lease() {
         let cache = tempdir().expect("cache");
-        let (listeners, configured) = test_sidecar_ports();
-        drop(listeners);
-        let _cache = EnvGuard::set(
-            "CODESTORY_CACHE_ROOT",
-            cache.path().to_str().expect("utf8 cache"),
-        );
-        let _qdrant_http = EnvGuard::set(
-            "CODESTORY_QDRANT_HTTP_PORT",
-            &configured.qdrant_http.to_string(),
-        );
-        let _qdrant_grpc = EnvGuard::set(
-            "CODESTORY_QDRANT_GRPC_PORT",
-            &configured.qdrant_grpc.to_string(),
-        );
-        let _embed = EnvGuard::set("CODESTORY_EMBED_PORT", &configured.embed_http.to_string());
-
-        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id(
+        let first = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
             None,
             SidecarProfile::Agent,
-            Some("configured"),
+            Some("successor"),
+            cache.path(),
         );
         let root = cache.path().join("sidecars");
-        let registry =
-            read_agent_port_registry(&root.join("port-allocations.json")).expect("read registry");
+        std::fs::remove_file(agent_port_owner_path(&root, &first.namespace))
+            .expect("remove first owner");
+        let successor = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            None,
+            SidecarProfile::Agent,
+            Some("successor"),
+            cache.path(),
+        );
 
-        assert_eq!(registry.get(&runtime.namespace), Some(&configured));
-        std::fs::remove_file(agent_port_reservation_path(&root, &runtime.namespace))
-            .expect("remove startup reservation");
-        write_test_sidecar_state(&root, &runtime.namespace, &configured, None);
-        let mut registry = registry;
-        let cleanup = prune_agent_port_registry(&root, "other", &mut registry);
-        assert_eq!(cleanup.retained, 1);
-        assert_eq!(cleanup.failures, 0);
+        assert_ne!(first.port_lease_owner_id, successor.port_lease_owner_id);
+        first
+            .ensure_ports_allocated()
+            .expect_err("stale runtime must not renew successor lease");
+        successor
+            .ensure_ports_allocated()
+            .expect("successor renews its lease");
+    }
+
+    #[test]
+    fn heartbeat_keeps_unbound_ports_past_original_ttl_under_contention() {
+        let cache = tempdir().expect("cache");
+        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            None,
+            SidecarProfile::Agent,
+            Some("heartbeat"),
+            cache.path(),
+        );
+        let root = cache.path().join("sidecars");
+        let lease_path = agent_port_lease_path(&root, &runtime.namespace);
+        let heartbeat = runtime
+            .start_port_lease_heartbeat_with_interval(Duration::from_millis(5))
+            .expect("heartbeat");
+        let original: AgentPortLease =
+            serde_json::from_slice(&std::fs::read(&lease_path).expect("original lease"))
+                .expect("parse original lease");
+        let renewed = (0..100)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(5));
+                let lease: AgentPortLease =
+                    serde_json::from_slice(&std::fs::read(&lease_path).ok()?).ok()?;
+                (lease.renewed_at_epoch_ms >= original.renewed_at_epoch_ms + 2).then_some(lease)
+            })
+            .expect("heartbeat renewed lease");
+        let contention_time = original.expires_at_epoch_ms + 1;
+        assert!(renewed.expires_at_epoch_ms > contention_time);
+        let error = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "contender",
+            configured_ports(&original.ports),
+            contention_time,
+        )
+        .expect_err("heartbeat must preserve ports beyond original ttl");
+        heartbeat.finish().expect("stop heartbeat");
+
+        assert!(error.to_string().contains("already reserved"));
+    }
+
+    #[test]
+    fn expired_crashed_owner_is_reclaimed_under_lock() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "crashed", [None; 3], 100)
+            .expect("first");
+        let configured = configured_ports(&first.ports);
+        let replacement = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "replacement",
+            configured,
+            lease_expiry(100) + 1,
+        )
+        .expect("replacement");
+        let registry =
+            read_agent_port_registry(&root, &root.join("port-allocations.json")).expect("registry");
+
+        assert_eq!(replacement.ports, first.ports);
+        assert!(!registry.leases.contains_key("crashed"));
+        assert_eq!(registry.leases.len(), 1);
+    }
+
+    #[test]
+    fn reclamation_never_removes_namespace_with_state_or_data() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "with-data", [None; 3], 100)
+            .expect("first");
+        let sentinel = root.join("with-data").join("qdrant").join("sentinel");
+        std::fs::create_dir_all(sentinel.parent().expect("sentinel parent")).expect("data dir");
+        std::fs::write(&sentinel, b"keep").expect("sentinel");
+
+        allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "replacement",
+            configured_ports(&first.ports),
+            lease_expiry(100) + 1,
+        )
+        .expect("replacement");
+
+        assert_eq!(std::fs::read(&sentinel).expect("sentinel remains"), b"keep");
+    }
+
+    #[test]
+    fn agent_port_lease_abort_child() {
+        let Some(base) = std::env::var_os(PORT_LEASE_ABORT_BASE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let result = allocate_agent_ports_in_registry(&base, "crash-child", [None; 3]);
+        panic!("port lease abort hook returned: {result:?}");
+    }
+
+    #[test]
+    fn process_abort_after_lease_write_recovers_without_reissue() {
+        let cache = tempdir().expect("cache");
+        let sentinel = cache.path().join("abort-sentinel");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("resolve retrieval test executable"),
+        )
+        .arg("--exact")
+        .arg("config::tests::agent_port_lease_abort_child")
+        .arg("--nocapture")
+        .env(PORT_LEASE_ABORT_BASE_ENV, cache.path())
+        .env(PORT_LEASE_ABORT_SENTINEL_ENV, &sentinel)
+        .status()
+        .expect("run lease abort child");
+        assert!(!status.success(), "abort child exited successfully");
+        assert_eq!(
+            std::fs::read(&sentinel).expect("abort sentinel"),
+            b"lease-persisted"
+        );
+
+        let root = cache.path().join("sidecars");
+        let registry = read_agent_port_registry(&root, &root.join("port-allocations.json"))
+            .expect("recover registry from lease record");
+        let ports = registry
+            .leases
+            .get("crash-child")
+            .expect("crashed lease")
+            .ports
+            .clone();
+        let error =
+            allocate_agent_ports_in_registry(cache.path(), "replacement", configured_ports(&ports))
+                .expect_err("crashed live lease must not be reissued");
+        assert!(error.to_string().contains("already reserved"));
     }
 
     fn test_sidecar_ports() -> (Vec<TcpListener>, SidecarPorts) {
@@ -1953,16 +2594,18 @@ mod tests {
         )
     }
 
-    fn write_test_sidecar_state(
-        root: &Path,
-        namespace: &str,
-        ports: &SidecarPorts,
-        embedding_launch: Option<serde_json::Value>,
-    ) {
-        let namespace_root = root.join(namespace);
-        std::fs::create_dir_all(&namespace_root).expect("namespace root");
+    fn configured_ports(ports: &SidecarPorts) -> [Option<u16>; 3] {
+        [
+            Some(ports.qdrant_http),
+            Some(ports.qdrant_grpc),
+            Some(ports.embed_http),
+        ]
+    }
+
+    fn write_owned_state(root: &Path, namespace: &str, ports: &SidecarPorts) {
+        std::fs::create_dir_all(root.join(namespace)).expect("namespace");
         std::fs::write(
-            namespace_root.join("retrieval-sidecars.json"),
+            root.join(namespace).join("retrieval-sidecars.json"),
             serde_json::to_vec(&serde_json::json!({
                 "owner": "codestory",
                 "namespace": namespace,
@@ -1970,171 +2613,335 @@ mod tests {
                 "qdrant_grpc_port": ports.qdrant_grpc,
                 "embed_http_port": ports.embed_http,
                 "embed_url": ports.embed_url,
-                "embedding_launch": embedding_launch,
             }))
-            .expect("serialize state"),
+            .expect("state"),
         )
-        .expect("write state");
+        .expect("state");
     }
 
     #[test]
-    fn agent_port_registry_prunes_missing_state() {
+    fn missing_owner_is_reclaimed_without_waiting_for_expiry() {
         let cache = tempdir().expect("cache");
         let root = cache.path().join("sidecars");
-        let (listeners, ports) = test_sidecar_ports();
-        drop(listeners);
-        let mut registry = BTreeMap::from([("stale".to_string(), ports)]);
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "missing", [None; 3], 100)
+            .expect("first");
+        std::fs::remove_file(agent_port_owner_path(&root, "missing")).expect("remove owner");
+        let replacement = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "replacement",
+            configured_ports(&first.ports),
+            101,
+        )
+        .expect("replacement");
 
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
-
-        assert!(registry.is_empty());
-        assert_eq!(cleanup.pruned, 1);
-        assert_eq!(cleanup.failures, 0);
+        assert_eq!(replacement.ports, first.ports);
     }
 
     #[test]
-    fn agent_port_registry_preserves_live_bound_state() {
+    fn bound_ports_are_never_reissued_after_expiry() {
         let cache = tempdir().expect("cache");
         let root = cache.path().join("sidecars");
         let (listeners, ports) = test_sidecar_ports();
-        write_test_sidecar_state(&root, "live", &ports, None);
-        let mut registry = BTreeMap::from([("live".to_string(), ports)]);
-
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+        write_owned_state(&root, "live", &ports);
+        let first = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "live",
+            configured_ports(&ports),
+            100,
+        )
+        .expect("first");
+        let error = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "other",
+            configured_ports(&ports),
+            lease_expiry(100) + 1,
+        )
+        .expect_err("bound ports remain reserved");
 
         assert_eq!(listeners.len(), 3);
-        assert!(registry.contains_key("live"));
-        assert_eq!(cleanup.retained, 1);
-        assert_eq!(cleanup.pruned, 0);
+        assert_eq!(first.ports, ports);
+        assert!(error.to_string().contains("already reserved"));
     }
 
     #[test]
-    fn agent_port_registry_preserves_bound_port_without_state() {
+    fn configured_bound_ports_require_matching_namespace_state() {
         let cache = tempdir().expect("cache");
-        let root = cache.path().join("sidecars");
         let (listeners, ports) = test_sidecar_ports();
-        let mut registry = BTreeMap::from([("ownerless".to_string(), ports)]);
 
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+        let error = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "unowned",
+            configured_ports(&ports),
+            100,
+        )
+        .expect_err("bound configured port must not be leased without ownership");
 
         assert_eq!(listeners.len(), 3);
-        assert!(registry.contains_key("ownerless"));
-        assert_eq!(cleanup.retained, 1);
+        assert!(
+            error
+                .to_string()
+                .contains("bound without matching ownership")
+        );
     }
 
     #[test]
-    fn agent_port_registry_preserves_malformed_state_fail_closed() {
+    fn pid_reuse_without_owner_token_does_not_preserve_free_ports() {
         let cache = tempdir().expect("cache");
         let root = cache.path().join("sidecars");
-        let namespace_root = root.join("malformed");
-        std::fs::create_dir_all(&namespace_root).expect("namespace root");
-        std::fs::write(namespace_root.join("retrieval-sidecars.json"), b"{")
-            .expect("malformed state");
-        let (_listeners, ports) = test_sidecar_ports();
-        let mut registry = BTreeMap::from([("malformed".to_string(), ports)]);
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "reused", [None; 3], 100)
+            .expect("first");
+        let impostor = AgentPortOwner {
+            id: uuid::Uuid::new_v4().to_string(),
+            process_id: std::process::id(),
+            created_at_epoch_ms: 101,
+        };
+        write_agent_port_owner(&root, "reused", &impostor).expect("impostor owner");
+        let replacement = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "replacement",
+            configured_ports(&first.ports),
+            102,
+        )
+        .expect("replacement");
 
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
-
-        assert!(registry.contains_key("malformed"));
-        assert_eq!(cleanup.failures, 1);
-        assert_eq!(cleanup.pruned, 0);
+        assert_eq!(impostor.process_id, std::process::id());
+        assert_ne!(impostor.id, first.owner_id);
+        assert_eq!(replacement.ports, first.ports);
     }
 
     #[test]
-    fn agent_port_registry_preserves_unreadable_state_shape_fail_closed() {
+    fn malformed_registry_recovers_from_atomic_lease_records() {
         let cache = tempdir().expect("cache");
         let root = cache.path().join("sidecars");
-        std::fs::create_dir_all(root.join("unreadable").join("retrieval-sidecars.json"))
-            .expect("state path directory");
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "first", [None; 3], 100)
+            .expect("first");
+        std::fs::write(root.join("port-allocations.json"), b"{").expect("corrupt registry");
+        let error = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "second",
+            configured_ports(&first.ports),
+            101,
+        )
+        .expect_err("live lease must survive registry recovery");
+
+        assert!(error.to_string().contains("already reserved"));
+        let registry = read_agent_port_registry(&root, &root.join("port-allocations.json"))
+            .expect("recovered registry");
+        assert_eq!(
+            registry.leases.get("first").map(|lease| &lease.ports),
+            Some(&first.ports)
+        );
+    }
+
+    #[test]
+    fn partial_registry_reconciles_atomic_lease_records() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "first", [None; 3], 100)
+            .expect("first");
+        write_agent_port_registry(
+            &root.join("port-allocations.json"),
+            &AgentPortRegistry::default(),
+        )
+        .expect("partial registry");
+
+        let error = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            "second",
+            configured_ports(&first.ports),
+            101,
+        )
+        .expect_err("recovery lease must fill partial registry");
+
+        assert!(error.to_string().contains("already reserved"));
+    }
+
+    #[test]
+    fn live_legacy_allocation_migrates_without_pid_trust() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        let namespace = "legacy-live";
         let (listeners, ports) = test_sidecar_ports();
-        drop(listeners);
-        let mut registry = BTreeMap::from([("unreadable".to_string(), ports)]);
+        std::fs::create_dir_all(root.join(namespace)).expect("namespace");
+        std::fs::write(
+            root.join("port-allocations.json"),
+            serde_json::to_vec(&BTreeMap::from([(namespace.to_string(), ports.clone())]))
+                .expect("legacy registry"),
+        )
+        .expect("registry");
+        std::fs::write(
+            root.join(namespace).join("retrieval-sidecars.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "owner": "codestory",
+                "namespace": namespace,
+                "qdrant_http_port": ports.qdrant_http,
+                "qdrant_grpc_port": ports.qdrant_grpc,
+                "embed_http_port": ports.embed_http,
+                "embed_url": ports.embed_url,
+                "embedding_launch": { "pid": std::process::id() },
+            }))
+            .expect("state"),
+        )
+        .expect("state");
 
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
+        let migrated = allocate_agent_ports_in_registry_at(
+            cache.path(),
+            namespace,
+            configured_ports(&ports),
+            100,
+        )
+        .expect("migrate live allocation");
 
-        assert!(registry.contains_key("unreadable"));
-        assert_eq!(cleanup.failures, 1);
+        assert_eq!(listeners.len(), 3);
+        assert_eq!(migrated.ports, ports);
+        assert_ne!(migrated.owner_id, format!("legacy-{namespace}"));
+    }
+
+    #[test]
+    fn malformed_lease_blocks_malformed_registry_recovery() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("port-allocations.json"), b"{").expect("registry");
+        std::fs::create_dir_all(root.join("port-leases")).expect("lease dir");
+        std::fs::write(root.join("port-leases").join("broken.json"), b"{").expect("lease");
+        let error = allocate_agent_ports_in_registry_at(cache.path(), "current", [None; 3], 100)
+            .expect_err("malformed lease must fail closed");
+
+        assert!(error.to_string().contains("recover malformed"));
+    }
+
+    #[test]
+    fn malformed_namespace_state_fails_closed_before_allocation() {
+        let cache = tempdir().expect("cache");
+        let root = cache.path().join("sidecars").join("current");
+        std::fs::create_dir_all(&root).expect("namespace");
+        std::fs::write(root.join("retrieval-sidecars.json"), b"{").expect("state");
+
+        let error = allocate_agent_ports_in_registry_at(cache.path(), "current", [None; 3], 100)
+            .expect_err("malformed state must fail closed");
+
+        assert!(error.to_string().contains("parse"));
     }
 
     #[test]
     fn agent_port_registry_rejects_traversal_namespace_without_touching_outside_file() {
         let cache = tempdir().expect("cache");
-        let root = cache.path().join("sidecars");
-        std::fs::create_dir_all(&root).expect("sidecars root");
         let sentinel = cache.path().join("outside.json");
         std::fs::write(&sentinel, b"keep").expect("outside sentinel");
-        let (listeners, ports) = test_sidecar_ports();
-        drop(listeners);
-        let mut registry = BTreeMap::from([("../outside".to_string(), ports)]);
+        allocate_agent_ports_in_registry_at(cache.path(), "../outside", [None; 3], 100)
+            .expect_err("traversal namespace");
 
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
-
-        assert!(registry.contains_key("../outside"));
-        assert_eq!(cleanup.failures, 1);
         assert_eq!(std::fs::read(&sentinel).expect("outside sentinel"), b"keep");
     }
 
     #[test]
-    fn agent_port_registry_preserves_state_with_reused_pid_fail_closed() {
+    fn concurrent_allocations_are_unique_and_registry_remains_parseable() {
         let cache = tempdir().expect("cache");
+        let base = std::sync::Arc::new(cache.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let base = base.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    allocate_agent_ports_in_registry_at(
+                        &base,
+                        &format!("worker-{index}"),
+                        [None; 3],
+                        100,
+                    )
+                    .expect("allocation")
+                    .ports
+                })
+            })
+            .collect();
+        let allocations: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker"))
+            .collect();
+        let unique: BTreeSet<_> = allocations
+            .iter()
+            .flat_map(|ports| [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http])
+            .collect();
         let root = cache.path().join("sidecars");
-        let (listeners, ports) = test_sidecar_ports();
-        drop(listeners);
-        write_test_sidecar_state(
-            &root,
-            "reused",
-            &ports,
-            Some(serde_json::json!({
-                "provider": "llamacpp",
-                "launch_mode": "native_spawned",
-                "endpoint": ports.embed_url,
-                "pid": std::process::id(),
-            })),
-        );
-        let mut registry = BTreeMap::from([("reused".to_string(), ports)]);
+        let registry =
+            read_agent_port_registry(&root, &root.join("port-allocations.json")).expect("registry");
 
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
-
-        assert!(registry.contains_key("reused"));
-        assert_eq!(cleanup.retained, 1);
+        assert_eq!(unique.len(), 24);
+        assert_eq!(registry.leases.len(), 8);
     }
 
     #[test]
-    fn agent_port_registry_preserves_recent_startup_reservation() {
+    fn long_run_reclamation_keeps_registry_bounded() {
         let cache = tempdir().expect("cache");
+        let project = tempdir().expect("project");
         let root = cache.path().join("sidecars");
-        write_agent_port_reservation(&root, "starting").expect("reservation");
-        let (_listeners, ports) = test_sidecar_ports();
-        let mut registry = BTreeMap::from([("starting".to_string(), ports)]);
+        let namespace_prefix = agent_namespace_prefix(project.path());
+        let mut now = 0;
+        for index in 0..256 {
+            allocate_agent_ports_in_registry_at(
+                cache.path(),
+                &format!("{namespace_prefix}run-{index}"),
+                [None; 3],
+                now,
+            )
+            .expect("allocation");
+            now = lease_expiry(now) + 1;
+        }
+        let registry =
+            read_agent_port_registry(&root, &root.join("port-allocations.json")).expect("registry");
 
-        let cleanup = prune_agent_port_registry(&root, "current", &mut registry);
-
-        assert!(registry.contains_key("starting"));
-        assert_eq!(cleanup.retained, 1);
-    }
-
-    #[test]
-    fn agent_port_registry_compaction_is_complete_and_parseable() {
-        let cache = tempdir().expect("cache");
-        let root = cache.path().join("sidecars");
-        std::fs::create_dir_all(&root).expect("sidecars root");
-        let (listeners, stale_ports) = test_sidecar_ports();
-        drop(listeners);
-        let registry_path = root.join("port-allocations.json");
-        write_agent_port_registry(
-            &registry_path,
-            &BTreeMap::from([("stale".to_string(), stale_ports)]),
-        )
-        .expect("seed registry");
-
-        let current = allocate_agent_ports_in_registry(cache.path(), "current", [None; 3])
-            .expect("allocate after compaction");
-        let compacted = read_agent_port_registry(&registry_path).expect("parse compacted registry");
-
+        assert_eq!(registry.leases.len(), 1);
+        let latest_namespace = format!("{namespace_prefix}run-255");
+        assert!(registry.leases.contains_key(&latest_namespace));
         assert_eq!(
-            compacted,
-            BTreeMap::from([("current".to_string(), current)])
+            std::fs::read_dir(root.join("port-leases"))
+                .expect("lease dir")
+                .count(),
+            1
         );
+        let latest_ports = &registry
+            .leases
+            .get(&latest_namespace)
+            .expect("latest lease")
+            .ports;
+        write_owned_state(&root, &latest_namespace, latest_ports);
+        let retained_namespace_dirs = std::fs::read_dir(&root)
+            .expect("sidecars root")
+            .flatten()
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&namespace_prefix)
+            })
+            .count();
+        assert_eq!(retained_namespace_dirs, 1);
+        assert_eq!(
+            latest_agent_run_id_in_cache(project.path(), cache.path()).as_deref(),
+            Some("run-255")
+        );
+    }
+
+    #[test]
+    fn separate_cache_roots_isolate_test_registries() {
+        let first_cache = tempdir().expect("first cache");
+        let second_cache = tempdir().expect("second cache");
+        let first = allocate_agent_ports_in_registry_at(first_cache.path(), "same", [None; 3], 100)
+            .expect("first");
+        let second = allocate_agent_ports_in_registry_at(
+            second_cache.path(),
+            "same",
+            configured_ports(&first.ports),
+            100,
+        )
+        .expect("second");
+
+        assert_eq!(first.ports, second.ports);
+        assert_ne!(first.owner_id, second.owner_id);
     }
 
     #[test]

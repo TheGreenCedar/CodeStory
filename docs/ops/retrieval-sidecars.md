@@ -322,14 +322,25 @@ run Docker prune, broad Docker cleanup, or host/global network deletion.
 `retrieval down` clears the sidecar state file only. Stop Docker/Compose
 separately if containers must be removed.
 
-Agent namespaces reserve dynamic ports in
-`<cache>/sidecars/port-allocations.json`. Allocation automatically compacts
-state-less entries whose ports are free while holding the registry lock and
-publishes the compacted file atomically. Valid state, bound ports, malformed or
-unreadable ownership, and a ten-minute startup reservation are retained
-fail-closed. Cleanup that prunes entries or encounters failures reports pruned,
-retained, and failed counts on stderr; renewable owner leases remain a separate
-lifecycle contract.
+Agent namespaces hold renewable ten-minute port leases in
+`<cache>/sidecars/port-allocations.json`. Each lease records its namespace,
+non-PID owner token, process ID for diagnostics, acquisition/renewal/expiry
+timestamps, and selected ports. Runtime construction and sidecar startup renew
+the same owner token; every renewal must present the token retained by that
+immutable runtime, and bootstrap renews periodically across storage repair,
+model preparation, and container startup. Under the registry lock, missing
+owners and expired leases are reclaimed only while their ports are free; bound
+ports remain fail-closed.
+The registry, owner records, and per-namespace recovery leases use atomic
+replacement. If the compact registry is malformed, CodeStory reconstructs it
+from valid recovery leases and refuses allocation when those records are also
+malformed. Normal allocation prunes inactive records, so registry size tracks
+active namespaces instead of permanent history. Reclamation removes a namespace
+directory only when it is empty; state and sidecar data are never recursively
+deleted by lease cleanup.
+Test harnesses and their ephemeral namespaces must use an explicit isolated
+cache root; lease registries are cache-root scoped and never shared across
+those roots.
 
 Native embedding output uses `llama-server-native.log` for the current launch
 and `llama-server-native.previous.log` for at most the final 256 KiB of the
@@ -349,7 +360,7 @@ Cache-root and profile layout:
 | Linux default | `$XDG_CACHE_HOME/codestory`, normally `~/.cache/codestory` |
 | Local profile | `<cache>/{lexical,qdrant,scip,retrieval-sidecars.json}` with configurable Qdrant/embed ports |
 | Managed Agent profile | `<cache>/sidecars/<namespace>/{lexical,qdrant,scip,retrieval-sidecars.json}` with dynamic or persisted Qdrant/embed ports |
-| Agent port registry | `<cache>/sidecars/port-allocations.json` |
+| Agent port registry | `<cache>/sidecars/port-allocations.json`, with atomic `port-leases/<namespace>.json` recovery records |
 
 Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
 `target/retrieval-models` are accepted only after pinned size and SHA-256
