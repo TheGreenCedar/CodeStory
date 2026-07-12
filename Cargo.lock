@@ -573,6 +573,7 @@ version = "0.14.3"
 dependencies = [
  "anyhow",
  "codestory-contracts",
+ "fs4",
  "parking_lot",
  "rusqlite",
  "serde",

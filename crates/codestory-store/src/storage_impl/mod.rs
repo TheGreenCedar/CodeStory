@@ -3,6 +3,7 @@ use codestory_contracts::graph::{
     EnumConversionError, Node, NodeId, NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty,
     TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
+use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
     Connection, MAIN_DB, OpenFlags, Result, Row, params, params_from_iter, types::Value,
@@ -10,7 +11,9 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +51,10 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
+#[cfg(test)]
+const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
+#[cfg(test)]
+const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -151,15 +158,110 @@ fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 3] {
 fn cleanup_sqlite_sidecars(path: &Path) -> Result<(), StorageError> {
     for candidate in sqlite_sidecar_paths(path) {
         if candidate.exists() {
-            fs::remove_file(&candidate).map_err(|err| {
-                StorageError::Other(format!(
-                    "Failed to remove SQLite artifact {}: {err}",
-                    candidate.display()
-                ))
-            })?;
+            match fs::remove_file(&candidate) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(StorageError::Other(format!(
+                        "Failed to remove SQLite artifact {}: {err}",
+                        candidate.display()
+                    )));
+                }
+            }
         }
     }
     Ok(())
+}
+
+struct PromotionLock {
+    file: File,
+}
+
+fn promotion_lock_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.promotion.lock", path.display()))
+}
+
+impl PromotionLock {
+    fn open(path: &Path) -> Result<File, StorageError> {
+        let lock_path = promotion_lock_path(path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                StorageError::Other(format!(
+                    "Failed to create promotion lock directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                StorageError::Other(format!(
+                    "Failed to open promotion lock {}: {error}",
+                    lock_path.display()
+                ))
+            })
+    }
+
+    fn acquire(path: &Path) -> Result<Self, StorageError> {
+        let file = Self::open(path)?;
+        FileExt::lock_exclusive(&file).map_err(|error| {
+            StorageError::Other(format!(
+                "Failed to acquire promotion lock for {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { file })
+    }
+
+    fn try_acquire(path: &Path) -> Result<Option<Self>, StorageError> {
+        let file = Self::open(path)?;
+        FileExt::try_lock_exclusive(&file)
+            .map(|locked| locked.then_some(Self { file }))
+            .map_err(|error| {
+                StorageError::Other(format!(
+                    "Failed to inspect promotion lock for {}: {error}",
+                    path.display()
+                ))
+            })
+    }
+}
+
+impl Drop for PromotionLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn recover_interrupted_promotion(path: &Path) -> Result<(), StorageError> {
+    if !path.with_extension("sqlite.backup").exists() {
+        return Ok(());
+    }
+    let Some(_lock) = PromotionLock::try_acquire(path)? else {
+        // A healthy promoter owns the lock. SQLite readers may wait for that
+        // transaction, but must never interpret its backup as crash evidence.
+        return Ok(());
+    };
+    recover_interrupted_promotion_locked(path)
+}
+
+fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError> {
+    let backup_path = path.with_extension("sqlite.backup");
+    if !backup_path.exists() {
+        return Ok(());
+    }
+    let mut live = Connection::open(path)?;
+    let _ = live.busy_timeout(Duration::from_millis(2_500));
+    live.restore(
+        MAIN_DB,
+        &backup_path,
+        None::<fn(rusqlite::backup::Progress)>,
+    )?;
+    drop(live);
+    cleanup_sqlite_sidecars(&backup_path)
 }
 
 fn grounding_display_name_expr(alias: &str) -> String {
@@ -1037,6 +1139,8 @@ impl Storage {
     /// concurrent readers must not contend with a staged refresh merely by
     /// opening the live database.
     pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        recover_interrupted_promotion(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_millis(2_500))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -1075,6 +1179,9 @@ impl Storage {
         mode: StorageOpenMode,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref();
+        if matches!(mode, StorageOpenMode::Live) {
+            recover_interrupted_promotion(path)?;
+        }
         let conn = Connection::open(path)?;
         // Allow concurrent reads while indexing writes, and avoid flaky "database is locked" errors
         // in app shells when users query mid-index.
@@ -1099,6 +1206,7 @@ impl Storage {
     }
 
     pub fn database_schema_version(path: &Path) -> Result<u32, StorageError> {
+        recover_interrupted_promotion(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         Ok(version.max(0) as u32)
@@ -1106,6 +1214,7 @@ impl Storage {
 
     /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
     pub fn database_has_incomplete_incremental_run(path: &Path) -> Result<bool, StorageError> {
+        recover_interrupted_promotion(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
@@ -1140,6 +1249,7 @@ impl Storage {
     pub fn database_index_publication(
         path: &Path,
     ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        recover_interrupted_promotion(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         read_index_publication(&conn)
     }
@@ -1149,6 +1259,7 @@ impl Storage {
     pub fn database_complete_index_publication(
         path: &Path,
     ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        recover_interrupted_promotion(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         read_complete_index_publication(&conn)
     }
@@ -1157,6 +1268,7 @@ impl Storage {
         source_path: &Path,
         target_path: &Path,
     ) -> Result<(), StorageError> {
+        recover_interrupted_promotion(source_path)?;
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 StorageError::Other(format!(
@@ -2183,6 +2295,8 @@ impl Storage {
         staged_path: &Path,
         live_path: &Path,
     ) -> Result<(), StorageError> {
+        let _promotion_lock = PromotionLock::acquire(live_path)?;
+        recover_interrupted_promotion_locked(live_path)?;
         let backup_path = live_path.with_extension("sqlite.backup");
         let live_exists = live_path.exists();
         cleanup_sqlite_sidecars(&backup_path)?;
@@ -2197,9 +2311,31 @@ impl Storage {
             )?;
         }
 
-        if let Err(err) =
-            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>)
+        #[cfg(test)]
+        let restore_result = if let Some(sentinel_path) =
+            std::env::var_os(PROMOTION_ABORT_SENTINEL_ENV).map(PathBuf::from)
         {
+            live_conn.restore(
+                MAIN_DB,
+                staged_path,
+                Some(move |_progress| {
+                    let mut sentinel = std::fs::File::create(&sentinel_path)
+                        .expect("create promotion abort sentinel");
+                    sentinel
+                        .write_all(PROMOTION_ABORT_SENTINEL)
+                        .expect("write promotion abort sentinel");
+                    sentinel.sync_all().expect("sync promotion abort sentinel");
+                    std::process::abort();
+                }),
+            )
+        } else {
+            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>)
+        };
+        #[cfg(not(test))]
+        let restore_result =
+            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>);
+
+        if let Err(err) = restore_result {
             if live_exists && backup_path.exists() {
                 let _ = live_conn.restore(
                     MAIN_DB,

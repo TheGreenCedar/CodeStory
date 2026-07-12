@@ -26,6 +26,15 @@
   client, and a cross-platform A/B/A stdio contract proves two trusted projects
   cannot cross-route embedding markers or vectors.
 
+- Added a table-driven full and incremental publication fault matrix covering
+  identity persistence, search build/validation/completion, catalog locking,
+  staged database replacement, incremental marker completion, and runtime cache
+  publication. Every boundary now has deterministic failure and cancellation
+  proof, including successful completion when cancellation arrives after the
+  database replacement point of no return. A store-level child process abort
+  after live mutation and before backup cleanup proves retry recovery and
+  artifact cleanup. Promotion-scoped locking prevents healthy backups from
+  being mistaken for abandoned crash recovery state by concurrent readers.
 - Added parser-backed Express route extraction for static module-scope
   registrations on source-ordered app and router bindings constructed from
   explicit `express` imports or `require("express")`. JavaScript, TypeScript,
@@ -110,6 +119,9 @@
   when its complete publication stayed stable, and keyed the cache by durable
   publication identity so concurrent publication cannot produce or retain a
   mixed-generation response.
+- Completed the durable incremental marker before exposing prepared runtime
+  search state or reporting indexing idle. Marker failure now leaves runtime
+  state cleared and the new database generation fenced from readers.
 - Corrected the Codex managed-platform guide to list the restored macOS x64 CLI
   while retaining its no-managed-accelerated-sidecar boundary.
 - Retried packaged-proof temporary directory removal after transient executable

@@ -1838,6 +1838,156 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
 }
 
 #[test]
+fn reader_open_during_healthy_promotion_does_not_recover_active_backup() -> Result<(), StorageError>
+{
+    let live_path = unique_temp_db_path("active-promotion-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let lock_path = promotion_lock_path(&live_path);
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+
+    seed_promotion_file(&live_path, 2, "new.rs")?;
+    seed_promotion_file(&backup_path, 1, "old.rs")?;
+    let promotion_lock = PromotionLock::acquire(&live_path)?;
+
+    let during_promotion = Storage::open(&live_path)?;
+    assert_eq!(
+        during_promotion.get_files()?[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(during_promotion);
+    assert!(
+        backup_path.exists(),
+        "active promoter still owns its backup"
+    );
+
+    drop(promotion_lock);
+    let recovered = Storage::open(&live_path)?;
+    assert_eq!(recovered.get_files()?[0].path, PathBuf::from("old.rs"));
+    drop(recovered);
+    assert!(
+        !backup_path.exists(),
+        "recovery consumes the abandoned backup"
+    );
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+    let _ = std::fs::remove_file(lock_path);
+    Ok(())
+}
+
+const PROMOTION_ABORT_LIVE_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_LIVE";
+const PROMOTION_ABORT_STAGED_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_STAGED";
+
+fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
+    let mut storage = Storage::open(path)?;
+    storage.insert_files_batch(&[FileInfo {
+        id,
+        path: PathBuf::from(name),
+        language: "rust".to_string(),
+        modification_time: id,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    }])?;
+    storage.finalize_staged_snapshot()
+}
+
+#[test]
+fn staged_promotion_abort_child() {
+    let Some(live_path) = std::env::var_os(PROMOTION_ABORT_LIVE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let staged_path =
+        PathBuf::from(std::env::var_os(PROMOTION_ABORT_STAGED_ENV).expect("child staged path"));
+    let result = Storage::promote_staged_snapshot(&staged_path, &live_path);
+    panic!("promotion abort hook returned: {result:?}");
+}
+
+#[test]
+fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
+    let live_path = unique_temp_db_path("promotion-abort-live");
+    let staged_path = unique_temp_db_path("promotion-abort-staged");
+    let sentinel_path = unique_temp_db_path("promotion-abort-sentinel");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
+
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("resolve store test executable"))
+            .arg("--exact")
+            .arg("storage_impl::tests::staged_promotion_abort_child")
+            .arg("--nocapture")
+            .env(PROMOTION_ABORT_LIVE_ENV, &live_path)
+            .env(PROMOTION_ABORT_STAGED_ENV, &staged_path)
+            .env(PROMOTION_ABORT_SENTINEL_ENV, &sentinel_path)
+            .status()
+            .expect("run promotion abort child");
+    assert!(
+        !status.success(),
+        "promotion abort child exited successfully"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_path).expect("read promotion abort sentinel"),
+        PROMOTION_ABORT_SENTINEL,
+        "ordinary child failure must not satisfy the crash proof"
+    );
+
+    let interrupted = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open interrupted live generation without recovery");
+    let interrupted_path: String = interrupted
+        .query_row("SELECT path FROM file ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read interrupted live generation");
+    assert_eq!(
+        interrupted_path, "new.rs",
+        "abort hook must run after the live database mutation"
+    );
+    drop(interrupted);
+
+    let live = Storage::open(&live_path).expect("open live generation after abort");
+    assert_eq!(
+        live.get_files().expect("read live generation")[0].path,
+        PathBuf::from("old.rs")
+    );
+    drop(live);
+    assert!(
+        staged_path.exists(),
+        "staged generation must remain retryable"
+    );
+    assert!(
+        !backup_path.exists(),
+        "opening live storage must consume the recovery backup"
+    );
+
+    Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect("retry promotion after abort");
+    let live = Storage::open(&live_path).expect("open recovered live generation");
+    assert_eq!(
+        live.get_files().expect("read recovered generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(live);
+    for artifact in sqlite_sidecar_paths(&staged_path)
+        .into_iter()
+        .chain(sqlite_sidecar_paths(&backup_path))
+    {
+        assert!(
+            !artifact.exists(),
+            "successful retry left promotion artifact {}",
+            artifact.display()
+        );
+    }
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&staged_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+    let _ = std::fs::remove_file(&sentinel_path);
+}
+
+#[test]
 fn test_resolution_query_plan_prefers_new_indexes() -> Result<(), StorageError> {
     let storage = Storage::new_in_memory()?;
 
