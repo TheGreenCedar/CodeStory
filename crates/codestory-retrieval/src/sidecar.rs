@@ -27,8 +27,6 @@ use std::time::{Duration, Instant};
 
 const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
 const LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT: usize = 4_096;
-const LEGACY_ZOEKT_HTTP_PORT: u16 = 6070;
-const LEGACY_ZOEKT_IMAGE_PIN: &str = "sourcegraph/zoekt-webserver:0.0.0-20250506123554-490422d1adb4@sha256:34c77a62bcafc41ce3ee193e44f42aa84690d9ec51b953e7efae4dfdfae80aff";
 #[cfg(not(windows))]
 const NATIVE_EMBEDDING_STOP_WAIT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
@@ -88,7 +86,7 @@ pub struct SidecarStateFile {
     pub embedding_launch: Option<EmbeddingLaunchMetadata>,
     #[serde(default = "default_sidecar_image_pins")]
     pub sidecar_images: SidecarImagePins,
-    #[serde(rename = "zoekt_data_dir", alias = "lexical_data_dir")]
+    #[serde(alias = "zoekt_data_dir")]
     pub lexical_data_dir: String,
     pub qdrant_data_dir: String,
     pub scip_artifacts_root: String,
@@ -157,17 +155,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
         cleanup_command: runtime.cleanup_command.clone(),
         started_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
     };
-    let mut value = serde_json::to_value(&state).context("serialize sidecar state")?;
-    let object = value
-        .as_object_mut()
-        .context("sidecar state must serialize as an object")?;
-    object.insert("zoekt_http_port".into(), LEGACY_ZOEKT_HTTP_PORT.into());
-    object
-        .get_mut("sidecar_images")
-        .and_then(serde_json::Value::as_object_mut)
-        .context("sidecar image pins must serialize as an object")?
-        .insert("zoekt".into(), LEGACY_ZOEKT_IMAGE_PIN.into());
-    let json = serde_json::to_vec_pretty(&value).context("serialize sidecar state")?;
+    let json = serde_json::to_vec_pretty(&state).context("serialize sidecar state")?;
     codestory_workspace::atomic_file::write_bytes_atomic(
         &layout.state_file,
         "retrieval-sidecars",
@@ -192,12 +180,7 @@ fn cleanup_owned_legacy_zoekt(layout: &SidecarLayout) -> Result<()> {
         .get("zoekt_data_dir")
         .and_then(|value| value.as_str())
         .is_some_and(|path| Path::new(path) == legacy_root);
-    let current_state_matches = state
-        .get("lexical_data_dir")
-        .or_else(|| state.get("zoekt_data_dir"))
-        .and_then(|value| value.as_str())
-        .is_some_and(|path| Path::new(path) == layout.lexical_data_dir);
-    if !legacy_state_matches && !current_state_matches {
+    if !legacy_state_matches {
         return Ok(());
     }
     let mut remaining = LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT;
@@ -1261,22 +1244,33 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&runtime.layout.state_file).expect("read state"))
                 .expect("state json");
-        assert_eq!(
-            raw.get("zoekt_http_port").and_then(|value| value.as_u64()),
-            Some(u64::from(LEGACY_ZOEKT_HTTP_PORT))
-        );
-        assert!(raw.get("zoekt_data_dir").is_some());
-        assert_eq!(
-            raw.pointer("/sidecar_images/zoekt")
-                .and_then(|value| value.as_str()),
-            Some(LEGACY_ZOEKT_IMAGE_PIN)
-        );
+        assert!(raw.get("lexical_data_dir").is_some());
+        assert!(raw.get("zoekt_data_dir").is_none());
+        assert!(raw.get("zoekt_http_port").is_none());
+        assert!(raw.pointer("/sidecar_images/zoekt").is_none());
         assert!(
             std::fs::read_dir(root.path())
                 .expect("read root")
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
         );
+    }
+
+    #[test]
+    fn sidecar_state_reads_legacy_zoekt_data_dir_without_reemitting_it() {
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        let state = sidecar_up_with_runtime(&runtime, None).expect("state");
+        let mut raw = serde_json::to_value(&state).expect("serialize state");
+        let object = raw.as_object_mut().expect("state object");
+        let lexical = object.remove("lexical_data_dir").expect("lexical path");
+        object.insert("zoekt_data_dir".to_string(), lexical);
+
+        let migrated: SidecarStateFile = serde_json::from_value(raw).expect("read legacy state");
+        let rewritten = serde_json::to_value(migrated).expect("rewrite state");
+
+        assert!(rewritten.get("lexical_data_dir").is_some());
+        assert!(rewritten.get("zoekt_data_dir").is_none());
     }
 
     #[test]

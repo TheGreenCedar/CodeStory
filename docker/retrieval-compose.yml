@@ -13,6 +13,8 @@ services:
     image: qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae
     container_name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory}-qdrant
     user: "${CODESTORY_QDRANT_USER:-0:0}"
+    environment:
+      QDRANT__STORAGE__SNAPSHOTS_PATH: "${CODESTORY_QDRANT_SNAPSHOTS_PATH:-/qdrant/snapshots}"
     restart: unless-stopped
     labels:
       dev.codestory.owner: ${CODESTORY_SIDECAR_OWNER:-codestory}

@@ -150,6 +150,14 @@ package execution does not close #887; live managed Metal endpoint survival
 still needs reporter or equivalent Apple Silicon hardware evidence. Current
 Ubuntu execution does not prove older-glibc compatibility.
 
+Proof cleanup validates the exact current `lexical_data_dir` and accepts the
+legacy `zoekt_data_dir` spelling only as read compatibility for an otherwise
+proof-owned state file. New state must never emit Zoekt path, port, or image
+keys. When local retrieval indexing fails, the proof records Compose process
+state and bounded Qdrant logs before cleanup so the primary failure remains
+diagnosable; cleanup failure is retained as secondary evidence and must not
+replace the primary gate failure.
+
 Release closeout is not complete until every published asset cell passes and
 the corresponding CodeStory plugin-source update is committed or merged in
 `TheGreenCedar/AgentPluginMarketplace`, followed by marketplace refresh and
