@@ -31,7 +31,7 @@ function routeForPrompt(prompt) {
     || /\breview\b[^.!?]*\b(?:diff|changes?|pull request)\b/u.test(text)
     || /\b(?:review\b[^.!?]*\bpr|pr\b[^.!?]*\breview)\b/u.test(text)
   ) {
-    return 'Review/change impact: use affected only with explicit git-changed paths, then inspect relevant symbols or traces; affected is planning evidence, not proof.';
+    return 'Review/change impact: use affected only with explicit git-changed paths, then inspect relevant symbol or trace evidence; affected is planning evidence, not proof.';
   }
   if (/\b(?:where is|defined|definition|owns?|ownership|symbol|class|function|method)\b/u.test(text)) {
     return 'Symbol ownership: use symbol, then definition; add callers/callees only when the question asks for flow.';
@@ -42,6 +42,24 @@ function routeForPrompt(prompt) {
   return 'Repository orientation: use ground; use files only for language, role, path, or coverage questions.';
 }
 
+function selectedPlan(route, prompt) {
+  const label = route.split(':', 1)[0];
+  const blockedDeep = /\b(?:packet(?:\s*\/\s*|\s+and\s+)search|packet|search)\b[^.!?]*\bblocked\b|\bblocked\b[^.!?]*\b(?:packet|search)\b/u.test(
+    normalizePrompt(prompt).toLowerCase(),
+  );
+  const plans = {
+    'Repository orientation': ['orientation', ['ground', 'files']],
+    'Symbol ownership': ['symbol_ownership', ['symbol', 'definition']],
+    'Call flow': ['call_flow', ['symbol', 'callers', 'callees', 'trace']],
+    'Review/change impact': ['change_impact', ['affected', 'symbol', 'trace']],
+    'Broad question': blockedDeep
+      ? ['broad_question', ['ground', 'symbol', 'trace']]
+      : ['broad_question', ['packet']],
+  };
+  const [category, tools] = plans[label];
+  return `Plan: category=${category}; tools=${tools.join(',')}`;
+}
+
 function eventHeader(event, input = {}) {
   if (event === 'UserPromptSubmit') {
     const route = routeForPrompt(input.prompt);
@@ -50,6 +68,7 @@ function eventHeader(event, input = {}) {
       'CODESTORY REQUEST ROUTING ACTIVE',
       '',
       `Route: ${route}`,
+      selectedPlan(route, input.prompt),
       '',
     ].join('\n');
   }

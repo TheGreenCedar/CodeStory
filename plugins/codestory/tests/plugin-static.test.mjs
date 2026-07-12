@@ -20,12 +20,7 @@ const {
   uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
-const { emitGenericUserPromptPolicy } = require(join(
-  pluginRoot,
-  "tests",
-  "fixtures",
-  "hook-generic-baseline.cjs",
-));
+const genericBaselineHook = join(pluginRoot, "tests", "fixtures", "hook-generic-baseline.cjs");
 
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
@@ -3097,8 +3092,8 @@ async function writeNodeCli(binDir, source) {
   return cliPath;
 }
 
-function runCodexHook(input, env) {
-  const result = spawnSync(process.execPath, [join(pluginRoot, "hooks", "codestory-activate.cjs")], {
+function runHookProcess(script, input, env) {
+  const result = spawnSync(process.execPath, [script], {
     env: {
       ...process.env,
       COPILOT_PLUGIN_DATA: "",
@@ -3109,6 +3104,10 @@ function runCodexHook(input, env) {
   });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
+}
+
+function runCodexHook(input, env) {
+  return runHookProcess(join(pluginRoot, "hooks", "codestory-activate.cjs"), input, env);
 }
 
 async function runCodexHookAsync(input, env) {
@@ -3195,49 +3194,43 @@ test("hook routing is stateless across repeated and parallel processes", async (
   }
 });
 
-test("hook qualification records emitted routes and observed drill surfaces", async (t) => {
+test("hook qualification compares executable policies with sourced MCP observations", async (t) => {
   const fixture = JSON.parse(await readFile(
     join(pluginRoot, "tests", "fixtures", "hook-route-qualification.json"),
     "utf8",
   ));
+  const observedDrills = JSON.parse(await readFile(
+    join(pluginRoot, "tests", "fixtures", "hook-observed-mcp-drills.json"),
+    "utf8",
+  ));
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-qualification-"));
-  const surfacePatterns = new Map([
-    ["status", /\bstatus\b/u],
-    ["ground", /\bground\b/u],
-    ["files", /\buse files\b/u],
-    ["symbol", /\bsymbols?\b/u],
-    ["definition", /\bdefinition\b/u],
-    ["callers", /\bcallers\b/u],
-    ["callees", /\bcallees\b/u],
-    ["trace", /\btraces?\b/u],
-    ["trail", /\btrails?\b/u],
-    ["affected", /\baffected\b/u],
-    ["packet", /\bpacket\b/u],
-    ["search", /\bsearch\b/u],
-    ["sidecar_setup", /\bsidecar_setup\b/u],
+  const toolVocabulary = new Set([
+    "affected", "callees", "callers", "definition", "files", "ground", "packet",
+    "search", "sidecar_setup", "snippet", "status", "symbol", "trace", "trail",
   ]);
   const record = (output) => {
     const context = output.hookSpecificOutput?.additionalContext || "";
-    const routeInstruction = context.match(/^Route: (.+)$/mu)?.[1] || "";
-    const surfaceText = routeInstruction || context;
+    const plan = context.match(/^Plan: category=([a-z_]+); tools=([a-z_,]+)$/mu);
+    const instructedTools = plan
+      ? [...new Set(plan[2].split(","))].sort()
+      : [];
+    assert.ok(instructedTools.every((tool) => toolVocabulary.has(tool)));
     return {
       suppressed: !context,
-      route: routeInstruction.match(/^([^:]+):/u)?.[1] || null,
-      instructed_surfaces: [...surfacePatterns]
-        .filter(([, pattern]) => pattern.test(surfaceText))
-        .map(([surface]) => surface),
+      category: plan?.[1] || null,
+      instructed_tools: instructedTools,
     };
   };
   const failures = (actual, expected) => {
     const result = [];
     if (actual.suppressed !== Boolean(expected.suppressed)) result.push("suppression");
-    if (!expected.suppressed && actual.route !== expected.route) result.push("route");
-    for (const surface of expected.required_surfaces || []) {
-      const normalized = { symbols: "symbol", traces: "trace" }[surface] || surface;
-      if (!actual.instructed_surfaces.includes(normalized)) result.push(`missing:${surface}`);
+    if (!expected.suppressed && actual.category !== expected.category) result.push("category");
+    const expectedTools = [...(expected.instructed_tools || [])].sort();
+    if (!expected.suppressed && actual.instructed_tools.join("\0") !== expectedTools.join("\0")) {
+      result.push(`tools:${actual.instructed_tools.join(",")}`);
     }
-    for (const surface of expected.forbidden_surfaces || []) {
-      if (actual.instructed_surfaces.includes(surface)) result.push(`forbidden:${surface}`);
+    for (const tool of expected.forbidden_tools || []) {
+      if (actual.instructed_tools.includes(tool)) result.push(`forbidden:${tool}`);
     }
     return result;
   };
@@ -3254,7 +3247,11 @@ test("hook qualification records emitted routes and observed drill surfaces", as
       assert.equal(context.includes(entry.prompt), false);
       assert.doesNotMatch(context, /hook output truncated/u);
       const current = record(currentOutput);
-      const baseline = record(emitGenericUserPromptPolicy(entry.prompt));
+      const baseline = record(runHookProcess(genericBaselineHook, {
+        hook_event_name: "UserPromptSubmit",
+        prompt: entry.prompt,
+        cwd: repoRoot,
+      }, { PLUGIN_DATA: dataDir, PATH: "" }));
       return {
         slug: entry.slug,
         current,
@@ -3264,49 +3261,63 @@ test("hook qualification records emitted routes and observed drill surfaces", as
       };
     });
 
-    const requiredTraceSurfaces = {
-      "Repository orientation": ["ground", "files"],
-      "Symbol ownership": ["symbol", "definition"],
-      "Call flow": ["symbol", "callers", "callees"],
-      "Review/change impact": ["affected"],
-      "Broad question": ["ground", "symbol", "trace"],
+    const requiredObservedTools = {
+      orientation: ["ground", "files"],
+      symbol_ownership: ["symbol", "definition"],
+      call_flow: ["symbol", "callers", "callees"],
+      change_impact: ["affected"],
+      broad_question: ["ground", "symbol", "trace"],
     };
-    for (const drill of fixture.drills) {
+    assert.equal(observedDrills.artifact_kind, "sourced_observed_mcp_drill_traces");
+    assert.equal(observedDrills.test_execution.executes_mcp, false);
+    for (const drill of observedDrills.observations) {
       const emitted = record(runCodexHook({
         hook_event_name: "UserPromptSubmit",
         prompt: drill.prompt,
         cwd: repoRoot,
       }, { PLUGIN_DATA: dataDir, PATH: "" }));
-      const sourceIndex = drill.surface_trace.indexOf("source");
-      const graphIndex = drill.surface_trace.findIndex((surface) =>
-        ["ground", "symbol", "callers", "callees", "trace", "trail", "affected"].includes(surface));
-      assert.equal(emitted.route, drill.route);
-      assert.equal(drill.surface_trace[0], "status");
-      assert.equal(drill.status_reused, true);
-      assert.ok(drill.evidence_source.includes("live MCP trace"));
-      assert.ok(requiredTraceSurfaces[drill.route].every((surface) =>
-        drill.surface_trace.includes(surface)), drill.evidence_source);
-      if (sourceIndex >= 0) assert.ok(graphIndex > 0 && sourceIndex > graphIndex, drill.evidence_source);
-      if (drill.blocked_surfaces) {
-        assert.ok(drill.blocked_surfaces.every((surface) => drill.status_outcome.includes(surface)));
+      const observedTools = drill.steps.map(({ tool }) => tool);
+      const sourceIndex = observedTools.indexOf("source");
+      const graphIndex = observedTools.findIndex((tool) =>
+        ["ground", "symbol", "callers", "callees", "trace", "trail", "affected"].includes(tool));
+      assert.ok(
+        observedTools.every((tool) => tool === "source" || toolVocabulary.has(tool)),
+        drill.source.location,
+      );
+      assert.equal(drill.source_fallback.used, sourceIndex >= 0, drill.source.location);
+      assert.equal(emitted.category, drill.category);
+      assert.equal(observedTools[0], "status");
+      assert.equal(drill.source.kind, "agent_observation");
+      assert.equal(drill.source.url, "https://github.com/TheGreenCedar/CodeStory/pull/982");
+      assert.match(drill.source.commit, /^[0-9a-f]{40}$/u);
+      assert.ok(requiredObservedTools[drill.category].every((tool) =>
+        observedTools.includes(tool)), drill.source.location);
+      if (sourceIndex >= 0) {
+        assert.equal(drill.source_fallback.used, true);
+        assert.equal(drill.source_fallback.after_graph, true);
+        assert.ok(graphIndex > 0 && sourceIndex > graphIndex, drill.source.location);
       }
-      if (drill.affected_paths) {
-        assert.deepEqual(drill.affected_paths, [
+      if (drill.blocked_tools) {
+        assert.deepEqual([...drill.blocked_tools].sort(), ["packet", "search"]);
+      }
+      const affected = drill.steps.find(({ tool }) => tool === "affected");
+      if (affected) {
+        assert.deepEqual(affected.arguments.paths, [
           "plugins/codestory/hooks/codestory-activate.cjs",
           "plugins/codestory/tests/plugin-static.test.mjs",
         ]);
-        assert.match(drill.affected_outcome, /both paths matched/u);
+        assert.equal(affected.result_kind, "explicit_path_match");
       }
-      assert.equal(drill.surface_trace.includes("sidecar_setup"), false);
+      assert.equal(observedTools.includes("sidecar_setup"), false);
       assert.equal(drill.repair_attempted, false);
     }
 
     t.diagnostic(JSON.stringify({
       cases,
-      drills: fixture.drills.map(({ slug, evidence_source, surface_trace }) => ({
+      observed_drills: observedDrills.observations.map(({ slug, source, steps }) => ({
         slug,
-        evidence_source,
-        observed_surfaces: surface_trace,
+        source,
+        observed_tools: steps.map(({ tool }) => tool),
       })),
     }));
     assert.deepEqual(cases.flatMap(({ slug, current_failures }) =>
