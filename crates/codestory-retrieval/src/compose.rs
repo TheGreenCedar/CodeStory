@@ -1,7 +1,7 @@
 use crate::config::{
     EmbeddingServerLaunchMode, NATIVE_LLAMA_MANAGED_CACHE_REL_PATH,
     NATIVE_LLAMA_SOURCE_CACHE_REL_PATH, SidecarLayout, SidecarProfile, SidecarRuntimeConfig,
-    embedding_server_launch_mode, retrieval_compose_profile, user_cache_root,
+    retrieval_compose_profile, user_cache_root,
 };
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
 use crate::outbound_http::read_bytes;
@@ -273,8 +273,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     layout.ensure_data_dirs()?;
     let storage_repair =
         repair_qdrant_storage(&layout, &storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
-    let launch_mode = embedding_server_launch_mode()?;
-    runtime.activate_embed_url_default();
+    let launch_mode = crate::config::embedding_server_launch_mode_for_runtime(runtime)?;
     let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
         .then(|| native_embedding_server_launch(repo_root, runtime))
         .transpose()?;
@@ -472,7 +471,7 @@ fn docker_compose_up(
     let mut command = docker_compose_command()?;
     let compose_profile = retrieval_compose_profile();
     remove_container_if_present("codestory-zoekt-stub")?;
-    let embedding_device = crate::embeddings::embedding_device_readiness();
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let accelerator_request = crate::embeddings::embedding_accelerator_request();
     let vulkan_override = maybe_write_vulkan_compose_override(
         &user_cache_root(),
@@ -516,10 +515,7 @@ fn docker_compose_up(
             docker_bind_path(&embed_model_dir(repo_root, layout)?),
         )
         .env("CODESTORY_EMBED_PORT", runtime.embed_http_port.to_string())
-        .env(
-            "CODESTORY_EMBED_LLAMACPP_URL",
-            SidecarLayout::embed_base_url(runtime.embed_http_port),
-        )
+        .env("CODESTORY_EMBED_LLAMACPP_URL", &runtime.embedding.endpoint)
         .env(
             "CODESTORY_EMBED_DEVICE_STATE",
             embedding_device.observed_state,
@@ -729,7 +725,7 @@ fn native_embedding_server_launch(
     repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<NativeEmbeddingServerLaunch> {
-    ensure_native_launch_backend_supported()?;
+    ensure_native_launch_backend_supported(runtime)?;
     ensure_selected_managed_native_llama_server(repo_root)?;
     let executable = native_llama_server_path(repo_root)?;
     let model_path =
@@ -993,8 +989,10 @@ fn matching_native_llama_backends(provider: &str) -> Vec<crate::config::LlamaSid
         .collect()
 }
 
-fn ensure_native_launch_backend_supported() -> Result<()> {
-    if crate::config::embedding_server_launch_mode()? != EmbeddingServerLaunchMode::NativeSpawned {
+fn ensure_native_launch_backend_supported(runtime: &SidecarRuntimeConfig) -> Result<()> {
+    if crate::config::embedding_server_launch_mode_for_runtime(runtime)?
+        != EmbeddingServerLaunchMode::NativeSpawned
+    {
         return Ok(());
     }
     let Some(request) = crate::embeddings::embedding_accelerator_request() else {
@@ -1455,7 +1453,7 @@ fn spawn_native_embedding_server(
     runtime: &SidecarRuntimeConfig,
     allow_spawn: bool,
 ) -> Result<Option<NativeEmbeddingSpawn>> {
-    let probe = crate::embeddings::probe_product_embedding_runtime();
+    let probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
     spawn_native_embedding_server_with_probe(launch, runtime, allow_spawn, probe)
 }
 
@@ -1828,6 +1826,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: std::collections::BTreeMap::new(),
+            ..SidecarRuntimeConfig::local()
         }
     }
 

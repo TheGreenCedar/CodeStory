@@ -473,6 +473,7 @@ struct QdrantCapabilityProbe {
     semantic_failure_reason: String,
 }
 
+#[cfg(test)]
 fn qdrant_capabilities(
     layout: &SidecarLayout,
     collection: &str,
@@ -480,6 +481,26 @@ fn qdrant_capabilities(
     expected_points: Option<u64>,
     product_embedding_backend: bool,
     current_product_embedding_backend: bool,
+) -> QdrantCapabilityProbe {
+    qdrant_capabilities_for_runtime(
+        layout,
+        collection,
+        probe,
+        expected_points,
+        product_embedding_backend,
+        current_product_embedding_backend,
+        &crate::config::SidecarRuntimeConfig::local(),
+    )
+}
+
+fn qdrant_capabilities_for_runtime(
+    layout: &SidecarLayout,
+    collection: &str,
+    probe: &crate::qdrant_client::QdrantHealthProbe,
+    expected_points: Option<u64>,
+    product_embedding_backend: bool,
+    current_product_embedding_backend: bool,
+    runtime: &crate::config::SidecarRuntimeConfig,
 ) -> QdrantCapabilityProbe {
     if !probe.reachable || !probe.collection_exists {
         return qdrant_capability_failure("qdrant_unreachable");
@@ -496,7 +517,12 @@ fn qdrant_capabilities(
     if !current_product_embedding_backend {
         return qdrant_capability_failure("qdrant_current_embedding_backend_not_product");
     }
-    let client = QdrantClient::new(layout);
+    let client = match QdrantClient::for_runtime(runtime) {
+        Ok(client) => client,
+        Err(error) => {
+            return qdrant_capability_failure(format!("embedding_runtime_unavailable: {error:#}"));
+        }
+    };
     match client.semantic_search_smoke_result(collection) {
         Ok(()) => QdrantCapabilityProbe {
             capabilities: SidecarCapabilities {
@@ -588,6 +614,17 @@ pub fn probe_sidecar_health_with_embedding_device(
     manifest: Option<codestory_store::RetrievalIndexManifest>,
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> RetrievalStatusReport {
+    let runtime = crate::config::SidecarRuntimeConfig::local();
+    probe_sidecar_health_for_runtime(layout, project_id, manifest, embedding_device, &runtime)
+}
+
+pub fn probe_sidecar_health_for_runtime(
+    layout: &SidecarLayout,
+    project_id: &str,
+    manifest: Option<codestory_store::RetrievalIndexManifest>,
+    embedding_device: &EmbeddingDeviceReadiness,
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> RetrievalStatusReport {
     if let Some(manifest) = manifest.as_ref() {
         if !manifest_has_current_sidecar_contract(project_id, manifest) {
             return unavailable_status_report_with_embedding_device(
@@ -637,7 +674,7 @@ pub fn probe_sidecar_health_with_embedding_device(
         capabilities: zoekt_capabilities,
     };
 
-    let current_embedding_backend = crate::embeddings::embedding_runtime_id();
+    let current_embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     let dense_anchor_count = manifest
         .dense_projection_count
         .or(manifest.projection_count)
@@ -654,13 +691,14 @@ pub fn probe_sidecar_health_with_embedding_device(
             manifest_embedding_backend_is_product(manifest.embedding_backend.as_deref());
         let current_product_embedding_backend =
             manifest_embedding_backend_is_product(Some(current_embedding_backend.as_str()));
-        let qdrant_capability_probe = qdrant_capabilities(
+        let qdrant_capability_probe = qdrant_capabilities_for_runtime(
             layout,
             &collection,
             &qdrant_probe,
             expected_qdrant_points,
             product_embedding_backend,
             current_product_embedding_backend,
+            runtime,
         );
         let qdrant_semantic_stub = qdrant_probe.reachable
             && qdrant_probe.collection_exists

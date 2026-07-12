@@ -1,9 +1,11 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, dir_size_bytes};
+#[cfg(test)]
+use crate::generation::manifest_unavailable_reason;
 use crate::generation::{
-    SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract, manifest_unavailable_reason,
-    sidecar_generation_id,
+    SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract,
+    manifest_unavailable_reason_for_runtime, sidecar_generation_id,
 };
-use crate::health::probe_sidecar_health_with_embedding_device;
+use crate::health::probe_sidecar_health_for_runtime;
 use crate::qdrant_client::{QDRANT_INDEX_UPSERT_BATCH_SIZE, QdrantClient, QdrantUpsertPoint};
 use crate::retention::{
     FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
@@ -70,6 +72,7 @@ struct SidecarStubFlags {
 }
 
 struct GenerationRetentionContext<'a> {
+    runtime: &'a SidecarRuntimeConfig,
     layout: &'a SidecarLayout,
     workspace_id: &'a str,
     previous_manifest: Option<&'a RetrievalIndexManifest>,
@@ -113,7 +116,9 @@ pub fn repair_project_qdrant_collection_for_runtime(
     else {
         return Ok(None);
     };
-    if let Some(reason) = manifest_unavailable_reason(&project_id, &storage, &manifest) {
+    if let Some(reason) =
+        manifest_unavailable_reason_for_runtime(&project_id, &storage, &manifest, runtime)
+    {
         return Ok(Some(ProjectQdrantRepairOutcome {
             project_id,
             qdrant_collection: manifest.qdrant_collection,
@@ -127,7 +132,7 @@ pub fn repair_project_qdrant_collection_for_runtime(
 
     let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
-    let qdrant_client = QdrantClient::new(layout);
+    let qdrant_client = QdrantClient::for_runtime(runtime)?;
     let probe = qdrant_client.health_probe(&manifest.qdrant_collection);
     if !probe.reachable {
         return Ok(Some(ProjectQdrantRepairOutcome {
@@ -207,7 +212,6 @@ pub fn finalize_index_for_runtime_with_progress(
     runtime: &SidecarRuntimeConfig,
     mut progress: impl FnMut(&'static str),
 ) -> Result<FinalizeIndexOutcome> {
-    runtime.activate_embed_url_default();
     let layout = runtime.layout.clone();
     let project_id = sidecar_project_id_for_root(project_root);
     let workspace_id = runtime
@@ -239,8 +243,8 @@ pub fn finalize_index_for_runtime_with_progress(
         );
     }
 
-    let qdrant_client = QdrantClient::new(&layout);
-    let embedding_backend = crate::embeddings::embedding_runtime_id();
+    let qdrant_client = QdrantClient::for_runtime(runtime)?;
+    let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)?;
@@ -249,22 +253,24 @@ pub fn finalize_index_for_runtime_with_progress(
     let mut storage =
         Store::open(storage_path).context("open storage for retrieval sidecar input")?;
     ensure_search_symbol_projection(&mut storage)?;
-    let sidecar_input = compute_sidecar_input_fingerprint(
+    let sidecar_input = compute_sidecar_input_fingerprint_for_runtime(
         &storage,
         storage_path,
         project_root,
         &project_id,
         &embedding_backend,
         embedding_dim,
+        &runtime.embedding,
     )?;
     let previous_manifest = storage
         .get_retrieval_index_manifest(&project_id)
         .context("load previous retrieval_index_manifest")?;
-    let previous_manifest_unavailable_reason = previous_manifest
-        .as_ref()
-        .and_then(|manifest| manifest_unavailable_reason(&project_id, &storage, manifest));
+    let previous_manifest_unavailable_reason = previous_manifest.as_ref().and_then(|manifest| {
+        manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
+    });
     drop(storage);
     let retention_context = GenerationRetentionContext {
+        runtime,
         layout: &layout,
         workspace_id: &workspace_id,
         previous_manifest: previous_manifest.as_ref(),
@@ -284,11 +290,12 @@ pub fn finalize_index_for_runtime_with_progress(
             &embedding_backend,
             embedding_dim,
         ) {
-            let status = probe_sidecar_health_with_embedding_device(
+            let status = probe_sidecar_health_for_runtime(
                 &layout,
                 &project_id,
                 Some(previous.clone()),
                 &embedding_device,
+                runtime,
             );
             let qdrant_point_count = qdrant_ready_point_count(
                 &qdrant_client,
@@ -362,11 +369,12 @@ pub fn finalize_index_for_runtime_with_progress(
     );
     manifest.scip_revision = read_scip_revision(&scip_dir);
 
-    let existing_status = probe_sidecar_health_with_embedding_device(
+    let existing_status = probe_sidecar_health_for_runtime(
         &layout,
         &project_id,
         Some(manifest.clone()),
         &embedding_device,
+        runtime,
     );
     let zoekt_ready = existing_status.zoekt.capabilities.lexical
         && crate::zoekt_index::shard_matches_lexical_input(
@@ -386,11 +394,12 @@ pub fn finalize_index_for_runtime_with_progress(
     if zoekt_ready && qdrant_ready_points.is_some() && scip_ready {
         update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
         manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
-        let status = probe_sidecar_health_with_embedding_device(
+        let status = probe_sidecar_health_for_runtime(
             &layout,
             &project_id,
             Some(manifest.clone()),
             &embedding_device,
+            runtime,
         );
         if status.retrieval_mode == "full" {
             info!(
@@ -725,11 +734,12 @@ fn finalize_manifest_after_health_check(
     ) {
         bail!("mandatory Zoekt lexical shard is incomplete for {project_id}");
     }
-    let status = probe_sidecar_health_with_embedding_device(
+    let status = probe_sidecar_health_for_runtime(
         layout,
         &project_id,
         Some(manifest.clone()),
         embedding_device,
+        retention_context.runtime,
     );
     if status.retrieval_mode != "full" {
         bail!(
@@ -913,7 +923,12 @@ fn persist_finalized_manifest(
     manifest.degraded_modes_json =
         serde_json::to_string(&degraded_modes).unwrap_or_else(|_| "[]".into());
     let mut storage = Store::open(storage_path).context("open storage for retrieval manifest")?;
-    if let Some(reason) = manifest_unavailable_reason(&project_id, &storage, &manifest) {
+    if let Some(reason) = manifest_unavailable_reason_for_runtime(
+        &project_id,
+        &storage,
+        &manifest,
+        retention_context.runtime,
+    ) {
         bail!(
             "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
         );
@@ -983,11 +998,12 @@ fn retain_published_generations(
     candidates.sort_by_key(|candidate| candidate.built_at_epoch_ms);
     candidates.dedup_by(|left, right| left.sidecar_generation == right.sidecar_generation);
     let verified_previous = candidates.into_iter().rev().find_map(|candidate| {
-        let status = probe_sidecar_health_with_embedding_device(
+        let status = probe_sidecar_health_for_runtime(
             context.layout,
             project_id,
             Some(candidate.clone()),
             context.embedding_device,
+            context.runtime,
         );
         (status.retrieval_mode == "full").then_some(VerifiedRollbackManifest {
             manifest: candidate,
@@ -1042,6 +1058,7 @@ fn retain_published_generations(
     (plan, apply)
 }
 
+#[cfg(test)]
 pub(crate) fn compute_sidecar_input_fingerprint(
     storage: &Store,
     storage_path: &Path,
@@ -1049,6 +1066,26 @@ pub(crate) fn compute_sidecar_input_fingerprint(
     project_id: &str,
     embedding_backend: &str,
     embedding_dim: i32,
+) -> Result<SidecarInputFingerprint> {
+    compute_sidecar_input_fingerprint_for_runtime(
+        storage,
+        storage_path,
+        project_root,
+        project_id,
+        embedding_backend,
+        embedding_dim,
+        &crate::config::SidecarRuntimeConfig::local().embedding,
+    )
+}
+
+pub(crate) fn compute_sidecar_input_fingerprint_for_runtime(
+    storage: &Store,
+    storage_path: &Path,
+    project_root: &Path,
+    project_id: &str,
+    embedding_backend: &str,
+    embedding_dim: i32,
+    embedding: &crate::config::EmbeddingRuntimeConfig,
 ) -> Result<SidecarInputFingerprint> {
     let lexical = lexical_input_fingerprint(project_root, Some(storage_path))
         .context("hash lexical sidecar input")?;
@@ -1063,17 +1100,10 @@ pub(crate) fn compute_sidecar_input_fingerprint(
     hash_part(&mut hasher, &lexical.hash);
     hash_part(&mut hasher, embedding_backend);
     hash_part(&mut hasher, &embedding_dim.to_string());
+    hash_part(&mut hasher, embedding.query_prefix.as_deref().unwrap_or(""));
     hash_part(
         &mut hasher,
-        std::env::var("CODESTORY_EMBED_QUERY_PREFIX")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    hash_part(
-        &mut hasher,
-        std::env::var("CODESTORY_EMBED_DOCUMENT_PREFIX")
-            .as_deref()
-            .unwrap_or(""),
+        embedding.document_prefix.as_deref().unwrap_or(""),
     );
     hash_part(&mut hasher, "qdrant-semantic-vectors");
     hash_part(&mut hasher, "scip-symbols-json-v1");
@@ -1542,6 +1572,7 @@ mod tests {
             embed_http_port: 11,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
+            ..SidecarRuntimeConfig::local()
         };
 
         let repair =

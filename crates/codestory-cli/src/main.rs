@@ -379,8 +379,12 @@ fn run_sidecar(cmd: SidecarCommand) -> Result<()> {
     }
 }
 
-fn new_agent_surface_runtime(project: &ProjectArgs) -> Result<RuntimeContext> {
-    RuntimeContext::new_agent_sidecar(project)
+fn new_agent_surface_runtime(
+    project: &ProjectArgs,
+    profile: Option<args::CliSidecarProfile>,
+    run_id: Option<&str>,
+) -> Result<RuntimeContext> {
+    RuntimeContext::new_agent_sidecar_with_selection(project, profile, run_id)
 }
 
 fn run_cache(cmd: CacheCommand) -> Result<()> {
@@ -1338,7 +1342,7 @@ struct ResolvedContextTarget {
 fn run_context(cmd: ContextCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "context")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "context")?;
 
@@ -1385,8 +1389,7 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    retrieval::activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project, cmd.profile, cmd.run_id.as_deref())?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "packet")?;
 
@@ -1418,7 +1421,7 @@ fn run_task(cmd: TaskCommand) -> Result<()> {
 fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "task brief")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "task brief")?;
 
@@ -2331,7 +2334,7 @@ fn run_fix(cmd: FixCommand) -> Result<()> {
 fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
     let runtime = if cmd.repair {
         if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
-            new_agent_surface_runtime(&cmd.project)?
+            new_agent_surface_runtime(&cmd.project, None, None)?
         } else {
             RuntimeContext::new(&cmd.project)?
         }
@@ -2708,8 +2711,8 @@ fn repair_ready_state(
 ) -> Result<Option<codestory_retrieval::SidecarRuntimeConfig>> {
     let agent_goal = matches!(goal, None | Some(args::ReadyGoal::Agent));
     let sidecar = agent_goal.then(|| {
-        codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-            &runtime.project_root,
+        runtime.sidecar.with_profile_and_run_id(
+            Some(&runtime.project_root),
             codestory_retrieval::SidecarProfile::Agent,
             run_id,
         )
@@ -2979,7 +2982,7 @@ fn run_ready_repair_with_native_embedding_lease(
                 &runtime.storage_path,
                 sidecar,
             );
-            let embed_smoke = ensure_ready_repair_embed_liveness(&infrastructure)?;
+            let embed_smoke = ensure_ready_repair_embed_liveness(&infrastructure, sidecar)?;
             let gpu_proof =
                 broker_gpu_proof_input_from_infrastructure_with_smoke(&infrastructure, embed_smoke);
             let _ =
@@ -3040,9 +3043,10 @@ struct ReadyRepairEmbedSmoke {
 
 fn ensure_ready_repair_embed_liveness(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<ReadyRepairEmbedSmoke> {
     ensure_ready_repair_embed_liveness_with_probe(infrastructure, || {
-        codestory_retrieval::probe_product_embedding_runtime()
+        codestory_retrieval::probe_product_embedding_runtime_for_runtime(sidecar)
     })
 }
 
@@ -3439,8 +3443,7 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    retrieval::activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project, cmd.profile, cmd.run_id.as_deref())?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "search")?;
     let search_results = runtime
@@ -3483,9 +3486,10 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         retrieval::finalize_retrieval_index_for_runtime(&runtime)
             .context("drill retrieval index finalize")?;
     }
-    let sidecar_retrieval_mode = codestory_retrieval::strict_sidecar_status(
+    let sidecar_retrieval_mode = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
+        runtime.sidecar.clone(),
     )
     .ok()
     .map(|status| status.retrieval_mode);
@@ -10901,7 +10905,7 @@ async fn run_serve(cmd: ServeCommand) -> Result<()> {
     if cmd.multi_project {
         return stdio_transport::run_stdio_server(None, cmd.refresh).await;
     }
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
         return stdio_transport::run_stdio_server(Some(runtime), cmd.refresh).await;
@@ -11350,7 +11354,7 @@ fn readiness_sidecar_input(
 }
 
 fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput {
-    let sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    let sidecar = runtime.sidecar.clone();
     match codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
@@ -11379,8 +11383,8 @@ fn ready_sidecar_status(
     if matches!(goal, Some(args::ReadyGoal::Agent))
         && let Some(run_id) = run_id
     {
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-            &runtime.project_root,
+        let sidecar = runtime.sidecar.with_profile_and_run_id(
+            Some(&runtime.project_root),
             codestory_retrieval::SidecarProfile::Agent,
             Some(run_id),
         );
@@ -11493,7 +11497,11 @@ pub(crate) fn selected_agent_readiness_sidecar_status(
     run_id: Option<&str>,
     fallback: &DoctorSidecarStatusOutput,
 ) -> DoctorSidecarStatusOutput {
-    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, run_id);
+    let agent_runtime = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
+        codestory_retrieval::SidecarProfile::Agent,
+        run_id,
+    );
     let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
     lane_scoped_agent_readiness_sidecar(fallback, agent_status)
 }
@@ -11525,11 +11533,16 @@ pub(crate) fn build_readiness_lanes_for_runtime(
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
-    let local_runtime = codestory_retrieval::sidecar_runtime_for_project(
-        &runtime.project_root,
+    let local_runtime = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         codestory_retrieval::SidecarProfile::Local,
+        None,
     );
-    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, agent_run_id);
+    let agent_runtime = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
+        codestory_retrieval::SidecarProfile::Agent,
+        agent_run_id,
+    );
     let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
     let agent_status = selected_agent_status
         .cloned()
@@ -11590,6 +11603,7 @@ fn apply_broker_ready_repair_overlay(
     ));
 }
 
+#[cfg(test)]
 fn agent_readiness_sidecar_runtime(
     project_root: &Path,
     run_id: Option<&str>,
@@ -11744,7 +11758,7 @@ fn apply_sidecar_profile_handoff(
 }
 
 fn doctor_sidecar_profile_handoff_failure(runtime: &RuntimeContext) -> Option<String> {
-    let active = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    let active = runtime.sidecar.clone();
     if active.profile == codestory_retrieval::SidecarProfile::Local {
         return None;
     }
@@ -13569,8 +13583,10 @@ mod tests {
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
 
-        let error = ensure_ready_repair_embed_liveness(&infrastructure)
-            .expect_err("unknown device should stop ready repair before indexing");
+        let error = ensure_ready_repair_embed_liveness_with_probe(&infrastructure, || {
+            unreachable!("device policy must fail before probing")
+        })
+        .expect_err("unknown device should stop ready repair before indexing");
         let message = format!("{error:#}");
 
         assert!(message.contains("embedding device policy failed before long semantic indexing"));
@@ -13610,6 +13626,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
+            ..codestory_retrieval::SidecarRuntimeConfig::local()
         };
         let state_dir = sidecar.layout.state_file.parent().expect("state parent");
         fs::create_dir_all(state_dir).expect("create state dir");

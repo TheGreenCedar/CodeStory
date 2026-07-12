@@ -38,7 +38,19 @@ index path when embedding assets are available.
 
 ## Configuration Files
 
-The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config may override home config for project-safe preferences. Cache roots, network endpoints, model selectors for source-egress calls, credentials, and source-text egress settings must come from trusted user config, explicit environment variables, or CLI options; project files cannot set `cache_dir`, `summary_endpoint`, `summary_model`, or embedding endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
+The CLI captures process environment defaults once, then loads optional
+`.codestory.toml` defaults from the user home directory and the selected project
+root. It merges those values into an immutable `SidecarRuntimeConfig` retained
+by that project runtime; it never publishes project choices back through the
+process environment. This is required for multi-project stdio: switching A/B/A
+must keep each project's endpoint, model, prefix, retrieval policy, and summary
+settings isolated. Cache roots, network endpoints, model selectors for
+source-egress calls, credentials, and source-text egress settings must come from
+trusted user config, explicit environment variables, or CLI options; project
+files cannot set `cache_dir`, `summary_endpoint`, `summary_model`, or embedding
+endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set
+deliberately for that process. Explicit environment values have highest
+precedence without being mutated.
 
 Embedding config keys map to the runtime env names:
 
@@ -48,8 +60,12 @@ Embedding config keys map to the runtime env names:
 | `embedding_model_id` | `CODESTORY_EMBED_MODEL_ID` | Overrides the resolved model id for the selected profile. |
 | `embedding_model` | `CODESTORY_EMBED_MODEL_ID` | Deprecated alias for `embedding_model_id`; prefer the explicit key in new config. |
 | `embedding_endpoint` | `CODESTORY_EMBED_LLAMACPP_URL` | Trusted-only endpoint for the product llama.cpp embedding sidecar. |
+| `embedding_query_prefix` | `CODESTORY_EMBED_QUERY_PREFIX` | Per-project query prefix retained with the embedding contract. |
+| `embedding_document_prefix` | `CODESTORY_EMBED_DOCUMENT_PREFIX` | Per-project document prefix retained with the embedding contract. |
 
-The CLI should not set stale embedding env aliases that the runtime does not read.
+Runtime status reports distinguish a managed sidecar endpoint from an explicit
+process, trusted-user, or trusted-project endpoint. The CLI must not set runtime
+environment variables after startup.
 
 Index output should expose:
 

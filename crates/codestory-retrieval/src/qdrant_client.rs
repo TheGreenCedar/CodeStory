@@ -47,6 +47,7 @@ pub(crate) enum QdrantDeleteOutcome {
 pub struct QdrantClient {
     base_url: String,
     timeout: Duration,
+    embedding: Option<embeddings::LlamaCppEmbeddingClient>,
 }
 
 impl QdrantClient {
@@ -54,7 +55,18 @@ impl QdrantClient {
         Self {
             base_url: layout.qdrant_base_url(),
             timeout: QDRANT_HEALTH_BUDGET,
+            embedding: None,
         }
+    }
+
+    pub fn for_runtime(runtime: &crate::config::SidecarRuntimeConfig) -> Result<Self> {
+        Ok(Self {
+            base_url: runtime.layout.qdrant_base_url(),
+            timeout: QDRANT_HEALTH_BUDGET,
+            embedding: Some(embeddings::LlamaCppEmbeddingClient::new(
+                &runtime.embedding,
+            )?),
+        })
     }
 
     pub fn collection_name(project_id: &str) -> String {
@@ -173,7 +185,11 @@ impl QdrantClient {
         query: &str,
         limit: usize,
     ) -> Result<Vec<super::CandidateHit>> {
-        let vector = query_vector(query)?;
+        let vector = self
+            .embedding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("qdrant query embedding runtime is not configured"))?
+            .embed_query(query)?;
         self.search_vector(collection, &vector, limit)
     }
 
@@ -316,7 +332,7 @@ impl QdrantClient {
         );
         let mut written = 0usize;
         for chunk in points.chunks(QDRANT_INDEX_UPSERT_BATCH_SIZE) {
-            let vectors = vectors_for_points(chunk)?;
+            let vectors = vectors_for_points(chunk, self.embedding.as_ref())?;
             if vectors.len() != chunk.len() {
                 bail!(
                     "embedding batch returned {} vector(s) for {} qdrant point(s)",
@@ -623,11 +639,10 @@ pub fn diagnostic_query_vector(query: &str) -> Result<Vec<f32>> {
     query_vector(query)
 }
 
-fn document_vectors(labels: &[String]) -> Result<Vec<Vec<f32>>> {
-    embeddings::embed_documents(labels)
-}
-
-fn vectors_for_points(points: &[QdrantUpsertPoint]) -> Result<Vec<Vec<f32>>> {
+fn vectors_for_points(
+    points: &[QdrantUpsertPoint],
+    embedding: Option<&embeddings::LlamaCppEmbeddingClient>,
+) -> Result<Vec<Vec<f32>>> {
     let provided = points.iter().filter(|point| point.vector.is_some()).count();
     if provided == points.len() {
         return Ok(points
@@ -645,13 +660,16 @@ fn vectors_for_points(points: &[QdrantUpsertPoint]) -> Result<Vec<Vec<f32>>> {
         .iter()
         .map(|point| point.display_name.clone())
         .collect::<Vec<_>>();
-    document_vectors(&labels).with_context(|| {
-        format!(
-            "embed qdrant document batch size={} first={}",
-            labels.len(),
-            labels.first().map(String::as_str).unwrap_or("<empty>")
-        )
-    })
+    embedding
+        .ok_or_else(|| anyhow::anyhow!("qdrant document embedding runtime is not configured"))?
+        .embed_documents(&labels)
+        .with_context(|| {
+            format!(
+                "embed qdrant document batch size={} first={}",
+                labels.len(),
+                labels.first().map(String::as_str).unwrap_or("<empty>")
+            )
+        })
 }
 
 #[cfg(test)]

@@ -55,6 +55,12 @@ Runtime rules:
   an older retrieval path.
 - Repo-text, hash, stub, and old local search surfaces may be used only as
   explicitly labeled diagnostics.
+- Each opened project owns one immutable `SidecarRuntimeConfig`. Retrieval
+  indexing, query embedding, readiness/status, runtime search, and summary
+  generation consume that retained value. Managed sidecar endpoints are
+  derived from the selected profile/run ports; external endpoints retain their
+  trusted origin. Request handlers never activate endpoints by mutating process
+  environment variables.
 
 ## Generation And Reuse
 

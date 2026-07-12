@@ -4,13 +4,13 @@ use crate::config::{
 };
 use crate::generation::{
     SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
-    manifest_staleness_reason, manifest_unavailable_reason,
+    manifest_staleness_reason_for_runtime, manifest_unavailable_reason_for_runtime,
 };
 use crate::health::{
     EmbeddingLaunchMetadata, RetrievalStatusReport, attach_manifest_contract, attach_repair_hint,
-    probe_sidecar_health_with_embedding_device, unavailable_status_report_with_embedding_device,
+    probe_sidecar_health_for_runtime, unavailable_status_report_with_embedding_device,
 };
-use crate::index::{compute_sidecar_input_fingerprint, sidecar_project_id_for_root};
+use crate::index::{compute_sidecar_input_fingerprint_for_runtime, sidecar_project_id_for_root};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
@@ -123,7 +123,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
     runtime.ensure_ports_allocated()?;
     let layout = &runtime.layout;
     layout.ensure_data_dirs()?;
-    let embedding_device = crate::embeddings::embedding_device_readiness();
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let state = SidecarStateFile {
         project_identity: runtime.project_identity.clone(),
         owner: "codestory".into(),
@@ -689,8 +689,15 @@ fn sidecar_status_inner_with_runtime(
     strict: bool,
     runtime: SidecarRuntimeConfig,
 ) -> Result<RetrievalStatusReport> {
-    runtime.activate_embed_url_default();
     let layout = runtime.layout.clone();
+    if runtime.embedding.endpoint_origin != crate::config::EmbeddingEndpointOrigin::ManagedSidecar {
+        let probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(&runtime);
+        tracing::debug!(
+            reachable = probe.reachable,
+            detail = %probe.detail,
+            "Probed explicit embedding endpoint for retained project runtime"
+        );
+    }
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
     let project_id = sidecar_project_id_for_root(project_root);
     let manifest = if let Some(path) = storage_path.filter(|path| path.exists()) {
@@ -700,12 +707,13 @@ fn sidecar_status_inner_with_runtime(
             .context("load retrieval manifest")?;
         if strict
             && let Some(manifest) = manifest.as_ref()
-            && let Some(reason) = strict_readiness_unavailable_reason(
+            && let Some(reason) = strict_readiness_unavailable_reason_for_runtime(
                 project_root,
                 path,
                 &storage,
                 &project_id,
                 manifest,
+                &runtime,
             )
             .context("check strict sidecar readiness")?
         {
@@ -729,7 +737,8 @@ fn sidecar_status_inner_with_runtime(
             ));
         }
         if let Some(manifest) = manifest.as_ref()
-            && let Some(reason) = manifest_unavailable_reason(&project_id, &storage, manifest)
+            && let Some(reason) =
+                manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, &runtime)
         {
             return Ok(attach_status_ownership(
                 enrich_status_with_semantic_doc_stats(
@@ -750,11 +759,12 @@ fn sidecar_status_inner_with_runtime(
                 &runtime,
             ));
         }
-        let report = probe_sidecar_health_with_embedding_device(
+        let report = probe_sidecar_health_for_runtime(
             &layout,
             &project_id,
             manifest,
             &embedding_device,
+            &runtime,
         );
         return Ok(attach_status_ownership(
             enrich_status_with_semantic_doc_stats(
@@ -773,11 +783,12 @@ fn sidecar_status_inner_with_runtime(
     Ok(attach_status_ownership(
         attach_repair_hint(
             attach_manifest_contract(
-                probe_sidecar_health_with_embedding_device(
+                probe_sidecar_health_for_runtime(
                     &layout,
                     &project_id,
                     manifest,
                     &embedding_device,
+                    &runtime,
                 ),
                 project_root,
             ),
@@ -793,6 +804,7 @@ fn attach_status_ownership(
     runtime: &SidecarRuntimeConfig,
 ) -> RetrievalStatusReport {
     report.ownership = Some(runtime.ownership());
+    report.query_embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     if let Some(state) = read_sidecar_state(&runtime.layout.state_file) {
         report.embedding_launch = state.embedding_launch.or(report.embedding_launch);
         report.sidecar_images = state.sidecar_images;
@@ -849,6 +861,25 @@ fn strict_readiness_unavailable_reason(
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
 ) -> Result<Option<String>> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
+    strict_readiness_unavailable_reason_for_runtime(
+        project_root,
+        storage_path,
+        storage,
+        project_id,
+        manifest,
+        &runtime,
+    )
+}
+
+fn strict_readiness_unavailable_reason_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    storage: &Store,
+    project_id: &str,
+    manifest: &codestory_store::RetrievalIndexManifest,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<Option<String>> {
     if storage
         .has_incomplete_incremental_run()
         .context("inspect incomplete incremental index marker")?
@@ -858,13 +889,13 @@ fn strict_readiness_unavailable_reason(
     if !manifest_has_current_sidecar_contract(project_id, manifest) {
         return Ok(None);
     }
-    if let Some(reason) = manifest_staleness_reason(storage, manifest)
+    if let Some(reason) = manifest_staleness_reason_for_runtime(storage, manifest, runtime)
         && manifest_contract_drift_should_win(&reason)
     {
         return Ok(None);
     }
-    let embedding_backend = crate::embeddings::embedding_runtime_id();
-    let expected_doc_backend = crate::embeddings::embedding_backend_label();
+    let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
+    let expected_doc_backend = crate::embeddings::embedding_backend_label_for_runtime(runtime);
     if let Ok(stats) = storage.get_llm_symbol_doc_stats() {
         if stats.mixed_embedding_backends {
             return Ok(Some("sidecar_symbol_docs_mixed_embedding_backends".into()));
@@ -883,13 +914,14 @@ fn strict_readiness_unavailable_reason(
     }
     let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    let current_input = compute_sidecar_input_fingerprint(
+    let current_input = compute_sidecar_input_fingerprint_for_runtime(
         storage,
         storage_path,
         project_root,
         project_id,
         &embedding_backend,
         embedding_dim,
+        &runtime.embedding,
     )
     .context("compute strict sidecar input fingerprint")?;
     let stored_files = storage
@@ -1015,7 +1047,7 @@ mod tests {
     use crate::generation::{
         SIDECAR_SCHEMA_VERSION, sidecar_generation_id, sidecar_qdrant_collection,
     };
-    use crate::index::{compute_sidecar_input_fingerprint, project_id_for_root};
+    use crate::index::project_id_for_root;
     use crate::test_support::retrieval_manifest_fixture;
     use codestory_contracts::graph::{ErrorInfo, IndexStep, Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc};
@@ -1042,6 +1074,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: BTreeMap::new(),
+            ..SidecarRuntimeConfig::local()
         }
     }
 
@@ -1503,7 +1536,7 @@ mod tests {
                 file_role: FileRole::Source,
             })
             .expect("insert incomplete file");
-        let input = compute_sidecar_input_fingerprint(
+        let input = crate::index::compute_sidecar_input_fingerprint(
             &storage,
             &storage_path,
             project.path(),
@@ -1821,7 +1854,7 @@ mod tests {
                 file_role: FileRole::Source,
             })
             .expect("insert indexed file");
-        let input = compute_sidecar_input_fingerprint(
+        let input = crate::index::compute_sidecar_input_fingerprint(
             &storage,
             &storage_path,
             project.path(),

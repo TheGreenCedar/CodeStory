@@ -12,6 +12,14 @@
 
 ### Added
 
+- Added immutable per-project runtime configuration for multi-project CLI and
+  stdio operation. Embedding endpoint provenance, profile/model/prefix contract,
+  batching and device policy, retrieval policy, and summary configuration now
+  travel with retained project state instead of being published through process
+  environment mutation. Retrieval and runtime share the concrete llama.cpp HTTP
+  client, and a cross-platform A/B/A stdio contract proves two trusted projects
+  cannot cross-route embedding markers or vectors.
+
 - Added parser-backed Express route extraction for static module-scope
   registrations on source-ordered app and router bindings constructed from
   explicit `express` imports or `require("express")`. JavaScript, TypeScript,
@@ -77,6 +85,13 @@
 
 ### Fixed
 
+- Hardened project-scoped embedding requests by retaining the configured model
+  identity, validating and ordering OpenAI response rows by their explicit
+  indices, deriving named-profile dimensions, refusing redirects, and
+  redacting endpoint credentials and query secrets from failures. Ready,
+  report, drill, stdio cache/readiness, and profile-selection paths now reuse
+  the captured runtime instead of rebuilding configuration from changed
+  process environment state.
 - Removed a plugin static test that froze exact grounding documentation copy;
   documentation remains covered by the repository link and diff checks.
 - Pinned each status summary to one SQLite read transaction, accepted it only

@@ -7,13 +7,11 @@ use fs4::fs_std::FileExt;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
 use rayon::prelude::*;
-use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
@@ -33,6 +31,7 @@ pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX
 pub const EMBEDDING_LAYER_NORM_ENV: &str = "CODESTORY_EMBED_LAYER_NORM";
 pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
 pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
+#[cfg(test)]
 const REMOVED_ONNX_ENV_VARS: &[&str] = &[
     "CODESTORY_EMBED_ONNX_MODEL",
     "CODESTORY_EMBED_ONNX_TOKENIZER",
@@ -44,9 +43,6 @@ pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
 pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
-const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
-const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 1;
-const MAX_LLAMACPP_REQUEST_COUNT: usize = 16;
 #[cfg(test)]
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
 
@@ -74,13 +70,6 @@ pub struct EmbeddingProfileContract {
     pub dimension: Option<u32>,
 }
 
-fn env_usize(key: &str, min: usize, max: usize) -> Option<usize> {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(min, max))
-}
-
 fn env_bool_override(key: &str) -> Option<bool> {
     std::env::var(key).ok().and_then(|raw| {
         let normalized = raw.trim().to_ascii_lowercase();
@@ -96,26 +85,10 @@ fn symbol_full_text_index_enabled_from_env() -> bool {
     env_bool_override(SYMBOL_FULL_TEXT_INDEX_ENV).unwrap_or(true)
 }
 
+#[cfg(test)]
 fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usize {
     let workers = worker_count.max(1).min(text_count.max(1));
     text_count.max(1).div_ceil(workers).max(1)
-}
-
-fn llamacpp_request_count_from_env() -> usize {
-    let Ok(raw) = std::env::var(LLAMACPP_REQUEST_COUNT_ENV) else {
-        return DEFAULT_LLAMACPP_REQUEST_COUNT;
-    };
-    let normalized = raw.trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "auto" | "available_parallelism") {
-        return std::thread::available_parallelism()
-            .map(|workers| workers.get())
-            .unwrap_or(DEFAULT_LLAMACPP_REQUEST_COUNT)
-            .clamp(1, MAX_LLAMACPP_REQUEST_COUNT);
-    }
-    normalized
-        .parse::<usize>()
-        .map(|value| value.clamp(1, MAX_LLAMACPP_REQUEST_COUNT))
-        .unwrap_or(DEFAULT_LLAMACPP_REQUEST_COUNT)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +98,7 @@ enum EmbeddingBackendSelection {
 }
 
 impl EmbeddingBackendSelection {
+    #[cfg(test)]
     fn from_env() -> Result<Self> {
         if let Some(name) = REMOVED_ONNX_ENV_VARS
             .iter()
@@ -134,13 +108,21 @@ impl EmbeddingBackendSelection {
                 "{name} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
             );
         }
-        let runtime_mode_raw = std::env::var(EMBEDDING_RUNTIME_MODE_ENV).ok();
-        let backend_raw = std::env::var(EMBEDDING_BACKEND_ENV).ok();
-        let runtime_mode = runtime_mode_raw
-            .as_deref()
-            .unwrap_or("llamacpp")
-            .trim()
-            .to_ascii_lowercase();
+        if let Ok(runtime_mode) = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
+            && matches!(
+                runtime_mode.trim().to_ascii_lowercase().as_str(),
+                "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
+            )
+        {
+            bail!(
+                "{EMBEDDING_RUNTIME_MODE_ENV}={runtime_mode} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+            );
+        }
+        Self::from_config(&codestory_retrieval::SidecarRuntimeConfig::local().embedding)
+    }
+
+    fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
+        let runtime_mode = config.backend.trim().to_ascii_lowercase();
         if matches!(
             runtime_mode.as_str(),
             "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
@@ -153,35 +135,10 @@ impl EmbeddingBackendSelection {
             return Ok(Self::HashProjection);
         }
 
-        let backend = backend_raw
-            .as_deref()
-            .unwrap_or(&runtime_mode)
-            .trim()
-            .to_ascii_lowercase();
-        if backend_is_auto_or_default(&backend)
-            && runtime_mode_raw
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            && backend_raw
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            && std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV)
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some()
-        {
-            return Ok(Self::LlamaCpp);
-        }
-        match backend.as_str() {
+        match runtime_mode.as_str() {
             "" | "auto" => Ok(Self::LlamaCpp),
             "onnx" | "ort" | "onnxruntime" | "onnx-runtime" => Err(anyhow!(
-                "embedding backend `{backend}` is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+                "embedding backend `{runtime_mode}` is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
             )),
             "llamacpp" | "llama.cpp" | "llama-cpp" | "gguf" => Ok(Self::LlamaCpp),
             "hash" | "hash_projection" => Ok(Self::HashProjection),
@@ -197,10 +154,6 @@ impl EmbeddingBackendSelection {
             Self::HashProjection => "hash",
         }
     }
-}
-
-fn backend_is_auto_or_default(value: &str) -> bool {
-    matches!(value, "" | "auto")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,11 +187,13 @@ struct EmbeddingProfile {
 }
 
 impl EmbeddingProfile {
+    #[cfg(test)]
     fn from_env() -> Result<Self> {
-        let name = std::env::var(EMBEDDING_PROFILE_ENV)
-            .unwrap_or_else(|_| "bge-base-en-v1.5".to_string())
-            .trim()
-            .to_ascii_lowercase();
+        Self::from_config(&codestory_retrieval::SidecarRuntimeConfig::local().embedding)
+    }
+
+    fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
+        let name = config.profile.trim().to_ascii_lowercase();
 
         let mut profile = match name.as_str() {
             "" | "minilm" | "all-minilm-l6-v2" => Self {
@@ -332,29 +287,27 @@ impl EmbeddingProfile {
             }
         };
 
-        if let Ok(model_id) = std::env::var(EMBEDDING_MODEL_ID_ENV)
-            && !model_id.trim().is_empty()
-        {
-            profile.model_id = model_id;
+        if let Some(model_id) = config.model_id.as_ref() {
+            profile.model_id = model_id.clone();
         }
-        if let Ok(raw) = std::env::var(EMBEDDING_POOLING_ENV) {
-            profile.pooling = EmbeddingPooling::from_value(&raw)
+        if let Some(raw) = config.pooling.as_ref() {
+            profile.pooling = EmbeddingPooling::from_value(raw)
                 .ok_or_else(|| anyhow!("unsupported {EMBEDDING_POOLING_ENV} value `{raw}`"))?;
         }
-        if let Ok(prefix) = std::env::var(EMBEDDING_QUERY_PREFIX_ENV) {
-            profile.query_prefix = prefix;
+        if let Some(prefix) = config.query_prefix.as_ref() {
+            profile.query_prefix = prefix.clone();
         }
-        if let Ok(prefix) = std::env::var(EMBEDDING_DOCUMENT_PREFIX_ENV) {
-            profile.document_prefix = prefix;
+        if let Some(prefix) = config.document_prefix.as_ref() {
+            profile.document_prefix = prefix.clone();
         }
-        if let Some(layer_norm) = env_bool_override(EMBEDDING_LAYER_NORM_ENV) {
+        if let Some(layer_norm) = config.layer_norm {
             profile.layer_norm = layer_norm;
         }
-        if let Some(truncate_dim) = env_usize(EMBEDDING_TRUNCATE_DIM_ENV, 1, 8192) {
+        if let Some(truncate_dim) = config.truncate_dim {
             profile.truncate_dim = Some(truncate_dim);
             profile.expected_dim = Some(truncate_dim);
         }
-        if let Some(expected_dim) = env_usize(EMBEDDING_EXPECTED_DIM_ENV, 1, 8192) {
+        if let Some(expected_dim) = config.expected_dim {
             profile.expected_dim = Some(expected_dim);
         }
 
@@ -381,13 +334,21 @@ impl EmbeddingProfile {
 }
 
 pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability {
-    let profile = match EmbeddingProfile::from_env() {
+    embedding_runtime_availability_from_config(
+        &codestory_retrieval::SidecarRuntimeConfig::local().embedding,
+    )
+}
+
+pub fn embedding_runtime_availability_from_config(
+    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+) -> EmbeddingRuntimeAvailability {
+    let profile = match EmbeddingProfile::from_config(config) {
         Ok(profile) => profile,
         Err(error) => {
             return unavailable_embedding_runtime(None, error);
         }
     };
-    let backend = match EmbeddingBackendSelection::from_env() {
+    let backend = match EmbeddingBackendSelection::from_config(config) {
         Ok(backend) => backend,
         Err(error) => {
             return unavailable_embedding_runtime(Some(profile.model_id.clone()), error);
@@ -399,7 +360,7 @@ pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability
         return available_embedding_runtime(model_id);
     }
 
-    if let Err(error) = ensure_embedding_backend_available(backend) {
+    if let Err(error) = ensure_embedding_backend_available(backend, config) {
         return unavailable_embedding_runtime(Some(model_id), error);
     }
 
@@ -425,18 +386,34 @@ fn unavailable_embedding_runtime(
     }
 }
 
-fn ensure_embedding_backend_available(backend: EmbeddingBackendSelection) -> Result<()> {
+fn ensure_embedding_backend_available(
+    backend: EmbeddingBackendSelection,
+    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+) -> Result<()> {
     match backend {
         EmbeddingBackendSelection::LlamaCpp => {
-            LlamaCppEndpoint::from_env().and_then(|endpoint| endpoint.ensure_reachable())
+            let probe = codestory_retrieval::LlamaCppEmbeddingClient::new(config)?.probe();
+            if probe.reachable {
+                Ok(())
+            } else {
+                bail!("{}", probe.detail)
+            }
         }
         EmbeddingBackendSelection::HashProjection => Ok(()),
     }
 }
 
 pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract> {
-    let profile = EmbeddingProfile::from_env()?;
-    let backend = EmbeddingBackendSelection::from_env()?;
+    embedding_profile_contract_from_config(
+        &codestory_retrieval::SidecarRuntimeConfig::local().embedding,
+    )
+}
+
+pub fn embedding_profile_contract_from_config(
+    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+) -> Result<EmbeddingProfileContract> {
+    let profile = EmbeddingProfile::from_config(config)?;
+    let backend = EmbeddingBackendSelection::from_config(config)?;
     let cache_key = profile.cache_model_id(backend);
     Ok(EmbeddingProfileContract {
         profile: profile.name.clone(),
@@ -677,234 +654,22 @@ enum EmbeddingBackend {
     HashProjection,
 }
 
-#[derive(Debug, Clone)]
-struct LlamaCppEndpoint {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-impl LlamaCppEndpoint {
-    fn from_env() -> Result<Self> {
-        let raw = std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV)
-            .unwrap_or_else(|_| DEFAULT_LLAMACPP_EMBEDDINGS_URL.to_string());
-        Self::parse(&raw)
-    }
-
-    fn parse(raw: &str) -> Result<Self> {
-        let trimmed = raw.trim();
-        let rest = trimmed
-            .strip_prefix("http://")
-            .ok_or_else(|| anyhow!("{LLAMACPP_EMBEDDINGS_URL_ENV} must be an http:// URL"))?;
-        let (authority, path) = rest
-            .split_once('/')
-            .map(|(authority, path)| (authority, format!("/{path}")))
-            .unwrap_or((rest, "/v1/embeddings".to_string()));
-        let (host, port) = if let Some((host, raw_port)) = authority.rsplit_once(':') {
-            let port = raw_port
-                .parse::<u16>()
-                .with_context(|| format!("invalid port in {LLAMACPP_EMBEDDINGS_URL_ENV}"))?;
-            (host.to_string(), port)
-        } else {
-            (authority.to_string(), 80)
-        };
-        if host.trim().is_empty() {
-            return Err(anyhow!("{LLAMACPP_EMBEDDINGS_URL_ENV} must include a host"));
-        }
-        Ok(Self { host, port, path })
-    }
-
-    fn url(&self) -> String {
-        format!("http://{}:{}{}", self.host, self.port, self.path)
-    }
-
-    fn display_url(&self) -> String {
-        let host = self
-            .host
-            .rsplit_once('@')
-            .map_or(self.host.as_str(), |(_, host)| host);
-        let path = self
-            .path
-            .split_once('#')
-            .map_or(self.path.as_str(), |(path, _)| path);
-        let path = path.split_once('?').map_or(path, |(path, _)| path);
-        format!("http://{host}:{}{path}", self.port)
-    }
-
-    fn redact_error_text(&self, text: &str) -> String {
-        let mut redacted = text.replace(&self.url(), &self.display_url());
-        if let Some((userinfo, host)) = self.host.rsplit_once('@') {
-            redacted = redacted
-                .replace(&self.host, host)
-                .replace(userinfo, "[redacted]");
-            if let Some((username, password)) = userinfo.split_once(':') {
-                for secret in [username, password] {
-                    if !secret.is_empty() {
-                        redacted = redacted.replace(secret, "[redacted]");
-                    }
-                }
-            }
-        }
-        if let Some((_, query_and_fragment)) = self.path.split_once('?') {
-            redacted = redacted.replace(query_and_fragment, "[redacted]");
-            for pair in query_and_fragment
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .split('&')
-            {
-                if let Some((_, value)) = pair.split_once('=')
-                    && !value.is_empty()
-                {
-                    redacted = redacted.replace(value, "[redacted]");
-                }
-            }
-        }
-        if let Some((_, fragment)) = self.path.split_once('#')
-            && !fragment.is_empty()
-        {
-            redacted = redacted.replace(fragment, "[redacted]");
-        }
-        redacted
-    }
-
-    fn ensure_reachable(&self) -> Result<()> {
-        match ureq::get(&self.url())
-            .timeout(Duration::from_millis(750))
-            .call()
-        {
-            Ok(_) | Err(ureq::Error::Status(_, _)) => Ok(()),
-            Err(error) => Err(anyhow!(
-                "failed to connect to llama.cpp endpoint {}: {}",
-                self.display_url(),
-                self.redact_error_text(&error.to_string())
-            )),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct LlamaCppEmbeddingRuntime {
-    endpoint: LlamaCppEndpoint,
-    request_count: usize,
+    client: codestory_retrieval::LlamaCppEmbeddingClient,
 }
 
 impl LlamaCppEmbeddingRuntime {
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.request_count > 1 && texts.len() > 1 {
-            let chunk_size = embedding_parallel_chunk_size(texts.len(), self.request_count);
-            let chunks = texts
-                .par_chunks(chunk_size)
-                .map(|chunk| self.embed_texts_serial(chunk))
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(chunks.into_iter().flatten().collect());
-        }
-        self.embed_texts_serial(texts)
+        self.client.embed_prepared_texts(texts)
     }
-
-    fn embed_texts_serial(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let request = json!({
-            "input": texts,
-            "model": "codestory-local-embedding"
-        });
-        let response = post_json_to_http_endpoint(&self.endpoint, &request)?;
-        parse_openai_embeddings_response(response, texts.len())
-    }
-}
-
-fn post_json_to_http_endpoint(
-    endpoint: &LlamaCppEndpoint,
-    request: &JsonValue,
-) -> Result<JsonValue> {
-    let body = serde_json::to_string(request).context("failed to serialize llama.cpp request")?;
-    let endpoint_url = endpoint.url();
-    let display_url = endpoint.display_url();
-    let agent = ureq::builder().redirects(0).build();
-    let response = codestory_retrieval::outbound_http::read_bytes(
-        agent
-            .post(&endpoint_url)
-            .timeout(Duration::from_secs(300))
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json")
-            .send_bytes(body.as_bytes()),
-    )
-    .map_err(|error| {
-        anyhow!(
-            "llama.cpp embeddings request to {display_url} failed: {}",
-            endpoint.redact_error_text(&error.to_string())
-        )
-    })?;
-    if !(200..300).contains(&response.status) {
-        let response_body = String::from_utf8_lossy(&response.body);
-        bail!(
-            "llama.cpp embeddings endpoint {} returned HTTP {}: {}",
-            display_url,
-            response.status,
-            codestory_retrieval::outbound_http::truncate_http_body(
-                &endpoint.redact_error_text(&response_body)
-            )
-        );
-    }
-
-    serde_json::from_slice(&response.body).with_context(|| {
-        format!(
-            "failed to parse JSON response from llama.cpp endpoint {}",
-            display_url
-        )
-    })
-}
-
-fn parse_openai_embeddings_response(
-    response: JsonValue,
-    expected_count: usize,
-) -> Result<Vec<Vec<f32>>> {
-    let data = response
-        .get("data")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| anyhow!("llama.cpp embeddings response missing `data` array"))?;
-    if data.len() != expected_count {
-        return Err(anyhow!(
-            "llama.cpp embeddings response returned {} vectors for {} inputs",
-            data.len(),
-            expected_count
-        ));
-    }
-
-    let mut indexed = Vec::with_capacity(data.len());
-    for (fallback_index, item) in data.iter().enumerate() {
-        let index = item
-            .get("index")
-            .and_then(JsonValue::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(fallback_index);
-        let embedding = item
-            .get("embedding")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| anyhow!("llama.cpp embeddings response item missing `embedding`"))?
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .map(|number| number as f32)
-                    .ok_or_else(|| anyhow!("llama.cpp embedding contained a non-numeric value"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        indexed.push((index, embedding));
-    }
-    indexed.sort_by_key(|(index, _)| *index);
-    Ok(indexed
-        .into_iter()
-        .map(|(_, embedding)| embedding)
-        .collect())
 }
 
 impl EmbeddingRuntime {
     pub fn probe_from_env() -> Result<EmbeddingRuntimeProbe> {
-        let profile = EmbeddingProfile::from_env()?;
-        let backend = EmbeddingBackendSelection::from_env()?;
+        let config = codestory_retrieval::SidecarRuntimeConfig::local().embedding;
+        let profile = EmbeddingProfile::from_config(&config)?;
+        let backend = EmbeddingBackendSelection::from_config(&config)?;
         let model_id = profile.cache_model_id(backend);
 
         if backend == EmbeddingBackendSelection::HashProjection {
@@ -915,10 +680,13 @@ impl EmbeddingRuntime {
         }
 
         if backend == EmbeddingBackendSelection::LlamaCpp {
-            let endpoint = LlamaCppEndpoint::from_env()?;
-            endpoint.ensure_reachable()?;
+            let client = codestory_retrieval::LlamaCppEmbeddingClient::new(&config)?;
+            let probe = client.probe();
+            if !probe.reachable {
+                bail!("{}", probe.detail);
+            }
             return Ok(EmbeddingRuntimeProbe {
-                model_path: PathBuf::from(endpoint.url()),
+                model_path: PathBuf::from(client.endpoint()),
                 model_id,
             });
         }
@@ -927,8 +695,12 @@ impl EmbeddingRuntime {
     }
 
     pub fn from_env() -> Result<Self> {
-        let profile = EmbeddingProfile::from_env()?;
-        let backend = EmbeddingBackendSelection::from_env()?;
+        Self::from_config(&codestory_retrieval::SidecarRuntimeConfig::local().embedding)
+    }
+
+    pub fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
+        let profile = EmbeddingProfile::from_config(config)?;
+        let backend = EmbeddingBackendSelection::from_config(config)?;
         let model_id = profile.cache_model_id(backend);
 
         match backend {
@@ -939,15 +711,17 @@ impl EmbeddingRuntime {
                 backend: EmbeddingBackend::HashProjection,
             }),
             EmbeddingBackendSelection::LlamaCpp => {
-                let endpoint = LlamaCppEndpoint::from_env()?;
-                endpoint.ensure_reachable()?;
+                let client = codestory_retrieval::LlamaCppEmbeddingClient::new(config)?;
+                let probe = client.probe();
+                if !probe.reachable {
+                    bail!("{}", probe.detail);
+                }
                 Ok(Self {
-                    model_path: PathBuf::from(endpoint.url()),
+                    model_path: PathBuf::from(client.endpoint()),
                     model_id,
                     profile,
                     backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
-                        endpoint,
-                        request_count: llamacpp_request_count_from_env(),
+                        client,
                     })),
                 })
             }
@@ -1409,9 +1183,11 @@ impl SearchEngine {
         self.embedding_runtime = Some(runtime);
     }
 
-    pub fn set_embedding_runtime_from_env(&mut self) -> Result<()> {
-        let runtime = EmbeddingRuntime::from_env()?;
-        self.embedding_runtime = Some(runtime);
+    pub fn set_embedding_runtime_from_config(
+        &mut self,
+        config: &codestory_retrieval::EmbeddingRuntimeConfig,
+    ) -> Result<()> {
+        self.embedding_runtime = Some(EmbeddingRuntime::from_config(config)?);
         Ok(())
     }
 
@@ -2465,13 +2241,18 @@ mod tests {
             truncate_dim: None,
             expected_dim: Some(3),
         };
+        let mut client_config = codestory_retrieval::SidecarRuntimeConfig::local().embedding;
+        client_config.endpoint = url.clone();
+        client_config.endpoint_origin =
+            codestory_retrieval::EmbeddingEndpointOrigin::TrustedProjectConfig;
+        client_config.expected_dim = Some(3);
+        client_config.request_count = 1;
         let runtime = EmbeddingRuntime {
             model_path: PathBuf::from(&url),
             model_id: profile.cache_model_id(EmbeddingBackendSelection::LlamaCpp),
             profile,
             backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
-                endpoint: LlamaCppEndpoint::parse(&url)?,
-                request_count: 1,
+                client: codestory_retrieval::LlamaCppEmbeddingClient::new(&client_config)?,
             })),
         };
         let embeddings = runtime.embed_texts(&["alpha".to_string(), "beta".to_string()])?;
@@ -2488,112 +2269,6 @@ mod tests {
             runtime.model_id(),
             "custom-local|backend=llamacpp|pool=Mean|query_prefix=|document_prefix=doc: |layer_norm=false|truncate_dim=None|expected_dim=Some(3)"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn llamacpp_embedding_post_rejects_redirects() -> Result<()> {
-        let (url, handle) = run_one_fake_embedding_server(
-            "302 Found",
-            "Location: http://127.0.0.1:9/redirected\r\n",
-            "redirect-secret query-secret".to_string(),
-        )?;
-        let url = format!(
-            "{}?token=query-secret#fragment-secret",
-            url.replacen("http://", "http://user:redirect-secret@", 1)
-        );
-        let endpoint = LlamaCppEndpoint::parse(&url)?;
-
-        let error = post_json_to_http_endpoint(
-            &endpoint,
-            &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
-        )
-        .expect_err("embedding POST must not follow redirects");
-        handle.join().expect("fake embedding server should finish");
-
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("HTTP 302"), "{rendered}");
-        assert!(rendered.contains(&endpoint.display_url()), "{rendered}");
-        for secret in ["redirect-secret", "query-secret", "fragment-secret"] {
-            assert!(!rendered.contains(secret), "{rendered}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn llamacpp_runtime_transport_errors_redact_endpoint_secrets() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        drop(listener);
-        let endpoint = LlamaCppEndpoint::parse(&format!(
-            "http://user:transport-secret@{addr}/v1/embeddings?token=query-secret#fragment-secret"
-        ))?;
-
-        let errors = [
-            endpoint.ensure_reachable().expect_err("endpoint is closed"),
-            post_json_to_http_endpoint(
-                &endpoint,
-                &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
-            )
-            .expect_err("endpoint is closed"),
-        ];
-
-        for error in errors {
-            let rendered = format!("{error:#}");
-            assert!(rendered.contains(&endpoint.display_url()), "{rendered}");
-            for secret in ["transport-secret", "query-secret", "fragment-secret"] {
-                assert!(!rendered.contains(secret), "{rendered}");
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn llamacpp_invalid_json_error_redacts_endpoint_secrets() -> Result<()> {
-        let (url, handle) = run_one_fake_embedding_server(
-            "200 OK",
-            "",
-            "invalid json-secret query-secret fragment-secret".to_string(),
-        )?;
-        let url = format!(
-            "{}?token=query-secret#fragment-secret",
-            url.replacen("http://", "http://user:json-secret@", 1)
-        );
-        let endpoint = LlamaCppEndpoint::parse(&url)?;
-
-        let error = post_json_to_http_endpoint(
-            &endpoint,
-            &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
-        )
-        .expect_err("response is not JSON");
-        handle.join().expect("fake embedding server should finish");
-
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains(&endpoint.display_url()), "{rendered}");
-        for secret in ["json-secret", "query-secret", "fragment-secret"] {
-            assert!(!rendered.contains(secret), "{rendered}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn llamacpp_embedding_post_accepts_json_over_ten_mib() -> Result<()> {
-        let response = json!({
-            "padding": "x".repeat(10 * 1024 * 1024 + 1),
-            "data": [{"index": 0, "embedding": [1.0, 0.0, 0.0]}]
-        })
-        .to_string();
-        assert!(response.len() > 10 * 1024 * 1024);
-        let (url, handle) = run_one_fake_embedding_server("200 OK", "", response)?;
-        let endpoint = LlamaCppEndpoint::parse(&url)?;
-
-        let response = post_json_to_http_endpoint(
-            &endpoint,
-            &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
-        )?;
-        handle.join().expect("fake embedding server should finish");
-
-        assert_eq!(parse_openai_embeddings_response(response, 1)?.len(), 1);
         Ok(())
     }
 
@@ -2710,16 +2385,6 @@ mod tests {
     fn l2_normalized(vector: &[f32]) -> bool {
         let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
         (norm - 1.0).abs() <= 0.05
-    }
-
-    #[test]
-    fn llamacpp_endpoint_parse_accepts_openai_embeddings_url() -> Result<()> {
-        let endpoint = LlamaCppEndpoint::parse("http://127.0.0.1:8080/v1/embeddings")?;
-
-        assert_eq!(endpoint.host, "127.0.0.1");
-        assert_eq!(endpoint.port, 8080);
-        assert_eq!(endpoint.path, "/v1/embeddings");
-        Ok(())
     }
 
     #[test]

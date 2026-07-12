@@ -79,8 +79,9 @@ fn direct_cli_and_stdio_agent_surfaces_share_runtime_constructor() {
     let main = read("crates/codestory-cli/src/main.rs");
     let helper = source_between(&main, "fn new_agent_surface_runtime", "fn run_cache");
     assert!(
-        helper.contains("RuntimeContext::new_agent_sidecar(project)"),
-        "shared agent surface runtime must keep ready/direct CLI/stdio on the agent-sidecar constructor"
+        helper
+            .contains("RuntimeContext::new_agent_sidecar_with_selection(project, profile, run_id)"),
+        "shared agent surface runtime must retain the selected profile and run id"
     );
 
     for (start, end, surface) in [
@@ -96,14 +97,14 @@ fn direct_cli_and_stdio_agent_surfaces_share_runtime_constructor() {
     ] {
         let body = source_between(&main, start, end);
         assert!(
-            body.contains("new_agent_surface_runtime(&cmd.project)?"),
+            body.contains("new_agent_surface_runtime(&cmd.project,"),
             "{surface} must use the same agent-sidecar runtime constructor as stdio status/ready"
         );
     }
 
     let ready = source_between(&main, "fn run_ready", "fn run_agent");
     assert!(
-        ready.contains("new_agent_surface_runtime(&cmd.project)?"),
+        ready.contains("new_agent_surface_runtime(&cmd.project,"),
         "ready --goal agent --repair must stay on the shared agent-sidecar runtime constructor"
     );
 }

@@ -312,7 +312,7 @@ fn acquire_native_embedding_resource_lease_if_needed_with_validator(
     poll: Duration,
     mut validate_launch: impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<u32>,
 ) -> Result<Option<BrokerNativeEmbeddingResourceLease>> {
-    if codestory_retrieval::embedding_server_launch_mode()?
+    if codestory_retrieval::embedding_server_launch_mode_for_runtime(sidecar)?
         != codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned
     {
         return Ok(None);

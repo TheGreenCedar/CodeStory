@@ -1249,6 +1249,7 @@ mod tests {
             embed_http_port: 8080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: Default::default(),
+            ..SidecarRuntimeConfig::local()
         }
     }
 

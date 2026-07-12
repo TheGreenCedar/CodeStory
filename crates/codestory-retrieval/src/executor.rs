@@ -1,6 +1,9 @@
 use crate::cache::{RetrievalCache, RetrievalCacheKey};
 use crate::candidate::CandidateHit;
-use crate::health::{probe_sidecar_health, probe_sidecar_health_with_embedding_device};
+use crate::health::{
+    probe_sidecar_health, probe_sidecar_health_for_runtime,
+    probe_sidecar_health_with_embedding_device,
+};
 use crate::index::query_fingerprint;
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::planner::{PlannedStage, RetrievalStageKind};
@@ -189,8 +192,18 @@ impl<'a> QueryExecutor<'a> {
                     Some("sidecar_layout_missing".into()),
                 );
             };
-            let report = if let Some(embedding_device) = self.sidecars.embedding_device_readiness()
-            {
+            let report = if let (Some(embedding_device), Some(runtime)) = (
+                self.sidecars.embedding_device_readiness(),
+                self.sidecars.runtime_config(),
+            ) {
+                probe_sidecar_health_for_runtime(
+                    layout,
+                    &manifest.project_id,
+                    Some(manifest.clone()),
+                    embedding_device,
+                    runtime,
+                )
+            } else if let Some(embedding_device) = self.sidecars.embedding_device_readiness() {
                 probe_sidecar_health_with_embedding_device(
                     layout,
                     &manifest.project_id,

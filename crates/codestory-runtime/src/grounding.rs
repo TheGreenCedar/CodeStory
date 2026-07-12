@@ -842,7 +842,8 @@ impl AppController {
         }
 
         let total_file_count = dto_stats.file_count;
-        let retrieval = retrieval_state_from_storage(&storage).ok();
+        let retrieval =
+            retrieval_state_from_storage_for_runtime(&storage, &self.runtime_config).ok();
         if let Some(state) = retrieval.as_ref() {
             let mode = match state.mode {
                 codestory_contracts::api::RetrievalModeDto::Hybrid => "hybrid",
