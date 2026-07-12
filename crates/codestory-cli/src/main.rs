@@ -75,8 +75,7 @@ use args::{
     DoctorOutput, DoctorSidecarStatusOutput, DrillAnchorOutput, DrillAnchorTimingsOutput,
     DrillBridgeEvidenceOutput, DrillBridgeOutput, DrillCommand, DrillCommandStatusOutput,
     DrillExecutionBoundaryOutput, DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput,
-    DrillSuiteAnswerQualityOutput, DrillSuiteCommand, DrillSuiteExpectationOutput,
-    DrillSuiteLayerFindingOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
+    DrillSuiteCommand, DrillSuiteExpectationOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
     DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput, DrillSummaryAnchorsOutput,
     DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
@@ -3821,15 +3820,11 @@ fn run_drill_suite(cmd: DrillSuiteCommand) -> Result<()> {
     ));
     write_drill_suite_outputs(cmd.format, &cmd.output_dir, &suite_output)?;
     emit_drill_suite_progress(format!(
-        "done repos={} ready={} degraded={} blocked={} answer_ready={} answer_degraded={} answer_failed={} answer_pending={} output_dir={}",
+        "done repos={} ready={} degraded={} blocked={} output_dir={}",
         suite_output.repo_count,
         suite_output.ready_count,
         suite_output.degraded_count,
         suite_output.blocked_count,
-        suite_output.answer_ready_count,
-        suite_output.answer_degraded_count,
-        suite_output.answer_failed_count,
-        suite_output.answer_pending_count,
         suite_output.output_dir
     ));
     let markdown = render_drill_suite_markdown(&suite_output);
@@ -3883,56 +3878,6 @@ struct DrillSuiteCase {
     expectations: DrillSuiteExpectationOutput,
 }
 
-#[derive(Debug, Deserialize)]
-struct DrillSuiteSourceTruthLedger {
-    #[allow(dead_code)]
-    schema_version: Option<u32>,
-    #[allow(dead_code)]
-    suite: Option<String>,
-    #[serde(default)]
-    cases: Vec<DrillSuiteLedgerCase>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DrillSuiteLedgerCase {
-    slug: String,
-    #[serde(default)]
-    draft_written: Option<bool>,
-    #[serde(default)]
-    claims: Vec<DrillSuiteLedgerClaim>,
-    #[serde(default)]
-    layer_findings: Vec<DrillSuiteLedgerLayerFinding>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DrillSuiteLedgerClaim {
-    id: String,
-    text: String,
-    classification: DrillSuiteClaimClassification,
-    #[serde(default)]
-    changed_after_source_read: Option<bool>,
-    #[serde(default)]
-    source_files: Vec<String>,
-    #[allow(dead_code)]
-    notes: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum DrillSuiteClaimClassification {
-    Correct,
-    Partial,
-    Misleading,
-    Unsupported,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DrillSuiteLedgerLayerFinding {
-    layer: String,
-    status: String,
-    detail: String,
-}
-
 fn emit_drill_suite_progress(message: impl AsRef<str>) {
     eprintln!("[drill-suite] {}", message.as_ref());
 }
@@ -3976,8 +3921,6 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
         .canonicalize()
         .with_context(|| format!("Failed to resolve {}", cmd.project.project.display()))?;
     let (suite_name, cases) = drill_suite_cases_from_manifest(&cmd.case_file, &owner_root)?;
-    let ledger_supplied = cmd.ledger.is_some();
-    let ledger_cases = drill_suite_ledger_cases(cmd.ledger.as_deref())?;
     let total_cases = cases.len();
     emit_drill_suite_progress(format!(
         "start cases={} refresh={} output_dir={}",
@@ -3991,25 +3934,14 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
     } else {
         drill_read_only_jobs(cmd.jobs, cmd.refresh)
     };
-    let repos = run_drill_suite_cases(
-        cmd,
-        cases,
-        &ledger_cases,
-        ledger_supplied,
-        suite_jobs,
-        drill_jobs,
-    );
+    let repos = run_drill_suite_cases(cmd, cases, suite_jobs, drill_jobs);
 
     let degraded_count = drill_suite_verdict_count(&repos, "degraded");
     let blocked_count = drill_suite_verdict_count(&repos, "blocked");
     let ready_count = drill_suite_verdict_count(&repos, "ready");
-    let answer_ready_count = drill_suite_answer_status_count(&repos, "ready");
-    let answer_degraded_count = drill_suite_answer_status_count(&repos, "degraded");
-    let answer_failed_count = drill_suite_answer_status_count(&repos, "failed");
-    let answer_pending_count = drill_suite_answer_pending_count(&repos);
     let next_actions = repos
         .iter()
-        .map(|repo| format!("{}: {}", repo.slug, drill_suite_next_action(repo)))
+        .map(|repo| format!("{}: {}", repo.slug, repo.summary.verdict.next_action))
         .collect::<Vec<_>>();
     let retrieval_blockers = drill_suite_retrieval_blockers(&repos);
 
@@ -4022,10 +3954,6 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
         degraded_count,
         blocked_count,
         ready_count,
-        answer_ready_count,
-        answer_degraded_count,
-        answer_failed_count,
-        answer_pending_count,
         repos,
         retrieval_blockers,
         next_actions,
@@ -4047,8 +3975,6 @@ fn drill_suite_case_jobs(
 fn run_drill_suite_cases(
     cmd: &DrillSuiteCommand,
     cases: Vec<DrillSuiteCase>,
-    ledger_cases: &BTreeMap<String, DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
     jobs: usize,
     drill_jobs: usize,
 ) -> Vec<DrillSuiteRepoOutput> {
@@ -4058,15 +3984,7 @@ fn run_drill_suite_cases(
             .iter()
             .enumerate()
             .map(|(case_index, case)| {
-                run_drill_suite_case(
-                    cmd,
-                    case_index,
-                    total_cases,
-                    case,
-                    ledger_cases.get(&case.slug),
-                    ledger_supplied,
-                    drill_jobs,
-                )
+                run_drill_suite_case(cmd, case_index, total_cases, case, drill_jobs)
             })
             .collect();
     }
@@ -4081,15 +3999,7 @@ fn run_drill_suite_cases(
                 chunk
                     .iter()
                     .map(|(case_index, case)| {
-                        let repo = run_drill_suite_case(
-                            cmd,
-                            *case_index,
-                            total_cases,
-                            case,
-                            ledger_cases.get(&case.slug),
-                            ledger_supplied,
-                            1,
-                        );
+                        let repo = run_drill_suite_case(cmd, *case_index, total_cases, case, 1);
                         (*case_index, repo)
                     })
                     .collect::<Vec<_>>()
@@ -4114,8 +4024,6 @@ fn run_drill_suite_case(
     case_index: usize,
     total_cases: usize,
     case: &DrillSuiteCase,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
     drill_jobs: usize,
 ) -> DrillSuiteRepoOutput {
     let progress_index = case_index + 1;
@@ -4148,12 +4056,6 @@ fn run_drill_suite_case(
         Ok(drill_summary(&drill_output))
     }) {
         Ok(summary) => {
-            let answer_quality = drill_suite_answer_quality(
-                &summary,
-                &case.expectations,
-                ledger_case,
-                ledger_supplied,
-            );
             emit_drill_suite_progress(drill_suite_repo_progress_done_message(
                 progress_index,
                 total_cases,
@@ -4169,7 +4071,6 @@ fn run_drill_suite_case(
                 artifact_extension: drill_artifact_extension(cmd.format).to_string(),
                 summary,
                 expectations: case.expectations.clone(),
-                answer_quality,
             }
         }
         Err(error) => {
@@ -4183,8 +4084,6 @@ fn run_drill_suite_case(
                 cmd.refresh,
                 cmd.format,
                 &error.to_string(),
-                ledger_case,
-                ledger_supplied,
             )
         }
     }
@@ -4195,26 +4094,6 @@ fn drill_suite_verdict_count(repos: &[DrillSuiteRepoOutput], status: &str) -> us
         .iter()
         .filter(|repo| repo.summary.verdict.status == status)
         .count()
-}
-
-fn drill_suite_answer_status_count(repos: &[DrillSuiteRepoOutput], status: &str) -> usize {
-    repos
-        .iter()
-        .filter(|repo| repo.answer_quality.final_answer_status == status)
-        .count()
-}
-
-fn drill_suite_answer_pending_count(repos: &[DrillSuiteRepoOutput]) -> usize {
-    repos
-        .iter()
-        .filter(|repo| {
-            drill_suite_answer_status_is_pending(&repo.answer_quality.final_answer_status)
-        })
-        .count()
-}
-
-fn drill_suite_answer_status_is_pending(status: &str) -> bool {
-    matches!(status, "pending_source_verification" | "blocked")
 }
 
 fn drill_suite_case_cache_dir(
@@ -4319,44 +4198,6 @@ fn drill_suite_expectations_from_config(
     }
 }
 
-fn drill_suite_ledger_cases(
-    ledger_path: Option<&std::path::Path>,
-) -> Result<BTreeMap<String, DrillSuiteLedgerCase>> {
-    let Some(ledger_path) = ledger_path else {
-        return Ok(BTreeMap::new());
-    };
-    let ledger_path = absolute_existing_path(ledger_path).with_context(|| {
-        format!(
-            "Failed to resolve drill-suite ledger file {}",
-            display::clean_path_string(&ledger_path.to_string_lossy())
-        )
-    })?;
-    let ledger_text = fs::read_to_string(&ledger_path).with_context(|| {
-        format!(
-            "Failed to read drill-suite ledger file {}",
-            display::clean_path_string(&ledger_path.to_string_lossy())
-        )
-    })?;
-    let ledger: DrillSuiteSourceTruthLedger =
-        serde_json::from_str(&ledger_text).with_context(|| {
-            format!(
-                "Failed to parse drill-suite ledger file {} as JSON",
-                display::clean_path_string(&ledger_path.to_string_lossy())
-            )
-        })?;
-    let mut cases = BTreeMap::new();
-    for case in ledger.cases {
-        let slug = output_slug(&case.slug);
-        if slug.is_empty() {
-            bail!("drill-suite ledger case slug cannot be empty");
-        }
-        if cases.insert(slug.clone(), case).is_some() {
-            bail!("drill-suite ledger case slug `{slug}` is duplicated");
-        }
-    }
-    Ok(cases)
-}
-
 fn absolute_existing_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -4380,8 +4221,6 @@ fn blocked_drill_suite_repo_output(
     refresh: args::RefreshMode,
     format: args::OutputFormat,
     error: &str,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
 ) -> DrillSuiteRepoOutput {
     let project = display::clean_path_string(&case.project_root.to_string_lossy());
     let output_dir = display::clean_path_string(&repo_output_dir.to_string_lossy());
@@ -4492,11 +4331,6 @@ fn blocked_drill_suite_repo_output(
             },
         },
         expectations: case.expectations.clone(),
-        answer_quality: drill_suite_blocked_answer_quality(
-            &case.expectations,
-            ledger_case,
-            ledger_supplied,
-        ),
     }
 }
 
@@ -4536,7 +4370,6 @@ fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
     render_drill_suite_header(&mut markdown, output);
     render_drill_suite_retrieval_blockers(&mut markdown, &output.retrieval_blockers);
     render_drill_suite_repo_table(&mut markdown, &output.repos);
-    render_drill_suite_answer_quality_findings(&mut markdown, &output.repos);
     render_drill_suite_repo_artifacts(&mut markdown, &output.repos);
     render_drill_suite_next_actions(&mut markdown, &output.next_actions);
     ensure_trailing_newline(markdown)
@@ -4553,14 +4386,6 @@ fn render_drill_suite_header(markdown: &mut String, output: &DrillSuiteOutput) {
         markdown,
         "- repos: {} total, {} ready, {} degraded, {} blocked",
         output.repo_count, output.ready_count, output.degraded_count, output.blocked_count
-    );
-    let _ = writeln!(
-        markdown,
-        "- answer_quality: {} ready, {} degraded, {} failed, {} pending",
-        output.answer_ready_count,
-        output.answer_degraded_count,
-        output.answer_failed_count,
-        output.answer_pending_count
     );
 }
 
@@ -4590,17 +4415,16 @@ fn render_drill_suite_repo_table(markdown: &mut String, repos: &[DrillSuiteRepoO
     let _ = writeln!(markdown);
     let _ = writeln!(
         markdown,
-        "| repo | verdict | answer quality | freshness | retrieval | anchors | bridges | source truth | reports | next action |"
+        "| repo | verdict | freshness | retrieval | anchors | bridges | source truth | reports | next action |"
     );
-    let _ = writeln!(markdown, "|---|---|---|---|---|---:|---:|---|---|---|");
+    let _ = writeln!(markdown, "|---|---|---|---|---:|---:|---|---|---|");
     for repo in repos {
         let reports = drill_suite_repo_report_label(repo);
         let _ = writeln!(
             markdown,
-            "| `{}` | {} | {} | {} | {} | {}/{} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {}/{} | {} | {} | {} | {} |",
             repo.slug,
             repo.summary.verdict.status,
-            drill_suite_answer_quality_label(&repo.answer_quality),
             repo.summary
                 .mechanical
                 .freshness_status
@@ -4610,61 +4434,10 @@ fn render_drill_suite_repo_table(markdown: &mut String, repos: &[DrillSuiteRepoO
             repo.summary.anchors.resolved,
             repo.summary.anchors.requested,
             drill_suite_bridge_label(&repo.summary.bridges),
-            drill_suite_source_truth_label_for_repo(repo),
+            drill_suite_source_truth_label(&repo.summary.source_truth),
             reports,
-            drill_suite_next_action(repo).replace('|', "\\|")
+            repo.summary.verdict.next_action.replace('|', "\\|")
         );
-    }
-}
-
-fn render_drill_suite_answer_quality_findings(
-    markdown: &mut String,
-    repos: &[DrillSuiteRepoOutput],
-) {
-    if !repos.iter().any(|repo| {
-        !repo.answer_quality.warnings.is_empty()
-            || !repo.answer_quality.missing_expected_files.is_empty()
-            || !repo.answer_quality.forbidden_claim_hits.is_empty()
-    }) {
-        return;
-    }
-
-    let _ = writeln!(markdown);
-    let _ = writeln!(markdown, "## Answer Quality Findings");
-    for repo in repos {
-        let quality = &repo.answer_quality;
-        if quality.warnings.is_empty()
-            && quality.missing_expected_files.is_empty()
-            && quality.forbidden_claim_hits.is_empty()
-        {
-            continue;
-        }
-        let _ = writeln!(
-            markdown,
-            "- `{}`: status={} ledger={} claims={}/{} correct partial={} misleading={} unsupported={} material_revisions={}",
-            repo.slug,
-            quality.final_answer_status,
-            quality.ledger_status,
-            quality.claim_correct_count,
-            quality.claim_count,
-            quality.claim_partial_count,
-            quality.claim_misleading_count,
-            quality.claim_unsupported_count,
-            quality.material_revision_count
-        );
-        if !quality.missing_expected_files.is_empty() {
-            let _ = writeln!(
-                markdown,
-                "  - missing_expected_files: {}",
-                quality.missing_expected_files.join(", ")
-            );
-        }
-        for hit in &quality.forbidden_claim_hits {
-            let _ = writeln!(markdown, "  - forbidden_claim_hit: {hit}");
-        }
-        for warning in &quality.warnings {
-            let _ = writeln!(markdown, "  - {warning}");
-        }
     }
 }
 
@@ -4713,30 +4486,6 @@ fn render_drill_suite_next_actions(markdown: &mut String, next_actions: &[String
     }
 }
 
-fn drill_suite_answer_quality_label(quality: &DrillSuiteAnswerQualityOutput) -> String {
-    let expected = if quality.expected_file_count > 0 {
-        format!(
-            "; expected_files={}/{}",
-            quality.expected_file_found_count, quality.expected_file_count
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "{} ({}, claims={} correct={} partial={} misleading={} unsupported={} revisions={}{})",
-        quality.final_answer_status,
-        quality.ledger_status,
-        quality.claim_count,
-        quality.claim_correct_count,
-        quality.claim_partial_count,
-        quality.claim_misleading_count,
-        quality.claim_unsupported_count,
-        quality.material_revision_count,
-        expected
-    )
-    .replace('|', "\\|")
-}
-
 fn drill_suite_repo_report_label(repo: &DrillSuiteRepoOutput) -> String {
     if repo.summary.full_report_markdown.is_empty() && repo.summary.full_report_json.is_empty() {
         return "not written (blocked before evidence)".to_string();
@@ -4771,30 +4520,6 @@ fn drill_suite_bridge_label(bridges: &DrillSummaryBridgesOutput) -> String {
     )
 }
 
-fn drill_suite_source_truth_label_for_repo(repo: &DrillSuiteRepoOutput) -> String {
-    let quality = &repo.answer_quality;
-    if quality.ledger_status == "present"
-        && !matches!(
-            quality.final_answer_status.as_str(),
-            "pending_source_verification" | "blocked"
-        )
-    {
-        return format!(
-            "ledger claims={} correct={} partial={} misleading={} unsupported={} revisions={}; packet {} targets / {} pending",
-            quality.claim_count,
-            quality.claim_correct_count,
-            quality.claim_partial_count,
-            quality.claim_misleading_count,
-            quality.claim_unsupported_count,
-            quality.material_revision_count,
-            repo.summary.source_truth.target_file_count,
-            repo.summary.source_truth.pending_check_count
-        )
-        .replace('|', "\\|");
-    }
-    drill_suite_source_truth_label(&repo.summary.source_truth)
-}
-
 fn drill_suite_source_truth_label(source_truth: &DrillSummarySourceTruthOutput) -> String {
     if source_truth.required
         || source_truth.pending_check_count > 0
@@ -4811,42 +4536,6 @@ fn drill_suite_source_truth_label(source_truth: &DrillSummarySourceTruthOutput) 
         "{} targets / {} checks",
         source_truth.target_file_count, source_truth.check_count
     )
-}
-
-fn drill_suite_next_action(repo: &DrillSuiteRepoOutput) -> String {
-    let quality = &repo.answer_quality;
-    match quality.final_answer_status.as_str() {
-        "ready" => {
-            if repo.summary.verdict.status == "ready" {
-                "answer is source-verified; keep the artifacts as the ready baseline".to_string()
-            } else if repo.summary.bridges.partial > 0 || repo.summary.bridges.graph_path == 0 {
-                format!(
-                    "answer is source-verified; improve graph/bridge evidence before promoting the mechanical verdict ({} partial bridge(s), {} graph bridge(s))",
-                    repo.summary.bridges.partial, repo.summary.bridges.graph_path
-                )
-            } else {
-                "answer is source-verified; inspect the mechanical degraded reason before promotion"
-                    .to_string()
-            }
-        }
-        "degraded" => {
-            if quality.material_revision_count > 0 || quality.claim_partial_count > 0 {
-                format!(
-                    "revise partial or materially changed claims, then rerun with the updated ledger (partial={}, revisions={})",
-                    quality.claim_partial_count, quality.material_revision_count
-                )
-            } else {
-                "inspect answer-quality warnings and update the ledger or expected evidence"
-                    .to_string()
-            }
-        }
-        "failed" => format!(
-            "remove or correct misleading/unsupported final claims before trusting the answer (misleading={}, unsupported={})",
-            quality.claim_misleading_count, quality.claim_unsupported_count
-        ),
-        "blocked" => repo.summary.verdict.next_action.clone(),
-        _ => repo.summary.verdict.next_action.clone(),
-    }
 }
 
 fn drill_suite_retrieval_blockers(
@@ -4883,276 +4572,6 @@ fn drill_suite_retrieval_blockers(
             }
         })
         .collect()
-}
-
-fn drill_suite_answer_quality(
-    summary: &DrillSummaryOutput,
-    expectations: &DrillSuiteExpectationOutput,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
-) -> DrillSuiteAnswerQualityOutput {
-    let (missing_expected_files, expected_file_found_count, expected_file_recall) =
-        drill_suite_expected_file_stats(expectations, &summary.source_truth.target_files);
-    let expected_file_count = expectations.source_truth_files.len();
-    let ledger_status = drill_suite_ledger_status(ledger_case, ledger_supplied);
-    let mut warnings = Vec::new();
-    let mut layer_findings = Vec::new();
-    let mut draft_written = None;
-    let mut claim_count = 0usize;
-    let mut claim_correct_count = 0usize;
-    let mut claim_partial_count = 0usize;
-    let mut claim_misleading_count = 0usize;
-    let mut claim_unsupported_count = 0usize;
-    let claim_unclassified_count = 0usize;
-    let mut material_revision_count = 0usize;
-    let mut forbidden_claim_hits = Vec::new();
-
-    if !missing_expected_files.is_empty() {
-        warnings.push(format!(
-            "{} expected source-truth file(s) were not emitted as drill targets",
-            missing_expected_files.len()
-        ));
-    }
-
-    if summary.verdict.status == "blocked" {
-        warnings.push("drill blocked before answer-quality scoring could complete".to_string());
-        return DrillSuiteAnswerQualityOutput {
-            ledger_status,
-            final_answer_status: "blocked".to_string(),
-            draft_written,
-            claim_count,
-            claim_correct_count,
-            claim_partial_count,
-            claim_misleading_count,
-            claim_unsupported_count,
-            claim_unclassified_count,
-            material_revision_count,
-            expected_file_count,
-            expected_file_found_count,
-            expected_file_missing_count: missing_expected_files.len(),
-            expected_file_recall,
-            missing_expected_files,
-            forbidden_claim_count: 0,
-            forbidden_claim_hits,
-            layer_findings,
-            warnings,
-        };
-    }
-
-    let Some(ledger_case) = ledger_case else {
-        warnings.push(if ledger_supplied {
-            "ledger was supplied, but this repo slug had no matching case".to_string()
-        } else {
-            "no source-truth ledger supplied; final answer quality is still pending".to_string()
-        });
-        return DrillSuiteAnswerQualityOutput {
-            ledger_status,
-            final_answer_status: "pending_source_verification".to_string(),
-            draft_written,
-            claim_count,
-            claim_correct_count,
-            claim_partial_count,
-            claim_misleading_count,
-            claim_unsupported_count,
-            claim_unclassified_count,
-            material_revision_count,
-            expected_file_count,
-            expected_file_found_count,
-            expected_file_missing_count: missing_expected_files.len(),
-            expected_file_recall,
-            missing_expected_files,
-            forbidden_claim_count: 0,
-            forbidden_claim_hits,
-            layer_findings,
-            warnings,
-        };
-    };
-
-    draft_written = ledger_case.draft_written;
-    claim_count = ledger_case.claims.len();
-    for claim in &ledger_case.claims {
-        match claim.classification {
-            DrillSuiteClaimClassification::Correct => claim_correct_count += 1,
-            DrillSuiteClaimClassification::Partial => claim_partial_count += 1,
-            DrillSuiteClaimClassification::Misleading => claim_misleading_count += 1,
-            DrillSuiteClaimClassification::Unsupported => claim_unsupported_count += 1,
-        }
-        if claim.source_files.is_empty() {
-            warnings.push(format!(
-                "ledger claim `{}` has no source_files verification evidence",
-                claim.id
-            ));
-        }
-        if claim.changed_after_source_read.unwrap_or(false) {
-            material_revision_count += 1;
-        }
-        if drill_suite_claim_has_forbidden_final_text(claim, expectations) {
-            forbidden_claim_hits.push(format!("{}: {}", claim.id, claim.text));
-        }
-    }
-    layer_findings = ledger_case
-        .layer_findings
-        .iter()
-        .map(|finding| DrillSuiteLayerFindingOutput {
-            layer: finding.layer.clone(),
-            status: finding.status.clone(),
-            detail: finding.detail.clone(),
-        })
-        .collect();
-
-    if claim_count == 0 {
-        warnings.push("ledger case has no verified claims".to_string());
-    }
-    if draft_written == Some(false) {
-        warnings.push("ledger reports that no CodeStory-only draft was written".to_string());
-    }
-
-    let final_answer_status = if draft_written == Some(false) || claim_count == 0 {
-        "pending_source_verification"
-    } else if claim_unsupported_count > 0
-        || claim_misleading_count > 0
-        || !forbidden_claim_hits.is_empty()
-    {
-        "failed"
-    } else if claim_partial_count > 0
-        || material_revision_count > 0
-        || !missing_expected_files.is_empty()
-    {
-        "degraded"
-    } else {
-        "ready"
-    };
-
-    DrillSuiteAnswerQualityOutput {
-        ledger_status,
-        final_answer_status: final_answer_status.to_string(),
-        draft_written,
-        claim_count,
-        claim_correct_count,
-        claim_partial_count,
-        claim_misleading_count,
-        claim_unsupported_count,
-        claim_unclassified_count,
-        material_revision_count,
-        expected_file_count,
-        expected_file_found_count,
-        expected_file_missing_count: missing_expected_files.len(),
-        expected_file_recall,
-        missing_expected_files,
-        forbidden_claim_count: forbidden_claim_hits.len(),
-        forbidden_claim_hits,
-        layer_findings,
-        warnings,
-    }
-}
-
-fn drill_suite_blocked_answer_quality(
-    expectations: &DrillSuiteExpectationOutput,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
-) -> DrillSuiteAnswerQualityOutput {
-    let (missing_expected_files, expected_file_found_count, expected_file_recall) =
-        drill_suite_expected_file_stats(expectations, &[]);
-    let ledger_status = drill_suite_ledger_status(ledger_case, ledger_supplied);
-    DrillSuiteAnswerQualityOutput {
-        ledger_status,
-        final_answer_status: "blocked".to_string(),
-        draft_written: ledger_case.and_then(|case| case.draft_written),
-        claim_count: ledger_case
-            .map(|case| case.claims.len())
-            .unwrap_or_default(),
-        claim_correct_count: 0,
-        claim_partial_count: 0,
-        claim_misleading_count: 0,
-        claim_unsupported_count: 0,
-        claim_unclassified_count: 0,
-        material_revision_count: 0,
-        expected_file_count: expectations.source_truth_files.len(),
-        expected_file_found_count,
-        expected_file_missing_count: missing_expected_files.len(),
-        expected_file_recall,
-        missing_expected_files,
-        forbidden_claim_count: 0,
-        forbidden_claim_hits: Vec::new(),
-        layer_findings: ledger_case
-            .map(|case| {
-                case.layer_findings
-                    .iter()
-                    .map(|finding| DrillSuiteLayerFindingOutput {
-                        layer: finding.layer.clone(),
-                        status: finding.status.clone(),
-                        detail: finding.detail.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        warnings: vec!["drill blocked before answer-quality scoring could complete".to_string()],
-    }
-}
-
-fn drill_suite_ledger_status(
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
-) -> String {
-    if ledger_case.is_some() {
-        "present".to_string()
-    } else if ledger_supplied {
-        "case_missing".to_string()
-    } else {
-        "not_supplied".to_string()
-    }
-}
-
-fn drill_suite_expected_file_stats(
-    expectations: &DrillSuiteExpectationOutput,
-    target_files: &[String],
-) -> (Vec<String>, usize, Option<f32>) {
-    if expectations.source_truth_files.is_empty() {
-        return (Vec::new(), 0, None);
-    }
-    let target_keys = target_files
-        .iter()
-        .map(|path| drill_suite_path_key(path))
-        .collect::<HashSet<_>>();
-    let mut missing = Vec::new();
-    let mut found = 0usize;
-    for expected in &expectations.source_truth_files {
-        if target_keys.contains(&drill_suite_path_key(expected)) {
-            found += 1;
-        } else {
-            missing.push(expected.clone());
-        }
-    }
-    (
-        missing,
-        found,
-        Some(found as f32 / expectations.source_truth_files.len() as f32),
-    )
-}
-
-fn drill_suite_claim_has_forbidden_final_text(
-    claim: &DrillSuiteLedgerClaim,
-    expectations: &DrillSuiteExpectationOutput,
-) -> bool {
-    if matches!(
-        claim.classification,
-        DrillSuiteClaimClassification::Misleading | DrillSuiteClaimClassification::Unsupported
-    ) {
-        return false;
-    }
-    let claim_text = drill_suite_text_key(&claim.text);
-    expectations.false_claims.iter().any(|false_claim| {
-        let false_claim = drill_suite_text_key(false_claim);
-        !false_claim.is_empty() && claim_text.contains(&false_claim)
-    })
-}
-
-fn drill_suite_path_key(path: &str) -> String {
-    let mut value = path.trim().replace('\\', "/");
-    while let Some(stripped) = value.strip_prefix("./") {
-        value = stripped.to_string();
-    }
-    value.trim_matches('/').to_ascii_lowercase()
 }
 
 fn drill_suite_text_key(value: &str) -> String {

@@ -125,6 +125,11 @@
   follow-up commands now populate the retained drill JSON, Markdown, summary, and
   bridge fields. Removed the public legacy evidence-packet DTO and production
   drill-only search, bridge, readiness, claim-scoring, and ledger assembly paths.
+- Moved drill-suite source-truth ledgers and answer-quality scoring out of the
+  production CLI into `scripts/score-drill-ledger.mjs`. The suite command now
+  emits mechanical evidence only; the versioned evaluator preserves the prior
+  scored JSON contract and can persist it to an explicit output path. The
+  standalone agent-quality evaluator and fixtures now live in `codestory-bench`.
 - Added staged repository-v2/project-v3 identity contracts that preserve
   transport schemes, effective and non-default remote ports, and case-sensitive
   repository paths, distinguish absolute and home-relative SCP paths, reject

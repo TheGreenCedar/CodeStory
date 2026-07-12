@@ -13,6 +13,7 @@ codestory-workspace = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 

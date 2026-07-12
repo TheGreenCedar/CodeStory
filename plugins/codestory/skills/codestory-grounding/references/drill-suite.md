@@ -32,13 +32,12 @@ The suite is intentionally manifest-driven so the CLI is not coupled to one work
 }
 ```
 
-The optional `expect` block lets the suite report target-ranking and
-answer-quality gaps without hard-coding those expectations into the CLI.
-Missing expected files are reported as source-truth target misses. False claims
-are checked when a source-truth ledger is supplied.
+The optional `expect` block records evaluation inputs without hard-coding them
+into runtime behavior. The production suite reports candidate source-truth
+targets; the versioned evaluator compares those targets and claims afterward.
 
 After writing the CodeStory-only draft and completing focused source reads,
-pass an optional source-truth ledger:
+record a source-truth ledger:
 
 ```json
 {
@@ -78,7 +77,6 @@ Allowed claim classifications are `correct`, `partial`, `misleading`, and
 |----------|------|---------|-------------|
 | `--project` | path | `.` | CodeStory owner checkout used to run the suite |
 | `--case-file` | path | **required** | JSON manifest describing suite cases |
-| `--ledger` | path | *none* | Optional source-truth ledger JSON to merge into answer-quality scoring |
 | `--cache-dir` | path | *auto* | Optional suite cache root; explicit roots are split into per-case sub-caches |
 | `--output-dir` | path | **required** | Directory for aggregate suite reports and per-case drill artifacts |
 | `--refresh` | enum | `full` | Refresh strategy passed to each per-case drill: `auto`, `full`, `incremental`, `none` |
@@ -94,14 +92,12 @@ The command writes:
 - one per-case drill directory named `<slug>-drill`
 - each successful per-case `drill-report.json`, `drill-report.md`, `drill-summary.json`, and anchor/bridge artifacts
 
-The suite report summarizes per-case verdicts, answer-quality status, freshness,
+The suite report summarizes per-case mechanical verdicts, freshness,
 retrieval mode, anchor resolution, bridge status, source-truth check counts,
-expected-file recall, source-truth target roles/ranking reasons, bridge
-`evidence_kind`, claim classification counts, and next actions. A case can
+source-truth target roles/ranking reasons, bridge `evidence_kind`, and next actions. A case can
 be mechanically healthy but still `degraded` when source-truth verification is
-required, bridge evidence is partial, retrieval needs repair, freshness is
-stale, expected files were missed, or the ledger records partial/materially
-revised claims. A failed case is recorded as `blocked` instead of aborting the
+required, bridge evidence is partial, retrieval needs repair, or freshness is
+stale. A failed case is recorded as `blocked` instead of aborting the
 whole suite, so other manifest cases still produce evidence.
 
 `--jobs` is default-off and only applies to read-only `--refresh none` loops.
@@ -124,12 +120,11 @@ treating broad search results as proof.
 Use `suite-report.json` for machine comparison across runs. Use `suite-report.md` for the short human readout. Then inspect each per-case `drill-summary.json` and `drill-report.json` before drafting CodeStory-only answers.
 
 Do not treat `ready_count`, `degraded_count`, or green index stats as
-answer-quality proof by themselves. The real question is whether the Evidence
-Packet, bridge rows, endpoint files, consumer summaries, and source-truth checks
-let an agent draft an answer that survives focused source verification. When a
-ledger is supplied, use `answer_quality.final_answer_status` and the claim
-counts to decide whether the final answer is `ready`, `degraded`, `failed`,
-`blocked`, or still `pending_source_verification`.
+answer-quality proof by themselves. After source verification, run
+`node scripts/score-drill-ledger.mjs <suite-report.json> <ledger.json> [scored-report.json]`.
+The scored artifact restores `answer_quality` per repo
+and aggregate ready/degraded/failed/pending counts without adding benchmark
+formulas to the production CLI.
 
 Bridge `evidence_kind` distinguishes `graph_path`, `framework_route`,
 `component_usage`, `data_collection_usage`, `shared_file`, `repo_text_hint`,

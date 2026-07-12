@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "suite": "compatibility-suite",
+  "cases": [
+    {
+      "slug": "alpha repo",
+      "draft_written": true,
+      "claims": [
+        {
+          "id": "claim-1",
+          "text": "The controller delegates through Repository.",
+          "classification": "correct",
+          "changed_after_source_read": false,
+          "source_files": ["src/api/controller.ts"]
+        },
+        {
+          "id": "claim-2",
+          "text": "The graph only partially exposed the store boundary.",
+          "classification": "partial",
+          "changed_after_source_read": true,
+          "source_files": ["src/store/repository.ts"]
+        }
+      ],
+      "layer_findings": [
+        { "layer": "graph_trail", "status": "partial", "detail": "Route entry was absent." }
+      ]
+    }
+  ]
+}

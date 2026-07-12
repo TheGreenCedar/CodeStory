@@ -369,7 +369,7 @@ fn linter_rejects_constructed_eval_corpus_dependencies() {
         r#"
 pub const LEAKED_TASK_CORPUS: &str = concat!("benchmarks", "/tasks", "/eval-probes.json");
 pub const LEAKED_PACKET_FIXTURE: &str = concat!("crates/codestory-cli/tests/fixtures/", "packet_search_eval");
-pub const LEAKED_QUALITY_FIXTURE: &str = concat!("crates/codestory-cli/tests/", "fixtures/agent_quality");
+pub const LEAKED_QUALITY_FIXTURE: &str = concat!("crates/codestory-bench/tests/", "fixtures/agent_quality");
 pub const LEAKED_DEPENDENCY: &str = include_str!(concat!("../../benchmarks/", "tasks/eval-probes.json"));
 "#,
     );
