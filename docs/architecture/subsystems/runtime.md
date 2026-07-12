@@ -49,10 +49,9 @@ Important tuning surfaces:
 
 Product packet/search evidence is served through mandatory sidecars. The live
 query sidecar must use `llamacpp:bge-base-en-v1.5`, and health must report
-`retrieval_mode=full`. Stored ONNX, hash, or other diagnostic producer metadata
+`retrieval_mode=full`. Stored legacy ONNX, hash, or other diagnostic producer metadata
 must fail closed when it does not match the current llama.cpp product manifest;
-hash and other in-process embedding paths remain diagnostic unless a future spec
-promotes them with fresh sidecar-quality evidence. Current benchmark findings live in
+hash and other in-process embedding paths remain diagnostic. Current benchmark findings live in
 [embedding-backend-benchmarks.md](../../testing/embedding-backend-benchmarks.md).
 
 The CLI owns managed embedding setup. `codestory-cli retrieval bootstrap` starts

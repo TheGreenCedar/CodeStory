@@ -36,6 +36,6 @@ Codex host/app session.
 - `doctor` does not accept `--refresh`; it is a read-only health surface.
 - The `attention:` block repeats warnings first so agents do not miss semantic partial/stale/failure messages buried in the full check list.
 - Environment rows report retrieval-related variables such as `CODESTORY_EMBED_BACKEND`, `CODESTORY_EMBED_LLAMACPP_URL`, and sidecar enablement flags.
-- The embedding checks distinguish product llama.cpp sidecar state from hash, ONNX, disabled, or stale diagnostic states.
+- The embedding checks distinguish product llama.cpp sidecar state from hash, disabled, or stale diagnostic states.
 - Treat `semantic ok` plus `retrieval_mode=full` as the health state suitable for broad repository explanation prompts. Under `graph_first_v1`, `full` may explicitly skip Qdrant only when dense-anchor count is zero and graph/lexical artifacts are current. Treat `semantic partial`, `semantic stale`, `semantic failed`, Qdrant count mismatch, and non-`full` retrieval modes as instructions to repair setup or rebuild before trusting agent-facing evidence.
 - Prefer JSON for CI or doc-contract checks.

@@ -2,11 +2,14 @@
 
 ## Unreleased
 
-### Added
+### Removed
 
-- Added an opt-in `diagnostic-onnx` Cargo feature for maintainers who still need
-  the legacy ONNX asset diagnostics. Default CLI builds no longer compile or
-  link ONNX Runtime, DirectML, ndarray, or tokenizer support.
+- Removed the legacy ONNX diagnostic runtime, asset installer, setup command,
+  comparison tooling, configuration, tests, and dependencies. Legacy ONNX
+  environment variables and backend selections now fail explicitly; product
+  packet/search readiness remains exclusively tied to the llama.cpp sidecar.
+
+### Added
 - Added parser-backed FastAPI decorator route extraction for single-target,
   module-scope receivers whose latest preceding assignment constructs an
   imported `FastAPI` or `APIRouter`, including exact handler, method, path,

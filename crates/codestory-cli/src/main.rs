@@ -51,11 +51,11 @@ mod args;
 mod config;
 mod display;
 mod drill_targeting;
+mod embedding_config;
 mod explore;
 mod file_state;
 mod http_transport;
 mod local_refresh_status;
-mod managed_embeddings;
 mod output;
 mod query_resolution;
 mod readiness;
@@ -90,10 +90,10 @@ use args::{
     GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
     PacketCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
     QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand, ReadyOutput, RepoTextMode,
-    SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand,
-    SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput,
-    SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand, TaskAction, TaskBriefCommand,
-    TaskCommand, TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SidecarAction, SidecarCommand,
+    SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput, SymbolCommand, SymbolJsonOutput,
+    SymbolWorkflowCommand, TaskAction, TaskBriefCommand, TaskCommand, TrailCommand,
+    TrailJsonOutput, VerificationTargetOutput, build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -259,7 +259,6 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Fix(cmd) => run_fix(cmd),
         Command::Smoke(cmd) => run_smoke(cmd),
         Command::Agent(cmd) => run_agent(cmd),
-        Command::Setup(cmd) => run_setup(cmd),
         Command::Cache(cmd) => run_cache(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Drill(cmd) => run_drill(cmd),
@@ -462,12 +461,6 @@ fn render_cache_identity_markdown(output: &codestory_runtime::RepositoryIdentity
     markdown
 }
 
-fn run_setup(cmd: SetupCommand) -> Result<()> {
-    match cmd.action {
-        SetupAction::Embeddings(cmd) => run_setup_embeddings(cmd),
-    }
-}
-
 fn run_cache_rehydrate(cmd: args::CacheRehydrateCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "cache rehydrate")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -535,42 +528,6 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
         }
     }
     markdown
-}
-
-fn run_setup_embeddings(cmd: args::SetupEmbeddingsCommand) -> Result<()> {
-    ensure_dot_only_for_trail(cmd.format, "setup embeddings")?;
-    preflight_output_file(cmd.output_file.as_deref())?;
-    let project_root = runtime::canonicalize_project_root(&cmd.project.project)?;
-    let cache_override =
-        runtime::trusted_cache_override(&project_root, cmd.project.cache_dir.as_deref())?;
-    let next_commands =
-        setup_embeddings_next_commands(&cmd.project.project, cmd.project.cache_dir.as_deref());
-    let managed_root = managed_embeddings::managed_root(cache_override.as_deref())?;
-    let mut output = managed_embeddings::setup_embeddings(
-        &managed_root,
-        cmd.quant,
-        cmd.variant,
-        cmd.dry_run,
-        !cmd.no_start,
-    )?;
-    output.next_commands = next_commands;
-    let markdown = managed_embeddings::render_setup_embeddings_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
-}
-
-fn setup_embeddings_next_commands(
-    project: &std::path::Path,
-    cache_dir: Option<&std::path::Path>,
-) -> Vec<String> {
-    let mut args = format!(" --project {}", quote_command_path(project));
-    if let Some(cache_dir) = cache_dir {
-        let _ = write!(args, " --cache-dir {}", quote_command_path(cache_dir));
-    }
-    vec![
-        format!("codestory-cli doctor{args}"),
-        format!("codestory-cli retrieval bootstrap{args}"),
-        format!("codestory-cli retrieval index{args} --refresh full"),
-    ]
 }
 
 fn quote_command_path(path: &std::path::Path) -> String {
@@ -11306,12 +11263,6 @@ fn build_doctor_output(
             checks.push(semantic_contract_check(retrieval));
         }
     }
-    let managed_status = managed_embeddings::inspect_status(&runtime.managed_embeddings_root);
-    checks.push(doctor_check(
-        "managed_embeddings",
-        managed_doctor_status(&managed_status.state),
-        managed_status.message,
-    ));
     if let Some(freshness) = summary.freshness.as_ref() {
         checks.push(index_freshness_check(freshness));
     }
@@ -11321,11 +11272,6 @@ fn build_doctor_output(
         "CODESTORY_EMBED_MODEL_ID",
         "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_RUNTIME_MODE",
-        "CODESTORY_EMBED_ONNX_MODEL",
-        "CODESTORY_EMBED_ONNX_TOKENIZER",
-        "CODESTORY_EMBED_ONNX_PROVIDER",
-        "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
-        "CODESTORY_EMBED_ONNX_THREADS",
         "CODESTORY_EMBED_LLAMACPP_URL",
         "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT",
         "CODESTORY_STORED_VECTOR_ENCODING",
@@ -11828,7 +11774,7 @@ fn doctor_env_check_message(name: &str, value: &str) -> String {
     if name.ends_with("_URL") || trimmed.contains("://") {
         return format!(
             "set to `{}`",
-            managed_embeddings::redact_url_for_display(trimmed)
+            embedding_config::redact_url_for_display(trimmed)
         );
     }
     format!("set to `{trimmed}`")
@@ -11863,7 +11809,7 @@ fn redact_url_token(token: &str) -> String {
     let (url, suffix) = url_and_suffix.split_at(suffix_start);
     format!(
         "{prefix}{}{suffix}",
-        managed_embeddings::redact_url_for_display(url)
+        embedding_config::redact_url_for_display(url)
     )
 }
 
@@ -12046,15 +11992,6 @@ fn semantic_contract_check(
                 gaps.join("; ")
             ),
         )
-    }
-}
-
-fn managed_doctor_status(state: &str) -> &'static str {
-    match state {
-        "managed_onnx_ready" | "external_llama_configured" | "disabled_by_config" => "ok",
-        "missing_managed_assets" => "info",
-        "external_llama_unreachable" | "managed_onnx_unusable" => "warn",
-        _ => "info",
     }
 }
 

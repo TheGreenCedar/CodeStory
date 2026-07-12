@@ -46,15 +46,8 @@ There is no `index --semantic off` flag. Graph-native `symbol_search_doc` rows
 are part of the default index contract. Under `graph_first_v1`, dense vectors
 are only written for selected anchors such as entrypoints, public APIs,
 documented nontrivial symbols, central graph nodes, component reports, and
-unstructured docs. On a fresh machine, check the setup plan first:
-
-```text
-<codestory-cli> setup embeddings --project <target-workspace> --dry-run --format json
-```
-
-Then install assets with `setup embeddings --project <target-workspace>` only
-for explicit ONNX diagnostics. Product packet/search readiness uses the
-llama.cpp retrieval sidecar path.
+unstructured docs. Product packet/search readiness uses the llama.cpp
+retrieval sidecar path.
 
 High-signal environment toggles:
 
@@ -65,8 +58,8 @@ High-signal environment toggles:
 | `CODESTORY_EMBED_LLAMACPP_URL=http://127.0.0.1:8080/v1/embeddings` | Explicit external embedding endpoint override for bge-base sidecar vectors across profiles. When unset, managed Agent profiles allocate and persist a dynamic endpoint. |
 | `CODESTORY_SUMMARY_ENDPOINT=local` | Enable deterministic local summaries with `--summarize`. |
 
-Use other embedding, alias, batch-size, tokenizer, provider, hash, ONNX, and
-summary tuning variables only for focused diagnostics or historical comparisons.
+Use other embedding, alias, batch-size, provider, hash, and summary tuning
+variables only for focused diagnostics or historical comparisons.
 Agent packet/search readiness requires `retrieval_mode=full`; see
 [status-contract.md](status-contract.md) and [retrieval-rollout.md](retrieval-rollout.md).
 

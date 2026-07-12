@@ -36,19 +36,6 @@ As of the mandatory sidecar reset, older ONNX and hash-projection rows are
 historical diagnostics. Add a fresh sidecar row before calling the active runtime
 promoted on quality and cross-repo evidence.
 
-## Diagnostic Identity Probe
-
-Use `node scripts/codestory-embedding-runtime-compare.mjs` for the smallest local
-ONNX-vs-llama embedding identity check. It reports model load time, query and
-document embedding time, cache bytes, vector shape checks, and top-k overlap for
-a fixed fixture set.
-
-The probe is diagnostic only. ONNX output from this path cannot satisfy product
-`retrieval_mode=full` by itself, and hash projection remains rejected as product
-semantic readiness. If llama.cpp or managed ONNX assets are unavailable, keep the
-reported failure text as the evidence instead of rerunning broad benchmark
-suites.
-
 ## Primary Comparison Matrix
 
 | Candidate or lane | Best relevant evidence | Quality signal | Speed and footprint signal | Decision |
@@ -70,7 +57,7 @@ suites.
 | Token-budget narrowing and semantic-scope pruning | tok320 `863128.088009`; no-macros `838267.207245`; no-test-macros `862424.110651` | Lost quality or rank profile | Some rows reduced semantic time but not enough | Discard. Removing documents is not free. |
 | Direct hydration, file-path cache, and reload skipping | Direct hydration `843840.934147`; stable-order hydration `859167.697841`; file-path cache `862471.707786` | Quality or speed regressed | Did not remove enough cache/semantic time | Discard for now. |
 | Background semantic embedding | Buggy packet `949630.846470`; corrected packet `857789.768509` | Corrected packet had lower quality | Corrected speed did not beat the incumbent candidate | Discard. The apparent win was a measurement bug. |
-| Older ONNX rows | Historical only | Older ONNX rows predate the active managed diagnostic path | Managed ONNX now runs in-process, but it is not product sidecar proof | Do not use old ONNX evidence for new default decisions. Re-run speed, quality, sidecar-contract, and cross-repo gates on the active implementation before declaring a benchmark promotion. |
+| Older ONNX rows | Historical only | Older ONNX rows predate the mandatory sidecar contract | The implementation has been removed | Do not use old ONNX evidence for new default decisions. |
 
 ## What Was Tried
 
@@ -111,9 +98,8 @@ The measured work covered these families:
 - VRAM was not measured on this Windows/Vulkan host because `nvidia-smi` did not
   return memory usage. Peak RAM is sampled working set evidence, not exact max
   RSS.
-- ONNX is the active managed diagnostic setup path. Older ONNX evidence should
-  not drive new product retrieval choices until the current implementation has
-  fresh speed, quality, sidecar-contract, and cross-repo rows.
+- ONNX implementation and setup were removed. Its measured rows remain only as
+  a truthful record of discarded experiments.
 
 ## How To Use This Matrix
 
