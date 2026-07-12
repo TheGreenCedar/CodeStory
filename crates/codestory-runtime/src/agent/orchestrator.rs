@@ -34,11 +34,11 @@ use crate::agent::packet_evidence_roles::{
 };
 #[cfg(test)]
 use crate::agent::packet_plan::{
-    build_packet_plan, packet_concept_queries, packet_symbol_probe_queries,
+    build_packet_plan, build_packet_plan_with_extra, packet_concept_queries,
+    packet_symbol_probe_queries,
 };
 use crate::agent::packet_plan::{
-    build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
-    packet_request_extra_probes,
+    packet_plan_annotation, packet_rank_terms, packet_request_extra_probes,
 };
 #[cfg(test)]
 use crate::agent::packet_required_probes::packet_sufficiency_required_probe_queries;
@@ -370,8 +370,8 @@ pub(crate) fn agent_packet(
     let project_root = controller.require_project_root()?;
     controller.begin_packet_retrieval();
 
+    let plan = super::plan_packet(&req)?;
     let extra_probes = packet_request_extra_probes(req.extra_probes);
-    let plan = build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
     let limits = packet_budget_limits(req.budget);
     let packet_latency = PacketLatencyBudget::new(req.latency_budget_ms);
     let retrieval_profile = packet_retrieval_profile(Some(plan.task_class), req.budget, &limits);
