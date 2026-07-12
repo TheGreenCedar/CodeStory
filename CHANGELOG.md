@@ -52,6 +52,8 @@
 
 ### Fixed
 
+- Corrected the Codex managed-platform guide to list the restored macOS x64 CLI
+  while retaining its no-managed-accelerated-sidecar boundary.
 - Extended the retrieval generalization guard from derived query literals to
   direct and split Rust string dependencies on eval/query corpus paths across
   production crates, including benchmark manifests, query catalogs, packet
