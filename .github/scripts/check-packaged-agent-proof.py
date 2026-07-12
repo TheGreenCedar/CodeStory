@@ -165,69 +165,145 @@ def proof_environment(base: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def cleanup_proof_compose(cache_root: Path, env: dict[str, str], results: list[dict], run) -> None:
-    for state_file in sorted(cache_root.rglob("retrieval-sidecars.json")):
-        state = read_json_file(state_file)
-        if not isinstance(state, dict) or state.get("owner") != "codestory":
-            raise RuntimeError(f"proof sidecar state has unexpected ownership: {state_file}")
-        if state.get("profile") != "local" or not state.get("compose_file"):
+def validated_proof_compose_state(cache_root: Path, project: Path, read_state) -> tuple[Path, dict] | None:
+    if cache_root.is_symlink() or project.is_symlink():
+        raise RuntimeError("proof cache and project roots must not be symlinks")
+    cache_root = cache_root.resolve(strict=True)
+    project = project.resolve(strict=True)
+    state_file = cache_root / "retrieval-sidecars.json"
+    if state_file.is_symlink():
+        raise RuntimeError(f"proof sidecar state must not be a symlink: {state_file}")
+    if not state_file.exists():
+        return None
+    if not state_file.is_file():
+        raise RuntimeError(f"proof sidecar state is not a regular file: {state_file}")
+    state = read_state(state_file)
+    if not isinstance(state, dict):
+        raise TypeError(f"proof sidecar state is not an object: {state_file}")
+    expected_identity = {
+        "owner": "codestory",
+        "profile": "local",
+        "namespace": "codestory",
+        "compose_project": "codestory",
+    }
+    for name, expected in expected_identity.items():
+        if state.get(name) != expected:
+            raise RuntimeError(f"proof sidecar state {name} does not match {expected!r}: {state_file}")
+    for name, expected in (
+        ("qdrant_data_dir", cache_root / "qdrant"),
+        ("lexical_data_dir", cache_root / "lexical"),
+    ):
+        value = state.get(name)
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"proof sidecar state {name} is not a path string: {state_file}")
+        observed = Path(value)
+        expected = expected.resolve(strict=True)
+        if observed != expected or observed.is_symlink() or observed.resolve(strict=True) != expected:
+            raise RuntimeError(f"proof sidecar state {name} escaped its cache root: {state_file}")
+    compose_value = state.get("compose_file")
+    if not isinstance(compose_value, str) or not compose_value:
+        raise TypeError(f"proof sidecar compose_file is not a path string: {state_file}")
+    compose_file = Path(compose_value)
+    if compose_file.is_symlink() or not compose_file.is_file():
+        raise RuntimeError(f"proof sidecar compose file is not a regular canonical file: {compose_file}")
+    allowed_compose_files = set()
+    for candidate in (
+        project / "docker" / "retrieval-compose.yml",
+        cache_root / "retrieval-compose.yml",
+    ):
+        if not candidate.is_file() or candidate.is_symlink():
             continue
-        required = ("compose_project", "namespace", "qdrant_data_dir", "lexical_data_dir")
-        if any(not isinstance(state.get(name), str) or not state[name] for name in required):
-            raise RuntimeError(f"proof sidecar state is missing compose ownership: {state_file}")
-        compose_file = Path(state["compose_file"])
-        if not compose_file.is_file():
-            raise RuntimeError(f"proof sidecar compose file is missing: {compose_file}")
-        compose_env = {
-            **env,
-            "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
-            "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
-            "CODESTORY_ZOEKT_DATA_DIR": state["lexical_data_dir"],
-            "CODESTORY_EMBED_MODEL_DIR": state["qdrant_data_dir"],
-        }
-        command = [
-            "docker",
-            "compose",
-            "-p",
-            state["compose_project"],
-            "-f",
-            str(compose_file),
-            "down",
-            "--remove-orphans",
-        ]
-        try:
-            result = run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-                check=False,
-                env=compose_env,
-                text=True,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            results.append({"kind": "compose_down", "state_file": str(state_file), "error": str(exc)})
-            raise RuntimeError(f"could not stop proof-owned Compose sidecars: {exc}") from exc
+        canonical_candidate = candidate.resolve(strict=True)
+        if candidate == canonical_candidate:
+            allowed_compose_files.add(canonical_candidate)
+    canonical_compose_file = compose_file.resolve(strict=True)
+    if compose_file != canonical_compose_file or canonical_compose_file not in allowed_compose_files:
+        raise RuntimeError(f"proof sidecar compose file is outside the allowed roots: {compose_file}")
+    return state_file, state
+
+
+def cleanup_proof_compose(
+    cache_root: Path,
+    project: Path,
+    env: dict[str, str],
+    results: list[dict],
+    run,
+    read_state,
+) -> None:
+    try:
+        validated = validated_proof_compose_state(cache_root, project, read_state)
+    except Exception as exc:
         results.append(
             {
-                "kind": "compose_down",
-                "state_file": str(state_file),
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "kind": "compose_state_validation",
+                "state_file": str(cache_root / "retrieval-sidecars.json"),
+                "error": f"{type(exc).__name__}: {exc}",
             }
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"proof-owned Compose cleanup exited {result.returncode}")
+        raise RuntimeError(f"proof-owned Compose state validation failed: {exc}") from exc
+    if validated is None:
+        return
+    state_file, state = validated
+    compose_env = {
+        **env,
+        "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
+        "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
+        "CODESTORY_ZOEKT_DATA_DIR": state["lexical_data_dir"],
+        "CODESTORY_EMBED_MODEL_DIR": state["qdrant_data_dir"],
+    }
+    command = [
+        "docker",
+        "compose",
+        "-p",
+        state["compose_project"],
+        "-f",
+        state["compose_file"],
+        "down",
+        "--remove-orphans",
+    ]
+    try:
+        result = run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+            env=compose_env,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        results.append({"kind": "compose_down", "state_file": str(state_file), "error": str(exc)})
+        raise RuntimeError(f"could not stop proof-owned Compose sidecars: {exc}") from exc
+    results.append(
+        {
+            "kind": "compose_down",
+            "state_file": str(state_file),
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"proof-owned Compose cleanup exited {result.returncode}")
 
 
-def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path, artifact: Path, run=subprocess.run) -> None:
+def cleanup_proof_cache(
+    cli: Path,
+    project: Path,
+    cache_root: Path,
+    artifact: Path,
+    run=subprocess.run,
+    read_state=read_json_file,
+) -> None:
     env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
     results = []
     try:
-        cleanup_proof_compose(cache_root, env, results, run)
-    except RuntimeError as exc:
-        write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
+        cleanup_proof_compose(cache_root, project, env, results, run, read_state)
+    except Exception as exc:
+        write_json(
+            artifact,
+            {"cache_root": str(cache_root), "commands": results, "removed": False, "error": str(exc)},
+        )
         raise
     for profile, extra in (("local", []), ("agent", ["--run-id", "shared-agent"])):
         try:
@@ -1994,26 +2070,27 @@ def self_test() -> None:
         stage.mkdir(parents=True)
         write_fake_cli(stage)
         fake_cli = find_cli(stage)
-        compose_file = root / "retrieval-compose.yml"
+        compose_file = root / "docker" / "retrieval-compose.yml"
+        compose_file.parent.mkdir()
         compose_file.write_text("services: {}\n", encoding="utf-8")
 
-        def write_proof_compose_state(cache_root: Path) -> None:
-            state_dir = cache_root / "sidecars" / "proof-local"
-            state_dir.mkdir(parents=True)
+        def write_proof_compose_state(cache_root: Path, overrides: dict | None = None) -> Path:
+            cache_root.mkdir()
             (cache_root / "qdrant").mkdir()
             (cache_root / "lexical").mkdir()
-            write_json(
-                state_dir / "retrieval-sidecars.json",
-                {
-                    "owner": "codestory",
-                    "profile": "local",
-                    "namespace": "proof-local",
-                    "compose_project": "proof-local",
-                    "compose_file": str(compose_file),
-                    "qdrant_data_dir": str(cache_root / "qdrant"),
-                    "lexical_data_dir": str(cache_root / "lexical"),
-                },
-            )
+            state = {
+                "owner": "codestory",
+                "profile": "local",
+                "namespace": "codestory",
+                "compose_project": "codestory",
+                "compose_file": str(compose_file),
+                "qdrant_data_dir": str(cache_root / "qdrant"),
+                "lexical_data_dir": str(cache_root / "lexical"),
+            }
+            state.update(overrides or {})
+            state_file = cache_root / "retrieval-sidecars.json"
+            write_json(state_file, state)
+            return state_file
 
         compose_cleanup_root = root / "compose-cleanup"
         write_proof_compose_state(compose_cleanup_root)
@@ -2035,7 +2112,7 @@ def self_test() -> None:
         )
         assert not compose_cleanup_root.exists()
         assert compose_calls[0][0][-2:] == ["down", "--remove-orphans"]
-        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"] == "proof-local"
+        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"] == "codestory"
         compose_cleanup = read_json_file(compose_cleanup_artifact)
         assert compose_cleanup["removed"] is True
         assert compose_cleanup["commands"][0]["kind"] == "compose_down"
@@ -2064,6 +2141,85 @@ def self_test() -> None:
         assert failed_compose_root.exists()
         assert read_json_file(failed_compose_artifact)["removed"] is False
         remove_tree_with_retry(failed_compose_root)
+
+        altered_compose_file = root / "altered-compose.yml"
+        altered_compose_file.write_text("services: {}\n", encoding="utf-8")
+        altered_qdrant = root / "altered-qdrant"
+        altered_qdrant.mkdir()
+        validation_cases = [
+            ("project", {"compose_project": "not-codestory"}),
+            ("file", {"compose_file": str(altered_compose_file)}),
+            ("path", {"qdrant_data_dir": str(altered_qdrant)}),
+            ("non-string", {"namespace": 7}),
+        ]
+        for label, overrides in validation_cases:
+            cache_root = root / f"compose-validation-{label}"
+            write_proof_compose_state(cache_root, overrides)
+            artifact = root / f"compose-validation-{label}.json"
+            try:
+                cleanup_proof_cache(fake_cli, root, cache_root, artifact)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"altered proof Compose {label} must fail closed")
+            validation = read_json_file(artifact)
+            assert validation["removed"] is False
+            assert validation["commands"][0]["kind"] == "compose_state_validation"
+            assert validation["commands"][0]["error"]
+            remove_tree_with_retry(cache_root)
+
+        malformed_root = root / "compose-validation-malformed"
+        malformed_state = write_proof_compose_state(malformed_root)
+        malformed_state.write_text("{", encoding="utf-8")
+        malformed_artifact = root / "compose-validation-malformed.json"
+        try:
+            cleanup_proof_cache(fake_cli, root, malformed_root, malformed_artifact)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("malformed proof Compose state must fail closed")
+        assert "JSONDecodeError" in read_json_file(malformed_artifact)["commands"][0]["error"]
+        remove_tree_with_retry(malformed_root)
+
+        unreadable_root = root / "compose-validation-unreadable"
+        write_proof_compose_state(unreadable_root)
+        unreadable_artifact = root / "compose-validation-unreadable.json"
+
+        def unreadable_state(_path):
+            raise PermissionError("forced unreadable state")
+
+        try:
+            cleanup_proof_cache(
+                fake_cli,
+                root,
+                unreadable_root,
+                unreadable_artifact,
+                read_state=unreadable_state,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("unreadable proof Compose state must fail closed")
+        assert "PermissionError" in read_json_file(unreadable_artifact)["commands"][0]["error"]
+        remove_tree_with_retry(unreadable_root)
+
+        symlink_root = root / "compose-validation-symlink"
+        symlink_root.mkdir()
+        (symlink_root / "qdrant").mkdir()
+        (symlink_root / "lexical").mkdir()
+        symlink_target = root / "compose-validation-symlink-target.json"
+        write_json(symlink_target, {"owner": "codestory"})
+        (symlink_root / "retrieval-sidecars.json").symlink_to(symlink_target)
+        symlink_artifact = root / "compose-validation-symlink.json"
+        try:
+            cleanup_proof_cache(fake_cli, root, symlink_root, symlink_artifact)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("symlinked proof Compose state must fail closed")
+        assert "symlink" in read_json_file(symlink_artifact)["commands"][0]["error"]
+        remove_tree_with_retry(symlink_root)
+        symlink_target.unlink()
 
         skill = stage / PLUGIN_SKILL_RELATIVE
         skill.parent.mkdir(parents=True)
