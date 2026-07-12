@@ -542,6 +542,7 @@ dependencies = [
  "tracing",
  "turbovec",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

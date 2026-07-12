@@ -261,7 +261,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     options: BootstrapSidecarsOptions,
     mut progress: impl FnMut(&'static str),
 ) -> Result<BootstrapReport> {
-    runtime.ensure_ports_allocated()?;
+    let port_lease_heartbeat = runtime.start_port_lease_heartbeat()?;
     let BootstrapSidecarsOptions {
         storage_scope,
         compose_file,
@@ -349,6 +349,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
         &layout,
         &embedding_device,
     );
+    port_lease_heartbeat.finish()?;
 
     Ok(BootstrapReport {
         state,
