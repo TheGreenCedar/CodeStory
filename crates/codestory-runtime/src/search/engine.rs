@@ -4,22 +4,23 @@ use crate::symbol_query::query_mentions_non_primary_source;
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::graph::NodeId;
 use fs4::fs_std::FileExt;
+#[cfg(feature = "diagnostic-onnx")]
 use ndarray::Array2;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
+#[cfg(feature = "diagnostic-onnx")]
 use ort::{
     ep, inputs,
     session::{Session, builder::GraphOptimizationLevel},
     value::TensorRef,
 };
+#[cfg(feature = "diagnostic-onnx")]
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,10 +44,15 @@ pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX
 pub const EMBEDDING_LAYER_NORM_ENV: &str = "CODESTORY_EMBED_LAYER_NORM";
 pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
 pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
+#[cfg(any(feature = "diagnostic-onnx", test))]
 pub const ONNX_MODEL_PATH_ENV: &str = "CODESTORY_EMBED_ONNX_MODEL";
+#[cfg(any(feature = "diagnostic-onnx", test))]
 pub const ONNX_TOKENIZER_PATH_ENV: &str = "CODESTORY_EMBED_ONNX_TOKENIZER";
+#[cfg(feature = "diagnostic-onnx")]
 pub const ONNX_PROVIDER_ENV: &str = "CODESTORY_EMBED_ONNX_PROVIDER";
+#[cfg(feature = "diagnostic-onnx")]
 pub const ONNX_THREADS_ENV: &str = "CODESTORY_EMBED_ONNX_THREADS";
+#[cfg(feature = "diagnostic-onnx")]
 pub const ONNX_BATCH_TOKENS_ENV: &str = "CODESTORY_EMBED_ONNX_BATCH_TOKENS";
 pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
 pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
@@ -55,12 +61,10 @@ pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
 const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 1;
 const MAX_LLAMACPP_REQUEST_COUNT: usize = 16;
+#[cfg(feature = "diagnostic-onnx")]
 const DEFAULT_ONNX_BATCH_TOKENS: usize = 32_768;
 #[cfg(test)]
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
-
-type HttpHeaders = Vec<(String, String)>;
-type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SymbolCandidateRank {
@@ -437,12 +441,24 @@ fn unavailable_embedding_runtime(
 
 fn ensure_embedding_backend_available(backend: EmbeddingBackendSelection) -> Result<()> {
     match backend {
-        EmbeddingBackendSelection::Onnx => OnnxEmbeddingRuntime::probe_from_env().map(|_| ()),
+        EmbeddingBackendSelection::Onnx => probe_onnx_runtime_from_env().map(|_| ()),
         EmbeddingBackendSelection::LlamaCpp => {
             LlamaCppEndpoint::from_env().and_then(|endpoint| endpoint.ensure_reachable())
         }
         EmbeddingBackendSelection::HashProjection => Ok(()),
     }
+}
+
+#[cfg(feature = "diagnostic-onnx")]
+fn probe_onnx_runtime_from_env() -> Result<PathBuf> {
+    OnnxEmbeddingRuntime::probe_from_env()
+}
+
+#[cfg(not(feature = "diagnostic-onnx"))]
+fn probe_onnx_runtime_from_env() -> Result<PathBuf> {
+    bail!(
+        "diagnostic ONNX support is not included in this build; rebuild codestory-cli with --features diagnostic-onnx"
+    )
 }
 
 pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract> {
@@ -460,12 +476,20 @@ pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract>
     })
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 pub fn probe_onnx_runtime_paths(model_path: &Path, tokenizer_path: &Path) -> Result<()> {
     OnnxEmbeddingRuntime::from_paths(OnnxModelPaths {
         model_path: model_path.to_path_buf(),
         tokenizer_path: tokenizer_path.to_path_buf(),
     })
     .map(|_| ())
+}
+
+#[cfg(not(feature = "diagnostic-onnx"))]
+pub fn probe_onnx_runtime_paths(_model_path: &Path, _tokenizer_path: &Path) -> Result<()> {
+    bail!(
+        "diagnostic ONNX support is not included in this build; rebuild codestory-cli with --features diagnostic-onnx"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -482,12 +506,14 @@ pub struct EmbeddingRuntimeProbe {
     pub model_id: String,
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 #[derive(Debug, Clone)]
 struct OnnxModelPaths {
     model_path: PathBuf,
     tokenizer_path: PathBuf,
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 impl OnnxModelPaths {
     fn from_env() -> Result<Self> {
         let model_path = required_path_env(ONNX_MODEL_PATH_ENV)?;
@@ -499,6 +525,7 @@ impl OnnxModelPaths {
     }
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn required_path_env(key: &str) -> Result<PathBuf> {
     let raw = std::env::var(key).with_context(|| {
         format!(
@@ -515,6 +542,7 @@ fn required_path_env(key: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnnxProvider {
     Auto,
@@ -522,6 +550,7 @@ enum OnnxProvider {
     Cpu,
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 impl OnnxProvider {
     fn from_env() -> Result<Self> {
         let raw = std::env::var(ONNX_PROVIDER_ENV)
@@ -539,18 +568,21 @@ impl OnnxProvider {
     }
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 #[derive(Debug)]
 struct OnnxEmbeddingRuntime {
     tokenizer: tokenizers::Tokenizer,
     session: Mutex<Session>,
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 struct OnnxEncodedRow {
     ids: Vec<i64>,
     attention: Vec<i64>,
     token_types: Vec<i64>,
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 struct OnnxEncodedBatch {
     input_ids: Array2<i64>,
     attention_mask: Array2<i64>,
@@ -559,6 +591,7 @@ struct OnnxEncodedBatch {
     sequence_len: usize,
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 impl OnnxEmbeddingRuntime {
     fn from_env() -> Result<(PathBuf, Self)> {
         let paths = OnnxModelPaths::from_env()?;
@@ -708,6 +741,7 @@ impl OnnxEmbeddingRuntime {
     }
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn onnx_batch_end_for_token_budget(
     rows: &[OnnxEncodedRow],
     start: usize,
@@ -727,6 +761,7 @@ fn onnx_batch_end_for_token_budget(
     end.max(start + 1)
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn shape_onnx_batch(
     rows: &[OnnxEncodedRow],
     pooling: EmbeddingPooling,
@@ -765,6 +800,7 @@ fn shape_onnx_batch(
     })
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn build_onnx_session(model_path: &Path) -> Result<Session> {
     match OnnxProvider::from_env()? {
         OnnxProvider::Auto => {
@@ -783,6 +819,7 @@ fn build_onnx_session(model_path: &Path) -> Result<Session> {
     }
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn build_onnx_session_for_provider(model_path: &Path, provider: OnnxProvider) -> Result<Session> {
     let mut builder = Session::builder()
         .context("failed to initialize ONNX Runtime session builder")?
@@ -814,6 +851,7 @@ fn build_onnx_session_for_provider(model_path: &Path, provider: OnnxProvider) ->
     })
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn extract_onnx_embeddings(
     data: &[f32],
     shape: &[i64],
@@ -836,6 +874,7 @@ fn extract_onnx_embeddings(
     }
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn collect_onnx_pooled_embeddings(
     data: &[f32],
     shape: &[i64],
@@ -858,6 +897,7 @@ fn collect_onnx_pooled_embeddings(
         .collect::<Vec<_>>())
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn pool_onnx_hidden_state(
     data: &[f32],
     shape: &[i64],
@@ -933,6 +973,7 @@ fn pool_onnx_hidden_state(
     Ok(embeddings)
 }
 
+#[cfg(feature = "diagnostic-onnx")]
 fn last_attention_index(attention: &[i64], row: usize, sequence_len: usize) -> Option<usize> {
     let offset = row * sequence_len;
     (0..sequence_len)
@@ -1150,6 +1191,7 @@ pub struct EmbeddingRuntime {
 
 #[derive(Debug, Clone)]
 enum EmbeddingBackend {
+    #[cfg(feature = "diagnostic-onnx")]
     Onnx(Arc<OnnxEmbeddingRuntime>),
     LlamaCpp(Arc<LlamaCppEmbeddingRuntime>),
     HashProjection,
@@ -1197,15 +1239,16 @@ impl LlamaCppEndpoint {
     }
 
     fn ensure_reachable(&self) -> Result<()> {
-        let mut addrs = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .with_context(|| format!("failed to resolve llama.cpp endpoint {}", self.url()))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| anyhow!("failed to resolve llama.cpp endpoint {}", self.url()))?;
-        TcpStream::connect_timeout(&addr, Duration::from_millis(750))
-            .with_context(|| format!("failed to connect to llama.cpp endpoint {}", self.url()))?;
-        Ok(())
+        match ureq::get(&self.url())
+            .timeout(Duration::from_millis(750))
+            .call()
+        {
+            Ok(_) | Err(ureq::Error::Status(_, _)) => Ok(()),
+            Err(error) => Err(anyhow!(
+                "failed to connect to llama.cpp endpoint {}: {error}",
+                self.url()
+            )),
+        }
     }
 }
 
@@ -1245,110 +1288,22 @@ fn post_json_to_http_endpoint(
     endpoint: &LlamaCppEndpoint,
     request: &JsonValue,
 ) -> Result<JsonValue> {
-    let body = serde_json::to_vec(request).context("failed to serialize llama.cpp request")?;
-    let mut stream =
-        TcpStream::connect((endpoint.host.as_str(), endpoint.port)).with_context(|| {
-            format!(
-                "failed to connect to llama.cpp embeddings endpoint {}",
-                endpoint.url()
-            )
-        })?;
-    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        endpoint.path,
-        endpoint.host,
-        endpoint.port,
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
+    let body = serde_json::to_string(request).context("failed to serialize llama.cpp request")?;
+    let response = codestory_retrieval::outbound_http::read_text(
+        ureq::post(&endpoint.url())
+            .timeout(Duration::from_secs(300))
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_string(&body),
+    )
+    .with_context(|| format!("llama.cpp embeddings request to {} failed", endpoint.url()))?;
 
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let (status_code, headers, body) = split_http_response(&response)?;
-    if !(200..300).contains(&status_code) {
-        return Err(anyhow!(
-            "llama.cpp embeddings endpoint {} returned HTTP {status_code}: {}",
-            endpoint.url(),
-            String::from_utf8_lossy(&body)
-        ));
-    }
-
-    let body = if headers
-        .iter()
-        .any(|(key, value)| key == "transfer-encoding" && value.contains("chunked"))
-    {
-        decode_chunked_http_body(&body)?
-    } else {
-        body
-    };
-
-    serde_json::from_slice(&body).with_context(|| {
+    serde_json::from_str(&response.body).with_context(|| {
         format!(
             "failed to parse JSON response from llama.cpp endpoint {}",
             endpoint.url()
         )
     })
-}
-
-fn split_http_response(response: &[u8]) -> Result<RawHttpResponse> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("invalid HTTP response from llama.cpp endpoint"))?;
-    let header_text = String::from_utf8_lossy(&response[..header_end]);
-    let mut lines = header_text.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("missing HTTP status line from llama.cpp endpoint"))?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("missing HTTP status code from llama.cpp endpoint"))?
-        .parse::<u16>()
-        .context("invalid HTTP status code from llama.cpp endpoint")?;
-    let headers = lines
-        .filter_map(|line| {
-            line.split_once(':').map(|(key, value)| {
-                (
-                    key.trim().to_ascii_lowercase(),
-                    value.trim().to_ascii_lowercase(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok((status_code, headers, response[header_end + 4..].to_vec()))
-}
-
-fn decode_chunked_http_body(body: &[u8]) -> Result<Vec<u8>> {
-    let mut offset = 0;
-    let mut decoded = Vec::new();
-    while offset < body.len() {
-        let line_end = body[offset..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| anyhow!("invalid chunked response from llama.cpp endpoint"))?
-            + offset;
-        let size_text = String::from_utf8_lossy(&body[offset..line_end]);
-        let size_hex = size_text.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .context("invalid chunk size from llama.cpp endpoint")?;
-        offset = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        if offset + size > body.len() {
-            return Err(anyhow!(
-                "truncated chunked response from llama.cpp endpoint"
-            ));
-        }
-        decoded.extend_from_slice(&body[offset..offset + size]);
-        offset += size + 2;
-    }
-    Ok(decoded)
 }
 
 fn parse_openai_embeddings_response(
@@ -1409,7 +1364,7 @@ impl EmbeddingRuntime {
         }
 
         if backend == EmbeddingBackendSelection::Onnx {
-            let model_path = OnnxEmbeddingRuntime::probe_from_env()?;
+            let model_path = probe_onnx_runtime_from_env()?;
             return Ok(EmbeddingRuntimeProbe {
                 model_path,
                 model_id,
@@ -1441,13 +1396,22 @@ impl EmbeddingRuntime {
                 backend: EmbeddingBackend::HashProjection,
             }),
             EmbeddingBackendSelection::Onnx => {
-                let (model_path, runtime) = OnnxEmbeddingRuntime::from_env()?;
-                Ok(Self {
-                    model_path,
-                    model_id,
-                    profile,
-                    backend: EmbeddingBackend::Onnx(Arc::new(runtime)),
-                })
+                #[cfg(feature = "diagnostic-onnx")]
+                {
+                    let (model_path, runtime) = OnnxEmbeddingRuntime::from_env()?;
+                    Ok(Self {
+                        model_path,
+                        model_id,
+                        profile,
+                        backend: EmbeddingBackend::Onnx(Arc::new(runtime)),
+                    })
+                }
+                #[cfg(not(feature = "diagnostic-onnx"))]
+                {
+                    Err(anyhow!(
+                        "diagnostic ONNX support is not included in this build; rebuild codestory-cli with --features diagnostic-onnx"
+                    ))
+                }
             }
             EmbeddingBackendSelection::LlamaCpp => {
                 let endpoint = LlamaCppEndpoint::from_env()?;
@@ -1519,6 +1483,7 @@ impl EmbeddingRuntime {
                 }
                 Ok(out)
             }
+            #[cfg(feature = "diagnostic-onnx")]
             EmbeddingBackend::Onnx(runtime) => runtime.embed_texts(texts, &self.profile),
             EmbeddingBackend::LlamaCpp(runtime) => runtime.embed_texts(texts),
         }?;
@@ -1961,23 +1926,6 @@ impl SearchEngine {
         self.llm_docs.len().min(u32::MAX as usize) as u32
     }
 
-    #[cfg(test)]
-    pub(crate) fn snapshot_content_version(&self) -> u64 {
-        let mut hash = 0xcbf29ce484222325_u64;
-        for value in [
-            self.symbols.len() as u64,
-            self.llm_docs.len() as u64,
-            self.quantized_llm_docs.len() as u64,
-            u64::from(self.semantic_doc_count()),
-            self.full_text_doc_count() as u64,
-            self.stored_vector_encoding as u8 as u64,
-        ] {
-            hash ^= value;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
-    }
-
     pub fn embed_text_refs(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let runtime = self
             .embedding_runtime
@@ -2397,10 +2345,6 @@ impl HybridSearchState {
             quantized_llm_docs: Arc::new(engine.quantized_llm_docs.clone()),
             stored_vector_encoding: engine.stored_vector_encoding,
         }
-    }
-
-    pub fn symbols(&self) -> &[(Utf32String, NodeId)] {
-        self.symbols.as_slice()
     }
 
     pub fn semantic_index_ready(&self) -> bool {
@@ -2877,6 +2821,16 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "diagnostic-onnx"))]
+    #[test]
+    fn default_build_reports_how_to_enable_diagnostic_onnx() {
+        let error = probe_onnx_runtime_paths(Path::new("model.onnx"), Path::new("tokenizer.json"))
+            .expect_err("default builds must not include ONNX runtime support");
+
+        assert!(error.to_string().contains("--features diagnostic-onnx"));
+    }
+
+    #[cfg(feature = "diagnostic-onnx")]
     #[test]
     fn onnx_runtime_availability_rejects_corrupt_assets() -> Result<()> {
         let _lock = ENV_TEST_LOCK
@@ -2915,6 +2869,7 @@ mod tests {
         assert_eq!(embedding_parallel_chunk_size(0, 4), 1);
     }
 
+    #[cfg(feature = "diagnostic-onnx")]
     #[test]
     fn onnx_hidden_state_pooling_respects_attention_mask() -> Result<()> {
         let data = vec![
@@ -2948,6 +2903,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "diagnostic-onnx")]
     #[test]
     fn onnx_rank2_output_is_treated_as_pooled_embeddings() -> Result<()> {
         let data = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
@@ -2962,6 +2918,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "diagnostic-onnx")]
     #[test]
     fn onnx_batch_token_budget_limits_padded_tensor_size() {
         let rows = vec![

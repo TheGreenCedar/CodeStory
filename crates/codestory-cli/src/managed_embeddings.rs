@@ -4,8 +4,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -27,9 +26,6 @@ const ONNX_CLS_INDEX_NAME: &str = "codestory_cls_index";
 const ONNX_CLS_POOL_NODE_NAME: &str = "codestory_cls_pool";
 const ENDPOINT_PROBE_TEXT: &str = "codestory managed embeddings health probe";
 const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-
-type HttpHeaders = Vec<(String, String)>;
-type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnnxAssetKind {
@@ -1016,45 +1012,16 @@ fn probe_embedding_endpoint(url: &str, expected_dimension: Option<usize>) -> Res
 
 fn post_json_to_endpoint(endpoint: &HttpEndpoint, request: &JsonValue) -> Result<JsonValue> {
     let body =
-        serde_json::to_vec(request).context("failed to serialize embedding probe request")?;
-    let mut addrs = (endpoint.host.as_str(), endpoint.port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve embedding endpoint {}", endpoint.url()))?;
-    let mut stream = addrs
-        .find_map(|addr| TcpStream::connect_timeout(&addr, ENDPOINT_PROBE_TIMEOUT).ok())
-        .ok_or_else(|| anyhow!("failed to connect to embedding endpoint {}", endpoint.url()))?;
-    stream.set_read_timeout(Some(ENDPOINT_PROBE_TIMEOUT))?;
-    stream.set_write_timeout(Some(ENDPOINT_PROBE_TIMEOUT))?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        endpoint.path,
-        endpoint.host,
-        endpoint.port,
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let (status_code, headers, body) = split_http_response(&response)?;
-    if !(200..300).contains(&status_code) {
-        bail!(
-            "embedding endpoint {} returned HTTP {status_code}: {}",
-            endpoint.url(),
-            String::from_utf8_lossy(&body)
-        );
-    }
-    let body = if headers
-        .iter()
-        .any(|(key, value)| key == "transfer-encoding" && value.contains("chunked"))
-    {
-        decode_chunked_http_body(&body)?
-    } else {
-        body
-    };
-    serde_json::from_slice(&body)
+        serde_json::to_string(request).context("failed to serialize embedding probe request")?;
+    let response = codestory_retrieval::outbound_http::read_text(
+        ureq::post(&endpoint.url())
+            .timeout(ENDPOINT_PROBE_TIMEOUT)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_string(&body),
+    )
+    .with_context(|| format!("embedding request to {} failed", endpoint.url()))?;
+    serde_json::from_str(&response.body)
         .with_context(|| format!("failed to parse JSON response from {}", endpoint.url()))
 }
 
@@ -1079,61 +1046,6 @@ impl HttpEndpoint {
     fn url(&self) -> String {
         format!("http://{}:{}{}", self.host, self.port, self.path)
     }
-}
-
-fn split_http_response(response: &[u8]) -> Result<RawHttpResponse> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("invalid HTTP response from embedding endpoint"))?;
-    let header_text = String::from_utf8_lossy(&response[..header_end]);
-    let mut lines = header_text.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("missing HTTP status line from embedding endpoint"))?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("missing HTTP status code from embedding endpoint"))?
-        .parse::<u16>()
-        .context("invalid HTTP status code from embedding endpoint")?;
-    let headers = lines
-        .filter_map(|line| {
-            line.split_once(':').map(|(key, value)| {
-                (
-                    key.trim().to_ascii_lowercase(),
-                    value.trim().to_ascii_lowercase(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok((status_code, headers, response[header_end + 4..].to_vec()))
-}
-
-fn decode_chunked_http_body(body: &[u8]) -> Result<Vec<u8>> {
-    let mut offset = 0;
-    let mut decoded = Vec::new();
-    while offset < body.len() {
-        let line_end = body[offset..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| anyhow!("invalid chunked response from embedding endpoint"))?
-            + offset;
-        let size_text = String::from_utf8_lossy(&body[offset..line_end]);
-        let size_hex = size_text.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .context("invalid chunk size from embedding endpoint")?;
-        offset = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        if offset + size > body.len() {
-            bail!("truncated chunked response from embedding endpoint");
-        }
-        decoded.extend_from_slice(&body[offset..offset + size]);
-        offset += size + 2;
-    }
-    Ok(decoded)
 }
 
 fn parse_embedding_probe_response(
