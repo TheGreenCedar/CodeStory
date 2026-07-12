@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Made sidecar generation GC root every current and rollback manifest across
+  the shared cache scope instead of collapsing rollback evidence to one latest
+  generation. Inventory now reports active, rollback, building, and reclaimable
+  bytes separately and treats unrooted artifacts as building while a
+  publication or cleanup writer owns the retention lock.
 - Made sidecar generation fingerprinting snapshot-coherent and current-manifest
   promotion fail closed when any graph, semantic, or lexical input changes
   during a build. Filesystem input is hashed before locking SQLite; final stored

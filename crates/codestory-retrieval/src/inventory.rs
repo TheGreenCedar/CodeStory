@@ -6,9 +6,9 @@ use crate::generation::{
 use crate::qdrant_client::QdrantClient;
 use crate::retention::{
     FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
-    GenerationRetentionLock, GenerationRetentionPlan, apply_generation_retention,
-    global_generation_gc_state_file, plan_generation_retention_with_qdrant_collections,
-    scan_retention_protection,
+    GenerationRetentionLock, GenerationRetentionPlan, GenerationRetentionState,
+    apply_generation_retention, global_generation_gc_state_file,
+    plan_generation_retention_with_unrooted_state, scan_retention_protection,
 };
 use crate::sidecar::SidecarStateFile;
 use anyhow::{Context, Result};
@@ -393,14 +393,28 @@ fn generation_retention_plan_for_storage(
     let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
     let layout = &runtime.layout;
     let project_id = crate::index::sidecar_project_id_for_root(project_root);
-    let _lock = GenerationRetentionLock::acquire(&layout.state_file, &project_id)
-        .context("lock sidecar generation inventory")?;
+    let (_lock, unrooted_state) = inventory_retention_view(layout, &project_id)?;
     Ok(build_generation_retention_plan(
         storage_path,
         cache_root,
         &runtime,
         &project_id,
+        unrooted_state,
     ))
+}
+
+fn inventory_retention_view(
+    layout: &crate::config::SidecarLayout,
+    project_id: &str,
+) -> Result<(Option<GenerationRetentionLock>, GenerationRetentionState)> {
+    let lock = GenerationRetentionLock::try_acquire_shared(&layout.state_file, project_id)
+        .context("observe sidecar generation inventory lock")?;
+    let state = if lock.is_some() {
+        GenerationRetentionState::Reclaimable
+    } else {
+        GenerationRetentionState::Building
+    };
+    Ok((lock, state))
 }
 
 fn apply_generation_retention_for_storage(
@@ -412,7 +426,13 @@ fn apply_generation_retention_for_storage(
     let project_id = crate::index::sidecar_project_id_for_root(project_root);
     let _lock = GenerationRetentionLock::acquire(&runtime.layout.state_file, &project_id)
         .context("lock sidecar generation retention apply")?;
-    let plan = build_generation_retention_plan(storage_path, cache_root, &runtime, &project_id);
+    let plan = build_generation_retention_plan(
+        storage_path,
+        cache_root,
+        &runtime,
+        &project_id,
+        GenerationRetentionState::Reclaimable,
+    );
     let mut remover = FsQdrantGenerationRemover::new(&runtime.layout);
     Ok(apply_generation_retention(&plan, &mut remover))
 }
@@ -422,6 +442,7 @@ fn build_generation_retention_plan(
     cache_root: &Path,
     runtime: &SidecarRuntimeConfig,
     project_id: &str,
+    unrooted_state: GenerationRetentionState,
 ) -> GenerationRetentionPlan {
     let layout = &runtime.layout;
     let mut protection =
@@ -492,11 +513,12 @@ fn build_generation_retention_plan(
             Vec::new()
         }
     };
-    plan_generation_retention_with_qdrant_collections(
+    plan_generation_retention_with_unrooted_state(
         layout,
         project_id,
         &protection,
         &live_qdrant_collections,
+        unrooted_state,
     )
 }
 
@@ -1038,6 +1060,77 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("active retrieval manifest is stale; pruning suppressed"));
         assert!(errors[0].contains("sidecar_embedding_dim_changed"));
+    }
+
+    #[test]
+    fn inventory_reports_unrooted_bytes_as_building_while_writer_is_active() {
+        let root = tempdir().expect("root");
+        let project_id = "repo-v1-project";
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.layout = crate::config::SidecarLayout {
+            qdrant_http_port: 9,
+            qdrant_grpc_port: 10,
+            lexical_data_dir: root.path().join("lexical"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("retrieval-sidecars.json"),
+        };
+        for suffix in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"] {
+            let generation = format!("{project_id}-{suffix}");
+            for path in [
+                runtime
+                    .layout
+                    .lexical_data_dir
+                    .join("shards")
+                    .join(&generation),
+                runtime.layout.scip_artifacts_root.join(&generation),
+                runtime
+                    .layout
+                    .qdrant_data_dir
+                    .join("collections")
+                    .join(format!("codestory_{project_id}_{suffix}")),
+            ] {
+                std::fs::create_dir_all(&path).expect("generation dir");
+                std::fs::write(path.join("data"), b"x").expect("generation bytes");
+            }
+        }
+        let protection = crate::retention::RetentionProtectionScan {
+            authoritative_active: vec![crate::test_support::retrieval_manifest_fixture(
+                project_id,
+                "aaaaaaaaaaaaaaaa",
+            )],
+            ..crate::retention::RetentionProtectionScan::default()
+        };
+        let writer = GenerationRetentionLock::acquire(&runtime.layout.state_file, project_id)
+            .expect("writer");
+
+        let (shared, state) = inventory_retention_view(&runtime.layout, project_id).expect("view");
+        assert!(shared.is_none());
+        let plan = plan_generation_retention_with_unrooted_state(
+            &runtime.layout,
+            project_id,
+            &protection,
+            &[],
+            state,
+        );
+        assert_eq!(plan.active_bytes, 3);
+        assert_eq!(plan.building_bytes, 3);
+        assert_eq!(plan.reclaimable_bytes, 0);
+        assert!(plan.pruning_suppressed);
+
+        drop(writer);
+        let (_shared, state) =
+            inventory_retention_view(&runtime.layout, project_id).expect("stable view");
+        let plan = plan_generation_retention_with_unrooted_state(
+            &runtime.layout,
+            project_id,
+            &protection,
+            &[],
+            state,
+        );
+        assert_eq!(plan.building_bytes, 0);
+        assert_eq!(plan.reclaimable_bytes, 3);
+        assert!(!plan.pruning_suppressed);
     }
 
     fn write_state(path: &Path, state: &SidecarStateFile) {

@@ -283,8 +283,8 @@ codestory-cli retrieval inventory --project <repo> --format json
 The inventory lists CodeStory-owned sidecar namespaces, state paths, cleanup
 commands, Compose projects, matching containers/networks, visible ports, and
 the required `bge-base-en-v1.5.Q8_0.gguf` model check. It also reports the
-project's generation bundles as active, verified rollback, or reclaimable with
-retained and reclaimable byte totals. It classifies namespaces as `live`,
+project's generation bundles as active, verified rollback, building, or
+reclaimable with separate byte totals for each state. It classifies namespaces as `live`,
 `stale`, `orphaned`, `incomplete`, or `unknown` with safe-candidate and blocking
 reasons. The default command is a dry-run: it does not run Docker prune, remove
 containers, delete networks, clear state files, or delete generations. When
@@ -303,10 +303,12 @@ codestory-cli retrieval inventory --project <repo> --apply --format json
 
 `--apply` removes only namespaces classified as inventory safe candidates and
 applies the generation plan shown by the dry-run. Generation cleanup requires a
-fully healthy active manifest, retains every manifest-referenced active
-generation sharing that sidecar scope plus at most one health-verified
-rollback, and removes only matching stale Qdrant, SCIP, and lexical artifacts
-under the per-project publication lock. Live namespaces,
+fully healthy active manifest, retains every generation referenced by a current
+or rollback manifest in the shared sidecar scope, and removes only unreachable
+Qdrant, SCIP, and lexical artifacts under the per-project publication lock.
+If inventory cannot obtain a stable shared view because a publication or GC
+writer is active, unrooted bytes are reported as `building` and reclaimable
+bytes remain zero. Live namespaces,
 incomplete state, unknown ownership, protection-scan errors, and malformed
 generation entries stay blocked with explicit reasons. The apply path does not
 run Docker prune, broad Docker cleanup, or host/global network deletion.
