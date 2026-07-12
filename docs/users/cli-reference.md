@@ -101,6 +101,12 @@ Team or user defaults: `.codestory.toml` at project root or user home. Home
 file loads first; project file overrides for project-safe preferences.
 Environment variables win over files.
 
+Configuration is resolved independently for each project and retained for the
+life of that project runtime. Multi-project stdio does not rewrite process
+environment variables when requests switch repositories. Trusted project files
+may also set `embedding_query_prefix` and `embedding_document_prefix` as part of
+their per-project embedding contract.
+
 Project `.codestory.toml` cannot choose cache roots or network egress settings.
 Put `cache_dir` in user home `.codestory.toml` or pass `--cache-dir`.
 

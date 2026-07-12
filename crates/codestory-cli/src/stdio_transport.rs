@@ -17,7 +17,6 @@ use codestory_contracts::api::{
     ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode, SearchRequest, TrailCallerScope,
     TrailDirection, TrailMode,
 };
-use codestory_retrieval::SidecarLayout;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1584,10 +1583,7 @@ fn handle_stdio_packet(
         .unwrap_or(true);
     let cache_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
         storage_fingerprint: stdio_storage_fingerprint(&runtime.storage_path),
-        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(
-            &runtime.project_root,
-            &runtime.storage_path,
-        ),
+        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(runtime),
         question,
         budget,
         task_class,
@@ -1763,30 +1759,29 @@ fn stdio_storage_modified(
     newest.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "storage state missing"))
 }
 
-fn stdio_mandatory_sidecar_fingerprint(
-    project_root: &std::path::Path,
-    storage_path: &std::path::Path,
-) -> String {
-    let layout = SidecarLayout::from_env_for_project(project_root);
-    let status = codestory_retrieval::strict_sidecar_status(project_root, Some(storage_path)).map(
-        |report| StdioSidecarStatusFingerprint {
-            retrieval_mode: report.retrieval_mode,
-            degraded_reason: report.degraded_reason,
-            embedding_device_policy: report.embedding_device_policy,
-            embedding_device_state: report.embedding_device_state,
-            embedding_device_observation_source: report.embedding_device_observation_source,
-            embedding_detected_provider: report.embedding_detected_provider,
-            embedding_detected_gpu: report.embedding_detected_gpu,
-            embedding_accelerator_requested: report.embedding_accelerator_requested,
-            embedding_accelerator_request_provider: report.embedding_accelerator_request_provider,
-            embedding_accelerator_request_device: report.embedding_accelerator_request_device,
-            embedding_cpu_allowed: report.embedding_cpu_allowed,
-            manifest: report.manifest,
-        },
-    );
+fn stdio_mandatory_sidecar_fingerprint(runtime: &RuntimeContext) -> String {
+    let status = codestory_retrieval::strict_sidecar_status_for_runtime(
+        &runtime.project_root,
+        Some(&runtime.storage_path),
+        runtime.sidecar.clone(),
+    )
+    .map(|report| StdioSidecarStatusFingerprint {
+        retrieval_mode: report.retrieval_mode,
+        degraded_reason: report.degraded_reason,
+        embedding_device_policy: report.embedding_device_policy,
+        embedding_device_state: report.embedding_device_state,
+        embedding_device_observation_source: report.embedding_device_observation_source,
+        embedding_detected_provider: report.embedding_detected_provider,
+        embedding_detected_gpu: report.embedding_detected_gpu,
+        embedding_accelerator_requested: report.embedding_accelerator_requested,
+        embedding_accelerator_request_provider: report.embedding_accelerator_request_provider,
+        embedding_accelerator_request_device: report.embedding_accelerator_request_device,
+        embedding_cpu_allowed: report.embedding_cpu_allowed,
+        manifest: report.manifest,
+    });
     stdio_mandatory_sidecar_fingerprint_from_status(
-        codestory_retrieval::embedding_runtime_id(),
-        stdio_path_fingerprint(&layout.state_file),
+        codestory_retrieval::embedding_runtime_id_for_runtime(&runtime.sidecar),
+        stdio_path_fingerprint(&runtime.sidecar.layout.state_file),
         status,
     )
 }
@@ -2034,10 +2029,7 @@ fn handle_stdio_search(
         .unwrap_or(10);
     let cache_key = StdioSearchFragmentCacheKey {
         storage_fingerprint: stdio_storage_fingerprint(&runtime.storage_path),
-        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(
-            &runtime.project_root,
-            &runtime.storage_path,
-        ),
+        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(runtime),
         query: query.trim().to_ascii_lowercase(),
         repo_text: match repo_text {
             SearchRepoTextMode::On => "on",
@@ -3020,7 +3012,6 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
 }
 
 fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication: &str) -> String {
-    let layout = SidecarLayout::from_env_for_project(&runtime.project_root);
     let marker_path = stdio_dirty_marker_env_path(&runtime.project_root);
     [
         format!("project:{}", runtime.project_root.display()),
@@ -3032,7 +3023,7 @@ fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication
         ),
         format!(
             "sidecar_state:{}",
-            stdio_path_fingerprint(&layout.state_file)
+            stdio_path_fingerprint(&runtime.sidecar.layout.state_file)
         ),
         format!(
             "native_embedding_broker:{}",
@@ -3072,7 +3063,7 @@ fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication
         ),
         format!(
             "release_metadata:{}",
-            stdio_path_fingerprint(&stdio_release_metadata_cache_path())
+            stdio_path_fingerprint(&stdio_release_metadata_cache_path(runtime))
         ),
         format!(
             "release_override:{}",
@@ -3081,7 +3072,7 @@ fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication
         ),
         format!(
             "active_embedding_backend:{}",
-            codestory_retrieval::embedding_runtime_id()
+            codestory_retrieval::embedding_runtime_id_for_runtime(&runtime.sidecar)
         ),
     ]
     .join("|")
@@ -3608,7 +3599,7 @@ fn read_stdio_status_resource(
     let sidecar = build_stdio_status_sidecar(runtime);
     let (server_executable, server_executable_sha256, server_warnings) =
         stdio_server_executable_status();
-    let runtime_update = stdio_runtime_update_advisory(server_executable.as_deref());
+    let runtime_update = stdio_runtime_update_advisory(server_executable.as_deref(), runtime);
     let source_checkout_version = stdio_source_checkout_version(&runtime.project_root);
     let plugin_runtime = stdio_plugin_runtime_status();
     let broker = build_stdio_status_broker(runtime, &sidecar.selected_agent_sidecar);
@@ -3680,7 +3671,7 @@ fn read_stdio_status_resource(
 }
 
 fn build_stdio_status_sidecar(runtime: &RuntimeContext) -> StdioSidecarStatusParts {
-    let sidecar_runtime = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    let sidecar_runtime = runtime.sidecar.clone();
     let (
         retrieval_mode,
         degraded_reason,
@@ -3939,8 +3930,8 @@ fn build_stdio_status_surfaces(
     selected_agent_sidecar: &args::DoctorSidecarStatusOutput,
     plugin_runtime: &serde_json::Value,
 ) -> StdioStatusSurfacesParts {
-    let selected_agent_runtime = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &runtime.project_root,
+    let selected_agent_runtime = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         codestory_retrieval::SidecarProfile::Agent,
         selected_agent_sidecar.run_id.as_deref(),
     );
@@ -4044,9 +4035,12 @@ struct StdioLatestReleaseMetadata {
     refresh_scheduled: bool,
 }
 
-fn stdio_runtime_update_advisory(server_executable: Option<&str>) -> serde_json::Value {
+fn stdio_runtime_update_advisory(
+    server_executable: Option<&str>,
+    runtime: &RuntimeContext,
+) -> serde_json::Value {
     let active_version = env!("CARGO_PKG_VERSION");
-    let metadata = stdio_latest_release_metadata();
+    let metadata = stdio_latest_release_metadata(runtime);
     let newer_installed = (env_nonempty("CODESTORY_PLUGIN_CLI_SOURCE").as_deref()
         == Some("managed"))
     .then(|| stdio_newer_installed_cli(active_version, server_executable))
@@ -4118,7 +4112,7 @@ fn stdio_runtime_update_advisory_from(
     })
 }
 
-fn stdio_latest_release_metadata() -> StdioLatestReleaseMetadata {
+fn stdio_latest_release_metadata(runtime: &RuntimeContext) -> StdioLatestReleaseMetadata {
     if let Ok(version) = std::env::var("CODESTORY_LATEST_RELEASE_VERSION")
         && let Some(version) = normalize_release_version(&version)
     {
@@ -4131,7 +4125,7 @@ fn stdio_latest_release_metadata() -> StdioLatestReleaseMetadata {
         };
     }
     let release_probe_disabled = std::env::var_os("CODESTORY_DISABLE_RELEASE_PROBE").is_some();
-    let path = stdio_release_metadata_cache_path();
+    let path = stdio_release_metadata_cache_path(runtime);
     let cache = stdio_read_release_metadata_cache(&path);
     let now = crate::ready_repair_status::now_epoch_ms();
     let due = cache
@@ -4159,17 +4153,10 @@ fn stdio_latest_release_metadata() -> StdioLatestReleaseMetadata {
     }
 }
 
-fn stdio_release_metadata_cache_path() -> PathBuf {
+fn stdio_release_metadata_cache_path(runtime: &RuntimeContext) -> PathBuf {
     env_nonempty("CODESTORY_PLUGIN_DATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            codestory_retrieval::SidecarRuntimeConfig::local()
-                .layout
-                .state_file
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(std::env::temp_dir)
-        })
+        .unwrap_or_else(|| runtime.cache_root.clone())
         .join("release-metadata.json")
 }
 
@@ -5058,8 +5045,8 @@ fn handle_stdio_sidecar_repair(
     if let Some(result) = stdio_sidecar_repair_policy_block_result(&sidecar_setup) {
         return result;
     }
-    let repair_sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &runtime.project_root,
+    let repair_sidecar = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         codestory_retrieval::SidecarProfile::Agent,
         Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
     );

@@ -4,7 +4,7 @@
 //! uses **BAAI/bge-base-en-v1.5** (768-dim) via llama.cpp `/v1/embeddings` for query vectors and
 //! semantic smoke checks.
 
-use crate::outbound_http::read_text;
+use crate::outbound_http::read_bytes;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -27,13 +27,7 @@ pub const BGE_QUERY_PREFIX_DEFAULT: &str =
     "Represent this sentence for searching relevant passages: ";
 pub const PRODUCT_EMBEDDING_RUNTIME_ID: &str = "llamacpp:bge-base-en-v1.5";
 
-const LLAMACPP_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
-const DEFAULT_LLAMACPP_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
 const EMBEDDING_BACKEND_ENV: &str = "CODESTORY_EMBED_BACKEND";
-const QUERY_PREFIX_ENV: &str = "CODESTORY_EMBED_QUERY_PREFIX";
-const DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX";
-const LLAMACPP_BATCH_SIZE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_BATCH_SIZE";
-const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 const ALLOW_REMOTE_EMBEDDINGS_ENV: &str = "CODESTORY_ALLOW_REMOTE_EMBEDDINGS";
 const DEVICE_POLICY_ENV: &str = "CODESTORY_EMBED_DEVICE_POLICY";
 const DEVICE_STATE_ENV: &str = "CODESTORY_EMBED_DEVICE_STATE";
@@ -50,9 +44,164 @@ const RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(1
 const RUNTIME_EMBED_DEVICE_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_LLAMACPP_BATCH_SIZE: usize = 128;
-const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 6;
+
+#[derive(Debug, Clone)]
+pub struct LlamaCppEmbeddingClient {
+    config: crate::config::EmbeddingRuntimeConfig,
+}
+
+impl LlamaCppEmbeddingClient {
+    pub fn new(config: &crate::config::EmbeddingRuntimeConfig) -> Result<Self> {
+        if let Some(error) = config.configuration_error.as_deref() {
+            bail!(error.to_string());
+        }
+        ensure_llamacpp_url_allowed_with_policy(&config.endpoint, config.allow_remote)?;
+        Ok(Self {
+            config: config.clone(),
+        })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
+    }
+
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let prefix = self.config.query_prefix.as_deref().unwrap_or_else(|| {
+            if self.is_llamacpp() {
+                BGE_QUERY_PREFIX_DEFAULT
+            } else {
+                ""
+            }
+        });
+        self.embed_prepared(&format!("{prefix}{text}"))
+    }
+
+    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefix = self.config.document_prefix.as_deref().unwrap_or_default();
+        let prepared = texts
+            .iter()
+            .map(|text| format!("{prefix}{text}"))
+            .collect::<Vec<_>>();
+        if prepared.iter().any(|text| text.trim().is_empty()) {
+            bail!("cannot embed empty text");
+        }
+        if self.is_llamacpp() {
+            self.embed_llamacpp_batched(&prepared)
+        } else {
+            Ok(prepared
+                .iter()
+                .map(|text| hash_projection_embed(text, RETRIEVAL_EMBEDDING_DIM))
+                .collect())
+        }
+    }
+
+    pub fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            bail!("cannot embed empty text");
+        }
+        if self.is_llamacpp() {
+            self.embed_llamacpp_batched(texts)
+        } else {
+            Ok(texts
+                .iter()
+                .map(|text| hash_projection_embed(text, RETRIEVAL_EMBEDDING_DIM))
+                .collect())
+        }
+    }
+
+    pub fn probe(&self) -> EmbeddingRuntimeProbe {
+        let started = Instant::now();
+        let result = self
+            .embed_query("codestory health probe")
+            .map(|embedding| vec![embedding]);
+        let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        match result {
+            Ok(vectors) => EmbeddingRuntimeProbe {
+                reachable: true,
+                detail: format!(
+                    "{} embeddings reachable dim={}",
+                    self.backend_label(),
+                    vectors.first().map(|vector| vector.len()).unwrap_or(0)
+                ),
+                elapsed_ms,
+            },
+            Err(error) => EmbeddingRuntimeProbe {
+                reachable: false,
+                detail: format!("{} embeddings unavailable: {error}", self.backend_label()),
+                elapsed_ms,
+            },
+        }
+    }
+
+    pub fn backend_label(&self) -> &'static str {
+        if self.is_llamacpp() {
+            "llamacpp"
+        } else {
+            "hash"
+        }
+    }
+
+    fn is_llamacpp(&self) -> bool {
+        matches!(
+            self.config.backend.trim().to_ascii_lowercase().as_str(),
+            "" | "auto" | "llamacpp" | "llama_cpp" | "llama.cpp" | "llama-cpp" | "gguf"
+        )
+    }
+
+    fn embed_prepared(&self, prepared: &str) -> Result<Vec<f32>> {
+        if prepared.trim().is_empty() {
+            bail!("cannot embed empty text");
+        }
+        if self.is_llamacpp() {
+            llamacpp_embed_with_timeout(&[prepared.to_string()], &self.config, HTTP_TIMEOUT)?
+                .pop()
+                .ok_or_else(|| anyhow!("llama.cpp returned no embedding vector"))
+        } else {
+            Ok(hash_projection_embed(prepared, RETRIEVAL_EMBEDDING_DIM))
+        }
+    }
+
+    fn embed_llamacpp_batched(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.len() <= self.config.batch_size {
+            return llamacpp_embed_with_timeout(texts, &self.config, HTTP_TIMEOUT);
+        }
+        let batches = texts
+            .chunks(self.config.batch_size)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let mut output = Vec::with_capacity(texts.len());
+        for (wave_index, wave) in batches.chunks(self.config.request_count).enumerate() {
+            let mut wave_results = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(wave.len());
+                for (index, batch) in wave.iter().cloned().enumerate() {
+                    let config = self.config.clone();
+                    handles.push(scope.spawn(move || {
+                        llamacpp_embed_with_timeout(&batch, &config, HTTP_TIMEOUT)
+                            .map(|vectors| (index, vectors))
+                    }));
+                }
+                let mut joined = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    joined.push(
+                        handle
+                            .join()
+                            .map_err(|_| anyhow!("llama.cpp embedding worker panicked"))??,
+                    );
+                }
+                Ok::<_, anyhow::Error>(joined)
+            })
+            .with_context(|| format!("embed llama.cpp request wave {wave_index}"))?;
+            wave_results.sort_by_key(|(index, _)| *index);
+            for (_, vectors) in wave_results {
+                output.extend(vectors);
+            }
+        }
+        Ok(output)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeProbe {
@@ -96,7 +245,16 @@ struct NativeEmbeddingDeviceLaunch {
 
 /// Stable id stored on retrieval manifest rows (backend + model family).
 pub fn embedding_runtime_id() -> String {
-    if llamacpp_backend_selected() {
+    embedding_runtime_id_for_runtime(&crate::config::SidecarRuntimeConfig::local())
+}
+
+pub fn embedding_runtime_id_for_runtime(runtime: &crate::config::SidecarRuntimeConfig) -> String {
+    if runtime
+        .embedding
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("llamacpp")
+    {
         PRODUCT_EMBEDDING_RUNTIME_ID.into()
     } else {
         "hash-projection:768".into()
@@ -114,7 +272,14 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
 pub fn ensure_product_embedding_backend_for_runtime(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Result<()> {
-    ensure_product_embedding_backend_static()?;
+    if !runtime
+        .embedding
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("llamacpp")
+    {
+        bail!("llama.cpp embedding sidecar is mandatory");
+    }
     let deadline = Instant::now() + RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT;
     let mut device = embedding_device_readiness_for_runtime(runtime);
     loop {
@@ -148,19 +313,30 @@ fn ensure_product_embedding_backend_static() -> Result<()> {
 }
 
 pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
-    embedding_device_readiness_with_observed_state(None)
+    embedding_device_readiness_with_observed_state(None, None)
 }
 
 pub fn embedding_device_readiness_for_runtime(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> EmbeddingDeviceReadiness {
-    embedding_device_readiness_with_observed_state(observe_sidecar_embedding_device_state(runtime))
+    embedding_device_readiness_with_observed_state(
+        observe_sidecar_embedding_device_state(runtime),
+        Some(runtime),
+    )
 }
 
 fn embedding_device_readiness_with_observed_state(
     sidecar_observed_state: Option<EmbeddingDeviceObservation>,
+    runtime: Option<&crate::config::SidecarRuntimeConfig>,
 ) -> EmbeddingDeviceReadiness {
-    let cpu_allowed = explicit_cpu_allowed();
+    let cpu_allowed = runtime
+        .map(|runtime| {
+            runtime
+                .embedding
+                .device_policy
+                .eq_ignore_ascii_case("allow_cpu")
+        })
+        .unwrap_or_else(explicit_cpu_allowed);
     let detection = host_embedding_device_detection();
     let accelerator_request = (!cpu_allowed).then(default_embedding_accelerator_request);
     let accelerator_requested = accelerator_request.is_some();
@@ -205,7 +381,7 @@ fn embedding_device_readiness_with_observed_state(
 fn observe_sidecar_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    if crate::config::embedding_server_launch_mode()
+    if crate::config::embedding_server_launch_mode_for_runtime(runtime)
         .ok()
         .is_some_and(|mode| mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned)
     {
@@ -636,8 +812,15 @@ fn env_truthy(name: &str) -> bool {
 }
 
 pub fn embed_query(text: &str) -> Result<Vec<f32>> {
-    let prefix = query_prefix();
-    embed_prepared(&format!("{prefix}{text}"))
+    LlamaCppEmbeddingClient::new(&crate::config::SidecarRuntimeConfig::local().embedding)?
+        .embed_query(text)
+}
+
+pub fn embed_query_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    text: &str,
+) -> Result<Vec<f32>> {
+    LlamaCppEmbeddingClient::new(&runtime.embedding)?.embed_query(text)
 }
 
 /// Active embedding backend label for ops/status (`hash`, `llamacpp`).
@@ -649,51 +832,32 @@ pub fn embedding_backend_label() -> &'static str {
     }
 }
 
-pub fn embed_documents(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    if texts.is_empty() {
-        return Ok(Vec::new());
-    }
-    let prefix = std::env::var(DOCUMENT_PREFIX_ENV).unwrap_or_default();
-    let prepared = texts
-        .iter()
-        .map(|text| format!("{prefix}{text}"))
-        .collect::<Vec<_>>();
-    if prepared.iter().any(|text| text.trim().is_empty()) {
-        bail!("cannot embed empty text");
-    }
-    if llamacpp_backend_selected() {
-        llamacpp_embed_batched(&prepared)
-    } else {
-        Ok(prepared
-            .iter()
-            .map(|text| hash_projection_embed(text, RETRIEVAL_EMBEDDING_DIM))
-            .collect())
-    }
-}
-
-fn query_prefix() -> String {
-    if let Ok(value) = std::env::var(QUERY_PREFIX_ENV)
-        && (!value.is_empty() || !llamacpp_backend_selected())
+pub fn embedding_backend_label_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> &'static str {
+    if runtime
+        .embedding
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("llamacpp")
     {
-        return value;
+        "llamacpp"
+    } else {
+        "hash"
     }
-    if llamacpp_backend_selected() {
-        return BGE_QUERY_PREFIX_DEFAULT.to_string();
-    }
-    String::new()
 }
 
-fn embed_prepared(prepared: &str) -> Result<Vec<f32>> {
-    if prepared.trim().is_empty() {
-        bail!("cannot embed empty text");
-    }
-    if llamacpp_backend_selected() {
-        llamacpp_embed(&[prepared.to_string()])?
-            .pop()
-            .ok_or_else(|| anyhow!("llama.cpp returned no embedding vector"))
-    } else {
-        Ok(hash_projection_embed(prepared, RETRIEVAL_EMBEDDING_DIM))
-    }
+#[cfg(test)]
+pub fn embed_documents(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    LlamaCppEmbeddingClient::new(&crate::config::SidecarRuntimeConfig::local().embedding)?
+        .embed_documents(texts)
+}
+
+pub fn embed_documents_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    LlamaCppEmbeddingClient::new(&runtime.embedding)?.embed_documents(texts)
 }
 
 fn llamacpp_backend_selected() -> bool {
@@ -706,106 +870,29 @@ fn llamacpp_backend_selected() -> bool {
     }
 }
 
-fn llamacpp_embed(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    let url = llamacpp_url()?;
-    llamacpp_embed_with_timeout(texts, &url, HTTP_TIMEOUT)
-}
-
-fn llamacpp_embed_batched(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    let batch_size = env_usize(
-        LLAMACPP_BATCH_SIZE_ENV,
-        DEFAULT_LLAMACPP_BATCH_SIZE,
-        1,
-        1024,
-    );
-    let request_count = env_usize(
-        LLAMACPP_REQUEST_COUNT_ENV,
-        DEFAULT_LLAMACPP_REQUEST_COUNT,
-        1,
-        16,
-    );
-    if texts.len() <= batch_size {
-        return llamacpp_embed(texts);
-    }
-
-    let url = llamacpp_url()?;
-    let batches = texts
-        .chunks(batch_size)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    let mut output = Vec::with_capacity(texts.len());
-    for (wave_index, wave) in batches.chunks(request_count).enumerate() {
-        let mut wave_results = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(wave.len());
-            for (index, batch) in wave.iter().cloned().enumerate() {
-                let url = url.clone();
-                handles.push(scope.spawn(move || {
-                    llamacpp_embed_with_timeout(&batch, &url, HTTP_TIMEOUT)
-                        .map(|vectors| (index, vectors))
-                }));
-            }
-            let mut joined = Vec::with_capacity(handles.len());
-            for handle in handles {
-                joined.push(
-                    handle
-                        .join()
-                        .map_err(|_| anyhow!("llama.cpp embedding worker panicked"))??,
-                );
-            }
-            Ok::<_, anyhow::Error>(joined)
-        })
-        .with_context(|| format!("embed llama.cpp request wave {wave_index}"))?;
-        wave_results.sort_by_key(|(index, _)| *index);
-        for (_, vectors) in wave_results {
-            output.extend(vectors);
-        }
-    }
-    Ok(output)
-}
-
-fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(min, max))
-        .unwrap_or(default)
-}
-
 pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
-    let started = Instant::now();
-    let result = llamacpp_url().and_then(|url| {
-        llamacpp_embed_with_timeout(
-            &["codestory health probe".to_string()],
-            &url,
-            HEALTH_TIMEOUT,
-        )
-    });
-    let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
-    match result {
-        Ok(vectors) => EmbeddingRuntimeProbe {
-            reachable: true,
-            detail: format!(
-                "llama.cpp embeddings reachable dim={}",
-                vectors.first().map(|vector| vector.len()).unwrap_or(0)
-            ),
-            elapsed_ms,
-        },
-        Err(error) => EmbeddingRuntimeProbe {
+    probe_product_embedding_runtime_for_runtime(&crate::config::SidecarRuntimeConfig::local())
+}
+
+pub fn probe_product_embedding_runtime_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> EmbeddingRuntimeProbe {
+    LlamaCppEmbeddingClient::new(&runtime.embedding)
+        .map(|client| client.probe())
+        .unwrap_or_else(|error| EmbeddingRuntimeProbe {
             reachable: false,
             detail: format!("llama.cpp embeddings unavailable: {error}"),
-            elapsed_ms,
-        },
-    }
+            elapsed_ms: None,
+        })
 }
 
-fn llamacpp_url() -> Result<String> {
-    let url = std::env::var(LLAMACPP_URL_ENV).unwrap_or_else(|_| DEFAULT_LLAMACPP_URL.to_string());
-    ensure_llamacpp_url_allowed(&url)?;
-    Ok(url)
-}
-
+#[cfg(test)]
 fn ensure_llamacpp_url_allowed(url: &str) -> Result<()> {
-    if !allow_remote_embeddings() && !is_loopback_embedding_url(url) {
+    ensure_llamacpp_url_allowed_with_policy(url, allow_remote_embeddings())
+}
+
+fn ensure_llamacpp_url_allowed_with_policy(url: &str, allow_remote: bool) -> Result<()> {
+    if !allow_remote && !is_loopback_embedding_url(url) {
         bail!(
             "remote embedding URL is disabled; use a loopback URL or set {ALLOW_REMOTE_EMBEDDINGS_ENV}=1"
         );
@@ -813,6 +900,7 @@ fn ensure_llamacpp_url_allowed(url: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn allow_remote_embeddings() -> bool {
     std::env::var(ALLOW_REMOTE_EMBEDDINGS_ENV)
         .ok()
@@ -849,26 +937,42 @@ fn http_url_host(url: &str) -> Option<&str> {
 
 fn llamacpp_embed_with_timeout(
     texts: &[String],
-    url: &str,
+    config: &crate::config::EmbeddingRuntimeConfig,
     timeout: Duration,
 ) -> Result<Vec<Vec<f32>>> {
+    let model = config
+        .model_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&config.profile);
     let body = serde_json::json!({
         "input": texts,
-        "model": "bge-base-en-v1.5",
+        "model": model,
     });
     let payload = serde_json::to_string(&body).context("serialize embeddings request")?;
-    let response = read_text(
-        ureq::post(url)
+    let display_endpoint = crate::config::redacted_embedding_endpoint(&config.endpoint);
+    let agent = ureq::builder().redirects(0).build();
+    let response = read_bytes(
+        agent
+            .post(&config.endpoint)
             .timeout(timeout)
             .set("Content-Type", "application/json")
             .send_string(&payload),
     )
-    .map_err(|error| anyhow!("llama.cpp embeddings request failed: {error}"))?;
+    .map_err(|error| {
+        anyhow!(
+            "llama.cpp embeddings request to {display_endpoint} failed: {}",
+            redact_embedding_error(&config.endpoint, &error.to_string())
+        )
+    })?;
     let status = response.status;
     if !(200..300).contains(&status) {
-        bail!("llama.cpp embeddings http {status}");
+        bail!("llama.cpp embeddings endpoint {display_endpoint} returned HTTP {status}");
     }
-    parse_openai_embeddings(&response.body, true)
+    let response_body = std::str::from_utf8(&response.body)
+        .with_context(|| format!("decode UTF-8 JSON from llama.cpp endpoint {display_endpoint}"))?;
+    parse_openai_embeddings(response_body, texts.len(), expected_embedding_dim(config))
+        .with_context(|| format!("parse response from llama.cpp endpoint {display_endpoint}"))
 }
 
 #[derive(Deserialize)]
@@ -878,27 +982,118 @@ struct OpenAiEmbeddingsResponse {
 
 #[derive(Deserialize)]
 struct OpenAiEmbeddingRow {
+    index: Option<usize>,
     embedding: Vec<f32>,
 }
 
-fn parse_openai_embeddings(body: &str, require_llamacpp_dim: bool) -> Result<Vec<Vec<f32>>> {
+fn parse_openai_embeddings(
+    body: &str,
+    expected_count: usize,
+    expected_dim: Option<usize>,
+) -> Result<Vec<Vec<f32>>> {
     let parsed: OpenAiEmbeddingsResponse =
         serde_json::from_str(body).context("parse llama.cpp embeddings json")?;
-    if parsed.data.is_empty() {
-        bail!("llama.cpp embeddings response had no data rows");
+    if parsed.data.len() != expected_count {
+        bail!(
+            "llama.cpp embeddings response returned {} vectors for {expected_count} inputs",
+            parsed.data.len()
+        );
     }
-    let mut vectors = Vec::with_capacity(parsed.data.len());
+    let mut indexed = Vec::with_capacity(parsed.data.len());
+    let mut seen = std::collections::BTreeSet::new();
     for row in parsed.data {
-        if require_llamacpp_dim && row.embedding.len() != RETRIEVAL_EMBEDDING_DIM {
+        let index = row
+            .index
+            .ok_or_else(|| anyhow!("llama.cpp embeddings response row missing `index`"))?;
+        if index >= expected_count {
+            bail!("llama.cpp embeddings response index {index} is outside 0..{expected_count}");
+        }
+        if !seen.insert(index) {
+            bail!("llama.cpp embeddings response duplicated index {index}");
+        }
+        if expected_dim.is_some_and(|expected| row.embedding.len() != expected) {
+            let expected_dim = expected_dim.expect("checked above");
             bail!(
-                "llama.cpp embedding dim {} != expected {} (bge-base-en-v1.5); check model GGUF and CODESTORY_EMBED_BACKEND",
+                "llama.cpp embedding dim {} != expected {}; check the configured model profile and GGUF",
                 row.embedding.len(),
-                RETRIEVAL_EMBEDDING_DIM
+                expected_dim
             );
         }
-        vectors.push(row.embedding);
+        indexed.push((index, row.embedding));
     }
-    Ok(vectors)
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, vector)| vector).collect())
+}
+
+fn expected_embedding_dim(config: &crate::config::EmbeddingRuntimeConfig) -> Option<usize> {
+    config
+        .expected_dim
+        .or(config.truncate_dim)
+        .or_else(|| named_embedding_profile_dim(&config.profile))
+}
+
+fn named_embedding_profile_dim(profile: &str) -> Option<usize> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "minilm" | "minilm-l6-v2" | "all-minilm-l6-v2" | "bge-small" | "bge-small-en-v1.5" => {
+            Some(384)
+        }
+        "bge-base"
+        | "bge-base-en-v1.5"
+        | "baai/bge-base-en-v1.5"
+        | "embeddinggemma"
+        | "embeddinggemma-300m"
+        | "gemma"
+        | "gemma-embedding-300m"
+        | "google/embeddinggemma-300m"
+        | "nomic"
+        | "nomic-v1.5"
+        | "nomic-embed-text-v1.5"
+        | "nomic-v2"
+        | "nomic-embed-text-v2"
+        | "nomic-embed-text-v2-moe" => Some(768),
+        "qwen" | "qwen3" | "qwen3-embedding-0.6b" | "qwen/qwen3-embedding-0.6b" => Some(1024),
+        _ => None,
+    }
+}
+
+fn redact_embedding_error(endpoint: &str, error: &str) -> String {
+    let display = crate::config::redacted_embedding_endpoint(endpoint);
+    let mut redacted = error.replace(endpoint, &display);
+    let rest = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        redacted = redacted
+            .replace(authority, host)
+            .replace(userinfo, "[redacted]");
+        for secret in userinfo.split(':') {
+            if !secret.is_empty() {
+                redacted = redacted.replace(secret, "[redacted]");
+            }
+        }
+    }
+    if let Some(query) = endpoint.split_once('?').map(|(_, value)| value) {
+        let query = query.split('#').next().unwrap_or_default();
+        if !query.is_empty() {
+            redacted = redacted.replace(query, "[redacted]");
+        }
+        for value in query
+            .split('&')
+            .filter_map(|pair| pair.split_once('=').map(|(_, value)| value))
+            .filter(|value| !value.is_empty())
+        {
+            redacted = redacted.replace(value, "[redacted]");
+        }
+    }
+    if let Some(fragment) = endpoint.split_once('#').map(|(_, value)| value)
+        && !fragment.is_empty()
+    {
+        redacted = redacted.replace(fragment, "[redacted]");
+    }
+    redacted
 }
 
 /// Same algorithm as `codestory_runtime::search::engine::embed_text_with_hash_projection`.
@@ -952,6 +1147,271 @@ mod tests {
     use super::*;
     use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
     use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    fn llama_client_config(endpoint: String) -> crate::config::EmbeddingRuntimeConfig {
+        crate::config::EmbeddingRuntimeConfig {
+            configuration_error: None,
+            backend: "llamacpp".into(),
+            endpoint,
+            endpoint_origin: crate::config::EmbeddingEndpointOrigin::TrustedProjectConfig,
+            profile: "custom".into(),
+            model_id: Some("retained-model-id".into()),
+            pooling: None,
+            query_prefix: None,
+            document_prefix: None,
+            layer_norm: None,
+            truncate_dim: None,
+            expected_dim: Some(3),
+            batch_size: 128,
+            request_count: 1,
+            allow_remote: false,
+            device_policy: "allow_cpu".into(),
+            server_launch: Some("external_endpoint".into()),
+        }
+    }
+
+    fn one_shot_embedding_server(
+        status: &str,
+        headers: &str,
+        body: String,
+    ) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
+        let url = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("embedding server address")
+        );
+        let status = status.to_string();
+        let headers = headers.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read embedding request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len().saturating_sub(header_end) >= content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write embedding response");
+            String::from_utf8(request).expect("embedding request utf8")
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn openai_embedding_rows_are_sorted_by_index() {
+        let body = serde_json::json!({"data": [
+            {"index": 1, "embedding": [0.0, 1.0, 0.0]},
+            {"index": 0, "embedding": [1.0, 0.0, 0.0]}
+        ]})
+        .to_string();
+
+        let vectors = parse_openai_embeddings(&body, 2, Some(3)).expect("parse rows");
+
+        assert_eq!(vectors[0], vec![1.0, 0.0, 0.0]);
+        assert_eq!(vectors[1], vec![0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn openai_embedding_rows_reject_invalid_index_sets_and_counts() {
+        for (body, expected_count, expected) in [
+            (
+                serde_json::json!({"data": [
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 0, "embedding": [2.0]}
+                ]})
+                .to_string(),
+                2,
+                "duplicated index 0",
+            ),
+            (
+                serde_json::json!({"data": [{"embedding": [1.0]}]}).to_string(),
+                1,
+                "missing `index`",
+            ),
+            (
+                serde_json::json!({"data": [{"index": 2, "embedding": [1.0]}]}).to_string(),
+                1,
+                "outside 0..1",
+            ),
+            (
+                serde_json::json!({"data": [{"index": 0, "embedding": [1.0]}]}).to_string(),
+                2,
+                "1 vectors for 2 inputs",
+            ),
+            (
+                serde_json::json!({"data": [
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 1, "embedding": [2.0]}
+                ]})
+                .to_string(),
+                1,
+                "2 vectors for 1 inputs",
+            ),
+        ] {
+            let error = parse_openai_embeddings(&body, expected_count, None)
+                .expect_err("invalid response must fail");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn named_embedding_profiles_supply_dimensions_with_explicit_precedence() {
+        let mut config = llama_client_config("http://127.0.0.1:8080/v1/embeddings".into());
+        config.expected_dim = None;
+        config.profile = "qwen3-embedding-0.6b".into();
+        assert_eq!(expected_embedding_dim(&config), Some(1024));
+        config.truncate_dim = Some(256);
+        assert_eq!(expected_embedding_dim(&config), Some(256));
+        config.expected_dim = Some(128);
+        assert_eq!(expected_embedding_dim(&config), Some(128));
+    }
+
+    #[test]
+    fn production_llamacpp_client_uses_retained_model_and_sorted_rows() -> Result<()> {
+        let response = serde_json::json!({"data": [
+            {"index": 1, "embedding": [0.0, 1.0, 0.0]},
+            {"index": 0, "embedding": [1.0, 0.0, 0.0]}
+        ]})
+        .to_string();
+        let (url, request) = one_shot_embedding_server("200 OK", "", response);
+        let client = LlamaCppEmbeddingClient::new(&llama_client_config(url))?;
+
+        let vectors = client.embed_prepared_texts(&["alpha".into(), "beta".into()])?;
+        let request = request.join().expect("embedding server thread");
+
+        assert_eq!(vectors[0], vec![1.0, 0.0, 0.0]);
+        assert_eq!(vectors[1], vec![0.0, 1.0, 0.0]);
+        assert!(request.contains("retained-model-id"), "{request}");
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_client_rejects_redirects_and_redacts_endpoint_secrets() -> Result<()> {
+        let (url, request) = one_shot_embedding_server(
+            "302 Found",
+            "Location: http://127.0.0.1:9/redirected\r\n",
+            "redirect".into(),
+        );
+        let secret_url = format!(
+            "{}?token=query-secret#fragment-secret",
+            url.replacen("http://", "http://username-secret:password-secret@", 1)
+        );
+        let error = LlamaCppEmbeddingClient::new(&llama_client_config(secret_url))?
+            .embed_prepared_texts(&["alpha".into()])
+            .expect_err("redirect must not be followed");
+        request.join().expect("embedding server thread");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("302"), "{rendered}");
+        for secret in [
+            "username-secret",
+            "password-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_transport_errors_redact_endpoint_secrets() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        let endpoint = format!(
+            "http://username-secret:password-secret@{address}/v1/embeddings?token=query-secret#fragment-secret"
+        );
+        let error = LlamaCppEmbeddingClient::new(&llama_client_config(endpoint))?
+            .embed_prepared_texts(&["alpha".into()])
+            .expect_err("closed endpoint must fail");
+
+        let rendered = format!("{error:#}");
+        for secret in [
+            "username-secret",
+            "password-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_invalid_json_errors_redact_endpoint_secrets() -> Result<()> {
+        let (url, request) = one_shot_embedding_server("200 OK", "", "invalid".into());
+        let endpoint = format!(
+            "{}?token=query-secret#fragment-secret",
+            url.replacen("http://", "http://username-secret:password-secret@", 1)
+        );
+        let error = LlamaCppEmbeddingClient::new(&llama_client_config(endpoint))?
+            .embed_prepared_texts(&["alpha".into()])
+            .expect_err("invalid JSON must fail");
+        request.join().expect("embedding server thread");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("parse llama.cpp embeddings json"),
+            "{rendered}"
+        );
+        for secret in [
+            "username-secret",
+            "password-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_client_accepts_json_over_ten_mib() -> Result<()> {
+        let response = serde_json::json!({
+            "padding": "x".repeat(10 * 1024 * 1024 + 1),
+            "data": [{"index": 0, "embedding": [1.0, 0.0, 0.0]}]
+        })
+        .to_string();
+        let (url, request) = one_shot_embedding_server("200 OK", "", response);
+
+        let vectors = LlamaCppEmbeddingClient::new(&llama_client_config(url))?
+            .embed_prepared_texts(&["alpha".into()])?;
+        request.join().expect("embedding server thread");
+
+        assert_eq!(vectors, vec![vec![1.0, 0.0, 0.0]]);
+        Ok(())
+    }
 
     #[test]
     fn hash_projection_dim_matches_retrieval_embedding_dim() {
@@ -1306,11 +1766,13 @@ mod tests {
         let observed = observed_embedding_device_state_from_text(
             "llama_model_load: offloaded 33/33 layers to GPU\n",
         );
-        let readiness =
-            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+        let readiness = embedding_device_readiness_with_observed_state(
+            Some(EmbeddingDeviceObservation {
                 state: observed,
                 source: "sidecar_log",
-            }));
+            }),
+            None,
+        );
 
         assert_eq!(observed, "accelerated");
         assert_eq!(readiness.requested_policy, "accelerator_required");
@@ -1345,7 +1807,7 @@ mod tests {
         let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
 
         let observed = observed_embedding_device_state_from_text("server listening on 0.0.0.0");
-        let readiness = embedding_device_readiness_with_observed_state(None);
+        let readiness = embedding_device_readiness_with_observed_state(None, None);
 
         assert_eq!(observed, "unknown");
         assert_eq!(readiness.requested_policy, "accelerator_required");
@@ -1369,11 +1831,13 @@ mod tests {
         let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
         let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
 
-        let readiness =
-            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+        let readiness = embedding_device_readiness_with_observed_state(
+            Some(EmbeddingDeviceObservation {
                 state: "accelerated",
                 source: "native_log",
-            }));
+            }),
+            None,
+        );
 
         assert_eq!(readiness.observed_state, "accelerated");
         assert_eq!(readiness.observation_source, "native_log");
@@ -1411,11 +1875,13 @@ mod tests {
         let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
         let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
 
-        let readiness =
-            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+        let readiness = embedding_device_readiness_with_observed_state(
+            Some(EmbeddingDeviceObservation {
                 state: "accelerated",
                 source: "native_device_list",
-            }));
+            }),
+            None,
+        );
 
         assert_eq!(readiness.observed_state, "accelerated");
         assert_eq!(readiness.observation_source, "native_device_list");
@@ -1612,6 +2078,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
+            ..SidecarRuntimeConfig::local()
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
             .expect("create state dir");
@@ -1662,6 +2129,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
+            ..SidecarRuntimeConfig::local()
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
             .expect("create state dir");

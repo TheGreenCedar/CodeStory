@@ -55,6 +55,7 @@ pub(crate) struct RuntimeContext {
     pub(crate) project_root: PathBuf,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
+    pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,8 +105,33 @@ impl RuntimeContext {
 
     /// Open runtime services for agent-facing packet/search commands.
     pub(crate) fn new_agent_sidecar(args: &ProjectArgs) -> Result<Self> {
-        crate::embedding_config::prepare_bundled_llamacpp_client_env_defaults();
-        Self::new(args)
+        Self::new_agent_sidecar_with_selection(args, None, None)
+    }
+
+    pub(crate) fn new_agent_sidecar_with_selection(
+        args: &ProjectArgs,
+        profile: Option<crate::args::CliSidecarProfile>,
+        run_id: Option<&str>,
+    ) -> Result<Self> {
+        let mut context = Self::new(args)?;
+        if profile.is_some() || run_id.is_some() {
+            let selected = profile
+                .map(Into::into)
+                .unwrap_or(codestory_retrieval::SidecarProfile::Agent);
+            context.sidecar = context.sidecar.with_profile_and_run_id(
+                Some(&context.project_root),
+                selected,
+                run_id,
+            );
+            let runtime = Runtime::new_with_config(context.sidecar.clone());
+            context.project = runtime.project_service();
+            context.index = runtime.index_service();
+            context.grounding = runtime.grounding_service();
+            context.bookmarks = runtime.bookmark_service();
+            context.browser = runtime.browser_service();
+            context.events = runtime.events();
+        }
+        Ok(context)
     }
 
     /// Open runtime services without starting managed embedding processes.
@@ -115,10 +141,17 @@ impl RuntimeContext {
 
     fn new_with_startup(args: &ProjectArgs) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
-        let cache_override = trusted_cache_override(&project_root, args.cache_dir.as_deref())?;
+        let config = crate::config::load_config(&project_root)?;
+        let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
         let cache_root = cache_root_for_project(&project_root, cache_override.as_deref())?;
         let storage_path = cache_root.join("codestory.db");
-        let runtime = Runtime::new();
+        let defaults = crate::config::process_runtime_defaults();
+        let sidecar = codestory_retrieval::SidecarRuntimeConfig::for_project_auto_with_defaults(
+            &project_root,
+            &defaults,
+            &config.runtime_overrides(),
+        );
+        let runtime = Runtime::new_with_config(sidecar.clone());
         let events = runtime.events();
         Ok(Self {
             project: runtime.project_service(),
@@ -130,6 +163,7 @@ impl RuntimeContext {
             project_root,
             cache_root,
             storage_path,
+            sidecar,
         })
     }
 
@@ -437,14 +471,6 @@ pub(crate) fn cache_root_for_project(
         None => Ok(codestory_retrieval::user_cache_root()
             .join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
     }
-}
-
-pub(crate) fn trusted_cache_override(
-    project_root: &Path,
-    cli_cache_dir: Option<&Path>,
-) -> Result<Option<PathBuf>> {
-    let config = crate::config::load_config(project_root)?;
-    Ok(cli_cache_dir.map(Path::to_path_buf).or(config.cache_dir))
 }
 
 /// Small stable hash used for path-derived cache directory names.
@@ -922,29 +948,22 @@ mod tests {
         let cache = temp.path().join("cache");
         fs::create_dir_all(&project).expect("create project");
 
-        RuntimeContext::new_agent_sidecar(&ProjectArgs {
+        let runtime = RuntimeContext::new_agent_sidecar(&ProjectArgs {
             project: project.clone(),
             cache_dir: Some(cache),
         })
         .expect("runtime context");
 
-        assert_eq!(
-            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
-            Some("llamacpp")
-        );
+        assert_eq!(runtime.sidecar.embedding.backend, "llamacpp");
         assert_eq!(env::var("CODESTORY_EMBED_LLAMACPP_URL").ok(), None);
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-            &project,
+        let sidecar = runtime.sidecar.with_profile_and_run_id(
+            Some(&project),
             codestory_retrieval::SidecarProfile::Agent,
             Some("ready-repair-test"),
         );
         let expected_url =
             codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
-        sidecar.activate_embed_url_default();
-        assert_eq!(
-            env::var("CODESTORY_EMBED_LLAMACPP_URL").ok().as_deref(),
-            Some(expected_url.as_str())
-        );
+        assert_eq!(sidecar.embedding.endpoint.as_str(), expected_url.as_str());
         assert_ne!(expected_url, "http://127.0.0.1:8080/v1/embeddings");
     }
 
@@ -960,15 +979,20 @@ mod tests {
             );
         }
 
-        crate::embedding_config::prepare_bundled_llamacpp_client_env_defaults();
+        let project = tempfile::tempdir().expect("project");
+        let runtime = RuntimeContext::new_agent_sidecar(&ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: None,
+        })
+        .expect("runtime context");
 
         assert_eq!(
             env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
             Some("llamacpp")
         );
         assert_eq!(
-            env::var("CODESTORY_EMBED_LLAMACPP_URL").ok().as_deref(),
-            Some("http://127.0.0.1:18080/v1/embeddings")
+            runtime.sidecar.embedding.endpoint.as_str(),
+            "http://127.0.0.1:18080/v1/embeddings"
         );
     }
 }

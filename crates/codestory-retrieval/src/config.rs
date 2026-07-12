@@ -48,6 +48,54 @@ pub const NATIVE_LLAMA_SOURCE_CACHE_REL_PATH: &str = "target/llamacpp/b8840/llam
 const LLAMA_SIDECAR_BACKENDS_JSON: &str = include_str!("../assets/llama-sidecar-backends.json");
 const TEST_HOST_PLATFORM_ENV: &str = "CODESTORY_TEST_HOST_PLATFORM";
 const AGENT_PORT_RESERVATION_GRACE: Duration = Duration::from_secs(10 * 60);
+const RUNTIME_ENV_KEYS: &[&str] = &[
+    "CODESTORY_RETRIEVAL_PROFILE",
+    "CODESTORY_SIDECAR_PROFILE",
+    "CODESTORY_SIDECAR_RUN_ID",
+    "CODESTORY_AGENT_RUN_ID",
+    "CODESTORY_AGENT",
+    "CODESTORY_AGENT_RUN",
+    "CI",
+    "GITHUB_ACTIONS",
+    "CODESTORY_ZOEKT_PORT",
+    "CODESTORY_QDRANT_HTTP_PORT",
+    "CODESTORY_QDRANT_GRPC_PORT",
+    "CODESTORY_EMBED_PORT",
+    "CODESTORY_EMBED_BACKEND",
+    "CODESTORY_EMBED_RUNTIME_MODE",
+    "CODESTORY_EMBED_LLAMACPP_URL",
+    "CODESTORY_EMBED_PROFILE",
+    "CODESTORY_EMBED_MODEL_ID",
+    "CODESTORY_EMBED_POOLING",
+    "CODESTORY_EMBED_QUERY_PREFIX",
+    "CODESTORY_EMBED_DOCUMENT_PREFIX",
+    "CODESTORY_EMBED_LAYER_NORM",
+    "CODESTORY_EMBED_TRUNCATE_DIM",
+    "CODESTORY_EMBED_EXPECTED_DIM",
+    "CODESTORY_EMBED_LLAMACPP_BATCH_SIZE",
+    "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT",
+    "CODESTORY_ALLOW_REMOTE_EMBEDDINGS",
+    "CODESTORY_EMBED_DEVICE_POLICY",
+    "CODESTORY_EMBED_ALLOW_CPU",
+    "CODESTORY_EMBED_SERVER_LAUNCH",
+    "CODESTORY_EMBED_ONNX_MODEL",
+    "CODESTORY_EMBED_ONNX_TOKENIZER",
+    "CODESTORY_EMBED_ONNX_PROVIDER",
+    "CODESTORY_EMBED_ONNX_THREADS",
+    "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
+    "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
+    "CODESTORY_SEMANTIC_DOC_SCOPE",
+    "CODESTORY_SEMANTIC_DOC_ALIAS_MODE",
+    "CODESTORY_SEMANTIC_DOC_MAX_TOKENS",
+    "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE",
+    "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS",
+    "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES",
+    "CODESTORY_SUMMARY_ENDPOINT",
+    "CODESTORY_SUMMARY_MODEL",
+    "CODESTORY_SUMMARY_API_KEY",
+    "CODESTORY_SUMMARY_MAX_TOKENS",
+    "CODESTORY_SUMMARY_TIMEOUT_SECS",
+];
 
 pub const ZOEKT_HEALTH_BUDGET: Duration = Duration::from_millis(100);
 pub const QDRANT_HEALTH_BUDGET: Duration = Duration::from_millis(200);
@@ -159,6 +207,97 @@ pub enum EmbeddingServerLaunchMode {
     ExternalEndpoint,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingEndpointOrigin {
+    #[default]
+    ManagedSidecar,
+    ProcessEnvironment,
+    TrustedUserConfig,
+    TrustedProjectConfig,
+    BuiltInDefault,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingRuntimeConfig {
+    pub configuration_error: Option<String>,
+    pub backend: String,
+    pub endpoint: String,
+    pub endpoint_origin: EmbeddingEndpointOrigin,
+    pub profile: String,
+    pub model_id: Option<String>,
+    pub pooling: Option<String>,
+    pub query_prefix: Option<String>,
+    pub document_prefix: Option<String>,
+    pub layer_norm: Option<bool>,
+    pub truncate_dim: Option<usize>,
+    pub expected_dim: Option<usize>,
+    pub batch_size: usize,
+    pub request_count: usize,
+    pub allow_remote: bool,
+    pub device_policy: String,
+    pub server_launch: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidecarRuntimeDefaults {
+    values: BTreeMap<String, String>,
+}
+
+impl SidecarRuntimeDefaults {
+    pub fn from_process_env() -> Self {
+        Self {
+            values: RUNTIME_ENV_KEYS
+                .iter()
+                .filter_map(|name| {
+                    std::env::var(name)
+                        .ok()
+                        .map(|value| ((*name).to_string(), value))
+                })
+                .collect(),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.values.get(name).map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalRuntimeConfig {
+    pub hybrid_enabled: bool,
+    pub semantic_doc_scope: String,
+    pub semantic_doc_alias_mode: String,
+    pub semantic_doc_max_tokens: usize,
+    pub llm_doc_embed_batch_size: usize,
+    pub stream_pending_docs: bool,
+    pub stream_sort_window_batches: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryRuntimeConfig {
+    pub endpoint: Option<String>,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub max_tokens: Option<usize>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidecarRuntimeOverrides {
+    pub embedding_profile: Option<String>,
+    pub embedding_model_id: Option<String>,
+    pub embedding_endpoint: Option<String>,
+    pub embedding_endpoint_origin: Option<EmbeddingEndpointOrigin>,
+    pub embedding_query_prefix: Option<String>,
+    pub embedding_document_prefix: Option<String>,
+    pub hybrid_retrieval_enabled: Option<bool>,
+    pub semantic_doc_scope: Option<String>,
+    pub semantic_doc_alias_mode: Option<String>,
+    pub summary_endpoint: Option<String>,
+    pub summary_model: Option<String>,
+}
+
 impl EmbeddingServerLaunchMode {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -189,6 +328,8 @@ pub struct SidecarOwnership {
     pub state_file: String,
     pub cleanup_command: String,
     pub ports: SidecarPorts,
+    #[serde(default)]
+    pub embedding_endpoint_origin: EmbeddingEndpointOrigin,
     pub labels: BTreeMap<String, String>,
 }
 
@@ -203,6 +344,9 @@ pub struct SidecarRuntimeConfig {
     pub embed_http_port: u16,
     pub cleanup_command: String,
     pub labels: BTreeMap<String, String>,
+    pub embedding: EmbeddingRuntimeConfig,
+    pub retrieval: RetrievalRuntimeConfig,
+    pub summary: SummaryRuntimeConfig,
 }
 
 impl SidecarLayout {
@@ -211,9 +355,7 @@ impl SidecarLayout {
     }
 
     pub fn from_env_for_project(project_root: &Path) -> Self {
-        let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-        runtime.activate_embed_url_default();
-        runtime.layout
+        SidecarRuntimeConfig::for_project_auto(project_root).layout
     }
 
     fn from_env_for_profile(project_root: Option<&Path>, profile: SidecarProfile) -> Self {
@@ -221,10 +363,7 @@ impl SidecarLayout {
     }
 
     pub fn from_env_agent(project_root: &Path) -> Self {
-        let runtime =
-            SidecarRuntimeConfig::for_project_profile(Some(project_root), SidecarProfile::Agent);
-        runtime.activate_embed_url_default();
-        runtime.layout
+        SidecarRuntimeConfig::for_project_profile(Some(project_root), SidecarProfile::Agent).layout
     }
 
     pub fn from_env_local(project_root: Option<&Path>) -> Self {
@@ -242,8 +381,27 @@ impl SidecarRuntimeConfig {
     }
 
     pub fn for_project_auto(project_root: &Path) -> Self {
-        let explicit_profile = env_profile();
-        let env_run_id = env_agent_run_id();
+        Self::for_project_auto_with_overrides(project_root, &SidecarRuntimeOverrides::default())
+    }
+
+    pub fn for_project_auto_with_overrides(
+        project_root: &Path,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
+        Self::for_project_auto_with_defaults(
+            project_root,
+            &SidecarRuntimeDefaults::from_process_env(),
+            overrides,
+        )
+    }
+
+    pub fn for_project_auto_with_defaults(
+        project_root: &Path,
+        defaults: &SidecarRuntimeDefaults,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
+        let explicit_profile = env_profile(defaults);
+        let env_run_id = env_agent_run_id(defaults);
         let latest_run_id = if explicit_profile.is_none() && env_run_id.is_none() {
             latest_agent_run_id(project_root)
         } else {
@@ -253,9 +411,15 @@ impl SidecarRuntimeConfig {
             explicit_profile,
             env_run_id,
             latest_run_id,
-            running_in_ci_agent(),
+            running_in_ci_agent(defaults),
         );
-        Self::for_project_profile_with_run_id(Some(project_root), profile, run_id.as_deref())
+        Self::for_project_profile_with_run_id_defaults_and_overrides(
+            Some(project_root),
+            profile,
+            run_id.as_deref(),
+            defaults,
+            overrides,
+        )
     }
 
     pub fn for_project_profile(project_root: Option<&Path>, profile: SidecarProfile) -> Self {
@@ -267,11 +431,43 @@ impl SidecarRuntimeConfig {
         profile: SidecarProfile,
         run_id: Option<&str>,
     ) -> Self {
-        Self::for_project_profile_with_run_id_in_cache(
+        Self::for_project_profile_with_run_id_and_overrides(
+            project_root,
+            profile,
+            run_id,
+            &SidecarRuntimeOverrides::default(),
+        )
+    }
+
+    pub fn for_project_profile_with_run_id_and_overrides(
+        project_root: Option<&Path>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
+        Self::for_project_profile_with_run_id_defaults_and_overrides(
+            project_root,
+            profile,
+            run_id,
+            &SidecarRuntimeDefaults::from_process_env(),
+            overrides,
+        )
+    }
+
+    fn for_project_profile_with_run_id_defaults_and_overrides(
+        project_root: Option<&Path>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+        defaults: &SidecarRuntimeDefaults,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
+        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
             project_root,
             profile,
             run_id,
             &user_cache_root(),
+            defaults,
+            overrides,
         )
     }
 
@@ -282,8 +478,44 @@ impl SidecarRuntimeConfig {
         run_id: Option<&str>,
         cache_root: &Path,
     ) -> Self {
+        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
+            project_root,
+            profile,
+            run_id,
+            cache_root,
+            &SidecarRuntimeDefaults::from_process_env(),
+            &SidecarRuntimeOverrides::default(),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn for_project_profile_with_run_id_in_cache_and_overrides(
+        project_root: Option<&Path>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+        cache_root: &Path,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
+        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
+            project_root,
+            profile,
+            run_id,
+            cache_root,
+            &SidecarRuntimeDefaults::from_process_env(),
+            overrides,
+        )
+    }
+
+    fn for_project_profile_with_run_id_in_cache_defaults_and_overrides(
+        project_root: Option<&Path>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+        cache_root: &Path,
+        defaults: &SidecarRuntimeDefaults,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
         let base = cache_root.to_path_buf();
-        let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id));
+        let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id, defaults));
         let namespace = namespace_for(project_root, profile, run_id.as_deref());
         let state_file = match profile {
             SidecarProfile::Local => base.join("retrieval-sidecars.json"),
@@ -295,10 +527,18 @@ impl SidecarRuntimeConfig {
         let stored = read_ports_from_state(&state_file);
         let dynamic = profile == SidecarProfile::Agent && stored.is_none();
         let configured_ports = [
-            env_port("CODESTORY_ZOEKT_PORT", DEFAULT_ZOEKT_HTTP_PORT),
-            env_port("CODESTORY_QDRANT_HTTP_PORT", DEFAULT_QDRANT_HTTP_PORT),
-            env_port("CODESTORY_QDRANT_GRPC_PORT", DEFAULT_QDRANT_GRPC_PORT),
-            env_port("CODESTORY_EMBED_PORT", DEFAULT_EMBED_HTTP_PORT),
+            env_port(defaults, "CODESTORY_ZOEKT_PORT", DEFAULT_ZOEKT_HTTP_PORT),
+            env_port(
+                defaults,
+                "CODESTORY_QDRANT_HTTP_PORT",
+                DEFAULT_QDRANT_HTTP_PORT,
+            ),
+            env_port(
+                defaults,
+                "CODESTORY_QDRANT_GRPC_PORT",
+                DEFAULT_QDRANT_GRPC_PORT,
+            ),
+            env_port(defaults, "CODESTORY_EMBED_PORT", DEFAULT_EMBED_HTTP_PORT),
         ];
         let dynamic_ports =
             dynamic.then(|| dynamic_agent_ports(&base, &namespace, configured_ports));
@@ -394,6 +634,9 @@ impl SidecarRuntimeConfig {
             labels.insert("dev.codestory.run_id".into(), run_id.to_string());
             labels.insert("dev.codestory.agent_id".into(), run_id.to_string());
         }
+        let embedding = embedding_runtime_config(embed_http_port, defaults, overrides);
+        let retrieval = retrieval_runtime_config(defaults, overrides);
+        let summary = summary_runtime_config(defaults, overrides);
         Self {
             project_identity,
             layout,
@@ -404,6 +647,9 @@ impl SidecarRuntimeConfig {
             embed_http_port,
             cleanup_command,
             labels,
+            embedding,
+            retrieval,
+            summary,
         }
     }
 
@@ -421,8 +667,9 @@ impl SidecarRuntimeConfig {
                 qdrant_http: self.layout.qdrant_http_port,
                 qdrant_grpc: self.layout.qdrant_grpc_port,
                 embed_http: self.embed_http_port,
-                embed_url: SidecarLayout::embed_base_url(self.embed_http_port),
+                embed_url: redacted_embedding_endpoint(&self.embedding.endpoint),
             },
+            embedding_endpoint_origin: self.embedding.endpoint_origin,
             labels: self.labels.clone(),
         }
     }
@@ -444,33 +691,37 @@ impl SidecarRuntimeConfig {
         Ok(())
     }
 
-    pub fn activate_embed_url_default(&self) {
-        let url_missing_or_blank = std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
-            .ok()
-            .is_none_or(|value| value.trim().is_empty());
-        let managed_url = std::env::var(MANAGED_LLAMACPP_URL_ENV).is_ok();
-
-        if url_missing_or_blank || managed_url {
-            // SAFETY: this is command-local setup before sidecar probes/query embedding calls.
-            unsafe {
-                std::env::set_var(
-                    "CODESTORY_EMBED_LLAMACPP_URL",
-                    SidecarLayout::embed_base_url(self.embed_http_port),
-                );
-                std::env::set_var(MANAGED_LLAMACPP_URL_ENV, "1");
-            }
+    pub fn with_profile_and_run_id(
+        &self,
+        project_root: Option<&Path>,
+        profile: SidecarProfile,
+        run_id: Option<&str>,
+    ) -> Self {
+        let cache_root = match self.profile {
+            SidecarProfile::Local => self.layout.state_file.parent(),
+            SidecarProfile::Agent => self
+                .layout
+                .state_file
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent),
         }
-    }
-
-    pub fn activate_embed_url(&self) {
-        // SAFETY: this is command-local setup before sidecar probes/query embedding calls.
-        unsafe {
-            std::env::set_var(
-                "CODESTORY_EMBED_LLAMACPP_URL",
-                SidecarLayout::embed_base_url(self.embed_http_port),
-            );
-            std::env::set_var(MANAGED_LLAMACPP_URL_ENV, "1");
+        .unwrap_or_else(|| Path::new("."));
+        let mut selected = Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
+            project_root,
+            profile,
+            run_id,
+            cache_root,
+            &SidecarRuntimeDefaults::default(),
+            &SidecarRuntimeOverrides::default(),
+        );
+        selected.embedding = self.embedding.clone();
+        if selected.embedding.endpoint_origin == EmbeddingEndpointOrigin::ManagedSidecar {
+            selected.embedding.endpoint = SidecarLayout::embed_base_url(selected.embed_http_port);
         }
+        selected.retrieval = self.retrieval.clone();
+        selected.summary = self.summary.clone();
+        selected
     }
 }
 
@@ -519,10 +770,229 @@ pub fn sidecar_runtime_auto(project_root: &Path) -> SidecarRuntimeConfig {
     SidecarRuntimeConfig::for_project_auto(project_root)
 }
 
-fn env_profile() -> Option<SidecarProfile> {
-    std::env::var("CODESTORY_RETRIEVAL_PROFILE")
-        .ok()
-        .or_else(|| std::env::var("CODESTORY_SIDECAR_PROFILE").ok())
+fn embedding_runtime_config(
+    embed_http_port: u16,
+    defaults: &SidecarRuntimeDefaults,
+    overrides: &SidecarRuntimeOverrides,
+) -> EmbeddingRuntimeConfig {
+    const REMOVED_ONNX_ENV_VARS: &[&str] = &[
+        "CODESTORY_EMBED_ONNX_MODEL",
+        "CODESTORY_EMBED_ONNX_TOKENIZER",
+        "CODESTORY_EMBED_ONNX_PROVIDER",
+        "CODESTORY_EMBED_ONNX_THREADS",
+        "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
+    ];
+    let configured_backend = default_nonempty(defaults, "CODESTORY_EMBED_BACKEND")
+        .or_else(|| default_nonempty(defaults, "CODESTORY_EMBED_RUNTIME_MODE"))
+        .unwrap_or_else(|| "llamacpp".to_string());
+    let configuration_error = REMOVED_ONNX_ENV_VARS
+        .iter()
+        .find(|name| defaults.get(name).is_some())
+        .map(|name| {
+            format!(
+                "{name} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+            )
+        })
+        .or_else(|| {
+            matches!(
+                configured_backend.trim().to_ascii_lowercase().as_str(),
+                "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
+            )
+            .then(|| {
+                format!(
+                    "embedding backend `{configured_backend}` is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+                )
+            })
+        });
+    let env_endpoint = default_nonempty(defaults, "CODESTORY_EMBED_LLAMACPP_URL");
+    let (mut endpoint, mut endpoint_origin) = if let Some(endpoint) = env_endpoint {
+        (endpoint, EmbeddingEndpointOrigin::ProcessEnvironment)
+    } else if let Some(endpoint) = overrides.embedding_endpoint.clone() {
+        (
+            endpoint,
+            overrides
+                .embedding_endpoint_origin
+                .unwrap_or(EmbeddingEndpointOrigin::TrustedUserConfig),
+        )
+    } else {
+        (
+            SidecarLayout::embed_base_url(embed_http_port),
+            EmbeddingEndpointOrigin::ManagedSidecar,
+        )
+    };
+    let mut server_launch = default_nonempty(defaults, "CODESTORY_EMBED_SERVER_LAUNCH");
+    if endpoint_origin != EmbeddingEndpointOrigin::ManagedSidecar {
+        let native_selected = server_launch.as_deref().is_some_and(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "native" | "native_spawned"
+            )
+        });
+        if native_selected {
+            endpoint = SidecarLayout::embed_base_url(embed_http_port);
+            endpoint_origin = EmbeddingEndpointOrigin::ManagedSidecar;
+        } else {
+            server_launch = Some("external_endpoint".to_string());
+        }
+    }
+    EmbeddingRuntimeConfig {
+        configuration_error,
+        backend: configured_backend,
+        endpoint,
+        endpoint_origin,
+        profile: default_nonempty(defaults, "CODESTORY_EMBED_PROFILE")
+            .or_else(|| overrides.embedding_profile.clone())
+            .unwrap_or_else(|| "bge-base-en-v1.5".to_string()),
+        model_id: default_nonempty(defaults, "CODESTORY_EMBED_MODEL_ID")
+            .or_else(|| overrides.embedding_model_id.clone()),
+        pooling: default_nonempty(defaults, "CODESTORY_EMBED_POOLING"),
+        query_prefix: defaults
+            .get("CODESTORY_EMBED_QUERY_PREFIX")
+            .map(str::to_string)
+            .or_else(|| overrides.embedding_query_prefix.clone()),
+        document_prefix: defaults
+            .get("CODESTORY_EMBED_DOCUMENT_PREFIX")
+            .map(str::to_string)
+            .or_else(|| overrides.embedding_document_prefix.clone()),
+        layer_norm: default_optional_bool(defaults, "CODESTORY_EMBED_LAYER_NORM"),
+        truncate_dim: default_bounded_usize(defaults, "CODESTORY_EMBED_TRUNCATE_DIM", 1, 8192),
+        expected_dim: default_bounded_usize(defaults, "CODESTORY_EMBED_EXPECTED_DIM", 1, 8192),
+        batch_size: default_bounded_usize(defaults, "CODESTORY_EMBED_LLAMACPP_BATCH_SIZE", 1, 1024)
+            .unwrap_or(128),
+        request_count: default_bounded_usize(
+            defaults,
+            "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT",
+            1,
+            16,
+        )
+        .unwrap_or_else(|| {
+            defaults
+                .get("CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT")
+                .filter(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "auto" | "available_parallelism"
+                    )
+                })
+                .and_then(|_| std::thread::available_parallelism().ok())
+                .map(|value| value.get().clamp(1, 16))
+                .unwrap_or(1)
+        }),
+        allow_remote: default_flag(defaults, "CODESTORY_ALLOW_REMOTE_EMBEDDINGS", false),
+        device_policy: if default_flag(defaults, "CODESTORY_EMBED_ALLOW_CPU", false) {
+            "allow_cpu".to_string()
+        } else {
+            default_nonempty(defaults, "CODESTORY_EMBED_DEVICE_POLICY")
+                .unwrap_or_else(|| "accelerator_required".to_string())
+        },
+        server_launch,
+    }
+}
+
+fn retrieval_runtime_config(
+    defaults: &SidecarRuntimeDefaults,
+    overrides: &SidecarRuntimeOverrides,
+) -> RetrievalRuntimeConfig {
+    RetrievalRuntimeConfig {
+        hybrid_enabled: default_optional_bool(defaults, "CODESTORY_HYBRID_RETRIEVAL_ENABLED")
+            .or(overrides.hybrid_retrieval_enabled)
+            .unwrap_or(true),
+        semantic_doc_scope: default_nonempty(defaults, "CODESTORY_SEMANTIC_DOC_SCOPE")
+            .or_else(|| overrides.semantic_doc_scope.clone())
+            .unwrap_or_else(|| "durable".to_string()),
+        semantic_doc_alias_mode: default_nonempty(defaults, "CODESTORY_SEMANTIC_DOC_ALIAS_MODE")
+            .or_else(|| overrides.semantic_doc_alias_mode.clone())
+            .unwrap_or_else(|| "alias_variant".to_string()),
+        semantic_doc_max_tokens: default_bounded_usize(
+            defaults,
+            "CODESTORY_SEMANTIC_DOC_MAX_TOKENS",
+            16,
+            8192,
+        )
+        .unwrap_or(128),
+        llm_doc_embed_batch_size: default_bounded_usize(
+            defaults,
+            "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE",
+            1,
+            2048,
+        )
+        .unwrap_or(128),
+        stream_pending_docs: default_optional_bool(
+            defaults,
+            "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS",
+        )
+        .unwrap_or(true),
+        stream_sort_window_batches: default_bounded_usize(
+            defaults,
+            "CODESTORY_SEMANTIC_STREAM_SORT_WINDOW_BATCHES",
+            1,
+            16,
+        )
+        .unwrap_or(1),
+    }
+}
+
+fn summary_runtime_config(
+    defaults: &SidecarRuntimeDefaults,
+    overrides: &SidecarRuntimeOverrides,
+) -> SummaryRuntimeConfig {
+    SummaryRuntimeConfig {
+        endpoint: default_nonempty(defaults, "CODESTORY_SUMMARY_ENDPOINT")
+            .or_else(|| overrides.summary_endpoint.clone()),
+        model: default_nonempty(defaults, "CODESTORY_SUMMARY_MODEL")
+            .or_else(|| overrides.summary_model.clone())
+            .unwrap_or_else(|| "codestory-symbol-summary".to_string()),
+        api_key: default_nonempty(defaults, "CODESTORY_SUMMARY_API_KEY"),
+        max_tokens: default_bounded_usize(
+            defaults,
+            "CODESTORY_SUMMARY_MAX_TOKENS",
+            1,
+            u32::MAX as usize,
+        ),
+        timeout: Duration::from_secs(
+            default_bounded_usize(defaults, "CODESTORY_SUMMARY_TIMEOUT_SECS", 1, 300).unwrap_or(30)
+                as u64,
+        ),
+    }
+}
+
+fn default_nonempty(defaults: &SidecarRuntimeDefaults, name: &str) -> Option<String> {
+    defaults
+        .get(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_optional_bool(defaults: &SidecarRuntimeDefaults, name: &str) -> Option<bool> {
+    defaults
+        .get(name)
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn default_bounded_usize(
+    defaults: &SidecarRuntimeDefaults,
+    name: &str,
+    min: usize,
+    max: usize,
+) -> Option<usize> {
+    defaults
+        .get(name)
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+}
+
+fn default_flag(defaults: &SidecarRuntimeDefaults, name: &str, default: bool) -> bool {
+    default_optional_bool(defaults, name).unwrap_or(default)
+}
+
+fn env_profile(defaults: &SidecarRuntimeDefaults) -> Option<SidecarProfile> {
+    defaults
+        .get("CODESTORY_RETRIEVAL_PROFILE")
+        .or_else(|| defaults.get("CODESTORY_SIDECAR_PROFILE"))
         .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
             "agent" | "ci" => Some(SidecarProfile::Agent),
             "local" | "dev" => Some(SidecarProfile::Local),
@@ -530,18 +1000,18 @@ fn env_profile() -> Option<SidecarProfile> {
         })
 }
 
-fn env_agent_run_id() -> Option<String> {
-    std::env::var("CODESTORY_SIDECAR_RUN_ID")
-        .ok()
-        .or_else(|| std::env::var("CODESTORY_AGENT_RUN_ID").ok())
-        .and_then(|value| normalized_label_component(&value))
+fn env_agent_run_id(defaults: &SidecarRuntimeDefaults) -> Option<String> {
+    defaults
+        .get("CODESTORY_SIDECAR_RUN_ID")
+        .or_else(|| defaults.get("CODESTORY_AGENT_RUN_ID"))
+        .and_then(normalized_label_component)
 }
 
-fn running_in_ci_agent() -> bool {
-    env_flag("CODESTORY_AGENT", false)
-        || env_flag("CODESTORY_AGENT_RUN", false)
-        || env_flag("CI", false)
-        || env_flag("GITHUB_ACTIONS", false)
+fn running_in_ci_agent(defaults: &SidecarRuntimeDefaults) -> bool {
+    default_flag(defaults, "CODESTORY_AGENT", false)
+        || default_flag(defaults, "CODESTORY_AGENT_RUN", false)
+        || default_flag(defaults, "CI", false)
+        || default_flag(defaults, "GITHUB_ACTIONS", false)
 }
 
 fn auto_runtime_selection(
@@ -627,11 +1097,25 @@ fn latest_agent_run_id(project_root: &Path) -> Option<String> {
     newest.map(|(_, run_id)| run_id)
 }
 
-fn agent_run_id(explicit: Option<&str>) -> String {
+fn agent_run_id(explicit: Option<&str>, defaults: &SidecarRuntimeDefaults) -> String {
     explicit
         .and_then(normalized_label_component)
-        .or_else(env_agent_run_id)
+        .or_else(|| env_agent_run_id(defaults))
         .unwrap_or_else(default_agent_run_id)
+}
+
+pub(crate) fn redacted_embedding_endpoint(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return "[invalid embedding endpoint]".to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let path = &rest[authority_end..];
+    let path_end = path.find(['?', '#']).unwrap_or(path.len());
+    format!("{scheme}://{host}{}", &path[..path_end])
 }
 
 fn default_agent_run_id() -> String {
@@ -1177,18 +1661,17 @@ pub fn retrieval_compose_profile() -> String {
     "real".to_string()
 }
 
-const MANAGED_LLAMACPP_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL_MANAGED";
-
-fn operator_explicit_llamacpp_endpoint_configured() -> bool {
-    std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-        && std::env::var(MANAGED_LLAMACPP_URL_ENV).is_err()
+pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
+    embedding_server_launch_mode_for_runtime(&SidecarRuntimeConfig::local())
 }
 
-pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
-    if let Some(mode) = std::env::var("CODESTORY_EMBED_SERVER_LAUNCH")
-        .ok()
+pub fn embedding_server_launch_mode_for_runtime(
+    runtime: &SidecarRuntimeConfig,
+) -> Result<EmbeddingServerLaunchMode> {
+    if let Some(mode) = runtime
+        .embedding
+        .server_launch
+        .as_deref()
         .map(|value| value.trim().to_ascii_lowercase())
         .and_then(|value| match value.as_str() {
             "native_spawned" | "native" => Some(EmbeddingServerLaunchMode::NativeSpawned),
@@ -1196,10 +1679,8 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
                 Some(EmbeddingServerLaunchMode::DockerComposeEmbed)
             }
             "external_endpoint" | "external" | "endpoint"
-                if !std::env::var("CODESTORY_EMBED_LLAMACPP_URL")
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty() =>
+                if runtime.embedding.endpoint_origin != EmbeddingEndpointOrigin::ManagedSidecar
+                    && !runtime.embedding.endpoint.trim().is_empty() =>
             {
                 Some(EmbeddingServerLaunchMode::ExternalEndpoint)
             }
@@ -1208,12 +1689,12 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
     {
         return Ok(mode);
     }
-    if std::env::var("CODESTORY_EMBED_SERVER_LAUNCH").is_ok() {
+    if runtime.embedding.server_launch.is_some() {
         anyhow::bail!(
             "CODESTORY_EMBED_SERVER_LAUNCH must be docker_compose_embed, native_spawned, or external_endpoint"
         );
     }
-    if operator_explicit_llamacpp_endpoint_configured() {
+    if runtime.embedding.endpoint_origin != EmbeddingEndpointOrigin::ManagedSidecar {
         return Ok(EmbeddingServerLaunchMode::ExternalEndpoint);
     }
     let request = crate::embeddings::embedding_accelerator_request();
@@ -1226,24 +1707,14 @@ pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
     }
 }
 
-fn env_port(name: &str, default: u16) -> Option<u16> {
-    std::env::var(name).ok().map(|value| {
+fn env_port(defaults: &SidecarRuntimeDefaults, name: &str, default: u16) -> Option<u16> {
+    defaults.get(name).map(|value| {
         value
             .parse()
             .ok()
             .filter(|port| *port != 0)
             .unwrap_or(default)
     })
-}
-
-fn env_flag(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.trim(),
-            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-        ),
-        Err(_) => default,
-    }
 }
 
 pub fn dir_size_bytes(path: &Path) -> u64 {
@@ -1777,7 +2248,6 @@ mod tests {
     fn explicit_llamacpp_url_selects_external_endpoint_launch() {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
-        let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
         let _url = EnvGuard::set(
             "CODESTORY_EMBED_LLAMACPP_URL",
             "http://127.0.0.1:37040/v1/embeddings",
@@ -1793,7 +2263,6 @@ mod tests {
     fn blank_llamacpp_url_does_not_select_external_endpoint_launch() {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
-        let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
         let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", " ");
         let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "linux/x86_64");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
@@ -1822,40 +2291,161 @@ mod tests {
     }
 
     #[test]
-    fn managed_llamacpp_url_after_activation_keeps_native_launch() {
+    fn managed_llamacpp_url_keeps_native_launch_without_environment_activation() {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
         let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
-        let _managed = EnvGuard::remove(MANAGED_LLAMACPP_URL_ENV);
         let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "windows/x86_64");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
         let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
 
-        runtime.activate_embed_url_default();
+        assert_eq!(
+            embedding_server_launch_mode_for_runtime(&runtime).expect("launch mode"),
+            EmbeddingServerLaunchMode::NativeSpawned
+        );
+        assert_eq!(
+            runtime.embedding.endpoint,
+            SidecarLayout::embed_base_url(runtime.embed_http_port)
+        );
+    }
+
+    #[test]
+    fn managed_llamacpp_url_is_retained_in_runtime_without_environment_mutation() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
 
         assert_eq!(
-            embedding_server_launch_mode().expect("launch mode"),
+            runtime.embedding.endpoint,
+            SidecarLayout::embed_base_url(runtime.embed_http_port)
+        );
+        assert!(std::env::var_os("CODESTORY_EMBED_LLAMACPP_URL").is_none());
+    }
+
+    #[test]
+    fn retained_runtime_profile_selection_does_not_reparse_process_environment() {
+        let _lock = crate::test_support::env_lock();
+        let cache = tempdir().expect("cache");
+        let poison_cache = tempdir().expect("poison cache");
+        let _cache = EnvGuard::remove("CODESTORY_CACHE_ROOT");
+        let _zoekt = EnvGuard::remove("CODESTORY_ZOEKT_PORT");
+        let _endpoint = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
+        let retained = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            None,
+            SidecarProfile::Local,
+            None,
+            cache.path(),
+        );
+        let _cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            poison_cache.path().to_str().expect("utf8 poison cache"),
+        );
+        let _zoekt = EnvGuard::set("CODESTORY_ZOEKT_PORT", "39999");
+        let _endpoint = EnvGuard::set(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            "http://127.0.0.1:39998/v1/embeddings",
+        );
+        let _run_id = EnvGuard::set("CODESTORY_AGENT_RUN_ID", "poison-run-id");
+
+        let selected = retained.with_profile_and_run_id(None, SidecarProfile::Local, None);
+        let selected_agent = retained.with_profile_and_run_id(None, SidecarProfile::Agent, None);
+
+        assert_eq!(selected.layout.zoekt_http_port, DEFAULT_ZOEKT_HTTP_PORT);
+        assert_eq!(
+            selected.layout.state_file,
+            cache.path().join("retrieval-sidecars.json")
+        );
+        assert_eq!(selected.embedding, retained.embedding);
+        assert!(!selected.layout.state_file.starts_with(poison_cache.path()));
+        assert_eq!(selected_agent.run_id.as_deref(), Some(DEFAULT_AGENT_RUN_ID));
+        assert!(!selected_agent.namespace.contains("poison-run-id"));
+    }
+
+    #[test]
+    fn retained_runtime_captures_removed_onnx_configuration_error() {
+        let _lock = crate::test_support::env_lock();
+        let _legacy = EnvGuard::set("CODESTORY_EMBED_ONNX_MODEL", "legacy.onnx");
+
+        let runtime = SidecarRuntimeConfig::local();
+
+        let error = runtime
+            .embedding
+            .configuration_error
+            .as_deref()
+            .expect("removed ONNX configuration error");
+        assert!(error.contains("CODESTORY_EMBED_ONNX_MODEL"), "{error}");
+        assert!(error.contains("no longer supported"), "{error}");
+    }
+
+    #[test]
+    fn ownership_redacts_external_embedding_endpoint_secrets() {
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.embedding.endpoint =
+            "http://username-secret:password-secret@127.0.0.1:8080/v1/embeddings?token=query-secret#fragment-secret"
+                .into();
+
+        let ownership = runtime.ownership();
+
+        assert_eq!(
+            ownership.ports.embed_url,
+            "http://127.0.0.1:8080/v1/embeddings"
+        );
+        for secret in [
+            "username-secret",
+            "password-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!ownership.ports.embed_url.contains(secret));
+        }
+    }
+
+    #[test]
+    fn explicit_native_launch_rewrites_external_endpoint_to_managed_sidecar() {
+        let _lock = crate::test_support::env_lock();
+        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
+        let _url = EnvGuard::set(
+            "CODESTORY_EMBED_LLAMACPP_URL",
+            "http://127.0.0.1:37040/v1/embeddings",
+        );
+        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+
+        assert_eq!(
+            runtime.embedding.endpoint_origin,
+            EmbeddingEndpointOrigin::ManagedSidecar
+        );
+        assert_eq!(
+            runtime.embedding.endpoint,
+            SidecarLayout::embed_base_url(runtime.embed_http_port)
+        );
+        assert_eq!(
+            embedding_server_launch_mode_for_runtime(&runtime).expect("native launch"),
             EmbeddingServerLaunchMode::NativeSpawned
         );
     }
 
     #[test]
-    fn managed_llamacpp_url_after_activation_retargets_runtime_url() {
+    fn external_endpoint_forces_external_launch_instead_of_managed_launch() {
         let _lock = crate::test_support::env_lock();
-        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
-        let _url = EnvGuard::set(
-            "CODESTORY_EMBED_LLAMACPP_URL",
-            "http://127.0.0.1:11111/v1/embeddings",
-        );
-        let _managed = EnvGuard::set(MANAGED_LLAMACPP_URL_ENV, "1");
+        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "docker_compose_embed");
+        let endpoint = "http://127.0.0.1:37040/v1/embeddings";
+        let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", endpoint);
         let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
 
-        runtime.activate_embed_url_default();
-
+        assert_eq!(runtime.embedding.endpoint, endpoint);
         assert_eq!(
-            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").expect("managed embed url"),
-            SidecarLayout::embed_base_url(runtime.embed_http_port)
+            runtime.embedding.endpoint_origin,
+            EmbeddingEndpointOrigin::ProcessEnvironment
+        );
+        assert_eq!(
+            runtime.embedding.server_launch.as_deref(),
+            Some("external_endpoint")
+        );
+        assert_eq!(
+            embedding_server_launch_mode_for_runtime(&runtime).expect("external launch"),
+            EmbeddingServerLaunchMode::ExternalEndpoint
         );
     }
 

@@ -5,7 +5,8 @@ pub use crate::search::engine::{
     EMBEDDING_QUERY_PREFIX_ENV, EMBEDDING_RUNTIME_MODE_ENV, EMBEDDING_TRUNCATE_DIM_ENV,
     EmbeddingProfileContract, EmbeddingRuntimeAvailability, HybridSearchConfig, HybridSearchHit,
     LLAMACPP_EMBEDDINGS_URL_ENV, LLAMACPP_REQUEST_COUNT_ENV, LlmSearchDoc,
-    STORED_VECTOR_ENCODING_ENV, embedding_profile_contract_from_env,
+    STORED_VECTOR_ENCODING_ENV, embedding_profile_contract_from_config,
+    embedding_profile_contract_from_env, embedding_runtime_availability_from_config,
     embedding_runtime_availability_from_env,
 };
 

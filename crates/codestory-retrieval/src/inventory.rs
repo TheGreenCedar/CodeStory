@@ -1,7 +1,8 @@
 use crate::compose::{EmbedModelInventory, embed_model_inventory};
 use crate::config::{SidecarRuntimeConfig, user_cache_root};
-use crate::generation::{manifest_has_current_sidecar_contract, manifest_unavailable_reason};
-use crate::health::probe_sidecar_health_with_embedding_device;
+use crate::generation::{
+    manifest_has_current_sidecar_contract, manifest_unavailable_reason_for_runtime,
+};
 use crate::qdrant_client::QdrantClient;
 use crate::retention::{
     FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
@@ -433,6 +434,7 @@ fn build_generation_retention_plan(
                         &store,
                         project_id,
                         &manifest,
+                        runtime,
                         &mut protection.errors,
                     );
                     Some(manifest)
@@ -458,11 +460,12 @@ fn build_generation_retention_plan(
     match manifest {
         Some(manifest) if manifest_has_current_sidecar_contract(project_id, &manifest) => {
             let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
-            let health = probe_sidecar_health_with_embedding_device(
+            let health = crate::health::probe_sidecar_health_for_runtime(
                 layout,
                 project_id,
                 Some(manifest),
                 &embedding_device,
+                runtime,
             );
             if health.retrieval_mode != "full" {
                 protection.errors.push(format!(
@@ -501,9 +504,12 @@ fn record_manifest_retention_freshness(
     store: &Store,
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
+    runtime: &SidecarRuntimeConfig,
     errors: &mut Vec<String>,
 ) {
-    if let Some(reason) = manifest_unavailable_reason(project_id, store, manifest) {
+    if let Some(reason) =
+        manifest_unavailable_reason_for_runtime(project_id, store, manifest, runtime)
+    {
         errors.push(format!(
             "active retrieval manifest is stale; pruning suppressed: {reason}"
         ));
@@ -1022,8 +1028,12 @@ mod tests {
         let mut manifest = crate::test_support::retrieval_manifest_fixture(project_id, "input");
         manifest.embedding_dim = Some(1);
         let mut errors = Vec::new();
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.embedding.backend = "llamacpp".into();
+        runtime.embedding.profile = "bge-base-en-v1.5".into();
+        runtime.embedding.model_id = None;
 
-        record_manifest_retention_freshness(&store, project_id, &manifest, &mut errors);
+        record_manifest_retention_freshness(&store, project_id, &manifest, &runtime, &mut errors);
 
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("active retrieval manifest is stale; pruning suppressed"));

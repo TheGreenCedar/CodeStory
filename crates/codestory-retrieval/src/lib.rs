@@ -51,19 +51,23 @@ pub use compose::{
 };
 pub use config::{
     DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
-    DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN,
+    DEFAULT_QDRANT_HTTP_PORT, DEFAULT_ZOEKT_HTTP_PORT, EmbeddingEndpointOrigin,
+    EmbeddingRuntimeConfig, EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN, RetrievalRuntimeConfig,
     SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile,
-    SidecarRuntimeConfig, ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN,
-    default_sidecar_image_pins, embedding_server_launch_mode, sidecar_runtime_auto,
+    SidecarRuntimeConfig, SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
+    ZOEKT_REAL_VERSION_PIN, ZOEKT_WEBSERVER_IMAGE_PIN, default_sidecar_image_pins,
+    embedding_server_launch_mode, embedding_server_launch_mode_for_runtime, sidecar_runtime_auto,
     sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id, user_cache_root,
 };
 #[cfg(feature = "test-support")]
 pub use config::{active_test_cache_root, with_test_cache_root};
 pub use embeddings::{
     BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingRuntimeProbe,
-    RETRIEVAL_EMBEDDING_DIM, embedding_backend_label, embedding_runtime_id,
-    ensure_product_embedding_backend, ensure_product_embedding_backend_for_runtime,
-    probe_product_embedding_runtime, qdrant_vector_dim,
+    LlamaCppEmbeddingClient, RETRIEVAL_EMBEDDING_DIM, embed_documents_for_runtime,
+    embed_query_for_runtime, embedding_backend_label, embedding_backend_label_for_runtime,
+    embedding_runtime_id, embedding_runtime_id_for_runtime, ensure_product_embedding_backend,
+    ensure_product_embedding_backend_for_runtime, probe_product_embedding_runtime,
+    probe_product_embedding_runtime_for_runtime, qdrant_vector_dim,
 };
 pub use executor::{QueryExecutor, QueryResult, QueryTrace, StageTrace, cancellation_flag};
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
@@ -97,7 +101,9 @@ pub use qdrant_storage::{
 };
 pub use query::{
     QueryBatchItem, QueryBatchRequest, QueryRequest, execute_retrieval_query,
-    execute_retrieval_query_with_cache, execute_strict_retrieval_query_batch_with_cache,
+    execute_retrieval_query_with_cache, execute_retrieval_query_with_cache_for_runtime,
+    execute_strict_retrieval_query_batch_with_cache,
+    execute_strict_retrieval_query_batch_with_cache_for_runtime,
 };
 pub use query_features::{QueryFeatures, QueryShape, classify_query};
 pub use ranker::rank_candidates;

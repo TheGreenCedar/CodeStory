@@ -1,5 +1,5 @@
 use crate::candidate::CandidateHit;
-use crate::config::SidecarLayout;
+use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embeddings::EmbeddingDeviceReadiness;
 use crate::qdrant_client::QdrantClient;
 use crate::scip_client::ScipClient;
@@ -16,6 +16,10 @@ pub trait SidecarSearch: Send + Sync {
         None
     }
 
+    fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
+        None
+    }
+
     fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
@@ -24,6 +28,7 @@ pub trait SidecarSearch: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct LiveSidecarSearch {
+    runtime: SidecarRuntimeConfig,
     layout: SidecarLayout,
     project_id: String,
     sidecar_generation: String,
@@ -49,8 +54,29 @@ impl LiveSidecarSearch {
         manifest: Option<&RetrievalIndexManifest>,
         embedding_device: Option<EmbeddingDeviceReadiness>,
     ) -> Self {
+        let runtime = crate::config::SidecarRuntimeConfig::for_project_profile(
+            None,
+            crate::config::SidecarProfile::Local,
+        );
+        Self::new_for_runtime_with_embedding_device(
+            &runtime,
+            layout,
+            project_id,
+            manifest,
+            embedding_device,
+        )
+        .expect("default embedding runtime configuration must be valid")
+    }
+
+    pub fn new_for_runtime_with_embedding_device(
+        runtime: &crate::config::SidecarRuntimeConfig,
+        layout: SidecarLayout,
+        project_id: String,
+        manifest: Option<&RetrievalIndexManifest>,
+        embedding_device: Option<EmbeddingDeviceReadiness>,
+    ) -> Result<Self> {
         let zoekt = ZoektClient::new(&layout);
-        let qdrant = QdrantClient::new(&layout);
+        let qdrant = QdrantClient::for_runtime(runtime)?;
         let sidecar_generation = manifest
             .and_then(|manifest| manifest.sidecar_generation.clone())
             .unwrap_or_else(|| format!("{project_id}-missing-manifest"));
@@ -60,7 +86,8 @@ impl LiveSidecarSearch {
         let qdrant_collection = manifest
             .map(|manifest| manifest.qdrant_collection.clone())
             .unwrap_or_else(|| format!("codestory_{project_id}_missing_manifest"));
-        Self {
+        Ok(Self {
+            runtime: runtime.clone(),
             layout,
             project_id,
             sidecar_generation,
@@ -69,7 +96,7 @@ impl LiveSidecarSearch {
             embedding_device,
             zoekt,
             qdrant,
-        }
+        })
     }
 
     pub fn layout(&self) -> &SidecarLayout {
@@ -92,6 +119,10 @@ impl SidecarSearch for LiveSidecarSearch {
 
     fn embedding_device_readiness(&self) -> Option<&EmbeddingDeviceReadiness> {
         self.embedding_device.as_ref()
+    }
+
+    fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
+        Some(&self.runtime)
     }
 
     fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {

@@ -31,4 +31,5 @@ ratatui = { workspace = true }
 
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["test-support"] }
+codestory-runtime = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

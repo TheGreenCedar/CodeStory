@@ -3,8 +3,8 @@ use crate::cache::RetrievalCacheKey;
 use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embeddings::{EmbeddingDeviceReadiness, embedding_device_readiness_for_runtime};
 use crate::executor::{QueryExecutor, QueryResult, cancellation_flag};
-use crate::generation::manifest_unavailable_reason;
-use crate::health::probe_sidecar_health_with_embedding_device;
+use crate::generation::manifest_unavailable_reason_for_runtime;
+use crate::health::probe_sidecar_health_for_runtime;
 use crate::index::{query_fingerprint, sidecar_project_id_for_root};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::query_features::classify_query;
@@ -52,19 +52,29 @@ pub fn execute_retrieval_query_with_cache(
     request: QueryRequest<'_>,
     cache: &mut RetrievalCache,
 ) -> Result<QueryResult> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(request.project_root);
+    execute_retrieval_query_with_cache_for_runtime(request, cache, &runtime)
+}
+
+pub fn execute_retrieval_query_with_cache_for_runtime(
+    request: QueryRequest<'_>,
+    cache: &mut RetrievalCache,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<QueryResult> {
     let QueryContext {
         layout,
         project_id,
         manifest,
         file_roles,
         embedding_device,
-    } = load_query_context(request.project_root, request.storage_path)?;
-    let sidecars = Arc::new(LiveSidecarSearch::new_with_embedding_device(
+    } = load_query_context(request.project_root, request.storage_path, runtime)?;
+    let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
+        runtime,
         layout,
         project_id,
         manifest.as_ref(),
         Some(embedding_device),
-    ));
+    )?);
     let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
     let mut executor = QueryExecutor {
         sidecars,
@@ -81,6 +91,15 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
     request: QueryBatchRequest<'_>,
     cache: &mut RetrievalCache,
 ) -> Result<Vec<QueryResult>> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(request.project_root);
+    execute_strict_retrieval_query_batch_with_cache_for_runtime(request, cache, &runtime)
+}
+
+pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
+    request: QueryBatchRequest<'_>,
+    cache: &mut RetrievalCache,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<Vec<QueryResult>> {
     if request.queries.is_empty() {
         return Ok(Vec::new());
     }
@@ -90,16 +109,21 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
         manifest,
         file_roles,
         embedding_device,
-    } = load_query_context(request.project_root, request.storage_path)?;
-    let sidecars = Arc::new(LiveSidecarSearch::new_with_embedding_device(
+    } = load_query_context(request.project_root, request.storage_path, runtime)?;
+    let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
+        runtime,
         layout,
         project_id,
         manifest.as_ref(),
         Some(embedding_device.clone()),
-    ));
+    )?);
     let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
-    let (mode, degraded_reason) =
-        resolve_batch_mode(sidecars.as_ref(), manifest.as_ref(), &embedding_device);
+    let (mode, degraded_reason) = resolve_batch_mode(
+        sidecars.as_ref(),
+        manifest.as_ref(),
+        &embedding_device,
+        runtime,
+    );
     if mode != RetrievalDegradedMode::Full {
         bail!(
             "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
@@ -252,10 +276,12 @@ struct QueryContext {
     embedding_device: EmbeddingDeviceReadiness,
 }
 
-fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryContext> {
-    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    runtime.activate_embed_url_default();
-    let embedding_device = embedding_device_readiness_for_runtime(&runtime);
+fn load_query_context(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<QueryContext> {
+    let embedding_device = embedding_device_readiness_for_runtime(runtime);
     let layout = runtime.layout.clone();
     let project_id = sidecar_project_id_for_root(project_root);
     let (manifest, file_roles) = if storage_path.exists() {
@@ -271,7 +297,9 @@ fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryC
                     "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
                 );
             }
-            if let Some(reason) = manifest_unavailable_reason(&project_id, &storage, manifest) {
+            if let Some(reason) =
+                manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
+            {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
                 );
@@ -308,6 +336,7 @@ fn resolve_batch_mode(
     sidecars: &dyn SidecarSearch,
     manifest: Option<&RetrievalIndexManifest>,
     embedding_device: &EmbeddingDeviceReadiness,
+    runtime: &SidecarRuntimeConfig,
 ) -> (RetrievalDegradedMode, Option<String>) {
     if let Some(manifest) = manifest {
         let Some(layout) = sidecars.layout() else {
@@ -316,11 +345,12 @@ fn resolve_batch_mode(
                 Some("sidecar_layout_missing".into()),
             );
         };
-        let report = probe_sidecar_health_with_embedding_device(
+        let report = probe_sidecar_health_for_runtime(
             layout,
             &manifest.project_id,
             Some(manifest.clone()),
             embedding_device,
+            runtime,
         );
         return derive_degraded_mode(&report.zoekt, &report.qdrant, &report.scip);
     }

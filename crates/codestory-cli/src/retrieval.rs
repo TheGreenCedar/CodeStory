@@ -5,8 +5,8 @@ use std::time::Duration;
 use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime, execute_retrieval_query,
-    sidecar_down_for_runtime, sidecar_up_with_runtime_preserving_launch, strict_sidecar_status,
+    SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime,
+    sidecar_down_for_runtime, sidecar_up_with_runtime_preserving_launch,
     strict_sidecar_status_for_runtime,
 };
 
@@ -39,8 +39,8 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         Some(runtime.cache_root.as_path()),
     );
     let sidecar_profile = cmd.profile;
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &runtime.project_root,
+    let sidecar = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
     );
@@ -74,7 +74,6 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
             },
             |report| &report.state,
             |report| {
-                activate_retrieval_profile_env(Some(sidecar_profile), sidecar.run_id.as_deref());
                 let project_qdrant_repair =
                     codestory_retrieval::repair_project_qdrant_collection_for_runtime(
                         &runtime.project_root,
@@ -113,8 +112,8 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
 
 fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &runtime.project_root,
+    let sidecar = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
@@ -126,8 +125,8 @@ fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
 
 fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &runtime.project_root,
+    let sidecar = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
@@ -159,8 +158,8 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
         .or_else(|| cmd.run_id.as_ref().map(|_| CliSidecarProfile::Agent));
     let mut agent_run_id = None;
     let report = if let Some(profile) = profile {
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-            &runtime.project_root,
+        let sidecar = runtime.sidecar.with_profile_and_run_id(
+            Some(&runtime.project_root),
             profile.into(),
             cmd.run_id.as_deref(),
         );
@@ -173,7 +172,11 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
             sidecar,
         )
     } else {
-        strict_sidecar_status(&runtime.project_root, Some(&runtime.storage_path))
+        strict_sidecar_status_for_runtime(
+            &runtime.project_root,
+            Some(&runtime.storage_path),
+            runtime.sidecar.clone(),
+        )
     }
     .context("retrieval status")?;
     let readiness_broker = crate::readiness_broker::observe_broker_snapshot(
@@ -216,13 +219,17 @@ pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<
 fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let result = execute_retrieval_query(QueryRequest {
-        project_root: &runtime.project_root,
-        storage_path: &runtime.storage_path,
-        query: &cmd.query,
-        budget_ms: cmd.budget_ms,
-        cancelled: None,
-    })
+    let result = codestory_retrieval::execute_retrieval_query_with_cache_for_runtime(
+        QueryRequest {
+            project_root: &runtime.project_root,
+            storage_path: &runtime.storage_path,
+            query: &cmd.query,
+            budget_ms: cmd.budget_ms,
+            cancelled: None,
+        },
+        &mut codestory_retrieval::RetrievalCache::new(),
+        &runtime.sidecar,
+    )
     .context("retrieval query")?;
     emit_retrieval_query(cmd.format, &result, cmd.output_file.as_deref())
 }
@@ -230,15 +237,12 @@ fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
 fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let sidecar_profile = cmd.profile.unwrap_or(CliSidecarProfile::Local);
-    activate_retrieval_profile_env(Some(sidecar_profile), cmd.run_id.as_deref());
-    prepare_retrieval_index_embedding_env(sidecar_profile);
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-        &runtime.project_root,
+    let sidecar = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
     );
-    prepare_retrieval_index_sidecar_env(&sidecar);
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     ensure_retrieval_index_embedding_policy(&sidecar)?;
@@ -262,39 +266,6 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
 fn ensure_retrieval_index_embedding_policy(sidecar: &SidecarRuntimeConfig) -> Result<()> {
     codestory_retrieval::ensure_product_embedding_backend_for_runtime(sidecar)
         .context("retrieval index embedding device policy")
-}
-
-fn prepare_retrieval_index_embedding_env(profile: CliSidecarProfile) {
-    if matches!(profile, CliSidecarProfile::Agent) {
-        crate::embedding_config::prepare_bundled_llamacpp_client_env_defaults();
-    }
-}
-
-fn prepare_retrieval_index_sidecar_env(sidecar: &SidecarRuntimeConfig) {
-    sidecar.activate_embed_url();
-}
-
-pub(crate) fn activate_retrieval_profile_env(
-    profile: Option<crate::args::CliSidecarProfile>,
-    run_id: Option<&str>,
-) {
-    if profile.is_some() || run_id.is_some() {
-        let profile = match profile {
-            Some(crate::args::CliSidecarProfile::Local) => "local",
-            Some(crate::args::CliSidecarProfile::Agent) | None => "agent",
-        };
-        // SAFETY: retrieval CLI commands are short-lived processes and set this before sidecar
-        // layout resolution or worker threads are started.
-        unsafe {
-            std::env::set_var("CODESTORY_RETRIEVAL_PROFILE", profile);
-        }
-    }
-    if let Some(run_id) = run_id {
-        // SAFETY: see the profile environment setup above.
-        unsafe {
-            std::env::set_var("CODESTORY_SIDECAR_RUN_ID", run_id);
-        }
-    }
 }
 
 fn run_retrieval_index_refresh(
@@ -326,8 +297,7 @@ fn run_retrieval_index_refresh(
 pub(crate) fn finalize_retrieval_index_for_runtime(
     runtime: &RuntimeContext,
 ) -> Result<FinalizeIndexOutcome> {
-    let sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
-    finalize_retrieval_index_for_sidecar_runtime(runtime, &sidecar)
+    finalize_retrieval_index_for_sidecar_runtime(runtime, &runtime.sidecar)
 }
 
 pub(crate) fn finalize_retrieval_index_for_sidecar_runtime(
@@ -352,7 +322,7 @@ fn ensure_local_profile_handoff(
     if indexed_sidecar.profile != SidecarProfile::Local {
         return Ok(());
     }
-    let default_sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    let default_sidecar = runtime.sidecar.clone();
     if let Some(mismatch) = sidecar_runtime_mismatch(indexed_sidecar, &default_sidecar) {
         anyhow::bail!("{mismatch}");
     }
@@ -928,34 +898,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_retrieval_index_defaults_to_llamacpp_backend() {
+    fn sidecar_runtime_retains_backend_endpoint_profile_and_run_without_env_mutation() {
         let _lock = crate::config::config_env_test_lock();
         let _runtime_mode = EnvGuard::remove("CODESTORY_EMBED_RUNTIME_MODE");
         let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
 
-        prepare_retrieval_index_embedding_env(CliSidecarProfile::Agent);
-
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_BACKEND").as_deref(),
-            Ok("llamacpp")
-        );
-    }
-
-    #[test]
-    fn local_retrieval_index_does_not_force_llamacpp_backend() {
-        let _lock = crate::config::config_env_test_lock();
-        let _runtime_mode = EnvGuard::remove("CODESTORY_EMBED_RUNTIME_MODE");
-        let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
-
-        prepare_retrieval_index_embedding_env(CliSidecarProfile::Local);
-
-        assert!(std::env::var("CODESTORY_EMBED_BACKEND").is_err());
-    }
-
-    #[test]
-    fn retrieval_index_activates_selected_sidecar_embed_url_default() {
-        let _lock = crate::config::config_env_test_lock();
-        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let project = tempfile::TempDir::new().expect("project");
         let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
             project.path(),
@@ -964,45 +911,12 @@ mod tests {
         );
         let expected = codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
 
-        prepare_retrieval_index_sidecar_env(&sidecar);
-
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").as_deref(),
-            Ok(expected.as_str())
-        );
-    }
-
-    #[test]
-    fn run_id_without_profile_selects_agent_over_ambient_local_profile() {
-        let _lock = crate::config::config_env_test_lock();
-        let _retrieval_profile = EnvGuard::set("CODESTORY_RETRIEVAL_PROFILE", "local");
-        let _sidecar_profile = EnvGuard::set("CODESTORY_SIDECAR_PROFILE", "local");
-        let _run_id = EnvGuard::remove("CODESTORY_SIDECAR_RUN_ID");
-
-        activate_retrieval_profile_env(None, Some("packet-search-eval"));
-
-        assert_eq!(
-            std::env::var("CODESTORY_RETRIEVAL_PROFILE").as_deref(),
-            Ok("agent")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_SIDECAR_RUN_ID").as_deref(),
-            Ok("packet-search-eval")
-        );
-
-        activate_retrieval_profile_env(
-            Some(crate::args::CliSidecarProfile::Local),
-            Some("explicit-local"),
-        );
-
-        assert_eq!(
-            std::env::var("CODESTORY_RETRIEVAL_PROFILE").as_deref(),
-            Ok("local")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_SIDECAR_RUN_ID").as_deref(),
-            Ok("explicit-local")
-        );
+        assert_eq!(sidecar.embedding.backend, "llamacpp");
+        assert_eq!(sidecar.embedding.endpoint, expected);
+        assert_eq!(sidecar.profile, SidecarProfile::Agent);
+        assert_eq!(sidecar.run_id.as_deref(), Some("packet-search-eval"));
+        assert!(std::env::var("CODESTORY_EMBED_BACKEND").is_err());
+        assert!(std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err());
     }
 
     #[test]

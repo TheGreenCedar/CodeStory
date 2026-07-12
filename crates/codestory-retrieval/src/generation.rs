@@ -45,11 +45,24 @@ pub fn manifest_has_current_sidecar_contract(
         && manifest.dense_reason_counts_json.is_some()
 }
 
+#[cfg(test)]
 pub fn manifest_staleness_reason(
     storage: &Store,
     manifest: &RetrievalIndexManifest,
 ) -> Option<String> {
-    let embedding_backend = crate::embeddings::embedding_runtime_id();
+    manifest_staleness_reason_for_runtime(
+        storage,
+        manifest,
+        &crate::config::SidecarRuntimeConfig::local(),
+    )
+}
+
+pub fn manifest_staleness_reason_for_runtime(
+    storage: &Store,
+    manifest: &RetrievalIndexManifest,
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<String> {
+    let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     if manifest.embedding_backend.as_deref() != Some(embedding_backend.as_str()) {
         return Some(format!(
             "sidecar_embedding_backend_changed: manifest={} current={embedding_backend}",
@@ -156,15 +169,30 @@ pub fn manifest_staleness_reason(
     }
 }
 
+#[cfg(test)]
 pub fn manifest_unavailable_reason(
     project_id: &str,
     storage: &Store,
     manifest: &RetrievalIndexManifest,
 ) -> Option<String> {
+    manifest_unavailable_reason_for_runtime(
+        project_id,
+        storage,
+        manifest,
+        &crate::config::SidecarRuntimeConfig::local(),
+    )
+}
+
+pub fn manifest_unavailable_reason_for_runtime(
+    project_id: &str,
+    storage: &Store,
+    manifest: &RetrievalIndexManifest,
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<String> {
     if !manifest_has_current_sidecar_contract(project_id, manifest) {
         return Some("sidecar_manifest_generation_contract_missing".into());
     }
-    manifest_staleness_reason(storage, manifest)
+    manifest_staleness_reason_for_runtime(storage, manifest, runtime)
         .map(|reason| format!("sidecar_manifest_stale: {reason}"))
 }
 

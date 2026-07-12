@@ -114,9 +114,10 @@ struct ReportSidecarStatus {
 }
 
 fn report_sidecar_status(runtime: &RuntimeContext) -> ReportSidecarStatus {
-    match codestory_retrieval::strict_sidecar_status(
+    match codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
+        runtime.sidecar.clone(),
     ) {
         Ok(report) => {
             let manifest_generation = report

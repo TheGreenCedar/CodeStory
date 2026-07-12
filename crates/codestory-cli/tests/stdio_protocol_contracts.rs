@@ -2,9 +2,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -33,6 +36,111 @@ struct StdioServer {
 }
 
 struct RemoveDirOnDrop(PathBuf);
+
+struct FakeEmbeddingEndpoint {
+    url: String,
+    response_vector: Vec<f32>,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeEmbeddingEndpoint {
+    fn spawn(vector: Vec<f32>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake embedding endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("set fake endpoint nonblocking");
+        let address = listener.local_addr().expect("fake endpoint address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_requests = Arc::clone(&requests);
+        let worker_stop = Arc::clone(&stop);
+        let response_vector = vector.clone();
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make accepted fake endpoint stream blocking");
+                        let body = read_http_request_body(&mut stream);
+                        let input_count = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|request| {
+                                request.get("input").and_then(Value::as_array).map(Vec::len)
+                            })
+                            .expect("embedding request input array");
+                        worker_requests.lock().expect("request log").push(body);
+                        let response_body = json!({
+                            "data": (0..input_count)
+                                .map(|index| json!({"index": index, "embedding": &vector}))
+                                .collect::<Vec<_>>(),
+                        })
+                        .to_string();
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .expect("write fake embedding response");
+                        stream.flush().expect("flush fake embedding response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept fake embedding request: {error}"),
+                }
+            }
+        });
+        Self {
+            url: format!("http://{address}/v1/embeddings"),
+            response_vector,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.requests.lock().expect("request log").clone()
+    }
+}
+
+impl Drop for FakeEmbeddingEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("join fake embedding endpoint");
+        }
+    }
+}
+
+fn read_http_request_body(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set fake endpoint read timeout");
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("read request header");
+        request.push(byte[0]);
+        assert!(request.len() < 64 * 1024, "request header too large");
+    }
+    let header = String::from_utf8_lossy(&request);
+    let content_length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("content length"))
+        })
+        .unwrap_or(0);
+    let mut body = vec![0_u8; content_length];
+    stream.read_exact(&mut body).expect("read request body");
+    String::from_utf8(body).expect("embedding request utf8")
+}
 
 impl Drop for RemoveDirOnDrop {
     fn drop(&mut self) {
@@ -402,6 +510,31 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
         .spawn()
         .expect("spawn multi-project stdio server");
+    let stdin = child.stdin.take().expect("multi-project stdio stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("multi-project stdio stdout"));
+    StdioServer {
+        child,
+        stdin,
+        stdout,
+    }
+}
+
+fn spawn_multi_project_stdio_server_with_project_network_config(cache_root: &Path) -> StdioServer {
+    let mut child = test_support::cli_command()
+        .arg("serve")
+        .arg("--stdio")
+        .arg("--multi-project")
+        .arg("--refresh")
+        .arg("full")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG", "1")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
+        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
+        .spawn()
+        .expect("spawn multi-project network-config stdio server");
     let stdin = child.stdin.take().expect("multi-project stdio stdin");
     let stdout = BufReader::new(child.stdout.take().expect("multi-project stdio stdout"));
     StdioServer {
@@ -1269,6 +1402,158 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
     );
     assert_eq!(first_snapshot["root"], first_again["root"]);
     assert_ne!(first_snapshot["root"], second_snapshot["root"]);
+}
+
+#[test]
+fn multi_project_stdio_keeps_project_embedding_endpoints_isolated_across_a_b_a() {
+    let first = tempfile::tempdir().expect("first workspace");
+    let second = tempfile::tempdir().expect("second workspace");
+    let cache_root = tempfile::tempdir().expect("multi-project cache root");
+    let first_endpoint = FakeEmbeddingEndpoint::spawn(vec![1.0; 768]);
+    let second_endpoint = FakeEmbeddingEndpoint::spawn(vec![-1.0; 768]);
+    write_tiny_rust_workspace(first.path());
+    write_tiny_rust_workspace(second.path());
+    fs::write(
+        first.path().join(".codestory.toml"),
+        format!(
+            "embedding_endpoint = {:?}\nembedding_query_prefix = \"project-a:\"\nembedding_document_prefix = \"project-a:\"\n",
+            first_endpoint.url
+        ),
+    )
+    .expect("write first runtime config");
+    fs::write(
+        second.path().join(".codestory.toml"),
+        format!(
+            "embedding_endpoint = {:?}\nembedding_query_prefix = \"project-b:\"\nembedding_document_prefix = \"project-b:\"\n",
+            second_endpoint.url
+        ),
+    )
+    .expect("write second runtime config");
+
+    let mut server =
+        spawn_multi_project_stdio_server_with_project_network_config(cache_root.path());
+    let status_request = |id: &str, project: &Path| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {"project": project}}
+        })
+    };
+    writeln!(server.stdin, "{}", status_request("config-a", first.path()))
+        .expect("queue project A status");
+    writeln!(
+        server.stdin,
+        "{}",
+        status_request("config-b", second.path())
+    )
+    .expect("queue project B status");
+    server.stdin.flush().expect("flush A/B status requests");
+    assert_tool_success(&read_json(&mut server), json!("config-a"));
+    assert_tool_success(&read_json(&mut server), json!("config-b"));
+
+    let first_before = first_endpoint.snapshot();
+    let second_before = second_endpoint.snapshot();
+    assert!(!first_before.is_empty(), "project A endpoint was not used");
+    assert!(!second_before.is_empty(), "project B endpoint was not used");
+    assert!(
+        first_before
+            .iter()
+            .all(|request| request.contains("project-a:") && !request.contains("project-b:")),
+        "project A endpoint received cross-project input: {first_before:?}"
+    );
+    assert!(
+        second_before
+            .iter()
+            .all(|request| request.contains("project-b:") && !request.contains("project-a:")),
+        "project B endpoint received cross-project input: {second_before:?}"
+    );
+
+    assert_tool_success(
+        &send_json(&mut server, status_request("config-a-again", first.path())),
+        json!("config-a-again"),
+    );
+    let first_after = first_endpoint.snapshot();
+    let second_after = second_endpoint.snapshot();
+    assert!(
+        first_after.len() > first_before.len(),
+        "A again must reuse project A's retained endpoint"
+    );
+    assert_eq!(
+        second_after.len(),
+        second_before.len(),
+        "A again must not touch project B's endpoint"
+    );
+
+    let persisted_embeddings = |project: &Path| {
+        let canonical = fs::canonicalize(project).expect("canonical project");
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in canonical.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let storage_path = cache_root
+            .path()
+            .join(format!("{hash:016x}"))
+            .join("codestory.db");
+        codestory_runtime::stored_semantic_embeddings_for_test(&storage_path)
+            .expect("read persisted semantic documents through runtime boundary")
+    };
+    let first_vectors = persisted_embeddings(first.path());
+    let second_vectors = persisted_embeddings(second.path());
+    assert!(
+        !first_vectors.is_empty(),
+        "project A persisted no embeddings"
+    );
+    assert!(
+        !second_vectors.is_empty(),
+        "project B persisted no embeddings"
+    );
+    assert!(
+        first_vectors
+            .iter()
+            .all(|vector| vector.len() == 768 && vector.iter().all(|value| *value > 0.0)),
+        "project A did not persist vectors returned by endpoint A"
+    );
+    assert!(
+        second_vectors
+            .iter()
+            .all(|vector| vector.len() == 768 && vector.iter().all(|value| *value < 0.0)),
+        "project B did not persist vectors returned by endpoint B"
+    );
+
+    assert!(
+        first_after
+            .iter()
+            .any(|request| request.contains("project-a:codestory health probe")),
+        "project A retained config never routed its semantic health query"
+    );
+    assert!(
+        second_after
+            .iter()
+            .any(|request| request.contains("project-b:codestory health probe")),
+        "project B retained config never routed its semantic health query"
+    );
+    let first_query = &first_endpoint.response_vector;
+    let second_query = &second_endpoint.response_vector;
+    let cosine = |left: &[f32], right: &[f32]| {
+        let dot = left
+            .iter()
+            .zip(right)
+            .map(|(left, right)| left * right)
+            .sum::<f32>();
+        let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+        let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
+        dot / (left_norm * right_norm)
+    };
+    assert!(
+        cosine(first_query, &first_vectors[0]) > cosine(first_query, &second_vectors[0]),
+        "project A semantic query must prefer project A's persisted vectors"
+    );
+    assert!(
+        cosine(second_query, &second_vectors[0]) > cosine(second_query, &first_vectors[0]),
+        "project B semantic query must prefer project B's persisted vectors"
+    );
 }
 
 #[test]

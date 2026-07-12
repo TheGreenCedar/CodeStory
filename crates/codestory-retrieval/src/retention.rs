@@ -1238,6 +1238,7 @@ mod tests {
             embed_http_port: 0,
             cleanup_command: String::new(),
             labels: BTreeMap::new(),
+            ..SidecarRuntimeConfig::local()
         };
         let local = runtime(
             SidecarProfile::Local,

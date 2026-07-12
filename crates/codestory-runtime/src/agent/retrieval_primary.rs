@@ -10,11 +10,13 @@ use codestory_contracts::api::{
     RetrievalStageTimingDto, SearchHit,
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
+#[cfg(test)]
+use codestory_retrieval::sidecar_runtime_auto;
 use codestory_retrieval::{
     CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
-    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache,
-    execute_strict_retrieval_query_batch_with_cache, is_phantom_sidecar_hit,
-    sidecar_project_id_for_root, sidecar_runtime_auto, strict_sidecar_status_for_runtime,
+    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
+    execute_strict_retrieval_query_batch_with_cache_for_runtime, is_phantom_sidecar_hit,
+    sidecar_project_id_for_root, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
 use std::collections::{BTreeMap, HashMap};
@@ -107,7 +109,8 @@ pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -
     let Ok(storage_path) = controller.require_storage_path() else {
         return Some("sidecar retrieval primary requires an index storage path".into());
     };
-    let status = sidecar_mode_status_for_project(&project_root, &storage_path);
+    let status =
+        sidecar_mode_status_for_runtime(&project_root, &storage_path, &controller.runtime_config);
     let reason = status
         .degraded_reason
         .map(|reason| format!("; reason={reason}"))
@@ -130,13 +133,20 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
         .unwrap_or_else(|| "<project>".to_string());
     let recovery_commands = project_root
         .as_deref()
-        .map(sidecar_retrieval_recovery_commands)
+        .map(|project_root| {
+            sidecar_retrieval_recovery_commands_for_runtime(
+                project_root,
+                &controller.runtime_config,
+            )
+        })
         .unwrap_or_else(|| sidecar_retrieval_recovery_commands_for_project(&project, None));
     ApiError::retrieval_unavailable(reason, project.clone(), recovery_commands)
 }
 
-fn sidecar_retrieval_recovery_commands(project_root: &Path) -> Vec<String> {
-    let runtime = sidecar_runtime_auto(project_root);
+fn sidecar_retrieval_recovery_commands_for_runtime(
+    project_root: &Path,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Vec<String> {
     let agent_run_id = (runtime.profile == SidecarProfile::Agent)
         .then_some(runtime.run_id.as_deref())
         .flatten();
@@ -243,9 +253,10 @@ fn sidecar_mode_is_required_full(controller: &AppController) -> bool {
     let Ok(storage_path) = controller.require_storage_path() else {
         return false;
     };
-    sidecar_status_can_serve_primary(&sidecar_mode_status_for_project(
+    sidecar_status_can_serve_primary(&sidecar_mode_status_for_runtime(
         &project_root,
         &storage_path,
+        &controller.runtime_config,
     ))
 }
 
@@ -264,9 +275,18 @@ struct SidecarModeStatus {
     degraded_reason: Option<String>,
 }
 
+#[cfg(test)]
 fn sidecar_mode_status_for_project(project_root: &Path, storage_path: &Path) -> SidecarModeStatus {
     let runtime = sidecar_runtime_auto(project_root);
-    match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime) {
+    sidecar_mode_status_for_runtime(project_root, storage_path, &runtime)
+}
+
+fn sidecar_mode_status_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> SidecarModeStatus {
+    match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime.clone()) {
         Ok(report) => SidecarModeStatus {
             profile: report
                 .ownership
@@ -356,7 +376,7 @@ pub(crate) fn run_sidecar_query(
         .require_storage_path()
         .map_err(|error| anyhow::anyhow!("storage path required: {}", error.message))?;
     with_detached_sidecar_query_cache(controller, |cache| {
-        execute_retrieval_query_with_cache(
+        execute_retrieval_query_with_cache_for_runtime(
             QueryRequest {
                 project_root: &project_root,
                 storage_path: &storage_path,
@@ -365,6 +385,7 @@ pub(crate) fn run_sidecar_query(
                 cancelled: None,
             },
             cache,
+            &controller.runtime_config,
         )
     })
 }
@@ -387,7 +408,7 @@ pub(crate) fn run_sidecar_query_batch(
         })
         .collect::<Vec<_>>();
     with_detached_sidecar_query_cache(controller, |cache| {
-        execute_strict_retrieval_query_batch_with_cache(
+        execute_strict_retrieval_query_batch_with_cache_for_runtime(
             QueryBatchRequest {
                 project_root: &project_root,
                 storage_path: &storage_path,
@@ -395,6 +416,7 @@ pub(crate) fn run_sidecar_query_batch(
                 cancelled: None,
             },
             cache,
+            &controller.runtime_config,
         )
     })
 }
