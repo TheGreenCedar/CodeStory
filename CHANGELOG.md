@@ -64,6 +64,20 @@
 - Retried packaged-proof temporary directory removal after transient executable
   locks while keeping persistent cleanup failures fail-closed, preventing a
   successful Windows managed-plugin handoff from failing during teardown.
+- Made managed CLI provisioning cross-process single-flight: one publisher now
+  downloads, extracts, checksum-validates, probes, and atomically publishes a
+  release while waiters reuse the verified result. Lock ownership is published
+  atomically with process-start identity, acquisition fails closed when that
+  identity cannot be established, and incomplete initialization is
+  reclaimed only after its owner exits. Orphaned pending-owner files are
+  removed with the same process-identity checks, deferring expensive identity
+  probes until the stale threshold while live and young malformed artifacts
+  remain protected; malformed, wrong-version, or
+  checksum-mismatched installs are quarantined with bounded retention and
+  reprovisioned, while locked or unmovable targets fail closed. Publication
+  states are exposed as redacted plugin-runtime warnings, and native packaged
+  proof now includes macOS x64 alongside the existing five release targets.
+
 - Extended the retrieval generalization guard from derived query literals to
   direct and split Rust string dependencies on eval/query corpus paths across
   production crates, including benchmark manifests, query catalogs, packet

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -59,7 +59,7 @@ function releaseAssetForPlatform(version) {
       ? "windows-arm64"
       : process.platform === "linux" && process.arch === "x64"
         ? "linux-x64"
-        : process.platform === "linux" && process.arch === "arm64"
+      : process.platform === "linux" && process.arch === "arm64"
           ? "linux-arm64"
           : process.platform === "darwin" && process.arch === "x64"
             ? "macos-x64"
@@ -72,8 +72,70 @@ function releaseAssetForPlatform(version) {
   return { archiveBase, archiveName };
 }
 
+function managedReleaseManifest(version, executablePath, sha256) {
+  const { archiveName } = releaseAssetForPlatform(version);
+  const target = archiveName.slice(`codestory-cli-v${version}-`.length).replace(/\.(?:zip|tar\.gz)$/u, "");
+  return {
+    path: executablePath,
+    sha256,
+    version,
+    build_source: "github_release",
+    repo_ref: `v${version}`,
+    archive: archiveName,
+    archive_url: `https://github.com/TheGreenCedar/CodeStory/releases/download/v${version}/${archiveName}`,
+    archive_sha256: "0".repeat(64),
+    target,
+  };
+}
+
+async function writeReleaseFixture(releaseDir, version) {
+  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
+  const stageDir = join(releaseDir, archiveBase);
+  const cliName = process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli";
+  const cliPath = join(stageDir, cliName);
+  const archivePath = join(releaseDir, archiveName);
+  await mkdir(stageDir, { recursive: true });
+  await writeFakeCli(cliPath);
+  const packArgs = archiveName.endsWith(".zip")
+    ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
+    : ["-czf", archivePath, "-C", releaseDir, archiveBase];
+  const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
+  assert.equal(pack.status, 0, pack.stderr);
+  const archiveSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
+  const sumsPath = join(releaseDir, "SHA256SUMS.txt");
+  await writeFile(sumsPath, `${archiveSha256}  ${archiveName}\n`, "utf8");
+  return { archiveName, archivePath, archiveSha256, cliName, sumsPath };
+}
+
+function spawnLauncher(launcher, env) {
+  const child = spawn(process.execPath, [launcher], {
+    env: { ...process.env, CODESTORY_CLI: "", ...env },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "codestory://status" } })}\n`);
+  const completed = once(child, "close").then(([status, signal]) => ({ status, signal, stdout, stderr }));
+  return { child, completed };
+}
+
+async function waitForPath(pathname, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(pathname);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  assert.fail(`timed out waiting for ${pathname}`);
+}
+
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
@@ -391,7 +453,11 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256, version }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
     const result = spawnSync(process.execPath, [launcher], {
@@ -597,9 +663,10 @@ test("managed cli retention reclaims an abandoned lock and provisioning sentinel
     await writeFile(
       join(lockDir, "owner.json"),
       JSON.stringify({
-        pid: process.pid,
+        pid: 2147483647,
         token: "abandoned",
         purpose: "retention",
+        process_start_identity: "dead:process",
         started_at: "2000-01-01T00:00:00.000Z",
       }),
       "utf8",
@@ -622,6 +689,264 @@ test("managed cli retention reclaims an abandoned lock and provisioning sentinel
     await assert.rejects(access(stale.versionDir));
     await assert.rejects(access(lockDir));
   } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention never reclaims an old lock owned by the live process", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-live-lock-"));
+  try {
+    const processStartIdentity = launcherTest.processStartIdentity(process.pid);
+    assert.ok(processStartIdentity, `process start identity unavailable on ${process.platform}`);
+    const stale = await writeManagedCliFixture(dataDir, "0.13.9");
+    await writeManagedCliFixture(dataDir, "0.14.0");
+    const active = await writeManagedCliFixture(dataDir, "0.14.1");
+    const lockDir = join(dataDir, "codestory-cli", ".retention-lock");
+    await mkdir(lockDir);
+    await writeFile(join(lockDir, "owner.json"), JSON.stringify({
+      pid: process.pid,
+      token: "live",
+      purpose: "retention",
+      process_start_identity: processStartIdentity,
+      started_at: "2000-01-01T00:00:00.000Z",
+    }), "utf8");
+    const probeVersion = (resolved) => ({ status: 0, error: null, version: resolved.version });
+    const report = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probeVersion({ version: "0.14.1" }),
+      { dataDir, probeVersion },
+    );
+    assert.deepEqual(report.removed, []);
+    assert.equal(report.warnings.includes("managed_cli_retention_locked"), true);
+    await access(lockDir);
+    await access(stale.versionDir);
+
+    await writeFile(join(lockDir, "owner.json"), JSON.stringify({
+      pid: process.pid,
+      token: "reused-pid",
+      purpose: "retention",
+      process_start_identity: "different-process-start",
+      started_at: "2000-01-01T00:00:00.000Z",
+    }), "utf8");
+    const reclaimed = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probeVersion({ version: "0.14.1" }),
+      { dataDir, probeVersion },
+    );
+    assert.deepEqual(reclaimed.removed.map((entry) => entry.version), ["0.13.9"]);
+    await assert.rejects(access(lockDir));
+    await assert.rejects(access(stale.versionDir));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli lock fails closed when self process identity is unavailable", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-lock-no-identity-"));
+  const root = join(dataDir, "codestory-cli");
+  await mkdir(root);
+  try {
+    assert.throws(
+      () => launcherTest.acquireManagedCliLock(root, "no-identity", 0, {
+        processStartIdentity: () => null,
+      }),
+      /managed_cli_process_identity_unavailable/u,
+    );
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli pending-owner cleanup protects live and young artifacts", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-pending-owner-"));
+  const root = join(dataDir, "codestory-cli");
+  await mkdir(root);
+  const identity = launcherTest.processStartIdentity(process.pid);
+  assert.ok(identity, `process start identity unavailable on ${process.platform}`);
+  const liveToken = "1".repeat(32);
+  const deadToken = "2".repeat(32);
+  const youngToken = "3".repeat(32);
+  const oldToken = "4".repeat(32);
+  const reusedToken = "5".repeat(32);
+  const live = join(root, `.retention-lock.owner-${process.pid}-${liveToken}`);
+  const dead = join(root, `.retention-lock.owner-2147483647-${deadToken}`);
+  const young = join(root, `.retention-lock.owner-8-${youngToken}`);
+  const old = join(root, `.retention-lock.owner-9-${oldToken}`);
+  const reused = join(root, `.retention-lock.owner-${process.pid}-${reusedToken}`);
+  try {
+    await writeFile(live, JSON.stringify({
+      pid: process.pid,
+      purpose: "waiter",
+      token: liveToken,
+      process_start_identity: identity,
+      started_at: "2000-01-01T00:00:00.000Z",
+    }));
+    await writeFile(dead, JSON.stringify({
+      pid: 2147483647,
+      purpose: "waiter",
+      token: deadToken,
+      process_start_identity: "dead:process",
+      started_at: new Date().toISOString(),
+    }));
+    await writeFile(young, "{partial");
+    await writeFile(old, "{malformed");
+    await writeFile(reused, JSON.stringify({
+      pid: process.pid,
+      purpose: "waiter",
+      token: reusedToken,
+      process_start_identity: "different-process-start",
+      started_at: "2000-01-01T00:00:00.000Z",
+    }));
+    const staleTime = new Date(Date.now() - 11 * 60 * 1000);
+    await utimes(old, staleTime, staleTime);
+    await utimes(reused, staleTime, staleTime);
+
+    assert.equal(launcherTest.reclaimStaleManagedCliPendingOwners(root), 3);
+    await access(live);
+    await access(young);
+    await assert.rejects(access(dead));
+    await assert.rejects(access(old));
+    await assert.rejects(access(reused));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli pending-owner cleanup skips identity probes for 64 young live records", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-young-pending-"));
+  const root = join(dataDir, "codestory-cli");
+  await mkdir(root);
+  let identityProbes = 0;
+  try {
+    for (let index = 0; index < 64; index += 1) {
+      const token = index.toString(16).padStart(32, "0");
+      await writeFile(
+        join(root, `.retention-lock.owner-${process.pid}-${token}`),
+        JSON.stringify({
+          pid: process.pid,
+          purpose: "waiter",
+          token,
+          process_start_identity: "young-live-owner",
+          started_at: new Date().toISOString(),
+        }),
+      );
+    }
+
+    assert.equal(launcherTest.reclaimStaleManagedCliPendingOwners(root, true, () => {
+      identityProbes += 1;
+      return "young-live-owner";
+    }), 0);
+    assert.equal(identityProbes, 0);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli publication removes a killed waiter's pending owner", { timeout: 15000 }, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-killed-waiter-"));
+  const root = join(dataDir, "codestory-cli");
+  const launcherPath = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  await mkdir(root);
+  const held = launcherTest.acquireManagedCliLock(root, "holder");
+  assert.ok(held);
+  const childScript = String.raw`
+    require(process.argv[1])._test.acquireManagedCliLock(process.argv[2], 'waiter', 60000);
+  `;
+  const waiter = spawn(process.execPath, ["-e", childScript, launcherPath, root], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let waiterStderr = "";
+  waiter.stderr.on("data", (chunk) => { waiterStderr += chunk; });
+  const completed = once(waiter, "close");
+  try {
+    const prefix = `.retention-lock.owner-${waiter.pid}-`;
+    const deadline = Date.now() + 5000;
+    let pending;
+    while (Date.now() < deadline && !pending) {
+      pending = (await readdir(root)).find((name) => name.startsWith(prefix));
+      if (!pending) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(pending, waiterStderr);
+    waiter.kill("SIGKILL");
+    await completed;
+    await access(join(root, pending));
+
+    launcherTest.releaseManagedCliLock(held);
+    const recovered = launcherTest.acquireManagedCliLock(root, "recovered");
+    assert.ok(recovered);
+    launcherTest.releaseManagedCliLock(recovered);
+    assert.equal(
+      (await readdir(root)).some((name) => name.startsWith(".retention-lock.owner-")),
+      false,
+    );
+  } finally {
+    waiter.kill("SIGKILL");
+    await completed;
+    try { launcherTest.releaseManagedCliLock(held); } catch {}
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli publication recovers a killed initializer before owner publication", { timeout: 15000 }, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-lock-initialization-"));
+  const root = join(dataDir, "codestory-cli");
+  const lockPath = join(root, ".retention-lock");
+  const readyPath = join(dataDir, "initializer-ready");
+  const launcherPath = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const childScript = String.raw`
+    const fs = require('fs');
+    const path = require('path');
+    const launcher = require(process.argv[1])._test;
+    const root = process.argv[2];
+    const ready = process.argv[3];
+    const linkSync = fs.linkSync;
+    fs.linkSync = (existing, destination) => {
+      if (path.basename(destination) === 'owner.json') {
+        fs.writeFileSync(ready, 'ready');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);
+      }
+      return linkSync(existing, destination);
+    };
+    launcher.acquireManagedCliLock(root, 'initializer', 1000);
+  `;
+  await mkdir(root, { recursive: true });
+  const initializer = spawn(process.execPath, ["-e", childScript, launcherPath, root, readyPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let initializerStderr = "";
+  initializer.stderr.on("data", (chunk) => { initializerStderr += chunk; });
+  const completed = once(initializer, "close");
+  try {
+    await waitForPath(readyPath);
+    await access(lockPath);
+    await assert.rejects(access(join(lockPath, "owner.json")));
+    const initializationOwner = JSON.parse(await readFile(`${lockPath}.initializing`, "utf8"));
+    assert.equal(initializationOwner.pid, initializer.pid);
+
+    const blocked = launcherTest.acquireManagedCliLock(root, "live-contender", 100);
+    assert.equal(blocked, null, "a live initializer must retain its claim");
+    await access(`${lockPath}.initializing`);
+    await assert.rejects(access(join(lockPath, "owner.json")));
+
+    initializer.kill("SIGKILL");
+    await completed;
+    const startedAt = Date.now();
+    const recovered = launcherTest.acquireManagedCliLock(root, "recovered", 2000);
+    assert.ok(recovered, initializerStderr);
+    assert.equal(recovered.waited, true);
+    assert.equal(recovered.reclaimed, true);
+    assert.ok(Date.now() - startedAt < 2000, "recovery must beat the waiter timeout");
+    launcherTest.releaseManagedCliLock(recovered);
+    await assert.rejects(access(lockPath));
+    await assert.rejects(access(`${lockPath}.initializing`));
+    assert.equal(
+      (await readdir(root)).some((name) => name.startsWith(".retention-lock.owner-")),
+      false,
+    );
+  } finally {
+    initializer.kill("SIGKILL");
+    await completed;
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -1693,7 +2018,11 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
     await writeFile(
@@ -1710,6 +2039,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
         PLUGIN_DATA: "",
         COPILOT_PLUGIN_DATA: "",
         TEST_OUT: outFile,
+        TEST_CODESTORY_VERSION: version,
         PATH: pathDir,
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -2025,13 +2355,18 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
 
     const result = spawnSync(process.execPath, [launcher], {
       env: {
         PLUGIN_DATA: dataDir,
+        CODESTORY_PLUGIN_RELEASE_DIR: join(dataDir, "missing-release"),
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -2045,7 +2380,7 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(
       status.readiness[0].repair_reason,
-      "managed_cli_unspawnable",
+      "managed_cli_provision_failed:managed_cli_asset_fetch_failed",
     );
     assert.equal(
       status.plugin_runtime.plugin_version,
@@ -2113,7 +2448,11 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
     await writeFile(
@@ -2126,6 +2465,7 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
       env: {
         PLUGIN_DATA: dataDir,
         TEST_LOG: logFile,
+        TEST_CODESTORY_VERSION: version,
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -2229,6 +2569,303 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async (t) => {
+  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
+  if (tarProbe.status !== 0) {
+    t.skip("tar unavailable for archive fixture");
+    return;
+  }
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-publication-contention-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-publication-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const outA = join(dataDir, "a.json");
+  const outB = join(dataDir, "b.json");
+  const probeLog = join(dataDir, "probes.log");
+  let server;
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    const requests = [];
+    server = createServer((request, response) => {
+      requests.push(request.url);
+      const body = assets.get(request.url);
+      if (!body) {
+        response.writeHead(404).end();
+        return;
+      }
+      setTimeout(() => response.writeHead(200).end(body), requests.length === 1 ? 250 : 0);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const baseUrl = `http://publication-secret@127.0.0.1:${server.address().port}`;
+    const common = {
+      CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+      PLUGIN_DATA: dataDir,
+      TEST_CODESTORY_VERSION: version,
+      CODESTORY_TEST_PROBE_LOG: probeLog,
+    };
+    const first = spawnLauncher(launcher, { ...common, TEST_OUT: outA });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const second = spawnLauncher(launcher, { ...common, TEST_OUT: outB });
+    const versionDir = join(dataDir, "codestory-cli", version);
+    let finished = false;
+    const visibility = (async () => {
+      while (!finished) {
+        try {
+          await access(versionDir);
+        } catch (error) {
+          if (error.code === "ENOENT") {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            continue;
+          }
+          throw error;
+        }
+        const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+        const executable = join(versionDir, ...manifest.path.split("/"));
+        const actual = createHash("sha256").update(await readFile(executable)).digest("hex");
+        assert.equal(actual, manifest.sha256);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    })();
+    const results = await Promise.all([first.completed, second.completed]);
+    finished = true;
+    await visibility;
+    for (const result of results) assert.equal(result.status, 0, result.stderr);
+    for (const file of [outA, outB]) {
+      await access(file).catch(() => assert.fail(JSON.stringify(results)));
+    }
+    const observed = await Promise.all([outA, outB].map(async (file) => JSON.parse(await readFile(file, "utf8"))));
+    assert.equal(observed[0].path, observed[1].path);
+    assert.equal(observed[0].sha256, observed[1].sha256);
+    const publishedManifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+    assert.doesNotMatch(publishedManifest.archive_url, /publication-secret/u);
+    assert.equal(requests.filter((url) => url === "/SHA256SUMS.txt").length, 1, JSON.stringify(requests));
+    assert.equal(requests.filter((url) => url === `/${fixture.archiveName}`).length, 1, JSON.stringify(requests));
+    assert.equal((await readFile(probeLog, "utf8")).trim().split(/\r?\n/u).filter(Boolean).length, 1);
+    assert.equal(observed.some((entry) => entry.warnings.includes("managed_cli_publication:publisher")), true);
+    assert.equal(observed.some((entry) => entry.warnings.includes("managed_cli_publication:waiter")), true);
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli publication reclaims crashes after lock and before publication", { timeout: 45000 }, async (t) => {
+  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
+  if (tarProbe.status !== 0) {
+    t.skip("tar unavailable for archive fixture");
+    return;
+  }
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-crash-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  let server;
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    let holdResponses = true;
+    server = createServer((request, response) => {
+      const body = assets.get(request.url);
+      if (!body) return response.writeHead(404).end();
+      const send = () => response.writeHead(200).end(body);
+      if (holdResponses) setTimeout(send, 5000);
+      else send();
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+    for (const crashPoint of ["after-lock", "before-publication"]) {
+      const dataDir = await mkdtemp(join(tmpdir(), `codestory-${crashPoint}-`));
+      try {
+        const failedOut = join(dataDir, "failed.json");
+        const recoveredOut = join(dataDir, "recovered.json");
+        holdResponses = crashPoint === "after-lock";
+        const crashed = spawnLauncher(launcher, {
+          CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_OUT: failedOut,
+          CODESTORY_TEST_PROBE_DELAY_MS: crashPoint === "before-publication" ? "5000" : "0",
+        });
+        if (crashPoint === "after-lock") {
+          await waitForPath(join(dataDir, "codestory-cli", ".retention-lock", "owner.json"));
+        } else {
+          const root = join(dataDir, "codestory-cli");
+          const deadline = Date.now() + 15000;
+          while (Date.now() < deadline) {
+            const children = await readdir(root).catch(() => []);
+            if (children.some((name) => name.startsWith(`.provisioning-${version}-`))) break;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert.equal((await readdir(root)).some((name) => name.startsWith(`.provisioning-${version}-`)), true);
+        }
+        crashed.child.kill("SIGKILL");
+        await crashed.completed;
+        holdResponses = false;
+        const recovered = spawnLauncher(launcher, {
+          CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_OUT: recoveredOut,
+          CODESTORY_TEST_PROBE_DELAY_MS: "0",
+        });
+        const result = await recovered.completed;
+        assert.equal(result.status, 0, result.stderr);
+        await access(recoveredOut).catch(() => assert.fail(JSON.stringify(result)));
+        const observed = JSON.parse(await readFile(recoveredOut, "utf8"));
+        assert.match(observed.warnings, /managed_cli_publication:reclaimed_lock/u);
+        const root = join(dataDir, "codestory-cli");
+        await access(join(root, version, "manifest.json"));
+        assert.equal(
+          (await readdir(root)).some((name) => name.startsWith(".retention-lock.owner-")),
+          false,
+        );
+      } finally {
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli quarantines corrupt installs, retains two, and fails closed on a locked directory", { timeout: 30000 }, async (t) => {
+  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
+  if (tarProbe.status !== 0) {
+    t.skip("tar unavailable for archive fixture");
+    return;
+  }
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-corrupt-install-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-corrupt-release-"));
+  const root = join(dataDir, "codestory-cli");
+  const versionDir = join(root, version);
+  const previousReleaseDir = process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+  const previousTestVersion = process.env.TEST_CODESTORY_VERSION;
+  try {
+    await writeReleaseFixture(releaseDir, version);
+    process.env.CODESTORY_PLUGIN_RELEASE_DIR = releaseDir;
+    process.env.TEST_CODESTORY_VERSION = version;
+    await launcherTest.provisionManagedCli(dataDir, version, []);
+    const corruptions = [
+      async () => writeFile(join(versionDir, "manifest.json"), "{", "utf8"),
+      async () => {
+        const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+        manifest.version = "0.0.0";
+        await writeFile(join(versionDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+      },
+      async () => {
+        const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+        manifest.sha256 = "f".repeat(64);
+        await writeFile(join(versionDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+      },
+      async () => {
+        const manifestPath = join(versionDir, "manifest.json");
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+        const executable = join(versionDir, ...manifest.path.split("/"));
+        if (process.platform === "win32") {
+          await writeFile(executable, "@echo off\r\necho codestory-cli 0.0.0\r\n", "utf8");
+        } else {
+          await writeFile(executable, "#!/bin/sh\necho codestory-cli 0.0.0\n", "utf8");
+          await chmod(executable, 0o755);
+        }
+        manifest.sha256 = createHash("sha256").update(await readFile(executable)).digest("hex");
+        await writeFile(manifestPath, JSON.stringify(manifest), "utf8");
+      },
+    ];
+    for (const corrupt of corruptions) {
+      await corrupt();
+      const warnings = [];
+      const resolved = await launcherTest.provisionManagedCli(dataDir, version, warnings);
+      assert.ok(resolved.path);
+      assert.equal(warnings.some((warning) => warning.startsWith("managed_cli_publication:quarantine:")), true);
+      assert.equal(warnings.some((warning) => warning.startsWith("managed_cli_publication:reprovision:")), true);
+    }
+    const quarantines = (await readdir(root)).filter((name) => name.startsWith(`.quarantine-${version}-`));
+    assert.equal(quarantines.length, 2, JSON.stringify(quarantines));
+
+    const lockedDir = join(root, "locked");
+    await mkdir(lockedDir);
+    assert.throws(
+      () => launcherTest.quarantineManagedCliVersion(root, lockedDir, version, "locked", {
+        renameSync() {
+          const error = new Error("locked");
+          error.code = "EPERM";
+          throw error;
+        },
+      }),
+      /managed_cli_quarantine_failed:EPERM/u,
+    );
+    await access(lockedDir);
+  } finally {
+    if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;
+    if (previousTestVersion === undefined) delete process.env.TEST_CODESTORY_VERSION;
+    else process.env.TEST_CODESTORY_VERSION = previousTestVersion;
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli resolution fails closed on a running Windows executable", { timeout: 15000 }, async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows executable locking semantics");
+    return;
+  }
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-locked-windows-cli-"));
+  const versionDir = join(dataDir, "codestory-cli", version);
+  const cliPath = join(versionDir, "bin", "codestory-cli.exe");
+  const readyPath = join(dataDir, "ready");
+  let locked;
+  try {
+    await mkdir(dirname(cliPath), { recursive: true });
+    await copyFile(process.execPath, cliPath);
+    const sha256 = createHash("sha256").update(await readFile(cliPath)).digest("hex");
+    await writeFile(
+      join(versionDir, "manifest.json"),
+      JSON.stringify(managedReleaseManifest(version, "bin/codestory-cli.exe", sha256)),
+      "utf8",
+    );
+    locked = spawn(cliPath, ["-e", `require('fs').writeFileSync(${JSON.stringify(readyPath)}, 'ready');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,60000)`], {
+      cwd: dirname(cliPath),
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    await waitForPath(readyPath);
+    await assert.rejects(
+      rm(cliPath),
+      (error) => ["EACCES", "EBUSY", "EPERM"].includes(error.code),
+    );
+
+    const warnings = [];
+    const resolved = await launcherTest.resolveManagedCli(dataDir, version, warnings);
+    assert.equal(resolved, null);
+    assert.equal(
+      warnings.some((warning) => warning.startsWith("managed_cli_publication:terminal_failure:managed_cli_quarantine_failed")),
+      true,
+      JSON.stringify(warnings),
+    );
+    await access(cliPath);
+  } finally {
+    if (locked) {
+      locked.kill("SIGKILL");
+      await once(locked, "close");
+    }
+    await rm(dataDir, { recursive: true, force: true });
   }
 });
 
@@ -2352,9 +2989,11 @@ test("mcp launcher keeps managed provision failures primary", async () => {
     assert.equal(result.status, 0, result.stderr);
     const response = JSON.parse(result.stdout.trim());
     const status = JSON.parse(response.result.contents[0].text);
-    assert.match(
-      status.degraded_reason,
-      /^managed_cli_provision_failed:managed_cli_asset_fetch_failed:SHA256SUMS\.txt:elapsed_ms=\d+:attempts=1:retry=restart_reload_status:/u,
+    assert.equal(status.degraded_reason, "managed_cli_provision_failed:managed_cli_asset_fetch_failed");
+    assert.doesNotMatch(JSON.stringify(status), new RegExp(releaseDir.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+    assert.equal(
+      status.plugin_runtime.warnings.includes("managed_cli_publication:terminal_failure:managed_cli_asset_fetch_failed"),
+      true,
     );
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
     assert.equal(
