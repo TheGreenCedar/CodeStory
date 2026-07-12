@@ -7,7 +7,8 @@ use crate::generation::{
 };
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::lexical_index::{
-    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, build_lexical_shard, lexical_input_fingerprint,
+    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, build_lexical_shard,
+    finish_lexical_input_for_store, lexical_source_input,
 };
 use crate::qdrant_client::{QDRANT_INDEX_UPSERT_BATCH_SIZE, QdrantClient, QdrantUpsertPoint};
 use crate::retention::{
@@ -73,7 +74,6 @@ struct SidecarStubFlags {
 
 struct LexicalGenerationOutcome {
     version: String,
-    rebuilt_fingerprint: Option<LexicalInputFingerprint>,
 }
 
 struct GenerationRetentionContext<'a> {
@@ -247,15 +247,22 @@ pub fn finalize_index_for_runtime_with_progress(
     let mut storage =
         Store::open(storage_path).context("open storage for retrieval sidecar input")?;
     ensure_search_symbol_projection(&mut storage)?;
-    let sidecar_input = compute_sidecar_input_fingerprint_for_runtime(
-        &storage,
-        storage_path,
+    let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
+    let input_snapshot = storage
+        .read_snapshot()
+        .context("open coherent sidecar input snapshot")?;
+    let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
+        input_snapshot.storage(),
         project_root,
         &project_id,
         &embedding_backend,
         embedding_dim,
         &runtime.embedding,
+        lexical_source,
     )?;
+    input_snapshot
+        .finish()
+        .context("finish coherent sidecar input snapshot")?;
     let previous_manifest = storage
         .get_retrieval_index_manifest(&project_id)
         .context("load previous retrieval_index_manifest")?;
@@ -313,7 +320,6 @@ pub fn finalize_index_for_runtime_with_progress(
                                 qdrant_stubbed,
                                 scip_stubbed,
                             },
-                            None,
                         );
                     }
                 }
@@ -337,7 +343,6 @@ pub fn finalize_index_for_runtime_with_progress(
                         qdrant_stubbed,
                         scip_stubbed,
                     },
-                    None,
                 );
             }
             warn!(
@@ -414,7 +419,6 @@ pub fn finalize_index_for_runtime_with_progress(
                     qdrant_stubbed,
                     scip_stubbed,
                 },
-                None,
             );
         }
     }
@@ -479,7 +483,6 @@ pub fn finalize_index_for_runtime_with_progress(
                 scip_stubbed,
             },
             &embedding_device,
-            lexical_outcome.rebuilt_fingerprint.as_ref(),
         )
     })
 }
@@ -502,7 +505,6 @@ fn ensure_lexical_generation(
     sidecar_input_hash: &str,
     mut lexical_ready: bool,
 ) -> Result<LexicalGenerationOutcome> {
-    let mut rebuilt_fingerprint = None;
     if lexical_ready {
         info!(sidecar_generation = %generation, "SQLite lexical shard reused");
     } else {
@@ -514,9 +516,8 @@ fn ensure_lexical_generation(
             expected,
             sidecar_input_hash,
         ) {
-            Ok(rebuilt) => {
+            Ok(_) => {
                 lexical_ready = true;
-                rebuilt_fingerprint = Some(rebuilt);
                 info!(sidecar_generation = %generation, "SQLite lexical shard built");
             }
             Err(error) => {
@@ -537,7 +538,6 @@ fn ensure_lexical_generation(
     }
     Ok(LexicalGenerationOutcome {
         version: LEXICAL_INDEX_VERSION.to_string(),
-        rebuilt_fingerprint,
     })
 }
 
@@ -719,7 +719,6 @@ fn finalize_manifest_after_health_check(
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
     embedding_device: &crate::embeddings::EmbeddingDeviceReadiness,
-    rebuilt_lexical_input: Option<&LexicalInputFingerprint>,
 ) -> Result<FinalizeIndexOutcome> {
     let generation = manifest
         .sidecar_generation
@@ -765,38 +764,7 @@ fn finalize_manifest_after_health_check(
         manifest,
         degraded_modes,
         stub_flags,
-        rebuilt_lexical_input,
     )
-}
-
-fn ensure_lexical_input_unchanged(
-    project_root: &Path,
-    storage_path: &Path,
-    expected: &SidecarInputFingerprint,
-) -> Result<()> {
-    let current = lexical_input_fingerprint(project_root, Some(storage_path))?;
-    if current.file_count != expected.lexical_file_count || current.hash != expected.lexical_hash {
-        bail!("lexical input changed before sidecar manifest publication");
-    }
-    Ok(())
-}
-
-fn ensure_lexical_freshness_for_publication(
-    project_root: &Path,
-    storage_path: &Path,
-    expected: &SidecarInputFingerprint,
-    rebuilt: Option<&LexicalInputFingerprint>,
-) -> Result<()> {
-    if let Some(rebuilt) = rebuilt {
-        if rebuilt.file_count == expected.lexical_file_count
-            && rebuilt.hash == expected.lexical_hash
-            && rebuilt.coverage == expected.lexical_coverage
-        {
-            return Ok(());
-        }
-        bail!("rebuilt lexical fingerprint does not match sidecar input");
-    }
-    ensure_lexical_input_unchanged(project_root, storage_path, expected)
 }
 
 #[allow(dead_code)] // Phase 2 cache keys
@@ -937,32 +905,38 @@ fn persist_finalized_manifest(
     mut manifest: RetrievalIndexManifest,
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
-    rebuilt_lexical_input: Option<&LexicalInputFingerprint>,
 ) -> Result<FinalizeIndexOutcome> {
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
     manifest.degraded_modes_json =
         serde_json::to_string(&degraded_modes).unwrap_or_else(|_| "[]".into());
+    let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
     let mut storage = Store::open(storage_path).context("open storage for retrieval manifest")?;
-    if let Some(reason) = manifest_unavailable_reason_for_runtime(
-        &project_id,
-        &storage,
-        &manifest,
-        retention_context.runtime,
-    ) {
-        bail!(
-            "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
-        );
-    }
-    ensure_lexical_freshness_for_publication(
-        project_root,
-        storage_path,
-        sidecar_input,
-        rebuilt_lexical_input,
-    )?;
-    storage
-        .upsert_retrieval_index_manifest(&manifest)
-        .context("persist retrieval_index_manifest")?;
-    drop(storage);
+    let embedding_backend =
+        crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
+    let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+        .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
+    promote_retrieval_manifest(&mut storage, sidecar_input, &manifest, |storage| {
+        let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
+            storage,
+            project_root,
+            &project_id,
+            &embedding_backend,
+            embedding_dim,
+            &retention_context.runtime.embedding,
+            lexical_source,
+        )?;
+        if let Some(reason) = manifest_unavailable_reason_for_runtime(
+            &project_id,
+            storage,
+            &manifest,
+            retention_context.runtime,
+        ) {
+            bail!(
+                "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
+            );
+        }
+        Ok(current_input)
+    })?;
 
     let (generation_retention_plan, generation_retention) =
         retain_published_generations(storage_path, retention_context, &project_id, &manifest);
@@ -985,6 +959,36 @@ fn persist_finalized_manifest(
         generation_retention_plan,
         generation_retention,
     })
+}
+
+fn ensure_sidecar_input_unchanged(
+    expected: &SidecarInputFingerprint,
+    current: &SidecarInputFingerprint,
+) -> Result<()> {
+    if current != expected {
+        bail!("sidecar generation input changed before manifest publication");
+    }
+    Ok(())
+}
+
+fn promote_retrieval_manifest(
+    storage: &mut Store,
+    expected: &SidecarInputFingerprint,
+    manifest: &RetrievalIndexManifest,
+    current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
+) -> Result<()> {
+    let mut publication = storage
+        .write_transaction()
+        .context("lock sidecar input and manifest publication")?;
+    let current = current_input(publication.storage())?;
+    ensure_sidecar_input_unchanged(expected, &current)?;
+    publication
+        .storage_mut()
+        .upsert_retrieval_index_manifest(manifest)
+        .context("persist retrieval_index_manifest")?;
+    publication
+        .finish()
+        .context("commit retrieval manifest publication")
 }
 
 fn retain_published_generations(
@@ -1104,15 +1108,36 @@ pub(crate) fn compute_sidecar_input_fingerprint(
 
 pub(crate) fn compute_sidecar_input_fingerprint_for_runtime(
     storage: &Store,
-    storage_path: &Path,
+    _storage_path: &Path,
     project_root: &Path,
     project_id: &str,
     embedding_backend: &str,
     embedding_dim: i32,
     embedding: &crate::config::EmbeddingRuntimeConfig,
 ) -> Result<SidecarInputFingerprint> {
-    let lexical = lexical_input_fingerprint(project_root, Some(storage_path))
-        .context("hash lexical sidecar input")?;
+    let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
+    compute_sidecar_input_fingerprint_with_lexical_source(
+        storage,
+        project_root,
+        project_id,
+        embedding_backend,
+        embedding_dim,
+        embedding,
+        lexical_source,
+    )
+}
+
+fn compute_sidecar_input_fingerprint_with_lexical_source(
+    storage: &Store,
+    project_root: &Path,
+    project_id: &str,
+    embedding_backend: &str,
+    embedding_dim: i32,
+    embedding: &crate::config::EmbeddingRuntimeConfig,
+    lexical_source: crate::lexical_index::LexicalSourceInput,
+) -> Result<SidecarInputFingerprint> {
+    let lexical = finish_lexical_input_for_store(lexical_source, project_root, storage)
+        .context("hash lexical symbol input")?;
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
     hash_part(&mut hasher, "codestory-sidecar-input-v5");
@@ -1463,47 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn just_built_lexical_fingerprint_skips_only_the_redundant_final_scan() {
-        let expected = SidecarInputFingerprint {
-            hash: "sidecar".into(),
-            symbol_doc_count: 0,
-            projection_count: 0,
-            dense_projection_count: 0,
-            semantic_policy_version: None,
-            graph_artifact_hash: "graph".into(),
-            dense_reason_counts_json: "{}".into(),
-            lexical_file_count: 0,
-            lexical_hash: "lexical".into(),
-            lexical_coverage: Default::default(),
-        };
-        let rebuilt = LexicalInputFingerprint {
-            file_count: 0,
-            hash: "lexical".into(),
-            coverage: Default::default(),
-        };
-        let root = TempDir::new().expect("root");
-        let missing = root.path().join("missing");
-
-        ensure_lexical_freshness_for_publication(
-            &missing,
-            Path::new("missing.db"),
-            &expected,
-            Some(&rebuilt),
-        )
-        .expect("matching just-built fingerprint avoids a third scan");
-        assert!(
-            ensure_lexical_freshness_for_publication(
-                &missing,
-                Path::new("missing.db"),
-                &expected,
-                None,
-            )
-            .is_err(),
-            "reused shards must retain the final freshness scan"
-        );
-    }
-
-    #[test]
     fn qdrant_semantic_smoke_gate_succeeds_first_attempt() {
         let mut calls = 0usize;
         ensure_qdrant_semantic_smoke_with(
@@ -1838,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_input_hash_changes_when_embedding_values_change() {
+    fn manifest_promotion_rejects_same_count_content_drift_and_preserves_current() {
         let project = TempDir::new().expect("project dir");
         std::fs::write(project.path().join("lib.rs"), "pub fn do_work() {}\n")
             .expect("project file");
@@ -1886,10 +1870,23 @@ mod tests {
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
         )
         .expect("first fingerprint");
-        doc.embedding[0] = 0.02;
+        let old_manifest = retrieval_manifest_for_sidecar(
+            "proj",
+            &sidecar_generation_id("proj", &first.hash),
+            &crate::generation::sidecar_qdrant_collection("proj", &first.hash),
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &first,
+        );
         storage
+            .upsert_retrieval_index_manifest(&old_manifest)
+            .expect("old manifest");
+        doc.embedding[0] = 0.02;
+        let mut concurrent = Store::open(&storage_path).expect("concurrent store");
+        concurrent
             .upsert_llm_symbol_docs_batch(&[doc])
             .expect("second doc");
+        drop(concurrent);
         let second = compute_sidecar_input_fingerprint(
             &storage,
             &storage_path,
@@ -1905,6 +1902,64 @@ mod tests {
         assert_eq!(first.dense_projection_count, 1);
         assert_eq!(first.dense_reason_counts_json, "{\"public_api\":1}");
         assert_ne!(first.hash, second.hash);
+
+        let mut rejected_manifest = retrieval_manifest_for_sidecar(
+            "proj",
+            &sidecar_generation_id("proj", &first.hash),
+            &crate::generation::sidecar_qdrant_collection("proj", &first.hash),
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &first,
+        );
+        rejected_manifest.built_at_epoch_ms += 1;
+        let lexical_source = lexical_source_input(project.path()).expect("lexical source");
+        let rejected =
+            promote_retrieval_manifest(&mut storage, &first, &rejected_manifest, |snapshot| {
+                compute_sidecar_input_fingerprint_with_lexical_source(
+                    snapshot,
+                    project.path(),
+                    "proj",
+                    crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                    crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                    &crate::config::SidecarRuntimeConfig::local().embedding,
+                    lexical_source,
+                )
+            });
+        assert!(rejected.is_err());
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")
+                .expect("current manifest"),
+            Some(old_manifest)
+        );
+
+        let new_manifest = retrieval_manifest_for_sidecar(
+            "proj",
+            &sidecar_generation_id("proj", &second.hash),
+            &crate::generation::sidecar_qdrant_collection("proj", &second.hash),
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            &second,
+        );
+        let lexical_source = lexical_source_input(project.path()).expect("lexical source");
+        promote_retrieval_manifest(&mut storage, &second, &new_manifest, |snapshot| {
+            compute_sidecar_input_fingerprint_with_lexical_source(
+                snapshot,
+                project.path(),
+                "proj",
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                &crate::config::SidecarRuntimeConfig::local().embedding,
+                lexical_source,
+            )
+        })
+        .expect("unchanged input promotes manifest");
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")
+                .expect("current manifest"),
+            Some(new_manifest)
+        );
     }
 
     fn insert_matching_semantic_doc(storage: &mut Store, project_root: &Path) {
