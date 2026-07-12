@@ -158,12 +158,80 @@ def verify_archive_checksum(archive: Path, checksum_file: Path, artifact: Path) 
     require(actual == expected, "checksum", artifact, f"checksum mismatch for {archive.name}")
 
 
-def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path, artifact: Path) -> None:
+def proof_environment(base: dict[str, str]) -> dict[str, str]:
+    env = dict(base)
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        env["CODESTORY_QDRANT_USER"] = f"{os.getuid()}:{os.getgid()}"
+    return env
+
+
+def cleanup_proof_compose(cache_root: Path, env: dict[str, str], results: list[dict], run) -> None:
+    for state_file in sorted(cache_root.rglob("retrieval-sidecars.json")):
+        state = read_json_file(state_file)
+        if not isinstance(state, dict) or state.get("owner") != "codestory":
+            raise RuntimeError(f"proof sidecar state has unexpected ownership: {state_file}")
+        if state.get("profile") != "local" or not state.get("compose_file"):
+            continue
+        required = ("compose_project", "namespace", "qdrant_data_dir", "lexical_data_dir")
+        if any(not isinstance(state.get(name), str) or not state[name] for name in required):
+            raise RuntimeError(f"proof sidecar state is missing compose ownership: {state_file}")
+        compose_file = Path(state["compose_file"])
+        if not compose_file.is_file():
+            raise RuntimeError(f"proof sidecar compose file is missing: {compose_file}")
+        compose_env = {
+            **env,
+            "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
+            "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
+            "CODESTORY_ZOEKT_DATA_DIR": state["lexical_data_dir"],
+            "CODESTORY_EMBED_MODEL_DIR": state["qdrant_data_dir"],
+        }
+        command = [
+            "docker",
+            "compose",
+            "-p",
+            state["compose_project"],
+            "-f",
+            str(compose_file),
+            "down",
+            "--remove-orphans",
+        ]
+        try:
+            result = run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+                env=compose_env,
+                text=True,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            results.append({"kind": "compose_down", "state_file": str(state_file), "error": str(exc)})
+            raise RuntimeError(f"could not stop proof-owned Compose sidecars: {exc}") from exc
+        results.append(
+            {
+                "kind": "compose_down",
+                "state_file": str(state_file),
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"proof-owned Compose cleanup exited {result.returncode}")
+
+
+def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path, artifact: Path, run=subprocess.run) -> None:
     env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
     results = []
+    try:
+        cleanup_proof_compose(cache_root, env, results, run)
+    except RuntimeError as exc:
+        write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
+        raise
     for profile, extra in (("local", []), ("agent", ["--run-id", "shared-agent"])):
         try:
-            result = subprocess.run(
+            result = run(
                 [
                     str(cli),
                     "retrieval",
@@ -187,6 +255,7 @@ def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path, artifact: Pa
             raise RuntimeError(f"could not stop {profile} proof sidecars: {exc}") from exc
         results.append(
             {
+                "kind": "retrieval_down",
                 "profile": profile,
                 "returncode": result.returncode,
                 "stdout": result.stdout,
@@ -576,13 +645,13 @@ def plugin_stdio_status(
             project,
             layer="plugin_stdio",
             cwd=project,
-            env={
+            env=proof_environment({
                 **os.environ,
                 "CODESTORY_CLI": "",
                 "CODESTORY_CACHE_ROOT": str(cache_root),
                 "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
                 "PLUGIN_DATA": data,
-            },
+            }),
             cleanup_status_workers=True,
         )
 
@@ -650,14 +719,14 @@ def plugin_stdio_handoff(
             project,
             layer="managed_plugin_handoff",
             cwd=project,
-            env={
+            env=proof_environment({
                 **os.environ,
                 "CODESTORY_CLI": "",
                 "CODESTORY_CACHE_ROOT": str(cache_root),
                 "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
                 "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH": str(policy_path),
                 "PLUGIN_DATA": str(plugin_data),
-            },
+            }),
             extra_requests=[
                 {
                     "jsonrpc": "2.0",
@@ -1171,7 +1240,7 @@ def run_gate(args: argparse.Namespace) -> None:
         cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-proof-cache-"))
         proof_cleanup_artifact = out_dir / "proof-cache-cleanup.json"
         cleanup_stack.callback(cleanup_proof_cache, cli, project, cache_root, proof_cleanup_artifact)
-        proof_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
+        proof_env = proof_environment({**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)})
         stdio_cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-stdio-cache-"))
         stdio_cleanup_artifact = out_dir / "stdio-cache-cleanup.json"
         cleanup_stack.callback(cleanup_proof_cache, cli, project, stdio_cache_root, stdio_cleanup_artifact)
@@ -1836,6 +1905,9 @@ def write_fake_plugin_launcher(plugin_root: Path) -> None:
 
 def self_test() -> None:
     base_environment = {"KEEP": "value", "CODESTORY_SIDECAR_PROFILE": "agent"}
+    owned_environment = proof_environment(base_environment)
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        assert owned_environment["CODESTORY_QDRANT_USER"] == f"{os.getuid()}:{os.getgid()}"
     local_environment = local_profile_environment(base_environment)
     assert local_environment["KEEP"] == "value"
     assert local_environment["CODESTORY_SIDECAR_PROFILE"] == "local"
@@ -1921,6 +1993,78 @@ def self_test() -> None:
         stage = root / "pkg" / "codestory-cli-v9.9.9-test"
         stage.mkdir(parents=True)
         write_fake_cli(stage)
+        fake_cli = find_cli(stage)
+        compose_file = root / "retrieval-compose.yml"
+        compose_file.write_text("services: {}\n", encoding="utf-8")
+
+        def write_proof_compose_state(cache_root: Path) -> None:
+            state_dir = cache_root / "sidecars" / "proof-local"
+            state_dir.mkdir(parents=True)
+            (cache_root / "qdrant").mkdir()
+            (cache_root / "lexical").mkdir()
+            write_json(
+                state_dir / "retrieval-sidecars.json",
+                {
+                    "owner": "codestory",
+                    "profile": "local",
+                    "namespace": "proof-local",
+                    "compose_project": "proof-local",
+                    "compose_file": str(compose_file),
+                    "qdrant_data_dir": str(cache_root / "qdrant"),
+                    "lexical_data_dir": str(cache_root / "lexical"),
+                },
+            )
+
+        compose_cleanup_root = root / "compose-cleanup"
+        write_proof_compose_state(compose_cleanup_root)
+        compose_cleanup_artifact = root / "compose-cleanup.json"
+        compose_calls = []
+
+        def successful_compose_cleanup(command, **kwargs):
+            if command[0] == "docker":
+                compose_calls.append((command, kwargs["env"]))
+                return subprocess.CompletedProcess(command, 0, "stopped", "")
+            return subprocess.run(command, **kwargs)
+
+        cleanup_proof_cache(
+            fake_cli,
+            root,
+            compose_cleanup_root,
+            compose_cleanup_artifact,
+            successful_compose_cleanup,
+        )
+        assert not compose_cleanup_root.exists()
+        assert compose_calls[0][0][-2:] == ["down", "--remove-orphans"]
+        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"] == "proof-local"
+        compose_cleanup = read_json_file(compose_cleanup_artifact)
+        assert compose_cleanup["removed"] is True
+        assert compose_cleanup["commands"][0]["kind"] == "compose_down"
+
+        failed_compose_root = root / "compose-cleanup-failed"
+        write_proof_compose_state(failed_compose_root)
+        failed_compose_artifact = root / "compose-cleanup-failed.json"
+
+        def failed_compose_cleanup(command, **kwargs):
+            if command[0] == "docker":
+                return subprocess.CompletedProcess(command, 17, "", "forced failure")
+            return subprocess.run(command, **kwargs)
+
+        try:
+            cleanup_proof_cache(
+                fake_cli,
+                root,
+                failed_compose_root,
+                failed_compose_artifact,
+                failed_compose_cleanup,
+            )
+        except RuntimeError as exc:
+            assert "Compose cleanup exited 17" in str(exc)
+        else:
+            raise AssertionError("failed proof-owned Compose cleanup must remain fail-closed")
+        assert failed_compose_root.exists()
+        assert read_json_file(failed_compose_artifact)["removed"] is False
+        remove_tree_with_retry(failed_compose_root)
+
         skill = stage / PLUGIN_SKILL_RELATIVE
         skill.parent.mkdir(parents=True)
         skill.write_text("name: codestory-grounding\n", encoding="utf-8")

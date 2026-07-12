@@ -11,7 +11,9 @@
   restart.
 - Expanded managed-plugin provisioning, local grounding, repair handoff, and
   proof cleanup from Windows x64 to every shipped native release asset in both
-  pre-publish and post-publish matrices.
+  pre-publish and post-publish matrices. Linux proof containers now write
+  bind-mounted Qdrant data as the proof owner, and cleanup explicitly stops the
+  proof-owned local Compose namespace before verifying cache removal.
 - Made sidecar generation GC root every current and rollback manifest across
   the shared cache scope instead of collapsing rollback evidence to one latest
   generation. Inventory now reports active, rollback, building, and reclaimable
