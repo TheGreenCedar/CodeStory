@@ -4,8 +4,7 @@ use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -27,9 +26,6 @@ const ONNX_CLS_INDEX_NAME: &str = "codestory_cls_index";
 const ONNX_CLS_POOL_NODE_NAME: &str = "codestory_cls_pool";
 const ENDPOINT_PROBE_TEXT: &str = "codestory managed embeddings health probe";
 const ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-
-type HttpHeaders = Vec<(String, String)>;
-type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnnxAssetKind {
@@ -1016,46 +1012,29 @@ fn probe_embedding_endpoint(url: &str, expected_dimension: Option<usize>) -> Res
 
 fn post_json_to_endpoint(endpoint: &HttpEndpoint, request: &JsonValue) -> Result<JsonValue> {
     let body =
-        serde_json::to_vec(request).context("failed to serialize embedding probe request")?;
-    let mut addrs = (endpoint.host.as_str(), endpoint.port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve embedding endpoint {}", endpoint.url()))?;
-    let mut stream = addrs
-        .find_map(|addr| TcpStream::connect_timeout(&addr, ENDPOINT_PROBE_TIMEOUT).ok())
-        .ok_or_else(|| anyhow!("failed to connect to embedding endpoint {}", endpoint.url()))?;
-    stream.set_read_timeout(Some(ENDPOINT_PROBE_TIMEOUT))?;
-    stream.set_write_timeout(Some(ENDPOINT_PROBE_TIMEOUT))?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        endpoint.path,
-        endpoint.host,
-        endpoint.port,
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let (status_code, headers, body) = split_http_response(&response)?;
-    if !(200..300).contains(&status_code) {
+        serde_json::to_string(request).context("failed to serialize embedding probe request")?;
+    let endpoint_url = endpoint.url();
+    let display_url = redact_url_for_display(&endpoint_url);
+    let agent = ureq::builder().redirects(0).build();
+    let response = codestory_retrieval::outbound_http::read_bytes(
+        agent
+            .post(&endpoint_url)
+            .timeout(ENDPOINT_PROBE_TIMEOUT)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_bytes(body.as_bytes()),
+    )
+    .with_context(|| format!("embedding request to {display_url} failed"))?;
+    if !(200..300).contains(&response.status) {
+        let response_body = String::from_utf8_lossy(&response.body);
         bail!(
-            "embedding endpoint {} returned HTTP {status_code}: {}",
-            endpoint.url(),
-            String::from_utf8_lossy(&body)
+            "embedding endpoint {display_url} returned HTTP {}: {}",
+            response.status,
+            codestory_retrieval::outbound_http::truncate_http_body(&response_body)
         );
     }
-    let body = if headers
-        .iter()
-        .any(|(key, value)| key == "transfer-encoding" && value.contains("chunked"))
-    {
-        decode_chunked_http_body(&body)?
-    } else {
-        body
-    };
-    serde_json::from_slice(&body)
-        .with_context(|| format!("failed to parse JSON response from {}", endpoint.url()))
+    serde_json::from_slice(&response.body)
+        .with_context(|| format!("failed to parse JSON response from {display_url}"))
 }
 
 fn parse_http_endpoint(url: &str) -> Option<HttpEndpoint> {
@@ -1079,61 +1058,6 @@ impl HttpEndpoint {
     fn url(&self) -> String {
         format!("http://{}:{}{}", self.host, self.port, self.path)
     }
-}
-
-fn split_http_response(response: &[u8]) -> Result<RawHttpResponse> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("invalid HTTP response from embedding endpoint"))?;
-    let header_text = String::from_utf8_lossy(&response[..header_end]);
-    let mut lines = header_text.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("missing HTTP status line from embedding endpoint"))?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("missing HTTP status code from embedding endpoint"))?
-        .parse::<u16>()
-        .context("invalid HTTP status code from embedding endpoint")?;
-    let headers = lines
-        .filter_map(|line| {
-            line.split_once(':').map(|(key, value)| {
-                (
-                    key.trim().to_ascii_lowercase(),
-                    value.trim().to_ascii_lowercase(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok((status_code, headers, response[header_end + 4..].to_vec()))
-}
-
-fn decode_chunked_http_body(body: &[u8]) -> Result<Vec<u8>> {
-    let mut offset = 0;
-    let mut decoded = Vec::new();
-    while offset < body.len() {
-        let line_end = body[offset..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| anyhow!("invalid chunked response from embedding endpoint"))?
-            + offset;
-        let size_text = String::from_utf8_lossy(&body[offset..line_end]);
-        let size_hex = size_text.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .context("invalid chunk size from embedding endpoint")?;
-        offset = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        if offset + size > body.len() {
-            bail!("truncated chunked response from embedding endpoint");
-        }
-        decoded.extend_from_slice(&body[offset..offset + size]);
-        offset += size + 2;
-    }
-    Ok(decoded)
 }
 
 fn parse_embedding_probe_response(
@@ -1333,25 +1257,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn endpoint_probe_rejects_wrong_dimension() {
+    fn run_probe_server(
+        status: &'static str,
+        response_headers: &'static str,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buffer = [0_u8; 1024];
             let _ = stream.read(&mut buffer).expect("read");
-            let body = r#"{"data":[{"embedding":[1.0,2.0]}]}"#;
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{response_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             );
             stream.write_all(response.as_bytes()).expect("write");
         });
-        let url = format!("http://{addr}/v1/embeddings");
+        (format!("http://{addr}/v1/embeddings"), handle)
+    }
+
+    #[test]
+    fn endpoint_probe_rejects_wrong_dimension() {
+        let (url, handle) = run_probe_server("200 OK", "", r#"{"data":[{"embedding":[1.0,2.0]}]}"#);
         assert!(!embedding_endpoint_ready(&url, Some(768)));
         handle.join().expect("server");
+    }
+
+    #[test]
+    fn endpoint_probe_rejects_redirects() {
+        let (url, handle) = run_probe_server(
+            "302 Found",
+            "Location: http://127.0.0.1:9/redirected\r\n",
+            "redirected",
+        );
+        let url = url.replacen("http://", "http://user:secret@", 1);
+
+        let error = probe_embedding_endpoint(&url, None)
+            .expect_err("embedding probe must not follow redirects");
+        handle.join().expect("server");
+
+        assert!(error.to_string().contains("HTTP 302"), "{error:#}");
+        assert!(!error.to_string().contains("secret"), "{error:#}");
     }
 
     #[test]

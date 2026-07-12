@@ -34,5 +34,9 @@ surprise-download. Agent-facing packet/search evidence still requires
 ## Notes
 
 - Normal commands may use already installed assets, but they do not download missing assets.
+- Release and default source builds exclude the legacy ONNX runtime. Maintainers
+  who need to execute or verify those diagnostic assets must build from source
+  with `cargo build -p codestory-cli --features diagnostic-onnx`; product
+  packet/search uses the llama.cpp sidecar and does not require this feature.
 - Plain `index` builds the core SQLite code index only; run `retrieval index` after sidecars are configured. Packet/search readiness: [status-contract.md](status-contract.md) and `docs/ops/retrieval-sidecars.md`.
 - Hash embeddings, ONNX-only flows, and non-sidecar embedding paths are diagnostic or historical comparison modes only.

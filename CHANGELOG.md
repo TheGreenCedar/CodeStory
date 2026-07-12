@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added an opt-in `diagnostic-onnx` Cargo feature for maintainers who still need
+  the legacy ONNX asset diagnostics. Default CLI builds no longer compile or
+  link ONNX Runtime, DirectML, ndarray, or tokenizer support.
 - Added a schema-backed publication generation and run identity to every staged
   full and incremental core database. Typed store and runtime reads now expose
   the generation that owns the live graph, and cache finalization verifies that
@@ -37,6 +40,15 @@
 - Kept the cross-platform concurrent-publication proof independent of cached
   build output so macOS runner image and Xcode updates cannot restore binaries
   linked against vanished toolchain paths.
+- Replaced the runtime embedding client and managed-endpoint probe's duplicate
+  socket-level HTTP and chunked-body parsers with the existing shared `ureq`
+  response path. Embedding POSTs do not follow redirects, require an explicit
+  2xx response, read successful batch bodies beyond `ureq`'s 10 MiB text limit,
+  and redact endpoint userinfo, query values, and fragments from runtime
+  reachability, transport, status-body, and JSON diagnostics. Endpoint
+  validation, bounded error bodies, response counts, and embedding-dimension
+  checks remain intact. Removed the unused search snapshot harness and helpers
+  that were referenced only by that harness.
 - Finalized graph-native and dense semantic documents in staged full and
   incremental databases before core publication. Post-publication cache loads
   now hydrate semantic state without rewriting live rows, and an unavailable
