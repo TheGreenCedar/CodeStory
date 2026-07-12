@@ -17,7 +17,9 @@ status, confidence floor, handler-link support, known gaps, and promotability.
   Remix, Fastify, Koa, Hono, NestJS.
 - Astro/Vue: Astro and Nuxt file-convention routes, plus Vue Router object
   routes.
-- Python: Django, Flask, FastAPI.
+- Python: Django and Flask retain structural collectors. FastAPI decorators use
+  a tree-sitter query for static string paths and handler links; malformed-file
+  lexical recovery is explicitly structural and low-confidence.
 - Ruby/PHP/Java/C#: Rails, Laravel, Spring, ASP.NET.
 - Rust: Axum, Actix, Rocket.
 - Go: Gin, Chi, Echo, Fiber as text-only partial route extraction until Go
@@ -61,6 +63,11 @@ be checked with `files --path <fragment>` or a fresh index.
   annotation, C# attribute, or Rust attribute.
 - `heuristic`: route comes from text/tree-sitter pattern matching and needs
   source review before claiming handler parity.
+
+FastAPI route metadata records `claim_tier=parser_backed` with
+`extraction_provenance=tree_sitter_query`. Its syntax-error fallback records
+`claim_tier=structural`, `extraction_provenance=lexical_fallback`, and
+`confidence=heuristic`; it must not be promoted as parser-backed evidence.
 
 ## Verification Playbook
 

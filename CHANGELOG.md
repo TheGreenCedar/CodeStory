@@ -7,6 +7,11 @@
 - Added an opt-in `diagnostic-onnx` Cargo feature for maintainers who still need
   the legacy ONNX asset diagnostics. Default CLI builds no longer compile or
   link ONNX Runtime, DirectML, ndarray, or tokenizer support.
+- Added parser-backed FastAPI decorator route extraction with exact handler,
+  method, path, provenance, and claim-tier metadata. Multiline and raw-string
+  routes are supported; dynamic templates and nested path builders no longer
+  become exact endpoint claims, while syntax-error fallback stays explicitly
+  structural and low-confidence.
 - Added a schema-backed publication generation and run identity to every staged
   full and incremental core database. Typed store and runtime reads now expose
   the generation that owns the live graph, and cache finalization verifies that
