@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Opened the diagnostic MCP immediately on fresh managed-plugin startup while
+  the existing single-flight installer provisions the exact CLI version in the
+  background. Status now reports the in-process provisioning state, and the
+  launcher hands the next request to the verified stdio runtime without a host
+  restart.
 - Made sidecar generation GC root every current and rollback manifest across
   the shared cache scope instead of collapsing rollback evidence to one latest
   generation. Inventory now reports active, rollback, building, and reclaimable
