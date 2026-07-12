@@ -4722,6 +4722,22 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
     assert_eq!(new_generation, old_generation + 1);
     let (_writer_client, writer_status) = writer.join().expect("join writer status client");
     assert_tool_success(&writer_status, json!("writer-start-refresh"));
+
+    let final_status = send_json(
+        &mut reader_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "reader-final-generation",
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        }),
+    );
+    let final_status = assert_tool_success(&final_status, json!("reader-final-generation"));
+    assert_eq!(
+        final_status["index_publication"]["generation"],
+        json!(old_generation + 1),
+        "lock handoff must coalesce onto the first complete refresh: {final_status}"
+    );
 }
 
 #[test]

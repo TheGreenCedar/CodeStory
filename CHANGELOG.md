@@ -67,6 +67,10 @@
 
 - Removed a plugin static test that froze exact grounding documentation copy;
   documentation remains covered by the repository link and diff checks.
+- Reopened published storage after acquiring the cross-process local-refresh
+  lock and served each status read from one complete immutable publication,
+  preventing redundant generations and spurious `cache_busy` failures during
+  status/grounding races.
 - Corrected the Codex managed-platform guide to list the restored macOS x64 CLI
   while retaining its no-managed-accelerated-sidecar boundary.
 - Retried packaged-proof temporary directory removal after transient executable

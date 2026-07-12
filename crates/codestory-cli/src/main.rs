@@ -2475,7 +2475,11 @@ pub(crate) fn wait_for_local_freshness(
             return Ok((summary, Some(output)));
         }
     };
-    let summary = inspect_runtime.open_project_summary()?;
+    // Another process may have replaced the published database while this
+    // caller waited for the cross-process lock. Reopen it before deciding that
+    // a second refresh is necessary; the pre-lock inspect runtime can still be
+    // bound to the previous SQLite generation.
+    let summary = RuntimeContext::new_inspect_only(project)?.open_project_summary()?;
     if !local_freshness_needs_refresh(&summary) {
         let mut output = local_refresh_output_from_summary(&summary);
         output.reason = Some("coalesced_refresh_completed".to_string());

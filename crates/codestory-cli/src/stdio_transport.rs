@@ -2712,63 +2712,17 @@ fn read_stdio_status_resource_cached(
         return Ok(cached.value.clone());
     }
 
-    let mut publication_before = runtime
-        .project
-        .complete_index_publication_at(&runtime.storage_path)
-        .map_err(map_api_error)?;
-    let mut value = read_stdio_status_resource_uncached(runtime, state)?;
-    let mut publication_after = runtime
-        .project
-        .complete_index_publication_at(&runtime.storage_path)
-        .map_err(map_api_error)?;
-    if publication_before != publication_after
-        || !stdio_status_matches_publication(&value, publication_after.as_ref())
-    {
-        let completed_refresh = value
-            .get("local_refresh")
-            .filter(|refresh| {
-                refresh.get("state").and_then(serde_json::Value::as_str) == Some("refreshed")
-            })
-            .filter(|refresh| {
-                refresh.get("reason").and_then(serde_json::Value::as_str) == Some("refreshed")
-            })
-            .cloned();
-        publication_before = publication_after;
-        value = read_stdio_status_resource_uncached(runtime, state)?;
-        publication_after = runtime
-            .project
-            .complete_index_publication_at(&runtime.storage_path)
-            .map_err(map_api_error)?;
-        if publication_before != publication_after
-            || !stdio_status_matches_publication(&value, publication_after.as_ref())
-        {
-            bail!(
-                "cache_busy: the index publication changed twice while status was reading; retry against the stable publication"
-            );
-        }
-        if let Some(completed_refresh) = completed_refresh {
-            value["local_refresh"] = completed_refresh;
-        }
-    }
-
-    let key = stdio_status_cache_key(runtime);
-    // ponytail: short stdio snapshot cache; source/storage/sidecar fingerprints bust it when state changes.
-    state.status_cache = Some(StdioStatusCacheEntry {
-        key,
+    let value = read_stdio_status_resource_uncached(runtime, state)?;
+    let key_after = stdio_status_cache_key(runtime);
+    // The uncached read opens one immutable published database, so its summary
+    // is complete even when the current pointer changes concurrently. Cache it
+    // only when the surrounding source/storage fingerprint stayed stable.
+    state.status_cache = (key == key_after).then(|| StdioStatusCacheEntry {
+        key: key_after,
         value: value.clone(),
         cached_at: Instant::now(),
     });
     Ok(value)
-}
-
-fn stdio_status_matches_publication(
-    status: &serde_json::Value,
-    publication: Option<&IndexPublicationDto>,
-) -> bool {
-    let expected = publication
-        .and_then(|publication| serde_json::to_value(publication).ok())
-        .unwrap_or(serde_json::Value::Null);
-    status.get("index_publication") == Some(&expected)
 }
 
 fn read_stdio_status_resource_uncached(
@@ -6042,26 +5996,6 @@ fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<s
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn status_response_must_match_the_current_complete_publication() {
-        let publication = IndexPublicationDto {
-            generation: 2,
-            generation_id: "22222222-2222-4222-8222-222222222222".to_string(),
-            run_id: "run-2".to_string(),
-            mode: codestory_contracts::api::IndexPublicationModeDto::Incremental,
-            published_at_epoch_ms: 2,
-        };
-        let matching = json!({"index_publication": publication.clone()});
-        assert!(stdio_status_matches_publication(
-            &matching,
-            Some(&publication)
-        ));
-        assert!(!stdio_status_matches_publication(
-            &json!({"index_publication": null}),
-            Some(&publication)
-        ));
-    }
 
     fn base_packet_cache_key_input(question: &str) -> StdioPacketCacheKeyInput<'_> {
         StdioPacketCacheKeyInput {
