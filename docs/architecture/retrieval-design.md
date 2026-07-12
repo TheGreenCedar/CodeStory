@@ -107,6 +107,14 @@ manifest together. Graph or semantic input drift during a build therefore
 leaves the previous current manifest untouched without holding the write lock
 during workspace discovery.
 
+Generation cleanup is a reachability pass. Every canonical generation named by
+a readable current manifest or active/rollback retention marker in the shared
+cache scope is a root. GC obtains the exclusive publication/retention locks and
+may delete only generation artifacts outside that root set. Inventory uses a shared
+view when available; if a writer owns the lock, it does not wait or infer that
+new artifacts are garbage, and instead reports all unrooted bytes as building.
+Status exposes active, rollback, building, and reclaimable bytes separately.
+
 ## AST-First Semantic Contract
 
 Code structure is graph-native first. Runtime writes a deterministic

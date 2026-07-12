@@ -86,6 +86,25 @@ impl GenerationRetentionLock {
         Self::acquire_with_mode(state_file, scope_id, true)
     }
 
+    pub fn try_acquire_shared(state_file: &Path, scope_id: &str) -> Result<Option<Self>> {
+        let path = retention_lock_path(state_file, scope_id)?;
+        ensure_retention_dir(state_file)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open generation retention lock {}", path.display()))?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(true) => Ok(Some(Self { file })),
+            Ok(false) => Ok(None),
+            Err(error) => Err(error).with_context(|| {
+                format!("try lock shared generation retention {}", path.display())
+            }),
+        }
+    }
+
     fn acquire_with_mode(state_file: &Path, scope_id: &str, shared: bool) -> Result<Self> {
         let path = retention_lock_path(state_file, scope_id)?;
         ensure_retention_dir(state_file)?;
@@ -282,6 +301,7 @@ pub fn scan_retention_protection(
 pub enum GenerationRetentionState {
     Active,
     Rollback,
+    Building,
     Reclaimable,
 }
 
@@ -316,6 +336,9 @@ pub struct GenerationRetentionPlan {
     pub dry_run: bool,
     pub project_id: String,
     pub pruning_suppressed: bool,
+    pub active_bytes: u64,
+    pub rollback_bytes: u64,
+    pub building_bytes: u64,
     pub retained_bytes: u64,
     pub reclaimable_bytes: u64,
     pub bundles: Vec<GenerationBundle>,
@@ -340,6 +363,26 @@ pub fn plan_generation_retention_with_qdrant_collections(
     protection: &RetentionProtectionScan,
     live_qdrant_collections: &[String],
 ) -> GenerationRetentionPlan {
+    plan_generation_retention_with_unrooted_state(
+        layout,
+        project_id,
+        protection,
+        live_qdrant_collections,
+        GenerationRetentionState::Reclaimable,
+    )
+}
+
+pub(crate) fn plan_generation_retention_with_unrooted_state(
+    layout: &SidecarLayout,
+    project_id: &str,
+    protection: &RetentionProtectionScan,
+    live_qdrant_collections: &[String],
+    unrooted_state: GenerationRetentionState,
+) -> GenerationRetentionPlan {
+    debug_assert!(matches!(
+        unrooted_state,
+        GenerationRetentionState::Building | GenerationRetentionState::Reclaimable
+    ));
     let mut errors = protection.errors.clone();
     let mut blocked = Vec::new();
     let mut builders = BTreeMap::<String, BundleBuilder>::new();
@@ -399,17 +442,19 @@ pub fn plan_generation_retention_with_qdrant_collections(
         &mut errors,
         "shared active",
     );
-    let rollback_evidence = if protection.authoritative_rollback.is_empty() {
-        &protection.rollback
-    } else {
-        &protection.authoritative_rollback
-    };
-    collect_latest_protected_generation(
+    collect_protected_generations(
         project_id,
-        rollback_evidence,
+        &protection.rollback,
         &mut rollback,
         &mut errors,
-        "rollback",
+        "shared rollback",
+    );
+    collect_protected_generations(
+        project_id,
+        &protection.authoritative_rollback,
+        &mut rollback,
+        &mut errors,
+        "authoritative rollback",
     );
     if active.is_empty() {
         errors.push(format!(
@@ -420,6 +465,12 @@ pub fn plan_generation_retention_with_qdrant_collections(
         builders.entry(generation.clone()).or_default();
     }
 
+    let effective_unrooted_state = if errors.is_empty() {
+        unrooted_state
+    } else {
+        GenerationRetentionState::Building
+    };
+
     let mut bundles = builders
         .into_iter()
         .map(|(generation, builder)| {
@@ -428,25 +479,33 @@ pub fn plan_generation_retention_with_qdrant_collections(
             } else if rollback.contains(&generation) {
                 GenerationRetentionState::Rollback
             } else {
-                GenerationRetentionState::Reclaimable
+                effective_unrooted_state
             };
             builder.finish(project_id, generation, state)
         })
         .collect::<Vec<_>>();
     bundles.sort_by(|left, right| left.generation.cmp(&right.generation));
-    let retained_bytes = bundles
-        .iter()
-        .filter(|bundle| bundle.state != GenerationRetentionState::Reclaimable)
-        .fold(0_u64, |total, bundle| total.saturating_add(bundle.bytes));
-    let reclaimable_bytes = bundles
-        .iter()
-        .filter(|bundle| bundle.state == GenerationRetentionState::Reclaimable)
-        .fold(0_u64, |total, bundle| total.saturating_add(bundle.bytes));
+    let bytes_for = |state| {
+        bundles
+            .iter()
+            .filter(|bundle| bundle.state == state)
+            .fold(0_u64, |total, bundle| total.saturating_add(bundle.bytes))
+    };
+    let active_bytes = bytes_for(GenerationRetentionState::Active);
+    let rollback_bytes = bytes_for(GenerationRetentionState::Rollback);
+    let building_bytes = bytes_for(GenerationRetentionState::Building);
+    let reclaimable_bytes = bytes_for(GenerationRetentionState::Reclaimable);
+    let retained_bytes = active_bytes
+        .saturating_add(rollback_bytes)
+        .saturating_add(building_bytes);
 
     GenerationRetentionPlan {
         dry_run: true,
         project_id: project_id.to_string(),
-        pruning_suppressed: !errors.is_empty(),
+        pruning_suppressed: effective_unrooted_state == GenerationRetentionState::Building,
+        active_bytes,
+        rollback_bytes,
+        building_bytes,
         retained_bytes,
         reclaimable_bytes,
         bundles,
@@ -523,6 +582,9 @@ pub struct GenerationRetentionApplyReport {
     pub dry_run: bool,
     pub project_id: String,
     pub pruning_suppressed: bool,
+    pub active_bytes: u64,
+    pub rollback_bytes: u64,
+    pub building_bytes: u64,
     pub retained_bytes: u64,
     pub reclaimable_bytes: u64,
     pub removed_bytes: u64,
@@ -540,6 +602,9 @@ pub fn apply_generation_retention(
             dry_run: false,
             project_id: plan.project_id.clone(),
             pruning_suppressed: true,
+            active_bytes: plan.active_bytes,
+            rollback_bytes: plan.rollback_bytes,
+            building_bytes: plan.building_bytes,
             retained_bytes: plan.retained_bytes,
             reclaimable_bytes: plan.reclaimable_bytes,
             removed_bytes: 0,
@@ -608,6 +673,9 @@ pub fn apply_generation_retention(
         dry_run: false,
         project_id: plan.project_id.clone(),
         pruning_suppressed: false,
+        active_bytes: plan.active_bytes,
+        rollback_bytes: plan.rollback_bytes,
+        building_bytes: plan.building_bytes,
         retained_bytes: plan.retained_bytes,
         reclaimable_bytes: plan.reclaimable_bytes,
         removed_bytes,
@@ -898,32 +966,6 @@ fn collect_protected_generations(
                 "{role} manifest for {project_id} is not safe retention evidence: {error:#}"
             )),
         }
-    }
-}
-
-fn collect_latest_protected_generation(
-    project_id: &str,
-    manifests: &[RetrievalIndexManifest],
-    generations: &mut BTreeSet<String>,
-    errors: &mut Vec<String>,
-    role: &str,
-) {
-    let mut candidates = manifests
-        .iter()
-        .filter(|manifest| manifest.project_id == project_id)
-        .filter_map(|manifest| match canonical_manifest_generation(manifest) {
-            Ok(generation) => Some((manifest.built_at_epoch_ms, generation)),
-            Err(error) => {
-                errors.push(format!(
-                    "{role} manifest for {project_id} is not safe retention evidence: {error:#}"
-                ));
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    if let Some((_, generation)) = candidates.pop() {
-        generations.insert(generation);
     }
 }
 
@@ -1313,6 +1355,9 @@ mod tests {
         let plan = plan_generation_retention(&layout, project, &protection);
 
         assert!(!plan.pruning_suppressed);
+        assert_eq!(plan.active_bytes, 6);
+        assert_eq!(plan.rollback_bytes, 15);
+        assert_eq!(plan.building_bytes, 0);
         assert_eq!(plan.retained_bytes, 21);
         assert_eq!(plan.reclaimable_bytes, 24);
         assert_eq!(
@@ -1344,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_active_manifests_remain_protected_while_rollback_is_bounded() {
+    fn every_shared_active_and_rollback_manifest_is_a_gc_root() {
         let root = tempdir().expect("root");
         let layout = layout(root.path());
         let project = "repo-v1-project";
@@ -1354,21 +1399,31 @@ mod tests {
             "cccccccccccccccc",
             "dddddddddddddddd",
             "eeeeeeeeeeeeeeee",
+            "ffffffffffffffff",
         ] {
             write_bundle(&layout, project, suffix, [1, 1, 1]);
         }
-        let protection = RetentionProtectionScan {
-            authoritative_active: vec![manifest(project, "aaaaaaaaaaaaaaaa", 10)],
-            active: vec![
-                manifest(project, "bbbbbbbbbbbbbbbb", 20),
-                manifest(project, "cccccccccccccccc", 30),
-            ],
-            rollback: vec![
-                manifest(project, "bbbbbbbbbbbbbbbb", 20),
-                manifest(project, "dddddddddddddddd", 40),
-            ],
-            ..RetentionProtectionScan::default()
-        };
+        let state_file = root.path().join("retrieval-sidecars.json");
+        for (workspace, active, rollback) in [
+            ("workspace_a", "aaaaaaaaaaaaaaaa", "dddddddddddddddd"),
+            ("workspace_b", "bbbbbbbbbbbbbbbb", "eeeeeeeeeeeeeeee"),
+        ] {
+            let marker = GenerationRetentionMarker::next(
+                workspace,
+                manifest(project, active, 10),
+                Some(VerifiedRollbackManifest {
+                    manifest: manifest(project, rollback, 5),
+                    verified_at_epoch_ms: 10,
+                }),
+                10,
+            )
+            .expect("marker");
+            write_retention_marker(&state_file, &marker).expect("write marker");
+        }
+        let mut protection = scan_retention_protection(root.path(), None, &state_file);
+        protection
+            .authoritative_active
+            .push(manifest(project, "cccccccccccccccc", 30));
 
         let plan = plan_generation_retention(&layout, project, &protection);
 
@@ -1395,6 +1450,10 @@ mod tests {
                     "repo-v1-project-dddddddddddddddd".to_string(),
                     GenerationRetentionState::Rollback,
                 ),
+                (
+                    "repo-v1-project-eeeeeeeeeeeeeeee".to_string(),
+                    GenerationRetentionState::Rollback,
+                ),
             ]
         );
         assert_eq!(
@@ -1403,8 +1462,36 @@ mod tests {
                 .filter(|bundle| bundle.state == GenerationRetentionState::Reclaimable)
                 .map(|bundle| bundle.generation.as_str())
                 .collect::<Vec<_>>(),
-            vec!["repo-v1-project-eeeeeeeeeeeeeeee"]
+            vec!["repo-v1-project-ffffffffffffffff"]
         );
+    }
+
+    #[test]
+    fn unrooted_bytes_are_building_until_the_retention_view_is_stable() {
+        let root = tempdir().expect("root");
+        let layout = layout(root.path());
+        let project = "repo-v1-project";
+        write_bundle(&layout, project, "aaaaaaaaaaaaaaaa", [1, 2, 3]);
+        write_bundle(&layout, project, "bbbbbbbbbbbbbbbb", [4, 5, 6]);
+        let protection = RetentionProtectionScan {
+            authoritative_active: vec![manifest(project, "aaaaaaaaaaaaaaaa", 1)],
+            ..RetentionProtectionScan::default()
+        };
+
+        let plan = plan_generation_retention_with_unrooted_state(
+            &layout,
+            project,
+            &protection,
+            &[],
+            GenerationRetentionState::Building,
+        );
+
+        assert_eq!(plan.active_bytes, 6);
+        assert_eq!(plan.rollback_bytes, 0);
+        assert_eq!(plan.building_bytes, 15);
+        assert_eq!(plan.reclaimable_bytes, 0);
+        assert_eq!(plan.retained_bytes, 21);
+        assert!(plan.pruning_suppressed);
     }
 
     #[test]
@@ -1447,7 +1534,8 @@ mod tests {
         let report = apply_generation_retention(&plan, &mut remover);
 
         assert!(plan.pruning_suppressed);
-        assert_eq!(plan.reclaimable_bytes, 9);
+        assert_eq!(plan.building_bytes, 9);
+        assert_eq!(plan.reclaimable_bytes, 0);
         assert!(report.pruning_suppressed);
         assert_eq!(report.removed_bytes, 0);
         assert!(remover.removed_paths.is_empty());
@@ -1473,7 +1561,8 @@ mod tests {
         let report = apply_generation_retention(&plan, &mut remover);
 
         assert!(plan.pruning_suppressed);
-        assert_eq!(plan.reclaimable_bytes, 9);
+        assert_eq!(plan.building_bytes, 9);
+        assert_eq!(plan.reclaimable_bytes, 0);
         assert!(report.pruning_suppressed);
         assert!(remover.removed_paths.is_empty());
         assert!(remover.removed_collections.is_empty());

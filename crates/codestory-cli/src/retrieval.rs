@@ -716,8 +716,13 @@ fn emit_retrieval_inventory(
     }
     if let Some(retention) = report.generation_retention.as_ref() {
         markdown.push_str(&format!(
-            "- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
-            retention.retained_bytes, retention.reclaimable_bytes, retention.pruning_suppressed
+            "- generation_retention_active_bytes: {}\n- generation_retention_rollback_bytes: {}\n- generation_retention_building_bytes: {}\n- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
+            retention.active_bytes,
+            retention.rollback_bytes,
+            retention.building_bytes,
+            retention.retained_bytes,
+            retention.reclaimable_bytes,
+            retention.pruning_suppressed
         ));
         if !retention.errors.is_empty() {
             markdown.push_str(&format!(
@@ -787,7 +792,10 @@ fn emit_retrieval_gc(
     }
     if let Some(retention) = report.generation_retention.as_ref() {
         markdown.push_str(&format!(
-            "- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_removed_bytes: {}\n- generation_retention_remaining_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
+            "- generation_retention_active_bytes: {}\n- generation_retention_rollback_bytes: {}\n- generation_retention_building_bytes: {}\n- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_removed_bytes: {}\n- generation_retention_remaining_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
+            retention.active_bytes,
+            retention.rollback_bytes,
+            retention.building_bytes,
             retention.retained_bytes,
             retention.reclaimable_bytes,
             retention.removed_bytes,
