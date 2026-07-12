@@ -8,6 +8,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 const { dirtyMarkerPathForProject } = require('../hooks/codestory-runtime.cjs');
 
 const pluginRoot = path.dirname(__dirname);
@@ -24,9 +25,22 @@ const releaseDownloadAttempts = 3;
 const releaseDownloadRetryDelaysMs = [1000, 3000];
 const managedCliLockStaleMs = 10 * 60 * 1000;
 const managedCliLockMaxAgeMs = 30 * 60 * 1000;
-const managedCliLockWaitMs = 5 * 60 * 1000;
+const releaseAssetRetryBudgetMs =
+  releaseDownloadAttempts * releaseDownloadTimeoutMs +
+  releaseDownloadRetryDelaysMs.slice(0, releaseDownloadAttempts - 1).reduce((sum, delay) => sum + delay, 0);
+const managedCliStagingBudgetMs = 30 * 1000;
+const managedCliLockWaitMs = 2 * releaseAssetRetryBudgetMs + managedCliStagingBudgetMs;
 const managedCliPendingOwnerCleanupLimit = 64;
 const managedCliQuarantineRetention = 2;
+const managedCliArchiveMaxBytes = 256 * 1024 * 1024;
+const managedCliArchiveMaxEntries = 20_000;
+const managedCliArchiveMaxEntryBytes = 256 * 1024 * 1024;
+const managedCliArchiveMaxOutputBytes = 512 * 1024 * 1024;
+const managedCliProbeStdoutMaxBytes = 64 * 1024;
+const managedCliProbeStderrMaxBytes = 4 * 1024;
+const managedCliProbeTerminationGraceMs = 500;
+const managedCliProbeForceKillGraceMs = 1000;
+const managedCliMcpProtocolVersion = '2024-11-05';
 
 function readJson(file) {
   try {
@@ -477,6 +491,7 @@ function sleep(ms) {
 
 function downloadFileOnce(url, destination, options = {}) {
   const timeoutMs = options.timeoutMs || releaseDownloadTimeoutMs;
+  const deadlineMs = options.deadlineMs ?? Date.now() + timeoutMs;
   const redirectsRemaining = options.redirectsRemaining ?? 5;
   const parsedUrl = new URL(url);
   const loopbackHttp = parsedUrl.protocol === 'http:' &&
@@ -486,30 +501,58 @@ function downloadFileOnce(url, destination, options = {}) {
   }
   const get = options.get || (loopbackHttp ? http.get : https.get);
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let output = null;
+    let activeRequest = null;
+    let activeResponse = null;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      if (error) {
+        if (output) output.destroy();
+        if (activeResponse) activeResponse.destroy();
+        if (activeRequest) activeRequest.destroy();
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const remainingMs = Math.max(0, deadlineMs - Date.now());
+    const deadlineTimer = setTimeout(
+      () => finish(new Error(`download timed out after ${timeoutMs}ms total: ${url}`)),
+      remainingMs,
+    );
     const request = get(url, (response) => {
+      activeResponse = response;
       if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
         response.resume();
         if (!response.headers.location || redirectsRemaining <= 0) {
-          reject(new Error(`download redirect failed: ${url}`));
+          finish(new Error(`download redirect failed: ${url}`));
           return;
         }
         const nextUrl = new URL(response.headers.location, url).toString();
-        downloadFileOnce(nextUrl, destination, { ...options, redirectsRemaining: redirectsRemaining - 1 })
-          .then(resolve, reject);
+        downloadFileOnce(nextUrl, destination, {
+          ...options,
+          deadlineMs,
+          redirectsRemaining: redirectsRemaining - 1,
+        }).then(() => finish(null), finish);
         return;
       }
       if (response.statusCode !== 200) {
         response.resume();
-        reject(new Error(`download failed ${response.statusCode}: ${url}`));
+        finish(new Error(`download failed ${response.statusCode}: ${url}`));
         return;
       }
-      const output = fs.createWriteStream(destination);
+      output = fs.createWriteStream(destination);
       response.pipe(output);
-      output.on('finish', () => output.close(resolve));
-      output.on('error', reject);
+      output.on('finish', () => output.close((error) => finish(error || null)));
+      output.on('error', finish);
+      response.on('aborted', () => finish(new Error(`download body aborted: ${url}`)));
+      response.on('error', finish);
     });
-    request.setTimeout(timeoutMs, () => request.destroy(new Error(`download timed out after ${timeoutMs}ms: ${url}`)));
-    request.on('error', reject);
+    activeRequest = request;
+    request.on('error', finish);
   });
 }
 
@@ -579,15 +622,266 @@ async function fetchReleaseFile(version, name, destination) {
   return redactedReleaseFileUrl(version, name);
 }
 
-function extractArchive(archivePath, destination) {
-  fs.mkdirSync(destination, { recursive: true });
-  const result = spawnSync('tar', ['-xf', archivePath, '-C', destination], {
-    encoding: 'utf8',
-    windowsHide: true,
-  });
-  if (result.status !== 0) {
-    throw new Error(`tar extract failed: ${result.stderr || result.error?.message || result.status}`);
+function safeArchiveDestination(destination, entryName) {
+  const normalized = String(entryName || '').replace(/\\/gu, '/');
+  if (!normalized || normalized.startsWith('/') || /^[A-Za-z]:\//u.test(normalized)) {
+    throw new Error(`archive_path_invalid:${entryName}`);
   }
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.some((part) => part === '..')) throw new Error(`archive_path_escape:${entryName}`);
+  const resolved = path.resolve(destination, ...parts);
+  const root = `${path.resolve(destination)}${path.sep}`;
+  if (resolved !== path.resolve(destination) && !resolved.startsWith(root)) {
+    throw new Error(`archive_path_escape:${entryName}`);
+  }
+  return resolved;
+}
+
+function crc32(content) {
+  let crc = 0xffffffff;
+  for (const byte of content) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function tarText(block, start, length) {
+  return block.subarray(start, start + length).toString('utf8').replace(/\0.*$/su, '').trim();
+}
+
+function tarNumber(block, start, length) {
+  const text = tarText(block, start, length);
+  if (!text || !/^[0-7]+$/u.test(text)) throw new Error('tar_numeric_field_invalid');
+  const value = Number.parseInt(text, 8);
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('tar_numeric_field_invalid');
+  return value;
+}
+
+function paxPath(payload) {
+  let offset = 0;
+  let selected = null;
+  while (offset < payload.length) {
+    const space = payload.indexOf(0x20, offset);
+    if (space < 0) throw new Error('tar_pax_length_missing');
+    const lengthText = payload.subarray(offset, space).toString('ascii');
+    if (!/^\d+$/u.test(lengthText)) throw new Error('tar_pax_length_invalid');
+    const length = Number.parseInt(lengthText, 10);
+    if (!Number.isSafeInteger(length) || length <= 0 || offset + length > payload.length) {
+      throw new Error('tar_pax_length_invalid');
+    }
+    if (payload[offset + length - 1] !== 0x0a) throw new Error('tar_pax_record_unterminated');
+    const record = payload.subarray(space + 1, offset + length - 1).toString('utf8');
+    const separator = record.indexOf('=');
+    if (separator <= 0) throw new Error('tar_pax_record_invalid');
+    if (record.slice(0, separator) === 'path') {
+      selected = record.slice(separator + 1);
+      if (!selected || selected.includes('\0')) throw new Error('tar_pax_path_invalid');
+    }
+    offset += length;
+  }
+  if (offset !== payload.length) throw new Error('tar_pax_trailing_bytes');
+  return selected;
+}
+
+function extractTarGz(archivePath, destination) {
+  const archive = zlib.gunzipSync(fs.readFileSync(archivePath), {
+    maxOutputLength: managedCliArchiveMaxOutputBytes,
+  });
+  let offset = 0;
+  let nextPath = null;
+  let entries = 0;
+  let outputBytes = 0;
+  let terminated = false;
+  while (offset + 512 <= archive.length) {
+    const header = archive.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) {
+      if (
+        offset + 1024 > archive.length ||
+        !archive.subarray(offset + 512, offset + 1024).every((byte) => byte === 0)
+      ) {
+        throw new Error('tar_terminator_invalid');
+      }
+      if (!archive.subarray(offset + 1024).every((byte) => byte === 0)) {
+        throw new Error('tar_trailing_bytes');
+      }
+      terminated = true;
+      break;
+    }
+    entries += 1;
+    if (entries > managedCliArchiveMaxEntries) throw new Error('archive_entry_limit_exceeded');
+    const storedChecksum = tarNumber(header, 148, 8);
+    let checksum = 0;
+    for (let index = 0; index < 512; index += 1) {
+      checksum += index >= 148 && index < 156 ? 0x20 : header[index];
+    }
+    if (checksum !== storedChecksum) throw new Error('tar_header_checksum_mismatch');
+    const size = tarNumber(header, 124, 12);
+    if (size > managedCliArchiveMaxEntryBytes) throw new Error('archive_entry_size_limit_exceeded');
+    const type = String.fromCharCode(header[156] || 0);
+    const prefix = tarText(header, 345, 155);
+    const headerName = tarText(header, 0, 100);
+    const name = nextPath || (prefix ? `${prefix}/${headerName}` : headerName);
+    nextPath = null;
+    const dataStart = offset + 512;
+    const dataEnd = dataStart + size;
+    if (dataEnd > archive.length) throw new Error('tar_entry_truncated');
+    const payload = archive.subarray(dataStart, dataEnd);
+    if (type === 'x') nextPath = paxPath(payload);
+    else if (type === 'L') {
+      const terminator = payload.indexOf(0);
+      if (terminator < 1 || !payload.subarray(terminator).every((byte) => byte === 0)) {
+        throw new Error('tar_long_name_unterminated');
+      }
+      nextPath = payload.subarray(0, terminator).toString('utf8');
+    }
+    else if (type === '5') fs.mkdirSync(safeArchiveDestination(destination, name), { recursive: true });
+    else if (type === '\0' || type === '0') {
+      if (!name) throw new Error('tar_entry_name_missing');
+      outputBytes += size;
+      if (outputBytes > managedCliArchiveMaxOutputBytes) throw new Error('archive_output_limit_exceeded');
+      const output = safeArchiveDestination(destination, name);
+      fs.mkdirSync(path.dirname(output), { recursive: true });
+      fs.writeFileSync(output, payload, { mode: tarNumber(header, 100, 8) || 0o644 });
+    } else if (type === 'g') {
+      paxPath(payload);
+    } else {
+      throw new Error(`tar_entry_type_unsupported:${type.charCodeAt(0)}`);
+    }
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  if (!terminated || nextPath) throw new Error(nextPath ? 'tar_extended_name_without_entry' : 'tar_terminator_missing');
+}
+
+function findZipEndOfCentralDirectory(archive) {
+  const minimum = Math.max(0, archive.length - 65557);
+  for (let offset = archive.length - 22; offset >= minimum; offset -= 1) {
+    if (
+      archive.readUInt32LE(offset) === 0x06054b50 &&
+      offset + 22 + archive.readUInt16LE(offset + 20) === archive.length
+    ) return offset;
+  }
+  throw new Error('zip_end_of_central_directory_missing');
+}
+
+function extractZip(archivePath, destination) {
+  const archive = fs.readFileSync(archivePath);
+  const eocd = findZipEndOfCentralDirectory(archive);
+  if (
+    archive.readUInt16LE(eocd + 4) !== 0 || archive.readUInt16LE(eocd + 6) !== 0 ||
+    archive.readUInt16LE(eocd + 8) !== archive.readUInt16LE(eocd + 10)
+  ) throw new Error('zip_multi_disk_unsupported');
+  const entries = archive.readUInt16LE(eocd + 10);
+  if (entries === 0xffff || entries > managedCliArchiveMaxEntries) {
+    throw new Error('archive_entry_limit_exceeded');
+  }
+  const centralSize = archive.readUInt32LE(eocd + 12);
+  const centralOffset = archive.readUInt32LE(eocd + 16);
+  if (
+    centralSize === 0xffffffff || centralOffset === 0xffffffff ||
+    centralOffset + centralSize !== eocd
+  ) throw new Error('zip_central_directory_bounds_invalid');
+  let offset = centralOffset;
+  let outputBytes = 0;
+  const extractedPaths = new Set();
+  for (let index = 0; index < entries; index += 1) {
+    if (offset + 46 > eocd) throw new Error('zip_central_directory_truncated');
+    if (archive.readUInt32LE(offset) !== 0x02014b50) throw new Error('zip_central_directory_invalid');
+    const flags = archive.readUInt16LE(offset + 8);
+    const method = archive.readUInt16LE(offset + 10);
+    const compressedSize = archive.readUInt32LE(offset + 20);
+    const uncompressedSize = archive.readUInt32LE(offset + 24);
+    const nameLength = archive.readUInt16LE(offset + 28);
+    const extraLength = archive.readUInt16LE(offset + 30);
+    const commentLength = archive.readUInt16LE(offset + 32);
+    const externalAttributes = archive.readUInt32LE(offset + 38);
+    const localOffset = archive.readUInt32LE(offset + 42);
+    const centralEnd = offset + 46 + nameLength + extraLength + commentLength;
+    if (centralEnd > eocd) throw new Error('zip_central_entry_bounds_invalid');
+    if (
+      compressedSize === 0xffffffff || uncompressedSize === 0xffffffff ||
+      localOffset === 0xffffffff || uncompressedSize > managedCliArchiveMaxEntryBytes
+    ) throw new Error('archive_entry_size_limit_exceeded');
+    const nameBytes = archive.subarray(offset + 46, offset + 46 + nameLength);
+    const name = nameBytes.toString('utf8');
+    if (!name || name.includes('\0') || name.includes('\ufffd')) throw new Error('zip_entry_name_invalid');
+    if ((flags & 0x1) !== 0) throw new Error('zip_encryption_unsupported');
+    if (((externalAttributes >>> 16) & 0o170000) === 0o120000) throw new Error('zip_symlink_unsupported');
+    if (localOffset + 30 > centralOffset || archive.readUInt32LE(localOffset) !== 0x04034b50) {
+      throw new Error('zip_local_header_invalid');
+    }
+    const localNameLength = archive.readUInt16LE(localOffset + 26);
+    const localExtraLength = archive.readUInt16LE(localOffset + 28);
+    const localName = archive.subarray(localOffset + 30, localOffset + 30 + localNameLength);
+    if (!localName.equals(nameBytes)) throw new Error('zip_local_name_mismatch');
+    const localFlags = archive.readUInt16LE(localOffset + 6);
+    const localMethod = archive.readUInt16LE(localOffset + 8);
+    const localCrc = archive.readUInt32LE(localOffset + 14);
+    const localCompressedSize = archive.readUInt32LE(localOffset + 18);
+    const localUncompressedSize = archive.readUInt32LE(localOffset + 22);
+    if (localFlags !== flags || localMethod !== method) {
+      throw new Error('zip_local_metadata_mismatch');
+    }
+    const usesDataDescriptor = (flags & 0x8) !== 0;
+    if (usesDataDescriptor) {
+      for (const [local, central] of [
+        [localCrc, archive.readUInt32LE(offset + 16)],
+        [localCompressedSize, compressedSize],
+        [localUncompressedSize, uncompressedSize],
+      ]) {
+        if (local !== 0 && local !== central) throw new Error('zip_local_metadata_mismatch');
+      }
+    } else if (
+      localCrc !== archive.readUInt32LE(offset + 16) ||
+      localCompressedSize !== compressedSize || localUncompressedSize !== uncompressedSize
+    ) {
+      throw new Error('zip_local_metadata_mismatch');
+    }
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    if (dataStart + compressedSize > centralOffset) throw new Error('zip_entry_bounds_invalid');
+    const compressed = archive.subarray(dataStart, dataStart + compressedSize);
+    if (compressed.length !== compressedSize) throw new Error('zip_entry_truncated');
+    if (usesDataDescriptor) {
+      let descriptorOffset = dataStart + compressedSize;
+      if (descriptorOffset + 4 <= centralOffset && archive.readUInt32LE(descriptorOffset) === 0x08074b50) {
+        descriptorOffset += 4;
+      }
+      if (descriptorOffset + 12 > centralOffset) throw new Error('zip_data_descriptor_missing');
+      if (
+        archive.readUInt32LE(descriptorOffset) !== archive.readUInt32LE(offset + 16) ||
+        archive.readUInt32LE(descriptorOffset + 4) !== compressedSize ||
+        archive.readUInt32LE(descriptorOffset + 8) !== uncompressedSize
+      ) throw new Error('zip_data_descriptor_mismatch');
+    }
+    const output = safeArchiveDestination(destination, name);
+    if (extractedPaths.has(output)) throw new Error('archive_duplicate_path');
+    extractedPaths.add(output);
+    if (name.endsWith('/')) {
+      fs.mkdirSync(output, { recursive: true });
+    } else {
+      outputBytes += uncompressedSize;
+      if (outputBytes > managedCliArchiveMaxOutputBytes) throw new Error('archive_output_limit_exceeded');
+      const content = method === 0 ? compressed : method === 8 ? zlib.inflateRawSync(compressed, {
+        maxOutputLength: Math.min(managedCliArchiveMaxEntryBytes, uncompressedSize + 1),
+      }) : null;
+      if (!content) throw new Error(`zip_compression_unsupported:${method}`);
+      if (content.length !== uncompressedSize) throw new Error('zip_entry_size_mismatch');
+      if (crc32(content) !== archive.readUInt32LE(offset + 16)) throw new Error('zip_entry_crc_mismatch');
+      fs.mkdirSync(path.dirname(output), { recursive: true });
+      fs.writeFileSync(output, content, { mode: ((externalAttributes >>> 16) & 0o777) || 0o644 });
+    }
+    offset = centralEnd;
+  }
+  if (offset !== eocd) throw new Error('zip_central_directory_entry_count_mismatch');
+}
+
+function extractArchive(archivePath, destination) {
+  const archiveBytes = fs.statSync(archivePath).size;
+  if (archiveBytes > managedCliArchiveMaxBytes) throw new Error('archive_input_limit_exceeded');
+  fs.mkdirSync(destination, { recursive: true });
+  if (archivePath.endsWith('.zip')) extractZip(archivePath, destination);
+  else if (archivePath.endsWith('.tar.gz')) extractTarGz(archivePath, destination);
+  else throw new Error(`archive_format_unsupported:${path.basename(archivePath)}`);
 }
 
 function processIsAlive(pid) {
@@ -766,16 +1060,72 @@ function reclaimStaleManagedCliPendingOwners(
 
 function reclaimStaleManagedCliInitialization(lockPath, checkProcessIdentity = true) {
   const initializationPath = `${lockPath}.initializing`;
-  const owner = readJson(initializationPath);
-  let stale = managedCliLockOwnerIsStale(owner, checkProcessIdentity);
-  if (stale === null) {
+  return removeManagedCliInitializationIf(initializationPath, (owner, metadata) => {
+    const stale = managedCliLockOwnerIsStale(owner, checkProcessIdentity);
+    return stale === null ? Date.now() - metadata.mtimeMs > managedCliLockStaleMs : stale;
+  });
+}
+
+function sameFileIdentity(left, right) {
+  return left.isFile() && right.isFile() && !left.isSymbolicLink() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.mtimeMs === right.mtimeMs;
+}
+
+function restoreMovedInitialization(initializationPath, movedPath) {
+  try {
+    fs.renameSync(movedPath, initializationPath);
+  } catch {
+    // A new contender already owns the canonical alias. Every initializing owner retains its
+    // private hard-linked pending-owner claim, so dropping only this moved alias cannot delete it.
     try {
-      stale = Date.now() - fs.statSync(initializationPath).mtimeMs > managedCliLockStaleMs;
+      fs.unlinkSync(movedPath);
     } catch {
-      return false;
+      // Best effort; the unique artifact is never mistaken for the canonical initialization path.
     }
   }
-  return stale ? removeManagedCliLockArtifact(initializationPath) : false;
+}
+
+function removeManagedCliInitializationIf(initializationPath, shouldRemove, options = {}) {
+  let descriptor;
+  const movedPath = `${initializationPath}.reclaim-${process.pid}-${randomBytes(8).toString('hex')}`;
+  try {
+    const before = fs.lstatSync(initializationPath);
+    if (!before.isFile() || before.isSymbolicLink()) return false;
+    descriptor = fs.openSync(
+      initializationPath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0),
+    );
+    const opened = fs.fstatSync(descriptor);
+    if (!sameFileIdentity(before, opened)) return false;
+    let owner = null;
+    try {
+      owner = JSON.parse(fs.readFileSync(descriptor, 'utf8'));
+    } catch {
+      // Malformed artifacts are removable only through the caller's age fallback.
+    }
+    if (!shouldRemove(owner, opened)) return false;
+    const current = fs.lstatSync(initializationPath);
+    if (!sameFileIdentity(opened, current)) return false;
+    fs.renameSync(initializationPath, movedPath);
+    if (options.afterRename) options.afterRename({ initializationPath, movedPath });
+    const moved = fs.lstatSync(movedPath);
+    const movedOwner = readJson(movedPath);
+    if (
+      !sameFileIdentity(opened, moved) ||
+      movedOwner?.pid !== owner?.pid || movedOwner?.token !== owner?.token
+    ) {
+      restoreMovedInitialization(initializationPath, movedPath);
+      return false;
+    }
+    fs.unlinkSync(movedPath);
+    return true;
+  } catch {
+    if (fs.existsSync(movedPath)) restoreMovedInitialization(initializationPath, movedPath);
+    return false;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
 }
 
 function reclaimStaleManagedCliLock(lockPath, checkProcessIdentity = true) {
@@ -798,9 +1148,10 @@ function reclaimStaleManagedCliLock(lockPath, checkProcessIdentity = true) {
 
 function releaseManagedCliInitialization(lockPath, owner) {
   const initializationPath = `${lockPath}.initializing`;
-  const current = readJson(initializationPath);
-  if (!current || current.pid !== owner.pid || current.token !== owner.token) return;
-  fs.rmSync(initializationPath, { force: true });
+  removeManagedCliInitializationIf(
+    initializationPath,
+    (current) => current?.pid === owner.pid && current?.token === owner.token,
+  );
 }
 
 function acquireManagedCliLock(root, purpose, waitMs = 0, options = {}) {
@@ -905,6 +1256,7 @@ function verifyPublishedManagedCli(
     manifest.repo_ref !== `v${version}` ||
     manifest.archive !== expectedAsset ||
     manifest.target !== expectedTarget ||
+    manifest.stdio_initialize_verified !== true ||
     !/^[0-9a-f]{64}$/iu.test(String(manifest.archive_sha256 || '')) ||
     manifest.archive_url !== redactedReleaseFileUrl(version, expectedAsset)
   ) {
@@ -913,6 +1265,127 @@ function verifyPublishedManagedCli(
   const resolved = resolveManifest(path.join(versionDir, 'manifest.json'));
   if (!resolved?.path) return { verified: false, reason: 'manifest_resolution_failed' };
   return { verified: true, reason: null, resolved: { ...resolved, cliVersion: version } };
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
+  return new Promise((resolve, reject) => {
+    const spawnChild = options.spawn || spawn;
+    const child = spawnChild(cliPath, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: process.platform === 'win32' && /\.(cmd|bat)$/iu.test(cliPath),
+      windowsHide: true,
+      env: { ...process.env, CODESTORY_PLUGIN_PROVISIONING_PROBE: '1' },
+    });
+    let completed = false;
+    let requestedOutcome = null;
+    let stdout = '';
+    let stderr = '';
+    let forceTimer = null;
+    let terminationTimer = null;
+    const finish = (error) => {
+      if (completed) return;
+      completed = true;
+      clearTimeout(probeTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (terminationTimer) clearTimeout(terminationTimer);
+      if (error) reject(error); else resolve();
+    };
+    const terminate = (error) => {
+      if (requestedOutcome) return;
+      requestedOutcome = { error };
+      clearTimeout(probeTimer);
+      try {
+        child.kill('SIGTERM');
+      } catch (killError) {
+        finish(new Error(`managed_cli_stdio_initialize_terminate:${killError.message}`));
+        return;
+      }
+      forceTimer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch (killError) {
+          finish(new Error(`managed_cli_stdio_initialize_force_kill:${killError.message}`));
+        }
+      },
+        options.terminationGraceMs ?? managedCliProbeTerminationGraceMs);
+      terminationTimer = setTimeout(
+        () => finish(new Error('managed_cli_stdio_initialize_termination_timeout')),
+        (options.terminationGraceMs ?? managedCliProbeTerminationGraceMs) +
+          (options.forceKillGraceMs ?? managedCliProbeForceKillGraceMs),
+      );
+    };
+    const probeTimer = setTimeout(
+      () => terminate(new Error(`managed_cli_stdio_initialize_timeout:${timeoutMs}`)),
+      timeoutMs,
+    );
+    child.stderr.on('data', (chunk) => {
+      const remaining = managedCliProbeStderrMaxBytes - Buffer.byteLength(stderr, 'utf8');
+      if (remaining > 0) {
+        stderr += Buffer.from(chunk).subarray(0, remaining).toString('utf8');
+      }
+    });
+    child.stderr.on('error', (error) => terminate(new Error(`managed_cli_stdio_initialize_stderr:${error.message}`)));
+    child.stdout.on('data', (chunk) => {
+      const bytes = Buffer.from(chunk);
+      if (Buffer.byteLength(stdout, 'utf8') + bytes.length > managedCliProbeStdoutMaxBytes) {
+        terminate(new Error('managed_cli_stdio_initialize_stdout_limit'));
+        return;
+      }
+      stdout += bytes.toString('utf8');
+      const newline = stdout.indexOf('\n');
+      if (newline < 0) return;
+      let response;
+      try {
+        response = JSON.parse(stdout.slice(0, newline).trim());
+      } catch (error) {
+        terminate(new Error(`managed_cli_stdio_initialize_invalid_json:${error.message}`));
+        return;
+      }
+      if (
+        response?.jsonrpc !== '2.0' || response?.id !== 'managed-cli-staging' ||
+        !isPlainObject(response.result) ||
+        response.result.protocolVersion !== managedCliMcpProtocolVersion ||
+        !isPlainObject(response.result.capabilities) ||
+        !isPlainObject(response.result.serverInfo) ||
+        typeof response.result.serverInfo.name !== 'string' || !response.result.serverInfo.name.trim() ||
+        typeof response.result.serverInfo.version !== 'string' || !response.result.serverInfo.version.trim()
+      ) {
+        terminate(new Error('managed_cli_stdio_initialize_incompatible'));
+        return;
+      }
+      terminate(null);
+    });
+    child.stdout.on('error', (error) => terminate(new Error(`managed_cli_stdio_initialize_stdout:${error.message}`)));
+    child.stdin.on('error', (error) => terminate(new Error(`managed_cli_stdio_initialize_stdin:${error.message}`)));
+    child.on('error', (error) => finish(new Error(`managed_cli_stdio_initialize_spawn:${error.message}`)));
+    child.on('exit', (code, signal) => {
+      if (requestedOutcome) {
+        finish(requestedOutcome.error);
+      } else {
+        finish(new Error(
+          `managed_cli_stdio_initialize_exit:code=${code}:signal=${signal || 'none'}:stderr=${stderr}`,
+        ));
+      }
+    });
+    try {
+      child.stdin.end(`${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'managed-cli-staging',
+        method: 'initialize',
+        params: {
+          protocolVersion: managedCliMcpProtocolVersion,
+          capabilities: {},
+          clientInfo: { name: 'codestory-managed-cli-staging', version: '1' },
+        },
+      })}\n`);
+    } catch (error) {
+      terminate(new Error(`managed_cli_stdio_initialize_stdin:${error.message}`));
+    }
+  });
 }
 
 function trimManagedCliQuarantines(root, version, options = {}) {
@@ -1021,7 +1494,7 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
     fs.copyFileSync(extracted, destination);
     if (process.platform !== 'win32') fs.chmodSync(destination, 0o755);
     const binarySha256 = fileSha256(destination);
-    fs.writeFileSync(manifestPath, JSON.stringify({
+    const manifest = {
       path: path.relative(stagingDir, destination).replace(/\\/gu, '/'),
       sha256: binarySha256,
       version,
@@ -1032,12 +1505,19 @@ async function provisionManagedCli(dataDir, version, warnings = []) {
       archive_sha256: actual,
       target,
       provisioned_at: new Date().toISOString(),
-    }, null, 2));
+      stdio_initialize_verified: true,
+    };
+    const versionProbe = probeResolvedCli({ path: destination, provisioningProbe: true });
+    if (versionProbe.error || versionProbe.status !== 0 || versionProbe.version !== version) {
+      throw new Error('managed_cli_staging_verification_failed:version_probe_failed');
+    }
+    await probeManagedCliStdio(destination);
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
     const staged = verifyPublishedManagedCli(
       stagingDir,
       version,
       target,
-      (resolved) => probeResolvedCli({ ...resolved, provisioningProbe: true }),
+      () => versionProbe,
     );
     if (!staged.verified) {
       throw new Error(`managed_cli_staging_verification_failed:${staged.reason}`);
@@ -2567,9 +3047,14 @@ if (require.main === module) {
     _test: {
       compareManagedCliVersions,
       downloadFile,
+      extractArchive,
       acquireManagedCliLock,
+      managedCliLockWaitMs,
+      releaseAssetRetryBudgetMs,
       reclaimStaleManagedCliPendingOwners,
+      removeManagedCliInitializationIf,
       processStartIdentity,
+      probeManagedCliStdio,
       provisionManagedCli,
       quarantineManagedCliVersion,
       releaseManagedCliLock,

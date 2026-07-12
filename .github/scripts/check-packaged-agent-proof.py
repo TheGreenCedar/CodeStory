@@ -184,6 +184,11 @@ def cleanup_proof_cache(cli: Path, project: Path, cache_root: Path) -> None:
     shutil.rmtree(cache_root, ignore_errors=True)
 
 
+def local_profile_environment(base: dict[str, str]) -> dict[str, str]:
+    """Keep explicit local commands and their default runtime in one namespace."""
+    return {**base, "CODESTORY_SIDECAR_PROFILE": "local"}
+
+
 def require_plugin_manifest_version(plugin_root: Path, expected_version: str) -> None:
     manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
     require(manifest_path.is_file(), "plugin_manifest", manifest_path, f"plugin manifest is missing: {manifest_path}")
@@ -1138,6 +1143,7 @@ def run_gate(args: argparse.Namespace) -> None:
             write_json(out_dir / "summary.json", summary)
             return
 
+        local_env = local_profile_environment(proof_env)
         local_bootstrap_artifact = out_dir / "local-retrieval-bootstrap.json"
         run_command(
             cli,
@@ -1156,7 +1162,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             local_bootstrap_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         summary["artifacts"]["local_retrieval_bootstrap"] = str(local_bootstrap_artifact)
         write_json(out_dir / "summary.json", summary)
@@ -1181,7 +1187,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             local_index_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_retrieval_index_ready(local_index, "local_retrieval_index", local_index_artifact)
         summary["artifacts"]["local_retrieval_index"] = str(local_index_artifact)
@@ -1205,7 +1211,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             local_status_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_retrieval_full(local_status, "local_retrieval_status", local_status_artifact)
         summary["artifacts"]["local_retrieval_status"] = str(local_status_artifact)
@@ -1640,6 +1646,12 @@ def write_fake_plugin_launcher(plugin_root: Path) -> None:
 
 
 def self_test() -> None:
+    base_environment = {"KEEP": "value", "CODESTORY_SIDECAR_PROFILE": "agent"}
+    local_environment = local_profile_environment(base_environment)
+    assert local_environment["KEEP"] == "value"
+    assert local_environment["CODESTORY_SIDECAR_PROFILE"] == "local"
+    assert base_environment["CODESTORY_SIDECAR_PROFILE"] == "agent"
+
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-self-test-") as temp:
         root = Path(temp)
         transient_cleanup_attempts = 0

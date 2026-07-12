@@ -32,11 +32,17 @@ Ambient `PATH` binaries are reported as diagnostics only; installed plugin
 runtime does not launch them.
 
 After a managed runtime passes archive checksum, executable checksum, manifest,
-and `--version` verification, the adapter retains that active version plus one
-verified pending upgrade or rollback. Same-version launches elect one publisher
+`--version`, and MCP stdio `initialize` verification, the adapter retains that
+active version plus one verified pending upgrade or rollback. ZIP and tar.gz
+release assets are extracted with Node platform APIs, without an external
+archive command, under explicit archive-size, entry-count, per-entry, and total
+output ceilings. Same-version launches elect one publisher
 under an atomically owner-published PID/start-identity/token lock; acquisition
 fails closed without a reliable process-start identity, and waiters reuse its
-atomically renamed staging directory. A corrupt target is quarantined (two
+atomically renamed staging directory. Their wait bound covers both release
+assets' absolute total download retry windows. The staging MCP probe bounds its
+output and waits for child termination with forced-kill escalation. Stale initialization aliases are
+revalidated by inode and owner token after rename before deletion. A corrupt target is quarantined (two
 copies retained) and reprovisioned once. A live owner or unmovable Windows
 executable is never deleted, and publication fails closed when safe quarantine
 or replacement is not possible. Publisher, waiter, reclaimed-lock, quarantine,
