@@ -31,16 +31,18 @@ pub(crate) use native_lease::{
     reusable_native_embedding_resource_pid_for_snapshot, run_with_native_embedding_lease_lifecycle,
     transfer_native_embedding_resource_lease,
 };
-#[allow(unused_imports)]
 pub(crate) use paths::machine_resource_cache_fingerprint;
 #[allow(unused_imports)]
-pub(crate) use reconcile::reconcile_before_enqueue;
+pub(crate) use reconcile::{reconcile_before_enqueue, reconcile_before_enqueue_for_sidecar};
 #[allow(unused_imports)]
 pub(crate) use scope::{
     BROKER_SCHEMA_VERSION, agent_repair_scope, broker_operation_id, operation_scope,
 };
 #[allow(unused_imports)]
-pub(crate) use snapshot::{observe_broker_snapshot, refresh_broker_snapshot};
+pub(crate) use snapshot::{
+    observe_broker_snapshot, observe_broker_snapshot_for_sidecar, refresh_broker_snapshot,
+    refresh_broker_snapshot_for_sidecar,
+};
 #[allow(unused_imports)]
 pub(crate) use types::{
     BrokerGpuProofInput, BrokerGpuProofSnapshot, BrokerOperationSnapshot,

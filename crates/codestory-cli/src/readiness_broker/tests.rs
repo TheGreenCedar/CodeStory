@@ -1141,6 +1141,76 @@ fn reconcile_before_enqueue_cleans_abandoned_repair_for_dead_pid() {
 }
 
 #[test]
+fn reconcile_before_enqueue_for_sidecar_keeps_abandoned_cleanup_in_retained_root() {
+    let project = tempdir().expect("project");
+    let retained_cache = tempdir().expect("retained cache");
+    let mutable_cache = tempdir().expect("mutable cache");
+    let run_id = "shared-agent";
+    let retained_sidecar =
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(project.path()),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(run_id),
+            retained_cache.path(),
+        );
+    let mutable_sidecar =
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(project.path()),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(run_id),
+            mutable_cache.path(),
+        );
+    let status_path = retained_sidecar
+        .layout
+        .state_file
+        .with_file_name("ready-repair-status.json");
+    fs::create_dir_all(status_path.parent().expect("status parent")).expect("create status parent");
+    fs::write(
+        &status_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "status": "repairing",
+            "project_root": clean_path_text(project.path()),
+            "profile": "agent",
+            "run_id": run_id,
+            "namespace": retained_sidecar.namespace,
+            "compose_project": retained_sidecar.compose_project,
+            "phase": "graph artifact",
+            "pid": u32::MAX,
+            "started_at_epoch_ms": now_epoch_ms(),
+            "updated_at_epoch_ms": now_epoch_ms()
+        }))
+        .expect("status json"),
+    )
+    .expect("write retained status");
+
+    let reconciliation = reconcile_before_enqueue_for_sidecar(
+        project.path(),
+        mutable_cache.path(),
+        &retained_sidecar,
+        "9.9.9",
+    );
+
+    assert_eq!(reconciliation.status, "stale_state_cleaned");
+    assert_eq!(reconciliation.abandoned_repairs.len(), 1);
+    assert!(!status_path.exists());
+    assert!(
+        retained_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-result.json")
+            .exists()
+    );
+    assert!(
+        !mutable_sidecar
+            .layout
+            .state_file
+            .with_file_name("ready-repair-result.json")
+            .exists()
+    );
+}
+
+#[test]
 fn reconcile_before_enqueue_reports_clean_when_empty() {
     let project = tempdir().expect("project");
     let cache = tempdir().expect("cache");

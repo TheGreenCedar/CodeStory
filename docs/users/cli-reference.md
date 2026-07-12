@@ -102,8 +102,9 @@ file loads first; project file overrides for project-safe preferences.
 Environment variables win over files.
 
 Configuration is resolved independently for each project and retained for the
-life of that project runtime. Multi-project stdio does not rewrite process
-environment variables when requests switch repositories. Trusted project files
+life of that project runtime. Multi-project stdio captures the user home,
+project-network opt-in, cache root, and runtime environment once; it neither
+rewrites nor re-reads them when requests switch repositories. Trusted project files
 may also set `embedding_query_prefix` and `embedding_document_prefix` as part of
 their per-project embedding contract.
 

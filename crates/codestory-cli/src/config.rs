@@ -6,6 +6,31 @@ use std::sync::OnceLock;
 
 const PROJECT_NETWORK_CONFIG_OPT_IN_ENV: &str = "CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG";
 
+#[derive(Debug, Clone)]
+pub(crate) struct CliStartupConfig {
+    pub(crate) user_home: Option<PathBuf>,
+    pub(crate) project_network_config_allowed: bool,
+    pub(crate) user_cache_root: PathBuf,
+    pub(crate) stdio_cache_root: Option<PathBuf>,
+    pub(crate) runtime_defaults: codestory_retrieval::SidecarRuntimeDefaults,
+}
+
+impl CliStartupConfig {
+    pub(crate) fn from_process_env() -> Self {
+        Self {
+            user_home: std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from),
+            project_network_config_allowed: std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)
+                .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
+            stdio_cache_root: std::env::var_os("CODESTORY_STDIO_CACHE_ROOT").map(PathBuf::from),
+            user_cache_root: codestory_retrieval::user_cache_root(),
+            runtime_defaults: codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct CliConfig {
     pub(crate) cache_dir: Option<PathBuf>,
@@ -31,47 +56,59 @@ enum ConfigSource {
     Project,
 }
 
+#[cfg(test)]
 pub(crate) fn load_config(project_root: &Path) -> Result<CliConfig> {
+    load_config_with_startup(project_root, &process_startup_config())
+}
+
+pub(crate) fn load_config_with_startup(
+    project_root: &Path,
+    startup: &CliStartupConfig,
+) -> Result<CliConfig> {
     let mut config = CliConfig::default();
-    if let Some(home) = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-    {
+    if let Some(home) = startup.user_home.as_ref() {
         merge_config_file(
             &mut config,
             &home.join(".codestory.toml"),
             ConfigSource::TrustedUser,
+            startup.project_network_config_allowed,
         )?;
     }
     merge_config_file(
         &mut config,
         &project_root.join(".codestory.toml"),
         ConfigSource::Project,
+        startup.project_network_config_allowed,
     )?;
     Ok(config)
 }
 
-pub(crate) fn process_runtime_defaults() -> codestory_retrieval::SidecarRuntimeDefaults {
+pub(crate) fn process_startup_config() -> CliStartupConfig {
     #[cfg(test)]
     {
-        codestory_retrieval::SidecarRuntimeDefaults::from_process_env()
+        CliStartupConfig::from_process_env()
     }
     #[cfg(not(test))]
     {
-        static DEFAULTS: OnceLock<codestory_retrieval::SidecarRuntimeDefaults> = OnceLock::new();
-        DEFAULTS
-            .get_or_init(codestory_retrieval::SidecarRuntimeDefaults::from_process_env)
+        static STARTUP: OnceLock<CliStartupConfig> = OnceLock::new();
+        STARTUP
+            .get_or_init(CliStartupConfig::from_process_env)
             .clone()
     }
 }
 
-fn merge_config_file(config: &mut CliConfig, path: &Path, source: ConfigSource) -> Result<()> {
+fn merge_config_file(
+    config: &mut CliConfig,
+    path: &Path,
+    source: ConfigSource,
+    project_network_config_allowed: bool,
+) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config {}", path.display()))?;
-    validate_config_trust_boundary(&raw, source, path)?;
+    validate_config_trust_boundary(&raw, source, path, project_network_config_allowed)?;
     let file_config: CliConfig = toml::from_str(&raw)
         .with_context(|| format!("Failed to parse config {}", path.display()))?;
     if file_config.cache_dir.is_some() {
@@ -113,7 +150,12 @@ fn merge_config_file(config: &mut CliConfig, path: &Path, source: ConfigSource) 
     Ok(())
 }
 
-fn validate_config_trust_boundary(raw: &str, source: ConfigSource, path: &Path) -> Result<()> {
+fn validate_config_trust_boundary(
+    raw: &str,
+    source: ConfigSource,
+    path: &Path,
+    project_network_config_allowed: bool,
+) -> Result<()> {
     if source != ConfigSource::Project {
         return Ok(());
     }
@@ -128,19 +170,13 @@ fn validate_config_trust_boundary(raw: &str, source: ConfigSource, path: &Path) 
         );
     }
     for field in ["summary_endpoint", "summary_model", "embedding_endpoint"] {
-        if table.contains_key(field) && !project_network_config_allowed() {
+        if table.contains_key(field) && !project_network_config_allowed {
             anyhow::bail!(
                 "project config field `{field}` is not trusted; set CODESTORY_SUMMARY_ENDPOINT, CODESTORY_SUMMARY_MODEL, CODESTORY_EMBED_LLAMACPP_URL, or pass a trusted CLI option instead"
             );
         }
     }
     Ok(())
-}
-
-fn project_network_config_allowed() -> bool {
-    std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
 }
 
 impl CliConfig {

@@ -470,6 +470,7 @@ fn write_ready_repair_worker_result_locked(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn read_ready_repair_worker_result(
     project_root: &Path,
     run_id: Option<&str>,
@@ -479,7 +480,13 @@ pub(crate) fn read_ready_repair_worker_result(
         SidecarProfile::Agent,
         run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
     );
-    fs::read_to_string(ready_repair_result_path(&sidecar))
+    read_ready_repair_worker_result_for_sidecar(&sidecar)
+}
+
+pub(crate) fn read_ready_repair_worker_result_for_sidecar(
+    sidecar: &SidecarRuntimeConfig,
+) -> Option<ReadyRepairWorkerResult> {
+    fs::read_to_string(ready_repair_result_path(sidecar))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
 }
@@ -559,14 +566,17 @@ fn try_acquire_ready_repair_lock_at(
         Err(error) => return Err(error.into()),
     }
 
-    if let Some(status) = active_ready_repair_status(project_root, active_run_id) {
+    let scan_all_runs = active_run_id.is_none();
+    if let Some(status) = active_ready_repair_status_for_lock(project_root, sidecar, scan_all_runs)
+    {
         return Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
             status: Some(status),
             lock_path: path,
             reason: None,
         })));
     }
-    let stale_live_status = stale_live_ready_repair_status(project_root, active_run_id);
+    let stale_live_status =
+        stale_live_ready_repair_status_for_lock(project_root, sidecar, scan_all_runs);
 
     if !ready_repair_lock_file_is_stale(&path) {
         return Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
@@ -584,7 +594,7 @@ fn try_acquire_ready_repair_lock_at(
         })),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
-                status: active_ready_repair_status(project_root, active_run_id),
+                status: active_ready_repair_status_for_lock(project_root, sidecar, scan_all_runs),
                 lock_path: path,
                 reason: Some("lock_contention".to_string()),
             })))
@@ -696,6 +706,41 @@ pub(crate) fn active_ready_repair_status(
         .max_by_key(|status| status.updated_at_epoch_ms)
 }
 
+pub(crate) fn active_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_sidecar(default_sidecar)
+        .into_iter()
+        .filter_map(|path| read_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+fn active_ready_repair_status_for_lock(
+    project_root: &Path,
+    sidecar: &SidecarRuntimeConfig,
+    scan_all_runs: bool,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_lock(sidecar, scan_all_runs)
+        .into_iter()
+        .filter_map(|path| read_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+fn stale_live_ready_repair_status_for_lock(
+    project_root: &Path,
+    sidecar: &SidecarRuntimeConfig,
+    scan_all_runs: bool,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_lock(sidecar, scan_all_runs)
+        .into_iter()
+        .filter_map(|path| read_stale_live_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
 pub(crate) fn abandoned_ready_repair_status(
     project_root: &Path,
     run_id: Option<&str>,
@@ -704,6 +749,28 @@ pub(crate) fn abandoned_ready_repair_status(
     ready_repair_status_paths(project_root, run_id)
         .into_iter()
         .filter_map(|path| read_abandoned_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+pub(crate) fn abandoned_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_sidecar(default_sidecar)
+        .into_iter()
+        .filter_map(|path| read_abandoned_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+pub(crate) fn stale_live_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_sidecar(default_sidecar)
+        .into_iter()
+        .filter_map(|path| read_stale_live_ready_repair_status(&path, project_root, now))
         .max_by_key(|status| status.updated_at_epoch_ms)
 }
 
@@ -722,18 +789,46 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
     project_root: &Path,
     run_id: Option<&str>,
 ) -> Vec<ReadyRepairCleanup> {
+    let default_sidecar = sidecar_runtime_for_project_with_run_id(
+        project_root,
+        SidecarProfile::Agent,
+        run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
+    );
+    cleanup_abandoned_ready_repair_status_from_paths(
+        project_root,
+        &default_sidecar,
+        ready_repair_status_paths(project_root, run_id),
+    )
+}
+
+pub(crate) fn cleanup_abandoned_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Vec<ReadyRepairCleanup> {
+    cleanup_abandoned_ready_repair_status_from_paths(
+        project_root,
+        default_sidecar,
+        ready_repair_status_paths_for_sidecar(default_sidecar),
+    )
+}
+
+fn cleanup_abandoned_ready_repair_status_from_paths(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+    paths: Vec<PathBuf>,
+) -> Vec<ReadyRepairCleanup> {
     let now = now_epoch_ms();
-    ready_repair_status_paths(project_root, run_id)
+    paths
         .into_iter()
         .filter_map(|path| {
             let observed = read_abandoned_ready_repair_status(&path, project_root, now)?;
             let run_id = observed.run_id.as_deref().unwrap_or(DEFAULT_AGENT_RUN_ID);
-            let sidecar = sidecar_runtime_for_project_with_run_id(
-                project_root,
+            let sidecar = default_sidecar.with_profile_and_run_id(
+                Some(project_root),
                 SidecarProfile::Agent,
                 Some(run_id),
             );
-            let observed_stale_locks = ready_repair_lock_paths_for_status(project_root, &observed)
+            let observed_stale_locks = ready_repair_lock_paths_for_sidecar(&sidecar)
                 .into_iter()
                 .filter_map(|lock_path| {
                     let lock = read_ready_repair_lock_file(&lock_path)?;
@@ -795,8 +890,19 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> String {
-    ready_repair_status_paths(project_root, None)
+    ready_repair_status_cache_fingerprint_for_paths(ready_repair_status_paths(project_root, None))
+}
+
+pub(crate) fn ready_repair_status_cache_fingerprint_for_sidecar(
+    sidecar: &SidecarRuntimeConfig,
+) -> String {
+    ready_repair_status_cache_fingerprint_for_paths(ready_repair_status_paths_for_sidecar(sidecar))
+}
+
+fn ready_repair_status_cache_fingerprint_for_paths(paths: Vec<PathBuf>) -> String {
+    paths
         .into_iter()
         .flat_map(|path| {
             [
@@ -1123,16 +1229,10 @@ fn probe_process_platform(_pid: u32) -> ProcessProbe {
     ProcessProbe::Unknown
 }
 
-fn ready_repair_lock_paths_for_status(
-    project_root: &Path,
-    status: &ReadyRepairStatus,
-) -> Vec<PathBuf> {
-    let run_id = status.run_id.as_deref().unwrap_or(DEFAULT_AGENT_RUN_ID);
-    let sidecar =
-        sidecar_runtime_for_project_with_run_id(project_root, SidecarProfile::Agent, Some(run_id));
+fn ready_repair_lock_paths_for_sidecar(sidecar: &SidecarRuntimeConfig) -> Vec<PathBuf> {
     vec![
-        ready_repair_lock_path(&sidecar),
-        project_ready_repair_lock_path(&sidecar),
+        ready_repair_lock_path(sidecar),
+        project_ready_repair_lock_path(sidecar),
     ]
 }
 
@@ -1163,9 +1263,14 @@ fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<P
         SidecarProfile::Agent,
         Some(DEFAULT_AGENT_RUN_ID),
     );
-    paths.insert(ready_repair_status_path(&default_sidecar));
+    ready_repair_status_paths_for_sidecar(&default_sidecar)
+}
 
-    if let Some((sidecars_root, namespace_prefix)) = agent_sidecars_scan_root(&default_sidecar)
+fn ready_repair_status_paths_for_sidecar(default_sidecar: &SidecarRuntimeConfig) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    paths.insert(ready_repair_status_path(default_sidecar));
+
+    if let Some((sidecars_root, namespace_prefix)) = agent_sidecars_scan_root(default_sidecar)
         && let Ok(entries) = fs::read_dir(sidecars_root)
     {
         for entry in entries.flatten() {
@@ -1183,6 +1288,17 @@ fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<P
     }
 
     paths.into_iter().collect()
+}
+
+fn ready_repair_status_paths_for_lock(
+    sidecar: &SidecarRuntimeConfig,
+    scan_all_runs: bool,
+) -> Vec<PathBuf> {
+    if scan_all_runs {
+        ready_repair_status_paths_for_sidecar(sidecar)
+    } else {
+        vec![ready_repair_status_path(sidecar)]
+    }
 }
 
 fn agent_sidecars_scan_root(sidecar: &SidecarRuntimeConfig) -> Option<(PathBuf, String)> {

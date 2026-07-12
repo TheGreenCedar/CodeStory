@@ -1365,7 +1365,7 @@ fn test_sidecar_runtime(project: &Path, run_id: &str) -> codestory_retrieval::Si
         Some(project),
         codestory_retrieval::SidecarProfile::Agent,
         Some(run_id),
-        &test_support::test_state_root().join("cache"),
+        &test_support::test_state_root().join("stdio-cache"),
     )
 }
 
@@ -1733,7 +1733,7 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
 }
 
 #[test]
-fn multi_project_stdio_keeps_project_embedding_endpoints_isolated_across_a_b_a() {
+fn multi_project_stdio_startup_snapshot_keeps_embedding_endpoints_isolated_across_a_b_a() {
     let first = tempfile::tempdir().expect("first workspace");
     let second = tempfile::tempdir().expect("second workspace");
     let cache_root = tempfile::tempdir().expect("multi-project cache root");
@@ -4177,6 +4177,17 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
     let repair_sidecar =
         test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
+    let mutable_cache_sidecar =
+        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(&canonical_root),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+            &test_support::test_state_root().join("cache"),
+        );
+    assert_ne!(
+        repair_sidecar.layout.state_file, mutable_cache_sidecar.layout.state_file,
+        "the regression contract requires distinct retained and mutable cache roots"
+    );
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -4218,6 +4229,16 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
             .is_some_and(|tail| tail.contains(&attempt_id)),
         "{setup}"
     );
+    let retained_result_path = repair_sidecar
+        .layout
+        .state_file
+        .with_file_name("ready-repair-result.json");
+    let retained_result: Value = serde_json::from_str(
+        &fs::read_to_string(&retained_result_path).expect("retained repair worker result"),
+    )
+    .expect("retained repair worker result json");
+    assert_eq!(retained_result["attempt_id"], json!(attempt_id));
+    assert_eq!(retained_result["outcome"], json!("succeeded"));
     assert!(
         !repair_sidecar
             .layout
@@ -4232,6 +4253,20 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
             .with_file_name("ready-repair-status.json")
             .exists()
     );
+    for file_name in [
+        "ready-repair-result.json",
+        "ready-repair-status.json",
+        "ready-repair-enqueue.lock",
+    ] {
+        assert!(
+            !mutable_cache_sidecar
+                .layout
+                .state_file
+                .with_file_name(file_name)
+                .exists(),
+            "stdio repair state must not leak into the mutable cache root: {file_name}"
+        );
+    }
 }
 
 #[test]
