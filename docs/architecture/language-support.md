@@ -151,12 +151,13 @@ language can have parser-backed graph support while a framework remains partial
 or heuristic. A route claim needs fixture or real-repo route evidence, not just a
 language parser. FastAPI decorator routes are parser-backed only when a
 tree-sitter query captures a static string path and decorated handler on a
-module-scope receiver whose latest preceding binding constructs an imported
-`FastAPI` or `APIRouter`. Later assignments, imports, functions, and classes
-invalidate shadowed ownership; unmatched, injected, factory-returned, and
-nested-scope receivers are not labeled as FastAPI. Error-local line-scan
-recovery remains structural evidence. Dynamic paths and ordinary escaped
-literals do not become exact route claims.
+single-target module-scope receiver whose latest preceding binding constructs
+an imported `FastAPI` or `APIRouter`. Later assignments, imports, functions,
+and classes invalidate shadowed ownership. Chained or multi-target constructor
+assignments are conservatively not promoted; unmatched, injected,
+factory-returned, and nested-scope receivers are not labeled as FastAPI.
+Error-local line-scan recovery remains structural evidence. Dynamic paths and
+ordinary escaped literals do not become exact route claims.
 
 ## Expansion Checklist
 

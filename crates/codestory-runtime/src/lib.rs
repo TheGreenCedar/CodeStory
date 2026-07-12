@@ -552,6 +552,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         unsupported_patterns: &[
             "path= keyword arguments and escaped non-raw string literals are not exact routes",
             "head/options/api_route/websocket decorators are not indexed",
+            "chained or multi-target FastAPI/APIRouter construction is not promoted",
             "factory-returned or injected router receivers without module-scope construction are not claimed",
         ],
         known_gaps: &["include_router prefix propagation is not modeled"],
@@ -12679,6 +12680,7 @@ mod tests {
         for unsupported in [
             "path= keyword arguments",
             "head/options/api_route/websocket",
+            "chained or multi-target FastAPI/APIRouter construction",
             "without module-scope construction are not claimed",
         ] {
             assert!(

@@ -70,11 +70,12 @@ be checked with `files --path <fragment>` or a fresh index.
 FastAPI route metadata records `claim_tier=parser_backed` with
 `extraction_provenance=tree_sitter_query`. Its syntax-error fallback records
 `claim_tier=structural`, `extraction_provenance=lexical_fallback`, and
-`confidence=heuristic`. Keyword `path=` arguments, ordinary escaped string
-literals, and `head`, `options`, `api_route`, and `websocket` decorators are not
-exact route claims in this slice. Factory-returned, injected, and nested-scope
-routers are not labeled as FastAPI until receiver-specific provenance is
-resolved.
+  `confidence=heuristic`. Keyword `path=` arguments, ordinary escaped string
+  literals, and `head`, `options`, `api_route`, and `websocket` decorators are not
+  exact route claims in this slice. Chained or multi-target constructor
+  assignments, including `app = router = FastAPI()`, are not promoted.
+  Factory-returned, injected, and nested-scope routers are not labeled as
+  FastAPI until receiver-specific provenance is resolved.
 
 ## Verification Playbook
 
