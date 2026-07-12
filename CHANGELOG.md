@@ -23,6 +23,13 @@
   becoming apparent deletions; incremental planning removes stored projections
   only after a complete inventory, while freshness and cache validation fail
   closed when absence cannot be proven.
+- Made MCP status reads observational. Grounding and other project tools now
+  own local refresh activation and, when the installed sidecar policy is
+  enabled, attach or enqueue agent readiness through the existing
+  project-scoped broker. Automatic repair retries persist a state fingerprint
+  and cooldown across MCP runtimes. Stale heartbeats from a still-live owner
+  remain fail-closed diagnostics surfaced by canonical MCP status; age alone
+  never terminates the process.
 - Renewed live local-refresh ownership during long incremental indexing, with
   token, PID, and process-start checks that prevent stale workers from
   overwriting changed ownership or terminal status.

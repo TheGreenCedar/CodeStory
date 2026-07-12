@@ -1519,7 +1519,7 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
 }
 
 #[test]
-fn stdio_starts_without_prebuilt_index_and_reports_status() {
+fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     let fixture = unindexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -1550,9 +1550,36 @@ fn stdio_starts_without_prebuilt_index_and_reports_status() {
     let status_result = assert_success_envelope(&status_response, json!("status-unindexed"));
     let status = json_resource_content(status_result, "codestory://status");
 
-    assert_eq!(status["readiness"][0]["status"], json!("ready"));
-    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
+    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
     assert_allowed_surface(&status, "search", false, "agent_packet_search", "blocked");
+
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-unindexed",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&ground, json!("ground-unindexed"));
+
+    let refreshed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-indexed-after-ground",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let refreshed = json_resource_content(
+        assert_success_envelope(&refreshed, json!("status-indexed-after-ground")),
+        "codestory://status",
+    );
+    assert_eq!(refreshed["readiness"][0]["status"], json!("ready"));
+    assert_allowed_surface(&refreshed, "ground", true, "local_navigation", "ready");
 }
 
 #[test]
@@ -1733,23 +1760,23 @@ fn multi_project_stdio_keeps_project_embedding_endpoints_isolated_across_a_b_a()
 
     let mut server =
         spawn_multi_project_stdio_server_with_project_network_config(cache_root.path());
-    let status_request = |id: &str, project: &Path| {
+    let ground_request = |id: &str, project: &Path| {
         json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
-            "params": {"name": "status", "arguments": {"project": project}}
+            "params": {"name": "ground", "arguments": {"project": project, "budget": "strict"}}
         })
     };
-    writeln!(server.stdin, "{}", status_request("config-a", first.path()))
-        .expect("queue project A status");
+    writeln!(server.stdin, "{}", ground_request("config-a", first.path()))
+        .expect("queue project A activation");
     writeln!(
         server.stdin,
         "{}",
-        status_request("config-b", second.path())
+        ground_request("config-b", second.path())
     )
-    .expect("queue project B status");
-    server.stdin.flush().expect("flush A/B status requests");
+    .expect("queue project B activation");
+    server.stdin.flush().expect("flush A/B activation requests");
     assert_tool_success(&read_json(&mut server), json!("config-a"));
     assert_tool_success(&read_json(&mut server), json!("config-b"));
 
@@ -1771,7 +1798,7 @@ fn multi_project_stdio_keeps_project_embedding_endpoints_isolated_across_a_b_a()
     );
 
     assert_tool_success(
-        &send_json(&mut server, status_request("config-a-again", first.path())),
+        &send_json(&mut server, ground_request("config-a-again", first.path())),
         json!("config-a-again"),
     );
     let first_after = first_endpoint.snapshot();
@@ -3606,10 +3633,14 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
     let status = json_resource_content(result, "codestory://status");
 
     assert_eq!(status["sidecar_setup"]["state"], json!("enabled"));
-    assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
+    assert_eq!(status["sidecar_setup"]["auto_repair"], json!(true));
     assert_eq!(
         status["sidecar_setup"]["status_triggered_repair"],
         json!(false)
+    );
+    assert_eq!(
+        status["sidecar_setup"]["activation_triggered_repair"],
+        json!(true)
     );
     assert_eq!(
         status["sidecar_setup"]["explicit_repair_enabled"],
@@ -3617,7 +3648,7 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
     );
     assert_eq!(
         status["sidecar_setup"]["repair_mode"],
-        json!("explicit_mcp")
+        json!("activation_or_explicit_mcp")
     );
     let sidecar_repair_command = status["sidecar_setup"]["next_repair_command"]
         .as_str()
@@ -3663,6 +3694,106 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
         !next_call_text.contains("\"method\":\"cli\""),
         "enabled policy should not expose CLI as the normal repair path: {status}"
     );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn ground_activation_enqueues_enabled_agent_repair() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(0);
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let result_path =
+        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            .layout
+            .state_file
+            .with_file_name("ready-repair-result.json");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-auto-agent-repair",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&response, json!("ground-auto-agent-repair"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !result_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "enabled grounding activation did not enqueue the broker-backed worker"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let result: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("automatic repair worker result"),
+    )
+    .expect("automatic repair worker result json");
+    assert_eq!(result["outcome"], json!("succeeded"), "{result}");
+    assert_eq!(
+        result["run_id"],
+        json!(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn repeated_grounding_cools_down_identical_failed_agent_repair_across_servers() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(17);
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let result_path =
+        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+            .layout
+            .state_file
+            .with_file_name("ready-repair-result.json");
+
+    let ground = |server: &mut StdioServer, id: &str| {
+        let response = send_json(
+            server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "ground", "arguments": {"budget": "strict"}}
+            }),
+        );
+        assert_tool_success(&response, json!(id));
+    };
+    let mut first_server = spawn_stdio_server(&fixture);
+    ground(&mut first_server, "ground-failed-repair-first");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !result_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "first automatic repair did not finish"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let first: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("first automatic repair result"),
+    )
+    .expect("first automatic repair result json");
+    assert_eq!(first["outcome"], json!("failed"), "{first}");
+    assert!(first["auto_retry_fingerprint"].is_string(), "{first}");
+    let first_attempt = first["attempt_id"].clone();
+    drop(first_server);
+
+    let mut second_server = spawn_stdio_server(&fixture);
+    ground(&mut second_server, "ground-failed-repair-second");
+    thread::sleep(Duration::from_millis(250));
+    let second: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("cooled-down automatic repair result"),
+    )
+    .expect("cooled-down automatic repair result json");
+    assert_eq!(second["attempt_id"], first_attempt, "{second}");
 }
 
 #[test]
@@ -4100,6 +4231,75 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
             .state_file
             .with_file_name("ready-repair-status.json")
             .exists()
+    );
+}
+
+#[test]
+fn resources_read_status_surfaces_stale_live_repair_without_mutation() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    let status_path = write_stale_live_repair_status_fixture(
+        &fixture,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+        "Embedding documents",
+    );
+    let status_before = fs::read(&status_path).expect("stale-live status before read");
+    let state_dir = status_path.parent().expect("status parent");
+    let reservation_path = state_dir.join("ready-repair-enqueue.lock");
+    let result_path = state_dir.join("ready-repair-result.json");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-stale-live-observational",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&response, json!("status-stale-live-observational")),
+        "codestory://status",
+    );
+
+    assert_eq!(
+        status["sidecar_setup"]["stale_live_repair"]["status"],
+        json!("stale_live"),
+        "{status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["stale_live_repair"]["pid"],
+        json!(std::process::id()),
+        "{status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["stale_live_repair"]["phase"],
+        json!("Embedding documents"),
+        "{status}"
+    );
+    assert!(
+        status["sidecar_setup"]["stale_live_repair"]
+            .get("cleanup_command")
+            .is_none(),
+        "live ownership must not expose destructive cleanup guidance: {status}"
+    );
+    assert!(
+        status["sidecar_setup"]["stale_live_repair"]["inspect_command"].is_string(),
+        "stale-live evidence should retain read-only inspection guidance: {status}"
+    );
+    assert_eq!(
+        fs::read(&status_path).expect("stale-live status after read"),
+        status_before,
+        "status read must not rewrite stale-live ownership"
+    );
+    assert!(
+        !reservation_path.exists(),
+        "status read must not reserve repair"
+    );
+    assert!(
+        !result_path.exists(),
+        "status read must not record a worker result"
     );
 }
 
@@ -4776,7 +4976,7 @@ fn local_dev_override_does_not_recommend_restart_for_managed_history() {
 }
 
 #[test]
-fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded_latency() {
+fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
     let warmup = send_json(
@@ -4813,6 +5013,40 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     fs::remove_file(fixture.workspace.path().join("src").join("alpha.rs"))
         .expect("remove indexed file after indexing");
 
+    let stale = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-observes-stale",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let stale = json_resource_content(
+        assert_success_envelope(&stale, json!("status-observes-stale")),
+        "codestory://status",
+    );
+    assert_eq!(
+        find_index_freshness(&stale).and_then(|freshness| freshness.get("status")),
+        Some(&json!("stale")),
+        "status must observe source drift without repairing it: {stale}"
+    );
+    assert!(
+        !fixture.cache_dir.path().join("local-refresh.lock").exists(),
+        "status must not acquire refresh ownership"
+    );
+
+    let activation = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-activates-refresh",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&activation, json!("ground-activates-refresh"));
+
     let refresh_deadline = Instant::now() + Duration::from_secs(15);
     let mut refresh_attempt = 0;
     let refreshed_status = loop {
@@ -4821,7 +5055,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
             &mut server,
             json!({
                 "jsonrpc": "2.0",
-                "id": id,
+                "id": id.clone(),
                 "method": "resources/read",
                 "params": {"uri": "codestory://status"}
             }),
@@ -4846,7 +5080,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     assert_eq!(
         refreshed_status["local_refresh"]["reason"],
         json!("refreshed"),
-        "long-lived status must not return the cached warm freshness result after source mutation: {refreshed_status}"
+        "ground activation must invalidate the cached warm freshness result: {refreshed_status}"
     );
     assert_eq!(
         refreshed_status["local_refresh"]["blocks_local_surfaces"],
@@ -4872,7 +5106,9 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
 
     let mut elapsed = Vec::new();
     let mut last_status = refreshed_status;
-    for index in 0..12 {
+    // Twenty samples are the minimum where this nearest-rank p95 is not just
+    // the single maximum scheduler outlier under the full parallel suite.
+    for index in 0..20 {
         let started = Instant::now();
         let response = send_json(
             &mut server,
@@ -5190,7 +5426,7 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
                 "jsonrpc": "2.0",
                 "id": "writer-start-refresh",
                 "method": "tools/call",
-                "params": {"name": "status", "arguments": {}}
+                "params": {"name": "ground", "arguments": {"budget": "strict"}}
             }),
         );
         (writer_client, response)
