@@ -100,12 +100,20 @@ impl std::error::Error for AmbiguousTargetError {}
 impl RuntimeContext {
     /// Open runtime services with the caller's embedding configuration.
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
-        Self::new_with_startup(args)
+        Self::new_with_startup(args, &crate::config::process_startup_config())
     }
 
     /// Open runtime services for agent-facing packet/search commands.
+    #[cfg(test)]
     pub(crate) fn new_agent_sidecar(args: &ProjectArgs) -> Result<Self> {
         Self::new_agent_sidecar_with_selection(args, None, None)
+    }
+
+    pub(crate) fn new_agent_sidecar_with_startup(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+    ) -> Result<Self> {
+        Self::new_agent_sidecar_with_startup_and_selection(args, startup, None, None)
     }
 
     pub(crate) fn new_agent_sidecar_with_selection(
@@ -113,7 +121,21 @@ impl RuntimeContext {
         profile: Option<crate::args::CliSidecarProfile>,
         run_id: Option<&str>,
     ) -> Result<Self> {
-        let mut context = Self::new(args)?;
+        Self::new_agent_sidecar_with_startup_and_selection(
+            args,
+            &crate::config::process_startup_config(),
+            profile,
+            run_id,
+        )
+    }
+
+    fn new_agent_sidecar_with_startup_and_selection(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+        profile: Option<crate::args::CliSidecarProfile>,
+        run_id: Option<&str>,
+    ) -> Result<Self> {
+        let mut context = Self::new_with_startup(args, startup)?;
         if profile.is_some() || run_id.is_some() {
             let selected = profile
                 .map(Into::into)
@@ -136,23 +158,35 @@ impl RuntimeContext {
 
     /// Open runtime services without starting managed embedding processes.
     pub(crate) fn new_inspect_only(args: &ProjectArgs) -> Result<Self> {
-        Self::new_with_startup(args)
+        Self::new(args)
     }
 
-    fn new_with_startup(args: &ProjectArgs) -> Result<Self> {
+    fn new_with_startup(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+    ) -> Result<Self> {
         #[cfg(test)]
         codestory_retrieval::enable_automatic_test_cache_root_for_process();
         let project_root = canonicalize_project_root(&args.project)?;
-        let config = crate::config::load_config(&project_root)?;
+        let config = crate::config::load_config_with_startup(&project_root, startup)?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
-        let cache_root = cache_root_for_project(&project_root, cache_override.as_deref())?;
-        let storage_path = cache_root.join("codestory.db");
-        let defaults = crate::config::process_runtime_defaults();
-        let sidecar = codestory_retrieval::SidecarRuntimeConfig::for_project_auto_with_defaults(
+        let process_cache_root = startup
+            .stdio_cache_root
+            .as_deref()
+            .unwrap_or(&startup.user_cache_root);
+        let cache_root = cache_root_for_project_in(
             &project_root,
-            &defaults,
-            &config.runtime_overrides(),
-        );
+            cache_override.as_deref(),
+            process_cache_root,
+        )?;
+        let storage_path = cache_root.join("codestory.db");
+        let sidecar =
+            codestory_retrieval::SidecarRuntimeConfig::for_project_auto_with_defaults_in_cache(
+                &project_root,
+                process_cache_root,
+                &startup.runtime_defaults,
+                &config.runtime_overrides(),
+            );
         let runtime = Runtime::new_with_config(sidecar.clone());
         let events = runtime.events();
         Ok(Self {
@@ -464,14 +498,26 @@ pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
 ///
 /// Explicit overrides are returned unchanged; otherwise the cache root is a
 /// stable hash of the canonical project path under the platform cache directory.
+#[cfg(test)]
 pub(crate) fn cache_root_for_project(
     project_root: &Path,
     override_dir: Option<&Path>,
 ) -> Result<PathBuf> {
+    cache_root_for_project_in(
+        project_root,
+        override_dir,
+        &codestory_retrieval::user_cache_root(),
+    )
+}
+
+fn cache_root_for_project_in(
+    project_root: &Path,
+    override_dir: Option<&Path>,
+    process_cache_root: &Path,
+) -> Result<PathBuf> {
     match override_dir {
         Some(path) => Ok(path.to_path_buf()),
-        None => Ok(codestory_retrieval::user_cache_root()
-            .join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
+        None => Ok(process_cache_root.join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
     }
 }
 
@@ -939,6 +985,76 @@ mod tests {
 
         assert_eq!(runtime.cache_root, cli_cache);
         assert_eq!(runtime.storage_path, cli_cache.join("codestory.db"));
+    }
+
+    #[test]
+    fn explicit_startup_snapshots_isolate_concurrent_runtime_paths_and_endpoints() {
+        let temp = tempdir().expect("temp dir");
+        let first_project = temp.path().join("first-project");
+        let second_project = temp.path().join("second-project");
+        let first_cache = temp.path().join("first-cache");
+        let second_cache = temp.path().join("second-cache");
+        fs::create_dir_all(&first_project).expect("create first project");
+        fs::create_dir_all(&second_project).expect("create second project");
+        fs::write(
+            first_project.join(".codestory.toml"),
+            r#"embedding_endpoint = "http://127.0.0.1:41001/v1/embeddings""#,
+        )
+        .expect("write first config");
+        fs::write(
+            second_project.join(".codestory.toml"),
+            r#"embedding_endpoint = "http://127.0.0.1:41002/v1/embeddings""#,
+        )
+        .expect("write second config");
+        let startup = |cache_root: &Path| crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: true,
+            user_cache_root: cache_root.to_path_buf(),
+            stdio_cache_root: Some(cache_root.to_path_buf()),
+            runtime_defaults: codestory_retrieval::SidecarRuntimeDefaults::default(),
+        };
+        let first_startup = startup(&first_cache);
+        let second_startup = startup(&second_cache);
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                RuntimeContext::new_agent_sidecar_with_startup(
+                    &ProjectArgs {
+                        project: first_project.clone(),
+                        cache_dir: None,
+                    },
+                    &first_startup,
+                )
+                .expect("first runtime")
+            });
+            let second = scope.spawn(|| {
+                RuntimeContext::new_agent_sidecar_with_startup(
+                    &ProjectArgs {
+                        project: second_project.clone(),
+                        cache_dir: None,
+                    },
+                    &second_startup,
+                )
+                .expect("second runtime")
+            });
+            (
+                first.join().expect("first runtime worker"),
+                second.join().expect("second runtime worker"),
+            )
+        });
+
+        assert!(first.storage_path.starts_with(&first_cache));
+        assert!(second.storage_path.starts_with(&second_cache));
+        assert!(first.sidecar.layout.state_file.starts_with(&first_cache));
+        assert!(second.sidecar.layout.state_file.starts_with(&second_cache));
+        assert_eq!(
+            first.sidecar.embedding.endpoint,
+            "http://127.0.0.1:41001/v1/embeddings"
+        );
+        assert_eq!(
+            second.sidecar.embedding.endpoint,
+            "http://127.0.0.1:41002/v1/embeddings"
+        );
     }
 
     #[test]

@@ -7383,7 +7383,7 @@ pub(crate) fn build_readiness_lanes_for_runtime(
     let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
     let agent_status = selected_agent_status
         .cloned()
-        .unwrap_or_else(|| doctor_sidecar_status_for_runtime(runtime, agent_runtime));
+        .unwrap_or_else(|| doctor_sidecar_status_for_runtime(runtime, agent_runtime.clone()));
     let agent_verdict = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch);
@@ -7401,15 +7401,14 @@ pub(crate) fn build_readiness_lanes_for_runtime(
             &project_arg,
         ),
     );
+    apply_ready_repair_status_overlay(
+        &mut lanes,
+        &runtime.project_root,
+        &agent_runtime,
+        &project_arg,
+    );
     if let Some(broker) = broker {
         apply_broker_ready_repair_overlay(&mut lanes, broker, &project_arg);
-    } else {
-        apply_ready_repair_status_overlay(
-            &mut lanes,
-            &runtime.project_root,
-            agent_run_id,
-            &project_arg,
-        );
     }
     lanes
 }
@@ -7479,10 +7478,11 @@ fn readiness_lane_output(
 fn apply_ready_repair_status_overlay(
     lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
     project_root: &Path,
-    agent_run_id: Option<&str>,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
     project_arg: &str,
 ) {
-    let Some(status) = ready_repair_status::active_ready_repair_status(project_root, agent_run_id)
+    let Some(status) =
+        ready_repair_status::active_ready_repair_status_for_sidecar(project_root, sidecar)
     else {
         return;
     };

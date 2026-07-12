@@ -14,6 +14,10 @@ const forbidden = [
   "activate_retrieval_profile_env",
   "CODESTORY_EMBED_LLAMACPP_URL_MANAGED",
 ];
+const lateStartupReads = [
+  'std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)',
+  'std::env::var_os("CODESTORY_STDIO_CACHE_ROOT")',
+];
 
 function rustFiles(root) {
   return fs.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
@@ -28,6 +32,26 @@ for (const file of roots.flatMap(rustFiles)) {
   const production = source.split(/\r?\n#\[cfg\(test\)\]\r?\nmod tests\s*\{/u, 1)[0];
   for (const token of forbidden) {
     if (production.includes(token)) violations.push(`${file}: ${token}`);
+  }
+}
+
+for (const file of [
+  "crates/codestory-cli/src/runtime.rs",
+  "crates/codestory-cli/src/stdio_transport.rs",
+]) {
+  const source = fs.readFileSync(file, "utf8");
+  for (const token of lateStartupReads) {
+    if (source.includes(token)) violations.push(`${file}: late startup read ${token}`);
+  }
+}
+
+const runtimeSource = fs.readFileSync("crates/codestory-cli/src/runtime.rs", "utf8");
+const runtimeSelection = runtimeSource
+  .split("fn new_with_startup", 2)[1]
+  ?.split("/// Open project", 1)[0];
+for (const token of ["user_cache_root()", "for_project_auto_with_defaults("]) {
+  if (runtimeSelection?.includes(token)) {
+    violations.push(`crates/codestory-cli/src/runtime.rs: project selection ${token}`);
   }
 }
 

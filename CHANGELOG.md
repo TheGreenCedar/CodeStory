@@ -30,6 +30,11 @@
   and cooldown across MCP runtimes. Stale heartbeats from a still-live owner
   remain fail-closed diagnostics surfaced by canonical MCP status; age alone
   never terminates the process.
+- Captured CLI user-home, project-network trust, stdio cache, and sidecar
+  defaults once at process startup so multi-project project selection cannot
+  drift through later process-environment reads. Repair status, terminal
+  results, lock arbitration, and broker overlays now consume that same retained
+  sidecar root instead of polling a second environment-derived cache tree.
 - Renewed live local-refresh ownership during long incremental indexing, with
   token, PID, and process-start checks that prevent stale workers from
   overwriting changed ownership or terminal status.

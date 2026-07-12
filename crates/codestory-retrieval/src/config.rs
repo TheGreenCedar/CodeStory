@@ -438,10 +438,25 @@ impl SidecarRuntimeConfig {
         defaults: &SidecarRuntimeDefaults,
         overrides: &SidecarRuntimeOverrides,
     ) -> Self {
+        Self::for_project_auto_with_defaults_in_cache(
+            project_root,
+            &user_cache_root(),
+            defaults,
+            overrides,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn for_project_auto_with_defaults_in_cache(
+        project_root: &Path,
+        cache_root: &Path,
+        defaults: &SidecarRuntimeDefaults,
+        overrides: &SidecarRuntimeOverrides,
+    ) -> Self {
         let explicit_profile = env_profile(defaults);
         let env_run_id = env_agent_run_id(defaults);
         let latest_run_id = if explicit_profile.is_none() && env_run_id.is_none() {
-            latest_agent_run_id(project_root)
+            latest_agent_run_id_in_cache(project_root, cache_root)
         } else {
             None
         };
@@ -451,10 +466,11 @@ impl SidecarRuntimeConfig {
             latest_run_id,
             running_in_ci_agent(defaults),
         );
-        Self::for_project_profile_with_run_id_defaults_and_overrides(
+        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
             Some(project_root),
             profile,
             run_id.as_deref(),
+            cache_root,
             defaults,
             overrides,
         )
@@ -1167,10 +1183,6 @@ fn project_hash(project_root: &Path) -> String {
 
 fn agent_namespace_prefix(project_root: &Path) -> String {
     format!("codestory-agent-{}-", project_hash(project_root))
-}
-
-fn latest_agent_run_id(project_root: &Path) -> Option<String> {
-    latest_agent_run_id_in_cache(project_root, &user_cache_root())
 }
 
 fn latest_agent_run_id_in_cache(project_root: &Path, cache_root: &Path) -> Option<String> {

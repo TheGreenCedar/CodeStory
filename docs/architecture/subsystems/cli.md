@@ -38,11 +38,13 @@ index path when embedding assets are available.
 
 ## Configuration Files
 
-The CLI captures process environment defaults once, then loads optional
-`.codestory.toml` defaults from the user home directory and the selected project
-root. It merges those values into an immutable `SidecarRuntimeConfig` retained
-by that project runtime; it never publishes project choices back through the
-process environment. This is required for multi-project stdio: switching A/B/A
+The CLI captures process environment defaults once, including the user config
+home, project-network opt-in, and multi-project stdio cache root, then loads
+optional `.codestory.toml` defaults from the captured user home directory and
+the selected project root. It merges those values into an immutable
+`SidecarRuntimeConfig` retained by that project runtime; it never publishes
+project choices back through the process environment. This is required for
+multi-project stdio: switching A/B/A
 must keep each project's endpoint, model, prefix, retrieval policy, and summary
 settings isolated. Cache roots, network endpoints, model selectors for
 source-egress calls, credentials, and source-text egress settings must come from
@@ -50,7 +52,8 @@ trusted user config, explicit environment variables, or CLI options; project
 files cannot set `cache_dir`, `summary_endpoint`, `summary_model`, or embedding
 endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set
 deliberately for that process. Explicit environment values have highest
-precedence without being mutated.
+precedence without being mutated or re-read when a stdio request switches
+projects.
 
 Embedding config keys map to the runtime env names:
 

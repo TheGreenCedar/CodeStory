@@ -28,15 +28,16 @@ pub(crate) fn refresh_broker_snapshot(input: BrokerSnapshotInput) -> ReadinessBr
 fn refresh_broker_snapshot_inner(input: BrokerSnapshotInput) -> ReadinessBrokerSnapshot {
     let identity = codestory_workspace::project_identity_v2(&input.project_root);
     let runtime_identity = current_gpu_runtime_identity(&input, &identity);
-    refresh_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref())
+    refresh_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref(), None)
 }
 
 fn refresh_broker_snapshot_with_identity(
     input: BrokerSnapshotInput,
     identity: codestory_workspace::ProjectIdentityV2,
     runtime_identity: Option<&BrokerGpuRuntimeIdentity>,
+    sidecar: Option<&codestory_retrieval::SidecarRuntimeConfig>,
 ) -> ReadinessBrokerSnapshot {
-    let mut snapshot = build_broker_snapshot(input, identity);
+    let mut snapshot = build_broker_snapshot(input, identity, sidecar);
     if let Some(proof) = snapshot.gpu_proof.as_mut() {
         bind_verified_runtime_identity(proof, runtime_identity);
     }
@@ -62,18 +63,61 @@ pub(crate) fn observe_broker_snapshot(input: BrokerSnapshotInput) -> ReadinessBr
     observe_broker_snapshot_inner(input)
 }
 
+pub(crate) fn observe_broker_snapshot_for_sidecar(
+    input: BrokerSnapshotInput,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> ReadinessBrokerSnapshot {
+    #[cfg(test)]
+    return super::paths::with_test_broker_root(|| {
+        observe_broker_snapshot_for_sidecar_inner(input, sidecar)
+    });
+    #[cfg(not(test))]
+    observe_broker_snapshot_for_sidecar_inner(input, sidecar)
+}
+
+pub(crate) fn refresh_broker_snapshot_for_sidecar(
+    input: BrokerSnapshotInput,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> ReadinessBrokerSnapshot {
+    #[cfg(test)]
+    return super::paths::with_test_broker_root(|| {
+        refresh_broker_snapshot_for_sidecar_inner(input, sidecar)
+    });
+    #[cfg(not(test))]
+    refresh_broker_snapshot_for_sidecar_inner(input, sidecar)
+}
+
+fn observe_broker_snapshot_for_sidecar_inner(
+    input: BrokerSnapshotInput,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> ReadinessBrokerSnapshot {
+    let identity = codestory_workspace::cached_project_identity_v2(&input.project_root);
+    let runtime_identity = gpu_runtime_identity_for_sidecar(sidecar, &identity);
+    observe_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref(), Some(sidecar))
+}
+
+fn refresh_broker_snapshot_for_sidecar_inner(
+    input: BrokerSnapshotInput,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> ReadinessBrokerSnapshot {
+    let identity = codestory_workspace::project_identity_v2(&input.project_root);
+    let runtime_identity = gpu_runtime_identity_for_sidecar(sidecar, &identity);
+    refresh_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref(), Some(sidecar))
+}
+
 fn observe_broker_snapshot_inner(input: BrokerSnapshotInput) -> ReadinessBrokerSnapshot {
     let identity = codestory_workspace::cached_project_identity_v2(&input.project_root);
     let runtime_identity = current_gpu_runtime_identity(&input, &identity);
-    observe_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref())
+    observe_broker_snapshot_with_identity(input, identity, runtime_identity.as_ref(), None)
 }
 
 fn observe_broker_snapshot_with_identity(
     input: BrokerSnapshotInput,
     identity: codestory_workspace::ProjectIdentityV2,
     runtime_identity: Option<&BrokerGpuRuntimeIdentity>,
+    sidecar: Option<&codestory_retrieval::SidecarRuntimeConfig>,
 ) -> ReadinessBrokerSnapshot {
-    let mut snapshot = build_broker_snapshot(input, identity);
+    let mut snapshot = build_broker_snapshot(input, identity, sidecar);
     if let Some(proof) = snapshot.gpu_proof.as_mut() {
         bind_verified_runtime_identity(proof, runtime_identity);
     }
@@ -106,7 +150,7 @@ pub(super) fn refresh_broker_snapshot_with_runtime_identity(
 ) -> ReadinessBrokerSnapshot {
     super::paths::with_test_broker_root(|| {
         let identity = codestory_workspace::project_identity_v2(&input.project_root);
-        refresh_broker_snapshot_with_identity(input, identity, runtime_identity)
+        refresh_broker_snapshot_with_identity(input, identity, runtime_identity, None)
     })
 }
 
@@ -117,7 +161,7 @@ pub(super) fn observe_broker_snapshot_with_runtime_identity(
 ) -> ReadinessBrokerSnapshot {
     super::paths::with_test_broker_root(|| {
         let identity = codestory_workspace::cached_project_identity_v2(&input.project_root);
-        observe_broker_snapshot_with_identity(input, identity, runtime_identity)
+        observe_broker_snapshot_with_identity(input, identity, runtime_identity, None)
     })
 }
 
@@ -144,9 +188,16 @@ fn current_gpu_runtime_identity(
             input.agent_run_id.as_deref(),
             &super::paths::broker_cache_root(),
         );
+    gpu_runtime_identity_for_sidecar(&runtime, expected_project_identity)
+}
+
+fn gpu_runtime_identity_for_sidecar(
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    expected_project_identity: &codestory_workspace::ProjectIdentityV2,
+) -> Option<BrokerGpuRuntimeIdentity> {
     let state: codestory_retrieval::SidecarStateFile =
         serde_json::from_slice(&fs::read(&runtime.layout.state_file).ok()?).ok()?;
-    if !codestory_retrieval::sidecar_state_matches_runtime(&state, &runtime) {
+    if !codestory_retrieval::sidecar_state_matches_runtime(&state, runtime) {
         return None;
     }
     let state_project_identity = state.project_identity.as_ref()?;
@@ -180,17 +231,24 @@ fn current_gpu_runtime_identity(
 fn build_broker_snapshot(
     input: BrokerSnapshotInput,
     identity: codestory_workspace::ProjectIdentityV2,
+    sidecar: Option<&codestory_retrieval::SidecarRuntimeConfig>,
 ) -> ReadinessBrokerSnapshot {
     let canonical_root = clean_path_text(&input.project_root);
     let canonical_root_hash = hash_text(&canonical_root);
     let project_id = identity.project_id.clone();
     let cli_version = input.cli_version;
     let mut operations = Vec::new();
-    let active_repair = ready_repair_status::active_ready_repair_status(
-        &input.project_root,
-        input.agent_run_id.as_deref(),
-    )
-    .or_else(|| ready_repair_status::active_ready_repair_status(&input.project_root, None));
+    let active_repair = match sidecar {
+        Some(sidecar) => ready_repair_status::active_ready_repair_status_for_sidecar(
+            &input.project_root,
+            sidecar,
+        ),
+        None => ready_repair_status::active_ready_repair_status(
+            &input.project_root,
+            input.agent_run_id.as_deref(),
+        )
+        .or_else(|| ready_repair_status::active_ready_repair_status(&input.project_root, None)),
+    };
     if let Some(active) = active_repair {
         operations.push(operation_from_ready_status(
             &input.project_root,
@@ -198,10 +256,16 @@ fn build_broker_snapshot(
             active,
             "running",
         ));
-    } else if let Some(abandoned) = ready_repair_status::abandoned_ready_repair_status(
-        &input.project_root,
-        input.agent_run_id.as_deref(),
-    ) {
+    } else if let Some(abandoned) = match sidecar {
+        Some(sidecar) => ready_repair_status::abandoned_ready_repair_status_for_sidecar(
+            &input.project_root,
+            sidecar,
+        ),
+        None => ready_repair_status::abandoned_ready_repair_status(
+            &input.project_root,
+            input.agent_run_id.as_deref(),
+        ),
+    } {
         operations.push(operation_from_ready_status(
             &input.project_root,
             &cli_version,
