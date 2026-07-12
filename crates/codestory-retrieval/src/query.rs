@@ -447,12 +447,16 @@ mod tests {
         struct CountingSidecars {
             active: AtomicUsize,
             max_active: AtomicUsize,
+            first_wave: std::sync::Barrier,
         }
 
         impl CountingSidecars {
             fn record(&self, query: &str) -> Vec<CandidateHit> {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_active.fetch_max(active, Ordering::SeqCst);
+                if matches!(query, "slow" | "fast") {
+                    self.first_wave.wait();
+                }
                 if query == "slow" {
                     std::thread::sleep(Duration::from_millis(30));
                 } else {
@@ -488,6 +492,7 @@ mod tests {
         let sidecars = Arc::new(CountingSidecars {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
+            first_wave: std::sync::Barrier::new(2),
         });
         let mut cache = RetrievalCache::new();
         let manifest = manifest_for("testproj", "cafebabedeadbeef", 3);
