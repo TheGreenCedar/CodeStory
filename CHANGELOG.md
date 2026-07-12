@@ -66,8 +66,10 @@
   Local navigation remains explicitly weaker than full packet/search proof.
 - Added a test-only hook qualification matrix for orientation, ownership, call
   flow, change impact, broad retrieval, blocked-deep fallback, and non-repo
-  suppression, including an executable comparison with the former generic
-  status-first behavior and representative recorded agent drill traces.
+  suppression. The former prompt-agnostic policy's first prompt emission and
+  current hook both run as processes; qualification scores structured route
+  categories and exact tool tokens. Separately sourced observed MCP drill
+  artifacts remain explicitly non-executable test evidence.
 - Replaced generic status-only lifecycle guidance with compact repository-task
   routing for orientation, symbol ownership, call flow, change impact, and broad
   questions. Prompt hooks no longer echo user text, suppress non-repository
