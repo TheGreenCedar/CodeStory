@@ -7,7 +7,6 @@ const isCodex = !isCopilot && Boolean(process.env.PLUGIN_DATA);
 
 const STATE_FILE = '.codestory-active';
 const THREAD_STATE_PREFIX = '.codestory-active-thread-';
-const HOOK_STATE_FILE = '.codestory-hook-output-state.json';
 const DIRTY_MARKER_SCHEMA_VERSION = 1;
 const DIRTY_MARKER_SAMPLE_LIMIT = 20;
 const DIRTY_HOOK_NAMES = ['post-checkout', 'post-merge', 'post-rewrite'];
@@ -84,27 +83,6 @@ function rememberActiveState(state) {
     if (threadFile) {
       fs.writeFileSync(threadFile, JSON.stringify(nextState));
     }
-  } catch (e) {
-    // Best effort only. Hook state must not block the host session.
-  }
-}
-
-function readHookState() {
-  const stateDir = pluginDataDir();
-  if (!stateDir) return {};
-  return readJson(path.join(stateDir, HOOK_STATE_FILE)) || {};
-}
-
-function writeHookState(state) {
-  const stateDir = pluginDataDir();
-  if (!stateDir) return;
-
-  try {
-    fs.mkdirSync(stateDir, { recursive: true });
-    fs.writeFileSync(path.join(stateDir, HOOK_STATE_FILE), JSON.stringify({
-      ...state,
-      updatedAt: new Date().toISOString(),
-    }));
   } catch (e) {
     // Best effort only. Hook state must not block the host session.
   }
@@ -346,10 +324,8 @@ module.exports = {
   dirtyHookStatus,
   installDirtyHooks,
   readActiveState,
-  readHookState,
   rememberActiveState,
   uninstallDirtyHooks,
   writeDirtyMarker,
-  writeHookState,
   writeHookOutput,
 };
