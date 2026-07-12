@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::machine_lock::{
@@ -375,9 +376,12 @@ pub(crate) fn reusable_native_embedding_resource_pid(
     else {
         return Ok(None);
     };
-    let same_normalized_root = super::scope::normalized_workspace_root(owner_workspace_root)
-        == super::scope::normalized_workspace_root(&scope.workspace_root);
-    if owner_identity.workspace_id != scope_identity.workspace_id || !same_normalized_root {
+    if owner_identity.workspace_id != scope_identity.workspace_id
+        || !codestory_workspace::same_workspace_path(
+            Path::new(owner_workspace_root),
+            Path::new(&scope.workspace_root),
+        )
+    {
         return Ok(None);
     }
     let Some(state) = read_sidecar_state_file(sidecar)? else {

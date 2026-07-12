@@ -1005,7 +1005,7 @@ fn read_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -1030,7 +1030,7 @@ fn read_abandoned_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -1051,7 +1051,7 @@ fn read_stale_live_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -1315,11 +1315,7 @@ fn clean_path_text(path: &Path) -> String {
         .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn same_path_text(left: &Path, right: &Path) -> bool {
-    clean_path_text(left) == clean_path_text(right)
+        .to_string()
 }
 
 fn path_fingerprint(path: &Path) -> String {
@@ -2335,5 +2331,14 @@ mod tests {
             Some(terminal),
             "cleanup must preserve an existing matching terminal result"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_ready_repair_root_preserves_unix_case() {
+        let parent = tempfile::tempdir().expect("parent");
+        let project = parent.path().join("CaseSensitiveProject");
+        fs::create_dir_all(&project).expect("project");
+        assert!(clean_path_text(&project).ends_with("CaseSensitiveProject"));
     }
 }

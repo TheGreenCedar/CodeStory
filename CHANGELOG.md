@@ -26,6 +26,13 @@
   metadata only after a matching verification read, and leave an incomplete
   retry error instead of accepting stale output even when the file's timestamp
   is restored.
+- Migrated readiness-broker scopes, operation IDs, machine locks, snapshots,
+  and GPU-runtime binding to lossless project identity schema 3. Legacy broker
+  state is reused only when its workspace and repository provenance map
+  unambiguously; case-distinct Unix roots no longer collide, while Windows
+  aliases still share their existing workspace. Refresh/repair and stdio path
+  ownership now use the shared filesystem-aware path comparator, and new
+  refresh/repair state preserves native path case.
 - Opened the diagnostic MCP immediately on fresh managed-plugin startup while
   the existing single-flight installer provisions the exact CLI version in the
   background. Status now reports the in-process provisioning state, and the

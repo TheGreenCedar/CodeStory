@@ -1,4 +1,4 @@
-use codestory_workspace::ProjectIdentityV2;
+use codestory_workspace::ProjectIdentityV3;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BrokerScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) identity: Option<ProjectIdentityV2>,
+    pub(crate) identity: Option<ProjectIdentityV3>,
     pub(crate) install_id: String,
     pub(crate) project_id: String,
     pub(crate) canonical_root_hash: String,
@@ -25,7 +25,7 @@ pub(crate) struct BrokerScope {
 pub(crate) struct ReadinessBrokerSnapshot {
     pub(crate) schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) identity: Option<ProjectIdentityV2>,
+    pub(crate) identity: Option<ProjectIdentityV3>,
     pub(crate) install_id: String,
     pub(crate) project_id: String,
     pub(crate) canonical_root_hash: String,

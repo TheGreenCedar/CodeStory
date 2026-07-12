@@ -3333,7 +3333,7 @@ fn stdio_dirty_marker_env_path(project_root: &Path) -> Option<PathBuf> {
     let env_root = std::env::var_os("CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| project_root.to_path_buf());
-    if !stdio_same_path_text(&env_root, project_root) {
+    if !codestory_workspace::same_workspace_path(&env_root, project_root) {
         return None;
     }
     Some(path)
@@ -3391,7 +3391,7 @@ fn stdio_dirty_marker_status(project_root: &Path, storage_path: &Path) -> StdioD
             reason: Some("schema_version_unsupported".to_string()),
         };
     }
-    if !stdio_same_path_text(Path::new(&marker.project_root), project_root) {
+    if !codestory_workspace::same_workspace_path(Path::new(&marker.project_root), project_root) {
         return StdioDirtyMarkerStatus {
             path: Some(path),
             marker: Some(marker),
@@ -3438,18 +3438,6 @@ fn stdio_dirty_marker_status(project_root: &Path, storage_path: &Path) -> StdioD
     }
 }
 
-fn stdio_same_path_text(left: &Path, right: &Path) -> bool {
-    let clean = |path: &Path| {
-        let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        path.to_string_lossy()
-            .trim_start_matches(r"\\?\")
-            .replace('\\', "/")
-            .trim_end_matches('/')
-            .to_ascii_lowercase()
-    };
-    clean(left) == clean(right)
-}
-
 fn stdio_workspace_mismatch(runtime: &RuntimeContext) -> Option<StdioWorkspaceMismatch> {
     if env_nonempty("CODESTORY_PLUGIN_MULTI_PROJECT").is_some() {
         return None;
@@ -3457,7 +3445,7 @@ fn stdio_workspace_mismatch(runtime: &RuntimeContext) -> Option<StdioWorkspaceMi
     let active_state_path =
         std::env::var_os("CODESTORY_PLUGIN_ACTIVE_STATE_PATH").map(PathBuf::from)?;
     let active_root = stdio_active_state_root(&active_state_path)?;
-    if stdio_same_path_text(&active_root, &runtime.project_root) {
+    if codestory_workspace::same_workspace_path(&active_root, &runtime.project_root) {
         return None;
     }
     Some(StdioWorkspaceMismatch {
@@ -4517,8 +4505,9 @@ fn stdio_validate_managed_cli_candidate(
     let manifest_dir = fs::canonicalize(candidate.manifest_path.parent()?).ok()?;
     let executable = fs::canonicalize(manifest_dir.join(candidate.executable)).ok()?;
     if !executable.starts_with(&manifest_dir)
-        || server_executable
-            .is_some_and(|active| stdio_same_path_text(&executable, Path::new(active)))
+        || server_executable.is_some_and(|active| {
+            codestory_workspace::same_workspace_path(&executable, Path::new(active))
+        })
         || !candidate
             .expected_sha256
             .eq_ignore_ascii_case(&sha256_file(&executable).ok()?)
