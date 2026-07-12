@@ -130,6 +130,9 @@
   emits mechanical evidence only; the versioned evaluator preserves the prior
   scored JSON contract and can persist it to an explicit output path. The
   standalone agent-quality evaluator and fixtures now live in `codestory-bench`.
+- Added deterministic retained-field fixtures and an executable full-sidecar
+  packet/drill parity gate covering artifact names, sufficiency, citations,
+  explicit probes, follow-up commands, and the single-packet execution boundary.
 - Added staged repository-v2/project-v3 identity contracts that preserve
   transport schemes, effective and non-default remote ports, and case-sensitive
   repository paths, distinguish absolute and home-relative SCP paths, reject

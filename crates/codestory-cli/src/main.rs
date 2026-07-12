@@ -3479,17 +3479,16 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         .clone()
         .unwrap_or_else(|| format!("Investigate anchors: {}", drill_anchors.join(", ")));
     let packet_timer = Instant::now();
-    let evidence_packet = runtime
-        .browser
-        .packet(AgentPacketRequestDto {
-            question,
-            budget: PacketBudgetModeDto::Standard,
-            task_class: None,
-            extra_probes: drill_anchors.clone(),
-            include_evidence: true,
-            latency_budget_ms: None,
-        })
-        .map_err(map_api_error)?;
+    let packet_request = AgentPacketRequestDto {
+        question,
+        budget: PacketBudgetModeDto::Standard,
+        task_class: None,
+        extra_probes: drill_anchors.clone(),
+        include_evidence: true,
+        latency_budget_ms: None,
+    };
+    let evidence_packet =
+        execute_drill_packet(packet_request, |request| runtime.browser.packet(request))?;
     let question_search_ms = elapsed_ms(packet_timer);
     let evidence_assembly_timer = Instant::now();
     let citations = drill_packet_citations(&evidence_packet);
@@ -3558,6 +3557,13 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         evidence_packet,
         next_commands,
     })
+}
+
+fn execute_drill_packet(
+    request: AgentPacketRequestDto,
+    execute: impl FnOnce(AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError>,
+) -> Result<AgentPacketDto> {
+    execute(request).map_err(map_api_error)
 }
 
 fn drill_packet_citations(packet: &AgentPacketDto) -> Vec<AgentCitationDto> {
@@ -11532,6 +11538,166 @@ mod tests {
         assert_eq!(
             bridges[0].evidence.next_commands,
             packet.sufficiency.follow_up_commands
+        );
+    }
+
+    #[test]
+    fn drill_executes_one_packet_with_explicit_anchor_probes() {
+        let packet = sample_task_brief_packet();
+        let calls = std::cell::Cell::new(0);
+        let request = AgentPacketRequestDto {
+            question: packet.question.clone(),
+            budget: PacketBudgetModeDto::Standard,
+            task_class: None,
+            extra_probes: vec!["WorkspaceIndexer".to_string()],
+            include_evidence: true,
+            latency_budget_ms: None,
+        };
+
+        let result = execute_drill_packet(request, |request| {
+            calls.set(calls.get() + 1);
+            assert_eq!(request.extra_probes, ["WorkspaceIndexer"]);
+            Ok(packet.clone())
+        })
+        .expect("execute packet");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.packet_id, packet.packet_id);
+    }
+
+    #[test]
+    fn drill_retained_fields_match_pre_adapter_fixture() {
+        let mut packet = sample_task_brief_packet();
+        let source = sample_task_brief_citation(
+            "WorkspaceIndexer",
+            NodeKind::FUNCTION,
+            "src/indexer.rs",
+            12,
+        );
+        let search =
+            sample_task_brief_citation("SearchService", NodeKind::STRUCT, "src/search.rs", 24);
+        packet.question = "How does indexing feed search?".to_string();
+        packet.answer.prompt = packet.question.clone();
+        packet.answer.citations = vec![source.clone(), search.clone()];
+        packet.plan.queries = vec![PacketPlanQueryDto {
+            query: "WorkspaceIndexer".to_string(),
+            purpose: "explicit symbol probe from packet request".to_string(),
+        }];
+        packet.sufficiency.covered_claims[0].citations = vec![source, search];
+        packet.sufficiency.follow_up_commands =
+            vec!["codestory-cli snippet --query WorkspaceIndexer --project .".to_string()];
+
+        let citations = drill_packet_citations(&packet);
+        let anchors = drill_packet_anchors(
+            Path::new("C:/repo"),
+            &["WorkspaceIndexer".to_string()],
+            &citations,
+        );
+        let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
+        let verification_targets =
+            drill_packet_verification_targets(Path::new("C:/repo"), &citations);
+        let output = DrillOutput {
+            project: "C:/repo".to_string(),
+            label: Some("fixture".to_string()),
+            question: Some(packet.question.clone()),
+            output_dir: "artifacts/drill".to_string(),
+            mechanical: DrillMechanicalOutput {
+                before_files: 2,
+                before_nodes: 4,
+                before_edges: 2,
+                before_errors: 0,
+                after_files: 2,
+                after_nodes: 4,
+                after_edges: 2,
+                after_errors: 0,
+                refresh: "none".to_string(),
+                retrieval: Some(sample_retrieval()),
+                sidecar_retrieval_mode: Some("full".to_string()),
+                freshness: None,
+                phase_timings: None,
+                drill_timings: DrillRuntimeTimingsOutput::default(),
+            },
+            question_search: Some(DrillCommandStatusOutput {
+                command: "packet".to_string(),
+                status: "partial".to_string(),
+                duration_ms: 1,
+                artifact: None,
+                error: None,
+            }),
+            question_supplemental_searches: Vec::new(),
+            anchors,
+            bridges,
+            execution_boundaries: vec![DrillExecutionBoundaryOutput {
+                command: "packet".to_string(),
+                flow: vec!["execute one bounded batch retrieval".to_string()],
+                source_files: vec![
+                    "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
+                ],
+            }],
+            verification_targets,
+            next_commands: packet.sufficiency.follow_up_commands.clone(),
+            evidence_packet: packet,
+        };
+        let output_dir = tempdir().expect("output dir");
+        write_drill_outputs(args::OutputFormat::Json, output_dir.path(), &output)
+            .expect("write drill fixtures");
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(output_dir.path().join("drill-report.json")).expect("read report"),
+        )
+        .expect("parse report");
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(output_dir.path().join("drill-summary.json")).expect("read summary"),
+        )
+        .expect("parse summary");
+        let markdown =
+            fs::read_to_string(output_dir.path().join("drill-report.md")).expect("read markdown");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/drill_packet_parity/retained-fields.json"
+        ))
+        .expect("parse retained-field fixture");
+
+        for (document, expected) in [
+            (&report, &fixture["report"]),
+            (&summary, &fixture["summary"]),
+        ] {
+            for (pointer, expected) in expected.as_object().expect("pointer map") {
+                assert_eq!(
+                    document.pointer(pointer),
+                    Some(expected),
+                    "retained field changed at {pointer}"
+                );
+            }
+        }
+        for marker in fixture["markdown_contains"]
+            .as_array()
+            .expect("markdown markers")
+        {
+            let marker = marker.as_str().expect("markdown marker string");
+            assert!(
+                markdown.contains(marker),
+                "missing retained Markdown `{marker}`"
+            );
+        }
+        let mut artifacts = fs::read_dir(output_dir.path())
+            .expect("list artifacts")
+            .map(|entry| {
+                entry
+                    .expect("artifact entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort();
+        assert_eq!(
+            artifacts,
+            fixture["artifacts"]
+                .as_array()
+                .expect("artifact names")
+                .iter()
+                .map(|value| value.as_str().expect("artifact name").to_string())
+                .collect::<Vec<_>>()
         );
     }
 

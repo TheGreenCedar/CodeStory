@@ -1,0 +1,51 @@
+{
+  "artifacts": [
+    "drill-report.json",
+    "drill-report.md",
+    "drill-summary.json"
+  ],
+  "report": {
+    "/project": "C:/repo",
+    "/label": "fixture",
+    "/question": "How does indexing feed search?",
+    "/output_dir": "artifacts/drill",
+    "/mechanical/before_files": 2,
+    "/mechanical/after_files": 2,
+    "/mechanical/refresh": "none",
+    "/question_search/command": "packet",
+    "/anchors/0/anchor": "WorkspaceIndexer",
+    "/anchors/0/typed_hit_count": 1,
+    "/execution_boundaries/0/command": "packet",
+    "/next_commands/0": "codestory-cli snippet --query WorkspaceIndexer --project ."
+  },
+  "summary": {
+    "/summary_version": 1,
+    "/project": "C:/repo",
+    "/label": "fixture",
+    "/question": "How does indexing feed search?",
+    "/output_dir": "artifacts/drill",
+    "/full_report_json": "drill-report.json",
+    "/full_report_markdown": "drill-report.md",
+    "/mechanical/refresh": "none",
+    "/mechanical/before/files": 2,
+    "/mechanical/after/files": 2,
+    "/anchors/requested": 1,
+    "/anchors/resolved": 1,
+    "/open_gaps/answer_quality_status": "partial",
+    "/open_gaps/next_command_count": 1
+  },
+  "markdown_contains": [
+    "# Drill",
+    "project: `C:/repo`",
+    "label: fixture",
+    "question: How does indexing feed search?",
+    "output_dir: `artifacts/drill`",
+    "index_before: files=2 nodes=4 edges=2 errors=0",
+    "index_after: files=2 nodes=4 edges=2 errors=0 refresh=none",
+    "question_search: packet [partial duration_ms=1]",
+    "anchors:",
+    "execution_boundaries:",
+    "evidence_packet: id=packet-task-brief sufficiency=partial citations=2",
+    "next_commands:"
+  ]
+}

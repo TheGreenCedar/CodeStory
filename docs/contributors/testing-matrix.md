@@ -315,6 +315,28 @@ cells must stay labeled as contract-only in PRs, issues, and release notes.
 | Real-repo drill | `CODESTORY_REAL_REPO_DRILL_CASES` points at prepared manifests and the drill cases run without skip allowances | Required before claiming the release was exercised beyond the CodeStory checkout. |
 | Promotion-grade benchmark | Full holdout packet-runtime rows cover cold and warm modes with three repeats, `--jobs 4`, prepared sidecars, `--publishable`, explicit `--max-source-reads-after-packet 0`, no `--allow-failures`, full sidecar provenance, no quality misses, no sufficiency gaps, and no SLA misses. Fixed-baseline A/B rows are supporting diagnostics only unless fingerprint-compatible. | Required for performance or retrieval-quality promotion claims. |
 
+Packet/drill adapter promotion proof is a separate executable gate over one
+already-finalized local sidecar generation:
+
+```sh
+node scripts/prove-drill-packet-parity.mjs \
+  --project . \
+  --question "How does indexing feed packet retrieval?" \
+  --anchor WorkspaceIndexer \
+  --output-dir target/drill-packet-parity
+```
+
+The gate records both retrieval-status reads, the packet and drill command
+transcript, generation identity, and artifact names in
+`drill-packet-parity-evidence.json`. It fails before packet/drill execution when
+`retrieval_mode` is not `full`, and reports the exact degraded reason instead of
+promoting contract fixtures to live sidecar evidence. A passing run requires the
+generation to remain unchanged and packet/drill sufficiency, citations, explicit
+probes, and follow-up commands to match. It also rejects supplemental, anchor, or
+separate bridge commands in the drill report. Evidence status is `blocked` only
+for an observed non-full preflight; command, parsing, parity, and artifact errors
+are `failed`.
+
 When logging release evidence, state the highest tier reached and the exact
 skip env vars used. The stats JSON reports `proof_tier` as the highest tier
 proven by that stats object. If `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`
