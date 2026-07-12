@@ -54,6 +54,9 @@
 
 - Corrected the Codex managed-platform guide to list the restored macOS x64 CLI
   while retaining its no-managed-accelerated-sidecar boundary.
+- Retried packaged-proof temporary directory removal after transient executable
+  locks while keeping persistent cleanup failures fail-closed, preventing a
+  successful Windows managed-plugin handoff from failing during teardown.
 - Extended the retrieval generalization guard from derived query literals to
   direct and split Rust string dependencies on eval/query corpus paths across
   production crates, including benchmark manifests, query catalogs, packet

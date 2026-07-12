@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -102,6 +103,31 @@ def captured_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value or ""
+
+
+def remove_tree_with_retry(path: Path, timeout_secs: float = 10.0, platform: str = os.name) -> None:
+    deadline = time.monotonic() + timeout_secs
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError as exc:
+            if platform != "nt" or getattr(exc, "winerror", None) not in {5, 32}:
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
+
+
+@contextlib.contextmanager
+def temporary_directory_with_retry(prefix: str, directory: Path):
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=directory))
+    try:
+        yield str(path)
+    finally:
+        remove_tree_with_retry(path)
 
 
 def sha256_file(path: Path) -> str:
@@ -376,15 +402,22 @@ def terminate_process_tree(process: subprocess.Popen[str]) -> None:
         process.kill()
 
 
+def require_windows_process_exit(process_handle, pid: int, timeout_ms: int = 10_000) -> None:
+    wait_result = ctypes.windll.kernel32.WaitForSingleObject(process_handle, timeout_ms)
+    if wait_result != 0:
+        raise RuntimeError(f"worker process {pid} did not terminate before cleanup (wait result {wait_result})")
+
+
 def terminate_worker_pid(pid: int) -> None:
     if pid <= 0:
         return
     if os.name == "nt":
         process_handle = None
+        open_error = 0
         try:
-            import ctypes
-
             process_handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+            if not process_handle:
+                open_error = ctypes.windll.kernel32.GetLastError()
         except (AttributeError, OSError):
             process_handle = None
         try:
@@ -399,9 +432,11 @@ def terminate_worker_pid(pid: int) -> None:
             pass
         if process_handle:
             try:
-                ctypes.windll.kernel32.WaitForSingleObject(process_handle, 10_000)
+                require_windows_process_exit(process_handle, pid)
             finally:
                 ctypes.windll.kernel32.CloseHandle(process_handle)
+        elif open_error != 87:
+            raise RuntimeError(f"could not prove worker process {pid} terminated")
     else:
         try:
             os.kill(pid, signal.SIGKILL)
@@ -471,7 +506,7 @@ def plugin_stdio_status(
     require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
     require(launcher.is_file(), "plugin_stdio", artifact, f"plugin launcher is missing: {launcher}")
-    with tempfile.TemporaryDirectory(prefix="codestory-plugin-data-", dir=artifact.parent) as data:
+    with temporary_directory_with_retry("codestory-plugin-data-", artifact.parent) as data:
         return stdio_status_command(
             ["node", str(launcher)],
             artifact,
@@ -503,7 +538,7 @@ def plugin_stdio_handoff(
     require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
     require(launcher.is_file(), "managed_plugin_handoff", artifact, f"plugin launcher is missing: {launcher}")
-    with tempfile.TemporaryDirectory(prefix="codestory-plugin-data-", dir=artifact.parent) as data:
+    with temporary_directory_with_retry("codestory-plugin-data-", artifact.parent) as data:
         plugin_data = Path(data)
         policy_path = plugin_data / "sidecar-setup-policy.json"
         policy_artifact = artifact.with_name("managed-plugin-policy.json")
@@ -1607,6 +1642,81 @@ def write_fake_plugin_launcher(plugin_root: Path) -> None:
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-self-test-") as temp:
         root = Path(temp)
+        transient_cleanup_attempts = 0
+        original_rmtree = shutil.rmtree
+
+        class SimulatedWindowsLock(PermissionError):
+            winerror = 5
+
+        def transient_cleanup(path):
+            nonlocal transient_cleanup_attempts
+            transient_cleanup_attempts += 1
+            if transient_cleanup_attempts == 1:
+                raise SimulatedWindowsLock("simulated transient executable lock")
+            original_rmtree(path)
+
+        retry_root = root / "cleanup-retry"
+        retry_root.mkdir()
+        shutil.rmtree = transient_cleanup
+        try:
+            remove_tree_with_retry(retry_root, timeout_secs=1, platform="nt")
+        finally:
+            shutil.rmtree = original_rmtree
+        assert transient_cleanup_attempts == 2
+
+        persistent_root = root / "cleanup-persistent"
+        persistent_root.mkdir()
+
+        def persistent_cleanup(_path):
+            raise SimulatedWindowsLock("simulated persistent lock")
+
+        shutil.rmtree = persistent_cleanup
+        try:
+            try:
+                remove_tree_with_retry(persistent_root, timeout_secs=0, platform="nt")
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("persistent cleanup lock should remain fail-closed")
+        finally:
+            shutil.rmtree = original_rmtree
+            original_rmtree(persistent_root)
+
+        unclassified_root = root / "cleanup-unclassified"
+        unclassified_root.mkdir()
+        unclassified_attempts = 0
+
+        def unclassified_cleanup(_path):
+            nonlocal unclassified_attempts
+            unclassified_attempts += 1
+            raise PermissionError("simulated ACL failure")
+
+        shutil.rmtree = unclassified_cleanup
+        try:
+            try:
+                remove_tree_with_retry(unclassified_root, timeout_secs=1, platform="nt")
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("unclassified cleanup failures must not be retried")
+        finally:
+            shutil.rmtree = original_rmtree
+            original_rmtree(unclassified_root)
+        assert unclassified_attempts == 1
+
+        if os.name == "nt":
+            process_handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, os.getpid())
+            assert process_handle
+            try:
+                try:
+                    require_windows_process_exit(process_handle, os.getpid(), timeout_ms=0)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("an unterminated worker must remain a cleanup failure")
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process_handle)
+
         stage = root / "pkg" / "codestory-cli-v9.9.9-test"
         stage.mkdir(parents=True)
         write_fake_cli(stage)
