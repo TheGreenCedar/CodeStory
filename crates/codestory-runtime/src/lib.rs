@@ -64,7 +64,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod agent;
-pub use agent::packet_step_trace_json;
+pub use agent::{packet_step_trace_json, plan_packet};
 mod browser;
 mod cache_rehydrate;
 pub mod graph_analysis;

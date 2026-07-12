@@ -45,9 +45,11 @@ into a real-repo evidence packet. Ledger claim classifications are `correct`,
 `partial`, `misleading`, and `unsupported`, and the suite keeps the final
 answer-quality verdict separate from green index/build mechanics.
 
-For source-truth recall, `drill` now feeds the broad question search and bounded
-supplemental searches into the verification target list. Treat those targets as
-candidate files for verification, not as final answer support.
+For source-truth recall, `drill` maps its question and seed anchors through the
+runtime packet planner, then feeds the broad question search and bounded planned
+subqueries into the verification target list. Treat those targets as candidate
+files for verification, not as final answer support. Drill still owns the
+compatibility report and source-truth scoring adapter; packet owns query planning.
 
 Keep `node ./scripts/codestory-agent-ab-benchmark.mjs --list` as the cheapest
 configuration smoke check.

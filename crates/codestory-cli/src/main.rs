@@ -22,8 +22,8 @@ use codestory_contracts::api::{
     EvidencePacketDto, EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto,
     GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
     IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto,
-    PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
-    ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    PacketPlanDto, PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary,
+    ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
     RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
     SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
     SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
@@ -3503,6 +3503,11 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         .as_ref()
         .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
     let drill_anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
+    let question_plan = cmd
+        .question
+        .as_deref()
+        .map(|question| drill_question_packet_plan(question, &drill_anchors))
+        .transpose()?;
     let question_search_timer = Instant::now();
     let question_search_result = cmd
         .question
@@ -3545,14 +3550,10 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
     }
     let mut question_supplemental_searches = Vec::new();
     let supplemental_search_timer = Instant::now();
-    if let Some(question) = cmd.question.as_deref() {
-        for (status, search_output) in run_drill_question_supplemental_searches(
-            &runtime,
-            &cmd.output_dir,
-            cmd.format,
-            question,
-            &anchor_outputs,
-        )? {
+    if let Some(plan) = question_plan.as_ref() {
+        for (status, search_output) in
+            run_drill_question_supplemental_searches(&runtime, &cmd.output_dir, cmd.format, plan)?
+        {
             all_verification_targets.extend(drill_question_search_verification_targets(
                 &search_output,
                 "supplemental question search source-truth target",
@@ -6144,15 +6145,34 @@ fn drill_question_search_query(question: &str, anchors: &[String]) -> String {
     format!("{question}\nSeed anchors: {}", anchors.join(", "))
 }
 
+fn drill_question_packet_plan(question: &str, anchors: &[String]) -> Result<PacketPlanDto> {
+    codestory_runtime::plan_packet(&AgentPacketRequestDto {
+        question: question.to_string(),
+        budget: PacketBudgetModeDto::Standard,
+        task_class: None,
+        extra_probes: anchors.to_vec(),
+        include_evidence: true,
+        latency_budget_ms: None,
+    })
+    .map_err(map_api_error)
+}
+
 fn run_drill_question_supplemental_searches(
     runtime: &RuntimeContext,
     output_dir: &std::path::Path,
     format: args::OutputFormat,
-    question: &str,
-    anchors: &[DrillAnchorOutput],
+    plan: &PacketPlanDto,
 ) -> Result<Vec<(DrillCommandStatusOutput, SearchOutput)>> {
     let mut outputs = Vec::new();
-    for query in drill_question_supplemental_queries(&runtime.project_root, question, anchors) {
+    let mut artifact_slugs = HashSet::new();
+    for (index, query) in plan
+        .queries
+        .iter()
+        .skip(1)
+        .take(10)
+        .map(|query| &query.query)
+        .enumerate()
+    {
         let command_timer = Instant::now();
         let search_results = runtime
             .browser
@@ -6167,7 +6187,7 @@ fn run_drill_question_supplemental_searches(
             .map_err(map_api_error)?;
         let search_output = search_output_from_results(runtime, &search_results, true);
         let search_markdown = render_search_markdown(&runtime.project_root, &search_output);
-        let slug = format!("question-supplement-{}", output_slug(&query));
+        let slug = drill_question_supplement_artifact_slug(query, index, &mut artifact_slugs);
         let status = write_drill_artifact(
             output_dir,
             format,
@@ -6184,64 +6204,23 @@ fn run_drill_question_supplemental_searches(
     Ok(outputs)
 }
 
-fn drill_question_supplemental_queries(
-    project_root: &std::path::Path,
-    question: &str,
-    anchors: &[DrillAnchorOutput],
-) -> Vec<String> {
-    let lower = question.to_ascii_lowercase();
-    let tokens = drill_question_alnum_tokens(&lower);
-    let mut queries = Vec::new();
-    if contains_any_token(
-        &tokens,
-        &["public", "page", "pages", "surface", "surfaces", "home"],
-    ) {
-        queries.push("Home".to_string());
+fn drill_question_supplement_artifact_slug(
+    query: &str,
+    index: usize,
+    used: &mut HashSet<String>,
+) -> String {
+    let base = format!("question-supplement-{}", output_slug(query));
+    if used.insert(base.clone()) {
+        return base;
     }
-    if contains_any_token(&tokens, &["comment", "comments"]) {
-        queries.push("Comments".to_string());
-    }
-    if contains_any_token(
-        &tokens,
-        &["post", "posts", "writing", "article", "articles"],
-    ) {
-        queries.push("Posts".to_string());
-    }
-    if contains_any_token(&tokens, &["social", "elsewhere", "feed"]) {
-        queries.push("social entries".to_string());
-        queries.push("elsewhere feed".to_string());
-    }
-    if contains_any_token(&tokens, &["store", "storage", "persist", "persistence"]) {
-        if let Some(project_name) = project_root.file_name().and_then(|name| name.to_str()) {
-            queries.push(format!("{project_name}-store"));
+    let mut suffix = index + 1;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
         }
-        queries.push("Store".to_string());
+        suffix += 1;
     }
-    for anchor in anchors {
-        if let Some(path) = anchor
-            .chosen_anchor
-            .as_ref()
-            .and_then(|hit| hit.file_path.as_deref())
-            && path.contains("/collections/")
-            && !queries.iter().any(|query| query == &anchor.anchor)
-        {
-            queries.push(anchor.anchor.clone());
-        }
-    }
-    let mut seen = HashSet::new();
-    queries
-        .into_iter()
-        .filter(|query| seen.insert(query.to_ascii_lowercase()))
-        .take(10)
-        .collect()
-}
-
-fn contains_any_token(tokens: &[String], needles: &[&str]) -> bool {
-    needles.iter().any(|needle| {
-        tokens
-            .iter()
-            .any(|token| token.eq_ignore_ascii_case(needle))
-    })
 }
 
 fn drill_question_search_verification_targets(
@@ -17656,30 +17635,45 @@ mod tests {
     }
 
     #[test]
-    fn drill_question_supplemental_queries_cover_public_payload_and_store_terms() {
-        let mut posts = sample_drill_anchor("Posts", "posts");
-        posts.chosen_anchor.as_mut().expect("anchor").file_path =
-            Some("src/collections/Posts.ts".to_string());
+    fn drill_question_queries_use_packet_planning_and_keep_seed_anchors() {
+        let question = "Explain how the indexer store supports search and trails.";
+        let plan = drill_question_packet_plan(
+            question,
+            &["Store".to_string(), "error_handler".to_string()],
+        )
+        .expect("plan drill question");
+        let plan_without_anchors =
+            drill_question_packet_plan(question, &[]).expect("plan without anchors");
 
-        let queries = drill_question_supplemental_queries(
-            Path::new("C:/repo/codestory"),
-            "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed.",
-            &[posts],
+        assert_eq!(
+            plan.queries.first().map(|query| query.query.as_str()),
+            Some(question)
         );
-
-        assert!(queries.iter().any(|query| query == "Home"));
-        assert!(queries.iter().any(|query| query == "Comments"));
-        assert!(queries.iter().any(|query| query == "Posts"));
-        assert!(queries.iter().any(|query| query == "social entries"));
-        assert!(queries.iter().any(|query| query == "elsewhere feed"));
-
-        let store_queries = drill_question_supplemental_queries(
-            Path::new("C:/repo/codestory"),
-            "Explain how the indexer store supports search, trail, and snippet.",
-            &[],
+        assert!(
+            plan.queries
+                .iter()
+                .any(|query| query.query.eq_ignore_ascii_case("Store"))
         );
-        assert!(store_queries.iter().any(|query| query == "codestory-store"));
-        assert!(store_queries.iter().any(|query| query == "Store"));
+        assert!(
+            plan.queries
+                .iter()
+                .any(|query| query.query == "error_handler")
+        );
+        assert!(plan.inferred_task_class);
+        assert_eq!(plan.task_class, plan_without_anchors.task_class);
+    }
+
+    #[test]
+    fn drill_question_supplement_artifacts_disambiguate_slug_collisions() {
+        let mut used = HashSet::new();
+        assert_eq!(
+            drill_question_supplement_artifact_slug("foo/bar", 0, &mut used),
+            "question-supplement-foo-bar"
+        );
+        assert_eq!(
+            drill_question_supplement_artifact_slug("foo::bar", 1, &mut used),
+            "question-supplement-foo-bar-2"
+        );
     }
 
     #[test]
