@@ -283,12 +283,14 @@ seconds, symbol docs written, dense docs skipped, dense reason counts, dense
 docs reused, dense docs embedded, total index seconds,
 `repeat_full_refresh_seconds`, repeat graph/semantic/cache/search timings,
 `retrieval_index_seconds`, `retrieval_status_seconds`, `report_seconds`,
-`proof_tier`, any `warnings`, and whether
+`proof_tier`, and whether
 `sidecar_status_after_retrieval_index` plus `search.sidecar_shadow_retrieval_mode`
-were `full`. The release stats harness reads the latest valid `Phase Metrics`
-row in that log as its living warning baseline and reads that row's
-`repeat full refresh <seconds>s` scenario text as the repeat full-refresh
-blocker baseline.
+were `full`. The log is telemetry only and cannot become a release baseline by
+appending a row. Use the approved profile and release decision command in
+[`performance-review-playbook.md`](../testing/performance-review-playbook.md).
+The harness still emits its prior latest-row warnings and repeat-refresh
+blocker during the transition; release workflow authorization comes only from
+the attested gate below.
 
 Release-readiness evidence is tiered:
 
@@ -311,29 +313,22 @@ skip env vars used. The stats JSON reports `proof_tier` as the highest tier
 proven by that stats object. If `CODESTORY_ALLOW_SKIP_REAL_REPO_DRILL_CASES=1`
 was used, record that the real-repo drill was intentionally skipped, but preserve
 the stats JSON tier exactly; for example, a passing full-sidecar stats object
-remains `full_sidecar`, not `stats_only`. Warning-free full-sidecar stats must
+remains `full_sidecar`, not `stats_only`. Full-sidecar stats must
 not be promoted to real-repo drill or promotion-grade evidence by themselves.
 
-The stats JSON also reports `warnings` for performance thresholds that should
-stay visible in logged evidence. Total index time and semantic phase warnings
-are computed against the latest `Phase Metrics` row in
-[`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md), not
-against older hard-coded timing rows:
-
-| Warning | Threshold |
-| --- | --- |
-| Total index time | `index_seconds` is more than 25% above the latest stats-log phase baseline |
-| Semantic phase time | `semantic_phase_seconds` is more than 25% above the latest stats-log phase baseline |
-| AST-first cold index gate | cold CodeStory product index is not under 180s or `semantic_embedding_ms` is not at least 70% below same-run baseline |
-
-Preserve those warning strings when copying the run into release evidence. An
-empty `warnings` array only means the measured run stayed under these warning
-thresholds; it does not raise the proof tier.
-
-For the current repo-scale baseline, use the latest row in
-[`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md). Older
-rows, including the 2026-04-18 durable-scope measurements, are historical
-examples only; do not copy them into current performance claims.
+Release-significant performance decisions are fail-closed. Normalize the raw
+stats and packet-runtime artifacts into the seven-metric candidate described in
+the performance playbook, then run
+`scripts/codestory-release-evidence-gate.mjs`. The selected machine profile
+must be approved, release-eligible, pinned to attested raw evidence, and match
+the candidate's corpus, cache, and machine fingerprint. Candidate artifacts can
+be produced on the same clean full SHA by the explicit manual/reusable
+`release-candidate-evidence.yml` workflow. This infrastructure is not wired to
+the release workflow until a live eligible baseline exists. A rejected metric
+blocks the release unless a non-expired exception binds the exact candidate
+hash, baseline id/hash, profile, metric, measured value, threshold, owner, ISO
+date, and rationale. Preserve the emitted decision JSON; it carries status,
+metric, decision, commit, and artifact paths/hashes.
 
 ## CLI Boundary And Output Changes
 

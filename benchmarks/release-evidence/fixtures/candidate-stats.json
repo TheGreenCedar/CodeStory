@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "commit": "2222222222222222222222222222222222222222",
+  "evidence_identity": {
+    "corpus_id": "ci-contract-corpus-v1",
+    "cache_id": "cold-full-sidecar-v1",
+    "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
+  },
+  "retrieval_status_seconds": 0.8,
+  "ground_seconds": 0.8,
+  "repeat_full_refresh_seconds": 8,
+  "repeat_graph_phase_seconds": 10,
+  "repeat_semantic_phase_seconds": 2,
+  "stats_baseline": {
+    "repeat_full_refresh_seconds": 10
+  },
+  "search_seconds": 0.8,
+  "index_seconds": 8,
+  "storage_bytes": 1020,
+  "proof_tier": "full_sidecar",
+  "repeat_semantic_docs_embedded": 0,
+  "index": {
+    "error_count": 0,
+    "sidecar_status_after_retrieval_index": "full"
+  },
+  "ground": {
+    "sidecar_status_after_retrieval_index": "full"
+  },
+  "search": {
+    "sidecar_shadow_retrieval_mode": "full"
+  },
+  "sidecar_manifest": {
+    "symbol_doc_count": 10,
+    "dense_projection_count": 4,
+    "projection_count": 4,
+    "semantic_policy_version": "graph_first_v1",
+    "graph_artifact_hash_present": true,
+    "dense_reason_count_total": 4
+  }
+}

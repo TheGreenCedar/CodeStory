@@ -24,6 +24,9 @@ on:
       - crates/codestory-indexer/Cargo.toml
       - crates/codestory-indexer/src/lib.rs
       - scripts/lint-retrieval-generalization.mjs
+      - scripts/codestory-release-evidence-gate.mjs
+      - scripts/tests/codestory-release-evidence-gate.test.mjs
+      - benchmarks/release-evidence/**
       - scripts/**retrieval**
       - docs/ops/retrieval-sidecars.md
       - docs/architecture/retrieval-*.md
@@ -54,6 +57,9 @@ on:
       - crates/codestory-indexer/Cargo.toml
       - crates/codestory-indexer/src/lib.rs
       - scripts/lint-retrieval-generalization.mjs
+      - scripts/codestory-release-evidence-gate.mjs
+      - scripts/tests/codestory-release-evidence-gate.test.mjs
+      - benchmarks/release-evidence/**
       - scripts/**retrieval**
       - docs/ops/retrieval-sidecars.md
       - docs/architecture/retrieval-*.md
@@ -80,6 +86,9 @@ jobs:
 
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
+
+      - name: Release evidence gate contracts
+        run: node --test scripts/tests/codestory-release-evidence-gate.test.mjs
 
       - name: Install Rust stable
         run: |

@@ -9,7 +9,16 @@ cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
 
-Keep the full emitted JSON in the test output when reviewing locally, and add the headline metrics here so search/index reuse trends are visible over time. The release stats harness reads the latest valid `Phase Metrics` row below as its living warning baseline, so append the phase row with the same evidence update. For performance branches, capture the baseline and no-regression threshold from [performance-review-playbook.md](performance-review-playbook.md) before tuning.
+Keep the full emitted JSON in the test output when reviewing locally, and add
+the headline metrics here so search/index reuse trends are visible over time.
+Rows in this log are telemetry only: appending a row never promotes it to a
+release baseline. Approved references and per-metric budgets live in
+[`approved-baselines.json`](../../benchmarks/release-evidence/approved-baselines.json),
+and release decisions use the gate in the
+[performance review playbook](performance-review-playbook.md).
+The repo-scale harness temporarily retains its prior warning strings and repeat
+refresh blocker as defense in depth; those legacy comparisons are not baseline
+approval or release authorization.
 
 Rows whose commit cell ends in `+wt` were run from the working tree based on that commit before the proof row itself was committed. When a row names the later commit in the result text, the runtime/code state under test is the working tree that became that commit; proof-only commits after the run still need fresh `ready`/`doctor` checks because docs change the sidecar input hash.
 
