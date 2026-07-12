@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Kept packaged local-retrieval proof commands in the local default runtime
+  namespace so the cross-platform gate validates a real local handoff before
+  exercising agent readiness.
+
 ### Removed
 
 - Removed the legacy ONNX diagnostic runtime, asset installer, setup command,
@@ -116,6 +122,12 @@
   reprovisioned, while locked or unmovable targets fail closed. Publication
   states are exposed as redacted plugin-runtime warnings, and native packaged
   proof now includes macOS x64 alongside the existing five release targets.
+- Closed the remaining managed CLI publication gaps: waiters now cover both
+  assets' absolute total configured retry windows, staged binaries must answer
+  the exact MCP stdio `initialize` contract within bounded output and process
+  shutdown limits, stale initialization aliases are inode-and-token revalidated
+  across rename, and resource-capped ZIP/tar.gz extraction uses Node platform
+  APIs instead of an external `tar` executable.
 
 - Extended the retrieval generalization guard from derived query literals to
   direct and split Rust string dependencies on eval/query corpus paths across

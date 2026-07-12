@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -8,6 +9,9 @@ import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
+import { deflateRawSync, gunzipSync, gzipSync } from "node:zlib";
+import { PassThrough, Writable } from "node:stream";
+import { EventEmitter } from "node:events";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
@@ -91,7 +95,125 @@ function managedReleaseManifest(version, executablePath, sha256) {
     archive_url: `https://github.com/TheGreenCedar/CodeStory/releases/download/v${version}/${archiveName}`,
     archive_sha256: "0".repeat(64),
     target,
+    stdio_initialize_verified: true,
   };
+}
+
+function crc32(content) {
+  let crc = 0xffffffff;
+  for (const byte of content) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function tarField(header, offset, length, value) {
+  const encoded = value.toString(8).padStart(length - 1, "0");
+  header.write(encoded, offset, length - 1, "ascii");
+  header[offset + length - 1] = 0;
+}
+
+function tarGzFixture(name, content) {
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 100, "utf8");
+  tarField(header, 100, 8, 0o755);
+  tarField(header, 108, 8, 0);
+  tarField(header, 116, 8, 0);
+  tarField(header, 124, 12, content.length);
+  tarField(header, 136, 12, 315532800);
+  header.fill(0x20, 148, 156);
+  header[156] = "0".charCodeAt(0);
+  header.write("ustar\0", 257, 6, "ascii");
+  header.write("00", 263, 2, "ascii");
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+  header[154] = 0;
+  header[155] = 0x20;
+  const padding = Buffer.alloc((512 - (content.length % 512)) % 512);
+  return gzipSync(Buffer.concat([header, content, padding, Buffer.alloc(1024)]), { mtime: 0 });
+}
+
+function rewriteTarChecksum(header) {
+  header.fill(0x20, 148, 156);
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+  header[154] = 0;
+  header[155] = 0x20;
+}
+
+function zipFixture(name, content, options = {}) {
+  const encodedName = Buffer.from(name, "utf8");
+  const compressed = deflateRawSync(content);
+  const checksum = crc32(content);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  const flags = 0x800 | (options.dataDescriptor ? 0x8 : 0);
+  local.writeUInt16LE(flags, 6);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt32LE(options.dataDescriptor ? 0 : checksum, 14);
+  local.writeUInt32LE(options.dataDescriptor ? 0 : compressed.length, 18);
+  local.writeUInt32LE(options.dataDescriptor ? 0 : content.length, 22);
+  local.writeUInt16LE(encodedName.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(0x0314, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(flags, 8);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt32LE(checksum, 16);
+  central.writeUInt32LE(compressed.length, 20);
+  central.writeUInt32LE(content.length, 24);
+  central.writeUInt16LE(encodedName.length, 28);
+  central.writeUInt32LE((0o100755 << 16) >>> 0, 38);
+  const descriptor = options.dataDescriptor ? Buffer.alloc(16) : Buffer.alloc(0);
+  if (options.dataDescriptor) {
+    descriptor.writeUInt32LE(0x08074b50, 0);
+    descriptor.writeUInt32LE(checksum, 4);
+    descriptor.writeUInt32LE(compressed.length, 8);
+    descriptor.writeUInt32LE(content.length, 12);
+  }
+  const centralOffset = local.length + encodedName.length + compressed.length + descriptor.length;
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(central.length + encodedName.length, 12);
+  eocd.writeUInt32LE(centralOffset, 16);
+  return Buffer.concat([local, encodedName, compressed, descriptor, central, encodedName, eocd]);
+}
+
+async function writeArchiveFixture(archivePath, entryName, content) {
+  await writeFile(
+    archivePath,
+    archivePath.endsWith(".zip") ? zipFixture(entryName, content) : tarGzFixture(entryName, content),
+  );
+}
+
+function fakeProbeChild(response, options = {}) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.killSignals = [];
+  child.kill = (signal = "SIGTERM") => {
+    child.killSignals.push(signal);
+    if (signal === "SIGKILL" && !options.ignoreSigkill) {
+      process.nextTick(() => child.emit("exit", null, signal));
+    }
+    return true;
+  };
+  child.stdin = new Writable({
+    write(_chunk, _encoding, callback) { callback(); },
+    final(callback) {
+      process.nextTick(() => {
+        if (options.stdoutError) child.stdout.emit("error", new Error("synthetic stdout failure"));
+        else child.stdout.write(`${JSON.stringify(response)}\n`);
+      });
+      callback();
+    },
+  });
+  return child;
 }
 
 async function writeReleaseFixture(releaseDir, version) {
@@ -102,11 +224,7 @@ async function writeReleaseFixture(releaseDir, version) {
   const archivePath = join(releaseDir, archiveName);
   await mkdir(stageDir, { recursive: true });
   await writeFakeCli(cliPath);
-  const packArgs = archiveName.endsWith(".zip")
-    ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
-    : ["-czf", archivePath, "-C", releaseDir, archiveBase];
-  const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
-  assert.equal(pack.status, 0, pack.stderr);
+  await writeArchiveFixture(archivePath, `${archiveBase}/${cliName}`, await readFile(cliPath));
   const archiveSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
   const sumsPath = join(releaseDir, "SHA256SUMS.txt");
   await writeFile(sumsPath, `${archiveSha256}  ${archiveName}\n`, "utf8");
@@ -141,7 +259,7 @@ async function waitForPath(pathname, timeoutMs = 10000) {
 }
 
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n',()=>process.exit(0))})}else{if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))}";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
@@ -165,6 +283,15 @@ async function writeRecordingCli(cliPath) {
     return;
   }
   await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
+  await chmod(cliPath, 0o755);
+}
+
+async function writeVersionOnlyCli(cliPath) {
+  if (process.platform === "win32") {
+    await writeFile(cliPath, "@echo off\r\necho codestory-cli %TEST_CODESTORY_VERSION%\r\n", "utf8");
+    return;
+  }
+  await writeFile(cliPath, "#!/bin/sh\necho codestory-cli \"$TEST_CODESTORY_VERSION\"\n", "utf8");
   await chmod(cliPath, 0o755);
 }
 
@@ -789,6 +916,258 @@ test("managed cli pending-owner cleanup protects live and young artifacts", asyn
     await assert.rejects(access(dead));
     await assert.rejects(access(old));
     await assert.rejects(access(reused));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli waiter covers both configured asset retry windows", () => {
+  assert.ok(launcherTest.releaseAssetRetryBudgetMs > 3 * 60 * 1000);
+  assert.ok(launcherTest.managedCliLockWaitMs >= 2 * launcherTest.releaseAssetRetryBudgetMs);
+});
+
+test("managed cli initializing reclaim preserves a new ABA owner", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-initializing-aba-"));
+  const initializing = join(dataDir, ".retention-lock.initializing");
+  const oldOwner = { pid: 1, token: "old", purpose: "old" };
+  const newOwner = { pid: process.pid, token: "new", purpose: "new" };
+  try {
+    await writeFile(initializing, JSON.stringify(oldOwner));
+    const removed = launcherTest.removeManagedCliInitializationIf(
+      initializing,
+      (owner) => owner?.token === oldOwner.token,
+      {
+        afterRename() {
+          fs.writeFileSync(initializing, JSON.stringify(newOwner), { flag: "wx" });
+        },
+      },
+    );
+    assert.equal(removed, true);
+    assert.deepEqual(JSON.parse(await readFile(initializing, "utf8")), newOwner);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli staging rejects a version-only binary without MCP initialize", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-stdio-probe-"));
+  const cliPath = join(dataDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  try {
+    await writeVersionOnlyCli(cliPath);
+    await assert.rejects(launcherTest.probeManagedCliStdio(cliPath, 1000), /stdio_initialize_/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli staging requires the exact MCP initialize contract", async () => {
+  const incompatible = {
+    jsonrpc: "2.0",
+    id: "managed-cli-staging",
+    result: {
+      protocolVersion: "2099-01-01",
+      capabilities: [],
+      serverInfo: { name: "", version: 1 },
+    },
+  };
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: () => fakeProbeChild(incompatible),
+      terminationGraceMs: 5,
+      forceKillGraceMs: 20,
+    }),
+    /stdio_initialize_incompatible/u,
+  );
+});
+
+test("managed cli staging escalates and awaits a stubborn child", async () => {
+  const compatible = {
+    jsonrpc: "2.0",
+    id: "managed-cli-staging",
+    result: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      serverInfo: { name: "fixture", version: "1" },
+    },
+  };
+  const child = fakeProbeChild(compatible);
+  await launcherTest.probeManagedCliStdio("fixture", 100, {
+    spawn: () => child,
+    terminationGraceMs: 5,
+    forceKillGraceMs: 20,
+  });
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
+
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: () => fakeProbeChild(compatible, { ignoreSigkill: true }),
+      terminationGraceMs: 5,
+      forceKillGraceMs: 10,
+    }),
+    /stdio_initialize_termination_timeout/u,
+  );
+});
+
+test("managed cli staging bounds output and handles stream errors", async () => {
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: () => fakeProbeChild(null, { stdoutError: true }),
+      terminationGraceMs: 5,
+      forceKillGraceMs: 20,
+    }),
+    /managed_cli_stdio_initialize_stdout/u,
+  );
+  const child = fakeProbeChild(null);
+  child.stdin = new Writable({
+    write(_chunk, _encoding, callback) { callback(); },
+    final(callback) {
+      child.stdout.write("x".repeat(70 * 1024));
+      callback();
+    },
+  });
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: () => child,
+      terminationGraceMs: 5,
+      forceKillGraceMs: 20,
+    }),
+    /stdio_initialize_stdout_limit/u,
+  );
+});
+
+test("managed cli extracts zip and tar.gz with Node platform APIs", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-native-extract-"));
+  const content = Buffer.from("native archive fixture\n");
+  try {
+    for (const extension of ["zip", "tar.gz"]) {
+      const archive = join(dataDir, `fixture.${extension}`);
+      const destination = join(dataDir, `extract-${extension.replace(".", "-")}`);
+      await writeArchiveFixture(archive, "release/bin/codestory-cli", content);
+      launcherTest.extractArchive(archive, destination);
+      assert.deepEqual(await readFile(join(destination, "release", "bin", "codestory-cli")), content);
+    }
+    const descriptorArchive = join(dataDir, "descriptor.zip");
+    await writeFile(
+      descriptorArchive,
+      zipFixture("release/bin/codestory-cli", content, { dataDescriptor: true }),
+    );
+    const descriptorDestination = join(dataDir, "extract-descriptor");
+    launcherTest.extractArchive(descriptorArchive, descriptorDestination);
+    assert.deepEqual(
+      await readFile(join(descriptorDestination, "release", "bin", "codestory-cli")),
+      content,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli archive extraction fails closed on bombs and malformed metadata", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-bad-archive-"));
+  const content = Buffer.from("fixture\n");
+  const extract = (archive) => launcherTest.extractArchive(archive, join(dataDir, `out-${Math.random()}`));
+  try {
+    const crcArchive = join(dataDir, "crc.zip");
+    const crcBytes = zipFixture("release/codestory-cli", content);
+    const central = crcBytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    crcBytes.writeUInt32LE(0, 14);
+    crcBytes.writeUInt32LE(0, central + 16);
+    await writeFile(crcArchive, crcBytes);
+    assert.throws(() => extract(crcArchive), /zip_entry_crc_mismatch/u);
+
+    const bombArchive = join(dataDir, "bomb.zip");
+    const bombBytes = zipFixture("release/codestory-cli", content);
+    const bombCentral = bombBytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    bombBytes.writeUInt32LE(300 * 1024 * 1024, bombCentral + 24);
+    await writeFile(bombArchive, bombBytes);
+    assert.throws(() => extract(bombArchive), /archive_entry_size_limit_exceeded/u);
+
+    const nameArchive = join(dataDir, "name.zip");
+    const nameBytes = zipFixture("release/codestory-cli", content);
+    nameBytes[30] ^= 1;
+    await writeFile(nameArchive, nameBytes);
+    assert.throws(() => extract(nameArchive), /zip_local_name_mismatch/u);
+
+    for (const [label, mutate] of [
+      ["flags", (bytes) => bytes.writeUInt16LE(0x808, 6)],
+      ["method", (bytes) => bytes.writeUInt16LE(0, 8)],
+      ["crc", (bytes) => bytes.writeUInt32LE(0, 14)],
+      ["compressed-size", (bytes) => bytes.writeUInt32LE(1, 18)],
+      ["uncompressed-size", (bytes) => bytes.writeUInt32LE(1, 22)],
+    ]) {
+      const archive = join(dataDir, `local-${label}.zip`);
+      const bytes = zipFixture("release/codestory-cli", content);
+      mutate(bytes);
+      await writeFile(archive, bytes);
+      assert.throws(() => extract(archive), /zip_local_metadata_mismatch/u);
+    }
+
+    const descriptorArchive = join(dataDir, "bad-descriptor.zip");
+    const descriptorBytes = zipFixture("release/codestory-cli", content, { dataDescriptor: true });
+    const descriptorCentral = descriptorBytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    descriptorBytes.writeUInt32LE(0, descriptorCentral - 12);
+    await writeFile(descriptorArchive, descriptorBytes);
+    assert.throws(() => extract(descriptorArchive), /zip_data_descriptor_mismatch/u);
+
+    const commentArchive = join(dataDir, "comment.zip");
+    const commentBytes = zipFixture("release/codestory-cli", content);
+    commentBytes.writeUInt16LE(4, commentBytes.length - 2);
+    await writeFile(commentArchive, commentBytes);
+    assert.throws(() => extract(commentArchive), /zip_end_of_central_directory_missing/u);
+
+    for (const [name, mode] of [["../escape", 0o100755], ["release/link", 0o120777]]) {
+      const archive = join(dataDir, `${mode}.zip`);
+      const bytes = zipFixture(name, content);
+      const directory = bytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+      bytes.writeUInt32LE((mode << 16) >>> 0, directory + 38);
+      await writeFile(archive, bytes);
+      assert.throws(
+        () => extract(archive),
+        mode === 0o120777 ? /zip_symlink_unsupported/u : /archive_path_escape/u,
+      );
+    }
+
+    const malformedTar = join(dataDir, "malformed.tar.gz");
+    const malformed = gunzipSync(tarGzFixture("release/codestory-cli", content));
+    malformed.fill("z".charCodeAt(0), 124, 136);
+    rewriteTarChecksum(malformed.subarray(0, 512));
+    await writeFile(malformedTar, gzipSync(malformed));
+    assert.throws(() => extract(malformedTar), /tar_numeric_field_invalid/u);
+
+    const unterminatedTar = join(dataDir, "unterminated.tar.gz");
+    const unterminated = gunzipSync(tarGzFixture("release/codestory-cli", content));
+    await writeFile(unterminatedTar, gzipSync(unterminated.subarray(0, unterminated.length - 512)));
+    assert.throws(() => extract(unterminatedTar), /tar_terminator_invalid|tar_terminator_missing/u);
+
+    const tarBomb = join(dataDir, "bomb.tar.gz");
+    const tarBombBytes = gunzipSync(tarGzFixture("release/codestory-cli", content));
+    tarField(tarBombBytes, 124, 12, 300 * 1024 * 1024);
+    rewriteTarChecksum(tarBombBytes.subarray(0, 512));
+    await writeFile(tarBomb, gzipSync(tarBombBytes));
+    assert.throws(() => extract(tarBomb), /archive_entry_size_limit_exceeded/u);
+
+    for (const [label, type] of [["extended", "x"], ["global", "g"]]) {
+      const paxTar = join(dataDir, `bad-pax-${label}.tar.gz`);
+      const paxBytes = gunzipSync(tarGzFixture("PaxHeader", Buffer.from("8x p=a\n")));
+      paxBytes[156] = type.charCodeAt(0);
+      rewriteTarChecksum(paxBytes.subarray(0, 512));
+      await writeFile(paxTar, gzipSync(paxBytes));
+      assert.throws(() => extract(paxTar), /tar_pax_length_invalid/u);
+    }
+
+    for (const [filename, type, expected] of [
+      ["../escape", "0", /archive_path_escape/u],
+      ["release/link", "2", /tar_entry_type_unsupported/u],
+    ]) {
+      const archive = join(dataDir, `tar-${type.charCodeAt(0)}.tar.gz`);
+      const bytes = gunzipSync(tarGzFixture("release/codestory-cli", content));
+      bytes.fill(0, 0, 100);
+      bytes.write(filename, 0, 100, "utf8");
+      bytes[156] = type.charCodeAt(0);
+      rewriteTarChecksum(bytes.subarray(0, 512));
+      await writeFile(archive, gzipSync(bytes));
+      assert.throws(() => extract(archive), expected);
+    }
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2477,14 +2856,7 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
   }
 });
 
-test("mcp launcher provisions a checksummed release asset into plugin data", async (t) => {
-  const { spawnSync } = await import("node:child_process");
-  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
-  if (tarProbe.status !== 0) {
-    t.skip("tar unavailable for archive fixture");
-    return;
-  }
-
+test("mcp launcher provisions a checksummed release asset into plugin data", async () => {
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
@@ -2499,11 +2871,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   try {
     await mkdir(stageDir, { recursive: true });
     await writeFakeCli(cliPath);
-    const packArgs = archiveName.endsWith(".zip")
-      ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
-      : ["-czf", archivePath, "-C", releaseDir, archiveBase];
-    const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
-    assert.equal(pack.status, 0, pack.stderr);
+    await writeArchiveFixture(archivePath, `${archiveBase}/${cliName}`, await readFile(cliPath));
     const archiveSha256 = createHash("sha256")
       .update(await readFile(archivePath))
       .digest("hex");
@@ -2546,6 +2914,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     assert.equal(manifest.build_source, "github_release");
     assert.equal(manifest.archive, archiveName);
     assert.equal(manifest.archive_sha256, archiveSha256);
+    assert.equal(manifest.stdio_initialize_verified, true);
     assert.equal(typeof manifest.sha256, "string");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
@@ -2553,12 +2922,7 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   }
 });
 
-test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async (t) => {
-  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
-  if (tarProbe.status !== 0) {
-    t.skip("tar unavailable for archive fixture");
-    return;
-  }
+test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {
   const { createServer } = await import("node:http");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-publication-contention-"));
@@ -2639,12 +3003,7 @@ test("managed cli publication is single-flight and atomically visible across two
   }
 });
 
-test("managed cli publication reclaims crashes after lock and before publication", { timeout: 45000 }, async (t) => {
-  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
-  if (tarProbe.status !== 0) {
-    t.skip("tar unavailable for archive fixture");
-    return;
-  }
+test("managed cli publication reclaims crashes after lock and before publication", { timeout: 45000 }, async () => {
   const { createServer } = await import("node:http");
   const version = await readPluginVersion();
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-crash-release-"));
@@ -2723,12 +3082,7 @@ test("managed cli publication reclaims crashes after lock and before publication
   }
 });
 
-test("managed cli quarantines corrupt installs, retains two, and fails closed on a locked directory", { timeout: 30000 }, async (t) => {
-  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
-  if (tarProbe.status !== 0) {
-    t.skip("tar unavailable for archive fixture");
-    return;
-  }
+test("managed cli quarantines corrupt installs, retains two, and fails closed on a locked directory", { timeout: 30000 }, async () => {
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-corrupt-install-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-corrupt-release-"));
@@ -2935,6 +3289,32 @@ test("release asset downloader retries a transient failure", async () => {
     assert.equal(calls, 2);
     assert.equal(await readFile(destination, "utf8"), "checksum fixture\n");
   } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader enforces a total body deadline", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-deadline-"));
+  const destination = join(dataDir, "slow.bin");
+  const server = createServer((_request, response) => {
+    response.writeHead(200);
+    const interval = setInterval(() => response.write("x"), 10);
+    response.on("close", () => clearInterval(interval));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      launcherTest.downloadFile(`http://127.0.0.1:${server.address().port}/slow`, destination, {
+        attempts: 1,
+        timeoutMs: 60,
+      }),
+      /timed out.*total/u,
+    );
+    assert.ok(Date.now() - started < 1000);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     await rm(dataDir, { recursive: true, force: true });
   }
 });
