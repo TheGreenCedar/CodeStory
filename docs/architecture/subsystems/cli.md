@@ -91,10 +91,13 @@ page owns the adapter boundary:
 - keep mutating setup paths explicit so read commands do not download assets or
   change sidecar state.
 
-Broad question surfaces (`packet`, sidecar-backed `search`, and `drill`) should
-remain separate from exact target context (`context`, `symbol`, `trail`,
-`snippet`, and local graph exploration). Generated help is the source of truth
-for the current flags on each command.
+`packet` owns broad-question retrieval. `drill` executes that packet path once
+with its explicit anchors as extra probes, then adapts packet citations,
+sufficiency, gaps, and follow-up commands into durable drill reports. It must
+not assemble a second search, bridge, readiness, or claim-scoring system.
+Sidecar-backed `search` remains candidate discovery, while `context`, `symbol`,
+`trail`, `snippet`, and local graph exploration remain exact-target surfaces.
+Generated help is the source of truth for the current flags on each command.
 
 `task brief` is an owner-directed implementation workflow view over `packet`.
 It must keep the stable JSON and Markdown brief contracts in the CLI adapter,

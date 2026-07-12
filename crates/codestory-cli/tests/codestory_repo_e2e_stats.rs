@@ -652,14 +652,6 @@ fn array_len(value: &Value, path: &[&str]) -> usize {
         .len()
 }
 
-fn array_contains_command(value: &Value, path: &[&str], expected: &str) -> bool {
-    json_path(value, path)
-        .as_array()
-        .unwrap_or_else(|| panic!("expected array at path {:?}", path))
-        .iter()
-        .any(|item| item["command"].as_str() == Some(expected))
-}
-
 fn array_item_by_field<'a>(
     value: &'a Value,
     path: &[&str],
@@ -1551,54 +1543,20 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             case.name
         );
         assert_eq!(
-            string_field(&drill_json, &["question_search", "status"]),
-            "ok",
-            "{} drill should collect natural-language repo-text evidence",
+            string_field(&drill_json, &["question_search", "command"]),
+            "packet",
+            "{} drill should execute the packet path once",
             case.name
         );
-        assert_question_search_names_seed_anchors(case, &drill_json);
-        assert!(
-            array_len(&drill_json, &["verification_checklist"]) >= 4,
-            "{} drill should force source-truth verification structure",
-            case.name
-        );
-        assert!(
-            bool_field(
-                &drill_json,
-                &["answer_quality_contract", "code_story_only_draft_required"]
-            ),
-            "{} drill should require a CodeStory-only draft before source reads",
-            case.name
-        );
-        assert!(
-            bool_field(
-                &drill_json,
-                &[
-                    "answer_quality_contract",
-                    "source_truth_verification_required",
-                ]
-            ),
-            "{} drill should require source-truth verification after the draft",
-            case.name
-        );
-        assert!(
-            array_len(&drill_json, &["answer_quality_contract", "score_inputs"]) >= 5,
-            "{} drill should expose score inputs for answer-quality reporting",
-            case.name
-        );
-        assert!(
-            array_len(&drill_json, &["claim_ledger_template", "claims"]) >= case.anchors.len(),
-            "{} drill should emit a fillable claim ledger template",
-            case.name
-        );
+        assert_packet_plan_names_seed_anchors(case, &drill_json);
         assert_eq!(
-            array_len(&drill_json, &["bridges"]),
-            case.anchors.len().saturating_sub(1) * case.anchors.len() / 2,
-            "{} drill should emit pairwise cross-anchor bridge evidence",
+            string_field(&drill_json, &["question_search", "status"]),
+            string_field(&drill_json, &["evidence_packet", "sufficiency", "status"]),
+            "{} drill status should be the packet sufficiency decision",
             case.name
         );
         assert_compact_bridge_status_handoff(&case.name, repo_json);
-        assert!(array_len(&drill_json, &["execution_boundaries"]) >= 3);
+        assert_eq!(array_len(&drill_json, &["execution_boundaries"]), 1);
 
         for anchor_index in 0..case.anchors.len() {
             let index = anchor_index.to_string();
@@ -1609,54 +1567,17 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
                 case.name
             );
             assert!(
-                array_len(&drill_json, &["anchors", index.as_str(), "commands"]) >= 1,
-                "{} drill anchor should record evidence command artifacts",
-                case.name
-            );
-            assert!(
                 u64_field(&drill_json, &["anchors", index.as_str(), "typed_hit_count"]) > 0,
                 "{} anchor {} should retain typed search hits",
                 case.name,
                 case.anchors[anchor_index]
             );
-            if !json_path(&drill_json, &["anchors", index.as_str(), "chosen_anchor"]).is_null() {
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "symbol"
-                    ),
-                    "{} drill should include symbol evidence for resolved anchors",
-                    case.name
-                );
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "trail"
-                    ),
-                    "{} drill should include trail evidence for resolved anchors",
-                    case.name
-                );
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "snippet"
-                    ),
-                    "{} drill should include snippet evidence for resolved anchors",
-                    case.name
-                );
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "explore"
-                    ),
-                    "{} drill should include an explore source-packet artifact for resolved anchors",
-                    case.name
-                );
-            }
+            assert_eq!(
+                array_len(&drill_json, &["anchors", index.as_str(), "commands"]),
+                0,
+                "{} drill anchors should adapt packet citations without rerunning commands",
+                case.name
+            );
         }
 
         assert_manifest_anchor_expectations(case, repo_json);
@@ -1668,27 +1589,16 @@ fn allow_skip_real_repo_drill_cases() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-fn assert_question_search_names_seed_anchors(case: &DrillRepoCase, drill_json: &Value) {
-    let artifact = PathBuf::from(string_field(drill_json, &["question_search", "artifact"]));
-    assert!(
-        artifact.is_file(),
-        "{} drill should write question-search artifact at {}",
-        case.name,
-        artifact.display()
-    );
-    let question_search: Value =
-        serde_json::from_slice(&fs::read(&artifact).expect("read question-search artifact"))
-            .expect("parse question-search artifact");
-    let subqueries = json_path(&question_search, &["search_plan", "subqueries"])
+fn assert_packet_plan_names_seed_anchors(case: &DrillRepoCase, drill_json: &Value) {
+    let subqueries = json_path(drill_json, &["evidence_packet", "plan", "queries"])
         .as_array()
-        .expect("question search plan subqueries");
+        .expect("packet plan queries");
     for anchor in &case.anchors {
         assert!(
-            subqueries.iter().any(|subquery| {
-                subquery["role"].as_str() == Some("named_anchor")
-                    && subquery["query"].as_str() == Some(anchor.as_str())
-            }),
-            "{} broad question Search Plan should preserve named-anchor subquery for {anchor}: {question_search:#}",
+            subqueries
+                .iter()
+                .any(|subquery| subquery["query"].as_str() == Some(anchor.as_str())),
+            "{} packet plan should preserve explicit anchor probe {anchor}: {drill_json:#}",
             case.name
         );
     }

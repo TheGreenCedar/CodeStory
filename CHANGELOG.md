@@ -86,10 +86,11 @@
 
 ### Changed
 
-- Routed drill question and supplemental query planning through the runtime packet
-  planner while preserving drill report and artifact output contracts. This removes
-  the separate drill-only product/domain query heuristic; drill remains a report
-  adapter over packet-planned evidence candidates.
+- Made drill a report adapter over one runtime packet execution. Explicit anchors
+  are packet probes; packet citations, covered claims, gaps, sufficiency, and
+  follow-up commands now populate the retained drill JSON, Markdown, summary, and
+  bridge fields. Removed the public legacy evidence-packet DTO and production
+  drill-only search, bridge, readiness, claim-scoring, and ledger assembly paths.
 - Added staged repository-v2/project-v3 identity contracts that preserve
   transport schemes, effective and non-default remote ports, and case-sensitive
   repository paths, distinguish absolute and home-relative SCP paths, reject

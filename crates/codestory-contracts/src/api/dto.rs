@@ -1858,23 +1858,6 @@ pub struct AgentAnswerDto {
     pub retrieval_trace: AgentRetrievalTraceDto,
 }
 
-/// Evidence item kind in a packet.
-///
-/// Variants identify where evidence came from. `Negative` records absence or a
-/// rejected path and must not be counted as supporting proof.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceTypeDto {
-    SearchHit,
-    SymbolContext,
-    Trail,
-    Snippet,
-    Explore,
-    Bridge,
-    RepoText,
-    Negative,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketBudgetModeDto {
@@ -1894,77 +1877,6 @@ pub enum ClaimReadinessDto {
     Inferred,
     NeedsSourceRead,
     ContradictedBySource,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct EvidenceSourceLocationDto {
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line_start: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line_end: Option<u32>,
-}
-
-/// One evidence row inside an evidence packet.
-///
-/// The row is auditable diagnostic/product evidence depending on
-/// `evidence_type`, `verification_status`, and optional source location. Artifact
-/// paths point to supporting files; they are not serialized source content.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct EvidenceItemDto {
-    pub id: String,
-    pub evidence_type: EvidenceTypeDto,
-    pub command: String,
-    pub status: String,
-    pub confidence: String,
-    pub verification_status: ClaimReadinessDto,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub match_quality: Option<SearchMatchQualityDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<EvidenceSourceLocationDto>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct SourceTruthCheckDto {
-    pub id: String,
-    pub reason: String,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-    pub required: bool,
-}
-
-/// Answer-readiness summary for packet consumers.
-///
-/// `safe_to_say` is supported output. `inferred_claims` and
-/// `needs_verification` are explicit non-claims until the listed checks pass.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct AnswerReadinessReportDto {
-    pub overall_status: ClaimReadinessDto,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub safe_to_say: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inferred_claims: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub needs_verification: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub next_commands: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_truth_checks: Vec<SourceTruthCheckDto>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct EvidencePacketDto {
-    pub packet_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub question: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<EvidenceItemDto>,
-    pub readiness: AnswerReadinessReportDto,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]

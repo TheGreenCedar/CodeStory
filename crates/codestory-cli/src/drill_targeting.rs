@@ -1,8 +1,5 @@
 use anyhow::{Result, bail};
-use codestory_contracts::api::{NodeKind, SearchHit};
 use std::collections::HashSet;
-
-use crate::query_resolution::{compare_resolution_hits, is_resolvable_graph_target};
 
 pub(crate) fn normalized_drill_anchors(anchors: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -24,18 +21,4 @@ pub(crate) fn validated_drill_anchors(anchors: &[String], context: &str) -> Resu
         bail!("{context} must name at least one anchor");
     }
     Ok(anchors)
-}
-
-pub(crate) fn choose_drill_anchor_hit<'a>(
-    anchor: &str,
-    hits: &'a [SearchHit],
-) -> Option<&'a SearchHit> {
-    hits.iter()
-        .filter(|hit| hit.kind != NodeKind::UNKNOWN && is_resolvable_graph_target(anchor, hit))
-        .min_by(|left, right| compare_resolution_hits(anchor, left, right))
-        .or_else(|| {
-            hits.iter()
-                .filter(|hit| is_resolvable_graph_target(anchor, hit))
-                .min_by(|left, right| compare_resolution_hits(anchor, left, right))
-        })
 }
