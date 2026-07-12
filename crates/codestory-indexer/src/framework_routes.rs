@@ -456,21 +456,25 @@ pub(super) fn allow_javascript_fastify_lexical_fallback(
     let Some(line) = source.lines().nth(route.line.saturating_sub(1) as usize) else {
         return false;
     };
+    let code_line = super::strip_c_style_comments(line)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     let receiver = if let Some((receiver, argument)) =
-        javascript_route_receiver_and_argument(line, &route.method)
+        javascript_route_receiver_and_argument(&code_line, &route.method)
     {
         if !javascript_fallback_has_static_argument(argument, route) {
             return false;
         }
         receiver
     } else {
-        let Some((receiver, _)) = line.trim_start().split_once(".route(") else {
+        let Some((receiver, _)) = code_line.trim_start().split_once(".route(") else {
             return false;
         };
-        if javascript_fallback_has_top_level_spread(line)
-            || !javascript_fallback_has_direct_handler_property(line)
-            || !javascript_fallback_has_static_method_property(line, &route.method)
-            || !javascript_fallback_has_static_property(line, "url", &route.raw_path)
+        if javascript_fallback_has_top_level_spread(&code_line)
+            || !javascript_fallback_has_direct_handler_property(&code_line)
+            || !javascript_fallback_has_static_method_property(&code_line, &route.method)
+            || !javascript_fallback_has_static_property(&code_line, "url", &route.raw_path)
         {
             return false;
         }
@@ -790,9 +794,13 @@ fn javascript_line_is_module_scope(tree: &Tree, line: &str, line_number: u32) ->
         ) {
             return false;
         }
-        node = current.parent();
+        let parent = current.parent();
+        if parent.is_some_and(|parent| parent.kind() == "program") {
+            return matches!(current.kind(), "expression_statement" | "ERROR");
+        }
+        node = parent;
     }
-    true
+    false
 }
 
 fn javascript_route_receiver_and_argument<'a>(
@@ -871,13 +879,7 @@ fn apply_express_module_statement(
         return;
     }
 
-    if matches!(
-        statement.kind(),
-        "function_declaration" | "class_declaration"
-    ) && let Some(name) = statement
-        .child_by_field_name("name")
-        .and_then(|node| node_text(node, source))
-    {
+    if let Some(name) = javascript_runtime_declaration_name(statement, source) {
         invalidate_express_binding(&name, bindings);
         return;
     }
@@ -991,6 +993,7 @@ fn apply_express_declarator(node: Node<'_>, source: &str, bindings: &mut Express
 }
 
 fn expression_is_express_require(node: Node<'_>, source: &str, bindings: &ExpressBindings) -> bool {
+    let node = javascript_transparent_expression(node);
     if bindings.require_shadowed || node.kind() != "call_expression" {
         return false;
     }
@@ -1011,6 +1014,7 @@ fn expression_constructs_express_receiver(
     source: &str,
     bindings: &ExpressBindings,
 ) -> bool {
+    let node = javascript_transparent_expression(node);
     if node.kind() != "call_expression" {
         return false;
     }
@@ -1090,13 +1094,7 @@ fn apply_fastify_module_statement(
         return;
     }
 
-    if matches!(
-        statement.kind(),
-        "function_declaration" | "class_declaration"
-    ) && let Some(name) = statement
-        .child_by_field_name("name")
-        .and_then(|node| node_text(node, source))
-    {
+    if let Some(name) = javascript_runtime_declaration_name(statement, source) {
         invalidate_fastify_binding(&name, bindings);
         return;
     }
@@ -1210,6 +1208,7 @@ fn apply_fastify_declarator(node: Node<'_>, source: &str, bindings: &mut Fastify
 }
 
 fn expression_is_fastify_require(node: Node<'_>, source: &str, bindings: &FastifyBindings) -> bool {
+    let node = javascript_transparent_expression(node);
     if bindings.require_shadowed || node.kind() != "call_expression" {
         return false;
     }
@@ -1230,6 +1229,7 @@ fn expression_constructs_fastify_receiver(
     source: &str,
     bindings: &FastifyBindings,
 ) -> bool {
+    let node = javascript_transparent_expression(node);
     if node.kind() != "call_expression" {
         return false;
     }
@@ -1351,6 +1351,44 @@ fn javascript_import_local_bindings(node: Node<'_>, source: &str) -> HashSet<Str
     bindings
 }
 
+fn javascript_runtime_declaration_name(node: Node<'_>, source: &str) -> Option<String> {
+    let declaration = if matches!(
+        node.kind(),
+        "function_declaration" | "class_declaration" | "enum_declaration"
+    ) {
+        node
+    } else if node.kind() == "export_statement" {
+        node.named_children(&mut node.walk()).find(|child| {
+            matches!(
+                child.kind(),
+                "function_declaration" | "class_declaration" | "enum_declaration"
+            )
+        })?
+    } else {
+        return None;
+    };
+    declaration
+        .child_by_field_name("name")
+        .and_then(|name| node_text(name, source))
+}
+
+fn javascript_transparent_expression(mut node: Node<'_>) -> Node<'_> {
+    loop {
+        let expression = match node.kind() {
+            "parenthesized_expression"
+            | "as_expression"
+            | "satisfies_expression"
+            | "non_null_expression" => node.named_child(0),
+            "type_assertion" => node.named_child(1),
+            _ => return node,
+        };
+        let Some(expression) = expression else {
+            return node;
+        };
+        node = expression;
+    }
+}
+
 fn collect_javascript_written_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
     if matches!(
         node.kind(),
@@ -1365,6 +1403,12 @@ fn collect_javascript_written_names(node: Node<'_>, source: &str, names: &mut Ha
     if node.kind() == "assignment_expression" {
         if let Some(left) = node.child_by_field_name("left") {
             collect_javascript_binding_names(left, source, names);
+        }
+        return;
+    }
+    if node.kind() == "update_expression" {
+        if let Some(argument) = node.named_child(0) {
+            collect_javascript_binding_names(argument, source, names);
         }
         return;
     }
@@ -2546,30 +2590,36 @@ api.route({ method: "GET", url: dynamicUrl, url: "/duplicate", handler });
                 tree_sitter_javascript::LANGUAGE.into(),
                 JavaScriptDialect::JavaScript,
                 r#"const Fastify = require("fastify");"#,
-                "Fastify",
+                "Fastify()",
             ),
             (
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 JavaScriptDialect::TypeScript,
                 r#"import { fastify as makeServer } from "fastify";"#,
-                "makeServer",
+                "makeServer() as FastifyInstance",
             ),
             (
                 tree_sitter_typescript::LANGUAGE_TSX.into(),
                 JavaScriptDialect::Tsx,
                 r#"import * as FastifyModule from "fastify";"#,
-                "FastifyModule.fastify",
+                "FastifyModule.fastify() satisfies FastifyInstance",
             ),
             (
                 tree_sitter_javascript::LANGUAGE.into(),
                 JavaScriptDialect::JavaScript,
                 r#"const { fastify: makeServer } = require("fastify");"#,
-                "makeServer",
+                "makeServer()",
+            ),
+            (
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                JavaScriptDialect::TypeScript,
+                r#"const TypedFastify = require("fastify") as typeof import("fastify");"#,
+                "TypedFastify()",
             ),
         ];
-        for (language, dialect, import, constructor) in cases {
+        for (language, dialect, import, initializer) in cases {
             let source = format!(
-                "{import}\nconst arbitraryName = {constructor}();\narbitraryName.get(\"/health\", {{ schema }}, health);"
+                "{import}\nconst arbitraryName = {initializer};\narbitraryName.get(\"/health\", {{ schema }}, health);"
             );
             let tree = parse_javascript(&language, &source);
             let routes = collect_javascript_fastify_routes(&language, dialect, &tree, &source)?;
@@ -2599,9 +2649,26 @@ factoryReturned.get("/factory-returned", handler);
 const unrelated = otherFramework();
 unrelated.get("/unrelated", handler);
 
+const memberAlias = require("fastify");
+memberAlias.fastify = otherFramework;
+const memberBuilt = memberAlias.fastify();
+memberBuilt.get("/overwritten-member", handler);
+
 const nestedAssigned = Fastify();
 const assignmentResult = (nestedAssigned = otherFramework());
 nestedAssigned.get("/nested-assignment", handler);
+
+let updated = Fastify();
+updated++;
+updated.get("/updated", handler);
+
+const enumReplaced = Fastify();
+enum enumReplaced { Value }
+enumReplaced.get("/enum-replaced", handler);
+
+const exportedReplaced = Fastify();
+export function exportedReplaced() {}
+exportedReplaced.get("/exported-replaced", handler);
 
 function register(api) {
   api.get("/injected", handler);
@@ -2727,6 +2794,10 @@ server.route({ method: "GET", "method": "POST", url: "/duplicate-method", handle
 server.route({ method: "GET", url: "/later-dynamic-url", url: dynamicUrl, handler
 server.route({ method: "GET", url: "/duplicate-url", "url": "/other-url", handler
 server.route({ method: "GET", url: "/spread", handler, ...dynamicOptions
+server.route({ method: "GET", url: "/comment-handler", /* handler: commented */
+if (flag) {
+  server.get("/nested-recovery" handler);
+}
 "#;
         let result = super::super::index_file(
             Path::new("dynamic-malformed.js"),
