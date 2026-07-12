@@ -986,6 +986,14 @@ pub(crate) struct DrillCommand {
         long_help = DRILL_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for drill packet retrieval. Passing --run-id implies the agent profile."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -2590,6 +2598,8 @@ mod tests {
         assert!(help.contains("--label <LABEL>"));
         assert!(help.contains("--question <QUESTION>"));
         assert!(help.contains("--jobs <N>"));
+        assert!(help.contains("--profile <PROFILE>"));
+        assert!(help.contains("--run-id <ID>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
         assert!(help.contains("Drill defaults to `full`"));
     }

@@ -325,13 +325,14 @@ cells must stay labeled as contract-only in PRs, issues, and release notes.
 | Promotion-grade benchmark | Full holdout packet-runtime rows cover cold and warm modes with three repeats, `--jobs 4`, prepared sidecars, `--publishable`, explicit `--max-source-reads-after-packet 0`, no `--allow-failures`, full sidecar provenance, no quality misses, no sufficiency gaps, and no SLA misses. Fixed-baseline A/B rows are supporting diagnostics only unless fingerprint-compatible. | Required for performance or retrieval-quality promotion claims. |
 
 Packet/drill adapter promotion proof is a separate executable gate over one
-already-finalized local sidecar generation:
+already-finalized Agent sidecar generation:
 
 ```sh
 node scripts/prove-drill-packet-parity.mjs \
   --project . \
-  --question "How does indexing feed packet retrieval?" \
-  --anchor WorkspaceIndexer \
+  --run-id drill-packet-parity \
+  --question "RuntimeContext" \
+  --anchor RuntimeContext \
   --output-dir target/drill-packet-parity
 ```
 

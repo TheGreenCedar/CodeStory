@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Launched the managed Windows Vulkan llama.cpp cells with proof verbosity so
+  current-launch logs retain the requested device and positive layer-offload
+  evidence required by the accelerator smoke gate.
+- Made agent-facing commands select the Agent sidecar by default, and bound the
+  live packet/drill parity gate plus drill's packet execution to the same
+  explicit Agent run instead of preflighting an unrelated Local generation.
 - Opened the diagnostic MCP immediately on fresh managed-plugin startup while
   the existing single-flight installer provisions the exact CLI version in the
   background. Status now reports the in-process provisioning state, and the

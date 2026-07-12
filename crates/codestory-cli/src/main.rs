@@ -3502,7 +3502,7 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
     let total_timer = Instant::now();
     let setup_timer = Instant::now();
     validate_drill_output_dir(&cmd.output_dir)?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project, cmd.profile, cmd.run_id.as_deref())?;
     let before = runtime.open_project_summary()?;
     let opened = runtime.ensure_open_from_summary(cmd.refresh, before.clone())?;
     ensure_index_ready(&opened, "drill")?;
@@ -4101,6 +4101,8 @@ fn run_drill_suite_case(
         question: Some(case.question.clone()),
         output_dir: repo_output_dir.clone(),
         refresh: cmd.refresh,
+        profile: None,
+        run_id: None,
         format: cmd.format,
         jobs: drill_jobs,
     };

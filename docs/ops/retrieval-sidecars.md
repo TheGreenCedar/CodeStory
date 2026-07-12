@@ -152,9 +152,10 @@ prewarm the managed Metal cache cell. Set `CODESTORY_EMBED_NATIVE_LLAMA_SERVER`
 only when overriding the managed binary with an absolute path.
 
 On Windows x64, the native llama.cpp resolver selects the manifest-backed b9902
-Vulkan cell by default and launches it with `Vulkan0` plus `99` GPU layers. A
-previous b9058 managed-cache install remains a recognized legacy cell only when
-its install manifest and executable checksum match.
+Vulkan cell by default and launches it with `Vulkan0`, `99` GPU layers, and
+proof verbosity that retains device/offload startup evidence. A previous b9058
+managed-cache install remains a recognized legacy cell only when its install
+manifest and executable checksum match, and uses the same proof verbosity.
 
 On Linux, accelerator-required setup remains Docker Compose based. The supported
 default cells are explicit Vulkan contracts for x64 and arm64, backed by the

@@ -136,23 +136,20 @@ impl RuntimeContext {
         run_id: Option<&str>,
     ) -> Result<Self> {
         let mut context = Self::new_with_startup(args, startup)?;
-        if profile.is_some() || run_id.is_some() {
-            let selected = profile
-                .map(Into::into)
-                .unwrap_or(codestory_retrieval::SidecarProfile::Agent);
-            context.sidecar = context.sidecar.with_profile_and_run_id(
-                Some(&context.project_root),
-                selected,
-                run_id,
-            );
-            let runtime = Runtime::new_with_config(context.sidecar.clone());
-            context.project = runtime.project_service();
-            context.index = runtime.index_service();
-            context.grounding = runtime.grounding_service();
-            context.bookmarks = runtime.bookmark_service();
-            context.browser = runtime.browser_service();
-            context.events = runtime.events();
-        }
+        let selected = profile
+            .map(Into::into)
+            .unwrap_or(codestory_retrieval::SidecarProfile::Agent);
+        context.sidecar =
+            context
+                .sidecar
+                .with_profile_and_run_id(Some(&context.project_root), selected, run_id);
+        let runtime = Runtime::new_with_config(context.sidecar.clone());
+        context.project = runtime.project_service();
+        context.index = runtime.index_service();
+        context.grounding = runtime.grounding_service();
+        context.bookmarks = runtime.bookmark_service();
+        context.browser = runtime.browser_service();
+        context.events = runtime.events();
         Ok(context)
     }
 
@@ -1072,6 +1069,10 @@ mod tests {
         })
         .expect("runtime context");
 
+        assert_eq!(
+            runtime.sidecar.profile,
+            codestory_retrieval::SidecarProfile::Agent
+        );
         assert_eq!(runtime.sidecar.embedding.backend, "llamacpp");
         assert_eq!(env::var("CODESTORY_EMBED_LLAMACPP_URL").ok(), None);
         let sidecar = runtime.sidecar.with_profile_and_run_id(
