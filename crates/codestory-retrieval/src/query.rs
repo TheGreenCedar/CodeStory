@@ -16,7 +16,7 @@ use codestory_store::{FileRole, RetrievalIndexManifest, Store};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const STRICT_BATCH_WORKER_CAP: usize = 4;
 
@@ -61,6 +61,10 @@ pub fn execute_retrieval_query_with_cache_for_runtime(
     cache: &mut RetrievalCache,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<QueryResult> {
+    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval query cancelled before preflight");
+    }
     let QueryContext {
         layout,
         project_id,
@@ -75,7 +79,6 @@ pub fn execute_retrieval_query_with_cache_for_runtime(
         manifest.as_ref(),
         Some(embedding_device),
     )?);
-    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
     let mut executor = QueryExecutor {
         sidecars,
         cache,
@@ -103,6 +106,10 @@ pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
     if request.queries.is_empty() {
         return Ok(Vec::new());
     }
+    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval query batch cancelled before preflight");
+    }
     let QueryContext {
         layout,
         project_id,
@@ -117,7 +124,6 @@ pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
         manifest.as_ref(),
         Some(embedding_device.clone()),
     )?);
-    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
     let (mode, degraded_reason) = resolve_batch_mode(
         sidecars.as_ref(),
         manifest.as_ref(),
@@ -160,11 +166,19 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
             mode.as_str()
         );
     }
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval query batch cancelled before cache lookup");
+    }
 
     let mut results = vec![None; queries.len()];
     let mut misses = Vec::new();
     for (index, query) in queries.iter().enumerate() {
-        if let Some(result) = cached_batch_result(manifest.as_ref(), cache, query.query, mode) {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query batch cancelled during cache lookup");
+        }
+        if let Some(result) =
+            cached_batch_result(manifest.as_ref(), cache, query.query, mode, &cancelled)
+        {
             results[index] = Some(result);
         } else {
             misses.push((index, query.query.to_string(), query.budget_ms));
@@ -172,6 +186,9 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
     }
 
     for wave in misses.chunks(worker_limit.max(1)) {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query batch cancelled before worker wave");
+        }
         let wave_results = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(wave.len());
             for (index, query, budget_ms) in wave {
@@ -204,7 +221,10 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
 
         for (index, result) in wave_results {
             let result = result?;
-            cache_completed_batch_result(manifest.as_ref(), cache, &result);
+            if cancelled.load(Ordering::Acquire) {
+                bail!("retrieval query batch cancelled after worker wave");
+            }
+            cache_completed_batch_result(manifest.as_ref(), cache, &result, &cancelled);
             results[index] = Some(result);
         }
     }
@@ -220,14 +240,22 @@ fn cached_batch_result(
     cache: &RetrievalCache,
     query: &str,
     mode: RetrievalDegradedMode,
+    cancelled: &AtomicBool,
 ) -> Option<QueryResult> {
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
     let manifest = manifest?;
     let features = classify_query(query);
     let key = RetrievalCacheKey::from_manifest(manifest, query_fingerprint(&features.raw_query));
-    cache.get(&key).map(|hits| QueryResult {
+    let hits = cache.get(&key)?.to_vec();
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(QueryResult {
         query: features.raw_query.clone(),
         features,
-        hits: hits.to_vec(),
+        hits,
         trace: crate::executor::QueryTrace {
             retrieval_mode: mode.as_str().into(),
             degraded_reason: None,
@@ -244,8 +272,9 @@ fn cache_completed_batch_result(
     manifest: Option<&RetrievalIndexManifest>,
     cache: &mut RetrievalCache,
     result: &QueryResult,
+    cancelled: &AtomicBool,
 ) {
-    if result.trace.cancel_reason.is_some() {
+    if result.trace.cancel_reason.is_some() || cancelled.load(Ordering::Acquire) {
         return;
     }
     if let Some(manifest) = manifest {
@@ -253,7 +282,12 @@ fn cache_completed_batch_result(
             manifest,
             query_fingerprint(&result.features.raw_query),
         );
-        cache.insert(key, result.hits.clone());
+        if !cancelled.load(Ordering::Acquire) {
+            cache.insert(key.clone(), result.hits.clone());
+            if cancelled.load(Ordering::Acquire) {
+                cache.remove(&key);
+            }
+        }
     }
 }
 
@@ -544,6 +578,36 @@ mod tests {
         .expect_err("non-full mode must fail before cache use");
 
         assert!(error.to_string().contains("retrieval sidecar is mandatory"));
+    }
+
+    #[test]
+    fn strict_batch_cancellation_preflight_rejects_cache_hits() {
+        let mut cache = RetrievalCache::new();
+        let manifest = manifest_for("testproj", "cafebabedeadbeef", 1);
+        cache.insert(
+            RetrievalCacheKey::from_manifest(&manifest, query_fingerprint("cached")),
+            vec![CandidateHit::lexical_stub("src/cached.rs", 1.0)],
+        );
+        let queries = [QueryBatchItem {
+            query: "cached",
+            budget_ms: Some(100),
+        }];
+        let cancelled = cancellation_flag();
+        cancelled.store(true, Ordering::Release);
+
+        let error = execute_strict_retrieval_query_batch_against_sidecars(
+            Arc::new(crate::sidecar_search::mock::MockSidecarSearch::default()),
+            Some(manifest),
+            Arc::new(HashMap::new()),
+            cancelled,
+            RetrievalDegradedMode::Full,
+            &queries,
+            &mut cache,
+            1,
+        )
+        .expect_err("cancelled batch must not serve cache");
+
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]

@@ -83,6 +83,19 @@ impl ScipClient {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        Self::anchor_search_with_cancel(layout, project_id, query, limit, &|| false)
+    }
+
+    pub fn anchor_search_with_cancel(
+        layout: &SidecarLayout,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        if cancelled() {
+            anyhow::bail!("SCIP anchor search cancelled");
+        }
         let probe = Self::health_probe(layout, project_id);
         let ScipAvailability::Ready { revision } = probe.availability else {
             return Ok(Vec::new());
@@ -96,11 +109,17 @@ impl ScipClient {
         };
         let profile = ScipQueryProfile::new(query);
         let mut hits = Vec::new();
-        for symbol in index.symbols {
+        for (index, symbol) in index.symbols.into_iter().enumerate() {
+            if index % 64 == 0 && cancelled() {
+                anyhow::bail!("SCIP anchor search cancelled");
+            }
             if symbol_matches_query(&symbol, &profile) {
                 let score = score_symbol_match(&symbol, &profile);
                 hits.push(symbol_to_hit(&symbol, score, 0, provenance));
             }
+        }
+        if cancelled() {
+            anyhow::bail!("SCIP anchor search cancelled");
         }
         hits.sort_by(|left, right| {
             right
@@ -121,6 +140,19 @@ impl ScipClient {
         anchors: &[super::CandidateHit],
         limit: usize,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        Self::expand_graph_with_cancel(layout, project_id, anchors, limit, &|| false)
+    }
+
+    pub fn expand_graph_with_cancel(
+        layout: &SidecarLayout,
+        project_id: &str,
+        anchors: &[super::CandidateHit],
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        if cancelled() {
+            anyhow::bail!("SCIP graph expansion cancelled");
+        }
         let probe = Self::health_probe(layout, project_id);
         let ScipAvailability::Ready { revision } = probe.availability else {
             return Ok(Vec::new());
@@ -135,7 +167,10 @@ impl ScipClient {
         let mut hits = Vec::new();
         for anchor in anchors.iter().take(4) {
             let anchor_symbol = anchor.symbol_name.as_deref().unwrap_or("");
-            for symbol in &index.symbols {
+            for (index, symbol) in index.symbols.iter().enumerate() {
+                if index % 64 == 0 && cancelled() {
+                    anyhow::bail!("SCIP graph expansion cancelled");
+                }
                 if hits.len() >= limit {
                     break;
                 }
@@ -154,6 +189,9 @@ impl ScipClient {
                     ));
                 }
             }
+        }
+        if cancelled() {
+            anyhow::bail!("SCIP graph expansion cancelled");
         }
         hits.truncate(limit);
         Ok(hits)
@@ -420,6 +458,7 @@ mod tests {
         SCIP_IMPORTED_PROOF_PROVENANCE, SCIP_PRECISE_SEMANTIC_IMPORT_PUBLIC_PROVENANCE,
         ScipPackageIdentity, ScipProofAdapterContract, ScipProofRecord, ScipSymbolsIndex,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
 
     fn write_scip_index(
@@ -543,6 +582,44 @@ mod tests {
             "exact SCIP symbol match should survive top-k truncation even when many earlier path-only matches exist"
         );
         assert_eq!(hits[0].file_path, "src/needle/target.ts");
+    }
+
+    #[test]
+    fn anchor_search_polls_cancellation_while_scanning_symbols() {
+        let root = TempDir::new().expect("root");
+        let layout = SidecarLayout {
+            qdrant_http_port: 2,
+            qdrant_grpc_port: 3,
+            lexical_data_dir: root.path().join("lexical"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("state.json"),
+        };
+        let project_dir = layout.scip_project_dir("project");
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        write_scip_index(
+            &project_dir,
+            "graph-test",
+            ScipProofAdapterContract::graph_projection("graph-test"),
+            (0..256)
+                .map(|index| ScipSymbolRecord {
+                    path: format!("src/{index}.rs"),
+                    symbol: format!("symbol_{index}"),
+                    start_line: index + 1,
+                    end_line: index + 1,
+                })
+                .collect(),
+            Vec::new(),
+        );
+        let polls = AtomicUsize::new(0);
+
+        let error = ScipClient::anchor_search_with_cancel(&layout, "project", "symbol", 8, &|| {
+            polls.fetch_add(1, AtomicOrdering::Relaxed) > 0
+        })
+        .expect_err("scan should observe cancellation");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(polls.load(AtomicOrdering::Relaxed) >= 2);
     }
 
     #[test]

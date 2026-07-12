@@ -71,7 +71,9 @@ pub use embeddings::{
     ensure_product_embedding_backend_for_runtime, probe_product_embedding_runtime,
     probe_product_embedding_runtime_for_runtime, qdrant_vector_dim,
 };
-pub use executor::{QueryExecutor, QueryResult, QueryTrace, StageTrace, cancellation_flag};
+pub use executor::{
+    QueryExecutor, QueryResult, QueryTrace, StageCompletionStatus, StageTrace, cancellation_flag,
+};
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
 pub use health::{
     ComponentHealth, ComponentStatus, EmbeddingLaunchMetadata, InfrastructureHealth,

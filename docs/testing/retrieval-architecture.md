@@ -160,6 +160,18 @@ Non-claims:
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
 | Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Derives banned identities, prompts, claims, paths, and query/probe phrases from benchmark manifests, script prompt/query catalogs, and the eval-only probe manifest/source, then scans Rust production retrieval trees after masking test-only items (CI via Rust guard test); missing, malformed, or partially parsed corpora fail closed |
 
+All planned retrieval stages use the same fixed-capacity worker pool, including
+symbol-like and natural-language queries. Each job carries the request deadline
+and cancellation flag into sidecar calls. Lexical and SCIP scans poll that
+context while iterating. Live query embedding and Qdrant requests clamp their
+transport timeout to the remaining deadline and use separate bounded reusable
+HTTP capacity, allowing the stage worker to return promptly when synchronous
+I/O cannot be interrupted in place. Stage traces report admission and queue
+wait separately, report execution duration only after completion, and classify
+completed, skipped, cancelled-before-start, pending-after-deadline, and
+observed-late work. Post-return completions are logged and discarded. Any cancelled or late
+result remains diagnostic and is never inserted into the retrieval cache.
+
 **Modes:** See the canonical
 [mode matrix](../architecture/retrieval-design.md#mode-matrix). Only `full` may
 serve primary packet/search results.

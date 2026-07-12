@@ -21,6 +21,14 @@
 
 ### Added
 
+- Added one bounded reusable retrieval-stage scheduler for narrow and broad
+  queries. Request deadlines and cancellation now propagate into sidecar work
+  and query-embedding/Qdrant HTTP work; lexical and graph scans poll the shared
+  token, and synchronous HTTP runs on separate bounded reusable capacity so a
+  cancelled caller releases stage capacity promptly. Timed-out or cancelled
+  results are discarded instead of cached, while traces truthfully separate
+  admission, queue, completed execution, and pending/late completion state.
+
 - Added immutable per-project runtime configuration for multi-project CLI and
   stdio operation. Embedding endpoint provenance, profile/model/prefix contract,
   batching and device policy, retrieval policy, and summary configuration now

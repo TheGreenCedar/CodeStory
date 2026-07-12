@@ -6,6 +6,64 @@ use crate::qdrant_client::QdrantClient;
 use crate::scip_client::ScipClient;
 use anyhow::Result;
 use codestory_store::RetrievalIndexManifest;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Request-scoped deadline and cancellation state shared by retrieval stages and sidecar I/O.
+#[derive(Debug, Clone)]
+pub struct SearchExecutionContext {
+    deadline: Instant,
+    request_cancelled: Arc<AtomicBool>,
+    stage_cancelled: Arc<AtomicBool>,
+}
+
+impl SearchExecutionContext {
+    pub(crate) fn new(
+        deadline: Instant,
+        request_cancelled: Arc<AtomicBool>,
+        stage_cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            deadline,
+            request_cancelled,
+            stage_cancelled,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.request_cancelled.load(Ordering::Acquire)
+            || self.stage_cancelled.load(Ordering::Acquire)
+            || Instant::now() >= self.deadline
+    }
+
+    pub fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            anyhow::bail!("retrieval stage cancelled or deadline exceeded");
+        }
+        Ok(())
+    }
+
+    pub fn timeout(&self, maximum: Duration) -> Result<Duration> {
+        self.check_cancelled()?;
+        let timeout = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(maximum);
+        if timeout.is_zero() {
+            anyhow::bail!("retrieval stage deadline exceeded");
+        }
+        Ok(timeout)
+    }
+
+    fn run<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.check_cancelled()?;
+        let value = operation()?;
+        self.check_cancelled()?;
+        Ok(value)
+    }
+}
+
 /// Sidecar search surface used by the executor (mockable in unit tests).
 pub trait SidecarSearch: Send + Sync {
     fn layout(&self) -> Option<&SidecarLayout> {
@@ -24,6 +82,42 @@ pub trait SidecarSearch: Send + Sync {
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>>;
+
+    fn lexical_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.lexical_search(query, limit))
+    }
+
+    fn qdrant_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.qdrant_search(query, limit))
+    }
+
+    fn scip_anchor_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.scip_anchor(query, limit))
+    }
+
+    fn scip_expand_with_context(
+        &self,
+        anchors: &[CandidateHit],
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.scip_expand(anchors, limit))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,16 +229,73 @@ impl SidecarSearch for LiveSidecarSearch {
         )
     }
 
+    fn lexical_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let context = context.clone();
+        self.lexical.search_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+            move || context.is_cancelled(),
+        )
+    }
+
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
         self.qdrant.search(&self.qdrant_collection, query, limit)
+    }
+
+    fn qdrant_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        self.qdrant
+            .search_with_context(&self.qdrant_collection, query, limit, context)
     }
 
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
         ScipClient::anchor_search(&self.layout, &self.sidecar_generation, query, limit)
     }
 
+    fn scip_anchor_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        ScipClient::anchor_search_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            query,
+            limit,
+            &|| context.is_cancelled(),
+        )
+    }
+
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>> {
         ScipClient::expand_graph(&self.layout, &self.sidecar_generation, anchors, limit)
+    }
+
+    fn scip_expand_with_context(
+        &self,
+        anchors: &[CandidateHit],
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        ScipClient::expand_graph_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            anchors,
+            limit,
+            &|| context.is_cancelled(),
+        )
     }
 }
 

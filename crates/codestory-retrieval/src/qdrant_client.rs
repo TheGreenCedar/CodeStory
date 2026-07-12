@@ -1,9 +1,12 @@
 use crate::config::{QDRANT_HEALTH_BUDGET, SidecarLayout};
 use crate::embeddings::{self, qdrant_vector_dim as active_vector_dim};
 use crate::outbound_http::{OutboundHttpError, read_text, truncate_http_body};
+use crate::sidecar_search::SearchExecutionContext;
 use anyhow::{Context, Result, bail};
 use codestory_store::FileRole;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 /// Back-compat smoke width when semantic vectors are explicitly downgraded.
@@ -16,6 +19,9 @@ const QDRANT_MUTATION_BUDGET: Duration = Duration::from_secs(5);
 const QDRANT_UPSERT_BUDGET: Duration = Duration::from_secs(60);
 const QDRANT_CREATE_POSTCONDITION_ATTEMPTS: usize = 10;
 const QDRANT_CREATE_POSTCONDITION_DELAY: Duration = Duration::from_secs(1);
+const QDRANT_QUERY_WORKER_LIMIT: usize = 4;
+const QDRANT_QUERY_WAIT_POLL: Duration = Duration::from_millis(5);
+static QDRANT_QUERY_POOL: OnceLock<QdrantQueryPool> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct QdrantUpsertPoint {
@@ -193,6 +199,39 @@ impl QdrantClient {
         self.search_vector(collection, &vector, limit)
     }
 
+    pub fn search_with_context(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<super::CandidateHit>> {
+        qdrant_query_pool().execute(
+            self.clone(),
+            collection.to_string(),
+            query.to_string(),
+            limit,
+            context.clone(),
+        )
+    }
+
+    fn search_with_context_blocking(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<super::CandidateHit>> {
+        let embedding_timeout = context.timeout(self.timeout)?;
+        let vector = self
+            .embedding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("qdrant query embedding runtime is not configured"))?
+            .embed_query_with_timeout(query, embedding_timeout)?;
+        context.check_cancelled()?;
+        self.search_vector_with_timeout(collection, &vector, limit, context.timeout(self.timeout)?)
+    }
+
     /// Diagnostic-only vector lookup against Qdrant without query embedding.
     ///
     /// Product retrieval must keep using [`QdrantClient::search`] so query
@@ -212,6 +251,16 @@ impl QdrantClient {
         vector: &[f32],
         limit: usize,
     ) -> Result<Vec<super::CandidateHit>> {
+        self.search_vector_with_timeout(collection, vector, limit, self.timeout)
+    }
+
+    fn search_vector_with_timeout(
+        &self,
+        collection: &str,
+        vector: &[f32],
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<Vec<super::CandidateHit>> {
         let expected_dim = active_vector_dim();
         if vector.len() != expected_dim {
             bail!(
@@ -228,7 +277,7 @@ impl QdrantClient {
         let payload = serde_json::to_string(&body).context("serialize qdrant search body")?;
         match read_text(
             ureq::post(&url)
-                .timeout(self.timeout)
+                .timeout(timeout)
                 .set("Content-Type", "application/json")
                 .send_string(&payload),
         ) {
@@ -448,6 +497,143 @@ impl QdrantClient {
     pub fn is_collection_stubbed(qdrant_data_dir: &Path, collection: &str) -> bool {
         Self::stub_marker_path(qdrant_data_dir, collection).is_file()
             || Self::legacy_stub_marker_path(qdrant_data_dir, collection).is_file()
+    }
+}
+
+struct QdrantQueryJob {
+    client: QdrantClient,
+    collection: String,
+    query: String,
+    limit: usize,
+    context: SearchExecutionContext,
+    sender: mpsc::Sender<Result<Vec<super::CandidateHit>>>,
+    _permit: QdrantQueryPermit,
+}
+
+struct QdrantQueryPool {
+    sender: mpsc::SyncSender<QdrantQueryJob>,
+    admission: Arc<QdrantQueryAdmission>,
+}
+
+struct QdrantQueryAdmission {
+    in_flight: Mutex<usize>,
+    available: Condvar,
+}
+
+struct QdrantQueryPermit {
+    admission: Arc<QdrantQueryAdmission>,
+}
+
+impl Drop for QdrantQueryPermit {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .admission
+            .in_flight
+            .lock()
+            .expect("qdrant query admission lock");
+        *in_flight = in_flight.saturating_sub(1);
+        self.admission.available.notify_one();
+    }
+}
+
+impl QdrantQueryPool {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<QdrantQueryJob>(QDRANT_QUERY_WORKER_LIMIT);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..QDRANT_QUERY_WORKER_LIMIT {
+            let receiver = Arc::clone(&receiver);
+            std::thread::Builder::new()
+                .name(format!("codestory-qdrant-query-{index}"))
+                .spawn(move || qdrant_query_worker(&receiver))
+                .expect("spawn qdrant query worker");
+        }
+        Self {
+            sender,
+            admission: Arc::new(QdrantQueryAdmission {
+                in_flight: Mutex::new(0),
+                available: Condvar::new(),
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        client: QdrantClient,
+        collection: String,
+        query: String,
+        limit: usize,
+        context: SearchExecutionContext,
+    ) -> Result<Vec<super::CandidateHit>> {
+        let permit = self.acquire(&context)?;
+        let (sender, receiver) = mpsc::channel();
+        self.sender
+            .send(QdrantQueryJob {
+                client,
+                collection,
+                query,
+                limit,
+                context: context.clone(),
+                sender,
+                _permit: permit,
+            })
+            .map_err(|_| anyhow::anyhow!("qdrant query worker pool disconnected"))?;
+        loop {
+            context.check_cancelled()?;
+            match receiver.recv_timeout(context.timeout(QDRANT_QUERY_WAIT_POLL)?) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("qdrant query worker disconnected")
+                }
+            }
+        }
+    }
+
+    fn acquire(&self, context: &SearchExecutionContext) -> Result<QdrantQueryPermit> {
+        let mut in_flight = self
+            .admission
+            .in_flight
+            .lock()
+            .expect("qdrant query admission lock");
+        loop {
+            context.check_cancelled()?;
+            if *in_flight < QDRANT_QUERY_WORKER_LIMIT * 2 {
+                *in_flight += 1;
+                return Ok(QdrantQueryPermit {
+                    admission: Arc::clone(&self.admission),
+                });
+            }
+            let (guard, _) = self
+                .admission
+                .available
+                .wait_timeout(in_flight, context.timeout(QDRANT_QUERY_WAIT_POLL)?)
+                .expect("qdrant query admission wait");
+            in_flight = guard;
+        }
+    }
+}
+
+fn qdrant_query_pool() -> &'static QdrantQueryPool {
+    QDRANT_QUERY_POOL.get_or_init(QdrantQueryPool::new)
+}
+
+fn qdrant_query_worker(receiver: &Mutex<mpsc::Receiver<QdrantQueryJob>>) {
+    loop {
+        let job = match receiver.lock().expect("qdrant query queue lock").recv() {
+            Ok(job) => job,
+            Err(_) => return,
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            job.client.search_with_context_blocking(
+                &job.collection,
+                &job.query,
+                job.limit,
+                &job.context,
+            )
+        }))
+        .map_err(|_| anyhow::anyhow!("qdrant query worker panicked"))
+        .and_then(|result| result);
+        let _ = job.sender.send(result);
     }
 }
 
@@ -676,12 +862,84 @@ fn vectors_for_points(
 mod tests {
     use super::*;
     use crate::candidate::CandidateSource;
+    use crate::config::{EmbeddingEndpointOrigin, EmbeddingRuntimeConfig};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn label_to_vector_has_fixed_dim() {
         let vector = label_to_vector("handler");
         assert_eq!(vector.len(), QDRANT_VECTOR_DIM);
         assert!(vector.iter().all(|value| (0.0..=1.0).contains(value)));
+    }
+
+    #[test]
+    fn synchronous_http_query_releases_stage_caller_on_cancellation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
+        let endpoint = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("server address")
+        );
+        listener.set_nonblocking(true).expect("nonblocking server");
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        std::thread::sleep(Duration::from_millis(200));
+                        drop(stream);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept request: {error}"),
+                }
+            }
+        });
+        let embedding = embeddings::LlamaCppEmbeddingClient::new(&EmbeddingRuntimeConfig {
+            configuration_error: None,
+            backend: "llamacpp".into(),
+            endpoint,
+            endpoint_origin: EmbeddingEndpointOrigin::TrustedProjectConfig,
+            profile: "custom".into(),
+            model_id: Some("test".into()),
+            pooling: None,
+            query_prefix: None,
+            document_prefix: None,
+            layer_norm: None,
+            truncate_dim: None,
+            expected_dim: Some(3),
+            batch_size: 1,
+            request_count: 1,
+            allow_remote: false,
+            device_policy: "allow_cpu".into(),
+            server_launch: Some("external_endpoint".into()),
+        })
+        .expect("embedding client");
+        let client = QdrantClient {
+            base_url: "http://127.0.0.1:9".into(),
+            timeout: Duration::from_secs(5),
+            embedding: Some(embedding),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = SearchExecutionContext::new(
+            Instant::now() + Duration::from_millis(500),
+            Arc::clone(&cancelled),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let started = Instant::now();
+        let query = std::thread::spawn(move || {
+            client.search_with_context("collection", "query", 1, &context)
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        cancelled.store(true, std::sync::atomic::Ordering::Release);
+        assert!(query.join().expect("query thread").is_err());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        server.join().expect("embedding server");
     }
 
     #[test]

@@ -1692,6 +1692,12 @@ pub struct RetrievalStageTimingDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u32>,
     pub elapsed_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_wait_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ms: Option<u32>,
     #[serde(default)]
     pub candidates_added: u32,
     #[serde(default)]
@@ -1706,6 +1712,12 @@ pub struct RetrievalStageTimingDto {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stub_reason: Option<String>,
+    #[serde(default = "completed_stage_status")]
+    pub completion_status: String,
+}
+
+fn completed_stage_status() -> String {
+    "completed".into()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -2156,6 +2168,9 @@ mod packet_tests {
                 stage: "stage1_lexical".to_string(),
                 deadline_ms: Some(120),
                 elapsed_ms: 18,
+                admission_wait_ms: Some(1),
+                queue_wait_ms: Some(2),
+                execution_ms: Some(16),
                 candidates_added: 3,
                 marginal_gain: 0.25,
                 cancel_reason: None,
@@ -2163,6 +2178,7 @@ mod packet_tests {
                 sidecar_latency_ms: Some(18),
                 degraded: false,
                 stub_reason: None,
+                completion_status: "completed".into(),
             }],
             candidates: vec![RetrievalCandidateSummaryDto {
                 rank: 1,
