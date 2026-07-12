@@ -1589,6 +1589,31 @@ fn observe_broker_snapshot_preserves_verified_smoke_for_current_runtime() {
 }
 
 #[test]
+fn failed_smoke_replaces_verified_proof_for_current_runtime() {
+    let project = tempdir().expect("project");
+    let cache = tempdir().expect("cache");
+    let runtime_identity = gpu_runtime_identity(project.path(), now_epoch_ms());
+    let input = |embed_smoke_ok| BrokerSnapshotInput {
+        project_root: project.path().to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: Some(verified_gpu_proof_input(embed_smoke_ok)),
+        reconciliation: None,
+    };
+
+    refresh_broker_snapshot_with_runtime_identity(input(Some(true)), Some(&runtime_identity));
+    let failed =
+        refresh_broker_snapshot_with_runtime_identity(input(Some(false)), Some(&runtime_identity));
+    let proof = failed.gpu_proof.expect("failed smoke proof");
+
+    assert_eq!(proof.proof_status, "gpu_unverified");
+    assert!(!proof.meaningful_accelerator_work_proven);
+    assert_eq!(proof.embed_smoke_ok, Some(false));
+    assert_eq!(proof.runtime_identity, None);
+}
+
+#[test]
 fn observe_broker_snapshot_invalidates_verified_smoke_for_changed_runtime_identity() {
     let project = tempdir().expect("project");
     let cache = tempdir().expect("cache");

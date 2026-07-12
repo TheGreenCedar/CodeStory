@@ -2958,9 +2958,53 @@ fn run_ready_repair_with_native_embedding_lease(
                 &runtime.storage_path,
                 sidecar,
             );
-            let embed_smoke = ensure_ready_repair_embed_liveness(&infrastructure, sidecar)?;
-            let gpu_proof =
-                broker_gpu_proof_input_from_infrastructure_with_smoke(&infrastructure, embed_smoke);
+            let embed_smoke = match ensure_ready_repair_embed_liveness(&infrastructure, sidecar) {
+                Ok(smoke) => smoke,
+                Err(error) => {
+                    let mut failed = broker_gpu_proof_input_from_infrastructure_with_smoke(
+                        &infrastructure,
+                        None,
+                    );
+                    failed.embed_smoke_ok = Some(false);
+                    failed.degraded_reason = Some("gpu_unverified".into());
+                    let _ = readiness_broker::refresh_broker_snapshot(
+                        readiness_broker::BrokerSnapshotInput {
+                            project_root: runtime.project_root.clone(),
+                            cache_root: runtime.cache_root.clone(),
+                            agent_run_id: sidecar.run_id.clone(),
+                            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                            gpu_proof: Some(failed),
+                            reconciliation: None,
+                        },
+                    );
+                    return Err(error);
+                }
+            };
+            let mut infrastructure = infrastructure;
+            if let Some(smoke) = embed_smoke.as_ref() {
+                infrastructure.embedding_device_policy = smoke.device.requested_policy.into();
+                infrastructure.embedding_device_state = smoke.device.observed_state.into();
+                infrastructure.embedding_device_observation_source =
+                    smoke.device.observation_source.into();
+                infrastructure.embedding_detected_provider = smoke.device.detected_provider.clone();
+                infrastructure.embedding_detected_gpu = smoke.device.detected_gpu.clone();
+                infrastructure.embedding_accelerator_requested = smoke.device.accelerator_requested;
+                infrastructure.embedding_accelerator_request_provider =
+                    smoke.device.accelerator_request_provider.clone();
+                infrastructure.embedding_accelerator_request_device =
+                    smoke.device.accelerator_request_device.clone();
+            }
+            let gpu_proof = broker_gpu_proof_input_from_infrastructure_with_smoke(
+                &infrastructure,
+                embed_smoke.as_ref(),
+            );
+            if !infrastructure.embedding_cpu_allowed
+                && readiness_broker::gpu_proof(gpu_proof.clone()).proof_status != "verified"
+            {
+                bail!(
+                    "gpu_unverified: native embedding smoke did not prove requested accelerator work before long semantic indexing"
+                );
+            }
             let _ =
                 readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
                     project_root: runtime.project_root.clone(),
@@ -3011,6 +3055,7 @@ fn run_ready_repair_with_native_embedding_lease(
     )
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReadyRepairEmbedSmoke {
     ok: Option<bool>,
@@ -3020,12 +3065,14 @@ struct ReadyRepairEmbedSmoke {
 fn ensure_ready_repair_embed_liveness(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
     sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> Result<ReadyRepairEmbedSmoke> {
-    ensure_ready_repair_embed_liveness_with_probe(infrastructure, || {
-        codestory_retrieval::probe_product_embedding_runtime_for_runtime(sidecar)
-    })
+) -> Result<Option<codestory_retrieval::EmbeddingAcceleratorSmoke>> {
+    if infrastructure.embedding_cpu_allowed {
+        return Ok(None);
+    }
+    codestory_retrieval::ensure_embedding_accelerator_smoke_for_runtime(sidecar)
 }
 
+#[cfg(test)]
 fn ensure_ready_repair_embed_liveness_with_probe(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
     probe: impl FnOnce() -> codestory_retrieval::EmbeddingRuntimeProbe,
@@ -3061,7 +3108,7 @@ fn ensure_ready_repair_embed_liveness_with_probe(
 
 fn broker_gpu_proof_input_from_infrastructure_with_smoke(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
-    smoke: ReadyRepairEmbedSmoke,
+    smoke: Option<&codestory_retrieval::EmbeddingAcceleratorSmoke>,
 ) -> readiness_broker::BrokerGpuProofInput {
     readiness_broker::BrokerGpuProofInput {
         embedding_device_policy: Some(infrastructure.embedding_device_policy.clone()),
@@ -3079,10 +3126,10 @@ fn broker_gpu_proof_input_from_infrastructure_with_smoke(
             .embedding_accelerator_request_device
             .clone(),
         embedding_cpu_allowed: Some(infrastructure.embedding_cpu_allowed),
-        embed_smoke_ok: smoke.ok,
-        embed_smoke_ms: smoke.ms,
+        embed_smoke_ok: smoke.map(|_| true),
+        embed_smoke_ms: smoke.map(|smoke| smoke.elapsed_ms),
         degraded_reason: (!infrastructure.embedding_cpu_allowed
-            && (infrastructure.embedding_device_state != "accelerated" || smoke.ok != Some(true)))
+            && (infrastructure.embedding_device_state != "accelerated" || smoke.is_none()))
         .then(|| "gpu_unverified".to_string()),
     }
 }
@@ -9298,10 +9345,22 @@ mod tests {
             final_status,
             gpu_proof: broker_gpu_proof_input_from_infrastructure_with_smoke(
                 &infrastructure,
-                ReadyRepairEmbedSmoke {
-                    ok: Some(true),
-                    ms: Some(17),
-                },
+                Some(&codestory_retrieval::EmbeddingAcceleratorSmoke {
+                    elapsed_ms: 17,
+                    device: codestory_retrieval::EmbeddingDeviceReadiness {
+                        requested_policy: "accelerator_required",
+                        observed_state: "accelerated",
+                        observation_source: "native_log",
+                        detected_provider: Some("amd".into()),
+                        detected_gpu: Some("Vulkan0".into()),
+                        accelerator_requested: true,
+                        accelerator_request_provider: Some("vulkan".into()),
+                        accelerator_request_device: Some("Vulkan0".into()),
+                        cpu_allowed: false,
+                        full_retrieval_allowed: true,
+                        degraded_reason: None,
+                    },
+                }),
             ),
         };
 
