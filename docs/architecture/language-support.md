@@ -159,6 +159,16 @@ factory-returned, and nested-scope receivers are not labeled as FastAPI.
 Error-local line-scan recovery remains structural evidence. Dynamic paths and
 ordinary escaped literals do not become exact route claims.
 
+Express registration calls are parser-backed only when a JavaScript,
+TypeScript, or TSX tree-sitter query captures a static path on a module-scope
+receiver whose latest source-ordered binding constructs an app or router from
+an explicit `express` import or `require("express")`. Reassignment and shadowing
+invalidate ownership. Substitution-free template literals are static; dynamic
+or escaped paths are not exact claims. Handler edges remain probable and are
+limited to direct names that graph resolution can match. Mounted prefixes,
+nested or injected receivers, factory returns, and runtime middleware behavior
+remain outside this claim tier; malformed-file line recovery is structural.
+
 ## Expansion Checklist
 
 Before adding a parser-backed language or widening a public claim:

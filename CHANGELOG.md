@@ -4,6 +4,14 @@
 
 ### Added
 
+- Added parser-backed Express route extraction for static module-scope
+  registrations on source-ordered app and router bindings constructed from
+  explicit `express` imports or `require("express")`. JavaScript, TypeScript,
+  and TSX use grammar-specific tree-sitter query caches; multiline calls and
+  substitution-free template literals are supported. Bare, shadowed, nested,
+  injected, chained, multi-target, and factory-returned receivers are not
+  promoted, dynamic or escaped paths are excluded, and malformed-file lexical
+  recovery remains structural and low-confidence.
 - Added an opt-in `diagnostic-onnx` Cargo feature for maintainers who still need
   the legacy ONNX asset diagnostics. Default CLI builds no longer compile or
   link ONNX Runtime, DirectML, ndarray, or tokenizer support.
