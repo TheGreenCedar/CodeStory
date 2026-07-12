@@ -92,7 +92,7 @@ const benchmarkEvalProbeSourcePath = path.join(
 const evalCorpusRoots = [
   benchmarkTaskRoot,
   path.join(repoRoot, "crates", "codestory-cli", "tests", "fixtures", "packet_search_eval"),
-  path.join(repoRoot, "crates", "codestory-cli", "tests", "fixtures", "agent_quality"),
+  path.join(repoRoot, "crates", "codestory-bench", "tests", "fixtures", "agent_quality"),
 ];
 
 const missingBenchmarkBoundaryFiles = [

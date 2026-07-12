@@ -369,7 +369,7 @@ The local real-repo agent-quality lane is ignored by default and must evaluate
 at least one sibling repository when run:
 
 ```sh
-cargo test -p codestory-cli --test agent_quality_eval -- --ignored --nocapture
+cargo test -p codestory-bench --test agent_quality_eval -- --ignored --nocapture
 ```
 
 Set `CODESTORY_ALLOW_SKIP_LOCAL_REAL_AGENT_QUALITY=1` only when intentionally

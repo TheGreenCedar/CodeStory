@@ -1010,12 +1010,6 @@ pub(crate) struct DrillSuiteCommand {
     pub(crate) case_file: PathBuf,
     #[arg(
         long,
-        value_name = "FILE",
-        help = "Optional source-truth ledger JSON to merge into the suite report after verification."
-    )]
-    pub(crate) ledger: Option<PathBuf>,
-    #[arg(
-        long,
         value_name = "DIR",
         help = "Directory where the suite report and per-repo drill artifacts are written."
     )]
@@ -2098,7 +2092,6 @@ pub(crate) struct DrillSuiteRepoOutput {
     pub(crate) artifact_extension: String,
     pub(crate) summary: DrillSummaryOutput,
     pub(crate) expectations: DrillSuiteExpectationOutput,
-    pub(crate) answer_quality: DrillSuiteAnswerQualityOutput,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2111,42 +2104,6 @@ pub(crate) struct DrillSuiteExpectationOutput {
     pub(crate) min_anchor_resolution: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) allow_partial_bridges: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSuiteLayerFindingOutput {
-    pub(crate) layer: String,
-    pub(crate) status: String,
-    pub(crate) detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSuiteAnswerQualityOutput {
-    pub(crate) ledger_status: String,
-    pub(crate) final_answer_status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) draft_written: Option<bool>,
-    pub(crate) claim_count: usize,
-    pub(crate) claim_correct_count: usize,
-    pub(crate) claim_partial_count: usize,
-    pub(crate) claim_misleading_count: usize,
-    pub(crate) claim_unsupported_count: usize,
-    pub(crate) claim_unclassified_count: usize,
-    pub(crate) material_revision_count: usize,
-    pub(crate) expected_file_count: usize,
-    pub(crate) expected_file_found_count: usize,
-    pub(crate) expected_file_missing_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) expected_file_recall: Option<f32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) missing_expected_files: Vec<String>,
-    pub(crate) forbidden_claim_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) forbidden_claim_hits: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) layer_findings: Vec<DrillSuiteLayerFindingOutput>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2167,10 +2124,6 @@ pub(crate) struct DrillSuiteOutput {
     pub(crate) degraded_count: usize,
     pub(crate) blocked_count: usize,
     pub(crate) ready_count: usize,
-    pub(crate) answer_ready_count: usize,
-    pub(crate) answer_degraded_count: usize,
-    pub(crate) answer_failed_count: usize,
-    pub(crate) answer_pending_count: usize,
     pub(crate) repos: Vec<DrillSuiteRepoOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) retrieval_blockers: Vec<DrillSuiteRetrievalBlockerOutput>,
@@ -2642,12 +2595,11 @@ mod tests {
     }
 
     #[test]
-    fn drill_suite_help_exposes_source_truth_ledger() {
+    fn drill_suite_help_exposes_report_controls() {
         let help = render_subcommand_help("drill-suite");
         assert!(help.contains("--case-file <FILE>"));
-        assert!(help.contains("--ledger <FILE>"));
         assert!(help.contains("--jobs <N>"));
-        assert!(help.contains("source-truth ledger JSON"));
+        assert!(!help.contains("--ledger"));
     }
 
     #[test]

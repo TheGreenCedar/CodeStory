@@ -1,0 +1,30 @@
+{
+  "suite": "compatibility-suite",
+  "repo_count": 2,
+  "degraded_count": 1,
+  "blocked_count": 0,
+  "ready_count": 1,
+  "repos": [
+    {
+      "slug": "alpha-repo",
+      "summary": {
+        "verdict": { "status": "degraded", "next_action": "verify sources" },
+        "source_truth": {
+          "target_files": ["src/api/controller.ts", "src/store/repository.ts"]
+        }
+      },
+      "expectations": {
+        "source_truth_files": ["src/api/controller.ts", "src/store/repository.ts"],
+        "false_claims": ["writes directly to the database"]
+      }
+    },
+    {
+      "slug": "beta",
+      "summary": {
+        "verdict": { "status": "ready", "next_action": "keep baseline" },
+        "source_truth": { "target_files": [] }
+      },
+      "expectations": { "source_truth_files": [], "false_claims": [] }
+    }
+  ]
+}

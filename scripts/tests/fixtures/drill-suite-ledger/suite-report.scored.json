@@ -1,0 +1,74 @@
+{
+  "suite": "compatibility-suite",
+  "repo_count": 2,
+  "degraded_count": 1,
+  "blocked_count": 0,
+  "ready_count": 1,
+  "repos": [
+    {
+      "slug": "alpha-repo",
+      "summary": {
+        "verdict": { "status": "degraded", "next_action": "verify sources" },
+        "source_truth": {
+          "target_files": ["src/api/controller.ts", "src/store/repository.ts"]
+        }
+      },
+      "expectations": {
+        "source_truth_files": ["src/api/controller.ts", "src/store/repository.ts"],
+        "false_claims": ["writes directly to the database"]
+      },
+      "answer_quality": {
+        "ledger_status": "present",
+        "final_answer_status": "degraded",
+        "draft_written": true,
+        "claim_count": 2,
+        "claim_correct_count": 1,
+        "claim_partial_count": 1,
+        "claim_misleading_count": 0,
+        "claim_unsupported_count": 0,
+        "claim_unclassified_count": 0,
+        "material_revision_count": 1,
+        "expected_file_count": 2,
+        "expected_file_found_count": 2,
+        "expected_file_missing_count": 0,
+        "expected_file_recall": 1,
+        "forbidden_claim_count": 0,
+        "layer_findings": [
+          { "layer": "graph_trail", "status": "partial", "detail": "Route entry was absent." }
+        ]
+      }
+    },
+    {
+      "slug": "beta",
+      "summary": {
+        "verdict": { "status": "ready", "next_action": "keep baseline" },
+        "source_truth": { "target_files": [] }
+      },
+      "expectations": { "source_truth_files": [], "false_claims": [] },
+      "answer_quality": {
+        "ledger_status": "case_missing",
+        "final_answer_status": "pending_source_verification",
+        "claim_count": 0,
+        "claim_correct_count": 0,
+        "claim_partial_count": 0,
+        "claim_misleading_count": 0,
+        "claim_unsupported_count": 0,
+        "claim_unclassified_count": 0,
+        "material_revision_count": 0,
+        "expected_file_count": 0,
+        "expected_file_found_count": 0,
+        "expected_file_missing_count": 0,
+        "forbidden_claim_count": 0,
+        "warnings": ["ledger was supplied, but this repo slug had no matching case"]
+      }
+    }
+  ],
+  "next_actions": [
+    "alpha-repo: revise partial or materially changed claims, then rerun with the updated ledger (partial=1, revisions=1)",
+    "beta: keep baseline"
+  ],
+  "answer_ready_count": 0,
+  "answer_degraded_count": 1,
+  "answer_failed_count": 0,
+  "answer_pending_count": 1
+}

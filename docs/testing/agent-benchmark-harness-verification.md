@@ -38,18 +38,20 @@ The fixture verifies:
 - publishable blockers when the `without_codestory` arm either calls CodeStory
   or never inspects the local repository.
 
-`drill-suite` answer-quality ledgers are the repo-grounded counterpart to this
-transcript scorer. Use the transcript harness to check how an agent behaved; use
-`drill-suite --ledger <file>` to merge focused source-truth classifications back
-into a real-repo evidence packet. Ledger claim classifications are `correct`,
-`partial`, `misleading`, and `unsupported`, and the suite keeps the final
+Drill-suite answer-quality ledgers are the repo-grounded counterpart to this
+transcript scorer. Use the transcript harness to check how an agent behaved;
+then run `node scripts/score-drill-ledger.mjs <suite-report.json> <ledger.json> [scored-report.json]`
+to merge focused source-truth classifications outside the
+product runtime. Ledger claim classifications are `correct`, `partial`,
+`misleading`, and `unsupported`; the scored artifact keeps the final
 answer-quality verdict separate from green index/build mechanics.
 
 For source-truth recall, `drill` maps its question and seed anchors through the
 runtime packet planner, then feeds the broad question search and bounded planned
 subqueries into the verification target list. Treat those targets as candidate
 files for verification, not as final answer support. Drill still owns the
-compatibility report and source-truth scoring adapter; packet owns query planning.
+compatibility report; the versioned script owns source-truth scoring, and packet
+owns query planning.
 
 Keep `node ./scripts/codestory-agent-ab-benchmark.mjs --list` as the cheapest
 configuration smoke check.
