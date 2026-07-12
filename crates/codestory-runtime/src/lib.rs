@@ -210,13 +210,6 @@ fn route_endpoint_extraction_score_adjustment(canonical_id: Option<&str>) -> f32
     }) {
         return -0.025;
     }
-    if canonical
-        .provenance
-        .iter()
-        .any(|entry| entry == "extraction:tree_sitter_query_unowned")
-    {
-        return -0.01;
-    }
     0.0
 }
 
@@ -559,7 +552,7 @@ const FRAMEWORK_ROUTE_COVERAGE_ENTRIES: &[FrameworkRouteCoverageEntry] = &[
         unsupported_patterns: &[
             "path= keyword arguments and escaped non-raw string literals are not exact routes",
             "head/options/api_route/websocket decorators are not indexed",
-            "factory-returned or injected router receivers without local construction stay structural",
+            "factory-returned or injected router receivers without module-scope construction are not claimed",
         ],
         known_gaps: &["include_router prefix propagation is not modeled"],
         promotable: true,
@@ -12686,7 +12679,7 @@ mod tests {
         for unsupported in [
             "path= keyword arguments",
             "head/options/api_route/websocket",
-            "without local construction stay structural",
+            "without module-scope construction are not claimed",
         ] {
             assert!(
                 fastapi
@@ -15608,15 +15601,6 @@ fn build_llm_symbol_doc_text() -> String {
                     start_line: Some(5),
                     ..Default::default()
                 },
-                Node {
-                    id: CoreNodeId(27),
-                    kind: NodeKind::FUNCTION,
-                    serialized_name: "GET /api/users".to_string(),
-                    file_node_id: Some(CoreNodeId(20)),
-                    canonical_id: Some(route_canonical_id("tree_sitter_query_unowned")),
-                    start_line: Some(6),
-                    ..Default::default()
-                },
             ])
             .expect("insert route nodes");
         let node_names = HashMap::from([
@@ -15625,7 +15609,6 @@ fn build_llm_symbol_doc_text() -> String {
             (CoreNodeId(24), "plain_handler".to_string()),
             (CoreNodeId(25), "GET /api/users".to_string()),
             (CoreNodeId(26), "GET /api/users".to_string()),
-            (CoreNodeId(27), "GET /api/users".to_string()),
         ]);
 
         let ast = AppController::build_search_hit(&storage, &node_names, CoreNodeId(22), 1.0)
@@ -15640,8 +15623,6 @@ fn build_llm_symbol_doc_text() -> String {
         let lexical_fallback =
             AppController::build_search_hit(&storage, &node_names, CoreNodeId(26), 1.0)
                 .expect("lexical fallback route hit");
-        let unowned = AppController::build_search_hit(&storage, &node_names, CoreNodeId(27), 1.0)
-            .expect("unowned query route hit");
 
         assert!(
             ast.score > text_only.score,
@@ -15651,8 +15632,6 @@ fn build_llm_symbol_doc_text() -> String {
         assert!(text_only.score < normal.score);
         assert_eq!(tree_sitter.score, ast.score);
         assert_eq!(lexical_fallback.score, text_only.score);
-        assert!(unowned.score < normal.score);
-        assert!(unowned.score > lexical_fallback.score);
         assert_eq!(normal.score, 1.0);
 
         let mut hits = [text_only, ast.clone()];

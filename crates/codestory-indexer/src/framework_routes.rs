@@ -21,7 +21,7 @@ const PYTHON_FASTAPI_QUERY: &str = r#"
 static PYTHON_FASTAPI_COMPILED_QUERY: OnceLock<Result<Query, String>> = OnceLock::new();
 
 #[derive(Default)]
-struct FastApiOwnership {
+struct FastApiBindings {
     constructors: HashSet<String>,
     modules: HashSet<String>,
     receivers: HashSet<String>,
@@ -32,10 +32,6 @@ pub(super) fn collect_python_fastapi_routes(
     tree: &Tree,
     source: &str,
 ) -> Result<Vec<FrameworkRoute>> {
-    let ownership = fastapi_ownership(tree, source);
-    if ownership.constructors.is_empty() && ownership.modules.is_empty() {
-        return Ok(Vec::new());
-    }
     let query = PYTHON_FASTAPI_COMPILED_QUERY
         .get_or_init(|| {
             Query::new(language, PYTHON_FASTAPI_QUERY).map_err(|error| error.to_string())
@@ -59,6 +55,8 @@ pub(super) fn collect_python_fastapi_routes(
         let mut path = None;
         let mut handler = None;
         let mut line = None;
+        let mut route_start_byte = None;
+        let mut module_scope = false;
 
         for capture in query_match.captures {
             let name = capture_names
@@ -70,17 +68,32 @@ pub(super) fn collect_python_fastapi_routes(
                 "method" => method = node_text(capture.node, source),
                 "path" => path = python_static_string(capture.node, source),
                 "handler" => handler = node_text(capture.node, source),
-                "decorator" => line = Some(capture.node.start_position().row as u32 + 1),
+                "decorator" => {
+                    line = Some(capture.node.start_position().row as u32 + 1);
+                    route_start_byte = Some(capture.node.start_byte());
+                    module_scope = capture
+                        .node
+                        .parent()
+                        .and_then(|node| node.parent())
+                        .is_some_and(|node| node.kind() == "module");
+                }
                 _ => {}
             }
         }
 
-        let (Some(receiver), Some(method), Some(path), Some(handler), Some(line)) =
-            (receiver, method, path, handler, line)
+        let (
+            Some(receiver),
+            Some(method),
+            Some(path),
+            Some(handler),
+            Some(line),
+            Some(route_start_byte),
+        ) = (receiver, method, path, handler, line, route_start_byte)
         else {
             continue;
         };
-        if !matches!(method.as_str(), "get" | "post" | "put" | "patch" | "delete") {
+        if !module_scope || !matches!(method.as_str(), "get" | "post" | "put" | "patch" | "delete")
+        {
             continue;
         }
         let route = FrameworkRoute::new(
@@ -91,13 +104,9 @@ pub(super) fn collect_python_fastapi_routes(
             line,
             "decorator",
         );
-        routes.push(if ownership.receivers.contains(&receiver) {
-            route.with_claim_evidence("tree_sitter_query", "parser_backed")
-        } else {
-            route
-                .with_confidence("heuristic")
-                .with_claim_evidence("tree_sitter_query_unowned", "structural")
-        });
+        if module_fastapi_receiver_owned_at(tree, source, &receiver, route_start_byte) {
+            routes.push(route.with_claim_evidence("tree_sitter_query", "parser_backed"));
+        }
     }
 
     Ok(routes)
@@ -122,19 +131,18 @@ pub(super) fn allow_python_fastapi_lexical_fallback(
     let direct_static = raw || argument.starts_with('"') || argument.starts_with('\'');
     direct_static
         && (raw || !route.raw_path.contains('\\'))
-        && fastapi_ownership(tree, source).receivers.contains(receiver)
+        && module_fastapi_receiver_owned_at(
+            tree,
+            source,
+            receiver,
+            source_byte_at_line(source, route.line),
+        )
         && syntax_error_near_line(tree.root_node(), route.line)
+        && line_is_module_scope(tree, line, route.line)
         && !line_is_inside_python_string_or_comment(tree, line, route.line)
 }
 
-fn fastapi_ownership(tree: &Tree, source: &str) -> FastApiOwnership {
-    let mut ownership = FastApiOwnership::default();
-    collect_fastapi_imports(tree.root_node(), source, &mut ownership);
-    collect_fastapi_receivers(tree.root_node(), source, &mut ownership);
-    ownership
-}
-
-fn collect_fastapi_imports(node: Node<'_>, source: &str, ownership: &mut FastApiOwnership) {
+fn apply_fastapi_import(node: Node<'_>, source: &str, bindings: &mut FastApiBindings) {
     match node.kind() {
         "import_from_statement" => {
             let module = node
@@ -159,7 +167,7 @@ fn collect_fastapi_imports(node: Node<'_>, source: &str, ownership: &mut FastApi
                         _ => name,
                     };
                     if matches!(name, "FastAPI" | "APIRouter") {
-                        ownership.constructors.insert(alias.to_string());
+                        bindings.constructors.insert(alias.to_string());
                     }
                 }
             }
@@ -177,32 +185,71 @@ fn collect_fastapi_imports(node: Node<'_>, source: &str, ownership: &mut FastApi
                         (Some("as"), Some(alias)) => alias,
                         _ => "fastapi",
                     };
-                    ownership.modules.insert(alias.to_string());
+                    bindings.modules.insert(alias.to_string());
                 }
             }
         }
         _ => {}
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_fastapi_imports(child, source, ownership);
+}
+
+fn module_fastapi_receiver_owned_at(
+    tree: &Tree,
+    source: &str,
+    receiver: &str,
+    before_byte: usize,
+) -> bool {
+    let mut bindings = FastApiBindings::default();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.start_byte() >= before_byte {
+            break;
+        }
+        apply_fastapi_import(statement, source, &mut bindings);
+        if let Some(assignment) = module_assignment(statement) {
+            apply_fastapi_assignment(assignment, source, &mut bindings);
+        }
+    }
+    bindings.receivers.contains(receiver)
+}
+
+fn module_assignment(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "assignment" {
+        return Some(node);
+    }
+    (node.kind() == "expression_statement")
+        .then(|| node.named_child(0))
+        .flatten()
+        .filter(|node| node.kind() == "assignment")
+}
+
+fn apply_fastapi_assignment(node: Node<'_>, source: &str, bindings: &mut FastApiBindings) {
+    if let Some(receiver) = node
+        .child_by_field_name("left")
+        .filter(|node| node.kind() == "identifier")
+        .and_then(|node| node_text(node, source))
+    {
+        let constructs_fastapi = assignment_constructs_fastapi(node, source, bindings);
+        bindings.receivers.remove(&receiver);
+        bindings.constructors.remove(&receiver);
+        bindings.modules.remove(&receiver);
+        if constructs_fastapi {
+            bindings.receivers.insert(receiver);
+        }
     }
 }
 
-fn collect_fastapi_receivers(node: Node<'_>, source: &str, ownership: &mut FastApiOwnership) {
+fn assignment_constructs_fastapi(node: Node<'_>, source: &str, bindings: &FastApiBindings) -> bool {
     if node.kind() == "assignment"
-        && let Some(receiver) = node
-            .child_by_field_name("left")
-            .filter(|node| node.kind() == "identifier")
-            .and_then(|node| node_text(node, source))
         && let Some(call) = node
             .child_by_field_name("right")
             .filter(|node| node.kind() == "call")
         && let Some(function) = call.child_by_field_name("function")
     {
-        let owned = match function.kind() {
+        return match function.kind() {
             "identifier" => node_text(function, source)
-                .is_some_and(|name| ownership.constructors.contains(&name)),
+                .is_some_and(|name| bindings.constructors.contains(&name)),
             "attribute" => {
                 let module = function
                     .child_by_field_name("object")
@@ -210,21 +257,37 @@ fn collect_fastapi_receivers(node: Node<'_>, source: &str, ownership: &mut FastA
                 let constructor = function
                     .child_by_field_name("attribute")
                     .and_then(|node| node_text(node, source));
-                module.is_some_and(|module| ownership.modules.contains(&module))
+                module.is_some_and(|module| bindings.modules.contains(&module))
                     && constructor
                         .as_deref()
                         .is_some_and(|name| matches!(name, "FastAPI" | "APIRouter"))
             }
             _ => false,
         };
-        if owned {
-            ownership.receivers.insert(receiver);
+    }
+    false
+}
+
+fn line_is_module_scope(tree: &Tree, line: &str, line_number: u32) -> bool {
+    let mut node = node_at_line_start(tree, line, line_number);
+    while let Some(current) = node {
+        if matches!(
+            current.kind(),
+            "function_definition" | "class_definition" | "lambda"
+        ) {
+            return false;
         }
+        node = current.parent();
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_fastapi_receivers(child, source, ownership);
-    }
+    true
+}
+
+fn source_byte_at_line(source: &str, line: u32) -> usize {
+    source
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1) as usize)
+        .map(str::len)
+        .sum()
 }
 
 fn fastapi_decorator_receiver_and_argument<'a>(
@@ -255,10 +318,7 @@ fn syntax_error_near_line(node: Node<'_>, line: u32) -> bool {
 }
 
 fn line_is_inside_python_string_or_comment(tree: &Tree, line: &str, line_number: u32) -> bool {
-    let row = line_number.saturating_sub(1) as usize;
-    let col = line.len().saturating_sub(line.trim_start().len());
-    let point = Point::new(row, col);
-    let mut node = tree.root_node().descendant_for_point_range(point, point);
+    let mut node = node_at_line_start(tree, line, line_number);
     while let Some(current) = node {
         if matches!(current.kind(), "string" | "comment") {
             return true;
@@ -266,6 +326,17 @@ fn line_is_inside_python_string_or_comment(tree: &Tree, line: &str, line_number:
         node = current.parent();
     }
     false
+}
+
+fn node_at_line_start<'tree>(
+    tree: &'tree Tree,
+    line: &str,
+    line_number: u32,
+) -> Option<Node<'tree>> {
+    let row = line_number.saturating_sub(1) as usize;
+    let col = line.len().saturating_sub(line.trim_start().len());
+    let point = Point::new(row, col);
+    tree.root_node().descendant_for_point_range(point, point)
 }
 
 fn node_text(node: Node<'_>, source: &str) -> Option<String> {
@@ -468,7 +539,7 @@ async def broken(
     }
 
     #[test]
-    fn test_fastapi_unowned_receiver_stays_structural_and_unrelated_app_is_ignored() -> Result<()> {
+    fn test_fastapi_unowned_receiver_and_unrelated_app_are_ignored() -> Result<()> {
         let imported = r#"
 from fastapi import APIRouter
 
@@ -482,17 +553,12 @@ async def external_router(): pass
             None,
             None,
         )?;
-        let route = imported_result
-            .nodes
-            .iter()
-            .find(|node| {
-                node.serialized_name
-                    == "GET /factory-owned-elsewhere (fastapi route; confidence=heuristic)"
-            })
-            .expect("unowned imported FastAPI receiver stays structural");
-        let canonical_id = route.canonical_id.as_deref().expect("route metadata");
-        assert!(canonical_id.contains(r#""extraction_provenance":"tree_sitter_query_unowned""#));
-        assert!(canonical_id.contains(r#""claim_tier":"structural""#));
+        assert!(imported_result.nodes.iter().all(|node| {
+            !node
+                .canonical_id
+                .as_deref()
+                .is_some_and(|value| value.contains(r#""framework":"fastapi""#))
+        }));
 
         let unrelated = r#"
 app = OtherFramework()
@@ -513,6 +579,58 @@ async def unrelated_handler(): pass
                 .as_deref()
                 .is_some_and(|value| value.contains(r#""framework":"fastapi""#))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fastapi_receiver_ownership_is_module_scoped_and_invalidated_by_reassignment()
+    -> Result<()> {
+        let nested_scopes = r#"
+from fastapi import FastAPI
+
+def build_fastapi():
+    app = FastAPI()
+    @app.get("/inside-one")
+    async def inside_one(): pass
+
+def build_other():
+    app = OtherFramework()
+    @app.get("/inside-two")
+    async def inside_two(): pass
+"#;
+        let reassigned = r#"
+from fastapi import FastAPI
+
+app = FastAPI()
+app = OtherFramework()
+
+@app.get("/after-reassignment")
+async def after_reassignment(): pass
+"#;
+        let constructor_reassigned = r#"
+from fastapi import FastAPI
+
+FastAPI = OtherFactory
+app = FastAPI()
+
+@app.get("/after-constructor-reassignment")
+async def after_constructor_reassignment(): pass
+"#;
+        for source in [nested_scopes, reassigned, constructor_reassigned] {
+            let result = super::super::index_file(
+                Path::new("scopes.py"),
+                source,
+                &super::super::get_language_for_ext("py").expect("python config"),
+                None,
+                None,
+            )?;
+            assert!(result.nodes.iter().all(|node| {
+                !node
+                    .canonical_id
+                    .as_deref()
+                    .is_some_and(|value| value.contains(r#""framework":"fastapi""#))
+            }));
+        }
         Ok(())
     }
 

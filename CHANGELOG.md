@@ -7,13 +7,14 @@
 - Added an opt-in `diagnostic-onnx` Cargo feature for maintainers who still need
   the legacy ONNX asset diagnostics. Default CLI builds no longer compile or
   link ONNX Runtime, DirectML, ndarray, or tokenizer support.
-- Added parser-backed FastAPI decorator route extraction for receivers locally
-  constructed from imported `FastAPI` or `APIRouter` constructors, including
-  exact handler, method, path, provenance, and claim-tier metadata. Multiline
-  and raw-string routes are supported; imported but unowned receivers remain
-  structural, while dynamic templates, nested path builders, ordinary escaped
-  literals, and unrelated-error lexical candidates do not become exact route
-  claims. Error-local syntax recovery stays explicitly structural and
+- Added parser-backed FastAPI decorator route extraction for module-scope
+  receivers whose latest preceding assignment constructs an imported `FastAPI`
+  or `APIRouter`, including exact handler, method, path, provenance, and
+  claim-tier metadata. Reassignment invalidates ownership. Multiline and raw
+  string routes are supported; unmatched or nested-scope receivers are not
+  labeled as FastAPI, while dynamic templates, nested path builders, ordinary
+  escaped literals, and unrelated-error lexical candidates do not become exact
+  route claims. Error-local syntax recovery stays explicitly structural and
   low-confidence.
 - Added a schema-backed publication generation and run identity to every staged
   full and incremental core database. Typed store and runtime reads now expose
