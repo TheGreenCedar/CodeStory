@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use codestory_store::{CURRENT_SCHEMA_VERSION, Store};
-use codestory_workspace::{RefreshInputs, WorkspaceInventory, WorkspaceManifest};
+use codestory_workspace::{
+    RefreshInputs, WorkspaceInventory, WorkspaceInventoryOutcome, WorkspaceManifest,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -289,12 +291,19 @@ fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCach
     {
         bail!("source cache has an incomplete incremental index run");
     }
-    let plan = workspace
-        .build_execution_plan(&RefreshInputs {
+    let refresh = workspace
+        .build_execution_outcome(&RefreshInputs {
             stored_files: storage.files().inventory()?,
             inventory: WorkspaceInventory::default(),
         })
         .context("build source cache refresh plan")?;
+    if refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+        bail!(
+            "source workspace inventory is {:?}; cache freshness cannot be proven",
+            refresh.inventory_outcome
+        );
+    }
+    let plan = refresh.plan;
     Ok(SourceCacheFreshness {
         changed_or_new_files: plan.files_to_index.len(),
         removed_files: plan.files_to_remove.len(),
