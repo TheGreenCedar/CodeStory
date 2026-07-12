@@ -42,9 +42,11 @@
   linked against vanished toolchain paths.
 - Replaced the runtime embedding client and managed-endpoint probe's duplicate
   socket-level HTTP and chunked-body parsers with the existing shared `ureq`
-  response path, preserving endpoint validation, redacted display URLs, error
-  bodies, response counts, and embedding-dimension checks. Removed the unused
-  search snapshot harness and helpers that were referenced only by that harness.
+  response path. Embedding POSTs do not follow redirects, require an explicit
+  2xx response, read successful batch bodies beyond `ureq`'s 10 MiB text limit,
+  and preserve endpoint validation, redacted display URLs, bounded error bodies,
+  response counts, and embedding-dimension checks. Removed the unused search
+  snapshot harness and helpers that were referenced only by that harness.
 - Finalized graph-native and dense semantic documents in staged full and
   incremental databases before core publication. Post-publication cache loads
   now hydrate semantic state without rewriting live rows, and an unavailable

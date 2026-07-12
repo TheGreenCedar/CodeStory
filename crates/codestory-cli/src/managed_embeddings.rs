@@ -1013,16 +1013,28 @@ fn probe_embedding_endpoint(url: &str, expected_dimension: Option<usize>) -> Res
 fn post_json_to_endpoint(endpoint: &HttpEndpoint, request: &JsonValue) -> Result<JsonValue> {
     let body =
         serde_json::to_string(request).context("failed to serialize embedding probe request")?;
-    let response = codestory_retrieval::outbound_http::read_text(
-        ureq::post(&endpoint.url())
+    let endpoint_url = endpoint.url();
+    let display_url = redact_url_for_display(&endpoint_url);
+    let agent = ureq::builder().redirects(0).build();
+    let response = codestory_retrieval::outbound_http::read_bytes(
+        agent
+            .post(&endpoint_url)
             .timeout(ENDPOINT_PROBE_TIMEOUT)
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
-            .send_string(&body),
+            .send_bytes(body.as_bytes()),
     )
-    .with_context(|| format!("embedding request to {} failed", endpoint.url()))?;
-    serde_json::from_str(&response.body)
-        .with_context(|| format!("failed to parse JSON response from {}", endpoint.url()))
+    .with_context(|| format!("embedding request to {display_url} failed"))?;
+    if !(200..300).contains(&response.status) {
+        let response_body = String::from_utf8_lossy(&response.body);
+        bail!(
+            "embedding endpoint {display_url} returned HTTP {}: {}",
+            response.status,
+            codestory_retrieval::outbound_http::truncate_http_body(&response_body)
+        );
+    }
+    serde_json::from_slice(&response.body)
+        .with_context(|| format!("failed to parse JSON response from {display_url}"))
 }
 
 fn parse_http_endpoint(url: &str) -> Option<HttpEndpoint> {
@@ -1245,25 +1257,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn endpoint_probe_rejects_wrong_dimension() {
+    fn run_probe_server(
+        status: &'static str,
+        response_headers: &'static str,
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
             let mut buffer = [0_u8; 1024];
             let _ = stream.read(&mut buffer).expect("read");
-            let body = r#"{"data":[{"embedding":[1.0,2.0]}]}"#;
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{response_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             );
             stream.write_all(response.as_bytes()).expect("write");
         });
-        let url = format!("http://{addr}/v1/embeddings");
+        (format!("http://{addr}/v1/embeddings"), handle)
+    }
+
+    #[test]
+    fn endpoint_probe_rejects_wrong_dimension() {
+        let (url, handle) = run_probe_server("200 OK", "", r#"{"data":[{"embedding":[1.0,2.0]}]}"#);
         assert!(!embedding_endpoint_ready(&url, Some(768)));
         handle.join().expect("server");
+    }
+
+    #[test]
+    fn endpoint_probe_rejects_redirects() {
+        let (url, handle) = run_probe_server(
+            "302 Found",
+            "Location: http://127.0.0.1:9/redirected\r\n",
+            "redirected",
+        );
+        let url = url.replacen("http://", "http://user:secret@", 1);
+
+        let error = probe_embedding_endpoint(&url, None)
+            .expect_err("embedding probe must not follow redirects");
+        handle.join().expect("server");
+
+        assert!(error.to_string().contains("HTTP 302"), "{error:#}");
+        assert!(!error.to_string().contains("secret"), "{error:#}");
     }
 
     #[test]

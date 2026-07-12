@@ -1289,16 +1289,27 @@ fn post_json_to_http_endpoint(
     request: &JsonValue,
 ) -> Result<JsonValue> {
     let body = serde_json::to_string(request).context("failed to serialize llama.cpp request")?;
-    let response = codestory_retrieval::outbound_http::read_text(
-        ureq::post(&endpoint.url())
+    let agent = ureq::builder().redirects(0).build();
+    let response = codestory_retrieval::outbound_http::read_bytes(
+        agent
+            .post(&endpoint.url())
             .timeout(Duration::from_secs(300))
             .set("Content-Type", "application/json")
             .set("Accept", "application/json")
-            .send_string(&body),
+            .send_bytes(body.as_bytes()),
     )
     .with_context(|| format!("llama.cpp embeddings request to {} failed", endpoint.url()))?;
+    if !(200..300).contains(&response.status) {
+        let response_body = String::from_utf8_lossy(&response.body);
+        bail!(
+            "llama.cpp embeddings endpoint {} returned HTTP {}: {}",
+            endpoint.url(),
+            response.status,
+            codestory_retrieval::outbound_http::truncate_http_body(&response_body)
+        );
+    }
 
-    serde_json::from_str(&response.body).with_context(|| {
+    serde_json::from_slice(&response.body).with_context(|| {
         format!(
             "failed to parse JSON response from llama.cpp endpoint {}",
             endpoint.url()
@@ -2949,7 +2960,9 @@ mod tests {
     }
 
     fn run_one_fake_embedding_server(
-        response_body: &'static str,
+        status: &'static str,
+        response_headers: &'static str,
+        response_body: String,
     ) -> Result<(String, thread::JoinHandle<String>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -2992,7 +3005,7 @@ mod tests {
             }
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{response_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
@@ -3007,7 +3020,7 @@ mod tests {
     #[test]
     fn llamacpp_backend_uses_openai_embedding_endpoint() -> Result<()> {
         let response = r#"{"data":[{"index":0,"embedding":[1.0,0.0,0.0]},{"index":1,"embedding":[0.0,2.0,0.0]}]}"#;
-        let (url, handle) = run_one_fake_embedding_server(response)?;
+        let (url, handle) = run_one_fake_embedding_server("200 OK", "", response.to_string())?;
         let profile = EmbeddingProfile {
             name: "custom".to_string(),
             model_id: "custom-local".to_string(),
@@ -3042,6 +3055,47 @@ mod tests {
             runtime.model_id(),
             "custom-local|backend=llamacpp|pool=Mean|query_prefix=|document_prefix=doc: |layer_norm=false|truncate_dim=None|expected_dim=Some(3)"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn llamacpp_embedding_post_rejects_redirects() -> Result<()> {
+        let (url, handle) = run_one_fake_embedding_server(
+            "302 Found",
+            "Location: http://127.0.0.1:9/redirected\r\n",
+            "redirected".to_string(),
+        )?;
+        let endpoint = LlamaCppEndpoint::parse(&url)?;
+
+        let error = post_json_to_http_endpoint(
+            &endpoint,
+            &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
+        )
+        .expect_err("embedding POST must not follow redirects");
+        handle.join().expect("fake embedding server should finish");
+
+        assert!(error.to_string().contains("HTTP 302"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn llamacpp_embedding_post_accepts_json_over_ten_mib() -> Result<()> {
+        let response = json!({
+            "padding": "x".repeat(10 * 1024 * 1024 + 1),
+            "data": [{"index": 0, "embedding": [1.0, 0.0, 0.0]}]
+        })
+        .to_string();
+        assert!(response.len() > 10 * 1024 * 1024);
+        let (url, handle) = run_one_fake_embedding_server("200 OK", "", response)?;
+        let endpoint = LlamaCppEndpoint::parse(&url)?;
+
+        let response = post_json_to_http_endpoint(
+            &endpoint,
+            &json!({"input": ["alpha"], "model": "codestory-local-embedding"}),
+        )?;
+        handle.join().expect("fake embedding server should finish");
+
+        assert_eq!(parse_openai_embeddings_response(response, 1)?.len(), 1);
         Ok(())
     }
 
