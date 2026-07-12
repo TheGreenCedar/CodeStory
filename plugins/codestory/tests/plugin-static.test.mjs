@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { once } from "node:events";
 import { deflateRawSync, gunzipSync, gzipSync } from "node:zlib";
 import { PassThrough, Writable } from "node:stream";
@@ -2904,7 +2904,7 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
   }
 });
 
-test("mcp launcher provisions a checksummed release asset into plugin data", async () => {
+test("mcp launcher upgrades a verified prior managed cli to the checksummed release", async () => {
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
@@ -2917,6 +2917,32 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   const archivePath = join(releaseDir, archiveName);
 
   try {
+    const priorVersion = "0.0.0";
+    const priorRelease = releaseAssetForPlatform(priorVersion);
+    const priorDir = join(dataDir, "codestory-cli", priorVersion);
+    const priorCli = join(priorDir, "bin", cliName);
+    await mkdir(dirname(priorCli), { recursive: true });
+    if (process.platform === "win32") {
+      await writeFile(priorCli, `@echo off\r\nif "%1"=="--version" (echo codestory-cli ${priorVersion}& exit /b 0)\r\nexit /b 90\r\n`, "utf8");
+    } else {
+      await writeFile(priorCli, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codestory-cli ${priorVersion}'; exit 0; fi\nexit 90\n`, "utf8");
+      await chmod(priorCli, 0o755);
+    }
+    const priorSha256 = createHash("sha256").update(await readFile(priorCli)).digest("hex");
+    await writeFile(join(priorDir, "manifest.json"), JSON.stringify({
+      path: `bin/${cliName}`,
+      sha256: priorSha256,
+      version: priorVersion,
+      build_source: "github_release",
+      repo_ref: `v${priorVersion}`,
+      archive: priorRelease.archiveName,
+      archive_url: pathToFileURL(join(releaseDir, priorRelease.archiveName)).toString(),
+      archive_sha256: "0".repeat(64),
+      target: priorRelease.archiveBase.slice(`codestory-cli-v${priorVersion}-`.length),
+      provisioned_at: "1970-01-01T00:00:00.000Z",
+      stdio_initialize_verified: true,
+    }), "utf8");
+
     await mkdir(stageDir, { recursive: true });
     await writeFakeCli(cliPath);
     await writeArchiveFixture(archivePath, `${archiveBase}/${cliName}`, await readFile(cliPath));
@@ -2944,6 +2970,14 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     assert.equal(observed.repoRef, `v${version}`);
     assert.equal(observed.buildSource, "github_release");
     assert.equal(observed.archiveSha256, archiveSha256);
+    assert.notEqual(observed.path, priorCli);
+    const retention = JSON.parse(observed.retention);
+    assert.equal(retention.active_version, version);
+    assert.equal(
+      retention.retained.some((entry) => entry.version === priorVersion && entry.reason === "rollback"),
+      true,
+      JSON.stringify(retention),
+    );
     assert.match(
       observed.path,
       new RegExp(String.raw`codestory-cli[\\/]+${version.replaceAll(".", String.raw`\.`)}[\\/]bin[\\/]codestory-cli`, "u"),

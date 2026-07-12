@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Added deterministic prior-version managed CLI upgrade proof to every native
+  managed-lifecycle cell. The gate now starts with a verified older install,
+  requires the requested packaged binary to serve status and grounding, and
+  retains the older version only as the verified rollback.
 - Launched the managed Windows Vulkan llama.cpp cells with proof verbosity so
   current-launch logs retain the requested device and positive layer-offload
   evidence required by the accelerator smoke gate.
