@@ -338,6 +338,55 @@ pub const LEAKED_EVAL_SOURCE_PROBE: &str = "createCacheHelper";
 }
 
 #[test]
+fn linter_structurally_rejects_production_dependencies_on_eval_corpora() {
+    let output = run_lint_with_fixture(
+        r#"
+pub const LEAKED_TASK_CORPUS: &str = "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json";
+pub const LEAKED_QUERY_CORPUS: &str = "scripts/cross-repo-sourcetrail-queries.mjs";
+pub const LEAKED_EVAL_PROBES: &str = "benchmarks/tasks/eval-probes.json";
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "production references to eval/query corpora must fail lint; stderr={stderr}"
+    );
+    for expected in [
+        "benchmarks/tasks",
+        "scripts/cross-repo-sourcetrail-queries.mjs",
+        "benchmarks/tasks/eval-probes.json",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "lint failure should identify corpus boundary {expected}; stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_rejects_constructed_eval_corpus_dependencies() {
+    let output = run_lint_with_fixture(
+        r#"
+pub const LEAKED_TASK_CORPUS: &str = concat!("benchmarks", "/tasks", "/eval-probes.json");
+pub const LEAKED_PACKET_FIXTURE: &str = concat!("crates/codestory-cli/tests/fixtures/", "packet_search_eval");
+pub const LEAKED_QUALITY_FIXTURE: &str = concat!("crates/codestory-cli/tests/", "fixtures/agent_quality");
+pub const LEAKED_DEPENDENCY: &str = include_str!(concat!("../../benchmarks/", "tasks/eval-probes.json"));
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "constructed production corpus dependencies must fail lint; stderr={stderr}"
+    );
+    for expected in ["benchmarkstasks", "packetsearcheval", "agentquality"] {
+        assert!(
+            stderr.to_lowercase().contains(expected),
+            "lint failure should identify constructed boundary {expected}; stderr={stderr}"
+        );
+    }
+}
+
+#[test]
 fn linter_fails_closed_when_one_prompt_corpus_entry_is_not_a_literal() {
     let output = run_lint_with_prompt_script_fixture(
         r#"

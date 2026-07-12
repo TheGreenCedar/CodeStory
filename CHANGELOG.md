@@ -18,6 +18,14 @@
   literals, and unrelated-error lexical candidates do not become exact route
   claims. Error-local syntax recovery stays explicitly structural and
   low-confidence.
+- Added a fail-closed, machine-profiled release evidence gate with pinned
+  approved references and separate budgets for status, local grounding,
+  convergence, packet, search, indexing, and storage growth. Decision reports
+  retain metric status, release decision, full commits, rationale, and artifact
+  hashes; an appended telemetry row cannot become its own baseline. A
+  provisioned same-SHA manual/reusable workflow now produces raw repo/packet
+  evidence without changing the current release path before a live profile is
+  approved.
 - Added a schema-backed publication generation and run identity to every staged
   full and incremental core database. Typed store and runtime reads now expose
   the generation that owns the live graph, and cache finalization verifies that
@@ -30,6 +38,11 @@
   readers, and preserves the legacy path for databases without an identity.
 
 ### Fixed
+
+- Extended the retrieval generalization guard from derived query literals to
+  direct and split Rust string dependencies on eval/query corpus paths across
+  production crates, including benchmark manifests, query catalogs, packet
+  fixtures, agent-quality fixtures, and eval probes.
 
 - Kept project-scoped MCP reads available during a single-flight local refresh
   by opening published SQLite generations read-only, serving the last complete

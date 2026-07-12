@@ -80,7 +80,7 @@ regression risk, but it is not answer-quality proof.
 
 | Gate | Current metric or threshold | Command that proves it | Source |
 | --- | --- | --- | --- |
-| Repeat refresh | `repeat_semantic_docs_embedded == 0`; repeat graph phase `< 20s`; repeat semantic reuse phase `< 3s`; repeat full-refresh process smoke stays within 25% of the latest stats-log phase-row baseline | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` | `crates/codestory-cli/tests/codestory_repo_e2e_stats.rs`, `docs/testing/codestory-e2e-stats-log.md` |
+| Repeat refresh | `repeat_semantic_docs_embedded == 0`; repeat graph phase `< 20s`; repeat semantic reuse phase `< 3s`; release-significant convergence changes use the approved machine-profile budget | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture`; release gate below | `crates/codestory-cli/tests/codestory_repo_e2e_stats.rs`, `benchmarks/release-evidence/approved-baselines.json` |
 | Retrieval status | After sidecar indexing, `retrieval_mode == "full"` and `retrieval status --format json` reports current manifest provenance: source root, input hash, generation, schema, graph hash, symbol-doc count, dense-anchor count, degraded modes, and lane provenance. Non-`full` status is diagnostic only. | `codestory-cli retrieval bootstrap --project <repo> --format json`; `codestory-cli retrieval index --project <repo> --refresh full --format json`; `codestory-cli retrieval status --project <repo> --format json` | `docs/ops/retrieval-sidecars.md`, `crates/codestory-retrieval/src/sidecar.rs`, `crates/codestory-runtime/src/agent/retrieval_primary.rs` |
 | Packet runtime | Product sidecar query budget defaults to `1,000ms`; packet batch budget defaults to `18,000ms` and is capped at `120,000ms`; packet runs must report `packet_latency.sla_missed == false` for product evidence. North-star targets are retrieval p50 `<= 250ms`, p90 `<= 600ms`, p99 `<= 1,000ms`, and worst-case packet wall `<= 1,500ms`, but those targets become promotion proof only inside a quality-gated benchmark run. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite local-real --repeats 1 --codestory-cli target/release/codestory-cli --timeout-ms 300000` | `crates/codestory-runtime/src/agent/retrieval_primary.rs`, `crates/codestory-retrieval/src/planner.rs`, `scripts/codestory-agent-ab-benchmark.mjs`, `docs/testing/retrieval-architecture.md` |
 | Benchmark promotion | `--publishable` requires at least 3 repeats, sidecar-primary retrieval, no diagnostic extra probes, no failed rows, token usage, clean preludes, manifest quality gates when present, packet-first compliance, sufficient packets with no unresolved diagnostics, and the explicit `--max-source-reads-after-packet` budget. Holdout/local task quality thresholds live in the task manifests; stats-log timing rows do not promote answer quality. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --packet-runtime-mode cold-cli --task-suite holdout-retrieval --materialize-repos --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli target/release/codestory-cli --timeout-ms 180000` | `scripts/codestory-agent-ab-benchmark.mjs`, `scripts/codestory-benchmark-contract.mjs`, `benchmarks/tasks/`, `docs/testing/retrieval-architecture.md` |
@@ -91,6 +91,85 @@ Current telemetry snapshot from `docs/testing/codestory-e2e-stats-log.md`
 refresh `29.45s` with `750` reused and `0` embedded, index `75.36s`, semantic
 phase `49.45s`. This row is useful regression telemetry; it does not prove
 answer quality because the real drill was intentionally skipped.
+
+## Release Evidence Gate
+
+The stats log is append-only telemetry, not a baseline selector. Release
+candidates must use a named machine profile from
+`benchmarks/release-evidence/approved-baselines.json`; the profile pins its
+accepted commit, approval rationale, source artifacts, and a separate budget
+for status, local grounding, convergence, packet, search, indexing, and
+same-corpus storage growth. This avoids applying one timing to dissimilar
+machines while preventing a slower appended row from becoming its own
+reference.
+
+Do not hand-author candidate metrics. The provisioned
+`release-candidate-evidence.yml` workflow runs the full repo-scale and
+publishable packet producers on the same clean SHA, records the corpus, cache,
+and machine fingerprint, hashes both non-empty raw artifacts, and derives the
+candidate. It refuses contract-only profiles during release runs. The release
+workflow is not yet activated; legacy warnings and blockers remain authoritative
+until the activation child has a provisioned release-eligible baseline and live
+candidate report.
+
+For maintainer reproduction, produce and evaluate from real raw artifacts:
+
+```sh
+node scripts/codestory-release-evidence-gate.mjs produce \
+  --baseline benchmarks/release-evidence/approved-baselines.json \
+  --profile <approved-release-profile> \
+  --stats target/release-evidence/stats.json \
+  --packet target/release-evidence/packet/packet-runtime-summary.json \
+  --out target/release-evidence/candidate.json \
+  --expected-sha <full-40-character-sha> --mode release --repo .
+node scripts/codestory-release-evidence-gate.mjs evaluate \
+  --baseline benchmarks/release-evidence/approved-baselines.json \
+  --candidate target/release-evidence/candidate.json \
+  --out target/release-evidence/decision.json \
+  --expected-sha <full-40-character-sha> --mode release --repo .
+```
+
+Production and evaluation both reject missing, empty, changed, or all-zero raw
+artifacts; short or dirty Git identities; self-baselining; identity drift; and
+unit or aggregation changes. The normalized report records the candidate and
+baseline hashes, full commits, artifact hashes and sizes, and every metric's
+status and decision. A regression exits nonzero. Each exception is bound to the
+exact candidate hash, baseline id/hash, full commit, profile, metric, measured
+value, threshold, owner, ISO approval date, rationale, and unexpired date.
+Approval never updates the pinned baseline.
+
+Packet provenance is finalized only after publishable blockers are calculated.
+The evaluator does not trust its status label: it requires an empty blocker
+list and independently checks every embedded row for pass/quality/sufficiency,
+full retrieval shadow, SLA, the benchmark's shared pinned-repository and
+local-cache provenance validators, and distinct exact `1..N` repeats matching
+the top-level modes/repeat contract. It also
+rechecks the raw stats object's `full_sidecar` tier, index/ground/search modes,
+manifest counts/hash/policy, zero index errors, and zero repeat embeddings.
+Repeat graph, semantic, and full-refresh limits are re-evaluated from the shared
+`repo-stats-contract.json`, whose values are asserted against the Rust harness
+constants so the downloaded-artifact gate cannot drift from the surviving
+release assertions.
+
+On rejection, the workflow uploads provisioning, raw, candidate, approval (when
+provided), and report files with `if: always()`. Author an exception against the
+reported hashes and values in the
+`CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON` secret, then dispatch the same SHA
+with `source_run_id=<rejected-run-id>`. That path downloads and re-evaluates the
+exact candidate without re-running measurements; any SHA, hash, value, profile,
+baseline, threshold, date, or expiry drift still fails.
+
+The checked-in `ci-contract-v1` fixture and report exercise this trust chain in
+ordinary CI but are explicitly `release_eligible: false`. A product profile must
+be created from provisioned raw evidence and explicitly approved before a
+release workflow can adopt this gate.
+
+The corpus boundary is deliberately precise: it scans Rust production files in
+all non-benchmark crates for direct path strings and adjacent/split literal
+construction such as `concat!` and `include_str!`. It does not prove arbitrary
+runtime path generation, non-Rust production surfaces, environment/config
+indirection, or dependencies hidden behind external processes. Those surfaces
+remain explicit follow-up audit scope rather than being claimed as covered.
 
 Do not promote importable or rebuildable graph/sidecar artifacts in this slice.
 A follow-up PR for that idea must require provenance before reuse: source root,
@@ -122,6 +201,9 @@ verification plan in the PR or final notes:
 cargo build --release -p codestory-cli
 cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
+
+Appending those rows is never a release decision. Assemble the candidate
+artifact and run the release evidence gate after the raw producers complete.
 
 ## Parallelization Candidate Gate
 

@@ -5258,6 +5258,7 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
   }
   await writeJsonlRows(path.join(outDir, "packet-runtime-runs.jsonl"), results);
   const summary = summarizePacketRuntimeRuns(results);
+  const blockers = packetRuntimePublishableBlockers(results, opts);
   const payload = {
     generated_at: new Date().toISOString(),
     benchmark_run_id: benchmarkId,
@@ -5275,6 +5276,33 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
       scorerPath: benchmarkScorerPath,
       cliIdentity: opts.codestoryCli ?? process.env.CODESTORY_CLI ?? null,
     }),
+    ...(process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT
+      ? {
+          release_evidence: {
+            commit: process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT,
+            profile: process.env.CODESTORY_RELEASE_EVIDENCE_PROFILE,
+            evidence_identity: {
+              corpus_id: process.env.CODESTORY_RELEASE_EVIDENCE_CORPUS_ID,
+              cache_id: process.env.CODESTORY_RELEASE_EVIDENCE_CACHE_ID,
+              machine_fingerprint:
+                process.env.CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT,
+            },
+            publishable: opts.publishable === true,
+            repeats: opts.repeats,
+            quality_gate_status:
+              opts.publishable === true && blockers.length === 0 ? "pass" : "fail",
+            publishable_blockers: blockers.map((blocker) => ({
+              repo: blocker.result.repo,
+              task_id: blocker.result.task_id,
+              mode: blocker.result.mode,
+              repeat: blocker.result.repeat,
+              category: blocker.category,
+              reasons: blocker.reasons,
+            })),
+            rows: results,
+          },
+        }
+      : {}),
     summary,
   };
   const packetRuntimeSummaryPath = path.join(outDir, "packet-runtime-summary.json");
@@ -5353,7 +5381,6 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
   );
   console.log(`ARTIFACT packet_runtime_artifacts=${packetRuntimeArtifactManifestPath}`);
 
-  const blockers = packetRuntimePublishableBlockers(results, opts);
   if (opts.publishable && blockers.length) {
     console.error(
       "--publishable failed: packet runtime rows must pass, include passing manifest quality gates, report sufficient packets with zero follow-ups or unresolved diagnostics, and use pinned clean repo provenance.",
@@ -6840,6 +6867,7 @@ export {
   packetRuntimeCacheObservations,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
+  cacheProvenanceBlockers,
   PACKET_COMPOSITION_WEIGHTS,
   MAX_REUSED_ARTIFACT_BYTES,
   packetCompositionFileScore,

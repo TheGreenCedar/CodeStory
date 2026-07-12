@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "commit": "1111111111111111111111111111111111111111",
+  "evidence_identity": {
+    "corpus_id": "ci-contract-corpus-v1",
+    "cache_id": "cold-full-sidecar-v1",
+    "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
+  },
+  "metrics": {
+    "status_seconds": 1,
+    "local_grounding_seconds": 1,
+    "convergence_seconds": 10,
+    "packet_seconds": 1,
+    "search_seconds": 1,
+    "indexing_seconds": 10,
+    "storage_bytes": 1000
+  }
+}

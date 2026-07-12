@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
+  "baseline_sha256": "e7488c0625620ebeaf669fab3b9d4150a29b60d08398a3c6a005b2ee4c152642",
+  "commit": "2222222222222222222222222222222222222222",
+  "git_state": "clean",
+  "profile": "ci-contract-v1",
+  "identity": {
+    "corpus_id": "ci-contract-corpus-v1",
+    "cache_id": "cold-full-sidecar-v1",
+    "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
+  },
+  "artifacts": {
+    "stats": {
+      "path": "candidate-stats.json",
+      "sha256": "f65c55078260a4ee6a6e1c0c73346317aeb972c8fe10c0c9580cab7c963da30a",
+      "bytes": 1106
+    },
+    "packet": {
+      "path": "candidate-packet.json",
+      "sha256": "ff3bb834b3e473e2f099dbbf8a52651622039dddb60a2ce2b9b2e0bd40c21a0f",
+      "bytes": 4911
+    }
+  },
+  "metrics": {
+    "status_seconds": {
+      "value": 0.8,
+      "unit": "seconds",
+      "aggregation": "full-sidecar command wall time"
+    },
+    "local_grounding_seconds": {
+      "value": 0.8,
+      "unit": "seconds",
+      "aggregation": "full-sidecar command wall time"
+    },
+    "convergence_seconds": {
+      "value": 8,
+      "unit": "seconds",
+      "aggregation": "unchanged-corpus repeat full-refresh wall time"
+    },
+    "packet_seconds": {
+      "value": 0.9,
+      "unit": "seconds",
+      "aggregation": "worst quality-gated packet median wall time"
+    },
+    "search_seconds": {
+      "value": 0.8,
+      "unit": "seconds",
+      "aggregation": "full-sidecar command wall time"
+    },
+    "indexing_seconds": {
+      "value": 8,
+      "unit": "seconds",
+      "aggregation": "cold full-refresh wall time"
+    },
+    "storage_growth_ratio": {
+      "value": 1.02,
+      "unit": "ratio",
+      "aggregation": "candidate bytes divided by approved same-corpus bytes"
+    }
+  }
+}

@@ -25,17 +25,17 @@ const explicitScanRoots = (
   .split(path.delimiter)
   .filter(Boolean);
 
+const structuralScanDirs = readdirSync(path.join(repoRoot, "crates"), { withFileTypes: true })
+  .filter((entry) => entry.isDirectory() && entry.name !== "codestory-bench")
+  .map((entry) => path.join(repoRoot, "crates", entry.name, "src"))
+  .filter(existsSync);
+
 const requiredScanDirs = [
   path.join(repoRoot, "crates", "codestory-runtime", "src", "agent"),
   path.join(repoRoot, "crates", "codestory-retrieval", "src"),
 ];
 
-const requiredProductionOnlyFiles = [
-  path.join(repoRoot, "crates", "codestory-runtime", "src", "agent", "orchestrator.rs"),
-  path.join(repoRoot, "crates", "codestory-runtime", "src", "lib.rs"),
-  path.join(repoRoot, "crates", "codestory-runtime", "src", "semantic_doc_text.rs"),
-  path.join(repoRoot, "crates", "codestory-retrieval", "src", "ranker.rs"),
-];
+const requiredProductionOnlyFiles = [];
 
 const usesDefaultScanRoots = explicitScanRoots.length === 0;
 const missingRequiredPaths = usesDefaultScanRoots
@@ -89,12 +89,18 @@ const benchmarkEvalProbeSourcePath = path.join(
   "agent",
   "eval_probes.rs",
 );
+const evalCorpusRoots = [
+  benchmarkTaskRoot,
+  path.join(repoRoot, "crates", "codestory-cli", "tests", "fixtures", "packet_search_eval"),
+  path.join(repoRoot, "crates", "codestory-cli", "tests", "fixtures", "agent_quality"),
+];
 
 const missingBenchmarkBoundaryFiles = [
   ...benchmarkIdentityScriptFiles,
   ...benchmarkPromptScriptFiles.map(({ filePath }) => filePath),
   benchmarkEvalProbeManifestPath,
   benchmarkEvalProbeSourcePath,
+  ...evalCorpusRoots,
 ].filter((scriptPath, index, paths) =>
   paths.indexOf(scriptPath) === index && !existsSync(scriptPath)
 );
@@ -200,6 +206,7 @@ const bannedPatterns = [
   "nvm",
   "install\\.sh\\s+nvm",
   "bash_completion\\s+__nvm",
+  ...evalCorpusBoundaryPatterns(),
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
   ...benchmarkScriptPromptDerivedPatterns(),
@@ -227,6 +234,7 @@ const bannedCompactPatterns = [
   "datarequest",
   "sessiondelegate",
   "sourceanimatecss",
+  ...evalCorpusCompactPatterns(),
 ];
 
 const allowedPatternLines = [
@@ -241,6 +249,27 @@ const allowedPatternLines = [
 ];
 
 const rankerFilenameLiteralPattern = /["'`][a-z0-9][a-z0-9._-]*\.[a-z0-9]+["'`]/i;
+
+function evalCorpusBoundaryPatterns() {
+  const corpusFiles = [
+    ...evalCorpusRoots.flatMap((root) => walkFiles(root, () => true)),
+    ...benchmarkIdentityScriptFiles,
+    benchmarkEvalProbeSourcePath,
+  ];
+  if (corpusFiles.length === 0) {
+    throw new Error("eval/query corpus boundary contains no files");
+  }
+  return [
+    ...evalCorpusRoots.map((root) => path.relative(repoRoot, root).replaceAll(path.sep, "/")),
+    ...corpusFiles.map((filePath) => path.relative(repoRoot, filePath).replaceAll(path.sep, "/")),
+  ].map(escapeRegExp);
+}
+
+function evalCorpusCompactPatterns() {
+  return evalCorpusBoundaryPatterns()
+    .map((pattern) => compactProductionSource(pattern.replaceAll("\\", "")))
+    .filter((pattern) => pattern.length >= 12);
+}
 
 function benchmarkManifestDerivedPatterns() {
   if (!existsSync(benchmarkTaskRoot)) {
@@ -1255,6 +1284,38 @@ for (const filePath of [...scanFiles].sort()) {
   }
 }
 
+const corpusRegexPatterns = evalCorpusBoundaryPatterns().map((pattern) => ({
+  pattern,
+  re: new RegExp(pattern, "i"),
+}));
+const corpusCombinedRegex = new RegExp(
+  corpusRegexPatterns.map(({ pattern }) => `(?:${pattern})`).join("|"),
+  "i",
+);
+const structuralFiles = new Set();
+for (const root of structuralScanDirs) {
+  for (const filePath of walkRustProductionFiles(root)) structuralFiles.add(filePath);
+}
+for (const filePath of [...structuralFiles].sort()) {
+  if (isEvalOnlyProductionFile(filePath)) continue;
+  const prepared = prepareProductionFile(filePath);
+  const hitsByPattern = scanProductionFile(prepared, corpusRegexPatterns, corpusCombinedRegex);
+  for (const { pattern } of corpusRegexPatterns) {
+    const hits = hitsByPattern.get(pattern) ?? [];
+    if (hits.length > 0) {
+      console.error(`Production dependency on eval/query corpus /${pattern}/ in ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`);
+      failed = true;
+    }
+  }
+  for (const pattern of evalCorpusCompactPatterns()) {
+    const hits = scanProductionCompactPatterns(prepared, pattern);
+    if (hits.length > 0) {
+      console.error(`Constructed production dependency on eval/query corpus /${pattern}/ in ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`);
+      failed = true;
+    }
+  }
+}
+
 if (failed) {
   console.error(
     "retrieval generalization lint failed: remove repo-specific literals from retrieval integration code",
@@ -1263,5 +1324,5 @@ if (failed) {
 }
 
 console.log(
-  `lint-retrieval-generalization: ok (${scanDirs.length} dir(s), ${scanFiles.size} production file(s), ${bannedPatterns.length} patterns)`,
+  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${bannedPatterns.length} patterns)`,
 );

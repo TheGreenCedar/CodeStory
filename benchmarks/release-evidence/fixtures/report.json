@@ -1,0 +1,102 @@
+{
+  "schema_version": 2,
+  "status": "pass",
+  "decision": "accept_contract",
+  "commit": "2222222222222222222222222222222222222222",
+  "profile": "ci-contract-v1",
+  "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
+  "baseline_sha256": "e7488c0625620ebeaf669fab3b9d4150a29b60d08398a3c6a005b2ee4c152642",
+  "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
+  "candidate_sha256": "6e34aa50106f6cac5ac66b9deb464575d285f2d110cd640336541b51e9f56937",
+  "artifact_paths": [
+    {
+      "path": "candidate-stats.json",
+      "sha256": "f65c55078260a4ee6a6e1c0c73346317aeb972c8fe10c0c9580cab7c963da30a",
+      "bytes": 1106
+    },
+    {
+      "path": "candidate-packet.json",
+      "sha256": "ff3bb834b3e473e2f099dbbf8a52651622039dddb60a2ce2b9b2e0bd40c21a0f",
+      "bytes": 4911
+    }
+  ],
+  "metrics": [
+    {
+      "status": "pass",
+      "metric": "status_seconds",
+      "decision": "accept",
+      "measured_value": 0.8,
+      "reference": 1,
+      "threshold": 1.25,
+      "unit": "seconds",
+      "aggregation": "full-sidecar command wall time",
+      "source": "baseline-raw.json"
+    },
+    {
+      "status": "pass",
+      "metric": "local_grounding_seconds",
+      "decision": "accept",
+      "measured_value": 0.8,
+      "reference": 1,
+      "threshold": 1.25,
+      "unit": "seconds",
+      "aggregation": "full-sidecar command wall time",
+      "source": "baseline-raw.json"
+    },
+    {
+      "status": "pass",
+      "metric": "convergence_seconds",
+      "decision": "accept",
+      "measured_value": 8,
+      "reference": 10,
+      "threshold": 11.5,
+      "unit": "seconds",
+      "aggregation": "unchanged-corpus repeat full-refresh wall time",
+      "source": "baseline-raw.json"
+    },
+    {
+      "status": "pass",
+      "metric": "packet_seconds",
+      "decision": "accept",
+      "measured_value": 0.9,
+      "reference": 1,
+      "threshold": 1.1,
+      "unit": "seconds",
+      "aggregation": "worst quality-gated packet median wall time",
+      "source": "baseline-raw.json"
+    },
+    {
+      "status": "pass",
+      "metric": "search_seconds",
+      "decision": "accept",
+      "measured_value": 0.8,
+      "reference": 1,
+      "threshold": 1.25,
+      "unit": "seconds",
+      "aggregation": "full-sidecar command wall time",
+      "source": "baseline-raw.json"
+    },
+    {
+      "status": "pass",
+      "metric": "indexing_seconds",
+      "decision": "accept",
+      "measured_value": 8,
+      "reference": 10,
+      "threshold": 12.5,
+      "unit": "seconds",
+      "aggregation": "cold full-refresh wall time",
+      "source": "baseline-raw.json"
+    },
+    {
+      "status": "pass",
+      "metric": "storage_growth_ratio",
+      "decision": "accept",
+      "measured_value": 1.02,
+      "reference": 1,
+      "threshold": 1.1,
+      "unit": "ratio",
+      "aggregation": "candidate bytes divided by approved same-corpus bytes",
+      "source": "baseline-raw.json"
+    }
+  ]
+}

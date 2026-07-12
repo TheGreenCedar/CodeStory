@@ -13,10 +13,13 @@ const REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET: f64 = 3.0;
 
 #[derive(Debug, Serialize)]
 struct RepoE2eStats {
+    commit: String,
+    evidence_identity: EvidenceIdentity,
     project_root: String,
     cache_dir: String,
     storage_path: String,
     search_dir: String,
+    storage_bytes: u64,
     proof_tier: String,
     warnings: Vec<String>,
     stats_baseline: StatsLogBaseline,
@@ -70,6 +73,13 @@ struct RepoE2eStats {
     trail: TrailStats,
     snippet: SnippetStats,
     report: ReportStats,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceIdentity {
+    corpus_id: String,
+    cache_id: String,
+    machine_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,6 +174,26 @@ struct ReportStats {
 const PROOF_TIER_STATS_ONLY: &str = "stats_only";
 const PROOF_TIER_FULL_SIDECAR: &str = "full_sidecar";
 const RELEASE_WARNING_REGRESSION_FACTOR: f64 = 1.25;
+
+#[test]
+fn shared_release_stats_contract_matches_harness_thresholds() {
+    let contract: Value = serde_json::from_str(include_str!(
+        "../../../benchmarks/release-evidence/repo-stats-contract.json"
+    ))
+    .expect("parse shared release stats contract");
+    assert_eq!(
+        contract["repeat_graph_phase_seconds_max"].as_f64(),
+        Some(REPEAT_GRAPH_PHASE_SECONDS_BUDGET)
+    );
+    assert_eq!(
+        contract["repeat_semantic_phase_seconds_max"].as_f64(),
+        Some(REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET)
+    );
+    assert_eq!(
+        contract["repeat_full_refresh_regression_factor"].as_f64(),
+        Some(RELEASE_WARNING_REGRESSION_FACTOR)
+    );
+}
 
 fn release_readiness_proof_tier(
     sidecar_status_after_retrieval_index: &str,
@@ -478,6 +508,21 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .expect("storage file stem");
     parent.join(format!("{stem}.search"))
+}
+
+fn path_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| path_bytes(&entry.path()))
+        .sum()
 }
 
 fn run_cli_json(
@@ -983,10 +1028,21 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
 
     let stats = RepoE2eStats {
+        commit: env::var("CODESTORY_RELEASE_EVIDENCE_COMMIT")
+            .unwrap_or_else(|_| "unbound-local-run".to_string()),
+        evidence_identity: EvidenceIdentity {
+            corpus_id: env::var("CODESTORY_RELEASE_EVIDENCE_CORPUS_ID")
+                .unwrap_or_else(|_| "unbound-local-run".to_string()),
+            cache_id: env::var("CODESTORY_RELEASE_EVIDENCE_CACHE_ID")
+                .unwrap_or_else(|_| "unbound-local-run".to_string()),
+            machine_fingerprint: env::var("CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT")
+                .unwrap_or_else(|_| "unbound-local-run".to_string()),
+        },
         project_root: project_root.display().to_string(),
         cache_dir: cache_dir.path().display().to_string(),
         storage_path: storage_path.display().to_string(),
         search_dir: search_dir.display().to_string(),
+        storage_bytes: path_bytes(cache_dir.path()),
         proof_tier,
         warnings,
         stats_baseline,
@@ -1154,10 +1210,16 @@ fn codestory_repo_release_e2e_emits_stats() {
         },
     };
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&stats).expect("serialize stats")
-    );
+    let stats_json = serde_json::to_string_pretty(&stats).expect("serialize stats");
+    println!("{stats_json}");
+    if let Ok(output_path) = env::var("CODESTORY_RELEASE_EVIDENCE_STATS_PATH") {
+        let output_path = PathBuf::from(output_path);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).expect("create release evidence stats parent");
+        }
+        fs::write(output_path, format!("{stats_json}\n"))
+            .expect("write release evidence stats artifact");
+    }
 
     assert_eq!(
         stats.index.error_count, 0,
