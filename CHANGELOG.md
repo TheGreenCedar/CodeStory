@@ -7,8 +7,12 @@
 - Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
   generation artifact scopes to project identity schema 3. Legacy schema-2
   state is discovered for inventory but never reused or destructively cleaned;
-  mismatched state fails closed. Runtime state also binds the non-secret
+  new Local and Agent state uses explicit `v3` namespaces and filenames so it
+  cannot collide with unversioned state. Mismatched state fails closed. Runtime
+  state also binds the non-secret
   endpoint origin and an install-keyed full-endpoint HMAC-SHA256 fingerprint,
+  whose key is initialized once under a private lock and atomically published
+  with owner-only permissions,
   external endpoints cannot supply managed GPU proof, and identity drift aborts
   publication and query instead of mixing artifact scopes. Managed native state
   also binds its launch endpoint and port arguments before reuse or cleanup, and

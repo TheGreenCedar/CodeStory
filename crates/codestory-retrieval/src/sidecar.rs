@@ -262,7 +262,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_
         "retrieval-sidecars",
         &json,
     )
-    .context("write retrieval-sidecars.json")?;
+    .context("write versioned sidecar state")?;
     Ok(state)
 }
 
@@ -471,11 +471,11 @@ fn sidecar_down_for_runtime_inner(
             crate::compose::docker_compose_down_for_state(&state)?;
         }
         stop_native_embedding_process_for_state(&state)?;
-        std::fs::remove_file(&layout.state_file).context("remove retrieval-sidecars.json")?;
+        std::fs::remove_file(&layout.state_file).context("remove versioned sidecar state")?;
     }
-    if let Some(legacy_state_file) = crate::config::legacy_agent_state_file_for_runtime(runtime) {
+    if let Some(legacy_state_file) = crate::config::legacy_state_file_for_runtime(runtime) {
         let message = format!(
-            "legacy project-identity-v2 sidecar state was discovered and preserved at {}; inspect it with `codestory-cli sidecar inventory --project <repo> --format json` before provenance-aware cleanup",
+            "legacy unversioned sidecar state was discovered and preserved at {}; inspect it with `codestory-cli sidecar inventory --project <repo> --format json` before provenance-aware cleanup",
             legacy_state_file.display()
         );
         if preserve_preexisting_compose {
@@ -1963,7 +1963,7 @@ mod tests {
         )
         .expect("publish failed-attempt state");
         assert!(!state.compose_started_by_bootstrap);
-        let legacy_state_file = crate::config::legacy_agent_state_path_for_runtime(&runtime)
+        let legacy_state_file = crate::config::legacy_state_path_for_runtime(&runtime)
             .expect("calculated legacy state path");
         let legacy_namespace = legacy_state_file
             .parent()
