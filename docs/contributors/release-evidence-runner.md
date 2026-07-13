@@ -53,7 +53,9 @@ Provisioning is idempotent. It:
   versions, then records the complete native package manifest;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
-- downloads and verifies the pinned BGE model;
+- streams a checksum-verified BGE model from the standard CodeStory cache when
+  present, otherwise downloads it, then verifies the contract checksum again
+  inside the guest;
 - prepares a source-backed `serde_json` drill at an exact commit;
 - pulls the digest-pinned ARM64 Qdrant and llama-server images;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
@@ -67,6 +69,11 @@ provisioning pass. No source or tool is executed through a host mount. `verify`
 prints the guest mount table and fails if it finds a host-backed VirtioFS, 9p,
 SSHFS, Lima, osxfs, or gRPC FUSE mount; any `/Users` visibility is also a hard
 failure.
+
+The model seed also crosses SSH rather than a host mount. Its default source is
+`~/Library/Caches/dev.codestory.codestory/retrieval/models/`; set
+`CODESTORY_RELEASE_EVIDENCE_MODEL_SEED` to an alternate exact file. The host
+and guest both reject bytes that do not match the machine contract.
 
 Provisioning first proves that an existing owned runner is idle. It requests a
 GitHub registration token only when the runner is unconfigured, checks the

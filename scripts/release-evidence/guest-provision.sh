@@ -6,6 +6,8 @@ expected_contract_sha=${2:?machine contract checksum is required}
 source_sha=${3:?validation source SHA is required}
 bootstrap_snapshot=${4:?APT snapshot is required}
 bootstrap_jq_version=${5:?jq version is required}
+model_seed=${6:--}
+test "$model_seed" = - || test "$model_seed" = /tmp/codestory-release-evidence-model-seed
 
 actual_contract_sha=$(sha256sum "$contract" | awk '{print $1}')
 test "$actual_contract_sha" = "$expected_contract_sha"
@@ -79,7 +81,11 @@ printf '%s\n' "$source_sha" \
   | sudo -u codestory-runner tee "$runner_root/validation/source-sha" >/dev/null
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+  rm -rf "$tmp"
+  if test "$model_seed" != -; then sudo rm -f "$model_seed"; fi
+}
+trap cleanup EXIT
 
 if ! command -v node >/dev/null || test "$(node --version)" != "v$node_version"; then
   node_archive="node-v${node_version}-linux-arm64.tar.xz"
@@ -153,16 +159,21 @@ model="$runner_root/models/$model_name"
 if ! sudo -u codestory-runner test -f "$model" \
     || ! printf '%s  %s\n' "$model_sha" "$model" | sudo -u codestory-runner sha256sum -c -; then
   sudo rm -f "$model.partial"
-  downloaded=false
-  for url in \
-    https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf \
-    https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf; do
-    if sudo -u codestory-runner curl -fL --retry 3 -o "$model.partial" "$url"; then
-      downloaded=true
-      break
-    fi
-  done
-  test "$downloaded" = true
+  if test "$model_seed" != - && test -f "$model_seed"; then
+    sudo install -o codestory-runner -g codestory-runner -m 0640 \
+      "$model_seed" "$model.partial"
+  else
+    downloaded=false
+    for url in \
+      https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf \
+      https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf; do
+      if sudo -u codestory-runner curl -fL --retry 3 -o "$model.partial" "$url"; then
+        downloaded=true
+        break
+      fi
+    done
+    test "$downloaded" = true
+  fi
   printf '%s  %s\n' "$model_sha" "$model.partial" | sudo -u codestory-runner sha256sum -c -
   sudo -u codestory-runner mv "$model.partial" "$model"
 fi

@@ -11,6 +11,9 @@ repository=$(get '.repository')
 runner_name=$(get '.runner.name')
 runner_version=$(get '.runner.version')
 runner_root=$(get '.runner.root')
+model_name=$(get '.assets.model.name')
+model_sha=$(get '.assets.model.sha256')
+model_source=${CODESTORY_RELEASE_EVIDENCE_MODEL_SEED:-"$HOME/Library/Caches/dev.codestory.codestory/retrieval/models/$model_name"}
 base_image_url=$(get '.vm.base_image.url')
 base_image_sha=$(get '.vm.base_image.sha512')
 base_image_path="$HOME/Library/Caches/dev.codestory.codestory/release-evidence-runner/$(basename "$base_image_url")"
@@ -206,13 +209,26 @@ sync_validation_source() {
   printf '%s\n' "$source_sha"
 }
 
+sync_model_seed() {
+  local guest_seed=/tmp/codestory-release-evidence-model-seed
+  colima ssh --profile "$profile" -- rm -f "$guest_seed"
+  if test -f "$model_source"; then
+    printf '%s  %s\n' "$model_sha" "$model_source" | shasum -a 256 -c - >/dev/null
+    colima ssh --profile "$profile" -- tee "$guest_seed" <"$model_source" >/dev/null
+    printf '%s\n' "$guest_seed"
+  else
+    printf '%s\n' -
+  fi
+}
+
 provision_guest() {
   local source_sha=$1
+  local model_seed=$2
   colima ssh --profile "$profile" -- sudo bash \
     /tmp/codestory-provision/scripts/release-evidence/guest-provision.sh \
     /tmp/codestory-provision/scripts/release-evidence/machine-contract.json \
     "$contract_sha" "$source_sha" "$(get '.guest.apt_snapshot')" \
-    "$(get '.guest.apt_packages.jq')"
+    "$(get '.guest.apt_packages.jq')" "$model_seed"
 }
 
 runner_inspect() {
@@ -403,7 +419,8 @@ case "$command" in
     assert_not_busy
     stop_local_runner 2>/dev/null || true
     source_sha=$(sync_validation_source)
-    provision_guest "$source_sha"
+    model_seed=$(sync_model_seed)
+    provision_guest "$source_sha" "$model_seed"
     configure_runner
     write_host_attestation
     guest_verify

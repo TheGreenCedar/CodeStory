@@ -13,7 +13,9 @@
   versions, runtime tools, model, images, and drill. Colima host mounts are
   disabled, validation source is copied into the guest, lifecycle cleanup is
   ownership-scoped, and release evidence rejects stale identity attestations,
-  host-home visibility, or any unexpected host-backed mount.
+  host-home visibility, or any unexpected host-backed mount. Checksum-verified
+  model bytes can stream over SSH from the normal CodeStory cache when the
+  pinned upstream download is unavailable.
 - Reduced the packaged macOS proof to one check per release boundary. The
   protected run still covers managed Metal cold/warm/recovery, exact process
   reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned
