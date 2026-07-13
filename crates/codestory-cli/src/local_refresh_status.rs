@@ -304,18 +304,15 @@ pub(crate) fn try_acquire_local_refresh_lock(
     }
 }
 
-pub(crate) fn wait_for_local_refresh_lock_release(
+pub(crate) fn wait_for_local_refresh_lock(
     cache_root: &Path,
     project_root: &Path,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<LocalRefreshLock> {
     let started = Instant::now();
     loop {
         match try_acquire_local_refresh_lock(cache_root, project_root)? {
-            LocalRefreshLockAttempt::Acquired(lock) => {
-                drop(lock);
-                return Ok(());
-            }
+            LocalRefreshLockAttempt::Acquired(lock) => return Ok(lock),
             LocalRefreshLockAttempt::Busy(busy) => {
                 let remaining = timeout.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
@@ -754,9 +751,21 @@ mod tests {
             drop(lock);
         });
 
-        wait_for_local_refresh_lock_release(cache.path(), project.path(), Duration::from_secs(1))
-            .expect("wait for current owner");
+        let handed_off_lock =
+            wait_for_local_refresh_lock(cache.path(), project.path(), Duration::from_secs(1))
+                .expect("wait for current owner");
         release.join().expect("release worker");
+
+        match try_acquire_local_refresh_lock(cache.path(), project.path())
+            .expect("second contender")
+        {
+            LocalRefreshLockAttempt::Busy(_) => {}
+            LocalRefreshLockAttempt::Acquired(_) => {
+                panic!("waiter must retain ownership through handoff")
+            }
+        }
+
+        drop(handed_off_lock);
     }
 
     #[test]

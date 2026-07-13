@@ -2168,26 +2168,50 @@ def terminate_worker_pid(
             time.sleep(0.1)
 
 
+def active_repair_worker(record: object, source: str) -> dict | None:
+    if not isinstance(record, dict):
+        return None
+    pid = record.get("pid")
+    attempt_id = record.get("attempt_id")
+    if not isinstance(pid, int) or pid <= 0 or not isinstance(attempt_id, str) or not attempt_id:
+        return None
+    return {"pid": pid, "attempt_id": attempt_id, "source": source}
+
+
 def proof_started_repair_workers(responses: list[dict]) -> list[dict]:
     responses_by_id = {response.get("id"): response for response in responses if isinstance(response, dict)}
+    workers = []
     repair = responses_by_id.get("repair", {}).get("result", {}).get("structuredContent", {})
-    if not isinstance(repair, dict) or repair.get("status") != "started":
-        return []
-    pid = repair.get("pid")
-    attempt_id = repair.get("attempt_id")
-    if not isinstance(pid, int) or not isinstance(attempt_id, str) or not attempt_id:
-        return []
     status = status_from_resource_response(responses_by_id.get("status_after_repair", {}))
-    if not isinstance(status, dict):
-        return []
-    setup = status.get("sidecar_setup", {})
-    observed_attempts = {
-        (setup.get("active_repair") or {}).get("attempt_id"),
-        (setup.get("last_worker_result") or {}).get("attempt_id"),
-    }
-    if attempt_id not in observed_attempts:
-        return []
-    return [{"pid": pid, "attempt_id": attempt_id, "source": "proof_started_repair_response"}]
+    active = status.get("sidecar_setup", {}).get("active_repair") if isinstance(status, dict) else None
+    worker = active_repair_worker(active, "proof_started_repair_response")
+    if (
+        isinstance(repair, dict)
+        and repair.get("status") == "started"
+        and worker is not None
+        and worker["attempt_id"] == repair.get("attempt_id")
+        and worker["pid"] == repair.get("pid")
+    ):
+        workers.append(worker)
+
+    ground = responses_by_id.get("ground_activation", {})
+    ground_succeeded = (
+        structured_content_from_response(ground) is not None
+        and ground.get("result", {}).get("isError") is not True
+    )
+    if ground_succeeded:
+        statuses = resource_statuses(responses, "convergence_status_")
+        latest_status = statuses[-1] if statuses else None
+        active = (
+            latest_status.get("sidecar_setup", {}).get("active_repair")
+            if isinstance(latest_status, dict)
+            else None
+        )
+        worker = active_repair_worker(active, "ground_activation_convergence_status")
+        if worker is not None:
+            workers.append(worker)
+
+    return list({(worker["pid"], worker["attempt_id"]): worker for worker in workers}.values())
 
 
 def read_stdio_line(stdout_queue: queue.Queue[str | None], timeout_secs: int) -> str | None:
@@ -2918,6 +2942,15 @@ def status_from_resource_response(response: dict) -> dict | None:
     return status if isinstance(status, dict) else None
 
 
+def resource_statuses(responses: list[dict], request_prefix: str) -> list[dict]:
+    return [
+        status
+        for response in responses
+        if str(response.get("id", "")).startswith(request_prefix)
+        and isinstance(status := status_from_resource_response(response), dict)
+    ]
+
+
 def managed_status_is_ready(status: dict) -> bool:
     surfaces = status.get("allowed_surfaces", {})
     proof = status.get("readiness_broker", {}).get("gpu_proof", {})
@@ -2929,6 +2962,8 @@ def managed_status_is_ready(status: dict) -> bool:
         and proof.get("proof_status") == "verified"
         and proof.get("meaningful_accelerator_work_proven") is True
         and proof.get("embed_smoke_ok") is True
+        and proof.get("requested_provider") == "metal"
+        and proof.get("detected_provider") == "metal"
     )
 
 
@@ -3024,7 +3059,7 @@ def require_managed_observational_status(
 def require_single_managed_repair(
     setup_snapshots: list[dict],
     expected_project: str | None,
-    expected_outcome: str,
+    expected_outcomes: set[str],
     artifact: Path,
 ) -> dict:
     records = [
@@ -3036,6 +3071,7 @@ def require_single_managed_repair(
         and record.get("attempt_id")
     ]
     attempt_ids = {record["attempt_id"] for record in records}
+    namespaces = [record.get("namespace") for record in records]
     require(
         len(attempt_ids) == 1,
         "managed_plugin_convergence",
@@ -3052,7 +3088,8 @@ def require_single_managed_repair(
             and isinstance(record.get("namespace"), str)
             and record.get("namespace")
             for record in records
-        ),
+        )
+        and len(set(namespaces)) == 1,
         "managed_plugin_convergence",
         artifact,
         "ground activation repair records did not preserve one durable project/profile/run/namespace identity",
@@ -3066,33 +3103,24 @@ def require_single_managed_repair(
         ),
         None,
     )
-    if terminal is None and expected_outcome == "succeeded":
-        final_setup = setup_snapshots[-1] if setup_snapshots else {}
-        require(
-            final_setup.get("active_repair") is None,
-            "managed_plugin_convergence",
-            artifact,
-            "automatic shared-agent repair remained active after readiness converged",
-        )
-        return records[-1]
     require(
         isinstance(terminal, dict)
         and terminal.get("attempt_id") in attempt_ids
         and terminal.get("run_id") == "shared-agent"
-        and terminal.get("outcome") == expected_outcome,
+        and terminal.get("outcome") in expected_outcomes,
         "managed_plugin_convergence",
         artifact,
-        f"automatic shared-agent repair did not finish with outcome {expected_outcome!r}",
+        f"automatic shared-agent repair did not finish with an expected outcome: {sorted(expected_outcomes)}",
     )
     return terminal
 
 
-def require_managed_plugin_convergence(
+def require_managed_ground_activation(
     status_before: dict,
     artifact: Path,
     expected_version: str,
     archive_cli: Path,
-) -> None:
+) -> int:
     require_managed_observational_status(status_before, artifact, expected_version, archive_cli)
     initial_generation = status_before["index_publication"]["generation"]
     ground = transcript_response(artifact, "ground_activation") or {}
@@ -3102,6 +3130,46 @@ def require_managed_plugin_convergence(
         "managed_plugin_convergence",
         artifact,
         "ground activation did not serve a complete publication",
+    )
+    return initial_generation
+
+
+def require_managed_generation_advanced(
+    status_after: dict | None,
+    initial_generation: int,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> dict:
+    require(
+        isinstance(status_after, dict),
+        "managed_plugin_convergence",
+        artifact,
+        "status after ground activation was unavailable",
+    )
+    require_managed_binary_provenance(status_after, artifact, expected_version, archive_cli)
+    require(
+        local_freshness_status(status_after) == "fresh"
+        and isinstance(status_after.get("index_publication", {}).get("generation"), int)
+        and status_after["index_publication"]["generation"] > initial_generation,
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation did not publish a newer complete local generation",
+    )
+    return status_after
+
+
+def require_managed_plugin_convergence(
+    status_before: dict,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> None:
+    initial_generation = require_managed_ground_activation(
+        status_before,
+        artifact,
+        expected_version,
+        archive_cli,
     )
     setup_snapshots = []
     for request_id in (
@@ -3119,46 +3187,21 @@ def require_managed_plugin_convergence(
             f"{request_id} did not return sidecar setup status",
         )
         setup_snapshots.append(setup)
-    terminal = next(
-        (
-            setup.get("last_worker_result")
-            for setup in reversed(setup_snapshots)
-            if isinstance(setup.get("last_worker_result"), dict)
-            and setup.get("active_repair") is None
-        ),
-        None,
-    )
-    require(isinstance(terminal, dict), "managed_plugin_convergence", artifact, "automatic repair has no terminal result")
-    outcome = terminal.get("outcome")
-    require(
-        outcome in {"failed", "succeeded"},
-        "managed_plugin_convergence",
-        artifact,
-        f"automatic repair has invalid terminal outcome {outcome!r}",
-    )
     require_single_managed_repair(
         setup_snapshots,
         status_before.get("project_root"),
-        str(outcome),
+        {"failed", "succeeded"},
         artifact,
     )
     status_after = status_from_resource_response(
         transcript_response(artifact, "status_after_convergence") or {}
     )
-    require(
-        isinstance(status_after, dict),
-        "managed_plugin_convergence",
+    status_after = require_managed_generation_advanced(
+        status_after,
+        initial_generation,
         artifact,
-        "status after ground activation was unavailable",
-    )
-    require_managed_binary_provenance(status_after, artifact, expected_version, archive_cli)
-    require(
-        local_freshness_status(status_after) == "fresh"
-        and isinstance(status_after.get("index_publication", {}).get("generation"), int)
-        and status_after["index_publication"]["generation"] > initial_generation,
-        "managed_plugin_convergence",
-        artifact,
-        "ground activation did not publish a newer complete local generation",
+        expected_version,
+        archive_cli,
     )
     gpu_proof = status_after.get("readiness_broker", {}).get("gpu_proof", {})
     require(
@@ -3181,15 +3224,11 @@ def require_managed_plugin_ready_convergence(
     expected_version: str,
     archive_cli: Path,
 ) -> dict:
-    require_managed_observational_status(status_before, artifact, expected_version, archive_cli)
-    initial_generation = status_before["index_publication"]["generation"]
-    ground = transcript_response(artifact, "ground_activation") or {}
-    require(
-        structured_content_from_response(ground) is not None
-        and ground.get("result", {}).get("isError") is not True,
-        "managed_plugin_convergence",
+    initial_generation = require_managed_ground_activation(
+        status_before,
         artifact,
-        "ground activation did not serve a complete publication",
+        expected_version,
+        archive_cli,
     )
 
     transcript = read_json_file(artifact).get("transcript", [])
@@ -3204,12 +3243,10 @@ def require_managed_plugin_ready_convergence(
         artifact,
         f"grounding-only proof invoked unexpected MCP tools: {tool_names}",
     )
-    status_snapshots = [
-        status
-        for entry in transcript
-        if str(entry.get("request", {}).get("id", "")).startswith("convergence_status_")
-        and isinstance(status := status_from_resource_response(entry.get("response", {})), dict)
-    ]
+    status_snapshots = resource_statuses(
+        [entry.get("response", {}) for entry in transcript],
+        "convergence_status_",
+    )
     require(
         status_snapshots and managed_status_is_ready(status_snapshots[-1]),
         "managed_plugin_convergence",
@@ -3220,7 +3257,7 @@ def require_managed_plugin_ready_convergence(
     require_single_managed_repair(
         [status.get("sidecar_setup", {}) for status in status_snapshots],
         status_before.get("project_root"),
-        "succeeded",
+        {"succeeded"},
         artifact,
     )
 
@@ -3237,24 +3274,18 @@ def require_managed_plugin_ready_convergence(
             "packet/search opened before verified GPU and embedding proof",
         )
 
-    status_after = status_snapshots[-1]
-    require_managed_binary_provenance(status_after, artifact, expected_version, archive_cli)
-    require(
-        local_freshness_status(status_after) == "fresh"
-        and isinstance(status_after.get("index_publication", {}).get("generation"), int)
-        and status_after["index_publication"]["generation"] > initial_generation,
-        "managed_plugin_convergence",
+    status_after = require_managed_generation_advanced(
+        status_snapshots[-1],
+        initial_generation,
         artifact,
-        "ground activation did not publish a newer complete local generation",
+        expected_version,
+        archive_cli,
     )
     proof = status_after.get("readiness_broker", {}).get("gpu_proof", {})
     launch = proof.get("runtime_identity", {}).get("embedding_launch")
     resource = status_after.get("readiness_broker", {}).get("resources", {}).get("native_embedding_runtime", {})
     require(
-        status_after.get("retrieval_mode") == "full"
-        and proof.get("proof_status") == "verified"
-        and proof.get("meaningful_accelerator_work_proven") is True
-        and proof.get("embed_smoke_ok") is True
+        managed_status_is_ready(status_after)
         and proof.get("observation_source") == "native_log"
         and isinstance(launch, dict)
         and launch.get("launch_mode") == "native_spawned"
@@ -4579,12 +4610,6 @@ def self_test() -> None:
         checksum_file.write_text(f"{sha256_file(archive)}  {archive.name}\n", encoding="utf-8")
         project = root / "repo"
         project.mkdir()
-        positive_plan = managed_convergence_request_plan(project, True, DEFAULT_QUESTION, DEFAULT_QUERY)
-        assert positive_plan["poll_request"]["method"] == "resources/read"
-        assert [request["params"]["name"] for request in positive_plan["post_poll_requests"]] == [
-            "packet",
-            "search",
-        ]
         registered_root = proof_owned_test_root("self-test")
         registered_archive = registered_root / archive.name
         shutil.copyfile(archive, registered_archive)

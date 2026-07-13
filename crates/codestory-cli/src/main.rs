@@ -2893,14 +2893,18 @@ fn repair_ready_state(
     if let Some(reservation) = handoff_reservation.as_mut() {
         reservation.disarm();
     }
-    if plugin_worker {
-        local_refresh_status::wait_for_local_refresh_lock_release(
-            &runtime.cache_root,
-            &runtime.project_root,
-            READY_REPAIR_LOCAL_REFRESH_WAIT,
+    let local_refresh_handoff = if plugin_worker {
+        Some(
+            local_refresh_status::wait_for_local_refresh_lock(
+                &runtime.cache_root,
+                &runtime.project_root,
+                READY_REPAIR_LOCAL_REFRESH_WAIT,
+            )
+            .context("wait for local refresh before MCP ready repair")?,
         )
-        .context("wait for local refresh before MCP ready repair")?;
-    }
+    } else {
+        None
+    };
     if let Some(sidecar) = sidecar.as_ref()
         && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
@@ -2970,6 +2974,7 @@ fn repair_ready_state(
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
+    drop(local_refresh_handoff);
     if !agent_goal {
         return Ok(None);
     }

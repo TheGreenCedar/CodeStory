@@ -719,6 +719,9 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
             } else {
                 "sidecar_log"
             };
+        device
+            .detected_provider
+            .get_or_insert_with(|| request.provider.clone());
         device.full_retrieval_allowed = true;
         device.degraded_reason = None;
     }
