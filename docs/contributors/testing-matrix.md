@@ -154,13 +154,13 @@ package execution does not close #887; live managed Metal endpoint survival
 still needs reporter or equivalent Apple Silicon hardware evidence. Current
 Ubuntu execution does not prove older-glibc compatibility.
 
-Proof cleanup validates the exact current `lexical_data_dir` and accepts the
-legacy `zoekt_data_dir` spelling only as read compatibility for an otherwise
-proof-owned state file. New state must never emit Zoekt path, port, or image
-keys. When local retrieval indexing fails, the proof records Compose process
-state and bounded Qdrant logs before cleanup so the primary failure remains
-diagnosable; cleanup failure is retained as secondary evidence and must not
-replace the primary gate failure.
+Proof cleanup validates the exact current `lexical_data_dir`. During the v0.15
+migration window it accepts the removed `zoekt_data_dir` spelling only as
+read compatibility for an otherwise proof-owned state file; remove that alias
+in v0.16. New state must emit only lexical path fields. When local retrieval
+indexing fails, the proof records Compose process state and bounded Qdrant logs
+before cleanup so the primary failure remains diagnosable; cleanup failure is
+retained as secondary evidence and must not replace the primary gate failure.
 
 Each native managed-plugin handoff also starts with a verified prior managed
 CLI whose executable can answer only its version probe. The requested packaged

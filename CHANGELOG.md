@@ -8,6 +8,12 @@
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and
   retains the older version only as the verified rollback.
+- Migrated retrieval manifests to schema 21 with a canonical
+  `lexical_version` column. Existing schema-19 and schema-20 rows are renamed
+  in place, and all reads and writes now use the lexical column without
+  recreating the removed legacy field. Non-persistent response/cache aliases
+  were removed; only the v0.15 owned-state and legacy-compose cleanup window
+  remains.
 - Launched the managed Windows Vulkan llama.cpp cells with proof verbosity so
   current-launch logs retain the requested device and positive layer-offload
   evidence required by the accelerator smoke gate.

@@ -16,15 +16,20 @@ with `retrieval_mode=full`.
   selects zero dense anchors, Qdrant is explicitly not required for that
   generation.
 - SCIP graph artifacts exist and are not stub markers.
-- The SQLite `retrieval_index_manifest` has the current schema version,
-  sidecar input hash, sidecar generation, Qdrant collection, embedding backend,
-  embedding dimension, symbol-doc count, dense-anchor count, semantic policy
-  version, graph artifact hash, and dense reason counts.
+- The SQLite `retrieval_index_manifest` has the current schema version and
+  canonical `lexical_version`, sidecar input hash, sidecar generation, Qdrant
+  collection, embedding backend, embedding dimension, symbol-doc count,
+  dense-anchor count, semantic policy version, graph artifact hash, and dense
+  reason counts.
 
 Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
 `unavailable`, stale manifests, stub markers, disabled sidecars, hash vectors,
 removed ONNX configuration, old env aliases, and `CODESTORY_RETRIEVAL=0` fail
 closed for agent-facing packet/search.
+
+Schema 21 renames the former lexical producer column in place, preserving every
+manifest row while removing the legacy column from both fresh and upgraded
+databases. Current code reads and writes only `lexical_version`.
 
 ## Ownership
 

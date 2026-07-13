@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 const MANIFEST_SELECT: &str = "
     SELECT
         project_id,
-        zoekt_version,
+        lexical_version,
         qdrant_collection,
         scip_revision,
         built_at_epoch_ms,
@@ -37,7 +37,6 @@ const MANIFEST_SELECT: &str = "
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalIndexManifest {
     pub project_id: String,
-    #[serde(alias = "zoekt_version")]
     pub lexical_version: String,
     pub qdrant_collection: String,
     pub scip_revision: Option<String>,
@@ -77,7 +76,7 @@ impl Storage {
         self.conn.execute(
             "INSERT INTO retrieval_index_manifest (
                 project_id,
-                zoekt_version,
+                lexical_version,
                 qdrant_collection,
                 scip_revision,
                 built_at_epoch_ms,
@@ -100,7 +99,7 @@ impl Storage {
                 precise_semantic_import_producer
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
             ON CONFLICT(project_id) DO UPDATE SET
-                zoekt_version = excluded.zoekt_version,
+                lexical_version = excluded.lexical_version,
                 qdrant_collection = excluded.qdrant_collection,
                 scip_revision = excluded.scip_revision,
                 built_at_epoch_ms = excluded.built_at_epoch_ms,

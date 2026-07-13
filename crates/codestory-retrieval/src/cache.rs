@@ -9,7 +9,6 @@ use std::collections::{HashMap, VecDeque};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RetrievalCacheKey {
     pub project_id: String,
-    #[serde(alias = "zoekt_version")]
     pub lexical_version: String,
     pub qdrant_collection: String,
     pub scip_revision: Option<String>,

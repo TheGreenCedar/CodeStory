@@ -243,7 +243,7 @@ def validated_proof_compose_state(cache_root: Path, project: Path, read_state) -
     if lexical_value is None:
         lexical_value = state.get("zoekt_data_dir")
     if not isinstance(lexical_value, str) or not lexical_value:
-        raise TypeError(f"proof sidecar state lexical_data_dir or legacy zoekt_data_dir is not a path string: {state_file}")
+        raise TypeError(f"proof sidecar state canonical or legacy lexical data directory is not a path string: {state_file}")
     observed = Path(lexical_value)
     if observed != lexical_expected or observed.is_symlink():
         raise RuntimeError(f"proof sidecar state lexical_data_dir escaped its cache root: {state_file}")

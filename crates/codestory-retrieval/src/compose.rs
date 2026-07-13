@@ -700,16 +700,11 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
 }
 
 fn compose_down_environment(state: &SidecarStateFile) -> Vec<(&'static str, String)> {
-    vec![
+    let mut environment = vec![
         ("CODESTORY_SIDECAR_NAMESPACE", state.namespace.clone()),
         (
             "CODESTORY_QDRANT_DATA_DIR",
             docker_bind_path(Path::new(&state.qdrant_data_dir)),
-        ),
-        // Migration-only: old compose files require this interpolation while `down` parses them.
-        (
-            "CODESTORY_ZOEKT_DATA_DIR",
-            docker_bind_path(Path::new(&state.lexical_data_dir)),
         ),
         // Compose requires this variable while parsing the file. `down` does not
         // access the model mount, so an existing owned data path is sufficient.
@@ -717,7 +712,21 @@ fn compose_down_environment(state: &SidecarStateFile) -> Vec<(&'static str, Stri
             "CODESTORY_EMBED_MODEL_DIR",
             docker_bind_path(Path::new(&state.qdrant_data_dir)),
         ),
-    ]
+    ];
+    // Migration-only: emit the removed interpolation variable solely while parsing an
+    // owned legacy compose file that still references it. Current compose files never do.
+    if state
+        .compose_file
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|compose| compose.contains("CODESTORY_ZOEKT_DATA_DIR"))
+    {
+        environment.push((
+            "CODESTORY_ZOEKT_DATA_DIR",
+            docker_bind_path(Path::new(&state.lexical_data_dir)),
+        ));
+    }
+    environment
 }
 
 fn docker_compose_command() -> Result<Command> {
@@ -1882,13 +1891,44 @@ mod tests {
             environment.get("CODESTORY_QDRANT_DATA_DIR"),
             Some(&docker_bind_path(Path::new(&state.qdrant_data_dir)))
         );
-        assert_eq!(
-            environment.get("CODESTORY_ZOEKT_DATA_DIR"),
-            Some(&docker_bind_path(Path::new(&state.lexical_data_dir)))
-        );
+        assert!(!environment.contains_key("CODESTORY_ZOEKT_DATA_DIR"));
         assert_eq!(
             environment.get("CODESTORY_EMBED_MODEL_DIR"),
             Some(&docker_bind_path(Path::new(&state.qdrant_data_dir)))
+        );
+    }
+
+    #[test]
+    fn compose_down_emits_removed_interpolation_only_for_legacy_compose_input() {
+        let root = tempdir().expect("root");
+        let compose_file = root.path().join("legacy-compose.yml");
+        std::fs::write(
+            &compose_file,
+            "volumes:\n  - ${CODESTORY_ZOEKT_DATA_DIR}:/data\n",
+        )
+        .expect("write legacy compose fixture");
+        let state: SidecarStateFile = serde_json::from_value(serde_json::json!({
+            "owner": "codestory",
+            "profile": "agent",
+            "namespace": "codestory-agent-test",
+            "compose_project": "codestory-agent-test",
+            "qdrant_http_port": 16333,
+            "qdrant_grpc_port": 16334,
+            "lexical_data_dir": root.path().join("lexical"),
+            "qdrant_data_dir": root.path().join("qdrant"),
+            "scip_artifacts_root": root.path().join("scip"),
+            "compose_file": compose_file,
+            "cleanup_command": "codestory-cli retrieval down",
+            "started_at_epoch_ms": 1
+        }))
+        .expect("state");
+
+        let environment = compose_down_environment(&state)
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment.get("CODESTORY_ZOEKT_DATA_DIR"),
+            Some(&docker_bind_path(Path::new(&state.lexical_data_dir)))
         );
     }
 

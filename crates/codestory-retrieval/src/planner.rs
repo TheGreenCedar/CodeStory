@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStageKind {
     Stage0ScipAnchor,
-    #[serde(alias = "stage1_zoekt_lexical")]
     Stage1Lexical,
     Stage1bQdrantSemantic,
     Stage2ScipExpand,
