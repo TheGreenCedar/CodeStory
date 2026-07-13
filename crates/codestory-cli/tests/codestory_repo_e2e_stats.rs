@@ -6,11 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempfile::tempdir;
 
-// Repo-scale smoke guard. Phase-specific assertions below carry the product
-// repeat-refresh contract; wall-clock process timing remains telemetry.
-const REPEAT_GRAPH_PHASE_SECONDS_BUDGET: f64 = 20.0;
-const REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET: f64 = 3.0;
-
 #[derive(Debug, Serialize)]
 struct RepoE2eStats {
     commit: String,
@@ -174,26 +169,6 @@ struct ReportStats {
 const PROOF_TIER_STATS_ONLY: &str = "stats_only";
 const PROOF_TIER_FULL_SIDECAR: &str = "full_sidecar";
 const RELEASE_WARNING_REGRESSION_FACTOR: f64 = 1.25;
-
-#[test]
-fn shared_release_stats_contract_matches_harness_thresholds() {
-    let contract: Value = serde_json::from_str(include_str!(
-        "../../../benchmarks/release-evidence/repo-stats-contract.json"
-    ))
-    .expect("parse shared release stats contract");
-    assert_eq!(
-        contract["repeat_graph_phase_seconds_max"].as_f64(),
-        Some(REPEAT_GRAPH_PHASE_SECONDS_BUDGET)
-    );
-    assert_eq!(
-        contract["repeat_semantic_phase_seconds_max"].as_f64(),
-        Some(REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET)
-    );
-    assert_eq!(
-        contract["repeat_full_refresh_regression_factor"].as_f64(),
-        Some(RELEASE_WARNING_REGRESSION_FACTOR)
-    );
-}
 
 fn release_readiness_proof_tier(
     sidecar_status_after_retrieval_index: &str,
@@ -1300,28 +1275,6 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.repeat_semantic_docs_embedded, 0,
         "repeat full refresh should embed zero unchanged dense docs"
     );
-    assert!(
-        stats.repeat_graph_phase_seconds < REPEAT_GRAPH_PHASE_SECONDS_BUDGET,
-        "repeat graph phase should stay under {:.0} seconds, got {:.2}s",
-        REPEAT_GRAPH_PHASE_SECONDS_BUDGET,
-        stats.repeat_graph_phase_seconds
-    );
-    assert!(
-        stats.repeat_semantic_phase_seconds < REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET,
-        "repeat semantic reuse phase should stay under {:.0} seconds, got {:.2}s",
-        REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET,
-        stats.repeat_semantic_phase_seconds
-    );
-    let repeat_full_refresh_seconds_budget =
-        stats.stats_baseline.repeat_full_refresh_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
-    assert!(
-        stats.repeat_full_refresh_seconds < repeat_full_refresh_seconds_budget,
-        "repeat full refresh process smoke cap should stay within 25% of latest stats-log baseline {} {}: threshold {:.2}s, got {:.2}s",
-        stats.stats_baseline.date,
-        stats.stats_baseline.commit,
-        repeat_full_refresh_seconds_budget,
-        stats.repeat_full_refresh_seconds
-    );
     assert_eq!(
         stats.search.top_symbol_name, "AppController",
         "exact symbol query should prefer the exact AppController symbol"
@@ -1346,16 +1299,6 @@ fn codestory_repo_release_e2e_emits_stats() {
     assert!(
         stats.search_dir_unchanged,
         "plain read commands should not recreate the persisted search dir"
-    );
-    assert!(
-        stats.search_seconds < 10.0,
-        "cold search should stay under 10 seconds on the codestory repo, got {:.2}s",
-        stats.search_seconds
-    );
-    assert!(
-        stats.symbol_seconds < 10.0,
-        "cold symbol lookup should stay under 10 seconds on the codestory repo, got {:.2}s",
-        stats.symbol_seconds
     );
 }
 

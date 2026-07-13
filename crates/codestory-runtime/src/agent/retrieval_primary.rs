@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_000;
+const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_500;
 const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
 const MAX_PACKET_BATCH_BUDGET_MS: u64 = 120_000;
 const MAX_SHADOW_CANDIDATES: usize = 20;
@@ -2257,8 +2257,8 @@ mod tests {
     #[test]
     fn sidecar_budget_respects_latency_cap() {
         assert_eq!(sidecar_budget_ms(Some(400)), 400);
-        assert_eq!(sidecar_budget_ms(Some(5_000)), DEFAULT_SIDECAR_BUDGET_MS);
-        assert_eq!(sidecar_budget_ms(None), DEFAULT_SIDECAR_BUDGET_MS);
+        assert_eq!(sidecar_budget_ms(Some(5_000)), 1_500);
+        assert_eq!(sidecar_budget_ms(None), 1_500);
     }
 
     #[test]
