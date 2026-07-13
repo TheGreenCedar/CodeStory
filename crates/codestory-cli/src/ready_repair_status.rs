@@ -369,7 +369,9 @@ pub(crate) fn adopt_ready_repair_reservation(
     attempt_id: &str,
 ) -> Result<ReadyRepairReservation> {
     let pid = std::process::id();
-    let process_start_identity = recorded_process_start_identity(pid);
+    let process_start_identity = recorded_process_start_identity(pid)
+        .filter(|identity| !identity.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("could not prove ready repair worker start identity"))?;
     let _coordination = acquire_ready_repair_coordination(sidecar)?;
     let path = ready_repair_reservation_path(sidecar);
     let mut reservation = read_ready_repair_reservation_file(&path)
@@ -391,7 +393,7 @@ pub(crate) fn adopt_ready_repair_reservation(
         anyhow::bail!("ready repair reservation parent is no longer the recorded process");
     }
     reservation.pid = pid;
-    reservation.process_start_identity = process_start_identity;
+    reservation.process_start_identity = Some(process_start_identity);
     reservation.started_at_epoch_ms = now_epoch_ms();
     reservation.adopted = true;
     crate::file_state::write_json_atomic(&path, "ready-repair-reservation", &reservation)?;
@@ -403,6 +405,57 @@ pub(crate) fn adopt_ready_repair_reservation(
             .unwrap_or(reservation.started_at_epoch_ms),
         armed: true,
     })
+}
+
+pub(crate) fn wait_for_ready_repair_reservation_adoption(
+    sidecar: &SidecarRuntimeConfig,
+    attempt_id: &str,
+    pid: u32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let _coordination = acquire_ready_repair_coordination(sidecar)?;
+            let reservation =
+                read_ready_repair_reservation_file(&ready_repair_reservation_path(sidecar))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ready repair reservation disappeared during handoff")
+                    })?;
+            if reservation.attempt_id != attempt_id {
+                anyhow::bail!("ready repair reservation changed attempt during handoff");
+            }
+            if reservation.adopted {
+                if reservation.pid != pid {
+                    anyhow::bail!("ready repair reservation adopted an invalid worker identity");
+                }
+                let expected_start_identity = reservation
+                    .process_start_identity
+                    .as_deref()
+                    .filter(|identity| !identity.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ready repair reservation adopted without a worker start identity"
+                        )
+                    })?;
+                match probe_process(reservation.pid) {
+                    ProcessProbe::NotRunning => return Ok(()),
+                    ProcessProbe::Running {
+                        start_identity: Some(actual),
+                    } if actual == expected_start_identity => return Ok(()),
+                    ProcessProbe::Running { .. } | ProcessProbe::Unknown => {
+                        anyhow::bail!(
+                            "ready repair reservation adopted an invalid worker identity"
+                        );
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for ready repair reservation adoption");
+        }
+        thread::sleep(READY_REPAIR_COORDINATION_POLL);
+    }
 }
 
 pub(crate) fn remove_ready_repair_reservation_if_attempt(
@@ -1419,6 +1472,13 @@ mod tests {
         assert_eq!(stored.attempt_id, attempt_id);
         assert!(stored.adopted);
         assert_eq!(stored.pid, std::process::id());
+        wait_for_ready_repair_reservation_adoption(
+            &sidecar,
+            &attempt_id,
+            std::process::id(),
+            Duration::ZERO,
+        )
+        .expect("parent observes exact adopted worker");
         drop(adopted);
         assert!(!ready_repair_reservation_path(&sidecar).exists());
     }

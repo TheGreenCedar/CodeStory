@@ -186,9 +186,12 @@ launcher on a self-hosted macOS 15 ARM64 runner. It is release-blocking and must
 preserve cold, warm, endpoint-death, and repaired status/log/packet artifacts.
 The cold path seeds a complete local publication, makes it stale with Agent
 sidecars absent, confirms `codestory://status` changes no ownership, and invokes
-only managed MCP `ground`. Canonical status polling must observe one successful
+only managed MCP `ground`. Before activation returns, MCP must observe the
+worker adopt its exact cache-owned repair reservation. Canonical status polling
+must observe one successful
 `shared-agent` attempt, a newer local generation, `native_spawned` Metal,
-positive offload, a bounded live embed smoke, `gpu_proof=verified`, and full
+an independent Metal runtime-init marker, positive offload, a bounded live
+embed smoke, `gpu_proof=verified`, and full
 retrieval before packet/search run through that same MCP session. A fresh MCP
 process must then reuse the exact native PID and launch fingerprint without a
 duplicate server. The remainder of the workflow proves readiness blocking after

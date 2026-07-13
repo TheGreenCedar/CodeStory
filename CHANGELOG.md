@@ -82,7 +82,11 @@
   Managed repair now retains the grounding-owned local refresh lock through
   its index open instead of racing a second refresh and failing `cache_busy` on
   larger repositories. Runtime-log proof records Metal as the detected
-  provider before packet/search can open.
+  provider before packet/search can open, but only when a Metal runtime-init
+  marker and positive offload agree; requested-provider text and package paths
+  do not count. MCP now waits for the child to adopt its cache-owned repair
+  reservation before publishing the handoff, and proof cleanup trusts that
+  reservation even when the grounding response or first status poll fails.
   Release packaging remains compatible with the system Python shipped by
   macOS 15, including Docker 29's nanosecond creation timestamps.
 - Expanded managed-plugin provisioning, local grounding, repair handoff, and

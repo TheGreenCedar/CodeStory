@@ -1160,6 +1160,13 @@ def cleanup_proof_cache(
         error = f"proof cache contains unregistered sidecar state: {unexpected}"
         results.append({"kind": "compose_state_validation", "error": error})
         errors.append(error)
+    worker_cleanup, worker_errors = cleanup_proof_owned_repair_workers(
+        canonical_cache,
+        project,
+        identities,
+    )
+    results.extend(worker_cleanup)
+    errors.extend(worker_errors)
     validated_states: list[tuple[dict, dict]] = []
     for identity in identities:
         try:
@@ -2041,6 +2048,50 @@ def windows_last_error(kernel32) -> int:
     return int(getattr(kernel32, "last_error", ctypes.get_last_error()))
 
 
+def process_start_identity_snapshot(
+    pid: int,
+    run=subprocess.run,
+    *,
+    platform: str | None = None,
+    system: str | None = None,
+) -> tuple[str, str | None]:
+    platform = platform or os.name
+    system = system or sys.platform
+    if pid <= 0:
+        return "invalid_pid", None
+    if system.startswith("linux"):
+        try:
+            stat_text = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return "already_exited", None
+        except OSError:
+            return "unknown", None
+        fields = stat_text.rsplit(") ", 1)
+        start = fields[1].split()[19] if len(fields) == 2 and len(fields[1].split()) > 19 else None
+        return ("running", f"linux:{start}") if start else ("unknown", None)
+    if platform == "nt":
+        script = f'$p=Get-CimInstance Win32_Process -Filter "ProcessId = {pid}" -ErrorAction Stop; if ($null -eq $p) {{ exit 2 }}; $p.CreationDate.ToUniversalTime().Ticks'
+        command, prefix, gone = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], "windows:", 2
+    else:
+        command, prefix, gone = ["ps", "-o", "lstart=", "-p", str(pid)], "unix:", 1
+    try:
+        result = run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2,
+            check=False,
+            text=True,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", None
+    if result.returncode == gone:
+        return "already_exited", None
+    identity = result.stdout.strip()
+    return ("running", f"{prefix}{identity}") if result.returncode == 0 and identity else ("unknown", None)
+
+
 def require_windows_process_exit(process_handle, pid: int, timeout_ms: int = 10_000, kernel32=None) -> None:
     kernel32 = kernel32 or windows_process_api()
     wait_result = kernel32.WaitForSingleObject(process_handle, timeout_ms)
@@ -2055,6 +2106,7 @@ def terminate_worker_pid(
     pid: int,
     diagnostics: dict | None = None,
     *,
+    expected_start_identity: str | None = None,
     kernel32=None,
     run=subprocess.run,
     platform: str | None = None,
@@ -2065,6 +2117,19 @@ def terminate_worker_pid(
     if pid <= 0:
         diagnostics["status"] = "invalid_pid"
         return
+    if expected_start_identity is not None:
+        identity_status, actual_start_identity = process_start_identity_snapshot(pid)
+        diagnostics["process_identity"] = {
+            "status": identity_status,
+            "start_identity": actual_start_identity,
+        }
+        if identity_status == "already_exited":
+            diagnostics["status"] = "already_exited"
+            return
+        if identity_status != "running":
+            raise RuntimeError(f"could not prove worker process {pid} start identity")
+        if actual_start_identity != expected_start_identity:
+            raise RuntimeError(f"refusing to terminate reused worker pid {pid}")
     if platform == "nt":
         kernel32 = kernel32 or windows_process_api()
         process_handle = None
@@ -2150,8 +2215,8 @@ def terminate_worker_pid(
         deadline = time.monotonic() + 10
         while True:
             try:
-                exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-                if exited is not None:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+                if waited_pid == pid:
                     diagnostics["status"] = "terminated"
                     return
             except ChildProcessError:
@@ -2168,50 +2233,73 @@ def terminate_worker_pid(
             time.sleep(0.1)
 
 
-def active_repair_worker(record: object, source: str) -> dict | None:
-    if not isinstance(record, dict):
-        return None
-    pid = record.get("pid")
-    attempt_id = record.get("attempt_id")
-    if not isinstance(pid, int) or pid <= 0 or not isinstance(attempt_id, str) or not attempt_id:
-        return None
-    return {"pid": pid, "attempt_id": attempt_id, "source": source}
-
-
-def proof_started_repair_workers(responses: list[dict]) -> list[dict]:
-    responses_by_id = {response.get("id"): response for response in responses if isinstance(response, dict)}
-    workers = []
-    repair = responses_by_id.get("repair", {}).get("result", {}).get("structuredContent", {})
-    status = status_from_resource_response(responses_by_id.get("status_after_repair", {}))
-    active = status.get("sidecar_setup", {}).get("active_repair") if isinstance(status, dict) else None
-    worker = active_repair_worker(active, "proof_started_repair_response")
-    if (
-        isinstance(repair, dict)
-        and repair.get("status") == "started"
-        and worker is not None
-        and worker["attempt_id"] == repair.get("attempt_id")
-        and worker["pid"] == repair.get("pid")
-    ):
-        workers.append(worker)
-
-    ground = responses_by_id.get("ground_activation", {})
-    ground_succeeded = (
-        structured_content_from_response(ground) is not None
-        and ground.get("result", {}).get("isError") is not True
-    )
-    if ground_succeeded:
-        statuses = resource_statuses(responses, "convergence_status_")
-        latest_status = statuses[-1] if statuses else None
-        active = (
-            latest_status.get("sidecar_setup", {}).get("active_repair")
-            if isinstance(latest_status, dict)
-            else None
-        )
-        worker = active_repair_worker(active, "ground_activation_convergence_status")
-        if worker is not None:
-            workers.append(worker)
-
-    return list({(worker["pid"], worker["attempt_id"]): worker for worker in workers}.values())
+def cleanup_proof_owned_repair_workers(
+    cache_root: Path,
+    project: Path,
+    registered_sidecars: list[dict] | None = None,
+) -> tuple[list[dict], list[str]]:
+    evidence = []
+    errors = []
+    canonical_cache = cache_root.resolve(strict=False)
+    identities = registered_sidecars or proof_agent_identities([canonical_cache], project)
+    for identity in identities:
+        item = None
+        try:
+            if (
+                not isinstance(identity, dict)
+                or Path(str(identity.get("cache_root", ""))).resolve(strict=False) != canonical_cache
+            ):
+                continue
+            path = Path(identity["state_file"]).with_name("ready-repair-enqueue.lock")
+            if not path.exists():
+                continue
+            if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(canonical_cache):
+                raise RuntimeError(f"proof ready-repair reservation is unsafe: {path}")
+            record = read_json_file(path)
+            if not isinstance(record, dict):
+                raise RuntimeError(f"proof ready-repair reservation is invalid: {path}")
+            if record.get("adopted") is not True:
+                continue
+            project_root = record.get("project_root")
+            expected = (identity["project"], identity["profile"], identity["run_id"], identity["namespace"])
+            observed = (
+                str(Path(project_root).resolve(strict=False)) if isinstance(project_root, str) else None,
+                record.get("profile"),
+                record.get("run_id"),
+                record.get("namespace"),
+            )
+            pid = record.get("pid")
+            attempt = record.get("token")
+            start = record.get("process_start_identity")
+            if observed != expected or not isinstance(pid, int) or pid <= 0:
+                raise RuntimeError("proof ready-repair reservation ownership changed")
+            if not isinstance(attempt, str) or not attempt or not isinstance(start, str) or not start:
+                raise RuntimeError("proof ready-repair reservation process identity is incomplete")
+            item = {
+                "kind": "ready_repair_worker_cleanup",
+                "pid": pid,
+                "attempt_id": attempt,
+                "process_start_identity": start,
+                "source": path.name,
+            }
+            evidence.append(item)
+            terminate_worker_pid(
+                pid,
+                item,
+                expected_start_identity=start,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if item is None:
+                evidence.append({
+                    "kind": "ready_repair_worker_validation",
+                    "state_file": str(identity.get("state_file", "")) if isinstance(identity, dict) else "",
+                    "error": error,
+                })
+            else:
+                item["error"] = error
+            errors.append(error)
+    return evidence, errors
 
 
 def read_stdio_line(stdout_queue: queue.Queue[str | None], timeout_secs: int) -> str | None:
@@ -2744,18 +2832,15 @@ def stdio_status_command(
                 terminate_process_tree(process)
             process_terminated = True
         worker_cleanup_artifact = artifact.with_name(f"{artifact.stem}-worker-cleanup.json")
-        worker_cleanup = []
-        owned_workers = proof_started_repair_workers(responses) if cleanup_status_workers else []
-        for worker in owned_workers:
-            evidence = dict(worker)
-            worker_cleanup.append(evidence)
-            try:
-                terminate_worker_pid(worker["pid"], evidence)
-            except Exception as exc:
-                evidence["error"] = f"{type(exc).__name__}: {exc}"
-                write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
-                raise
-            write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
+        cache_value = (env or os.environ).get("CODESTORY_CACHE_ROOT")
+        worker_cleanup, worker_errors = (
+            cleanup_proof_owned_repair_workers(Path(cache_value), project)
+            if cleanup_status_workers and cache_value
+            else ([], [])
+        )
+        write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
+        if worker_errors:
+            raise RuntimeError("proof-owned repair worker cleanup failed: " + "; ".join(worker_errors))
         if process.poll() is None:
             process.kill()
             process.wait(timeout=2)
@@ -4309,6 +4394,15 @@ def self_test() -> None:
                 microsecond
             )
 
+        windows_probe_commands = []
+        def failed_windows_probe(command, **_kwargs):
+            windows_probe_commands.append(command)
+            return subprocess.CompletedProcess(command, 1, "", "CIM provider failed")
+        failed_windows_identity = process_start_identity_snapshot(
+            42, failed_windows_probe, platform="nt", system="win32"
+        )
+        assert failed_windows_identity[0] == "unknown" and "-ErrorAction Stop" in windows_probe_commands[0][-1]
+
         def proof_owned_test_root(suffix: str) -> Path:
             path = proof_root_parent / f"codestory-metal-proof-owned-{suffix}"
             path.mkdir()
@@ -4419,6 +4513,39 @@ def self_test() -> None:
             state_file = Path(identity["state_file"])
             write_json(state_file, state)
             return state_file
+
+        if os.name != "nt":
+            worker_cache = root / "ready-repair-cleanup"
+            identity = proof_agent_identity(worker_cache, root, PROOF_LOCAL_RUN_ID)
+            Path(identity["state_file"]).parent.mkdir(parents=True)
+            repair_worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                status, start = process_start_identity_snapshot(repair_worker.pid)
+                assert status == "running"
+                record = {
+                    "project_root": identity["project"],
+                    "profile": identity["profile"],
+                    "run_id": identity["run_id"],
+                    "namespace": identity["namespace"],
+                    "pid": repair_worker.pid,
+                    "token": "proof-ground-activation",
+                    "process_start_identity": start,
+                    "adopted": True,
+                }
+                status_path = Path(identity["state_file"]).with_name("ready-repair-status.json")
+                lock_path = status_path.with_name("ready-repair-enqueue.lock")
+                status_path.write_text("{", encoding="utf-8")
+                write_json(lock_path, record)
+                cleanup, errors = cleanup_proof_owned_repair_workers(
+                    worker_cache, root, [identity]
+                )
+                repair_worker.wait(timeout=5)
+                assert not errors and cleanup[0]["attempt_id"] == record["token"]
+                assert cleanup[0]["status"] == "terminated"
+            finally:
+                if repair_worker.poll() is None:
+                    repair_worker.terminate()
+                    repair_worker.wait(timeout=5)
 
         compose_cleanup_root = root / "compose-cleanup"
         write_proof_compose_state(compose_cleanup_root)
