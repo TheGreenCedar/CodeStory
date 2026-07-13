@@ -1,0 +1,135 @@
+name: Exact-head source proof
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      proof_key:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Same-repository pull request accepted by exact-head review.
+        required: true
+        type: string
+      expected_head_sha:
+        description: Exact reviewed head SHA. The gate refuses a newer or older head.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: source-proof-${{ inputs.proof_key || inputs.pr_number || github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name != 'review-accepted' && github.event.label.name || 'candidate' }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    if: github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'review-accepted')
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Resolve trusted exact head
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          CALLER_REF: ${{ inputs.ref }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "$EVENT_PR_NUMBER" ]; then
+            test "$EVENT_HEAD_REPO" = "$GITHUB_REPOSITORY" || {
+              echo "::error::Exact-head proof does not execute fork pull requests."
+              exit 1
+            }
+            pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$EVENT_PR_NUMBER")"
+            current_head="$(jq -r '.head.sha' <<<"$pr")"
+            test "$current_head" = "$EVENT_HEAD_SHA" || {
+              echo "::error::PR #$EVENT_PR_NUMBER moved after the review-accepted label event."
+              exit 1
+            }
+            echo "ref=$EVENT_HEAD_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$PR_NUMBER" ]; then
+            pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+            head_repo="$(jq -r '.head.repo.full_name' <<<"$pr")"
+            head_sha="$(jq -r '.head.sha' <<<"$pr")"
+            test "$head_repo" = "$GITHUB_REPOSITORY" || {
+              echo "::error::Exact-head proof does not execute fork pull requests."
+              exit 1
+            }
+            test "$head_sha" = "$EXPECTED_HEAD_SHA" || {
+              echo "::error::PR #$PR_NUMBER moved from reviewed head $EXPECTED_HEAD_SHA to $head_sha."
+              exit 1
+            }
+            echo "ref=$head_sha" >> "$GITHUB_OUTPUT"
+          else
+            test -n "$CALLER_REF"
+            echo "ref=$CALLER_REF" >> "$GITHUB_OUTPUT"
+          fi
+
+  full-source-gate:
+    name: full-source-gate
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Capture Rust cache identity
+        id: rust-cache-key
+        shell: bash
+        run: |
+          echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo inputs and output
+        id: cargo-cache-restore
+        uses: actions/cache/restore@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-source-proof-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-source-proof-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-
+
+      - name: Test the complete workspace once
+        run: cargo test --workspace --locked
+
+      - name: Lint every workspace target and feature once
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Save Cargo inputs and output
+        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        uses: actions/cache/save@v5
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
