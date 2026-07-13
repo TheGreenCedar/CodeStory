@@ -24,6 +24,9 @@
   the native process creation time. Immediate identity reads and snapshot start
   times no longer depend on CIM convergence and retain the existing serialized
   identity format.
+- Raised the bounded primary sidecar query window to 1.5 seconds so cold SCIP
+  and lexical stages can borrow enough request slack to complete without
+  changing incomplete or cancelled trace eligibility.
 - Made incremental freshness compare verified parser source hashes when file
   mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
   stale graph data current, while legacy and non-parser rows retain the
