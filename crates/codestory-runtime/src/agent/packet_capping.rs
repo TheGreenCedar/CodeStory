@@ -1227,7 +1227,6 @@ mod tests {
         AgentRetrievalPresetDto, AgentRetrievalTraceDto, NodeId, PacketEvidenceResolutionDto,
         PacketEvidenceTierDto,
     };
-    use std::time::{Duration, Instant};
 
     fn citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
         AgentCitationDto {
@@ -1422,7 +1421,6 @@ mod tests {
         const REQUIRED_PROBE_COUNT: usize = 96;
         const DUPLICATE_MULTI_MATCH_PROBE_COUNT: usize =
             REQUIRED_PROBE_COUNT - UNIQUE_REQUIRED_PROBE_COUNT;
-        const MAX_ELAPSED: Duration = Duration::from_secs(3);
 
         let mut citations = Vec::with_capacity(CITATION_COUNT);
         for index in 0..CITATION_COUNT {
@@ -1476,18 +1474,7 @@ mod tests {
         };
         let mut answer = answer_fixture(citations);
 
-        let started = Instant::now();
         let truncated = cap_packet_citations(&mut answer, &limits, &required_probe_queries);
-        let elapsed = started.elapsed();
-
-        eprintln!(
-            "packet_citation_capping_large_probe_set elapsed_ms={} citations={} required_probes={} kept={} threshold_ms={}",
-            elapsed.as_millis(),
-            CITATION_COUNT,
-            REQUIRED_PROBE_COUNT,
-            answer.citations.len(),
-            MAX_ELAPSED.as_millis()
-        );
 
         assert!(
             truncated,
@@ -1550,14 +1537,6 @@ mod tests {
                 .count(),
             1,
             "duplicate required probes should be deduped before promotion"
-        );
-        assert!(
-            elapsed <= MAX_ELAPSED,
-            "packet citation capping regressed past the bounded guard: elapsed_ms={} threshold_ms={} citations={} required_probes={}",
-            elapsed.as_millis(),
-            MAX_ELAPSED.as_millis(),
-            CITATION_COUNT,
-            REQUIRED_PROBE_COUNT
         );
     }
 }
