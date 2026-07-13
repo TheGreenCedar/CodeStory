@@ -56,8 +56,8 @@ function packagedPrSigningPolicyViolations(content) {
   if (yamlJobWithValue(packagedProofJob, "sign_macos") !== "false") {
     found.push("named packaged-proof job must set with.sign_macos to false");
   }
-  if (/^\s+secrets:\s*(?:#.*)?$/mu.test(content)) {
-    found.push("must not contain a secrets block");
+  if (packagedProofJob.some((line) => /^    secrets:/u.test(line))) {
+    found.push("named packaged-proof job must not receive caller secrets");
   }
   if (/\bAPPLE_[A-Z0-9_]+\b/u.test(content)) {
     found.push("must not reference Apple secret identifiers");
@@ -557,6 +557,10 @@ if (!fs.existsSync(packagedPlatformPr)) {
         "      sign_macos: false",
         "      sign_macos: false\n    secrets:\n      PACKAGE_PROOF_TOKEN: ${{ secrets.PACKAGE_PROOF_TOKEN }}",
       ),
+    ],
+    [
+      "inherited secrets",
+      content.replace("      sign_macos: false", "      sign_macos: false\n    secrets: inherit"),
     ],
     [
       "Apple secret identifier",
