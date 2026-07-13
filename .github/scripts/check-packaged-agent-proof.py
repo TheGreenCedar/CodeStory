@@ -1452,7 +1452,7 @@ def require_intel_cpu_external_ready(payload: object, artifact: Path, endpoint: 
     require(payload.get("compose_started") is False, "intel_cpu_external", artifact, "external endpoint proof unexpectedly started Compose")
     require(payload.get("embed_reachable") is True, "intel_cpu_external", artifact, "explicit CPU/external embedding endpoint was not reachable")
     require(state.get("embed_url") == endpoint, "intel_cpu_external", artifact, "sidecar state did not retain the explicit embedding endpoint")
-    require(state.get("embedding_device_policy") == "allow_cpu", "intel_cpu_external", artifact, "CPU policy was not labelled allow_cpu")
+    require(state.get("embedding_device_policy") == "cpu_allowed", "intel_cpu_external", artifact, "CPU policy was not labelled cpu_allowed")
     require(state.get("embedding_device_state") == "cpu", "intel_cpu_external", artifact, "CPU runtime was not labelled cpu")
     require(state.get("embedding_device_observation_source") == "cpu_policy", "intel_cpu_external", artifact, "CPU runtime observation source is not cpu_policy")
     require(state.get("embedding_cpu_allowed") is True, "intel_cpu_external", artifact, "CPU runtime did not report explicit CPU allowance")
@@ -3870,6 +3870,14 @@ def expect_fake_gate_failure(
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-self-test-") as temp:
         root = Path(temp)
+        runner_temp = os.environ.get("RUNNER_TEMP", "").strip()
+        proof_root_parent = Path(runner_temp).resolve(strict=True) if runner_temp else root
+
+        def proof_owned_test_root(suffix: str) -> Path:
+            path = proof_root_parent / f"codestory-metal-proof-owned-{suffix}"
+            path.mkdir()
+            return path
+
         evidence_cache = root / "native-evidence-cache"
         evidence_cache.mkdir()
         native_log = evidence_cache / "llama-server-native.log"
@@ -4171,8 +4179,7 @@ def self_test() -> None:
         checksum_file.write_text(f"{sha256_file(archive)}  {archive.name}\n", encoding="utf-8")
         project = root / "repo"
         project.mkdir()
-        registered_root = root / "codestory-metal-proof-owned-self-test"
-        registered_root.mkdir()
+        registered_root = proof_owned_test_root("self-test")
         registered_archive = registered_root / archive.name
         shutil.copyfile(archive, registered_archive)
         registered_cache = registered_root / "codestory-packaged-proof-cache-self-test"
@@ -4217,8 +4224,7 @@ def self_test() -> None:
         )
 
         if sys.platform == "darwin":
-            retry_root = root / "codestory-metal-proof-owned-missing-edge"
-            retry_root.mkdir()
+            retry_root = proof_owned_test_root("missing-edge")
             retry_archive = retry_root / archive.name
             shutil.copyfile(archive, retry_archive)
             vanished_project = root / "vanished edge project"
@@ -4316,8 +4322,7 @@ def self_test() -> None:
             ]
             assert retry_cleanup["native_processes"][0]["status"] == "terminated"
 
-        tampered_root = root / "codestory-metal-proof-owned-tampered"
-        tampered_root.mkdir()
+        tampered_root = proof_owned_test_root("tampered")
         tampered_archive = tampered_root / archive.name
         shutil.copyfile(archive, tampered_archive)
         tampered_cache = tampered_root / "codestory-packaged-proof-cache-tampered"
