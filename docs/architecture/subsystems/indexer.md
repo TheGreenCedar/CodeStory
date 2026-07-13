@@ -35,7 +35,7 @@ The indexer does not choose staged versus live storage. It only consumes a refre
 `WorkspaceIndexer::run` handles both full and incremental work, but the plan changes the behavior:
 
 - full refresh indexes every discovered source file, does not remove file rows, and runs unscoped resolution
-- incremental refresh only touches files whose mtime increased or that were previously not indexed, tracks removed file IDs, seeds the symbol table from existing rows, and scopes resolution to touched files
+- incremental refresh only touches files whose mtime changed, whose verified parser source hash no longer matches, or that were previously not indexed; it tracks removed file IDs, seeds the symbol table from existing rows, and scopes resolution to touched files
 
 Incremental work also does more cleanup:
 

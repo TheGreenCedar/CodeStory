@@ -92,13 +92,19 @@ The indexer does not know whether the store is staged or live.
 
 - `source_files` walks the configured source groups from the workspace manifest, follows directories, applies exclude globs, sorts the result, and removes duplicates
 - `source_inventory` retains whether that walk was complete, partial, unreadable, or stopped by its candidate bound, plus any traversal failures
-- `build_refresh_plan` compares discovered files against stored inventory and only plans stored-file deletion from a complete inventory
+- `build_refresh_plan` compares discovered files against stored inventory and only plans stored-file deletion from a complete inventory. Stored parser-backed rows carry the verified SHA-256 identity of the bytes that produced their projection, so matching millisecond mtimes do not hide changed content
 
 For incremental work, a file is reindexed when:
 
 - it is new
-- its modification time is newer than the stored row
+- its modification time differs from the stored row
+- its modification time matches but its verified parser content hash differs
 - it exists in the store but is marked as not indexed
+
+Legacy rows and collectors without a verified parser hash retain the metadata
+fallback. Content comparison reads only rows that already carry a verified
+source hash; it does not add hashing for structural, text-only, or oversized
+files that did not produce one.
 
 Files that disappeared from a complete discovery are collected into
 `files_to_remove`. Partial, unreadable, and bounded inventories retain observed

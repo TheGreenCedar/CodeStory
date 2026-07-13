@@ -1767,6 +1767,15 @@ impl Storage {
             .map_err(StorageError::from)
     }
 
+    pub(crate) fn get_file_content_hashes(&self) -> Result<HashMap<i64, String>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content_hash FROM file WHERE content_hash IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StorageError::from)
+    }
+
     pub fn refresh_grounding_summary_snapshots(&self) -> Result<(), StorageError> {
         let rank_sql = grounding_node_rank_sql("n");
         let display_name = grounding_display_name_expr("n");

@@ -5,9 +5,10 @@
 //! graph state; its contract is to decide which files are in scope, which
 //! stored file records are stale, and which projections should be removed.
 //!
-//! Freshness is path- and mtime-based. Callers must provide inventory from the
-//! same project root they are planning. Discovery completeness is explicit so
-//! an unreadable or bounded walk cannot be mistaken for file deletion.
+//! Freshness uses paths, mtimes, and verified parser content hashes when they
+//! are available. Callers must provide inventory from the same project root
+//! they are planning. Discovery completeness is explicit so an unreadable or
+//! bounded walk cannot be mistaken for file deletion.
 
 use anyhow::{Result, bail};
 pub use codestory_contracts::workspace::{
@@ -15,9 +16,11 @@ pub use codestory_contracts::workspace::{
     RefreshPlan, StoredFileRecord, StoredFileState, WorkspaceInventory,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -164,8 +167,8 @@ pub struct WorkspaceMembersManifest {
 ///
 /// Use this when the caller already has a manifest and stored inventory. The
 /// methods are pure with respect to CodeStory storage: they inspect the
-/// filesystem, compare stored mtimes and ids, and return a plan for the caller
-/// to execute.
+/// filesystem, compare stored mtimes, content hashes, and ids, and return a
+/// plan for the caller to execute.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceDiscovery;
 
@@ -416,8 +419,9 @@ impl WorkspaceManifest {
     /// Build an incremental refresh plan from stored file inventory.
     ///
     /// A file is scheduled when it is new, unreadable, previously unindexed,
-    /// carries a retryable file-level error, or its filesystem mtime differs
-    /// from the stored millisecond timestamp.
+    /// carries a retryable file-level error, its filesystem mtime differs from
+    /// the stored millisecond timestamp, or its verified parser content hash
+    /// no longer matches.
     /// Stored file ids absent from current discovery are scheduled for removal.
     pub fn build_execution_plan(&self, inputs: &RefreshInputs) -> Result<RefreshPlan> {
         WorkspaceDiscovery.build_refresh_plan(self, inputs)
@@ -678,12 +682,7 @@ impl WorkspaceDiscovery {
             let needs_index = match normalized_stored_map.get(&normalized_key) {
                 Some(file) => {
                     existing_file_ids.insert(path.clone(), file.id);
-                    match modification_time_millis(&path) {
-                        Ok(mtime) => {
-                            mtime != file.modification_time || !file.indexed || file.retry_required
-                        }
-                        Err(_) => true,
-                    }
+                    stored_file_needs_index(&path, file)
                 }
                 None => true,
             };
@@ -759,6 +758,44 @@ fn modification_time_millis(path: &Path) -> Result<i64> {
     let modified = metadata.modified()?;
     let duration = modified.duration_since(std::time::UNIX_EPOCH)?;
     Ok(duration.as_millis().min(i64::MAX as u128) as i64)
+}
+
+fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
+    if !file.indexed || file.retry_required {
+        return true;
+    }
+    let Ok(mtime) = modification_time_millis(path) else {
+        return true;
+    };
+    if mtime != file.modification_time {
+        return true;
+    }
+    let Some(expected_hash) = file.content_hash.as_deref() else {
+        return false;
+    };
+    match current_content_hash(path) {
+        Ok(actual_hash) => actual_hash != expected_hash,
+        Err(_) => true,
+    }
+}
+
+fn current_content_hash(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let before = file.metadata()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file.metadata()?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        bail!("source metadata changed while hashing {}", path.display());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
@@ -1110,6 +1147,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time: 0,
+                    content_hash: None,
                     indexed: true,
                     complete: true,
                     retry_required: false,
@@ -1140,6 +1178,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time: modification_time_millis(&file)?,
+                    content_hash: Some(current_content_hash(&file)?),
                     indexed: true,
                     complete: true,
                     retry_required: false,
@@ -1153,6 +1192,37 @@ mod tests {
             "unchanged files should not look dirty when stored mtimes use file-table millisecond precision"
         );
         assert_eq!(plan.existing_file_ids.get(&file), Some(&7));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_refresh_detects_changed_content_with_matching_mtime() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn first() {}\n")?;
+        let indexed_hash = current_content_hash(&file)?;
+        fs::write(&file, "fn other() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let plan = WorkspaceDiscovery.build_refresh_plan(
+            &manifest,
+            &RefreshInputs {
+                stored_files: vec![StoredFileState {
+                    id: 7,
+                    path: file.clone(),
+                    modification_time: modification_time_millis(&file)?,
+                    content_hash: Some(indexed_hash),
+                    indexed: true,
+                    complete: true,
+                    retry_required: false,
+                }],
+                inventory: WorkspaceInventory::default(),
+            },
+        )?;
+
+        assert_eq!(plan.files_to_index, vec![file]);
         Ok(())
     }
 
@@ -1172,6 +1242,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time,
+                    content_hash: None,
                     indexed: true,
                     complete: false,
                     retry_required: false,
@@ -1185,6 +1256,7 @@ mod tests {
                     IndexedFileRecord {
                         file_id: 7,
                         modification_time,
+                        content_hash: None,
                         indexed: true,
                         complete: false,
                         retry_required: false,
@@ -1219,6 +1291,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time,
+                    content_hash: None,
                     indexed: true,
                     complete: false,
                     retry_required: true,
@@ -1232,6 +1305,7 @@ mod tests {
                     IndexedFileRecord {
                         file_id: 7,
                         modification_time,
+                        content_hash: None,
                         indexed: true,
                         complete: false,
                         retry_required: true,
@@ -1269,6 +1343,7 @@ mod tests {
                         IndexedFileRecord {
                             file_id: 11,
                             modification_time: modification_time_millis(&file)?,
+                            content_hash: None,
                             indexed: true,
                             complete: true,
                             retry_required: false,
@@ -1279,6 +1354,7 @@ mod tests {
                         IndexedFileRecord {
                             file_id: 19,
                             modification_time: 0,
+                            content_hash: None,
                             indexed: true,
                             complete: true,
                             retry_required: false,
@@ -1316,6 +1392,7 @@ mod tests {
                 id: 19,
                 path: root.join("still-present.rs"),
                 modification_time: 0,
+                content_hash: None,
                 indexed: true,
                 complete: true,
                 retry_required: false,
@@ -1346,6 +1423,7 @@ mod tests {
                 id: 19,
                 path: root.join("stored.rs"),
                 modification_time: 0,
+                content_hash: None,
                 indexed: true,
                 complete: true,
                 retry_required: false,
@@ -1380,6 +1458,7 @@ mod tests {
                 id: 19,
                 path: root.join("stored.rs"),
                 modification_time: 0,
+                content_hash: None,
                 indexed: true,
                 complete: true,
                 retry_required: false,
@@ -1431,6 +1510,7 @@ mod tests {
                     id: 19,
                     path: root.join("stored.rs"),
                     modification_time: 0,
+                    content_hash: None,
                     indexed: true,
                     complete: true,
                     retry_required: false,
