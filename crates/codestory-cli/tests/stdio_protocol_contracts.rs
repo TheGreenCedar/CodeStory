@@ -1338,7 +1338,7 @@ fn write_repair_status_fixture(
         .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase();
+        .to_string();
     fs::write(
         &status_path,
         json!({
@@ -5376,7 +5376,7 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
         .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase();
+        .to_string();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
