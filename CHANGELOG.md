@@ -4,6 +4,10 @@
 
 ### Changed
 
+- GitHub releases now use the exact matching version section from this
+  changelog before the existing platform proof-boundary appendix. Publication
+  fails when that version section is missing, duplicated, or empty instead of
+  substituting an automatically generated pull-request list.
 - Reduced the packaged macOS proof to one check per release boundary. The
   protected run still covers managed Metal cold/warm/recovery, exact process
   reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned

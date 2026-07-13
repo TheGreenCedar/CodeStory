@@ -11,6 +11,7 @@ const closeDevIssues = path.join(workflowRoot, "close-dev-issues.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
 const releaseWorkflow = path.join(workflowRoot, "release.yml");
+const releaseNotesExtractor = path.join(".github", "scripts", "extract-codestory-release-notes.mjs");
 const postPublishReleaseSmoke = path.join(workflowRoot, "post-publish-release-smoke.yml");
 const packagedPlatformPr = path.join(workflowRoot, "packaged-platform-pr.yml");
 const packagedPlatformProof = path.join(workflowRoot, "packaged-platform-proof.yml");
@@ -326,14 +327,43 @@ if (!fs.existsSync(releaseWorkflow)) {
     "use_packaged_cli_artifact: true",
     "version: ${{ needs.preflight.outputs.version }}",
     "uses: ./.github/workflows/post-publish-release-smoke.yml",
-    "--notes-file target/release-assets/proof-boundaries.md",
+    "Validate versioned changelog notes",
+    "Compose versioned GitHub release notes",
+    "node .github/scripts/extract-codestory-release-notes.mjs",
+    "--notes-file target/release-assets/release-notes.md",
     'if [ "${#assets[@]}" -ne 7 ]; then',
     "Expected six binary archives plus SHA256SUMS.txt",
     "macOS x64/arm64",
     "gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof",
     "Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.",
-    "--generate-notes",
   ], snippet => `release.yml must include ${snippet}`);
+  if (!fs.existsSync(releaseNotesExtractor)) {
+    violations.push("release.yml must use the checked-in versioned changelog extractor");
+  }
+  const preflightNotesStep = namedStep(
+    yamlJob(content, "preflight"),
+    "Validate versioned changelog notes",
+  ).join("\n");
+  const publishNotesStep = namedStep(
+    yamlJob(content, "publish"),
+    "Compose versioned GitHub release notes",
+  ).join("\n");
+  if (
+    !preflightNotesStep.includes("node .github/scripts/extract-codestory-release-notes.mjs") ||
+    !preflightNotesStep.includes('--version "$VERSION"')
+  ) {
+    violations.push("release.yml preflight must validate the exact versioned changelog section");
+  }
+  if (
+    !publishNotesStep.includes("node .github/scripts/extract-codestory-release-notes.mjs") ||
+    !publishNotesStep.includes("--output target/release-assets/release-notes.md") ||
+    !publishNotesStep.includes("## Platform proof boundaries")
+  ) {
+    violations.push("release.yml publish must compose changelog notes before the proof-boundary appendix");
+  }
+  if (content.includes("--generate-notes")) {
+    violations.push("release.yml must not replace curated changelog notes with generated pull-request notes");
+  }
   requireContent(content, [
     "macos-metal-proof:\n    needs:\n      - preflight\n      - packaged-proof\n    uses: ./.github/workflows/macos-metal-proof.yml",
     "needs:\n      - preflight\n      - packaged-proof\n      - macos-metal-proof\n    runs-on: ubuntu-latest",
