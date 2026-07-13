@@ -55,6 +55,15 @@ deliberately for that process. Explicit environment values have highest
 precedence without being mutated or re-read when a stdio request switches
 projects.
 
+Plugin launchers start one projectless multi-project stdio process. Every tool
+or status request supplies its absolute project root; hook-written active-state
+files are diagnostics only and never select a runtime. The optional bootstrap
+diagnostic asks `cache identity` for the lossless schema-3 project and workspace
+ids, then accepts broker readiness only when those ids match. Existing
+executables and roots compare by filesystem identity; only missing paths use
+platform lexical rules (case-sensitive on Unix and case-insensitive on
+Windows).
+
 Embedding config keys map to the runtime env names:
 
 | `.codestory.toml` key | Runtime env var | Notes |

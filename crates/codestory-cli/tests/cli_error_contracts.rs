@@ -542,7 +542,7 @@ fn cache_identity_json_reports_canonical_contract_fields() {
             "remote",
             "add",
             "origin",
-            "git@github.com:TheGreenCedar/CodeStory.git",
+            "ssh://git@EXAMPLE.com:2222/TheGreenCedar/CodeStory.git",
         ],
     );
     git(workspace.path(), &["add", "."]);
@@ -558,14 +558,31 @@ fn cache_identity_json_reports_canonical_contract_fields() {
 
     assert_eq!(
         json["normalized_repository_identity"],
-        "github.com/thegreencedar/codestory"
+        "ssh://example.com:2222/TheGreenCedar/CodeStory"
     );
-    assert_eq!(json["repository_identity_schema_version"], 1);
+    assert_eq!(json["repository_identity_schema_version"], 2);
+    assert_eq!(json["project_identity_schema_version"], 3);
+    assert!(
+        json["project_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("repo-v2-"))
+    );
+    assert!(
+        json["workspace_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(json["artifact_scope_id"], json["project_id"]);
+    assert_eq!(
+        json["legacy_alias_disposition"],
+        "unavailable_without_provenance"
+    );
+    assert_eq!(json["legacy_project_id"], serde_json::Value::Null);
     assert_eq!(json["portable_reuse_eligible"], true);
     assert!(
         json["canonical_repository_id"]
             .as_str()
-            .is_some_and(|value| value.starts_with("repo-v1-"))
+            .is_some_and(|value| value.starts_with("repo-v2-"))
     );
     assert!(json["root_derived_project_id"].as_str().is_some());
     assert!(json["git_tree"].as_str().is_some());

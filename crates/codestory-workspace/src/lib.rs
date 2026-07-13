@@ -31,8 +31,8 @@ pub use repository_identity::{
     ProjectIdentityV3, REPOSITORY_IDENTITY_SCHEMA_VERSION, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
     RepositoryIdentity, RepositoryIdentityV2, SidecarProjectIdentity, cached_project_identity_v2,
     cached_project_identity_v3, inspect_repository_identity, inspect_repository_identity_v2,
-    project_identity_v2, project_identity_v3, same_workspace_path, sidecar_project_identity,
-    workspace_id_for_root, workspace_id_v3_for_root,
+    project_identity_v2, project_identity_v3, project_identity_v3_from_repository,
+    same_workspace_path, sidecar_project_identity, workspace_id_for_root, workspace_id_v3_for_root,
 };
 
 /// Source-group language selector used during workspace discovery.

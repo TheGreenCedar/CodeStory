@@ -148,11 +148,6 @@ function existingProjectRoot(projectRoot) {
   }
 }
 
-function activeProjectStateMaxAgeMs() {
-  const parsed = Number.parseInt(process.env.CODESTORY_PLUGIN_ACTIVE_PROJECT_TTL_MS || '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60 * 60 * 1000;
-}
-
 function activeProjectStateTimestamp(active, statePath) {
   const parsed = Date.parse(active?.updatedAt || active?.updated_at || '');
   if (Number.isFinite(parsed)) return parsed;
@@ -161,27 +156,6 @@ function activeProjectStateTimestamp(active, statePath) {
   } catch {
     return null;
   }
-}
-
-function activeProjectStateMatchesHost(active) {
-  const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
-  const activeThread = String(active?.codexThreadId || '').trim();
-  if (!activeThread) return true;
-  if (!currentThread) return false;
-  return activeThread === currentThread;
-}
-
-function activeProjectStateMatchesCurrentThread(active) {
-  const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
-  if (!currentThread) return true;
-  return String(active?.codexThreadId || '').trim() === currentThread;
-}
-
-function activeProjectStateFresh(active, statePath, nowMs = Date.now(), options = {}) {
-  const timestamp = activeProjectStateTimestamp(active, statePath);
-  return timestamp !== null
-    && nowMs - timestamp <= activeProjectStateMaxAgeMs()
-    && (!options.requireThreadMatch || activeProjectStateMatchesHost(active));
 }
 
 function activeProjectStateSummary(statePath, nowMs = Date.now()) {
@@ -212,59 +186,32 @@ function projectResolutionDiagnostics(projectResolution, nowMs = Date.now()) {
 }
 
 function resolveProjectRoot(options = {}) {
-  const explicit = existingProjectRoot(options.projectRoot || process.env.CODESTORY_PROJECT_ROOT);
-  if (explicit) {
-    return { projectRoot: explicit, source: options.projectRoot ? 'argument' : 'env' };
+  const argumentProvided = options.projectRootProvided
+    || (options.projectRoot !== null && options.projectRoot !== undefined);
+  const envProvided = Object.hasOwn(process.env, 'CODESTORY_PROJECT_ROOT');
+  if (argumentProvided || envProvided) {
+    const source = argumentProvided ? 'argument' : 'env';
+    const requestedRoot = argumentProvided ? options.projectRoot : process.env.CODESTORY_PROJECT_ROOT;
+    const explicit = existingProjectRoot(requestedRoot);
+    return explicit
+      ? { projectRoot: explicit, source }
+      : {
+          projectRoot: null,
+          source: `${source}_invalid`,
+          statePath: null,
+          reason: 'project_root_invalid',
+        };
   }
 
   const cwd = existingProjectRoot(options.cwd || launchCwd);
-  if (cwd && !samePathText(cwd, pluginRoot)) {
+  if (cwd && !sameFilesystemPath(cwd, pluginRoot)) {
     return { projectRoot: cwd, source: 'process_cwd' };
-  }
-
-  const currentThread = String(process.env.CODEX_THREAD_ID || '').trim();
-  const threadStatePath = activeThreadStatePath(currentThread);
-  const threadActive = threadStatePath ? readJson(threadStatePath) : null;
-  if (threadActive && !activeProjectStateFresh(threadActive, threadStatePath, Date.now(), { requireThreadMatch: true })) {
-    return {
-      projectRoot: null,
-      source: 'plugin_active_thread_state_stale',
-      statePath: threadStatePath,
-      reason: 'project_root_unavailable',
-    };
-  }
-  const threadRoot = existingProjectRoot(threadActive?.cwd);
-  if (threadRoot && !samePathText(threadRoot, pluginRoot)) {
-    return { projectRoot: threadRoot, source: 'plugin_active_thread_state', statePath: threadStatePath };
-  }
-
-  const statePath = activeStatePath();
-  const active = statePath ? readJson(statePath) : null;
-  if (active && !activeProjectStateFresh(active, statePath)) {
-    return {
-      projectRoot: null,
-      source: 'plugin_active_state_stale',
-      statePath,
-      reason: 'project_root_unavailable',
-    };
-  }
-  if (active && !activeProjectStateMatchesCurrentThread(active)) {
-    return {
-      projectRoot: null,
-      source: 'plugin_active_state_thread_mismatch',
-      statePath,
-      reason: 'project_root_unavailable',
-    };
-  }
-  const activeRoot = existingProjectRoot(active?.cwd);
-  if (activeRoot && !samePathText(activeRoot, pluginRoot)) {
-    return { projectRoot: activeRoot, source: 'plugin_active_state', statePath };
   }
 
   return {
     projectRoot: null,
-    source: statePath ? 'plugin_active_state_missing' : 'plugin_data_missing',
-    statePath,
+    source: 'request_argument_missing',
+    statePath: null,
     reason: 'project_root_unavailable',
   };
 }
@@ -1917,7 +1864,7 @@ function managedCliRetentionReportUnlocked(resolved, probe, options = {}) {
   }
   const activeVerification = verifyManagedCliVersion(active, options.probeVersion || probeResolvedCli);
   if (!activeVerification.verified
-      || !samePathText(activeVerification.executablePath, resolved.path)) {
+      || !sameFilesystemPath(activeVerification.executablePath, resolved.path)) {
     report.warnings.push(`managed_cli_retention_active_unverified:${activeVerification.reason || 'path_mismatch'}`);
     reportUnverifiedManagedCliInventory(report, inventory.entries, 'active_unverified');
     return report;
@@ -2137,6 +2084,18 @@ function runAgentReadiness(resolved, projectRoot) {
   return { args, result };
 }
 
+function runProjectIdentity(resolved, projectRoot) {
+  const args = ['cache', 'identity', '--project', projectRoot, '--format', 'json'];
+  const result = spawnSync(resolved.path, args, {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
+    timeout: localWaitFreshTimeoutMs(),
+    windowsHide: true,
+  });
+  return { args, result };
+}
+
 function localReadySetup(prefix, args, result) {
   return {
     [`${prefix}_args`]: args,
@@ -2191,6 +2150,69 @@ function parseAgentReadinessResult(result) {
     parsed,
     verdict,
   };
+}
+
+function probeProjectIdentity(resolved, projectRoot) {
+  const probe = runProjectIdentity(resolved, projectRoot);
+  const setup = localReadySetup('project_identity', probe.args, probe.result);
+  if (probe.result.error || probe.result.status !== 0) {
+    return {
+      identity: null,
+      reason: probe.result.error
+        ? `project_identity_probe_failed:${probe.result.error.message}`
+        : `project_identity_probe_failed:${probe.result.status}`,
+      setup,
+    };
+  }
+  let identity;
+  try {
+    identity = JSON.parse(probe.result.stdout || '{}');
+  } catch (error) {
+    return { identity: null, reason: `project_identity_invalid_json:${error.message}`, setup };
+  }
+  if (!sameFilesystemPath(identity.project, projectRoot)) {
+    return { identity: null, reason: 'project_identity_root_mismatch', setup };
+  }
+  if (
+    identity.project_identity_schema_version !== 3
+    || typeof identity.project_id !== 'string'
+    || !identity.project_id
+    || typeof identity.workspace_id !== 'string'
+    || !identity.workspace_id
+  ) {
+    return { identity: null, reason: 'project_identity_schema_invalid', setup };
+  }
+  const expectedScope = identity.portable_reuse_eligible
+    ? identity.project_id
+    : identity.workspace_id;
+  if (identity.artifact_scope_id !== expectedScope) {
+    return { identity: null, reason: 'project_identity_scope_invalid', setup };
+  }
+  const legacySafe = identity.legacy_alias_disposition === 'safe'
+    && typeof identity.legacy_project_id === 'string'
+    && identity.legacy_project_id.length > 0;
+  const legacyUnavailable = identity.legacy_alias_disposition === 'unavailable_without_provenance'
+    && (identity.legacy_project_id === null || identity.legacy_project_id === undefined);
+  if (!legacySafe && !legacyUnavailable) {
+    return { identity: null, reason: 'project_identity_legacy_alias_invalid', setup };
+  }
+  return { identity, reason: null, setup };
+}
+
+function projectIdentityMismatch(identity, agentReadiness) {
+  const broker = agentReadiness.parsed?.readiness_broker;
+  if (!broker) return agentReadiness.ready ? 'readiness_broker_missing' : null;
+  const brokerIdentity = broker.identity;
+  if (!brokerIdentity) return agentReadiness.ready ? 'readiness_broker_identity_missing' : null;
+  if (
+    broker.schema_version !== 3
+    || brokerIdentity.project_identity_schema_version !== identity.project_identity_schema_version
+    || brokerIdentity.project_id !== identity.project_id
+    || brokerIdentity.workspace_id !== identity.workspace_id
+  ) {
+    return 'readiness_broker_identity_mismatch';
+  }
+  return null;
 }
 
 function localRefreshFailure(state, reason, readinessStatus = 'repair_setup') {
@@ -2540,6 +2562,18 @@ async function bootstrapStatus(projectRoot = launchCwd) {
   resolved.managedCliRetention = managedCliRetentionReport(resolved, probe);
   rememberLaunch(resolved);
 
+  const projectIdentity = probeProjectIdentity(resolved, projectRoot);
+  if (!projectIdentity.identity) {
+    return {
+      ready: false,
+      ...fallbackDiagnostic(resolved, probe, projectIdentity.reason, {
+        projectRoot,
+        summary: 'CodeStory plugin MCP could not verify the request-scoped project identity.',
+        setup: projectIdentity.setup,
+      }),
+    };
+  }
+
   const localReadiness = probeLocalNavigation(resolved, projectRoot);
   if (!localReadiness.ready) {
     return {
@@ -2551,7 +2585,7 @@ async function bootstrapStatus(projectRoot = launchCwd) {
         minimumNext: localReadiness.minimumNext,
         fullRepair: localReadiness.fullRepair,
         localRefresh: localReadiness.localRefresh,
-        setup: localReadiness.setup,
+        setup: { ...projectIdentity.setup, ...localReadiness.setup },
       }),
     };
   }
@@ -2559,6 +2593,23 @@ async function bootstrapStatus(projectRoot = launchCwd) {
   const sidecarPolicy = readSidecarPolicy();
   const plugin = pluginRuntimeForResolved(resolved);
   const agentReadiness = probeAgentReadiness(resolved, projectRoot);
+  const identityMismatch = projectIdentityMismatch(projectIdentity.identity, agentReadiness);
+  if (identityMismatch) {
+    return {
+      ready: false,
+      ...fallbackDiagnostic(resolved, probe, identityMismatch, {
+        projectRoot,
+        summary: 'CodeStory plugin MCP rejected stale or cross-project readiness evidence.',
+        localRefresh: localReadiness.localRefresh,
+        setup: {
+          ...projectIdentity.setup,
+          ...localReadiness.setup,
+          ...agentReadiness.setup,
+          project_identity: projectIdentity.identity,
+        },
+      }),
+    };
+  }
   const localRefresh = localReadiness.localRefresh || {
     state: 'fresh',
     blocks_local_surfaces: false,
@@ -2573,6 +2624,7 @@ async function bootstrapStatus(projectRoot = launchCwd) {
     minimum_next: [{ method: 'resources/read', uri: 'codestory://status' }],
     full_repair: [],
     setup: {
+      ...projectIdentity.setup,
       ...localReadiness.setup,
       readiness_verdict: localReadiness.verdict,
       ...agentReadiness.setup,
@@ -2585,6 +2637,7 @@ async function bootstrapStatus(projectRoot = launchCwd) {
   return {
     ready: true,
     project_root: projectRoot,
+    project_identity: projectIdentity.identity,
     server_version: resolved.version,
     cli_version: probe.version,
     plugin_runtime: plugin,
@@ -2606,7 +2659,10 @@ async function bootstrapStatus(projectRoot = launchCwd) {
 
 async function handleBootstrapStatusCommand(argv) {
   if (argv[2] !== 'bootstrap-status') return false;
-  const resolution = resolveProjectRoot({ projectRoot: optionValue(argv, '--project') });
+  const resolution = resolveProjectRoot({
+    projectRoot: optionValue(argv, '--project'),
+    projectRootProvided: argv.includes('--project'),
+  });
   try {
     if (!resolution.projectRoot) {
       const resolved = await resolveCli();
@@ -2635,19 +2691,34 @@ async function handleBootstrapStatusCommand(argv) {
   process.exit(0);
 }
 
-function samePathText(left, right) {
+function sameFilesystemPath(left, right) {
   if (!String(left || '').trim() || !String(right || '').trim()) return false;
-  const normalize = (value) => {
-    let normalized = path.resolve(String(value || ''));
-    try {
-      normalized = fs.realpathSync(normalized);
-    } catch {
-      // Missing paths still receive stable lexical comparison below.
+  const leftPath = path.resolve(String(left));
+  const rightPath = path.resolve(String(right));
+  let leftStat;
+  let rightStat;
+  try {
+    leftStat = fs.statSync(leftPath, { bigint: true });
+  } catch (error) {
+    if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) return false;
+  }
+  try {
+    rightStat = fs.statSync(rightPath, { bigint: true });
+  } catch (error) {
+    if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) return false;
+  }
+  if (leftStat && rightStat) {
+    if (leftStat.ino !== 0n || rightStat.ino !== 0n) {
+      return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
     }
-    normalized = normalized.replace(/[\\/]+$/u, '');
-    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
-  };
-  return normalize(left) === normalize(right);
+    const leftReal = fs.realpathSync(leftPath);
+    const rightReal = fs.realpathSync(rightPath);
+    const normalizeExisting = (value) => process.platform === 'win32' ? value.toLowerCase() : value;
+    return normalizeExisting(leftReal) === normalizeExisting(rightReal);
+  }
+  if (leftStat || rightStat) return false;
+  const normalizeMissing = (value) => process.platform === 'win32' ? value.toLowerCase() : value;
+  return normalizeMissing(leftPath) === normalizeMissing(rightPath);
 }
 
 function pathInside(child, parent) {
@@ -3240,6 +3311,7 @@ if (require.main === module) {
       releaseManagedCliLock,
       resolveManagedCli,
       runFailOpenMcp,
+      sameFilesystemPath,
       managedCliRetentionReport,
       managedCliVersionEntries,
       removeManagedCliVersion,

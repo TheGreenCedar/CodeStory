@@ -315,7 +315,7 @@ Read these pages first:
 
 - default cache layout: user cache root + hashed project path
 - explicit `--cache-dir`: use the exact directory you passed
-- `cache identity`: reports the root-derived project id, canonical repository id, Git remote/tree freshness input, cache schema version, and portable-reuse eligibility without changing cache files
+- `cache identity`: reports schema-3 project, workspace, and artifact-scope ids; the lossless canonical repository identity; explicit legacy-alias disposition; Git remote/tree freshness input; cache schema version; and portable-reuse eligibility without changing cache files
 - Child worktree bootstrap: run `codestory-cli cache rehydrate --from-project <main-or-parent-worktree> --project <child-worktree>` before the first child-thread index. The command copies a compatible cache only when both worktrees are clean, share the same `origin` URL, have the same Git tree, the source SQLite schema matches the running CLI, and the target cache directory is empty.
 - Rehydrated caches rebase copied path-bound SQLite graph/search/doc rows under the child worktree path, preserve portable v2 index artifact cache rows, and invalidate retrieval manifests. Run the printed `doctor` command to inspect freshness, then run `retrieval index --refresh full` before using sidecar-backed packet/search evidence.
 - If `cache rehydrate` reports `skipped`, use the printed rebuild commands. This is CodeStory SQLite graph/search/doc plus portable v2 index artifact cache reuse; retrieval sidecar reuse across path/root-derived identities remains future work. It does not configure Rust compilation caching such as `sccache`.

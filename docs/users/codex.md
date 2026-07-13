@@ -164,6 +164,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | --- | --- |
 | No CodeStory `status` tool is visible | Reload only after plugin install or config changes, then start a fresh thread from the target repo |
 | CodeStory resources are visible but `mcp__codestory` tools are hidden | Report the host blocker. Unscoped resources cannot safely select a repository in multi-project mode |
+| Status names the wrong repository | Retry the call with the target repository's absolute `project` path. Hook active-state files do not route MCP requests; a schema-3 project/workspace identity mismatch is rejected instead of reusing another repository's readiness. |
 | Status shows `runtime_update.state=available` | Current compatible surfaces keep working; reload when convenient if `restart_recommended=true` |
 | Status shows `repair_setup` | The active runtime could not start or prove compatibility; follow `recommended_next_calls` |
 | Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
