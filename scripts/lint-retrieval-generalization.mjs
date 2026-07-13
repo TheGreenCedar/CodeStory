@@ -1216,6 +1216,7 @@ function prepareNonRustFile(filePath) {
   const lines = staticSource.split(/\r?\n/);
   return {
     filePath,
+    extension,
     production,
     lines,
     logicalLines: logicalNonRustLines(lines, extension),
@@ -1228,6 +1229,9 @@ function prepareNonRustFile(filePath) {
 function maskNonRustComments(source, extension) {
   if (executableJavaScriptExtensions.has(extension)) {
     return maskJavaScriptComments(source);
+  }
+  if (extension === ".yaml" || extension === ".yml") {
+    return maskYamlComments(source);
   }
   if (hashCommentExtensions.has(extension)) {
     return maskHashComments(source, extension);
@@ -1264,8 +1268,7 @@ function maskHashComments(source, extension) {
   const masked = source.split("");
   const escape = extension === ".ps1" ? "`" : "\\";
   const outsideEscape = extension === ".ps1" || extension === ".sh";
-  const doubledQuoteEscape = extension === ".ps1" || extension === ".yaml"
-    || extension === ".yml";
+  const doubledQuoteEscape = extension === ".ps1";
   let quote = null;
 
   for (let index = 0; index < source.length; index += 1) {
@@ -1293,13 +1296,6 @@ function maskHashComments(source, extension) {
 
     if (outsideEscape && source[index] === escape && index + 1 < source.length) {
       index += 1;
-      continue;
-    }
-    if (
-      source[index] === "'"
-      && (extension === ".yaml" || extension === ".yml")
-      && /[a-zA-Z0-9_]/.test(source[index - 1] ?? "")
-    ) {
       continue;
     }
     if (source[index] === "\"" || source[index] === "'") {
@@ -1330,6 +1326,63 @@ function maskHashComments(source, extension) {
   return masked.join("");
 }
 
+function maskYamlComments(source) {
+  const masked = source.split("");
+  const blockScalarKinds = yamlBlockScalarKinds(source.split(/\r?\n/));
+  let quote = null;
+  let quoteInBlockScalar = false;
+  let line = 0;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const current = source[index];
+    if (index > 0 && source[index - 1] === "\n") line += 1;
+    if (quote != null) {
+      if (
+        !quoteInBlockScalar
+        && quote === "'"
+        && current === "'"
+        && source[index + 1] === "'"
+      ) index += 1;
+      else if (quote === '"' && current === "\\") index += 1;
+      else if (current === quote) {
+        quote = null;
+        quoteInBlockScalar = false;
+      }
+      continue;
+    }
+    quoteInBlockScalar = blockScalarKinds[line] != null;
+    if (
+      (current === "'" || current === '"')
+      && (quoteInBlockScalar || yamlQuoteStartsScalar(source, index))
+    ) {
+      quote = current;
+      continue;
+    }
+    quoteInBlockScalar = false;
+    if (
+      current !== "#"
+      || (index > 0 && source[index - 1] !== "\n" && !/[\t ]/.test(source[index - 1]))
+    ) {
+      continue;
+    }
+    while (index < source.length && source[index] !== "\r" && source[index] !== "\n") {
+      masked[index] = " ";
+      index += 1;
+    }
+    index -= 1;
+  }
+  return masked.join("");
+}
+
+function yamlQuoteStartsScalar(source, index) {
+  const lineStart = source.lastIndexOf("\n", index - 1) + 1;
+  const before = source.slice(lineStart, index);
+  const token = before.trimEnd();
+  const delimiter = token.at(-1);
+  if (delimiter == null || ":[{,?".includes(delimiter)) return true;
+  return delimiter === "-" && /(?:^|[\t [{,])-$/.test(token);
+}
+
 function logicalNonRustLines(lines, extension) {
   const yamlScalarKinds = extension === ".yaml" || extension === ".yml"
     ? yamlBlockScalarKinds(lines)
@@ -1347,8 +1400,9 @@ function logicalNonRustLines(lines, extension) {
         : text.slice(0, -1) + lines[end + 1].trimStart();
       end += 1;
     }
+    const yamlRunCommand = yamlRunCommandText(lines[start], extension);
     logicalLines.push({
-      text,
+      text: yamlRunCommand ?? text,
       startLine: start + 1,
       endLine: end + 1,
       shellLike: extension === ".sh"
@@ -1375,11 +1429,12 @@ function yamlBlockScalarKinds(lines) {
       blockIndent = null;
     }
     const header = line.trimStart().match(
-      /^([^#\n]+):\s*([|>])(?:[1-9][+-]?|[+-][1-9]?)?\s*$/,
+      /^([^#\n]+):\s*([|>])(?:[1-9][+-]?|[+-][1-9]?)?(?:\s+#.*)?\s*$/,
     );
     if (header != null) {
       blockIndent = indent;
-      const shellPrefix = /^(?:-\s*)?run$/.test(header[1].trim()) ? "run" : "";
+      const key = header[1].trim().replace(/^-\s*/, "");
+      const shellPrefix = ["run", "'run'", '"run"'].includes(key) ? "run" : "";
       scalarKind = `${shellPrefix}${header[2]}`;
     }
   }
@@ -1388,7 +1443,22 @@ function yamlBlockScalarKinds(lines) {
 
 function isYamlRunLine(line, extension) {
   return (extension === ".yaml" || extension === ".yml")
-    && /^\s*(?:-\s*)?run\s*:/.test(line);
+    && yamlRunLineMatch(line) != null;
+}
+
+function yamlRunLineMatch(line) {
+  return line.match(/^\s*(?:-\s*)?(?:run|'run'|"run")\s*:\s*(.*)$/);
+}
+
+function yamlRunCommandText(line, extension) {
+  if (extension !== ".yaml" && extension !== ".yml") return null;
+  const match = yamlRunLineMatch(line);
+  if (match == null) return null;
+  const scalar = match[1].trim();
+  if (/^[|>](?:[1-9][+-]?|[+-][1-9]?)?$/.test(scalar)) return null;
+  if (scalar.startsWith("'") && scalar.endsWith("'")) return scalar.slice(1, -1).replaceAll("''", "'");
+  if (scalar.startsWith('"') && scalar.endsWith('"')) return scalar.slice(1, -1).replace(/\\(["\\])/g, "$1");
+  return scalar;
 }
 
 function lineContinuationMarker(line, extension, yamlScalarKind) {
@@ -1504,8 +1574,33 @@ function compactProductionSource(text) {
 }
 
 function normalizeNativeSeparators(text, shellLike = false) {
-  const normalized = text.replaceAll("\\", "/");
-  return shellLike ? normalized.replace(/["']/g, "") : normalized;
+  const normalized = shellLike ? normalizeShellLikeText(text) : text;
+  return normalized.replaceAll("\\", "/");
+}
+
+function normalizeShellLikeText(text) {
+  let normalized = "";
+  let quote = null;
+  for (let index = 0; index < text.length; index += 1) {
+    const current = text[index];
+    if (quote == null && (current === "'" || current === '"')) {
+      quote = current;
+      continue;
+    }
+    if (current === quote) {
+      quote = null;
+      continue;
+    }
+    const escaped = current === "\\" && index + 1 < text.length
+      && (quote == null || (quote === '"' && '$`"\\'.includes(text[index + 1])));
+    if (escaped) {
+      normalized += text[index + 1];
+      index += 1;
+    } else {
+      normalized += current;
+    }
+  }
+  return normalized;
 }
 
 function staticStringLiteralContent(literal) {
@@ -1539,6 +1634,9 @@ function scanProductionCompactPatterns(
         end > start
         && !literalJoinGapAllowsCompactScan(
           production.slice(literals[end - 1].endOffset, literals[end].startOffset),
+          prepared.extension,
+          literals[end - 1].literal,
+          literals[end].literal,
         )
       ) {
         break;
@@ -1597,7 +1695,15 @@ function lineNumberAtOffset(lineStarts, offset) {
   return high + 1;
 }
 
-function literalJoinGapAllowsCompactScan(gap) {
+function literalJoinGapAllowsCompactScan(gap, extension, previousLiteral, nextLiteral) {
+  if (
+    (extension === ".yaml" || extension === ".yml")
+    && gap === ""
+    && previousLiteral.startsWith("'")
+    && nextLiteral.startsWith("'")
+  ) {
+    return false;
+  }
   const withoutContinuations = gap
     .replace(/\\\r?\n/g, "")
     .replace(/`\r?\n/g, "");

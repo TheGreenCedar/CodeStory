@@ -453,6 +453,26 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
             "run: |\n  node scripts/fetch-'holdout-repos.mjs'\n",
         ),
         (
+            "quoted-run-key.yml",
+            "steps:\n  - \"run\": |\n      node scripts/fetch-'holdout-repos.mjs'\n",
+        ),
+        (
+            "escaped-shell-word.sh",
+            "node scripts/fetch\\-holdout-repos.mjs\n",
+        ),
+        (
+            "quoted-yaml-scalar.yml",
+            "value: 'clean # scripts/fetch-holdout-repos.mjs'\n",
+        ),
+        (
+            "quoted-block-scalar.yml",
+            "run: |\n  value='clean # scripts/fetch-holdout-repos.mjs'\n",
+        ),
+        (
+            "github-script.yml",
+            "uses: actions/github-script@v8\nwith:\n  script: |\n    const script = \"scripts/fetch-\" + \"holdout-repos.mjs\";\n",
+        ),
+        (
             "plugins/codestory/skills/codestory-grounding/SKILL.md",
             "Run `node scripts/fetch-holdout-repos.mjs` before grounding.\n",
         ),
@@ -474,6 +494,11 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         ("line-continuation.mjs", "fetchholdoutreposmjs"),
         ("joined-shell-word.sh", "fetch-'holdout-repos.mjs"),
         ("joined-workflow-word.yml", "fetch-'holdout-repos.mjs"),
+        ("quoted-run-key.yml", "fetch-'holdout-repos.mjs"),
+        ("escaped-shell-word.sh", "fetch\\-holdout-repos.mjs"),
+        ("quoted-yaml-scalar.yml", "fetch-holdout-repos.mjs"),
+        ("quoted-block-scalar.yml", "fetch-holdout-repos.mjs"),
+        ("github-script.yml", "fetchholdoutreposmjs"),
         ("skill.md", "fetch-holdout-repos.mjs"),
         ("codestory.mdc", "benchmarks/tasks"),
     ] {
@@ -523,6 +548,14 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         (
             "plain-apostrophe.yml",
             "message: don't load it # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "punctuated-apostrophe.yml",
+            "message: rock-'n roll # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "doubled-single-quote.yml",
+            "value: 'scripts/fetch-''holdout-repos.mjs'\n",
         ),
     ]);
     let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
