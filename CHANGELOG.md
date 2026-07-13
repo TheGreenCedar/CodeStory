@@ -20,7 +20,9 @@
   non-Rust product and release-control boundary. Direct and adjacent/split
   evaluation-corpus dependencies now fail in plugin launch/setup surfaces,
   worktree/install tooling, runtime configuration, release scripts/workflows,
-  and the release evaluator; missing protected paths fail closed.
+  and the release evaluator across native separators, case variants, shell
+  continuations, and PowerShell continuations; missing protected paths fail
+  closed.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and

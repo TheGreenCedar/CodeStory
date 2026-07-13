@@ -131,7 +131,7 @@ fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
         .expect("run lint with prompt script fixture")
 }
 
-fn run_lint_with_non_rust_fixture(contents: &str) -> Output {
+fn run_lint_with_non_rust_fixture(file_name: &str, contents: &str) -> Output {
     let repo_root = workspace_root();
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
@@ -140,8 +140,7 @@ fn run_lint_with_non_rust_fixture(contents: &str) -> Output {
         "pub fn repository_neutral_fixture() {}\n",
     )
     .expect("write neutral Rust fixture");
-    std::fs::write(fixture_root.path().join("leaked.mjs"), contents)
-        .expect("write non-Rust fixture");
+    std::fs::write(fixture_root.path().join(file_name), contents).expect("write non-Rust fixture");
 
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -419,26 +418,33 @@ pub const LEAKED_DEPENDENCY: &str = include_str!(concat!("../../benchmarks/", "t
 
 #[test]
 fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
-    let output = run_lint_with_non_rust_fixture(
-        r#"
-export const directCorpus = import(
-  "./fetch-holdout-repos.mjs"
-);
-export const splitCorpus = ["scripts/", "cross-repo-sourcetrail-queries.mjs"].join("");
-"#,
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "protected non-Rust corpus dependencies must fail lint; stderr={stderr}"
-    );
-    for expected in [
-        "fetch-holdout-repos.mjs",
-        "scriptscrossreposourcetrailqueriesmjs",
-    ] {
+    let cases = [
+        (
+            "leaked.ps1",
+            "$corpus = \"scripts\\cross-repo-\" + `\n  \"sourcetrail-queries.mjs\"\n",
+            "scriptscrossreposourcetrailqueriesmjs",
+        ),
+        (
+            "leaked.sh",
+            "corpus=\"benchmarks/tasks/\"\\\n\"eval-probes.json\"\n",
+            "benchmarkstasksevalprobesjson",
+        ),
+        (
+            "leaked.mjs",
+            "export const corpus = import(\"./FETCH-HOLDOUT-REPOS.MJS\");\n",
+            "fetch-holdout-repos.mjs",
+        ),
+    ];
+    for (file_name, contents, expected) in cases {
+        let output = run_lint_with_non_rust_fixture(file_name, contents);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "protected non-Rust corpus dependency in {file_name} must fail lint; stderr={stderr}"
+        );
         assert!(
             stderr.to_ascii_lowercase().contains(expected),
-            "lint failure should identify non-Rust corpus dependency {expected}; stderr={stderr}"
+            "lint failure should identify {expected} in {file_name}; stderr={stderr}"
         );
     }
 }

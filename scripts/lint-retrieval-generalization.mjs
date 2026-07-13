@@ -39,6 +39,7 @@ const protectedNonRustDirs = [
 ];
 
 const requiredProtectedNonRustFiles = [
+  path.join(repoRoot, ".codex", "environments", "environment.toml"),
   path.join(repoRoot, "scripts", "codestory-evidence-provenance.mjs"),
   path.join(repoRoot, "scripts", "codestory-release-evidence-gate.mjs"),
   path.join(repoRoot, "scripts", "codex-worktree-setup.mjs"),
@@ -68,13 +69,14 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "score-drill-ledger.mjs"),
   path.join(repoRoot, "scripts", "setup-retrieval-env.mjs"),
   path.join(repoRoot, "scripts", "setup-retrieval-env.ps1"),
+  path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
   path.join(repoRoot, ".github", "workflows", "release-candidate-evidence.yml"),
   path.join(repoRoot, ".github", "workflows", "retrieval-sidecar-smoke.yml"),
 ].map((filePath) => path.resolve(filePath)));
 const corpusHarnessModuleNames = new Set(
   [...corpusHarnessNonRustFiles]
     .filter((filePath) => [".cjs", ".js", ".mjs"].includes(path.extname(filePath)))
-    .map((filePath) => path.basename(filePath)),
+    .map((filePath) => path.basename(filePath).toLowerCase()),
 );
 
 const protectedNonRustExtensions = new Set([
@@ -654,12 +656,9 @@ function walkProtectedNonRustFiles(root) {
       return false;
     }
     const segments = path.relative(repoRoot, filePath).split(path.sep);
-    const baseName = path.basename(filePath);
     return (
       !segments.includes("tests")
       && !segments.includes("fixtures")
-      && !baseName.startsWith("test-")
-      && !baseName.includes(".test.")
     );
   });
 }
@@ -1168,8 +1167,8 @@ function scanCorpusHarnessImports(prepared) {
   let match;
   while ((match = importPattern.exec(prepared.production)) != null) {
     const moduleName = path.posix.basename(
-      match[1].split(/[?#]/, 1)[0].replaceAll("\\", "/"),
-    );
+      normalizeNativeSeparators(match[1]).split(/[?#]/, 1)[0],
+    ).toLowerCase();
     if (corpusHarnessModuleNames.has(moduleName)) {
       const line = prepared.production.slice(0, match.index).split(/\r?\n/).length;
       hits.push(
@@ -1184,11 +1183,12 @@ function scanProductionFile(prepared, patterns, combinedRe) {
   const lines = prepared.lines;
   const hitsByPattern = new Map();
   for (let index = 0; index < lines.length; index += 1) {
-    if (!combinedRe.test(lines[index])) {
+    const normalizedLine = normalizeNativeSeparators(lines[index]);
+    if (!combinedRe.test(normalizedLine)) {
       continue;
     }
     for (const { pattern, re } of patterns) {
-      if (re.test(lines[index]) && !lineAllowedForPattern(pattern, lines[index])) {
+      if (re.test(normalizedLine) && !lineAllowedForPattern(pattern, lines[index])) {
         if (!hitsByPattern.has(pattern)) {
           hitsByPattern.set(pattern, []);
         }
@@ -1204,7 +1204,10 @@ function scanProductionStringLiterals(prepared, pattern, re) {
   const hits = [];
   for (let index = 0; index < lines.length; index += 1) {
     for (const literal of staticStringLiteralsOnLine(lines[index])) {
-      if (re.test(literal) && !lineAllowedForPattern(pattern, lines[index])) {
+      if (
+        re.test(normalizeNativeSeparators(literal))
+        && !lineAllowedForPattern(pattern, lines[index])
+      ) {
         hits.push(`${prepared.filePath}:${index + 1}:${lines[index]}`);
         break;
       }
@@ -1218,6 +1221,10 @@ function compactProductionSource(text) {
     .replace(/["'`]/g, "")
     .replace(/[^a-zA-Z0-9]+/g, "")
     .toLowerCase();
+}
+
+function normalizeNativeSeparators(text) {
+  return text.replaceAll("\\", "/");
 }
 
 function staticStringLiteralContent(literal) {
@@ -1302,7 +1309,10 @@ function lineNumberAtOffset(lineStarts, offset) {
 }
 
 function literalJoinGapAllowsCompactScan(gap) {
-  const withoutJoinCalls = gap
+  const withoutContinuations = gap
+    .replace(/\\\r?\n/g, "")
+    .replace(/`\r?\n/g, "");
+  const withoutJoinCalls = withoutContinuations
     .replace(/\.(?:concat|join)\s*\(/g, "")
     .replace(/\bpath\.(?:join|resolve)\s*\(/g, "");
   return /^[\s,+()[\].]*$/.test(withoutJoinCalls);
@@ -1456,6 +1466,11 @@ for (const filePath of [...structuralFiles].sort()) {
 const protectedNonRustScanFiles = new Set();
 for (const root of nonRustScanRoots) {
   for (const filePath of walkProtectedNonRustFiles(root)) {
+    protectedNonRustScanFiles.add(filePath);
+  }
+}
+if (usesDefaultNonRustScanRoots) {
+  for (const filePath of requiredProtectedNonRustFiles) {
     protectedNonRustScanFiles.add(filePath);
   }
 }
