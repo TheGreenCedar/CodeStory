@@ -354,7 +354,7 @@ wait_online() {
   local runner_id
   local remote
   runner_id=$(jq -er '.runner_id' "$owner_path")
-  for _ in {1..20}; do
+  for _ in {1..60}; do
     remote=$(remote_by_id "$runner_id")
     if test -n "$remote" && test "$(jq -r '.status' <<<"$remote")" = online; then break; fi
     sleep 1
@@ -375,7 +375,7 @@ wait_offline() {
     test "$(jq 'length' <<<"$remote")" -eq 0
     return
   fi
-  for _ in {1..20}; do
+  for _ in {1..60}; do
     remote=$(remote_by_id "$runner_id")
     if test "$(jq -r '.status' <<<"$remote")" = offline; then break; fi
     sleep 1
