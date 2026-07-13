@@ -5,9 +5,8 @@ use std::time::Duration;
 use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarProfile, SidecarRuntimeConfig, bootstrap_sidecars_with_runtime,
-    sidecar_down_for_runtime, sidecar_up_with_runtime_preserving_launch,
-    strict_sidecar_status_for_runtime,
+    SidecarProfile, SidecarRuntimeConfig, sidecar_down_for_runtime,
+    sidecar_up_with_runtime_preserving_launch, strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
@@ -39,7 +38,7 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         Some(runtime.cache_root.as_path()),
     );
     let sidecar_profile = cmd.profile;
-    let sidecar = runtime.sidecar.with_profile_and_run_id(
+    let mut sidecar = runtime.sidecar.with_profile_and_run_id(
         Some(&runtime.project_root),
         sidecar_profile.into(),
         cmd.run_id.as_deref(),
@@ -55,36 +54,45 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         crate::readiness_broker::run_with_native_embedding_lease_lifecycle(
             crate::readiness_broker::NativeEmbeddingLeaseLifecycleParams {
                 scope: &broker_scope,
-                sidecar: &sidecar,
+                sidecar: &mut sidecar,
+                resource: crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
                 wait: Duration::from_secs(30),
                 poll: Duration::from_millis(250),
                 bootstrap_context: "retrieval bootstrap",
                 sidecar_cleanup_label: "retrieval sidecar",
             },
-            |allow_native_embedding_spawn| {
-                bootstrap_sidecars_with_runtime(
-                    &sidecar,
+            |selected_sidecar,
+             allow_native_embedding_spawn,
+             reusable_native_embedding_launch,
+             observe_new_native_launch| {
+                codestory_retrieval::bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
+                    selected_sidecar,
                     Some(&runtime.project_root),
-                    &storage_scope,
-                    cmd.compose_file.as_deref(),
-                    cmd.skip_compose,
-                    Duration::from_secs(cmd.wait_secs),
-                    allow_native_embedding_spawn,
+                    codestory_retrieval::BootstrapSidecarsOptions {
+                        storage_scope: storage_scope.clone(),
+                        compose_file: cmd.compose_file.clone(),
+                        skip_compose: cmd.skip_compose,
+                        wait_timeout: Duration::from_secs(cmd.wait_secs),
+                        allow_native_embedding_spawn,
+                        reusable_native_embedding_launch: reusable_native_embedding_launch.cloned(),
+                    },
+                    |_| {},
+                    observe_new_native_launch,
                 )
             },
             |report| &report.state,
-            |report| {
+            |report, selected_sidecar| {
                 let project_qdrant_repair =
                     codestory_retrieval::repair_project_qdrant_collection_for_runtime(
                         &runtime.project_root,
                         &runtime.storage_path,
-                        &sidecar,
+                        selected_sidecar,
                     )
                     .context("retrieval project qdrant repair")?;
                 let status = strict_sidecar_status_for_runtime(
                     &runtime.project_root,
                     Some(&runtime.storage_path),
-                    sidecar.clone(),
+                    selected_sidecar.clone(),
                 )
                 .context("retrieval status after bootstrap")?;
                 Ok((report, project_qdrant_repair, status))
@@ -336,7 +344,7 @@ fn ensure_local_profile_handoff(
         default_sidecar,
     )
     .context("retrieval local/default status after index")?;
-    if status.retrieval_mode != "full" {
+    if !status.is_live_ready() {
         anyhow::bail!(
             "retrieval profile handoff failed: local/default status after index is mode={} reason={}; indexed_project_id={} sidecar={}",
             status.retrieval_mode,
@@ -889,7 +897,7 @@ mod tests {
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
         let _device = EnvGuard::remove("CODESTORY_EMBED_DEVICE_STATE");
         let _host_detection = EnvGuard::set("CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT", "1");
-        let sidecar = SidecarRuntimeConfig::local();
+        let sidecar = crate::sidecar_runtime::local();
 
         let error = ensure_retrieval_index_embedding_policy(&sidecar)
             .expect_err("unknown embedding device must block retrieval index refresh");
@@ -912,7 +920,7 @@ mod tests {
         let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
 
         let project = tempfile::TempDir::new().expect("project");
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some("packet-search-eval"),
@@ -930,9 +938,8 @@ mod tests {
     #[test]
     fn local_profile_handoff_reports_default_namespace_path_mismatch() {
         let project = tempfile::TempDir::new().expect("project");
-        let local =
-            codestory_retrieval::sidecar_runtime_for_project(project.path(), SidecarProfile::Local);
-        let agent = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let local = crate::sidecar_runtime::for_project(project.path(), SidecarProfile::Local);
+        let agent = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some("issue-534"),

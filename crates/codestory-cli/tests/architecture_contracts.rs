@@ -110,6 +110,86 @@ fn direct_cli_and_stdio_agent_surfaces_share_runtime_constructor() {
 }
 
 #[test]
+fn direct_full_retrieval_surfaces_require_identity_bound_gpu_proof() {
+    let main = read("crates/codestory-cli/src/main.rs");
+    for (start, end, surface) in [
+        ("fn run_context", "fn run_packet", "context"),
+        ("fn run_packet", "fn run_task", "packet"),
+        (
+            "fn run_task_brief",
+            "fn render_packet_markdown",
+            "task brief",
+        ),
+        ("fn run_search", "fn search_request_from_command", "search"),
+        ("fn execute_drill", "fn execute_drill_packet", "drill"),
+    ] {
+        let body = source_between(&main, start, end);
+        assert!(
+            body.contains("ensure_agent_surface_gpu_proof(&runtime,"),
+            "{surface} must reject full accelerator-required retrieval without identity-bound broker proof"
+        );
+    }
+}
+
+#[test]
+fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
+    let source_root = repo_root().join("crates/codestory-cli/src");
+    let gateway_path = source_root.join("sidecar_runtime.rs");
+    let gateway = fs::read_to_string(&gateway_path).expect("read sidecar runtime gateway");
+    let activation = gateway
+        .find("enable_automatic_test_cache_root_for_process")
+        .expect("gateway enables automatic unit-test cache isolation");
+    let first_cache_lookup = gateway
+        .find("codestory_retrieval::user_cache_root()")
+        .expect("gateway owns the platform cache lookup");
+    assert!(
+        activation < first_cache_lookup,
+        "test cache isolation must be enabled before the first platform cache lookup"
+    );
+
+    let config = read("crates/codestory-cli/src/config.rs");
+    let startup = source_between(
+        &config,
+        "pub(crate) fn from_process_env()",
+        "#[derive(Debug, Clone, Default, Deserialize)]",
+    );
+    assert!(
+        startup.contains("crate::sidecar_runtime::prepare_cache_access();"),
+        "startup configuration must activate cache isolation before resolving its cache root"
+    );
+
+    let mut files = Vec::new();
+    collect_rs_files(&source_root, &mut files);
+    let forbidden = [
+        "SidecarRuntimeConfig::local(",
+        "SidecarRuntimeConfig::for_project_",
+        "sidecar_runtime_for_project(",
+        "sidecar_runtime_for_project_with_run_id(",
+        "strict_sidecar_status_for_profile(",
+        "codestory_retrieval::embedding_runtime_id()",
+        "codestory_retrieval::user_cache_root(",
+        "enable_automatic_test_cache_root_for_process",
+    ];
+    let mut violations = Vec::new();
+    for path in files {
+        if path == gateway_path {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read CLI source");
+        for needle in forbidden {
+            if source.contains(needle) {
+                violations.push(format!("{}: {needle}", path.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "CLI sidecar constructors must remain behind sidecar_runtime.rs:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn workspace_crate_stays_decoupled_from_store_and_runtime() {
     let dependencies = dependency_names("crates/codestory-workspace/Cargo.toml");
     assert!(

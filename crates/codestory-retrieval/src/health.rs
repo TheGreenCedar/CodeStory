@@ -78,6 +78,10 @@ pub struct EmbeddingLaunchMetadata {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at_epoch_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +92,8 @@ pub struct EmbeddingLaunchMetadata {
     pub executable_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_device: Option<String>,
 }
@@ -139,6 +145,13 @@ pub struct RetrievalStatusReport {
     pub manifest: Option<codestory_store::RetrievalIndexManifest>,
 }
 
+impl RetrievalStatusReport {
+    /// Whether the persisted full-retrieval classification is also live and usable now.
+    pub fn is_live_ready(&self) -> bool {
+        self.retrieval_mode == "full" && self.degraded_reason.is_none()
+    }
+}
+
 pub fn attach_manifest_contract(
     mut report: RetrievalStatusReport,
     source_root: &Path,
@@ -155,7 +168,7 @@ pub fn attach_repair_hint(
     project_root: &Path,
     runtime: Option<&SidecarRuntimeConfig>,
 ) -> RetrievalStatusReport {
-    if report.retrieval_mode == "full" {
+    if report.is_live_ready() {
         return report;
     }
     let reason = repair_reason_code(
@@ -205,6 +218,9 @@ pub fn attach_repair_hint(
 fn repair_reason_code(degraded_reason: &str) -> String {
     if degraded_reason.starts_with("sidecar_manifest_stale:") {
         return "sidecar_manifest_stale".into();
+    }
+    if degraded_reason.starts_with("embedding_runtime_unavailable:") {
+        return "embedding_runtime_unavailable".into();
     }
     degraded_reason.to_string()
 }
@@ -301,6 +317,11 @@ fn parse_degraded_modes(manifest: &codestory_store::RetrievalIndexManifest) -> V
         .unwrap_or_else(|_| vec!["degraded_modes_json_invalid".into()])
 }
 
+fn manifest_classifies_full(manifest: &codestory_store::RetrievalIndexManifest) -> bool {
+    manifest_has_current_sidecar_contract(&manifest.project_id, manifest)
+        && parse_degraded_modes(manifest).is_empty()
+}
+
 fn component_status_label(component: &ComponentHealth) -> String {
     if let Some(reason) = component.degraded_reason.as_ref() {
         return reason.clone();
@@ -378,6 +399,10 @@ pub fn unavailable_status_report_with_embedding_device(
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> RetrievalStatusReport {
     let reason = reason.into();
+    let retrieval_mode = manifest
+        .as_ref()
+        .filter(|manifest| manifest_classifies_full(manifest))
+        .map_or("unavailable", |_| "full");
     let manifest_vector_embedding_backend = manifest
         .as_ref()
         .and_then(|manifest| manifest.embedding_backend.clone());
@@ -385,7 +410,7 @@ pub fn unavailable_status_report_with_embedding_device(
         .as_ref()
         .and_then(|manifest| manifest.embedding_dim);
     RetrievalStatusReport {
-        retrieval_mode: "unavailable".into(),
+        retrieval_mode: retrieval_mode.into(),
         ownership: None,
         sidecar_images: default_sidecar_image_pins(),
         degraded_reason: Some(reason.clone()),
@@ -416,19 +441,21 @@ pub fn unavailable_status_report_with_embedding_device(
     }
 }
 
-/// Local lexical storage plus Qdrant and embedding reachability before a project generation.
-pub fn probe_infrastructure_health(layout: &SidecarLayout) -> InfrastructureHealth {
-    let embedding_device = crate::embeddings::embedding_device_readiness();
-    probe_infrastructure_health_with_embedding_device(layout, &embedding_device)
+/// Runtime-scoped lexical storage plus Qdrant and embedding reachability before a project
+/// generation.
+pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> InfrastructureHealth {
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    probe_infrastructure_health_with_embedding_device(runtime, &embedding_device)
 }
 
 pub fn probe_infrastructure_health_with_embedding_device(
-    layout: &SidecarLayout,
+    runtime: &SidecarRuntimeConfig,
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> InfrastructureHealth {
+    let layout = &runtime.layout;
     let qdrant_client = QdrantClient::new(layout);
     let qdrant_probe = qdrant_client.list_collections_probe();
-    let embed_probe = crate::embeddings::probe_product_embedding_runtime();
+    let embed_probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
     InfrastructureHealth {
         lexical_ready: layout.lexical_data_dir.is_dir(),
         qdrant_reachable: qdrant_probe.reachable,
@@ -796,10 +823,15 @@ pub fn probe_sidecar_health_for_runtime(
         capabilities: scip_capabilities,
     };
 
-    let (mode, degraded_reason) = crate::mode::derive_degraded_mode(&lexical, &qdrant, &scip);
+    let (live_mode, degraded_reason) = crate::mode::derive_degraded_mode(&lexical, &qdrant, &scip);
+    let retrieval_mode = if manifest_classifies_full(&manifest) {
+        "full"
+    } else {
+        live_mode.as_str()
+    };
 
     RetrievalStatusReport {
-        retrieval_mode: mode.as_str().into(),
+        retrieval_mode: retrieval_mode.into(),
         ownership: None,
         sidecar_images: default_sidecar_image_pins(),
         degraded_reason,
@@ -1013,7 +1045,8 @@ mod tests {
         let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
 
         assert!(!report.lexical.capabilities.lexical);
-        assert_ne!(report.retrieval_mode, "full");
+        assert_eq!(report.retrieval_mode, "full");
+        assert!(!report.is_live_ready());
     }
 
     #[test]
@@ -1080,7 +1113,8 @@ mod tests {
             report.lexical.degraded_reason.as_deref(),
             Some("lexical_source_coverage_empty")
         );
-        assert_ne!(report.retrieval_mode, "full");
+        assert_eq!(report.retrieval_mode, "full");
+        assert!(!report.is_live_ready());
     }
 
     #[test]

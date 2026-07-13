@@ -1164,11 +1164,13 @@ mod tests {
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
             embedding_launch: None,
+            embedding_launch_ownership: crate::sidecar::EmbeddingLaunchOwnership::Owner,
             sidecar_images: crate::config::default_sidecar_image_pins(),
             lexical_data_dir: root.join("lexical").display().to_string(),
             qdrant_data_dir: root.join("qdrant").display().to_string(),
             scip_artifacts_root: root.join("scip").display().to_string(),
             compose_file: None,
+            compose_started_by_bootstrap: true,
             cleanup_command: format!(
                 "codestory-cli retrieval down --project C:/repo --profile agent --run-id {}",
                 namespace

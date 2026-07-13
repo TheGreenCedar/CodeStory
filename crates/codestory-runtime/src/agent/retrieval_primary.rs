@@ -265,7 +265,9 @@ fn sidecar_mode_can_serve_primary(mode: &str) -> bool {
 }
 
 fn sidecar_status_can_serve_primary(status: &SidecarModeStatus) -> bool {
-    status.profile.as_deref() == Some("agent") && sidecar_mode_can_serve_primary(&status.mode)
+    status.profile.as_deref() == Some("agent")
+        && sidecar_mode_can_serve_primary(&status.mode)
+        && status.degraded_reason.is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,12 +275,6 @@ struct SidecarModeStatus {
     profile: Option<String>,
     mode: String,
     degraded_reason: Option<String>,
-}
-
-#[cfg(test)]
-fn sidecar_mode_status_for_project(project_root: &Path, storage_path: &Path) -> SidecarModeStatus {
-    let runtime = sidecar_runtime_auto(project_root);
-    sidecar_mode_status_for_runtime(project_root, storage_path, &runtime)
 }
 
 fn sidecar_mode_status_for_runtime(
@@ -2358,12 +2354,18 @@ mod tests {
             mode: "full".into(),
             degraded_reason: None,
         };
+        let agent_full_but_dead = SidecarModeStatus {
+            profile: Some("agent".into()),
+            mode: "full".into(),
+            degraded_reason: Some("embedding_runtime_unavailable: connection refused".into()),
+        };
 
         assert!(
             !sidecar_status_can_serve_primary(&local_full),
             "local/default full sidecar must not serve packet/search/context primary retrieval"
         );
         assert!(sidecar_status_can_serve_primary(&agent_full));
+        assert!(!sidecar_status_can_serve_primary(&agent_full_but_dead));
         assert!(!sidecar_status_can_serve_primary(&missing_profile_full));
     }
 
@@ -2399,10 +2401,18 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_mode_status_rejects_stale_manifest_before_health_probe() {
+    fn sidecar_mode_status_reports_dead_endpoint_before_stale_manifest() {
         let project = tempfile::tempdir().expect("project");
         let storage_dir = tempfile::tempdir().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve dead port");
+        let dead_port = listener.local_addr().expect("dead port address").port();
+        drop(listener);
+        let mut runtime = sidecar_runtime_auto(project.path());
+        runtime.embed_http_port = dead_port;
+        runtime.embedding.endpoint = format!("http://127.0.0.1:{dead_port}/v1/embeddings");
+        runtime.embedding.endpoint_origin =
+            codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar;
         let project_id = project_id_for_root(project.path());
         let hash = "deadbeefcafebabe";
         let mut storage = Store::open(&storage_path).expect("open storage");
@@ -2412,17 +2422,13 @@ mod tests {
             .upsert_retrieval_index_manifest(&manifest)
             .expect("manifest");
 
-        let status = sidecar_mode_status_for_project(project.path(), &storage_path);
+        let status = sidecar_mode_status_for_runtime(project.path(), &storage_path, &runtime);
 
-        assert_eq!(status.mode, "unavailable");
-        let reason = status.degraded_reason.expect("stale reason");
+        assert_eq!(status.mode, "full");
+        let reason = status.degraded_reason.expect("unavailable reason");
         assert!(
-            reason.contains("sidecar_manifest_stale"),
-            "expected stale manifest reason, got: {reason}"
-        );
-        assert!(
-            reason.contains("sidecar_embedding_backend_changed"),
-            "expected embedding backend detail, got: {reason}"
+            reason.starts_with("embedding_runtime_unavailable:"),
+            "expected live endpoint failure to precede stale manifest classification, got: {reason}"
         );
     }
 

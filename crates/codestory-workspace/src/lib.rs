@@ -768,6 +768,27 @@ fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
         .unwrap_or_else(|_| normalize_lexical_path(&manifest.root_dir()))
 }
 
+fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = existing.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return normalize_lexical_path(&canonical);
+        }
+        let Some(name) = existing.file_name() else {
+            return normalize_lexical_path(path);
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return normalize_lexical_path(path);
+        };
+        existing = parent;
+    }
+}
+
 fn resolve_manifest_source_path(
     manifest: &WorkspaceManifest,
     source_path: &Path,
@@ -791,9 +812,7 @@ fn resolve_manifest_source_path(
 
     let full_path = normalize_lexical_path(&root.join(source_path));
     let canonical_root = workspace_root(manifest);
-    let canonical_source = full_path
-        .canonicalize()
-        .unwrap_or_else(|_| normalize_lexical_path(&full_path));
+    let canonical_source = canonicalize_with_missing_tail(&full_path);
     if relative_path_for_matching(&canonical_source, &canonical_root).is_none() {
         bail!(
             "repo-local manifest source path `{}` resolves outside manifest root `{}`",
@@ -893,6 +912,12 @@ impl CompiledExcludePattern {
 
 fn relative_path_for_matching(path: &Path, root: &Path) -> Option<PathBuf> {
     if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+
+    if let (Ok(canonical_path), Ok(canonical_root)) = (path.canonicalize(), root.canonicalize())
+        && let Ok(relative) = canonical_path.strip_prefix(canonical_root)
+    {
         return Some(relative.to_path_buf());
     }
 
@@ -1723,6 +1748,25 @@ mod tests {
             error.to_string().contains("must be relative"),
             "absolute source path rejection should explain the trusted boundary: {error}"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_local_manifest_allows_missing_paths_beneath_a_symlinked_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let actual = temp.path().join("actual");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(&actual)?;
+        symlink(&actual, &alias)?;
+        write_repo_manifest(&actual, vec![PathBuf::from("unreadable")])?;
+
+        let manifest = WorkspaceManifest::open(alias.clone())?;
+        let resolved = resolve_manifest_source_path(&manifest, Path::new("unreadable"))?;
+
+        assert_eq!(resolved, alias.join("unreadable"));
         Ok(())
     }
 

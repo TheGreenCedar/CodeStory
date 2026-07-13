@@ -345,7 +345,10 @@ pub struct SidecarRuntimeConfig {
 
 #[doc(hidden)]
 #[derive(Clone, PartialEq, Eq)]
-pub struct AgentPortLeaseOwnerToken(String);
+pub struct AgentPortLeaseOwnerToken {
+    owner_id: String,
+    allocated_ports: SidecarPorts,
+}
 
 impl std::fmt::Debug for AgentPortLeaseOwnerToken {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -579,6 +582,8 @@ impl SidecarRuntimeConfig {
                 .join("retrieval-sidecars.json"),
         };
         let stored = read_ports_from_state(&state_file);
+        let stored_native_embedding =
+            profile == SidecarProfile::Agent && sidecar_state_uses_native_embedding(&state_file);
         let configured_ports = [
             env_port(
                 defaults,
@@ -594,6 +599,9 @@ impl SidecarRuntimeConfig {
         ];
         let requested_ports = std::array::from_fn(|index| {
             configured_ports[index].or_else(|| {
+                if index == 2 && stored_native_embedding {
+                    return None;
+                }
                 stored.as_ref().map(|ports| match index {
                     0 => ports.qdrant_http,
                     1 => ports.qdrant_grpc,
@@ -632,7 +640,9 @@ impl SidecarRuntimeConfig {
         );
         let embed_http_port = selected_port(
             configured_ports[2],
-            stored.as_ref().map(|ports| ports.embed_http),
+            (!stored_native_embedding)
+                .then(|| stored.as_ref().map(|ports| ports.embed_http))
+                .flatten(),
             agent_allocation
                 .as_ref()
                 .map(|allocation| allocation.ports.embed_http),
@@ -688,13 +698,24 @@ impl SidecarRuntimeConfig {
             labels.insert("dev.codestory.run_id".into(), run_id.to_string());
             labels.insert("dev.codestory.agent_id".into(), run_id.to_string());
         }
-        let embedding = embedding_runtime_config(embed_http_port, defaults, overrides);
+        let mut embedding = embedding_runtime_config(embed_http_port, defaults, overrides);
+        if embedding.endpoint_origin == EmbeddingEndpointOrigin::ManagedSidecar
+            && let Some(stored_endpoint) = stored
+                .as_ref()
+                .map(|ports| ports.embed_url.as_str())
+                .filter(|endpoint| local_embedding_endpoint_port(endpoint).is_some())
+        {
+            embedding.endpoint = stored_endpoint.to_string();
+        }
         let retrieval = retrieval_runtime_config(defaults, overrides);
         let summary = summary_runtime_config(defaults, overrides);
         let port_lease_owner_id = agent_allocation
             .as_ref()
             .filter(|allocation| !allocation.failed())
-            .map(|allocation| AgentPortLeaseOwnerToken(allocation.owner_id.clone()));
+            .map(|allocation| AgentPortLeaseOwnerToken {
+                owner_id: allocation.owner_id.clone(),
+                allocated_ports: allocation.ports.clone(),
+            });
         Self {
             project_identity,
             layout,
@@ -724,7 +745,8 @@ impl SidecarRuntimeConfig {
             ports: SidecarPorts {
                 qdrant_http: self.layout.qdrant_http_port,
                 qdrant_grpc: self.layout.qdrant_grpc_port,
-                embed_http: self.embed_http_port,
+                embed_http: local_embedding_endpoint_port(&self.embedding.endpoint)
+                    .unwrap_or(self.embed_http_port),
                 embed_url: redacted_embedding_endpoint(&self.embedding.endpoint),
             },
             embedding_endpoint_origin: self.embedding.endpoint_origin,
@@ -749,7 +771,7 @@ impl SidecarRuntimeConfig {
             let owner_id = self
                 .port_lease_owner_id
                 .as_ref()
-                .map(|token| token.0.as_str())
+                .map(|token| token.owner_id.as_str())
                 .context("agent sidecar runtime has no port lease owner token")?;
             let cache_root = self
                 .layout
@@ -762,7 +784,11 @@ impl SidecarRuntimeConfig {
                 cache_root,
                 &self.namespace,
                 owner_id,
-                &self.ownership().ports,
+                &self
+                    .port_lease_owner_id
+                    .as_ref()
+                    .expect("agent lease token checked above")
+                    .allocated_ports,
             )?;
         }
         Ok(())
@@ -795,9 +821,14 @@ impl SidecarRuntimeConfig {
         let owner_id = self
             .port_lease_owner_id
             .as_ref()
-            .map(|token| token.0.clone())
+            .map(|token| token.owner_id.clone())
             .context("agent sidecar runtime has no port lease owner token")?;
-        let ports = self.ownership().ports;
+        let ports = self
+            .port_lease_owner_id
+            .as_ref()
+            .expect("agent lease token checked above")
+            .allocated_ports
+            .clone();
         let (stop, stopped) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("codestory-port-lease-heartbeat".into())
@@ -844,13 +875,113 @@ impl SidecarRuntimeConfig {
             &SidecarRuntimeDefaults::default(),
             &SidecarRuntimeOverrides::default(),
         );
+        let selected_managed_endpoint = selected.embedding.endpoint.clone();
         selected.embedding = self.embedding.clone();
         if selected.embedding.endpoint_origin == EmbeddingEndpointOrigin::ManagedSidecar {
-            selected.embedding.endpoint = SidecarLayout::embed_base_url(selected.embed_http_port);
+            selected.embedding.endpoint = selected_managed_endpoint;
         }
         selected.retrieval = self.retrieval.clone();
         selected.summary = self.summary.clone();
         selected
+    }
+
+    /// Retarget the managed embedding endpoint after the broker has established
+    /// ownership. A new launch uses the profile's allocated port; a reused
+    /// launch uses the already-running process port. The agent's provisional
+    /// tuple remains isolated in its registry lease when those ports differ.
+    #[doc(hidden)]
+    pub fn use_broker_verified_native_embedding_endpoint(&mut self, port: u16) -> Result<()> {
+        if port == 0 {
+            anyhow::bail!("broker-verified native embedding port cannot be 0");
+        }
+        if self.profile == SidecarProfile::Agent && self.port_lease_owner_id.is_none() {
+            anyhow::bail!("agent sidecar runtime has no port lease owner token");
+        }
+        self.embedding.endpoint = SidecarLayout::embed_base_url(port);
+        Ok(())
+    }
+
+    /// Revalidate an agent's provisional native-embedding port immediately before a
+    /// broker-owned launch. Allocation and any rotation happen under the registry lock,
+    /// closing the gap where another process binds the port after runtime construction.
+    #[doc(hidden)]
+    pub fn revalidate_broker_native_embedding_port(&mut self) -> Result<()> {
+        if self.profile != SidecarProfile::Agent {
+            return self.use_broker_verified_native_embedding_endpoint(self.embed_http_port);
+        }
+        let base = self
+            .layout
+            .state_file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("agent sidecar state path has no cache root")?
+            .to_path_buf();
+        let token = self
+            .port_lease_owner_id
+            .as_ref()
+            .context("agent sidecar runtime has no port lease owner token")?;
+        let ports = revalidate_agent_embedding_port(
+            &base,
+            &self.namespace,
+            &token.owner_id,
+            &token.allocated_ports,
+            false,
+        )?;
+        self.embed_http_port = ports.embed_http;
+        self.port_lease_owner_id
+            .as_mut()
+            .expect("agent port lease token checked above")
+            .allocated_ports = ports.clone();
+        self.use_broker_verified_native_embedding_endpoint(ports.embed_http)
+    }
+
+    /// Select a different managed native-embedding port after the launched server
+    /// proves that another process won the bind race. Agent rotations update the
+    /// durable lease while holding the registry lock; local rotations remain
+    /// process-local because local runtimes have no port registry.
+    #[doc(hidden)]
+    pub fn rotate_broker_native_embedding_port(&mut self) -> Result<()> {
+        if self.profile != SidecarProfile::Agent {
+            let previous = self.embed_http_port;
+            let mut replacement = free_local_port();
+            for _ in 0..10 {
+                if replacement != 0 && replacement != previous {
+                    break;
+                }
+                replacement = free_local_port();
+            }
+            if replacement == 0 || replacement == previous {
+                anyhow::bail!("native embedding port rotation is unavailable");
+            }
+            self.embed_http_port = replacement;
+            return self.use_broker_verified_native_embedding_endpoint(replacement);
+        }
+        let base = self
+            .layout
+            .state_file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .context("agent sidecar state path has no cache root")?
+            .to_path_buf();
+        let token = self
+            .port_lease_owner_id
+            .as_ref()
+            .context("agent sidecar runtime has no port lease owner token")?;
+        let ports = revalidate_agent_embedding_port(
+            &base,
+            &self.namespace,
+            &token.owner_id,
+            &token.allocated_ports,
+            true,
+        )?;
+        self.embed_http_port = ports.embed_http;
+        self.port_lease_owner_id
+            .as_mut()
+            .expect("agent port lease token checked above")
+            .allocated_ports = ports.clone();
+        self.use_broker_verified_native_embedding_endpoint(ports.embed_http)
     }
 }
 
@@ -1276,6 +1407,27 @@ fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
     sidecar_ports_from_value(&value)
 }
 
+fn sidecar_state_uses_native_embedding(path: &Path) -> bool {
+    serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).unwrap_or_default())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("embedding_launch")?
+                .get("launch_mode")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .is_some_and(|mode| mode == EmbeddingServerLaunchMode::NativeSpawned.as_str())
+}
+
+fn local_embedding_endpoint_port(endpoint: &str) -> Option<u16> {
+    endpoint
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.strip_suffix("/v1/embeddings"))
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+}
+
 fn sidecar_ports_from_value(value: &serde_json::Value) -> Option<SidecarPorts> {
     Some(SidecarPorts {
         qdrant_http: value.get("qdrant_http_port")?.as_u64()?.try_into().ok()?,
@@ -1466,8 +1618,10 @@ fn allocate_agent_ports_in_registry_at(
         .as_ref()
         .filter(|lease| lease.owner.id == owner.id && lease.ports == ports);
     let acquired_at_epoch_ms = continued_lease.map_or(now, |lease| lease.acquired_at_epoch_ms);
-    let renewed_at_epoch_ms =
-        continued_lease.map_or(now, |lease| now.max(lease.renewed_at_epoch_ms));
+    let renewed_at_epoch_ms = match existing.as_ref() {
+        Some(lease) => next_lease_renewal_epoch_ms(now, lease.renewed_at_epoch_ms)?,
+        None => now,
+    };
     let lease = AgentPortLease {
         namespace: namespace.to_string(),
         owner: owner.clone(),
@@ -1533,6 +1687,13 @@ fn new_agent_port_owner(now: i64) -> AgentPortOwner {
 
 fn lease_expiry(now: i64) -> i64 {
     now.saturating_add(AGENT_PORT_LEASE_TTL.as_millis() as i64)
+}
+
+fn next_lease_renewal_epoch_ms(now: i64, previous: i64) -> Result<i64> {
+    let after_previous = previous
+        .checked_add(1)
+        .context("agent sidecar port lease renewal timestamp overflowed")?;
+    Ok(now.max(after_previous))
 }
 
 fn write_agent_port_owner(root: &Path, namespace: &str, owner: &AgentPortOwner) -> Result<()> {
@@ -1714,11 +1875,73 @@ fn renew_agent_port_lease(
     {
         anyhow::bail!("agent sidecar namespace {namespace} port lease ownership changed");
     }
-    let now = now_epoch_ms().max(lease.renewed_at_epoch_ms);
+    let now = next_lease_renewal_epoch_ms(now_epoch_ms(), lease.renewed_at_epoch_ms)?;
     lease.renewed_at_epoch_ms = now;
     lease.expires_at_epoch_ms = lease_expiry(now);
     write_agent_port_lease(&root, lease)?;
     write_agent_port_registry(&registry_path, &registry)
+}
+
+fn revalidate_agent_embedding_port(
+    base: &Path,
+    namespace: &str,
+    owner_id: &str,
+    ports: &SidecarPorts,
+    force_rotation: bool,
+) -> Result<SidecarPorts> {
+    let root = base.join("sidecars");
+    let lock_path = root.join("port-allocations.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open sidecar port allocation lock {}", lock_path.display()))?;
+    FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("take sidecar port allocation lock {}", lock_path.display()))?;
+    let registry_path = root.join("port-allocations.json");
+    let mut registry = read_agent_port_registry(&root, &registry_path)?;
+    let current = registry
+        .leases
+        .get(namespace)
+        .cloned()
+        .with_context(|| format!("agent sidecar namespace {namespace} has no port lease"))?;
+    let owner = read_agent_port_owner(&root, namespace)?
+        .with_context(|| format!("agent sidecar namespace {namespace} has no port owner"))?;
+    if current.owner.id != owner_id
+        || owner.id != owner_id
+        || !same_port_numbers(&current.ports, ports)
+    {
+        anyhow::bail!("agent sidecar namespace {namespace} port lease ownership changed");
+    }
+
+    let mut selected = current.ports.clone();
+    if force_rotation || !local_port_available(selected.embed_http) {
+        let mut reserved = reserved_registry_ports_excluding(&registry.leases, namespace);
+        reserved.insert(selected.qdrant_http);
+        reserved.insert(selected.qdrant_grpc);
+        if force_rotation {
+            reserved.insert(selected.embed_http);
+        }
+        selected.embed_http = reserve_dynamic_agent_port(namespace, "embed", &mut reserved);
+        if selected.embed_http == 0 {
+            anyhow::bail!("agent sidecar embedding port rotation is unavailable");
+        }
+        selected.embed_url = SidecarLayout::embed_base_url(selected.embed_http);
+    }
+
+    let lease = registry
+        .leases
+        .get_mut(namespace)
+        .expect("agent port lease checked above");
+    let now = next_lease_renewal_epoch_ms(now_epoch_ms(), lease.renewed_at_epoch_ms)?;
+    lease.ports = selected.clone();
+    lease.renewed_at_epoch_ms = now;
+    lease.expires_at_epoch_ms = lease_expiry(now);
+    write_agent_port_lease(&root, lease)?;
+    write_agent_port_registry(&registry_path, &registry)?;
+    Ok(selected)
 }
 
 fn is_agent_namespace_path_component(namespace: &str) -> bool {
@@ -2431,6 +2654,44 @@ mod tests {
         assert_eq!(lease.acquired_at_epoch_ms, 100);
         assert_eq!(lease.renewed_at_epoch_ms, 200);
         assert_eq!(lease.expires_at_epoch_ms, lease_expiry(200));
+    }
+
+    #[test]
+    fn same_millisecond_atomic_lease_update_recovers_over_stale_compact_registry() {
+        let cache = tempdir().expect("cache");
+        let first = allocate_agent_ports_in_registry_at(cache.path(), "same-ms", [None; 3], 100)
+            .expect("initial allocation");
+        let root = cache.path().join("sidecars");
+        let registry_path = root.join("port-allocations.json");
+        let compact = read_agent_port_registry(&root, &registry_path).expect("initial registry");
+        std::fs::remove_file(agent_port_owner_path(&root, "same-ms"))
+            .expect("simulate vanished first owner");
+        let replacement =
+            allocate_agent_ports_in_registry_at(cache.path(), "same-ms", [None; 3], 100)
+                .expect("same-millisecond replacement owner");
+        let recovered: AgentPortLease = serde_json::from_slice(
+            &std::fs::read(agent_port_lease_path(&root, "same-ms")).expect("newer atomic lease"),
+        )
+        .expect("parse newer atomic lease");
+        assert_ne!(replacement.owner_id, first.owner_id);
+
+        // Simulate a crash after the per-lease atomic write but before the compact
+        // registry publication. The newer +1 timestamp must win deterministically.
+        write_agent_port_registry(&registry_path, &compact)
+            .expect("restore stale compact registry");
+        let reconciled = read_agent_port_registry(&root, &registry_path)
+            .expect("reconcile same-millisecond crash");
+        let selected = reconciled.leases.get("same-ms").expect("recovered lease");
+
+        assert_eq!(selected, &recovered);
+        assert!(
+            selected.renewed_at_epoch_ms
+                > compact
+                    .leases
+                    .get("same-ms")
+                    .expect("compact lease")
+                    .renewed_at_epoch_ms
+        );
     }
 
     #[test]

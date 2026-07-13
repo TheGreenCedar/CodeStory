@@ -507,7 +507,31 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .expect("storage file stem");
-    parent.join(format!("{stem}.search"))
+    parent.join(format!("{stem}.search-generations"))
+}
+
+struct ReleaseE2eSidecarCleanup {
+    binary: PathBuf,
+    project_root: PathBuf,
+    cache_dir: PathBuf,
+    run_id: String,
+}
+
+impl Drop for ReleaseE2eSidecarCleanup {
+    fn drop(&mut self) {
+        let _ = test_support::command(&self.binary)
+            .current_dir(&self.project_root)
+            .args(["retrieval", "down", "--profile", "agent", "--run-id"])
+            .arg(&self.run_id)
+            .arg("--project")
+            .arg(&self.project_root)
+            .arg("--cache-dir")
+            .arg(&self.cache_dir)
+            .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+            .env("CODESTORY_EMBED_BACKEND", "llamacpp")
+            .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
+            .output();
+    }
 }
 
 fn path_bytes(path: &Path) -> u64 {
@@ -716,6 +740,12 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
 
     let cache_dir = tempdir().expect("cache dir");
+    let _sidecar_cleanup = ReleaseE2eSidecarCleanup {
+        binary: binary.clone(),
+        project_root: project_root.clone(),
+        cache_dir: cache_dir.path().to_path_buf(),
+        run_id: sidecar_run_id.to_string(),
+    };
 
     let (index_seconds, index_json) = run_cli_json(
         &binary,

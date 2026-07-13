@@ -1203,7 +1203,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_paths_preserve_case_and_non_utf8_bytes() {
+    fn unix_paths_preserve_filesystem_case_identity_and_non_utf8_bytes() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
@@ -1211,16 +1211,33 @@ mod tests {
         let upper = project.path().join("Repo");
         let lower = project.path().join("repo");
         fs::create_dir(&upper).expect("upper-case path");
-        fs::create_dir(&lower).expect("lower-case path");
-        assert!(!same_workspace_path(&upper, &lower));
-        assert_ne!(
-            workspace_id_v3_for_root(&upper),
-            workspace_id_v3_for_root(&lower)
-        );
+        match fs::create_dir(&lower) {
+            Ok(()) => {
+                assert!(!same_workspace_path(&upper, &lower));
+                assert_ne!(
+                    workspace_id_v3_for_root(&upper),
+                    workspace_id_v3_for_root(&lower)
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                assert!(
+                    same_workspace_path(&upper, &lower),
+                    "case-insensitive filesystems must identify case aliases as the same path"
+                );
+            }
+            Err(error) => panic!("lower-case path: {error}"),
+        }
 
         let first = project.path().join(OsString::from_vec(vec![b'r', 0x80]));
         let second = project.path().join(OsString::from_vec(vec![b'r', 0x81]));
-        fs::create_dir(&first).expect("first non-UTF-8 path");
+        match fs::create_dir(&first) {
+            Ok(()) => {}
+            // Darwin rejects non-UTF-8 path components with EILSEQ (92), so
+            // only exercise byte-distinct identities on filesystems that can
+            // materialize those names.
+            Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => return,
+            Err(error) => panic!("first non-UTF-8 path: {error}"),
+        }
         fs::create_dir(&second).expect("second non-UTF-8 path");
         assert_ne!(
             workspace_id_v3_for_root(&first),

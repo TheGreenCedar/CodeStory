@@ -27,6 +27,23 @@ flowchart TD
 
 Replace `[TARGET_FEATURE]` and `[OWNING_CRATE]` with the specific feature and crate you are working on.
 
+## Host prerequisites
+
+Supported Mac development starts at macOS 15 on Apple Silicon or Intel. Install
+the Xcode Command Line Tools, Node.js 18+, and the Rust toolchain. Start Docker
+Desktop or another compatible Docker engine before running packet/search lanes;
+Qdrant uses Docker on both Mac architectures even though Apple Silicon runs the
+managed embedding server natively with Metal.
+
+The protected packaged-hardware proof also requires `python3`; use that
+versioned command in Mac automation because Command Line Tools does not promise
+an unversioned `python` shim.
+
+Apple Silicon is the managed accelerated Mac cell. Intel supports the native
+CLI/plugin and local graph; retrieval must use explicit degraded CPU allowance
+or a trusted external embedding endpoint under explicit operator policy, and
+must never be described as Metal.
+
 ## Choose The Verification Lane First
 
 Before running Cargo or setting up sidecars, answer two questions:
@@ -177,8 +194,15 @@ After bootstrap, run a target-repo sidecar index before using packet/search:
 ## Delegated Worktree Proof Target
 
 Before a delegated CodeStory lane spends time on cache repair, readiness, or
-sidecar proof, verify the Git target. `scripts/codex-worktree-setup.ps1` prints
-this handoff surface first:
+sidecar proof, verify the Git target. The tracked Codex environment runs:
+
+```sh
+node scripts/codex-worktree-setup.mjs
+```
+
+The Node.js dispatcher selects `scripts/codex-worktree-setup.ps1` on Windows
+and `scripts/codex-worktree-setup.sh` on macOS/Linux. Both print this handoff
+surface first:
 
 ```text
 intended_base_ref
@@ -193,15 +217,29 @@ remote_tip_verification.<target>.result
 ```
 
 Defaults are intentionally narrow: `intended_base_ref` is
-`origin/dev/codestory-next`, and a PR lane with `CODESTORY_PR_HEAD_REF` or
-`-PrHeadRef` proves `base:origin/dev/codestory-next + pr-head:<ref>`. Use
-`-BranchHeadProof` or `CODESTORY_BRANCH_HEAD_PROOF=1` only when the lane is
-explicitly proving the branch head by itself.
+`origin/dev/codestory-next`, and a PR lane with `CODESTORY_PR_HEAD_REF`,
+`--pr-head-ref`, or `-PrHeadRef` proves
+`base:origin/dev/codestory-next + pr-head:<ref>`. Use `--branch-head-proof`,
+or `-BranchHeadProof` only when the lane is explicitly proving the branch head
+by itself.
 
-The setup script reports stale `main`, stale local `dev/codestory-next`, stale
-PR heads, unresolved refs, and the exact `git ls-remote origin ...` result
-before it runs index, retrieval, or doctor handoff work. Treat those warnings as
-Git proof-target blockers, not packet/search readiness blockers.
+The setup reports stale `main`, stale local `dev/codestory-next`, stale PR
+heads, unresolved refs, and the exact `git ls-remote origin ...` result before
+it runs index, retrieval, or doctor handoff work. It then resolves a
+version-matched CLI through `CODESTORY_CLI`, PATH, the CodeStory install
+directory, this worktree, and sibling worktrees; tries the matching release;
+and falls back to a release Cargo build with optional `sccache`. It best-effort
+rehydrates a compatible sibling cache, refreshes the local index, and reports
+agent sidecar readiness. Treat Git-target warnings as proof-target blockers,
+not packet/search readiness blockers.
+
+Exercise the dispatcher and platform implementation without changing your real
+workspace state:
+
+```sh
+node --test scripts/tests/codex-worktree-setup.test.mjs
+node scripts/codex-worktree-setup.mjs --self-test
+```
 
 ## Recommended Reading Order
 

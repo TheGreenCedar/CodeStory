@@ -237,11 +237,16 @@ function spawnLauncher(launcher, env) {
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "codestory://status" } })}\n`);
   const runtimeMetadata = env.PLUGIN_DATA && join(env.PLUGIN_DATA, ".codestory-mcp-runtime.json");
+  let handoffRequestId = 2;
   const handoffPoll = runtimeMetadata && setInterval(() => {
     try {
+      if (child.exitCode !== null || (env.TEST_OUT && fs.existsSync(env.TEST_OUT))) {
+        clearInterval(handoffPoll);
+        return;
+      }
       if (JSON.parse(fs.readFileSync(runtimeMetadata, "utf8")).source !== "managed") return;
-      clearInterval(handoffPoll);
-      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" })}\n`);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: handoffRequestId, method: "tools/list" })}\n`);
+      handoffRequestId += 1;
     } catch {
       // Provisioning has not published runtime metadata yet.
     }
@@ -606,7 +611,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
     assert.equal(observed.source, "managed");
-    assert.equal(observed.path, cliPath);
+    assert.equal(await realpath(observed.path), await realpath(cliPath));
     assert.equal(observed.sha256, sha256);
     const retention = JSON.parse(observed.retention);
     assert.deepEqual(
@@ -2435,8 +2440,8 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
     assert.equal(observed.source, "managed");
-    assert.equal(observed.path, cliPath);
-    assert.equal(observed.pluginRoot, installRoot);
+    assert.equal(await realpath(observed.path), await realpath(cliPath));
+    assert.equal(await realpath(observed.pluginRoot), await realpath(installRoot));
     assert.equal(observed.pluginCacheVersion, version);
     assert.equal(observed.dirtyMarkerPath, undefined);
   } finally {

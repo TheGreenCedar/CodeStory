@@ -319,7 +319,8 @@ fn verdict_state(
         let sidecar_mode = sidecar
             .map(|sidecar| sidecar.retrieval_mode)
             .unwrap_or("unavailable");
-        if sidecar_mode != "full" || sidecar_profile != Some("agent") {
+        let degraded_reason = sidecar.and_then(|sidecar| sidecar.degraded_reason);
+        if sidecar_mode != "full" || sidecar_profile != Some("agent") || degraded_reason.is_some() {
             let device_note = sidecar
                 .and_then(|sidecar| sidecar.embedding_device_policy.zip(sidecar.embedding_device_state).map(|(policy, state)| (sidecar, policy, state)))
                 .map(|(sidecar, policy, state)| {
@@ -354,11 +355,20 @@ fn verdict_state(
                 .unwrap_or_default();
             let full_repair = agent_packet_search_repair_commands(project_arg, sidecar_run_id);
             let minimum_next = full_repair.iter().take(1).cloned().collect();
+            let status = if sidecar_profile == Some("agent")
+                && degraded_reason
+                    .is_some_and(|reason| reason.starts_with("embedding_runtime_unavailable:"))
+            {
+                ReadinessStatusDto::RepairRetrieval
+            } else {
+                ReadinessStatusDto::Blocked
+            };
             return (
-                ReadinessStatusDto::Blocked,
+                status,
                 format!(
-                    "Agent packet/search is blocked until full agent sidecar retrieval is proven; current profile is `{}` and mode is `{sidecar_mode}`.{device_note}",
-                    sidecar_profile.unwrap_or("unknown")
+                    "Agent packet/search is blocked until full agent sidecar retrieval is live; current profile is `{}`, mode is `{sidecar_mode}`, and degraded reason is `{}`.{device_note}",
+                    sidecar_profile.unwrap_or("unknown"),
+                    degraded_reason.unwrap_or("none")
                 ),
                 minimum_next,
                 full_repair,
@@ -806,11 +816,6 @@ mod tests {
         );
 
         assert_eq!(unavailable.status, ReadinessStatusDto::Blocked);
-        assert!(
-            unavailable
-                .summary
-                .contains("blocked until full agent sidecar retrieval is proven")
-        );
         assert!(unavailable.sidecar.is_none());
 
         let local = build_readiness_verdict(
@@ -969,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_readiness_uses_sidecar_gate_when_freshness_is_unknown() {
+    fn dead_agent_endpoint_reports_repair_retrieval_when_freshness_is_unknown() {
         let stats = stats(3);
         let verdict = build_readiness_verdict(
             ReadinessGoalDto::AgentPacketSearch,
@@ -979,8 +984,8 @@ mod tests {
                 Some(ReadinessSidecarInput {
                     profile: Some("agent"),
                     run_id: Some("run"),
-                    retrieval_mode: "unavailable",
-                    degraded_reason: None,
+                    retrieval_mode: "full",
+                    degraded_reason: Some("embedding_runtime_unavailable: connection refused"),
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("unknown"),
                     embedding_device_observation_source: Some("sidecar_unobserved"),
@@ -996,7 +1001,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(verdict.status, ReadinessStatusDto::Blocked);
+        assert_eq!(verdict.status, ReadinessStatusDto::RepairRetrieval);
         assert!(
             verdict
                 .full_repair

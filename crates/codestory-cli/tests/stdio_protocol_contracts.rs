@@ -5593,7 +5593,10 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
         "concurrent resource read observed neither complete file set: {concurrent_ground}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(45);
+    // Workspace-wide default-concurrency runs can heavily contend with the
+    // real indexer on smaller macOS runners. Keep the assertion bounded while
+    // allowing the background publication worker to finish under that load.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let new_generation = loop {
         let status_response = send_json(
             &mut reader_client,

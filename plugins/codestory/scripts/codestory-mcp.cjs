@@ -907,6 +907,7 @@ function processStartIdentity(pid) {
     if (process.platform === 'darwin') {
       const result = spawnSync('/bin/ps', ['-o', 'lstart=', '-p', String(pid)], {
         encoding: 'utf8',
+        env: { ...process.env, LC_ALL: 'C' },
         windowsHide: true,
       });
       const started = result.status === 0 ? result.stdout.trim().replace(/\s+/gu, ' ') : '';
@@ -2635,7 +2636,17 @@ async function handleBootstrapStatusCommand(argv) {
 }
 
 function samePathText(left, right) {
-  const normalize = (value) => String(value || '').replace(/[\\/]+$/u, '').toLowerCase();
+  if (!String(left || '').trim() || !String(right || '').trim()) return false;
+  const normalize = (value) => {
+    let normalized = path.resolve(String(value || ''));
+    try {
+      normalized = fs.realpathSync(normalized);
+    } catch {
+      // Missing paths still receive stable lexical comparison below.
+    }
+    normalized = normalized.replace(/[\\/]+$/u, '');
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  };
   return normalize(left) === normalize(right);
 }
 

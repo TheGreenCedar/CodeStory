@@ -5,9 +5,13 @@ and `context`. They are required for `agent_packet_search` infrastructure
 readiness: `retrieval status` must report `retrieval_mode: "full"` before those
 surfaces can claim full sidecar retrieval.
 
-A healthy SQLite cache alone is not enough. Full sidecars also do not prove
-answer quality by themselves; answer quality still needs the matching
-packet-runtime, drill, or benchmark evidence tier.
+A healthy SQLite cache alone is not enough. A persisted full manifest also
+cannot override dead live infrastructure: under `accelerator_required`, agent
+packet/search additionally requires the selected embedding endpoint to answer,
+the native executable, arguments, and process-start identity to match, and
+`gpu_proof=verified`. Full sidecars do not prove answer quality by themselves;
+answer quality still needs the matching packet-runtime, drill, or benchmark
+evidence tier.
 
 **Runtime truth and surface gating:** When plugin MCP is live, read
 `codestory://status` first and obey `allowed_surfaces` plus `retrieval_mode`.
@@ -60,7 +64,7 @@ active runtime source when it is available.
 
 | State | Meaning | Operator action |
 |-------|---------|-----------------|
-| `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph and sidecar packet/search infrastructure are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
+| `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph, persisted sidecar state, and any required live endpoint/accelerator identity are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
 | `local_navigation=ready`, `agent_packet_search=repairing` | Agent sidecar repair is active and status should include the current `phase`, `profile`, `run_id`, and `namespace` | Wait or reread `codestory://status`; do not start a second agent repair for the same run |
 | `sidecar_setup.last_worker_result.outcome=failed` or `abandoned` | The background repair worker reached a durable terminal state without completing | Match `attempt_id` and, when present, branch on `terminal_envelope.error.code` and its failed layer. For a legacy persisted result without an envelope, use `wait_error` and bounded tails as compatibility diagnostics |
 | `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; call MCP `sidecar_setup repair` from status before packet/search claims |
@@ -81,10 +85,10 @@ Layer repair should follow the first failing layer, not a broad rebuild:
 | Manifest contract | `manifest_contract`, source root, input hash, generation, schema, graph hash, counts, lane provenance | Rerun `retrieval index --project <repo> --refresh full` |
 
 A legacy semantic diagnostic warning against `127.0.0.1:8080` is not by itself a
-packet/search blocker when `doctor` reports `sidecar_retrieval: mode=full` and
-the sidecar health probe succeeds against the configured endpoint. Keep the
-warning in the evidence bundle; do not treat it as proof that a separate
-runtime fix has landed.
+packet/search blocker when the selected runtime uses another endpoint. Read the
+configured endpoint from status and require the live health, process identity,
+and accelerator proof applicable to that runtime; `sidecar_retrieval: mode=full`
+alone is insufficient. Keep the warning in the evidence bundle.
 
 Attach these artifacts to issues or PRs that claim readiness repair:
 
@@ -106,11 +110,14 @@ Attach these artifacts to issues or PRs that claim readiness repair:
 
 ### Prerequisites
 
+- macOS 15 or later for supported Mac operation. Install the Xcode Command Line
+  Tools and Node.js 18+; contributors building from source also need Rust.
 - Rust toolchain with `cargo`, or an already-built `codestory-cli` binary.
 - Docker Desktop or Docker Engine for automated Qdrant and llama.cpp
-  sidecars.
-- Node.js 18+ if you need `scripts/setup-retrieval-env.mjs` to fetch or verify
-  the pinned GGUF.
+  sidecars. On Apple Silicon the managed embedding server is native Metal, but
+  Qdrant still requires Docker. Confirm the Docker daemon is running.
+- Node.js 18+ is also required by `scripts/setup-retrieval-env.mjs` to fetch or
+  verify the pinned GGUF and native `llama-server` payload.
 - For manual Local profile only, the default localhost ports are Qdrant HTTP
   `6333`, Qdrant gRPC `6334`, and llama.cpp embeddings `8080`; lexical search
   has no service port.
@@ -150,6 +157,14 @@ a `vulkan:Vulkan0` request on Apple Silicon. Use
 `node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only` only to
 prewarm the managed Metal cache cell. Set `CODESTORY_EMBED_NATIVE_LLAMA_SERVER`
 only when overriding the managed binary with an absolute path.
+
+On macOS x64, the CLI, managed plugin, local index, and grounding are supported,
+but there is no managed Metal cell. Packet/search requires an explicit degraded
+CPU opt-in or a trusted external llama.cpp-compatible endpoint under explicit
+operator policy. External endpoints cannot satisfy `accelerator_required`
+because CodeStory cannot bind their provider-owned logs and PID identity to the
+request; opt into CPU/external operation explicitly. Intel status and release
+evidence must never claim Metal.
 
 On Windows x64, the native llama.cpp resolver selects the manifest-backed b9902
 Vulkan cell by default and launches it with `Vulkan0`, `99` GPU layers, and
@@ -248,6 +263,9 @@ cargo run -p codestory-cli -- retrieval status --project <repo> --format json
 The proof is the final status JSON:
 
 - `retrieval_mode` is exactly `"full"`.
+- For agent packet/search under `accelerator_required`, the selected embedding
+  endpoint is reachable, its native executable/arguments/process-start identity
+  still match, and `readiness_broker.gpu_proof.proof_status` is `verified`.
 - `capabilities.lexical`, `capabilities.semantic`, and `capabilities.graph`
   match the active manifest policy.
 - `manifest_contract` is present and matches the current source root, input

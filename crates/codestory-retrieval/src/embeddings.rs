@@ -38,6 +38,7 @@ const LLAMACPP_DEVICE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_DEVICE";
 const LLAMACPP_N_GPU_LAYERS_ENV: &str = "CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS";
 const ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
 const NATIVE_LLAMA_LOG_START_MARKER: &str = "starting native llama.cpp embedding server:";
+const NATIVE_LLAMA_LOG_READ_START_BYTES: u64 = 512 * 1024;
 const NATIVE_LLAMA_LOG_READ_TAIL_BYTES: u64 = 512 * 1024;
 const NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES: u64 = 256 * 1024;
 const RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -438,13 +439,10 @@ fn read_container_embedding_log(runtime: &crate::config::SidecarRuntimeConfig) -
 fn observe_native_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    let text = read_native_embedding_log_tail(
-        &native_embedding_log_path(runtime),
-        NATIVE_LLAMA_LOG_READ_TAIL_BYTES,
-    )
-    .ok();
+    let text =
+        read_native_embedding_log_current_launch_evidence(&native_embedding_log_path(runtime)).ok();
     if let Some(text) = text.as_deref() {
-        match observed_embedding_device_state_from_text(native_embedding_log_current_launch(text)) {
+        match observed_embedding_device_state_from_text(text) {
             "unknown" => {}
             state => {
                 return Some(EmbeddingDeviceObservation {
@@ -507,12 +505,50 @@ fn native_device_list_proves_accelerator(
 }
 
 pub(crate) fn native_embedding_log_path(runtime: &crate::config::SidecarRuntimeConfig) -> PathBuf {
-    runtime
+    let default = runtime
         .layout
         .state_file
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join("llama-server-native.log")
+        .join("llama-server-native.log");
+    let Some(state) = std::fs::read_to_string(&runtime.layout.state_file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<crate::sidecar::SidecarStateFile>(&text).ok())
+    else {
+        return default;
+    };
+    if !crate::sidecar::sidecar_state_matches_runtime(&state, runtime) {
+        return default;
+    }
+    let candidate = state
+        .embedding_launch
+        .and_then(|launch| launch.log_path)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "llama-server-native.log")
+        });
+    let Some(candidate) = candidate else {
+        return default;
+    };
+    let cache_root = match runtime.profile {
+        crate::config::SidecarProfile::Local => runtime.layout.state_file.parent(),
+        crate::config::SidecarProfile::Agent => runtime
+            .layout
+            .state_file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent),
+    };
+    let Some(cache_root) = cache_root.and_then(|path| path.canonicalize().ok()) else {
+        return default;
+    };
+    candidate
+        .canonicalize()
+        .ok()
+        .filter(|path| path.starts_with(cache_root))
+        .unwrap_or(default)
 }
 
 pub(crate) fn prepare_native_embedding_log_for_launch(path: &Path) -> Result<()> {
@@ -541,13 +577,6 @@ pub(crate) fn prepare_native_embedding_log_for_launch(path: &Path) -> Result<()>
     Ok(())
 }
 
-fn read_native_embedding_log_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    Ok(
-        String::from_utf8_lossy(&read_native_embedding_log_tail_bytes(path, max_bytes)?)
-            .into_owned(),
-    )
-}
-
 fn read_native_embedding_log_tail_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
@@ -558,6 +587,58 @@ fn read_native_embedding_log_tail_bytes(path: &Path, max_bytes: u64) -> std::io:
     Ok(bytes)
 }
 
+fn read_native_embedding_log_current_launch_evidence(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let bounded_len = NATIVE_LLAMA_LOG_READ_START_BYTES + NATIVE_LLAMA_LOG_READ_TAIL_BYTES;
+    if len <= bounded_len {
+        let mut bytes = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes);
+        return text
+            .rfind(NATIVE_LLAMA_LOG_START_MARKER)
+            .map(|offset| text[offset..].to_string())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "native embedding log has no current-launch marker",
+                )
+            });
+    }
+
+    let mut start = Vec::with_capacity(NATIVE_LLAMA_LOG_READ_START_BYTES as usize);
+    file.by_ref()
+        .take(NATIVE_LLAMA_LOG_READ_START_BYTES)
+        .read_to_end(&mut start)?;
+    file.seek(SeekFrom::Start(
+        len.saturating_sub(NATIVE_LLAMA_LOG_READ_TAIL_BYTES),
+    ))?;
+    let mut tail = Vec::with_capacity(NATIVE_LLAMA_LOG_READ_TAIL_BYTES as usize);
+    file.take(NATIVE_LLAMA_LOG_READ_TAIL_BYTES)
+        .read_to_end(&mut tail)?;
+
+    let tail = String::from_utf8_lossy(&tail);
+    if let Some(offset) = tail.rfind(NATIVE_LLAMA_LOG_START_MARKER) {
+        return Ok(tail[offset..].to_string());
+    }
+
+    let start = String::from_utf8_lossy(&start);
+    let offset = start.rfind(NATIVE_LLAMA_LOG_START_MARKER).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native embedding log has no bounded current-launch marker",
+        )
+    })?;
+    let mut evidence = String::with_capacity(start.len() - offset + tail.len() + 1);
+    evidence.push_str(&start[offset..]);
+    if !evidence.ends_with('\n') {
+        evidence.push('\n');
+    }
+    evidence.push_str(&tail);
+    Ok(evidence)
+}
+
+#[cfg(test)]
 fn native_embedding_log_current_launch(text: &str) -> &str {
     text.rfind(NATIVE_LLAMA_LOG_START_MARKER)
         .map(|offset| &text[offset..])
@@ -611,12 +692,7 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
         }
         crate::sidecar::ensure_native_embedding_launch_identity(&after)
             .context("gpu_unverified: validate native embedding launch after smoke")?;
-        read_native_embedding_log_tail(
-            &native_embedding_log_path(runtime),
-            NATIVE_LLAMA_LOG_READ_TAIL_BYTES,
-        )
-        .ok()
-        .map(|text| native_embedding_log_current_launch(&text).to_string())
+        read_native_embedding_log_current_launch_evidence(&native_embedding_log_path(runtime)).ok()
     } else {
         let after_state = exact_embedding_runtime_state(runtime)?;
         if after_state != state {
@@ -2440,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_native_log_read_ignores_stale_acceleration_outside_tail() {
+    fn bounded_native_log_evidence_ignores_stale_acceleration_before_current_launch() {
         let dir = tempfile::tempdir().expect("log dir");
         let path = dir.path().join("llama-server-native.log");
         let mut bytes =
@@ -2454,13 +2530,158 @@ mod tests {
         bytes.extend_from_slice(b" current\nn_gpu_layers = 0\n");
         std::fs::write(&path, bytes).expect("write multi-launch log");
 
-        let text = read_native_embedding_log_tail(&path, NATIVE_LLAMA_LOG_READ_TAIL_BYTES)
-            .expect("bounded tail");
-        let current = native_embedding_log_current_launch(&text);
+        let current = read_native_embedding_log_current_launch_evidence(&path)
+            .expect("bounded current-launch evidence");
 
         assert!(current.contains("current"));
         assert!(!current.contains("offloaded 33/33"));
-        assert_eq!(observed_embedding_device_state_from_text(current), "cpu");
+        assert_eq!(observed_embedding_device_state_from_text(&current), "cpu");
+    }
+
+    #[test]
+    fn bounded_native_log_evidence_retains_startup_offload_after_large_request_tail() {
+        let _lock = crate::test_support::env_lock();
+        let _device = EnvGuard::set(LLAMACPP_DEVICE_ENV, "Metal0");
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let dir = tempfile::tempdir().expect("log dir");
+        let path = dir.path().join("llama-server-native.log");
+        let mut bytes = concat!(
+            "starting native llama.cpp embedding server: current --device Metal0\n",
+            "ggml_metal_init: found device Metal0: Apple M5\n",
+            "load_tensors: offloaded 13/13 layers to GPU\n",
+        )
+        .as_bytes()
+        .to_vec();
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            (NATIVE_LLAMA_LOG_READ_START_BYTES + NATIVE_LLAMA_LOG_READ_TAIL_BYTES + 37) as usize,
+        ));
+        bytes.extend_from_slice(b"\nrequest: POST /v1/embeddings 200\n");
+        std::fs::write(&path, bytes).expect("write noisy current-launch log");
+
+        let evidence = read_native_embedding_log_current_launch_evidence(&path)
+            .expect("bounded current-launch evidence");
+        let request = default_embedding_accelerator_request();
+
+        assert!(evidence.contains("offloaded 13/13 layers to GPU"));
+        assert!(evidence.contains("POST /v1/embeddings 200"));
+        assert_eq!(
+            observed_embedding_device_state_from_text(&evidence),
+            "accelerated"
+        );
+        assert!(runtime_log_proves_requested_accelerator(
+            &evidence, &request
+        ));
+    }
+
+    #[test]
+    fn reused_native_runtime_keeps_constrained_original_launch_log() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let owner_log = cache.path().join("llama-server-native.log");
+        std::fs::write(
+            &owner_log,
+            "starting native llama.cpp embedding server: current\noffloaded 13/13 layers to GPU\n",
+        )
+        .expect("owner log");
+        let mut runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("shared-agent"),
+            cache.path(),
+        );
+        let allocated_embed_port = runtime.embed_http_port;
+        let reused_embed_port = if allocated_embed_port == 18080 {
+            18081
+        } else {
+            18080
+        };
+        runtime
+            .use_broker_verified_native_embedding_endpoint(reused_embed_port)
+            .expect("retarget verified endpoint");
+        let launch = crate::health::EmbeddingLaunchMetadata {
+            provider: "llamacpp".into(),
+            launch_mode: crate::config::EmbeddingServerLaunchMode::NativeSpawned
+                .as_str()
+                .into(),
+            endpoint: runtime.embedding.endpoint.clone(),
+            pid: Some(std::process::id()),
+            spawned_at_epoch_ms: Some(123),
+            process_start_identity: None,
+            spawn_protocol: None,
+            launch_args: vec!["--port".into(), reused_embed_port.to_string()],
+            launch_fingerprint_sha256: Some("fingerprint".into()),
+            executable_source: Some("test".into()),
+            executable_path: Some("/tmp/llama-server".into()),
+            model_path: Some("/tmp/model.gguf".into()),
+            log_path: Some(owner_log.display().to_string()),
+            requested_device: Some("Metal0".into()),
+        };
+        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(
+            &runtime,
+            None,
+            Some(launch.clone()),
+        )
+        .expect("persist reused launch");
+
+        let state: crate::sidecar::SidecarStateFile = serde_json::from_slice(
+            &std::fs::read(&runtime.layout.state_file).expect("read reused state"),
+        )
+        .expect("parse reused state");
+        assert_eq!(state.embed_http_port, reused_embed_port);
+        assert_eq!(
+            state.embed_url,
+            SidecarLayout::embed_base_url(reused_embed_port)
+        );
+        assert_eq!(runtime.ownership().ports.embed_http, reused_embed_port);
+
+        let warm = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("shared-agent"),
+            cache.path(),
+        );
+        assert_eq!(warm.embed_http_port, allocated_embed_port);
+        assert_eq!(warm.embedding.endpoint, runtime.embedding.endpoint);
+        assert!(crate::sidecar::sidecar_state_matches_runtime(&state, &warm));
+        warm.ensure_ports_allocated()
+            .expect("warm runtime renews the original isolated lease tuple");
+        let local = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(project.path()),
+            SidecarProfile::Local,
+            None,
+            cache.path(),
+        );
+        let selected = local.with_profile_and_run_id(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        assert_eq!(selected.embed_http_port, allocated_embed_port);
+        assert_eq!(selected.embedding.endpoint, runtime.embedding.endpoint);
+
+        assert_eq!(
+            native_embedding_log_path(&runtime),
+            owner_log.canonicalize().expect("canonical owner log")
+        );
+
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_log = outside.path().join("llama-server-native.log");
+        std::fs::write(&outside_log, "forged offloaded 99/99 layers to GPU\n")
+            .expect("outside log");
+        let mut forged = launch;
+        forged.log_path = Some(outside_log.display().to_string());
+        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(forged))
+            .expect("persist forged path");
+        assert_eq!(
+            native_embedding_log_path(&runtime),
+            runtime
+                .layout
+                .state_file
+                .parent()
+                .expect("state parent")
+                .join("llama-server-native.log")
+        );
     }
 
     #[test]
@@ -2567,7 +2788,7 @@ mod tests {
             .expect("create state dir");
         std::fs::write(
             native_embedding_log_path(&runtime),
-            "llama_model_load: offloaded 33/33 layers to GPU\n",
+            "starting native llama.cpp embedding server: test --device Vulkan0\nllama_model_load: offloaded 33/33 layers to GPU\n",
         )
         .expect("write native log");
 
