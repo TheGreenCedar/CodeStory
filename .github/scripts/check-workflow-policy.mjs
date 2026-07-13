@@ -266,6 +266,8 @@ if (!fs.existsSync(packagedPlatformProof)) {
     'LINUX_GLIBC_BUILD_IMAGE: "rust:1.95.0-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf"',
     'LINUX_GLIBC_BASELINE_IMAGE: "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"',
     "Build Linux x64 at the glibc 2.31 baseline",
+    "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
+    'cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli"',
     "bash .github/scripts/check-linux-glibc-baseline.sh",
     '"glibc 2.31"',
     "linux-glibc-2.31-baseline-proof",
