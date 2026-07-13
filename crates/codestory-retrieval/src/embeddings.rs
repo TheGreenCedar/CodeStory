@@ -365,6 +365,10 @@ fn embedding_device_readiness_with_observed_state(
     let observation = sidecar_observed_state
         .unwrap_or_else(|| observed_embedding_device_state(cpu_allowed, accelerator_requested));
     let observed_state = observation.state;
+    let detected_provider = detection
+        .as_ref()
+        .map(|gpu| gpu.provider.clone())
+        .or_else(|| observation.detected_provider.map(str::to_string));
     let accelerated = observed_state == "accelerated";
     let full_retrieval_allowed = accelerated || cpu_allowed;
     let requested_policy = if cpu_allowed {
@@ -385,7 +389,7 @@ fn embedding_device_readiness_with_observed_state(
         requested_policy,
         observed_state,
         observation_source: observation.source,
-        detected_provider: detection.as_ref().map(|gpu| gpu.provider.clone()),
+        detected_provider,
         detected_gpu: detection.map(|gpu| gpu.name),
         accelerator_requested,
         accelerator_request_provider: accelerator_request
@@ -413,7 +417,11 @@ fn observe_sidecar_embedding_device_state(
     };
     match observed_embedding_device_state_from_text(&text) {
         "unknown" => None,
-        state => Some(EmbeddingDeviceObservation { state, source }),
+        state => Some(EmbeddingDeviceObservation {
+            state,
+            source,
+            detected_provider: observed_embedding_provider_from_text(&text),
+        }),
     }
 }
 
@@ -448,6 +456,7 @@ fn observe_native_embedding_device_state(
                 return Some(EmbeddingDeviceObservation {
                     state,
                     source: "native_log",
+                    detected_provider: observed_embedding_provider_from_text(text),
                 });
             }
         }
@@ -479,6 +488,7 @@ fn observe_native_embedding_device_state_from_device_list(
         Some(EmbeddingDeviceObservation {
             state: "accelerated",
             source: "native_device_list",
+            detected_provider: None,
         })
     } else {
         None
@@ -887,24 +897,29 @@ fn runtime_log_proves_requested_accelerator(
     request: &EmbeddingAcceleratorRequest,
 ) -> bool {
     let text = text.to_ascii_lowercase();
-    let positive_offload = text
-        .lines()
-        .any(|line| line_reports_gpu_offload(line) == Some(true));
     let provider = request.provider.to_ascii_lowercase();
-    let provider_seen = text.contains(&provider)
-        || crate::config::selected_llama_sidecar_backend(&request.provider).is_some_and(
-            |backend| {
-                backend
-                    .log_markers
-                    .iter()
-                    .any(|marker| text.contains(&marker.to_ascii_lowercase()))
-            },
-        );
+    let provider_offload_proven = if provider == "metal" {
+        observe_metal_runtime(&text).offload_proven
+    } else {
+        let provider_seen = text.contains(&provider)
+            || crate::config::selected_llama_sidecar_backend(&request.provider).is_some_and(
+                |backend| {
+                    backend
+                        .log_markers
+                        .iter()
+                        .any(|marker| text.contains(&marker.to_ascii_lowercase()))
+                },
+            );
+        provider_seen
+            && text
+                .lines()
+                .any(|line| line_reports_gpu_offload(line) == Some(true))
+    };
     let device_seen = request
         .device
         .as_deref()
         .is_none_or(|device| text.contains(&device.to_ascii_lowercase()));
-    positive_offload && provider_seen && device_seen
+    provider_offload_proven && device_seen
 }
 
 pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
@@ -958,6 +973,7 @@ fn explicit_cpu_allowed() -> bool {
 struct EmbeddingDeviceObservation {
     state: &'static str,
     source: &'static str,
+    detected_provider: Option<&'static str>,
 }
 
 fn observed_embedding_device_state(
@@ -979,33 +995,47 @@ fn observed_embedding_device_state(
         return EmbeddingDeviceObservation {
             state,
             source: "manual_env",
+            detected_provider: None,
         };
     }
     if cpu_allowed {
         return EmbeddingDeviceObservation {
             state: "cpu",
             source: "cpu_policy",
+            detected_provider: None,
         };
     }
     if accelerator_requested {
         return EmbeddingDeviceObservation {
             state: "unknown",
             source: "accelerator_request_unobserved",
+            detected_provider: None,
         };
     }
     EmbeddingDeviceObservation {
         state: "unknown",
         source: "sidecar_unobserved",
+        detected_provider: None,
     }
+}
+
+fn observed_embedding_provider_from_text(text: &str) -> Option<&'static str> {
+    observe_metal_runtime(text)
+        .provider_observed
+        .then_some("metal")
 }
 
 fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     let mut saw_cpu = false;
     let mut saw_accelerated = false;
-    let mut saw_metal = false;
     let text = text.to_ascii_lowercase();
     let log_markers = selected_backend_log_markers();
     let metal_requested = log_markers.iter().any(|marker| marker == "metal");
+    let metal = if metal_requested {
+        observe_metal_runtime(&text)
+    } else {
+        MetalRuntimeObservation::default()
+    };
     for line in text.lines() {
         if line_reports_gpu_offload(line) == Some(true) {
             saw_accelerated = true;
@@ -1017,9 +1047,6 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         {
             saw_accelerated = true;
         }
-        if metal_requested && line_reports_metal_evidence(line) {
-            saw_metal = true;
-        }
         saw_cpu |= line_reports_gpu_offload(line) == Some(false)
             || line.contains("n_gpu_layers = 0")
             || line.contains("using cpu")
@@ -1030,8 +1057,9 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         "accelerated"
     } else if saw_cpu {
         "cpu"
-    } else if saw_metal
-        || (!log_markers.is_empty()
+    } else if metal.provider_observed
+        || (!metal_requested
+            && !log_markers.is_empty()
             && log_markers
                 .iter()
                 .all(|marker| text.contains(&marker.to_ascii_lowercase())))
@@ -1042,11 +1070,70 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     }
 }
 
-fn line_reports_metal_evidence(line: &str) -> bool {
-    line.contains("ggml_metal_init")
-        || line.contains("metal backend")
-        || line.trim_start().starts_with("mtl0")
-        || line.trim_start().starts_with("mtl :")
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MetalRuntimeObservation {
+    provider_observed: bool,
+    offload_proven: bool,
+}
+
+fn observe_metal_runtime(text: &str) -> MetalRuntimeObservation {
+    let mut observation = MetalRuntimeObservation::default();
+    let text = text.to_ascii_lowercase();
+    for line in text.lines() {
+        match metal_runtime_event(line) {
+            Some(true) => observation.provider_observed = true,
+            Some(false) => {
+                observation = MetalRuntimeObservation::default();
+                continue;
+            }
+            None => {}
+        }
+        if observation.provider_observed && line_reports_gpu_offload(line) == Some(true) {
+            observation.offload_proven = true;
+        }
+    }
+    observation
+}
+
+fn metal_runtime_event(line: &str) -> Option<bool> {
+    let line = line.trim_start();
+    let prefixed_mtl_device = line.contains("- mtl0") && line.contains(": apple");
+    let metal_line = line.starts_with("mtl0")
+        || line.starts_with("mtl :")
+        || prefixed_mtl_device
+        || line.contains("ggml_metal_init")
+        || line.contains("metal backend");
+    if !metal_line {
+        return None;
+    }
+    let rejected = [
+        "fail",
+        "error",
+        "unavailable",
+        "disabled",
+        "not ",
+        "unsupported",
+        "unable",
+        "could not",
+        "no metal",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker));
+    if rejected {
+        return Some(false);
+    }
+    let affirmative = [
+        "found device",
+        "picking default device",
+        "using embedded metal library",
+        "ready",
+        "initialized",
+        "registered",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker));
+    (line.starts_with("mtl0") || line.starts_with("mtl :") || prefixed_mtl_device || affirmative)
+        .then_some(true)
 }
 
 fn selected_backend_log_markers() -> Vec<String> {
@@ -2144,7 +2231,7 @@ mod tests {
 
     #[test]
     fn accelerator_smoke_requires_requested_device_offload_and_timing() {
-        let request = EmbeddingAcceleratorRequest {
+        let mut request = EmbeddingAcceleratorRequest {
             provider: "vulkan".into(),
             device: Some("Vulkan0".into()),
             n_gpu_layers: "99".into(),
@@ -2161,6 +2248,49 @@ mod tests {
             "vulkan backend ready\nusing device Vulkan0\noffloaded 0/13 layers to GPU\n",
             &request,
         ));
+
+        request.provider = "metal".into();
+        request.device = None;
+        let metal_log =
+            "ggml_metal_init: found device Metal0: Apple M5\noffloaded 13/13 layers to GPU\n";
+        assert!(runtime_log_proves_requested_accelerator(
+            metal_log, &request
+        ));
+        assert!(runtime_log_proves_requested_accelerator(
+            "0.06 I common_param:   - MTL0 : Apple M5\n\
+             load_tensors: offloaded 13/13 layers to GPU\n\
+             ggml_metal_init: found device: Apple M5\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\noffloaded 13/13 layers to GPU\n\
+             0.06 I common_param:   - MTL0 : Apple M5\n",
+            &request,
+        ));
+        assert_eq!(
+            observed_embedding_provider_from_text(metal_log),
+            Some("metal")
+        );
+        assert!(!runtime_log_proves_requested_accelerator(
+            "starting /tmp/macos-arm64-metal/llama-server\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "ggml_metal_init: failed to initialize Metal backend\nvulkan backend ready\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        let invalidated_metal_log = "ggml_metal_init: found device Metal0: Apple M5\n\
+ggml_metal_init: failed to initialize Metal backend\n\
+vulkan backend ready\n\
+offloaded 13/13 layers to GPU\n";
+        assert!(!runtime_log_proves_requested_accelerator(
+            invalidated_metal_log,
+            &request,
+        ));
+        assert_eq!(
+            observed_embedding_provider_from_text(invalidated_metal_log),
+            None
+        );
 
         let device = EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
@@ -2330,6 +2460,7 @@ mod tests {
             Some(EmbeddingDeviceObservation {
                 state: observed,
                 source: "sidecar_log",
+                detected_provider: None,
             }),
             None,
         );
@@ -2395,6 +2526,7 @@ mod tests {
             Some(EmbeddingDeviceObservation {
                 state: "accelerated",
                 source: "native_log",
+                detected_provider: None,
             }),
             None,
         );
@@ -2439,6 +2571,7 @@ mod tests {
             Some(EmbeddingDeviceObservation {
                 state: "accelerated",
                 source: "native_device_list",
+                detected_provider: None,
             }),
             None,
         );

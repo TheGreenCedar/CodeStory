@@ -118,8 +118,8 @@ def package_release(
     checksum = sha256_file(archive_path)
     checksum_line = f"{checksum}  {archive_path.name}\n"
     checksum_path = out_dir / f"{archive_path.name}.sha256"
-    checksum_path.write_text(checksum_line, encoding="utf-8", newline="\n")
-    (out_dir / "SHA256SUMS.txt").write_text(checksum_line, encoding="utf-8", newline="\n")
+    checksum_path.write_bytes(checksum_line.encode("utf-8"))
+    (out_dir / "SHA256SUMS.txt").write_bytes(checksum_line.encode("utf-8"))
     return archive_path
 
 

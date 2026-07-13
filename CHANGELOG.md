@@ -4,22 +4,40 @@
 
 ### Changed
 
-- Rewrote the repository agent guide around the current request-scoped MCP
-  workflow, crate ownership, identity/publication invariants, isolated test
-  contract, maturity-routed verification, and claim-specific release proof.
 - Staged CI proof by pull-request maturity and changed surface. Draft pushes
   now stay on one Ubuntu source lane, exact-head review promotion runs the full
   workspace test and clippy gate once, and explicit platform promotion selects
   no package matrix, the two Mac targets, or all six native targets. Promoted
-  heads run repo-scale stats once; signed package artifacts are built once per
-  target and reused by package smoke, notarization, install, and protected
-  Apple Silicon proof. Per-proof concurrency cancels stale heads, while the
-  integrated platform dispatcher verifies successful exact-head source proof,
-  and its integration mode proves the current `dev/codestory-next` merge result
-  before rechecking that dev did not move during the gate.
+  heads run repo-scale stats once and reuse each selected unsigned package for
+  package and install checks, with the Mac arm64 candidate also used for
+  protected Metal proof. The main-triggered release signs and notarizes Mac
+  binaries once before packaging and publication, failing closed on any Apple
+  error. Per-proof concurrency cancels stale heads, and the integration
+  dispatcher proves the current `dev/codestory-next` merge result before
+  rechecking that dev did not move during the gate.
+- Rewrote the repository agent guide around the current request-scoped MCP
+  workflow, crate ownership, identity/publication invariants, isolated test
+  contract, maturity-routed verification, and claim-specific release proof.
+- Kept promoted repo-scale stats as a correctness gate while making its
+  wall-clock measurements telemetry. Hardware-bound timing limits remain in
+  the release-evidence gate, so shared hosted runners no longer fail a Mac
+  platform proof for crossing a local-machine threshold by scheduler noise.
 
 ### Fixed
 
+- Recognized current llama.cpp's logger-prefixed Metal device inventory so
+  native offload proof remains bound to the selected provider and current
+  launch even when `ggml_metal_init` reports later in startup.
+- Included the aggregate release checksum manifest in reusable package
+  artifacts so protected hardware and installation proofs can provision the
+  exact packaged CLI without falling back to a network release lookup.
+- Kept the protected Metal proof runnable when the platform-only source-call
+  job is intentionally skipped, while still requiring successful routing and
+  package production before protected hardware starts.
+- Made Mac notarization retain its submission ID and retry status queries
+  across transient Apple transport failures. Terminal rejection still fails
+  immediately with the notarization log retained, and polling now has an
+  explicit one-hour bound.
 - Replaced the Windows native embedding process-start identity CIM probe with
   the native process creation time. Immediate identity reads and snapshot start
   times no longer depend on CIM convergence and retain the existing serialized
@@ -97,6 +115,21 @@
   refresh or repair ownership, activates through `ground`, observes one
   terminal `shared-agent` attempt and a newer complete local generation, and
   keeps packet/search closed without verified accelerator smoke.
+- Changed the protected Apple Silicon cold lifecycle to reach its first full
+  Agent generation through the managed plugin's `ground` activation instead
+  of `ready --repair`. The exact packaged runtime must now move from a stale
+  local publication and absent sidecars to verified Metal, serve packet/search
+  through the same MCP session, and reuse the native process after MCP restart.
+  Managed repair now retains the grounding-owned local refresh lock through
+  its index open instead of racing a second refresh and failing `cache_busy` on
+  larger repositories. Runtime-log proof records Metal as the detected
+  provider before packet/search can open, but only when a Metal runtime-init
+  marker and positive offload agree; requested-provider text and package paths
+  do not count. MCP now waits for the child to adopt its cache-owned repair
+  reservation before publishing the handoff, and proof cleanup trusts that
+  reservation even when the grounding response or first status poll fails.
+  Release packaging remains compatible with the system Python shipped by
+  macOS 15, including Docker 29's nanosecond creation timestamps.
 - Expanded managed-plugin provisioning, local grounding, repair handoff, and
   proof cleanup from Windows x64 to every shipped native release asset in both
   pre-publish and post-publish matrices. Linux proof containers now write

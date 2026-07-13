@@ -143,16 +143,20 @@ the active plugin runtime plus observed and missing server-advertised MCP
 resources. This proves the installed plugin launcher advertises the resources;
 it is not Codex host/model visibility proof.
 
-Packaged acceptance builds each selected native target once and reuses that
-artifact for package smoke, signing/notarization, install checks, and the
-protected Apple Silicon lifecycle. Draft pushes never start this matrix. A
+Packaged acceptance compiles each selected native target once. PR and
+integration invocations package unsigned Mac candidates and reuse them for
+package smoke, install checks, and protected Apple Silicon lifecycle proof.
+Release invocation signs and notarizes each Mac binary after that single build
+and before packaging, then reuses the signed archive for release checks and
+publication. Its Metal job runs the same archive only for functional lifecycle
+proof; signing evidence comes from the signing and post-publish checks. Draft
+pushes never start this matrix. A
 same-repository `platform-proof` label or coordinator dispatch rechecks the
 exact PR head and requires a completed successful `full-source-gate` job for
-that SHA, then routes script/test-guard-only changes to `none`, Mac
-lifecycle changes to the two Mac targets, and cross-platform runtime or
-packaging changes to all six targets. Forks are rejected before checkout and no
-proof lane uses `pull_request_target` to execute PR code. Mac package promotion
-uses the protected signing environment; unavailable credentials fail the proof.
+that SHA, then routes script/test-guard-only changes to `none`, Mac lifecycle
+changes to the two Mac targets, and cross-platform runtime or packaging changes
+to all six targets. Forks are rejected before checkout and no proof lane uses
+`pull_request_target` to execute PR code.
 
 The `review-accepted` label runs the full Ubuntu source gate once for that exact
 head; the persistent label alone does not authorize later heads. After merge,
@@ -170,8 +174,8 @@ SHA.
 | Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
-| macOS x64 | `macos-15-intel` | Version and help (Developer ID signed/notarized in release and post-publish cells), stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, actionable failure without a backend, and explicitly labelled CPU/external operation when configured; never Metal |
-| macOS arm64 | `macos-15` | Version and help (Developer ID signed/notarized in release and post-publish cells), stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
+| macOS x64 | `macos-15-intel` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, actionable failure without a backend, and explicitly labelled CPU/external operation when configured; never Metal |
+| macOS arm64 | `macos-15` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 
 The managed convergence proof on every native runner uses an isolated project
 with a complete publication, then introduces source drift while leaving the
@@ -195,18 +199,26 @@ claim musl support or extend the glibc baseline claim to Linux arm64.
 The separate protected Apple Silicon workflow runs the packaged CLI and plugin
 launcher on a self-hosted macOS 15 ARM64 runner. It is release-blocking and must
 preserve cold, warm, endpoint-death, and repaired status/log/packet artifacts.
-A passing run proves checksum-pinned model/server setup, `native_spawned` Metal,
-positive offload, a bounded live embed smoke, `gpu_proof=verified`, full
-retrieval, stable PID reuse across MCP restart, no duplicate server, readiness
-blocking after endpoint death, successful repair/recovery, packet/search, and
-proof-owned cleanup. The same protected run copies the repository and cache
-through spaces/Unicode paths, proves dynamic selection away from an occupied
-embedding port, reclaims a vanished lease, interrupts and recovers a proof-owned
-repair worker, and checksum-repairs corrupt model plus partial native-server
-installs. It preserves bounded current-launch logs and exact launch identity
-before marker-scoped cleanup; the following run also cleans a marker-owned prior
-attempt if cancellation prevented the prior `always()` step. Contract tests or
-hosted package smoke cannot replace this hardware evidence.
+The cold path seeds a complete local publication, makes it stale with Agent
+sidecars absent, confirms `codestory://status` changes no ownership, and invokes
+only managed MCP `ground`. Before activation returns, MCP must observe the
+worker adopt its exact cache-owned repair reservation. Canonical status polling
+must observe one successful
+`shared-agent` attempt, a newer local generation, `native_spawned` Metal,
+an independent Metal runtime-init marker, positive offload, a bounded live
+embed smoke, `gpu_proof=verified`, and full
+retrieval before packet/search run through that same MCP session. A fresh MCP
+process must then reuse the exact native PID and launch fingerprint without a
+duplicate server. The remainder of the workflow proves readiness blocking after
+endpoint death, explicit recovery, packet/search, and proof-owned cleanup. The
+same protected run copies the repository and cache through spaces/Unicode paths,
+proves dynamic selection away from an occupied embedding port, reclaims a
+vanished lease, interrupts and recovers a proof-owned repair worker, and
+checksum-repairs corrupt model plus partial native-server installs. It preserves
+bounded current-launch logs and exact launch identity before marker-scoped
+cleanup; the following run also cleans a marker-owned prior attempt if
+cancellation prevented the prior `always()` step. Contract tests or hosted
+package smoke cannot replace this hardware evidence.
 
 An actual Mac host reboot remains a separate two-phase operator proof because a
 GitHub job cannot safely reboot its own self-hosted runner and resume the same
@@ -214,6 +226,15 @@ job. Preserve the pre-reboot PID/launch/status bundle, reboot the protected host
 then run the packaged warm/recovery workflow and attach the post-reboot
 status/packet/search bundle. Do not describe the automated hardware job alone as
 host-restart evidence.
+
+PR and integration proofs deliberately package unsigned Mac candidates and do
+not enter the `macos-release-signing` environment. The protected Metal job uses
+that exact unsigned package for functional lifecycle proof. Only the
+main-triggered release workflow requests Developer ID credentials; it signs and
+notarizes each Mac binary once before publication, and the resulting artifact is
+the one published and checked again after download. Apple service availability
+therefore cannot block review, while a signing or notarization failure still
+blocks the release before any Mac asset is published.
 
 After publication, both Mac tarballs receive a download quarantine before
 extraction. Because command-line tar does not propagate that xattr, the proof

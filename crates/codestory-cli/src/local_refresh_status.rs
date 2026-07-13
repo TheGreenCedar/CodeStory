@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOCAL_REFRESH_STATUS_FILE: &str = "local-refresh-status.json";
 const LOCAL_REFRESH_LOCK_FILE: &str = "local-refresh.lock";
@@ -301,6 +301,30 @@ pub(crate) fn try_acquire_local_refresh_lock(
             }))
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn wait_for_local_refresh_lock(
+    cache_root: &Path,
+    project_root: &Path,
+    timeout: Duration,
+) -> Result<LocalRefreshLock> {
+    let started = Instant::now();
+    loop {
+        match try_acquire_local_refresh_lock(cache_root, project_root)? {
+            LocalRefreshLockAttempt::Acquired(lock) => return Ok(lock),
+            LocalRefreshLockAttempt::Busy(busy) => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    anyhow::bail!(
+                        "cache_busy: local refresh still owns {} after {} seconds",
+                        busy.lock_path.display(),
+                        timeout.as_secs()
+                    );
+                }
+                thread::sleep(Duration::from_millis(50).min(remaining));
+            }
+        }
     }
 }
 
@@ -710,6 +734,38 @@ mod tests {
                 )
             }
         }
+    }
+
+    #[test]
+    fn local_refresh_lock_waits_for_current_owner() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let lock = match try_acquire_local_refresh_lock(cache.path(), project.path())
+            .expect("initial lock")
+        {
+            LocalRefreshLockAttempt::Acquired(lock) => lock,
+            LocalRefreshLockAttempt::Busy(_) => panic!("initial lock should be available"),
+        };
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            drop(lock);
+        });
+
+        let handed_off_lock =
+            wait_for_local_refresh_lock(cache.path(), project.path(), Duration::from_secs(1))
+                .expect("wait for current owner");
+        release.join().expect("release worker");
+
+        match try_acquire_local_refresh_lock(cache.path(), project.path())
+            .expect("second contender")
+        {
+            LocalRefreshLockAttempt::Busy(_) => {}
+            LocalRefreshLockAttempt::Acquired(_) => {
+                panic!("waiter must retain ownership through handoff")
+            }
+        }
+
+        drop(handed_off_lock);
     }
 
     #[test]
