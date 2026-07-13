@@ -511,9 +511,18 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         ("quoted-yaml-scalar.yml", "fetch-holdout-repos.mjs"),
         ("quoted-block-scalar.yml", "fetch-holdout-repos.mjs"),
         ("github-script.yml", "fetchholdoutreposmjs"),
-        ("direct-harness-import.mjs", "codestory-agent-ab-benchmark.mjs"),
-        ("constructed-harness-import.mjs", "codestoryagentabbenchmarkmjs"),
-        ("unapproved-policy-reference.mjs", "retrieval-sidecar-smoke.yml"),
+        (
+            "direct-harness-import.mjs",
+            "codestory-agent-ab-benchmark.mjs",
+        ),
+        (
+            "constructed-harness-import.mjs",
+            "codestoryagentabbenchmarkmjs",
+        ),
+        (
+            "unapproved-policy-reference.mjs",
+            "retrieval-sidecar-smoke.yml",
+        ),
         ("skill.md", "fetch-holdout-repos.mjs"),
         ("codestory.mdc", "benchmarks/tasks"),
     ] {
@@ -577,6 +586,47 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
     assert!(
         allowed.status.success(),
         "prose, comments, and unrelated continuations must pass lint; stderr={allowed_stderr}"
+    );
+}
+
+#[test]
+fn linter_binds_policy_allowances_to_the_exact_approved_use() {
+    let allowed = run_lint_with_non_rust_fixtures(&[
+        (
+            ".github/scripts/route-ci-proof.mjs",
+            "        \".github/workflows/retrieval-sidecar-smoke.yml\",\n",
+        ),
+        (
+            ".github/scripts/check-workflow-policy.mjs",
+            "const retrievalSidecarSmoke = path.join(workflowRoot, \"retrieval-sidecar-smoke.yml\");\nviolations.push(\"retrieval-sidecar-smoke.yml must exist\");\nviolations.push(\"retrieval-sidecar-smoke.yml Windows proof must be workflow_dispatch-only\");\n",
+        ),
+    ]);
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(
+        allowed.status.success(),
+        "the exact policy and routing references must pass lint; stderr={allowed_stderr}"
+    );
+
+    let rejected = run_lint_with_non_rust_fixtures(&[
+        (
+            ".github/scripts/route-ci-proof.mjs",
+            "        \".github/workflows/retrieval-sidecar-smoke.yml\",\n        \".github/workflows/retrieval-sidecar-smoke.yml\",\nawait import(\".github/workflows/retrieval-sidecar-smoke.yml\");\n",
+        ),
+        (
+            ".github/scripts/check-workflow-policy.mjs",
+            "const retrievalSidecarSmoke = path.join(workflowRoot, \"retrieval-sidecar-smoke.yml\");\nconst hostile = \".github/workflows/retrieval-\" + \"sidecar-smoke.yml\";\n",
+        ),
+    ]);
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
+    assert!(
+        !rejected.status.success(),
+        "an approved file must not hide another harness use; stderr={rejected_stderr}"
+    );
+    assert!(
+        rejected_stderr.contains("route-ci-proof.mjs:3:await import")
+            && rejected_stderr.contains("check-workflow-policy.mjs:2:")
+            && rejected_stderr.contains("githubworkflowsretrievalsidecarsmokeyml"),
+        "lint must identify both the hostile direct and split uses; stderr={rejected_stderr}"
     );
 }
 

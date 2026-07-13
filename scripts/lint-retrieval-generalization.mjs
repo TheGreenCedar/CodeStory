@@ -91,24 +91,39 @@ const corpusSupportNonRustFiles = new Set([
 ].map((filePath) => path.resolve(filePath)));
 const allowedHarnessReferences = [
   [
-    path.join(groundingSkillDir, "references", "drill-suite.md"),
+    path.join("plugins", "codestory", "skills", "codestory-grounding", "references", "drill-suite.md"),
     "scripts/score-drill-ledger.mjs",
+    "`node scripts/score-drill-ledger.mjs <suite-report.json> <ledger.json> [scored-report.json]`.",
   ],
   [
-    path.join(groundingSkillDir, "references", "retrieval-rollout.md"),
+    path.join("plugins", "codestory", "skills", "codestory-grounding", "references", "retrieval-rollout.md"),
     ".github/workflows/retrieval-sidecar-smoke.yml",
+    "| Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/ops/retrieval-sidecars.md#preflight-smoke-contract` pass criteria | PRs touching retrieval crate, runtime/stdio/search wiring, indexer retrieval hooks, retrieval docs, scripts, Docker sidecar config, or the workflow | Full sidecar readiness. CI smoke uses `--skip-compose --wait-secs 0` and proves manifest-missing fail-closed shape only |",
   ],
   [
-    path.join(repoRoot, ".github", "scripts", "check-workflow-policy.mjs"),
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
     "retrieval-sidecar-smoke.yml",
+    "const retrievalSidecarSmoke = path.join(workflowRoot, \"retrieval-sidecar-smoke.yml\");",
   ],
   [
-    path.join(repoRoot, ".github", "scripts", "route-ci-proof.mjs"),
-    ".github/workflows/retrieval-sidecar-smoke.yml",
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    "retrieval-sidecar-smoke.yml",
+    "violations.push(\"retrieval-sidecar-smoke.yml must exist\");",
   ],
-].map(([filePath, includes]) => ({
-  filePath: path.resolve(filePath),
+  [
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    "retrieval-sidecar-smoke.yml",
+    "violations.push(\"retrieval-sidecar-smoke.yml Windows proof must be workflow_dispatch-only\");",
+  ],
+  [
+    path.join(".github", "scripts", "route-ci-proof.mjs"),
+    ".github/workflows/retrieval-sidecar-smoke.yml",
+    "\".github/workflows/retrieval-sidecar-smoke.yml\",",
+  ],
+].map(([relativePath, includes, use]) => ({
+  relativePath,
   includes,
+  use,
 }));
 
 const executableJavaScriptExtensions = new Set([
@@ -1519,14 +1534,10 @@ function openQuoteAtEnd(text, escape) {
 function scanCorpusHarnessDependencies(prepared) {
   const hits = [];
   for (const line of prepared.logicalLines) {
-    const normalizedLine = normalizeNativeSeparators(line.text, line.shellLike);
+    const normalizedLine = normalizeNativeSeparators(line.text, line.shellLike).trim();
     const hasProtectedDependency = corpusHarnessDependencyRegexes.some((pattern) =>
-      pattern.test(normalizedLine)
-      && !harnessDependencyAllowed(
-        prepared,
-        line.startLine,
-        line.endLine,
-        (includes) => pattern.test(normalizeNativeSeparators(includes)),
+      regexOccurrences(pattern, normalizedLine).some((occurrence) =>
+        !harnessDependencyAllowed(prepared, line, pattern, occurrence)
       )
     );
     if (hasProtectedDependency) {
@@ -1538,24 +1549,55 @@ function scanCorpusHarnessDependencies(prepared) {
   return hits;
 }
 
-function harnessDependencyAllowed(prepared, startLine, endLine, markerMatches) {
-  const source = prepared.sourceLines.slice(startLine - 1, endLine).join("\n");
-  return allowedHarnessReferences.some(({ filePath, includes }) =>
-    path.resolve(prepared.filePath) === filePath
-    && source.includes(includes)
-    && markerMatches(includes)
+function regexOccurrences(pattern, source) {
+  const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+  return [...source.matchAll(new RegExp(pattern.source, flags))].map((match) => ({
+    index: match.index,
+    length: match[0].length,
+  }));
+}
+
+function harnessDependencyAllowed(prepared, line, pattern, occurrence) {
+  return allowedHarnessReferences.some(({ relativePath, includes, use }) =>
+    allowedReferenceFileMatches(prepared.filePath, relativePath)
+    && allowedReferenceUseMatches(prepared, use, line.startLine, line.endLine)
+    && regexOccurrences(pattern, normalizeNativeSeparators(use)).some((allowed) =>
+      allowed.index === occurrence.index && allowed.length === occurrence.length
+    )
+    && pattern.test(normalizeNativeSeparators(includes))
   );
 }
 
 function compactHarnessDependencyAllowed(prepared, literals, marker) {
-  return allowedHarnessReferences.some(({ filePath, includes }) => {
+  const startLine = Math.min(...literals.map(({ line }) => line));
+  const endLine = Math.max(...literals.map(({ line }) => line));
+  const source = prepared.sourceLines.slice(startLine - 1, endLine).join("\n").trim();
+  return allowedHarnessReferences.some(({ relativePath, includes, use }) => {
     const includesCompact = compactProductionSource(normalizeNativeSeparators(includes));
-    return path.resolve(prepared.filePath) === filePath
+    return allowedReferenceFileMatches(prepared.filePath, relativePath)
+      && source === use
+      && allowedReferenceUseMatches(prepared, use, startLine, endLine)
       && literals.some(({ literal }) =>
         normalizeNativeSeparators(staticStringLiteralContent(literal)).includes(includes)
       )
       && (marker.includes(includesCompact) || includesCompact.includes(marker));
   });
+}
+
+function allowedReferenceFileMatches(filePath, relativePath) {
+  const roots = usesDefaultNonRustScanRoots ? [repoRoot] : nonRustScanRoots;
+  return roots.some((root) =>
+    path.resolve(filePath) === path.resolve(root, relativePath)
+  );
+}
+
+function allowedReferenceUseMatches(prepared, use, startLine, endLine) {
+  const matches = prepared.logicalLines.filter((line) =>
+    normalizeNativeSeparators(line.text, line.shellLike).trim() === use
+  );
+  return matches.length === 1
+    && matches[0].startLine === startLine
+    && matches[0].endLine === endLine;
 }
 
 function scanProductionFile(prepared, patterns, combinedRe) {
@@ -1665,6 +1707,7 @@ function scanProductionCompactPatterns(
   const literals = prepared.literals;
   for (let start = 0; start < literals.length; start += 1) {
     let compact = "";
+    const segments = [];
     for (let end = start; end < literals.length; end += 1) {
       if (
         end > start
@@ -1678,20 +1721,31 @@ function scanProductionCompactPatterns(
         break;
       }
       const latestBoundary = compact.length;
-      compact += compactProductionSource(literals[end].literal);
-      const matchedRequiredLiterals = end - start + 1 >= minimumLiteralCount
-        && compactMarkerMatches(
+      const literalCompact = compactProductionSource(literals[end].literal);
+      compact += literalCompact;
+      segments.push({
+        ...literals[end],
+        compactStart: latestBoundary,
+        compactEnd: compact.length,
+      });
+      const occurrences = end - start + 1 >= minimumLiteralCount
+        ? compactMarkerOccurrences(
           compact,
           markerLower,
           allowSurroundingText,
           minimumLiteralCount > 1 ? latestBoundary : null,
+        )
+        : [];
+      const rejected = occurrences.some(({ index, length }) => {
+        const matchedLiterals = segments.filter((literal) =>
+          literal.compactStart < index + length && literal.compactEnd > index
         );
-      if (matchedRequiredLiterals) {
-        if (!matchAllowed(literals.slice(start, end + 1), markerLower)) {
-          hits.push(
-            compactPatternHit(prepared.filePath, literals[start].line, literals[end].line, marker),
-          );
-        }
+        return !matchAllowed(matchedLiterals, markerLower);
+      });
+      if (rejected) {
+        hits.push(
+          compactPatternHit(prepared.filePath, literals[start].line, literals[end].line, marker),
+        );
         break;
       }
       if (!allowSurroundingText && compact.length >= markerLower.length) {
@@ -1702,14 +1756,17 @@ function scanProductionCompactPatterns(
   return hits;
 }
 
-function compactMarkerMatches(compact, marker, allowSurroundingText, requiredBoundary) {
+function compactMarkerOccurrences(compact, marker, allowSurroundingText, requiredBoundary) {
   if (!allowSurroundingText) {
     return compact === marker
       && (
         requiredBoundary == null
         || (requiredBoundary > 0 && marker.length > requiredBoundary)
-      );
+      )
+      ? [{ index: 0, length: marker.length }]
+      : [];
   }
+  const occurrences = [];
   for (
     let offset = compact.indexOf(marker);
     offset >= 0;
@@ -1719,10 +1776,10 @@ function compactMarkerMatches(compact, marker, allowSurroundingText, requiredBou
       requiredBoundary == null
       || (offset < requiredBoundary && offset + marker.length > requiredBoundary)
     ) {
-      return true;
+      occurrences.push({ index: offset, length: marker.length });
     }
   }
-  return false;
+  return occurrences;
 }
 
 function staticStringLiteralSpans(text) {
