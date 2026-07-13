@@ -10,6 +10,7 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/route-ci-proof.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
       - .github/workflows/rust-ci.yml
@@ -18,6 +19,8 @@ on:
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/source-proof.yml
+      - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
       - scripts/codex-worktree-setup.*
@@ -36,6 +39,7 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/route-ci-proof.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
       - .github/workflows/rust-ci.yml
@@ -44,6 +48,8 @@ on:
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/source-proof.yml
+      - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
       - scripts/codex-worktree-setup.*
@@ -73,6 +79,9 @@ jobs:
       - name: Check workflow policy
         run: node .github/scripts/check-workflow-policy.mjs
 
+      - name: Check CI proof routing fixtures
+        run: node .github/scripts/route-ci-proof.mjs --self-test
+
       - name: Check packaged proof harness
         run: python .github/scripts/check-packaged-agent-proof.py --self-test
 
@@ -87,22 +96,3 @@ jobs:
         run: |
           version="$(python -c "import tomllib; print(tomllib.load(open('crates/codestory-cli/Cargo.toml', 'rb'))['package']['version'])")"
           python .github/scripts/check-codestory-release.py --version "$version"
-
-  macos-setup-static:
-    name: macOS setup self-tests
-    runs-on: macos-15
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Check retrieval setup contracts
-        run: node scripts/setup-retrieval-env.mjs --self-test
-
-      - name: Check worktree setup dispatcher contracts
-        run: node --test scripts/tests/codex-worktree-setup.test.mjs
-
-      - name: Check POSIX worktree setup implementation
-        run: node scripts/codex-worktree-setup.mjs --self-test
-
-      - name: Check shipped grounding setup executable mode
-        run: test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh

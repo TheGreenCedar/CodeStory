@@ -37,7 +37,10 @@
 
 ## Testing Guidelines
 - Tests live in `#[cfg(test)]` blocks or `*_tests.rs`; name them `test_*`.
-- Before committing, run the repo-scale CLI e2e stats test and append the emitted stats to `docs/testing/codestory-e2e-stats-log.md`:
+- On the final merge-ready head, run the repo-scale CLI e2e stats test once and
+  append the emitted stats to `docs/testing/codestory-e2e-stats-log.md`.
+  Intermediate checkpoint commits use focused verification and do not append
+  telemetry rows:
   - `cargo build --release -p codestory-cli`
   - `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture`
 - To exercise indexing fidelity and coverage, you must explicitly run full test binaries, not just filters:

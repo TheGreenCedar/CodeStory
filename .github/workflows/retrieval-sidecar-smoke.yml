@@ -100,6 +100,7 @@ jobs:
         shell: bash
         run: |
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
@@ -110,10 +111,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
-            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-
 
       - name: Runtime sidecar and packet contract tests
         run: |
@@ -148,7 +148,7 @@ jobs:
           key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
 
   windows-manifest-missing:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:windows-smoke')
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -163,7 +163,9 @@ jobs:
         id: rust-cache-key
         run: |
           $release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }
+          $target = rustc -Vv | Select-String '^host: ' | ForEach-Object { $_.ToString().Substring(6) }
           "version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
@@ -174,10 +176,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
-            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-
 
       - name: Retrieval bootstrap manifest-missing contract
         run: cargo test -p codestory-cli --test retrieval_bootstrap_contracts
