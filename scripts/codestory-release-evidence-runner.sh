@@ -123,7 +123,8 @@ assert_remote_exact() {
   local runner_id=$2
   jq -e --argjson id "$runner_id" --arg name "$runner_name" \
     --arg version "$runner_version" --slurpfile contract "$contract" '
-    .id == $id and .name == $name and .version == $version and .os == "Linux" and
+    .id == $id and .name == $name and .os == "Linux" and
+    (.version == $version or (.status == "offline" and .version == null)) and
     ((.labels | map(.name)) as $labels |
       ($contract[0].runner.labels - $labels | length) == 0)
     ' <<<"$remote" >/dev/null
