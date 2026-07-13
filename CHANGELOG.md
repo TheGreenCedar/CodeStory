@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Rewrote the repository agent guide around the current request-scoped MCP
+  workflow, crate ownership, identity/publication invariants, isolated test
+  contract, maturity-routed verification, and claim-specific release proof.
 - Kept promoted repo-scale stats as a correctness gate while making its
   wall-clock measurements telemetry. Hardware-bound timing limits remain in
   the release-evidence gate, so shared hosted runners no longer fail a Mac
