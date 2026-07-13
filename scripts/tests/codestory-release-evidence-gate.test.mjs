@@ -32,6 +32,23 @@ function reattest(candidate, artifact, filePath) {
   candidate.artifacts[artifact].bytes = bytes.length;
 }
 
+test("fingerprint prefers a validated provisioned machine identity", () => {
+  const identity = "colima-vz0.10.3/mac17.4/apple-m5/macos26.5.2/linux-arm64/4vcpu/17GiB";
+  let result = spawnSync(process.execPath, [script, "fingerprint"], {
+    encoding: "utf8",
+    env: { ...process.env, CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: identity },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), identity);
+
+  result = spawnSync(process.execPath, [script, "fingerprint"], {
+    encoding: "utf8",
+    env: { ...process.env, CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: "not portable" },
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /portable identity characters/);
+});
+
 test("checked-in candidate and report are deterministic and fully attested", () => {
   const dir = workspace();
   const out = path.join(dir, "report.json");

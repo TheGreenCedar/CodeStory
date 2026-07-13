@@ -112,6 +112,11 @@ workflow is not yet activated; legacy warnings and blockers remain authoritative
 until the activation child has a provisioned release-eligible baseline and live
 candidate report.
 
+Provision, verify, recover, and unregister the dedicated Linux host using the
+[release-evidence runner runbook](../contributors/release-evidence-runner.md).
+Its root-provisioned fingerprint binds the virtual guest to the approved host
+profile when generic Linux CPU metadata is unavailable.
+
 For maintainer reproduction, produce and evaluate from real raw artifacts:
 
 ```sh

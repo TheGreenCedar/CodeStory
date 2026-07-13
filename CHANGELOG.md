@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Added reproducible provisioning for the repository-scoped Linux
+  release-evidence runner. The runner uses a stable provisioned machine
+  identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64
+  sidecars, an exact real-repository drill, isolated proof state, and explicit
+  verification, recovery, unregister, and destruction paths.
 - Staged CI proof by pull-request maturity and changed surface. Draft pushes
   now stay on one Ubuntu source lane, exact-head review promotion runs the full
   workspace test and clippy gate once, and explicit platform promotion selects

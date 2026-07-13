@@ -17,6 +17,7 @@ const METRICS = [
 ];
 const SHA = /^[0-9a-f]{40}$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const MACHINE_FINGERPRINT = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{2,199}$/;
 
 function fail(message) { throw new Error(message); }
 function object(value, label) {
@@ -54,6 +55,13 @@ function git(args, cwd) {
   return result.stdout.trim();
 }
 function machineFingerprint() {
+  const provisioned = process.env.CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT?.trim();
+  if (provisioned) {
+    if (!MACHINE_FINGERPRINT.test(provisioned)) {
+      fail("CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT must be 3-200 portable identity characters");
+    }
+    return provisioned;
+  }
   const cpu = os.cpus()[0]?.model?.trim() ?? "unknown";
   const memoryGiB = Math.round(os.totalmem() / 2 ** 30);
   return `${process.platform}/${process.arch}/${os.cpus().length}/${cpu}/${memoryGiB}GiB`;
