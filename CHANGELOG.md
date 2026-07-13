@@ -29,6 +29,9 @@
   across transient Apple transport failures. Terminal rejection still fails
   immediately with the notarization log retained, and polling now has an
   explicit one-hour bound.
+- Replaced the Windows native embedding process-start identity CIM probe with
+  the native process creation time. Immediate post-spawn identity reads no
+  longer depend on CIM convergence and retain the existing serialized format.
 - Made incremental freshness compare verified parser source hashes when file
   mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
   stale graph data current, while legacy and non-parser rows retain the
