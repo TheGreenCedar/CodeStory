@@ -421,6 +421,9 @@ if (!fs.existsSync(packagedPlatformProof)) {
   if (releaseAssetBlock.includes("target/notarization-proof")) {
     violations.push("packaged-platform-proof.yml must keep notarization evidence out of the flat binary release artifact");
   }
+  if (!releaseAssetBlock.includes("target/release-dist/SHA256SUMS.txt")) {
+    violations.push("packaged-platform-proof.yml must include SHA256SUMS.txt in each reusable package artifact");
+  }
   const matrixMatch = content.match(
     /^      matrix: \$\{\{ fromJSON\(inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\) \}\}$/mu,
   );

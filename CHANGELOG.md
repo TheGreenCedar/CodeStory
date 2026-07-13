@@ -25,6 +25,9 @@
 
 ### Fixed
 
+- Included the aggregate release checksum manifest in reusable package
+  artifacts so protected hardware and installation proofs can provision the
+  exact packaged CLI without falling back to a network release lookup.
 - Kept the protected Metal proof runnable when the platform-only source-call
   job is intentionally skipped, while still requiring successful routing and
   package production before protected hardware starts.

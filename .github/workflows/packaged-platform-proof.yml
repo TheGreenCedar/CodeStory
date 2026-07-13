@@ -469,6 +469,7 @@ jobs:
             target/release-dist/*.tar.gz
             target/release-dist/*.zip
             target/release-dist/*.sha256
+            target/release-dist/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Upload macOS notarization proof
