@@ -86,6 +86,9 @@ jobs:
     uses: ./.github/workflows/packaged-platform-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ github.sha }}
+      scope: full
+      proof_key: release-${{ needs.preflight.outputs.version }}
       sign_macos: true
     # Provision these names as environment secrets on macos-release-signing.
     # That protected environment is selected by the called macOS matrix jobs,
@@ -106,6 +109,7 @@ jobs:
     with:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_artifact: true
 
   publish:

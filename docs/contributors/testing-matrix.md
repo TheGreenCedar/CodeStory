@@ -18,13 +18,13 @@ flowchart TD
     change --> bench["Bench or perf-surface work"]
     change --> e2e["Repo-scale semantic or cold-start behavior"]
     docs --> docs_checks["readback + git diff --check + check-doc-links.mjs"]
-    always --> workspace["fmt, check, targeted tests, clippy"]
+    always --> workspace["draft: fmt, check, lib clippy, focused tests"]
     indexer --> fidelity["fidelity_regression, tictactoe_language_coverage, integration"]
     store --> store_tests["cargo test -p codestory-store"]
     runtime --> runtime_tests["cargo test -p codestory-runtime and retrieval_eval"]
     cli --> cli_tests["cargo test -p codestory-cli"]
     bench --> bench_checks["cargo check -p codestory-bench --bench name"]
-    e2e --> e2e_stats["release build + codestory_repo_e2e_stats"]
+    e2e --> e2e_stats["final merge-ready head: release build + repo-scale stats"]
 ```
 
 ## Verification Lane Summary
@@ -34,12 +34,13 @@ Run Cargo commands serially in this repo.
 | Lane | Commands |
 | --- | --- |
 | Docs only | `git diff --check`, `node .github/scripts/check-doc-links.mjs` |
-| Routine code | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
-| macOS workspace | On both `macos-15` and `macos-15-intel`: `cargo check --workspace --locked`, `cargo test --locked`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`; keep commands serialized within each job |
-| Concurrent publication | `cargo test -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture`; `rust-ci.yml` repeats this focused contract on Ubuntu, Windows, and macOS |
-| Publication fault recovery | `cargo test -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture`; `cargo test -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture`; `rust-ci.yml` repeats both proofs on Ubuntu, Windows, and macOS |
+| Draft code | On Ubuntu: `cargo fmt --check`, `cargo check --workspace --locked`, library clippy, and focused publication contracts |
+| Exact-head source proof | After independent review accepts the current head: `cargo test --workspace --locked`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`, once |
+| Scoped macOS source proof | On both `macos-15` and `macos-15-intel`: `cargo check --workspace --locked` plus setup self-tests, only for an explicitly promoted Mac-scoped head |
+| Concurrent publication | `cargo test -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture`; draft CI runs this focused contract on Ubuntu |
+| Publication fault recovery | `cargo test -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture`; `cargo test -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture`; draft CI runs both focused proofs on Ubuntu |
 | Release-blocking fidelity | `cargo test -p codestory-indexer --test fidelity_regression`, `cargo test -p codestory-indexer --test tictactoe_language_coverage`, `cargo test -p codestory-runtime --test retrieval_eval` |
-| Heavy repo-scale timing | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` |
+| Heavy repo-scale timing | Once on a promoted final merge-ready head: `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture`; upload the output and append its metrics before the final commit |
 
 Append fresh headline rows to
 [`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md) when
@@ -86,11 +87,11 @@ Do not use `cargo test --workspace --all-targets` as the routine broad test
 gate. `--all-targets` expands into benchmark targets; Criterion benches are
 compiled or run through the bench lane below.
 
-The macOS CI merge bar runs the complete workspace lane independently on
-Apple Silicon (`macos-15`) and Intel (`macos-15-intel`). Mac setup changes must
-also pass the retrieval setup self-test, the Node dispatcher test, and the POSIX
-worktree setup self-test. Run locally from an isolated cache when changing these
-surfaces:
+An explicitly promoted Mac-scoped head runs source checks independently on
+Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) before packaging. Mac
+setup changes also pass the retrieval setup self-test, the Node dispatcher
+test, and the POSIX worktree setup self-test. Draft pushes stay on Ubuntu. Run
+locally from an isolated cache when changing these surfaces:
 
 ```sh
 node scripts/setup-retrieval-env.mjs --self-test
@@ -142,16 +143,26 @@ the active plugin runtime plus observed and missing server-advertised MCP
 resources. This proves the installed plugin launcher advertises the resources;
 it is not Codex host/model visibility proof.
 
-Packaged acceptance uses the same six native hosted-runner cells before and
-after publication. Pull requests that change release, packaging, installer, or
-plugin-launch surfaces call the same read-only reusable packaged-proof workflow
-as the release, so the native matrix is reviewed before publication without
-granting release permissions to pull-request code:
+Packaged acceptance builds each selected native target once and reuses that
+artifact for package smoke, signing/notarization, install checks, and the
+protected Apple Silicon lifecycle. Draft pushes never start this matrix. A
+same-repository `platform-proof` label or coordinator dispatch rechecks the
+exact PR head and requires a completed successful `full-source-gate` job for
+that SHA, then routes script/test-guard-only changes to `none`, Mac
+lifecycle changes to the two Mac targets, and cross-platform runtime or
+packaging changes to all six targets. Forks are rejected before checkout and no
+proof lane uses `pull_request_target` to execute PR code. Mac package promotion
+uses the protected signing environment; unavailable credentials fail the proof.
 
-Pull-request cells do not receive the protected Apple signing credentials, so
-their Mac archives prove packaging and runtime behavior but remain unsigned.
-Developer ID signing, notarization, and Gatekeeper checks apply to the release
-and post-publish cells only.
+The `review-accepted` label runs the full Ubuntu source gate once for that exact
+head; the persistent label alone does not authorize later heads. After merge,
+the coordinator selects integration mode in the same dispatcher for the
+current `dev/codestory-next` SHA. That mode forces the full source, six-target
+package, repo-scale stats, and packaged Metal workflows, then rechecks that dev
+did not move while they ran.
+Every lane cancels an older run for the same PR or proof identity. Cargo cache
+keys use the toolchain, lockfile, feature set, and target triple, never a commit
+SHA.
 
 | Asset | Native runner | Required packaged proof |
 | --- | --- | --- |
@@ -372,8 +383,9 @@ cargo test -p codestory-runtime --test integration test_repo_scale_call_resoluti
 
 ## Repo-Scale Semantic And Cold-Start Checks
 
-Run this lane when default `index` behavior, symbol-doc persistence, dense-anchor
-persistence/reuse, embedding reuse, or cold-start performance changes:
+Run this lane once on the final merge-ready head when default `index` behavior,
+symbol-doc persistence, dense-anchor persistence/reuse, embedding reuse, or
+cold-start performance changes. Intermediate checkpoints do not append rows:
 
 ```sh
 cargo build --release -p codestory-cli
