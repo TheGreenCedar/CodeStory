@@ -582,24 +582,30 @@ pub fn native_embedding_launch_identity_status(
             reason: format!("native embedding pid {pid} is the current CodeStory process"),
         };
     }
-    let expected_start_identity = launch.process_start_identity.as_deref();
-    let start_identity_before = if expected_start_identity.is_some() {
-        match native_embedding_process_start_identity(pid) {
-            Ok(Some(identity)) => Some(identity),
-            Ok(None) => {
-                return NativeEmbeddingLaunchIdentityStatus::NotRunning { pid };
-            }
-            Err(error) => {
-                return NativeEmbeddingLaunchIdentityStatus::Unverified {
-                    pid: Some(pid),
-                    reason: format!(
-                        "query native embedding process start identity before snapshot: {error}"
-                    ),
-                };
-            }
+    let start_identity_before = match native_embedding_process_start_identity(pid) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            return NativeEmbeddingLaunchIdentityStatus::NotRunning { pid };
         }
-    } else {
-        None
+        Err(error) => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: format!(
+                    "query native embedding process start identity before snapshot: {error}"
+                ),
+            };
+        }
+    };
+    let Some(expected_start_identity) = launch
+        .process_start_identity
+        .as_deref()
+        .filter(|identity| !identity.trim().is_empty())
+    else {
+        return NativeEmbeddingLaunchIdentityStatus::Unverified {
+            pid: Some(pid),
+            reason: "recorded native embedding launch is missing exact process start identity"
+                .to_string(),
+        };
     };
     let snapshot = match native_embedding_process_snapshot(pid) {
         Ok(Some(snapshot)) => snapshot,
@@ -611,39 +617,35 @@ pub fn native_embedding_launch_identity_status(
             };
         }
     };
-    if let Some(expected) = expected_start_identity {
-        match native_embedding_process_start_identity(pid) {
-            Ok(Some(actual)) if start_identity_before.as_deref() != Some(actual.as_str()) => {
-                return NativeEmbeddingLaunchIdentityStatus::Unverified {
-                    pid: Some(pid),
-                    reason: format!(
-                        "native embedding process start identity changed during snapshot: before={:?}, after={actual}",
-                        start_identity_before.as_deref()
-                    ),
-                };
-            }
-            Ok(Some(actual)) if actual == expected => {}
-            Ok(Some(actual)) => {
-                return NativeEmbeddingLaunchIdentityStatus::Mismatched {
-                    pid,
-                    reason: format!(
-                        "live process start identity does not match recorded native embedding launch: expected {expected}, got {actual}"
-                    ),
-                };
-            }
-            Ok(None) => {
-                return NativeEmbeddingLaunchIdentityStatus::Unverified {
-                    pid: Some(pid),
-                    reason: "live native embedding process start identity is unavailable"
-                        .to_string(),
-                };
-            }
-            Err(error) => {
-                return NativeEmbeddingLaunchIdentityStatus::Unverified {
-                    pid: Some(pid),
-                    reason: format!("query live native embedding process start identity: {error}"),
-                };
-            }
+    match native_embedding_process_start_identity(pid) {
+        Ok(Some(actual)) if start_identity_before != actual => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: format!(
+                    "native embedding process start identity changed during snapshot: before={start_identity_before}, after={actual}"
+                ),
+            };
+        }
+        Ok(Some(actual)) if actual == expected_start_identity => {}
+        Ok(Some(actual)) => {
+            return NativeEmbeddingLaunchIdentityStatus::Mismatched {
+                pid,
+                reason: format!(
+                    "live process start identity does not match recorded native embedding launch: expected {expected_start_identity}, got {actual}"
+                ),
+            };
+        }
+        Ok(None) => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: "live native embedding process start identity is unavailable".to_string(),
+            };
+        }
+        Err(error) => {
+            return NativeEmbeddingLaunchIdentityStatus::Unverified {
+                pid: Some(pid),
+                reason: format!("query live native embedding process start identity: {error}"),
+            };
         }
     }
     native_embedding_process_match_status(launch, &snapshot, pid)
@@ -2507,6 +2509,54 @@ mod tests {
             "unexpected executable: {executable}"
         );
         assert_eq!(arguments.get(1..), Some(expected.as_slice()));
+        Ok(())
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn native_embedding_identity_without_exact_start_distinguishes_live_from_dead() -> Result<()> {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/S", "/C", "ping -n 60 127.0.0.1 >NUL"]);
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("60");
+            command
+        };
+        let mut child = command.spawn().context("spawn missing-identity fixture")?;
+        let mut launch = native_embedding_launch_fixture();
+        launch.pid = Some(child.id());
+        launch.process_start_identity = None;
+        let live_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match native_embedding_launch_identity_status(&launch) {
+                NativeEmbeddingLaunchIdentityStatus::Unverified { reason, .. }
+                    if reason.contains("missing exact process start identity") =>
+                {
+                    break;
+                }
+                status if std::time::Instant::now() < live_deadline => {
+                    if child.try_wait()?.is_some() {
+                        anyhow::bail!(
+                            "missing-identity fixture exited before live probe: {status:?}"
+                        );
+                    }
+                    thread::sleep(std::time::Duration::from_millis(20));
+                }
+                status => anyhow::bail!("live process was not rejected as unverified: {status:?}"),
+            }
+        }
+
+        child.kill().context("kill missing-identity fixture")?;
+        child.wait().context("wait for missing-identity fixture")?;
+        assert!(matches!(
+            native_embedding_launch_identity_status(&launch),
+            NativeEmbeddingLaunchIdentityStatus::NotRunning { .. }
+        ));
         Ok(())
     }
 

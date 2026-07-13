@@ -44,7 +44,9 @@
   also binds its launch endpoint and port arguments before reuse or cleanup, and
   failed bootstrap cleanup removes its exact schema-3 state before preserving
   owned schema-2 inventory. Native executable ownership now uses filesystem
-  identity instead of case-folded path text.
+  identity instead of case-folded path text, requires an exact persisted process
+  start identity, and reconciles terminal repair results from the compatible
+  schema-2 coordination path during migration.
 - Recognized current llama.cpp's logger-prefixed Metal device inventory so
   native offload proof remains bound to the selected provider and current
   launch even when `ggml_metal_init` reports later in startup.

@@ -790,6 +790,11 @@ impl SidecarRuntimeConfig {
         }
     }
 
+    #[doc(hidden)]
+    pub fn legacy_state_path_for_compatibility(&self) -> Option<PathBuf> {
+        legacy_state_path_for_runtime(self)
+    }
+
     pub(crate) fn embedding_endpoint_fingerprint(&self) -> Result<String> {
         let cache_root = self
             .cache_root()
