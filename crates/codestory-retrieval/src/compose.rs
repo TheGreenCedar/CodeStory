@@ -2579,6 +2579,7 @@ mod tests {
     fn compose_test_runtime(root: &std::path::Path) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,

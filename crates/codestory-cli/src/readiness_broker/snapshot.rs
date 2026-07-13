@@ -206,10 +206,7 @@ pub(super) fn gpu_runtime_identity_for_sidecar(
     if !codestory_retrieval::sidecar_state_matches_runtime(&state, runtime) {
         return None;
     }
-    let state_project_identity = state.project_identity.as_ref()?;
-    let legacy_identity = codestory_workspace::project_identity_v2(project_root);
-    if runtime.project_identity.as_ref()? != &legacy_identity
-        || state_project_identity != &legacy_identity
+    if runtime.project_identity.as_ref()? != expected_project_identity
         || expected_project_identity.workspace_id
             != codestory_workspace::workspace_id_v3_for_root(project_root)
         || state.started_at_epoch_ms <= 0

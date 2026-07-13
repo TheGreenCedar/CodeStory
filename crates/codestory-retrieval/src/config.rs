@@ -312,7 +312,7 @@ pub struct SidecarPorts {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SidecarOwnership {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV3>,
     pub owner: String,
     pub profile: String,
     pub namespace: String,
@@ -327,7 +327,9 @@ pub struct SidecarOwnership {
 
 #[derive(Debug, Clone)]
 pub struct SidecarRuntimeConfig {
-    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV3>,
+    #[doc(hidden)]
+    pub accepted_legacy_project_identity: Option<codestory_workspace::ProjectIdentityV3>,
     pub layout: SidecarLayout,
     pub profile: SidecarProfile,
     pub run_id: Option<String>,
@@ -573,7 +575,8 @@ impl SidecarRuntimeConfig {
     ) -> Self {
         let base = cache_root.to_path_buf();
         let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id, defaults));
-        let namespace = namespace_for(project_root, profile, run_id.as_deref());
+        let project_identity = project_root.map(codestory_workspace::project_identity_v3);
+        let namespace = namespace_for(project_identity.as_ref(), profile, run_id.as_deref());
         let state_file = match profile {
             SidecarProfile::Local => base.join("retrieval-sidecars.json"),
             SidecarProfile::Agent => base
@@ -581,9 +584,29 @@ impl SidecarRuntimeConfig {
                 .join(&namespace)
                 .join("retrieval-sidecars.json"),
         };
-        let stored = read_ports_from_state(&state_file);
-        let stored_native_embedding =
-            profile == SidecarProfile::Agent && sidecar_state_uses_native_embedding(&state_file);
+        let stored_value = read_sidecar_state_value(&state_file);
+        let stored_value = stored_value.filter(|value| {
+            sidecar_state_matches_runtime_selection(
+                value,
+                project_root,
+                project_identity.as_ref(),
+                profile,
+                &namespace,
+                run_id.as_deref(),
+            )
+        });
+        let accepted_legacy_project_identity = stored_value
+            .as_ref()
+            .and_then(sidecar_state_project_identity)
+            .filter(|identity| {
+                identity.project_identity_schema_version
+                    == codestory_workspace::PROJECT_IDENTITY_SCHEMA_VERSION
+            });
+        let stored = stored_value.as_ref().and_then(sidecar_ports_from_value);
+        let stored_native_embedding = profile == SidecarProfile::Agent
+            && stored_value
+                .as_ref()
+                .is_some_and(sidecar_state_uses_native_embedding);
         let configured_ports = [
             env_port(
                 defaults,
@@ -663,15 +686,16 @@ impl SidecarRuntimeConfig {
         let cleanup_command = project_root
             .map(|path| retrieval_command("down", path, profile, run_id.as_deref(), None))
             .unwrap_or_else(|| "codestory-cli retrieval down".to_string());
-        let project_identity = project_root.map(codestory_workspace::cached_project_identity_v2);
         let mut labels = BTreeMap::new();
         labels.insert("dev.codestory.owner".into(), "codestory".into());
         labels.insert("dev.codestory.profile".into(), profile.as_str().into());
         labels.insert("dev.codestory.namespace".into(), namespace.clone());
         if let Some(project_root) = project_root {
-            let hash = project_hash(project_root);
-            labels.insert("dev.codestory.project_hash".into(), hash.clone());
             if let Some(identity) = project_identity.as_ref() {
+                labels.insert(
+                    "dev.codestory.project_hash".into(),
+                    identity.workspace_id.clone(),
+                );
                 labels.insert(
                     "dev.codestory.project_id".into(),
                     identity.project_id.clone(),
@@ -718,6 +742,7 @@ impl SidecarRuntimeConfig {
             });
         Self {
             project_identity,
+            accepted_legacy_project_identity,
             layout,
             profile,
             run_id,
@@ -1287,16 +1312,16 @@ fn auto_runtime_selection(
 }
 
 fn namespace_for(
-    project_root: Option<&Path>,
+    project_identity: Option<&codestory_workspace::ProjectIdentityV3>,
     profile: SidecarProfile,
     run_id: Option<&str>,
 ) -> String {
-    match (profile, project_root) {
+    match (profile, project_identity) {
         (SidecarProfile::Local, _) => "codestory".into(),
-        (SidecarProfile::Agent, Some(path)) => {
+        (SidecarProfile::Agent, Some(identity)) => {
             format!(
                 "codestory-agent-{}-{}",
-                project_hash(path),
+                identity.workspace_id,
                 run_id.unwrap_or("run")
             )
         }
@@ -1308,12 +1333,11 @@ fn namespace_for(
     }
 }
 
-fn project_hash(project_root: &Path) -> String {
-    fnv1a_hex(project_root.to_string_lossy().as_bytes())
-}
-
 fn agent_namespace_prefix(project_root: &Path) -> String {
-    format!("codestory-agent-{}-", project_hash(project_root))
+    format!(
+        "codestory-agent-{}-",
+        codestory_workspace::workspace_id_v3_for_root(project_root)
+    )
 }
 
 fn latest_agent_run_id_in_cache(project_root: &Path, cache_root: &Path) -> Option<String> {
@@ -1401,22 +1425,93 @@ fn normalized_label_component(value: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
-    let value =
-        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()?;
-    sidecar_ports_from_value(&value)
+fn read_sidecar_state_value(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-fn sidecar_state_uses_native_embedding(path: &Path) -> bool {
-    serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).unwrap_or_default())
-        .ok()
-        .and_then(|value| {
-            value
-                .get("embedding_launch")?
-                .get("launch_mode")?
-                .as_str()
-                .map(str::to_string)
-        })
+fn sidecar_state_project_identity(
+    value: &serde_json::Value,
+) -> Option<codestory_workspace::ProjectIdentityV3> {
+    serde_json::from_value(value.get("project_identity")?.clone()).ok()
+}
+
+pub(crate) fn project_identity_matches_runtime(
+    stored: Option<&codestory_workspace::ProjectIdentityV3>,
+    current: Option<&codestory_workspace::ProjectIdentityV3>,
+    accepted_legacy: Option<&codestory_workspace::ProjectIdentityV3>,
+) -> bool {
+    match (stored, current) {
+        (None, None) => true,
+        (Some(stored), Some(current))
+            if stored.project_identity_schema_version
+                == codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION =>
+        {
+            stored == current
+        }
+        (Some(stored), Some(_))
+            if stored.project_identity_schema_version
+                == codestory_workspace::PROJECT_IDENTITY_SCHEMA_VERSION =>
+        {
+            accepted_legacy == Some(stored)
+        }
+        _ => false,
+    }
+}
+
+fn sidecar_state_matches_runtime_selection(
+    value: &serde_json::Value,
+    project_root: Option<&Path>,
+    project_identity: Option<&codestory_workspace::ProjectIdentityV3>,
+    profile: SidecarProfile,
+    namespace: &str,
+    run_id: Option<&str>,
+) -> bool {
+    value.get("owner").and_then(serde_json::Value::as_str) == Some("codestory")
+        && value.get("profile").and_then(serde_json::Value::as_str) == Some(profile.as_str())
+        && value.get("namespace").and_then(serde_json::Value::as_str) == Some(namespace)
+        && value
+            .get("compose_project")
+            .and_then(serde_json::Value::as_str)
+            == Some(namespace)
+        && value.get("run_id").and_then(serde_json::Value::as_str) == run_id
+        && project_identity_matches_runtime_selection(
+            sidecar_state_project_identity(value).as_ref(),
+            project_root,
+            project_identity,
+        )
+}
+
+fn project_identity_matches_runtime_selection(
+    stored: Option<&codestory_workspace::ProjectIdentityV3>,
+    project_root: Option<&Path>,
+    current: Option<&codestory_workspace::ProjectIdentityV3>,
+) -> bool {
+    let Some(stored) = stored else {
+        return current.is_none();
+    };
+    if stored.project_identity_schema_version
+        != codestory_workspace::PROJECT_IDENTITY_SCHEMA_VERSION
+    {
+        return project_identity_matches_runtime(Some(stored), current, None);
+    }
+    let Some(legacy) = project_root.map(codestory_workspace::project_identity_v2) else {
+        return false;
+    };
+    stored.project_id == legacy.project_id
+        && stored.workspace_id == legacy.workspace_id
+        && stored.artifact_scope_id == legacy.artifact_scope_id
+        && stored.canonical_repository_id == legacy.canonical_repository_id
+        && stored.legacy_canonical_repository_id.is_none()
+        && stored.legacy_raw_root_project_id == legacy.legacy_raw_root_project_id
+        && stored.normalized_root_project_id_alias == legacy.normalized_root_project_id_alias
+        && stored.portable_reuse_eligible == legacy.portable_reuse_eligible
+}
+
+fn sidecar_state_uses_native_embedding(value: &serde_json::Value) -> bool {
+    value
+        .get("embedding_launch")
+        .and_then(|launch| launch.get("launch_mode"))
+        .and_then(serde_json::Value::as_str)
         .is_some_and(|mode| mode == EmbeddingServerLaunchMode::NativeSpawned.as_str())
 }
 
@@ -2502,7 +2597,7 @@ mod tests {
     }
 
     #[test]
-    fn project_runtime_exposes_v2_identity_without_changing_namespace_contract() {
+    fn project_runtime_exposes_v3_identity_and_namespace() {
         let _lock = crate::test_support::env_lock();
         let project = tempdir().expect("project");
         let _cache = EnvGuard::set(
@@ -2512,6 +2607,11 @@ mod tests {
         let runtime =
             SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
         let identity = runtime.project_identity.as_ref().expect("project identity");
+
+        assert_eq!(
+            identity.project_identity_schema_version,
+            codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION
+        );
 
         assert_eq!(
             runtime.labels.get("dev.codestory.project_id"),
@@ -2526,11 +2626,10 @@ mod tests {
             Some(&identity.artifact_scope_id)
         );
         assert!(
-            runtime.namespace.starts_with(&format!(
-                "codestory-agent-{}-",
-                project_hash(project.path())
-            )),
-            "0.14 identity metadata must not rename existing sidecar namespaces"
+            runtime
+                .namespace
+                .starts_with(&format!("codestory-agent-{}-", identity.workspace_id)),
+            "agent namespaces must use the lossless workspace identity"
         );
         assert_eq!(
             runtime.ownership().project_identity.as_ref(),
@@ -2587,6 +2686,12 @@ mod tests {
         std::fs::write(
             &first.layout.state_file,
             serde_json::to_vec(&serde_json::json!({
+                "project_identity": first.project_identity,
+                "owner": "codestory",
+                "profile": first.profile.as_str(),
+                "namespace": first.namespace,
+                "compose_project": first.compose_project,
+                "run_id": first.run_id,
                 "qdrant_http_port": first.layout.qdrant_http_port,
                 "qdrant_grpc_port": first.layout.qdrant_grpc_port,
                 "embed_http_port": first.embed_http_port,
@@ -2611,6 +2716,48 @@ mod tests {
             first.layout.qdrant_grpc_port
         );
         assert_eq!(second.embed_http_port, first.embed_http_port);
+    }
+
+    #[test]
+    fn legacy_identity_reuse_requires_the_exact_workspace() {
+        let project = tempdir().expect("project");
+        let current = codestory_workspace::project_identity_v3(project.path());
+        let legacy = codestory_workspace::project_identity_v2(project.path());
+        let stored: codestory_workspace::ProjectIdentityV3 = serde_json::from_value(
+            serde_json::to_value(&legacy).expect("serialize legacy identity"),
+        )
+        .expect("read legacy identity through migration shape");
+
+        assert!(project_identity_matches_runtime_selection(
+            Some(&stored),
+            Some(project.path()),
+            Some(&current),
+        ));
+        assert!(project_identity_matches_runtime(
+            Some(&stored),
+            Some(&current),
+            Some(&stored),
+        ));
+        assert!(!project_identity_matches_runtime(
+            Some(&stored),
+            Some(&current),
+            None,
+        ));
+
+        let mut foreign = stored.clone();
+        foreign.canonical_repository_id = Some("foreign-repository".to_string());
+        foreign.project_id = "foreign-repository".to_string();
+        foreign.artifact_scope_id = "foreign-repository".to_string();
+        assert!(!project_identity_matches_runtime_selection(
+            Some(&foreign),
+            Some(project.path()),
+            Some(&current),
+        ));
+        assert!(!project_identity_matches_runtime(
+            None,
+            Some(&current),
+            None
+        ));
     }
 
     #[test]

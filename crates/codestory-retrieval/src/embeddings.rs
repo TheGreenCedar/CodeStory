@@ -2767,6 +2767,7 @@ mod tests {
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
@@ -2817,6 +2818,7 @@ mod tests {
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,

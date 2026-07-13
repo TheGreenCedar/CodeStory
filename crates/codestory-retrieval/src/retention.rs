@@ -1272,6 +1272,7 @@ mod tests {
         let root = tempdir().expect("root");
         let runtime = |profile, state_file| SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 state_file,
                 ..layout(root.path())

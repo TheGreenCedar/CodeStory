@@ -75,7 +75,7 @@ pub enum NativeEmbeddingLaunchIdentityStatus {
 /// callers must use `sidecar_status` or `strict_sidecar_status` before trusting retrieval output.
 pub struct SidecarStateFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV3>,
     #[serde(default = "default_sidecar_owner")]
     pub owner: String,
     #[serde(default = "default_sidecar_profile")]
@@ -337,24 +337,21 @@ pub fn sidecar_state_matches_runtime(
     state: &SidecarStateFile,
     runtime: &SidecarRuntimeConfig,
 ) -> bool {
+    let ports = runtime.ownership().ports;
     state.owner == "codestory"
         && state.namespace == runtime.namespace
         && state.compose_project == runtime.compose_project
         && state.profile == runtime.profile.as_str()
         && state.run_id.as_deref() == runtime.run_id.as_deref()
-        && state.embed_http_port == runtime.ownership().ports.embed_http
-        && state.embed_url == runtime.ownership().ports.embed_url
-        && state
-            .project_identity
-            .as_ref()
-            .is_none_or(|state_identity| {
-                runtime
-                    .project_identity
-                    .as_ref()
-                    .is_some_and(|runtime_identity| {
-                        state_identity.workspace_id == runtime_identity.workspace_id
-                    })
-            })
+        && state.qdrant_http_port == ports.qdrant_http
+        && state.qdrant_grpc_port == ports.qdrant_grpc
+        && state.embed_http_port == ports.embed_http
+        && state.embed_url == ports.embed_url
+        && crate::config::project_identity_matches_runtime(
+            state.project_identity.as_ref(),
+            runtime.project_identity.as_ref(),
+            runtime.accepted_legacy_project_identity.as_ref(),
+        )
 }
 
 fn reusable_embedding_launch_from_state(
@@ -757,7 +754,10 @@ fn command_mentions_path(command_line: &str, expected_path: &str) -> bool {
 }
 
 fn same_identity_path(left: &str, right: &str) -> bool {
-    normalized_identity_path(left) == normalized_identity_path(right)
+    codestory_workspace::same_workspace_path(
+        Path::new(left.trim_matches('"')),
+        Path::new(right.trim_matches('"')),
+    )
 }
 
 fn normalized_identity_path(path: &str) -> String {
@@ -1269,7 +1269,9 @@ fn attach_status_ownership(
 ) -> RetrievalStatusReport {
     report.ownership = Some(runtime.ownership());
     report.query_embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
-    if let Some(state) = read_sidecar_state(&runtime.layout.state_file) {
+    if let Some(state) = read_sidecar_state(&runtime.layout.state_file)
+        && sidecar_state_matches_runtime(&state, runtime)
+    {
         report.embedding_launch = state.embedding_launch.or(report.embedding_launch);
         report.sidecar_images = state.sidecar_images;
     }
@@ -1286,12 +1288,7 @@ pub(crate) fn embedding_launch_metadata_for_runtime(
     runtime: &SidecarRuntimeConfig,
 ) -> Option<EmbeddingLaunchMetadata> {
     let state = read_sidecar_state(&runtime.layout.state_file)?;
-    (state.owner == "codestory"
-        && state.namespace == runtime.namespace
-        && state.profile == runtime.profile.as_str()
-        && state.run_id.as_deref() == runtime.run_id.as_deref()
-        && state.embed_http_port == runtime.ownership().ports.embed_http
-        && state.embed_url == runtime.ownership().ports.embed_url)
+    sidecar_state_matches_runtime(&state, runtime)
         .then_some(state.embedding_launch)
         .flatten()
 }
@@ -1558,6 +1555,7 @@ mod tests {
     fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
@@ -1674,7 +1672,7 @@ mod tests {
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let root = TempDir::new().expect("root");
         let mut runtime = test_runtime(&root);
-        runtime.project_identity = Some(codestory_workspace::project_identity_v2(root.path()));
+        runtime.project_identity = Some(codestory_workspace::project_identity_v3(root.path()));
         let launch = EmbeddingLaunchMetadata {
             provider: "llamacpp".to_string(),
             launch_mode: "native_spawned".to_string(),
@@ -1702,6 +1700,12 @@ mod tests {
             .expect("foreign identity")
             .workspace_id = "foreign-workspace".to_string();
         assert!(!sidecar_state_matches_runtime(&state, &foreign_runtime));
+        let mut foreign_qdrant_runtime = runtime.clone();
+        foreign_qdrant_runtime.layout.qdrant_http_port += 1;
+        assert!(!sidecar_state_matches_runtime(
+            &state,
+            &foreign_qdrant_runtime
+        ));
         assert_eq!(state.embedding_launch, Some(launch.clone()));
         assert_eq!(
             state.embedding_accelerator_request_provider.as_deref(),
@@ -1932,6 +1936,10 @@ mod tests {
     }
 
     fn native_embedding_launch_fixture() -> EmbeddingLaunchMetadata {
+        let executable = std::env::current_exe()
+            .expect("current test executable")
+            .display()
+            .to_string();
         EmbeddingLaunchMetadata {
             provider: "llamacpp".to_string(),
             launch_mode: "native_spawned".to_string(),
@@ -1948,7 +1956,7 @@ mod tests {
             ],
             launch_fingerprint_sha256: Some("fingerprint".to_string()),
             executable_source: Some("managed_cache".to_string()),
-            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            executable_path: Some(executable),
             model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
             log_path: Some("C:/cache/llama-server-native.log".to_string()),
             requested_device: None,
@@ -1958,13 +1966,18 @@ mod tests {
     #[test]
     fn native_embedding_identity_accepts_matching_process_snapshot() {
         let launch = native_embedding_launch_fixture();
+        let arguments = std::iter::once(
+            launch
+                .executable_path
+                .clone()
+                .expect("fixture executable path"),
+        )
+        .chain(launch.launch_args.clone())
+        .collect();
         let snapshot = NativeEmbeddingProcessSnapshot {
-            executable_path: Some("C:\\cache\\llama-server.exe".to_string()),
-            command_line: Some(
-                "\"C:\\cache\\llama-server.exe\" --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
-                    .to_string(),
-            ),
-            arguments: None,
+            executable_path: launch.executable_path.clone(),
+            command_line: None,
+            arguments: Some(arguments),
             started_at_epoch_ms: Some(123),
         };
 
@@ -1973,7 +1986,12 @@ mod tests {
 
     #[test]
     fn native_embedding_identity_preserves_spaced_quoted_unicode_argv_tokens() {
-        let executable = "/tmp/Code Story 語/llama-server".to_string();
+        let root = TempDir::new().expect("temp dir");
+        let executable_path = root.path().join("Code Story 語").join("llama-server");
+        std::fs::create_dir_all(executable_path.parent().expect("fixture parent"))
+            .expect("unicode fixture dir");
+        std::fs::write(&executable_path, b"fixture").expect("executable fixture");
+        let executable = executable_path.display().to_string();
         let model = "/tmp/Code Story 語/models/model \"alpha\".gguf".to_string();
         let mut launch = native_embedding_launch_fixture();
         launch.executable_path = Some(executable.clone());
@@ -2027,7 +2045,7 @@ mod tests {
         let mut launch = native_embedding_launch_fixture();
         launch.launch_args.clear();
         let snapshot = NativeEmbeddingProcessSnapshot {
-            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            executable_path: launch.executable_path.clone(),
             command_line: Some("\"C:/cache/llama-server.exe\" --port 18080".to_string()),
             arguments: None,
             started_at_epoch_ms: Some(123),
@@ -2224,7 +2242,7 @@ mod tests {
     fn native_embedding_identity_rejects_reused_pid_with_same_command() {
         let launch = native_embedding_launch_fixture();
         let snapshot = NativeEmbeddingProcessSnapshot {
-            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            executable_path: launch.executable_path.clone(),
             command_line: Some(
                 "\"C:/cache/llama-server.exe\" --model C:/cache/bge-base-en-v1.5.Q8_0.gguf --port 18080"
                     .to_string(),
@@ -2263,7 +2281,7 @@ mod tests {
         ));
 
         let unverified = NativeEmbeddingProcessSnapshot {
-            executable_path: Some("C:/cache/llama-server.exe".to_string()),
+            executable_path: launch.executable_path.clone(),
             command_line: None,
             arguments: None,
             started_at_epoch_ms: Some(123),

@@ -9826,6 +9826,7 @@ mod tests {
         let root = tempdir().expect("temp dir");
         let sidecar = codestory_retrieval::SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: codestory_retrieval::SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,

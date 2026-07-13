@@ -1336,6 +1336,7 @@ mod tests {
         let namespace = format!("codestory-agent-{run_id}");
         SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 6333,
                 qdrant_grpc_port: 6334,

@@ -449,16 +449,19 @@ To refresh an image pin safely:
 
 ### Manifest and generation contract
 
-CodeStory 0.14 separates three identities:
+CodeStory separates three schema-3 identities:
 
 - `project_id` identifies the logical repository when a canonical Git remote is
   available, otherwise it falls back to the workspace id.
-- `workspace_id` is the existing FNV-1a hash of the canonical workspace root and
-  scopes live processes, locks, ports, and local state.
+- `workspace_id` is the FNV-1a hash of the canonical workspace root's native OS
+  bytes/code units and scopes live processes, locks, ports, and local state.
 - `artifact_scope_id` uses `project_id` only when portable reuse is eligible;
   dirty or unidentified workspaces fail closed to `workspace_id`.
 
-Existing namespace and manifest paths are not renamed during the 0.14 upgrade.
+Agent namespaces and generation roots use these schema-3 ids. A legacy
+schema-2 state file is reused only when it proves the same exact workspace and
+has an internally consistent repository/artifact scope; repository aliases,
+missing identity, and foreign roots fail closed and rebuild.
 Sidecar artifacts are content-addressed by:
 
 ```text

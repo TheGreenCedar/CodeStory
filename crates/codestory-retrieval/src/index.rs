@@ -89,11 +89,11 @@ const QDRANT_SEMANTIC_SMOKE_RETRY_ATTEMPTS: usize = 2;
 const QDRANT_SEMANTIC_SMOKE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 pub fn project_id_for_root(project_root: &Path) -> String {
-    codestory_workspace::workspace_id_for_root(project_root)
+    codestory_workspace::workspace_id_v3_for_root(project_root)
 }
 
 pub fn sidecar_project_id_for_root(project_root: &Path) -> String {
-    codestory_workspace::project_identity_v2(project_root).artifact_scope_id
+    codestory_workspace::project_identity_v3(project_root).artifact_scope_id
 }
 
 pub fn repair_project_qdrant_collection(
@@ -223,7 +223,7 @@ pub fn finalize_index_for_runtime_with_progress(
         .project_identity
         .as_ref()
         .map(|identity| identity.workspace_id.clone())
-        .unwrap_or_else(|| codestory_workspace::workspace_id_for_root(project_root));
+        .unwrap_or_else(|| codestory_workspace::workspace_id_v3_for_root(project_root));
     let global_gc_state_file = global_generation_gc_state_file(runtime);
     let _global_gc_lock = GenerationRetentionLock::acquire_shared(
         &global_gc_state_file,
@@ -1918,6 +1918,7 @@ mod tests {
 
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
+            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 9,
                 qdrant_grpc_port: 10,

@@ -74,8 +74,8 @@ hash. Identity is intentionally split: logical `project_id` is repository-wide,
 `workspace_id` owns local processes and state, and `artifact_scope_id` uses the
 logical repository only when portable reuse is eligible. Dirty workspaces fall
 back to `workspace_id`; `canonical_root_hash` is only a local broker snapshot
-locator. The 0.14 migration records these identities without renaming existing
-namespace or artifact paths.
+locator. Sidecar state, Agent namespaces, Compose labels, generation roots, and
+retention all use project identity schema 3.
 
 Repository identity schema 2 lowercases only the remote host, normalizes an
 omitted port to that scheme's effective default, and preserves the transport
@@ -92,10 +92,11 @@ case-sensitivity flag. A schema-1 repository id is never inferred from the
 current remote spelling alone; migration requires persisted provenance.
 
 The schema-2/schema-3 contract is exposed through
-`inspect_repository_identity_v2` and `project_identity_v3`. Existing
-repository-v1/project-v2 broker, repair, and sidecar entrypoints remain
-unchanged until the parent identity migration can move their persisted state
-and ownership checks together.
+`inspect_repository_identity_v2` and `project_identity_v3`. Legacy
+project-identity-v2 sidecar state is accepted only when its complete identity
+is internally consistent and its workspace id maps to the current exact root.
+Repository aliases alone never authorize reuse; unknown, missing, or ambiguous
+identity state rebuilds in the schema-3 scope.
 
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
 dense-anchor rows, semantic file-role metadata, sidecar schema version, lexical
