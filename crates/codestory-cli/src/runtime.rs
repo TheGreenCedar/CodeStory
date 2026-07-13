@@ -162,8 +162,6 @@ impl RuntimeContext {
         args: &ProjectArgs,
         startup: &crate::config::CliStartupConfig,
     ) -> Result<Self> {
-        #[cfg(test)]
-        codestory_retrieval::enable_automatic_test_cache_root_for_process();
         let project_root = canonicalize_project_root(&args.project)?;
         let config = crate::config::load_config_with_startup(&project_root, startup)?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
@@ -177,13 +175,12 @@ impl RuntimeContext {
             process_cache_root,
         )?;
         let storage_path = cache_root.join("codestory.db");
-        let sidecar =
-            codestory_retrieval::SidecarRuntimeConfig::for_project_auto_with_defaults_in_cache(
-                &project_root,
-                process_cache_root,
-                &startup.runtime_defaults,
-                &config.runtime_overrides(),
-            );
+        let sidecar = crate::sidecar_runtime::for_project_auto_with_defaults_in_cache(
+            &project_root,
+            process_cache_root,
+            &startup.runtime_defaults,
+            &config.runtime_overrides(),
+        );
         let runtime = Runtime::new_with_config(sidecar.clone());
         let events = runtime.events();
         Ok(Self {
@@ -503,7 +500,7 @@ pub(crate) fn cache_root_for_project(
     cache_root_for_project_in(
         project_root,
         override_dir,
-        &codestory_retrieval::user_cache_root(),
+        &crate::sidecar_runtime::user_cache_root(),
     )
 }
 

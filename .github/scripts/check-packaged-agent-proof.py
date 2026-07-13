@@ -4,13 +4,17 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
+import datetime
 import hashlib
+import http.server
 import json
 import os
 import queue
 import signal
 import shutil
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -28,6 +32,9 @@ STATUS_URI = "codestory://status"
 AGENT_GUIDE_URI = "codestory://agent-guide"
 SERVER_RESOURCE_URIS = (STATUS_URI, AGENT_GUIDE_URI)
 PLUGIN_SKILL_RELATIVE = Path("plugins/codestory/skills/codestory-grounding/SKILL.md")
+PROOF_TEMP_OWNER_FILE = ".codestory-macos-metal-proof-owner.json"
+PROOF_LOCAL_RUN_ID = "shared-agent"
+PROOF_AGENT_RUN_IDS = (PROOF_LOCAL_RUN_ID,)
 
 
 class GateFailure(Exception):
@@ -138,6 +145,107 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def bounded_file_copy(source: Path, destination: Path, max_bytes: int = 4 * 1024 * 1024) -> dict:
+    size = source.stat().st_size
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if size <= max_bytes:
+        shutil.copyfile(source, destination)
+        copied = size
+        truncated = False
+    else:
+        half = max_bytes // 2
+        with source.open("rb") as handle:
+            head = handle.read(half)
+            handle.seek(max(0, size - half))
+            tail = handle.read(half)
+        marker = f"\n--- CodeStory proof omitted {size - len(head) - len(tail)} log bytes ---\n".encode()
+        destination.write_bytes(head + marker + tail)
+        copied = destination.stat().st_size
+        truncated = True
+    return {
+        "source": str(source),
+        "source_size_bytes": size,
+        "source_sha256": sha256_file(source),
+        "preserved": str(destination),
+        "preserved_size_bytes": copied,
+        "truncated": truncated,
+        "max_source_bytes_preserved": max_bytes,
+    }
+
+
+def preserve_native_embedding_evidence(
+    cache_root: Path,
+    out_dir: Path,
+    label: str,
+    *,
+    required: bool = False,
+    exact_launch: dict | None = None,
+) -> Path | None:
+    state_file = cache_root / "retrieval-sidecars.json"
+    metadata_artifact = out_dir / f"{label}-native-launch.json"
+    launch = exact_launch
+    if launch is None:
+        if not state_file.is_file() or state_file.is_symlink():
+            if required:
+                raise RuntimeError(f"native proof state is missing or unsafe: {state_file}")
+            return None
+        state = read_json_file(state_file)
+        if not isinstance(state, dict) or state.get("owner") != "codestory":
+            if required:
+                raise RuntimeError(f"native proof state is not CodeStory-owned: {state_file}")
+            return None
+        launch = state.get("embedding_launch")
+    if not isinstance(launch, dict) or launch.get("launch_mode") != "native_spawned":
+        if required:
+            raise RuntimeError(f"native proof state has no native_spawned launch: {state_file}")
+        return None
+    log_value = launch.get("log_path")
+    payload = {
+        "cache_root": str(cache_root),
+        "state_file": str(state_file) if exact_launch is None else None,
+        "embedding_launch": launch,
+    }
+    if exact_launch is not None:
+        snapshot = registered_native_process_snapshot(launch)
+        payload["live_identity"] = snapshot
+        fingerprint = launch.get("launch_fingerprint_sha256")
+        if snapshot.get("status") != "matching" or not (
+            isinstance(fingerprint, str) and len(fingerprint) == 64
+        ):
+            payload["error"] = "exact broker launch identity is not live or fingerprinted"
+            write_json(metadata_artifact, payload)
+            if required:
+                raise RuntimeError(payload["error"])
+            return metadata_artifact
+    if not isinstance(log_value, str) or not log_value:
+        payload["error"] = "native launch metadata has no log_path"
+        write_json(metadata_artifact, payload)
+        if required:
+            raise RuntimeError(payload["error"])
+        return metadata_artifact
+    log_path = Path(log_value)
+    if log_path.is_symlink() or not log_path.is_file():
+        payload["error"] = f"native launch log is missing or unsafe: {log_path}"
+        write_json(metadata_artifact, payload)
+        if required:
+            raise RuntimeError(payload["error"])
+        return metadata_artifact
+    canonical_log = log_path.resolve(strict=True)
+    canonical_cache = cache_root.resolve(strict=True)
+    if not canonical_log.is_relative_to(canonical_cache):
+        payload["error"] = f"native launch log escaped proof cache: {canonical_log}"
+        write_json(metadata_artifact, payload)
+        if required:
+            raise RuntimeError(payload["error"])
+        return metadata_artifact
+    payload["log"] = bounded_file_copy(
+        canonical_log,
+        out_dir / f"{label}-llama-server-native.log",
+    )
+    write_json(metadata_artifact, payload)
+    return metadata_artifact
+
+
 def verify_archive_checksum(archive: Path, checksum_file: Path, artifact: Path) -> None:
     lines = checksum_file.read_text(encoding="utf-8").splitlines()
     expected = next(
@@ -160,7 +268,7 @@ def verify_archive_checksum(archive: Path, checksum_file: Path, artifact: Path) 
 
 def proof_environment(base: dict[str, str]) -> dict[str, str]:
     env = dict(base)
-    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+    if sys.platform.startswith("linux") and hasattr(os, "getuid") and hasattr(os, "getgid"):
         env["CODESTORY_QDRANT_USER"] = f"{os.getuid()}:{os.getgid()}"
         env["CODESTORY_QDRANT_SNAPSHOTS_PATH"] = "/qdrant/storage/snapshots"
     return env
@@ -176,6 +284,68 @@ def write_managed_convergence_fixture(project: Path) -> None:
         "pub fn complete_publication() -> &'static str { \"initial\" }\n",
         encoding="utf-8",
     )
+
+
+def macos_arm64_backend(project: Path) -> dict:
+    metadata = project / "crates" / "codestory-retrieval" / "assets" / "llama-sidecar-backends.json"
+    payload = read_json_file(metadata)
+    backends = payload.get("backends", []) if isinstance(payload, dict) else []
+    backend = next(
+        (
+            item
+            for item in backends
+            if isinstance(item, dict) and item.get("id") == "macos-aarch64-metal"
+        ),
+        None,
+    )
+    if not isinstance(backend, dict):
+        raise RuntimeError(f"managed macOS arm64 backend is missing: {metadata}")
+    return backend
+
+
+def seed_corrupt_managed_server(cache_root: Path, project: Path) -> dict:
+    backend = macos_arm64_backend(project)
+    relative = backend.get("managed_cache_rel_dir")
+    executable_name = backend.get("executable_rel_path")
+    if not isinstance(relative, str) or not isinstance(executable_name, str):
+        raise RuntimeError("managed macOS backend has incomplete install metadata")
+    install_dir = cache_root / Path(relative)
+    executable = install_dir / executable_name
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_bytes(b"interrupted managed llama-server install\n")
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    return {
+        "backend": backend["id"],
+        "executable": str(executable),
+        "expected_sha256": backend.get("executable_sha256"),
+    }
+
+
+def require_managed_server_repaired(seed: dict, artifact: Path) -> None:
+    executable = Path(seed["executable"])
+    expected = seed.get("expected_sha256")
+    actual = sha256_file(executable) if executable.is_file() else None
+    payload = {**seed, "actual_sha256": actual, "repaired": actual == expected}
+    write_json(artifact, payload)
+    require(
+        isinstance(expected, str) and actual == expected,
+        "native_corrupt_server_repair",
+        artifact,
+        "managed native server was not checksum-repaired after a partial install",
+    )
+
+
+def free_local_ports(count: int) -> list[int]:
+    listeners = []
+    try:
+        for _ in range(count):
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.bind(("127.0.0.1", 0))
+            listeners.append(listener)
+        return [listener.getsockname()[1] for listener in listeners]
+    finally:
+        for listener in listeners:
+            listener.close()
 
 
 def make_managed_convergence_fixture_stale(project: Path) -> None:
@@ -205,14 +375,504 @@ def proof_ownership_snapshot(cache_root: Path) -> dict[str, str]:
     }
 
 
-def validated_proof_compose_state(cache_root: Path, project: Path, read_state) -> tuple[Path, dict] | None:
+def fnv1a_hex(value: str) -> str:
+    digest = 0xCBF29CE484222325
+    for byte in os.fsencode(value):
+        digest ^= byte
+        digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{digest:016x}"
+
+
+def proof_agent_identity(cache_root: Path, project: Path, run_id: str) -> dict[str, str]:
+    canonical_cache = cache_root.resolve(strict=False)
+    canonical_project = project.resolve(strict=False)
+    namespace = f"codestory-agent-{fnv1a_hex(str(canonical_project))}-{run_id}"
+    state_root = canonical_cache / "sidecars" / namespace
+    return {
+        "cache_root": str(canonical_cache),
+        "project": str(canonical_project),
+        "profile": "agent",
+        "run_id": run_id,
+        "namespace": namespace,
+        "compose_project": namespace,
+        "state_file": str(state_root / "retrieval-sidecars.json"),
+        "qdrant_data_dir": str(state_root / "qdrant"),
+        "lexical_data_dir": str(state_root / "lexical"),
+        "scip_artifacts_root": str(state_root / "scip"),
+    }
+
+
+def proof_agent_identities(cache_roots: list[Path], project: Path) -> list[dict[str, str]]:
+    return [
+        proof_agent_identity(cache, project, run_id)
+        for cache in cache_roots
+        for run_id in PROOF_AGENT_RUN_IDS
+    ]
+
+
+def run_docker_json(
+    command: list[str],
+    run=subprocess.run,
+    env: dict[str, str] | None = None,
+) -> object:
+    try:
+        result = run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+            text=True,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"could not inspect Docker proof resources: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Docker proof resource inspection exited {result.returncode}: "
+            f"{captured_text(result.stderr).strip()}"
+        )
+    body = captured_text(result.stdout).strip()
+    if not body:
+        return []
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as aggregate_error:
+        try:
+            return [json.loads(line) for line in body.splitlines() if line.strip()]
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Docker proof resource inspection returned invalid JSON: {aggregate_error}; {exc}"
+            ) from exc
+
+
+def docker_created_epoch_ms(value: object) -> int | None:
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def docker_compose_resource_snapshot(state: dict, run=subprocess.run) -> dict:
+    compose_project = state.get("compose_project")
+    if not isinstance(compose_project, str) or not compose_project:
+        raise RuntimeError("proof sidecar state has no Compose project for Docker inspection")
+    inspect_env = {
+        **os.environ,
+        "CODESTORY_SIDECAR_NAMESPACE": str(state.get("namespace", "")),
+        "CODESTORY_QDRANT_DATA_DIR": str(state.get("qdrant_data_dir", "")),
+    }
+
+    def matching_ids(kind: str) -> list[str]:
+        payload = run_docker_json(
+            [
+                "docker",
+                kind,
+                "ls",
+                "--all" if kind == "container" else "--filter",
+                *(
+                    ["--filter", f"label=com.docker.compose.project={compose_project}"]
+                    if kind == "container"
+                    else [f"label=com.docker.compose.project={compose_project}"]
+                ),
+                "--format",
+                "{{json .}}",
+            ],
+            run,
+            inspect_env,
+        )
+        # Docker 29 emits a single JSON object (not an array) when `ls --format
+        # json` has exactly one match. Multiple matches remain newline-delimited
+        # objects and are normalized by `run_docker_json`.
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            raise RuntimeError(f"Docker {kind} listing was not a JSON array")
+        ids = []
+        for item in payload:
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Docker {kind} listing contained a non-object")
+            value = item.get("ID")
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(f"Docker {kind} listing contained no ID")
+            ids.append(value)
+        return sorted(set(ids))
+
+    container_ids = matching_ids("container")
+    network_ids = matching_ids("network")
+    container_inspect = (
+        run_docker_json(["docker", "container", "inspect", *container_ids], run, inspect_env)
+        if container_ids
+        else []
+    )
+    network_inspect = (
+        run_docker_json(["docker", "network", "inspect", *network_ids], run, inspect_env)
+        if network_ids
+        else []
+    )
+    if not isinstance(container_inspect, list) or not isinstance(network_inspect, list):
+        raise RuntimeError("Docker proof resource inspect output was not an array")
+
+    containers = []
+    for item in container_inspect:
+        if not isinstance(item, dict):
+            raise RuntimeError("Docker container inspect contained a non-object")
+        config = item.get("Config") if isinstance(item.get("Config"), dict) else {}
+        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+        mounts = item.get("Mounts") if isinstance(item.get("Mounts"), list) else []
+        containers.append(
+            {
+                "id": item.get("Id"),
+                "name": str(item.get("Name", "")).lstrip("/"),
+                "created": item.get("Created"),
+                "labels": {str(key): str(value) for key, value in sorted(labels.items())},
+                "mounts": sorted(
+                    [
+                        {
+                            "type": mount.get("Type"),
+                            "source": mount.get("Source"),
+                            "destination": mount.get("Destination"),
+                        }
+                        for mount in mounts
+                        if isinstance(mount, dict)
+                    ],
+                    key=lambda mount: (
+                        str(mount.get("destination")),
+                        str(mount.get("source")),
+                    ),
+                ),
+            }
+        )
+    networks = []
+    for item in network_inspect:
+        if not isinstance(item, dict):
+            raise RuntimeError("Docker network inspect contained a non-object")
+        labels = item.get("Labels") if isinstance(item.get("Labels"), dict) else {}
+        attached = item.get("Containers") if isinstance(item.get("Containers"), dict) else {}
+        networks.append(
+            {
+                "id": item.get("Id"),
+                "name": item.get("Name"),
+                "created": item.get("Created"),
+                "labels": {str(key): str(value) for key, value in sorted(labels.items())},
+                "attached_container_ids": sorted(str(value) for value in attached),
+            }
+        )
+    return {
+        "compose_project": compose_project,
+        "containers": sorted(containers, key=lambda item: (str(item.get("id")), str(item.get("name")))),
+        "networks": sorted(networks, key=lambda item: (str(item.get("id")), str(item.get("name")))),
+    }
+
+
+def validate_proof_docker_resources(
+    state: dict,
+    observed: dict,
+    registered: dict | None = None,
+) -> None:
+    if registered is not None:
+        if registered.get("compose_project") != observed.get("compose_project"):
+            raise RuntimeError("Docker resources changed their registered Compose project")
+        for kind in ("containers", "networks"):
+            registered_items = registered.get(kind)
+            observed_items = observed.get(kind)
+            if not isinstance(registered_items, list) or not isinstance(observed_items, list):
+                raise RuntimeError("registered Docker resource snapshot is malformed")
+            registered_by_id = {
+                item.get("id"): item
+                for item in registered_items
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+            observed_by_id = {
+                item.get("id"): item
+                for item in observed_items
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            }
+            if len(registered_by_id) != len(registered_items) or len(observed_by_id) != len(
+                observed_items
+            ):
+                raise RuntimeError("Docker resource snapshot contains duplicate or invalid IDs")
+            if not set(observed_by_id).issubset(registered_by_id):
+                raise RuntimeError("Docker resources include IDs absent from proof registration")
+            for resource_id, item in observed_by_id.items():
+                registered_item = registered_by_id[resource_id]
+                if kind == "containers" and item != registered_item:
+                    raise RuntimeError(
+                        f"Docker container {resource_id} changed after proof ownership registration"
+                    )
+                if kind == "networks" and any(
+                    item.get(field) != registered_item.get(field)
+                    for field in ("id", "name", "created", "labels")
+                ):
+                    raise RuntimeError(
+                        f"Docker network {resource_id} changed after proof ownership registration"
+                    )
+    compose_project = state["compose_project"]
+    if observed.get("compose_project") != compose_project:
+        raise RuntimeError("Docker resource snapshot changed the Compose project")
+    containers = observed.get("containers")
+    networks = observed.get("networks")
+    if not isinstance(containers, list) or not isinstance(networks, list):
+        raise RuntimeError("Docker resource snapshot is malformed")
+    if not containers and networks and registered is None:
+        raise RuntimeError("cannot prove an unregistered Compose network without its containers")
+    expected_container_ids = set()
+    services = set()
+    qdrant_created = None
+    for container in containers:
+        if not isinstance(container, dict):
+            raise RuntimeError("Docker resource snapshot contains a malformed container")
+        container_id = container.get("id")
+        labels = container.get("labels")
+        if not isinstance(container_id, str) or not container_id or not isinstance(labels, dict):
+            raise RuntimeError("Docker resource snapshot contains an unidentified container")
+        expected_labels = {
+            "com.docker.compose.project": compose_project,
+            "dev.codestory.owner": "codestory",
+            "dev.codestory.profile": "agent",
+            "dev.codestory.namespace": state["namespace"],
+        }
+        if any(labels.get(name) != value for name, value in expected_labels.items()):
+            raise RuntimeError(f"Docker container {container_id} has foreign ownership labels")
+        service = labels.get("com.docker.compose.service")
+        if service not in {"qdrant", "embed"} or service in services:
+            raise RuntimeError(f"Docker container {container_id} has an unexpected Compose service")
+        if container.get("name") != f"{state['namespace']}-{service}":
+            raise RuntimeError(f"Docker container {container_id} has a foreign resource name")
+        services.add(service)
+        expected_container_ids.add(container_id)
+        created = docker_created_epoch_ms(container.get("created"))
+        if created is None:
+            raise RuntimeError(f"Docker container {container_id} has no creation identity")
+        if service == "qdrant":
+            qdrant_created = created
+            expected_qdrant = Path(state["qdrant_data_dir"]).resolve(strict=False)
+            matching_mount = any(
+                isinstance(mount, dict)
+                and mount.get("type") == "bind"
+                and mount.get("destination") == "/qdrant/storage"
+                and isinstance(mount.get("source"), str)
+                and Path(mount["source"]).resolve(strict=False) == expected_qdrant
+                for mount in container.get("mounts", [])
+            )
+            if not matching_mount:
+                raise RuntimeError(
+                    f"Docker qdrant container {container_id} is mounted from a foreign cache"
+                )
+    if containers and "qdrant" not in services:
+        raise RuntimeError("Docker proof resources have no cache-bound qdrant container")
+    if qdrant_created is not None:
+        started = state.get("started_at_epoch_ms")
+        if isinstance(started, int) and not (qdrant_created - 5_000 <= started <= qdrant_created + 1_800_000):
+            raise RuntimeError("Docker qdrant creation does not match the sidecar state lifetime")
+        for container in containers:
+            created = docker_created_epoch_ms(container.get("created"))
+            if created is None or abs(created - qdrant_created) > 300_000:
+                raise RuntimeError("Docker containers do not share the registered creation lifetime")
+    if len(networks) > 1:
+        raise RuntimeError("Docker proof resources contain multiple Compose networks")
+    for network in networks:
+        if not isinstance(network, dict):
+            raise RuntimeError("Docker resource snapshot contains a malformed network")
+        network_id = network.get("id")
+        labels = network.get("labels")
+        if not isinstance(network_id, str) or not network_id or not isinstance(labels, dict):
+            raise RuntimeError("Docker resource snapshot contains an unidentified network")
+        if (
+            labels.get("com.docker.compose.project") != compose_project
+            or labels.get("com.docker.compose.network") != "default"
+            or network.get("name") != f"{compose_project}_default"
+        ):
+            raise RuntimeError(f"Docker network {network_id} has foreign ownership labels")
+        attached = network.get("attached_container_ids")
+        if not isinstance(attached, list) or not set(attached).issubset(expected_container_ids):
+            raise RuntimeError(f"Docker network {network_id} has foreign attached containers")
+        network_created = docker_created_epoch_ms(network.get("created"))
+        if network_created is None:
+            raise RuntimeError(f"Docker network {network_id} has no creation identity")
+        if qdrant_created is not None and abs(network_created - qdrant_created) > 300_000:
+            raise RuntimeError(f"Docker network {network_id} has a foreign creation lifetime")
+
+
+def proof_temp_root_from_environment() -> Path | None:
+    value = os.environ.get("CODESTORY_PROOF_TEMP_ROOT", "").strip()
+    if not value:
+        return None
+    root = Path(value)
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(f"proof temp root is missing or unsafe: {root}")
+    return root.resolve(strict=True)
+
+
+def register_proof_temp_ownership(project: Path, cache_roots: list[Path], archive: Path) -> None:
+    root = proof_temp_root_from_environment()
+    if root is None:
+        return
+    canonical_project = project.resolve(strict=True)
+    canonical_caches = []
+    for cache in cache_roots:
+        canonical = cache.resolve(strict=True)
+        if not canonical.is_relative_to(root):
+            raise RuntimeError(f"proof cache is outside registered proof temp root: {canonical}")
+        canonical_caches.append(str(canonical))
+    canonical_archive = archive.resolve(strict=True)
+    owned_archive = root / canonical_archive.name
+    if owned_archive.is_symlink() or not owned_archive.is_file():
+        raise RuntimeError(f"proof-owned archive copy is missing or unsafe: {owned_archive}")
+    if sha256_file(owned_archive) != sha256_file(canonical_archive):
+        raise RuntimeError("proof-owned archive copy does not match the verified input archive")
+    marker = root / PROOF_TEMP_OWNER_FILE
+    payload = {
+        "owner": "codestory-macos-metal-proof",
+        "repository": os.environ.get("GITHUB_REPOSITORY"),
+        "project": str(canonical_project),
+        "cache_roots": canonical_caches,
+        "sidecars": proof_agent_identities([Path(value) for value in canonical_caches], canonical_project),
+        "launches": [],
+        "ports": [],
+        "archive_name": owned_archive.name,
+        "archive_sha256": sha256_file(owned_archive),
+        "harness_pid": os.getpid(),
+        "created_at_epoch_ms": int(time.time() * 1000),
+    }
+    write_json(marker, payload)
+
+
+def load_proof_temp_ownership() -> tuple[Path, dict] | None:
+    root = proof_temp_root_from_environment()
+    if root is None:
+        return None
+    marker = root / PROOF_TEMP_OWNER_FILE
+    payload = read_json_file(marker)
+    if not isinstance(payload, dict) or payload.get("owner") != "codestory-macos-metal-proof":
+        raise RuntimeError(f"proof temp owner marker is invalid: {marker}")
+    return marker, payload
+
+
+def record_proof_runtime_identity(
+    payload: dict,
+    launch: dict | None,
+    ports: list[object] | tuple[object, ...] | None = None,
+) -> None:
+    if isinstance(launch, dict) and launch.get("launch_mode") == "native_spawned":
+        fingerprint = (launch.get("pid"), launch.get("launch_fingerprint_sha256"))
+        existing = {
+            (item.get("pid"), item.get("launch_fingerprint_sha256"))
+            for item in payload.get("launches", [])
+            if isinstance(item, dict)
+        }
+        if fingerprint not in existing:
+            payload.setdefault("launches", []).append(launch)
+    known_ports = {value for value in payload.get("ports", []) if isinstance(value, int)}
+    for port in ports or ():
+        if isinstance(port, int) and 0 < port <= 65535 and port not in known_ports:
+            payload.setdefault("ports", []).append(port)
+            known_ports.add(port)
+
+
+def register_current_proof_runtime(cache_root: Path) -> None:
+    ownership = load_proof_temp_ownership()
+    if ownership is None:
+        return
+    marker, payload = ownership
+    registered = payload.get("sidecars", [])
+    if not isinstance(registered, list):
+        raise RuntimeError(f"proof temp owner marker has invalid sidecars: {marker}")
+    for identity in registered:
+        if not isinstance(identity, dict):
+            raise RuntimeError(f"proof temp owner marker has invalid sidecar identity: {marker}")
+        if Path(str(identity.get("cache_root", ""))).resolve(strict=False) != cache_root.resolve(strict=True):
+            continue
+        validated = validated_proof_compose_state(
+            cache_root,
+            Path(identity.get("project", payload.get("project", "."))),
+            read_json_file,
+            run_id=str(identity.get("run_id", "")),
+            registered_identity=identity,
+        )
+        if validated is None:
+            continue
+        _, state = validated
+        if state.get("compose_file") is not None:
+            snapshot = docker_compose_resource_snapshot(state)
+            registered_resources = identity.get("docker_resources")
+            validate_proof_docker_resources(
+                state,
+                snapshot,
+                registered_resources if isinstance(registered_resources, dict) else None,
+            )
+            identity["docker_resources"] = snapshot
+        record_proof_runtime_identity(
+            payload,
+            state.get("embedding_launch"),
+            (
+                state.get("qdrant_http_port"),
+                state.get("qdrant_grpc_port"),
+                state.get("embed_http_port"),
+            ),
+        )
+    write_json(marker, payload)
+
+
+def register_proof_launch(launch: dict | None, ports: list[object] | None = None) -> None:
+    ownership = load_proof_temp_ownership()
+    if ownership is None:
+        return
+    marker, payload = ownership
+    record_proof_runtime_identity(payload, launch, ports)
+    write_json(marker, payload)
+
+
+def validated_proof_compose_state(
+    cache_root: Path,
+    project: Path,
+    read_state,
+    *,
+    run_id: str = PROOF_LOCAL_RUN_ID,
+    registered_identity: dict | None = None,
+    allow_missing_compose_file: bool = False,
+) -> tuple[Path, dict] | None:
     if cache_root.is_symlink() or project.is_symlink():
         raise RuntimeError("proof cache and project roots must not be symlinks")
     cache_root = cache_root.resolve(strict=True)
-    project = project.resolve(strict=True)
-    state_file = cache_root / "retrieval-sidecars.json"
-    if state_file.is_symlink():
-        raise RuntimeError(f"proof sidecar state must not be a symlink: {state_file}")
+    project = project.resolve(strict=registered_identity is None)
+    local_state = cache_root / "retrieval-sidecars.json"
+    if local_state.exists() or local_state.is_symlink():
+        raise RuntimeError(
+            f"proof cleanup refuses the global local-sidecar namespace: {local_state}"
+        )
+    expected = registered_identity or proof_agent_identity(cache_root, project, run_id)
+    required_identity = proof_agent_identity(cache_root, Path(expected.get("project", project)), run_id)
+    for name in (
+        "cache_root",
+        "project",
+        "profile",
+        "run_id",
+        "namespace",
+        "compose_project",
+        "state_file",
+        "qdrant_data_dir",
+        "lexical_data_dir",
+        "scip_artifacts_root",
+    ):
+        if expected.get(name) != required_identity[name]:
+            raise RuntimeError(f"registered proof sidecar identity changed {name!r}")
+    if expected["namespace"] == "codestory" or not expected["namespace"].startswith("codestory-agent-"):
+        raise RuntimeError("proof sidecar namespace is not isolated from the global local namespace")
+    state_file = Path(expected["state_file"])
+    canonical_state_file = state_file.resolve(strict=False)
+    if (
+        state_file.is_symlink()
+        or canonical_state_file != state_file
+        or not canonical_state_file.is_relative_to(cache_root)
+    ):
+        raise RuntimeError(f"proof sidecar state escaped its cache root through a symlink: {state_file}")
     if not state_file.exists():
         return None
     if not state_file.is_file():
@@ -222,43 +882,77 @@ def validated_proof_compose_state(cache_root: Path, project: Path, read_state) -
         raise TypeError(f"proof sidecar state is not an object: {state_file}")
     expected_identity = {
         "owner": "codestory",
-        "profile": "local",
-        "namespace": "codestory",
-        "compose_project": "codestory",
+        "profile": "agent",
+        "run_id": run_id,
+        "namespace": expected["namespace"],
+        "compose_project": expected["compose_project"],
     }
-    for name, expected in expected_identity.items():
-        if state.get(name) != expected:
-            raise RuntimeError(f"proof sidecar state {name} does not match {expected!r}: {state_file}")
+    for name, expected_value in expected_identity.items():
+        if state.get(name) != expected_value:
+            raise RuntimeError(
+                f"proof sidecar state {name} does not match {expected_value!r}: {state_file}"
+            )
     state = dict(state)
-    for name, expected in (("qdrant_data_dir", cache_root / "qdrant"),):
+    for name, expected_path in (
+        ("qdrant_data_dir", Path(expected["qdrant_data_dir"])),
+        ("scip_artifacts_root", Path(expected["scip_artifacts_root"])),
+    ):
         value = state.get(name)
         if not isinstance(value, str) or not value:
             raise TypeError(f"proof sidecar state {name} is not a path string: {state_file}")
         observed = Path(value)
-        expected = expected.resolve(strict=True)
-        if observed != expected or observed.is_symlink() or observed.resolve(strict=True) != expected:
+        canonical_expected = expected_path.resolve(strict=False)
+        if (
+            canonical_expected != expected_path
+            or not canonical_expected.is_relative_to(cache_root)
+            or observed.is_symlink()
+            or observed.resolve(strict=False) != canonical_expected
+        ):
             raise RuntimeError(f"proof sidecar state {name} escaped its cache root: {state_file}")
-    lexical_expected = cache_root / "lexical"
+    lexical_expected = Path(expected["lexical_data_dir"])
+    canonical_lexical_expected = lexical_expected.resolve(strict=False)
+    if (
+        canonical_lexical_expected != lexical_expected
+        or not canonical_lexical_expected.is_relative_to(cache_root)
+    ):
+        raise RuntimeError(f"proof sidecar lexical_data_dir escaped its cache root: {state_file}")
     lexical_value = state.get("lexical_data_dir")
     if lexical_value is None:
         lexical_value = state.get("zoekt_data_dir")
     if not isinstance(lexical_value, str) or not lexical_value:
         raise TypeError(f"proof sidecar state canonical or legacy lexical data directory is not a path string: {state_file}")
     observed = Path(lexical_value)
-    if observed != lexical_expected or observed.is_symlink():
-        raise RuntimeError(f"proof sidecar state lexical_data_dir escaped its cache root: {state_file}")
-    if observed.exists() and observed.resolve(strict=True) != lexical_expected:
+    if observed.is_symlink() or observed.resolve(strict=False) != canonical_lexical_expected:
         raise RuntimeError(f"proof sidecar state lexical_data_dir escaped its cache root: {state_file}")
     state["lexical_data_dir"] = str(lexical_expected)
+    state["proof_identity"] = expected
     compose_value = state.get("compose_file")
+    if compose_value is None:
+        state["compose_file"] = None
+        return state_file, state
     if not isinstance(compose_value, str) or not compose_value:
         raise TypeError(f"proof sidecar compose_file is not a path string: {state_file}")
     compose_file = Path(compose_value)
-    if compose_file.is_symlink() or not compose_file.is_file():
+    if compose_file.is_symlink():
+        raise RuntimeError(f"proof sidecar compose file is not a regular canonical file: {compose_file}")
+    allowed_compose_paths = {
+        candidate.resolve(strict=False)
+        for candidate in (
+            Path(expected["project"]) / "docker" / "retrieval-compose.yml",
+            cache_root / "retrieval-compose.yml",
+        )
+    }
+    if not compose_file.is_file():
+        if (
+            allow_missing_compose_file
+            and compose_file.resolve(strict=False) in allowed_compose_paths
+        ):
+            state["compose_file_missing"] = True
+            return state_file, state
         raise RuntimeError(f"proof sidecar compose file is not a regular canonical file: {compose_file}")
     allowed_compose_files = set()
     for candidate in (
-        project / "docker" / "retrieval-compose.yml",
+        Path(expected["project"]) / "docker" / "retrieval-compose.yml",
         cache_root / "retrieval-compose.yml",
     ):
         if not candidate.is_file() or candidate.is_symlink():
@@ -267,7 +961,7 @@ def validated_proof_compose_state(cache_root: Path, project: Path, read_state) -
         if candidate == canonical_candidate:
             allowed_compose_files.add(canonical_candidate)
     canonical_compose_file = compose_file.resolve(strict=True)
-    if compose_file != canonical_compose_file or canonical_compose_file not in allowed_compose_files:
+    if canonical_compose_file not in allowed_compose_files:
         raise RuntimeError(f"proof sidecar compose file is outside the allowed roots: {compose_file}")
     return state_file, state
 
@@ -279,14 +973,28 @@ def cleanup_proof_compose(
     results: list[dict],
     run,
     read_state,
+    *,
+    run_id: str = PROOF_LOCAL_RUN_ID,
+    registered_identity: dict | None = None,
 ) -> None:
     try:
-        validated = validated_proof_compose_state(cache_root, project, read_state)
+        validated = validated_proof_compose_state(
+            cache_root,
+            project,
+            read_state,
+            run_id=run_id,
+            registered_identity=registered_identity,
+            allow_missing_compose_file=True,
+        )
     except Exception as exc:
         results.append(
             {
                 "kind": "compose_state_validation",
-                "state_file": str(cache_root / "retrieval-sidecars.json"),
+                "state_file": str(
+                    registered_identity.get("state_file")
+                    if isinstance(registered_identity, dict)
+                    else proof_agent_identity(cache_root, project, run_id)["state_file"]
+                ),
                 "error": f"{type(exc).__name__}: {exc}",
             }
         )
@@ -294,154 +1002,223 @@ def cleanup_proof_compose(
     if validated is None:
         return
     state_file, state = validated
-    compose_env = {
+    if state.get("compose_file") is None:
+        results.append(
+            {
+                "kind": "compose_down_skipped",
+                "state_file": str(state_file),
+                "proof_identity": state["proof_identity"],
+                "reason": "sidecar_state_has_no_compose_file",
+            }
+        )
+        return
+    try:
+        observed = docker_compose_resource_snapshot(state, run)
+        registered_resources = (
+            registered_identity.get("docker_resources")
+            if isinstance(registered_identity, dict)
+            else None
+        )
+        validate_proof_docker_resources(
+            state,
+            observed,
+            registered_resources if isinstance(registered_resources, dict) else None,
+        )
+    except Exception as exc:
+        results.append(
+            {
+                "kind": "docker_resource_validation",
+                "state_file": str(state_file),
+                "proof_identity": state["proof_identity"],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        raise RuntimeError(f"proof-owned Docker resource validation failed: {exc}") from exc
+    containers = [item["id"] for item in observed["containers"]]
+    networks = [item["id"] for item in observed["networks"]]
+    resource_env = {
         **env,
         "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
         "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
-        "CODESTORY_EMBED_MODEL_DIR": state["qdrant_data_dir"],
     }
-    command = [
-        "docker",
-        "compose",
-        "-p",
-        state["compose_project"],
-        "-f",
-        state["compose_file"],
-        "down",
-        "--remove-orphans",
-    ]
-    try:
-        result = run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
-            env=compose_env,
-            text=True,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        results.append({"kind": "compose_down", "state_file": str(state_file), "error": str(exc)})
-        raise RuntimeError(f"could not stop proof-owned Compose sidecars: {exc}") from exc
-    results.append(
-        {
-            "kind": "compose_down",
-            "state_file": str(state_file),
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"proof-owned Compose cleanup exited {result.returncode}")
-
-
-def capture_proof_compose_diagnostics(
-    cache_root: Path,
-    project: Path,
-    env: dict[str, str],
-    artifact: Path,
-    run=subprocess.run,
-    read_state=read_json_file,
-) -> None:
-    payload = {"state_file": str(cache_root / "retrieval-sidecars.json"), "commands": []}
-    try:
-        validated = validated_proof_compose_state(cache_root, project, read_state)
-        if validated is None:
-            payload["error"] = "proof-owned Compose state is absent"
-            write_json(artifact, payload)
-            return
-        _, state = validated
-        compose_env = {
-            **env,
-            "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
-            "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
-            "CODESTORY_EMBED_MODEL_DIR": state["qdrant_data_dir"],
-        }
-        base = ["docker", "compose", "-p", state["compose_project"], "-f", state["compose_file"]]
-        for kind, extra in (
-            ("compose_ps", ["ps", "--all"]),
-            ("qdrant_logs", ["logs", "--no-color", "--tail", "200", "qdrant"]),
-        ):
-            try:
-                result = run(
-                    [*base, *extra],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=20,
-                    check=False,
-                    env=compose_env,
-                    text=True,
-                )
-                payload["commands"].append(
-                    {
-                        "kind": kind,
-                        "returncode": result.returncode,
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                    }
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                payload["commands"].append({"kind": kind, "error": f"{type(exc).__name__}: {exc}"})
-    except Exception as exc:
-        payload["error"] = f"{type(exc).__name__}: {exc}"
-    write_json(artifact, payload)
-
-
-def cleanup_proof_cache(
-    cli: Path,
-    project: Path,
-    cache_root: Path,
-    artifact: Path,
-    run=subprocess.run,
-    read_state=read_json_file,
-) -> None:
-    env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
-    results = []
-    try:
-        cleanup_proof_compose(cache_root, project, env, results, run, read_state)
-    except Exception as exc:
-        write_json(
-            artifact,
-            {"cache_root": str(cache_root), "commands": results, "removed": False, "error": str(exc)},
-        )
-        raise
-    for profile, extra in (("local", []), ("agent", ["--run-id", "shared-agent"])):
+    for kind, ids in (("container", containers), ("network", networks)):
+        if not ids:
+            continue
+        command = [
+            "docker",
+            kind,
+            "rm",
+            *(("-f",) if kind == "container" else ()),
+            *ids,
+        ]
         try:
             result = run(
-                [
-                    str(cli),
-                    "retrieval",
-                    "down",
-                    "--project",
-                    str(project),
-                    "--profile",
-                    profile,
-                    *extra,
-                ],
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=20,
+                timeout=30,
                 check=False,
-                env=env,
+                env=resource_env,
                 text=True,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            results.append({"profile": profile, "error": str(exc)})
-            write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
-            raise RuntimeError(f"could not stop {profile} proof sidecars: {exc}") from exc
+            results.append(
+                {"kind": f"docker_{kind}_remove", "state_file": str(state_file), "error": str(exc)}
+            )
+            raise RuntimeError(f"could not remove exact proof-owned Docker {kind}s: {exc}") from exc
         results.append(
             {
-                "kind": "retrieval_down",
-                "profile": profile,
+                "kind": f"docker_{kind}_remove",
+                "state_file": str(state_file),
+                "proof_identity": state["proof_identity"],
+                "resource_ids": ids,
                 "returncode": result.returncode,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
             }
         )
         if result.returncode != 0:
-            write_json(artifact, {"cache_root": str(cache_root), "commands": results, "removed": False})
-            raise RuntimeError(f"{profile} proof sidecar cleanup exited {result.returncode}")
+            raise RuntimeError(f"proof-owned Docker {kind} cleanup exited {result.returncode}")
+    if not containers and not networks:
+        results.append(
+            {
+                "kind": "docker_resources_absent",
+                "state_file": str(state_file),
+                "proof_identity": state["proof_identity"],
+            }
+        )
+
+
+def cleanup_proof_cache(
+    cli: Path | None,
+    project: Path,
+    cache_root: Path,
+    artifact: Path,
+    run=subprocess.run,
+    read_state=read_json_file,
+    *,
+    registered_sidecars: list[dict] | None = None,
+    direct_only: bool = False,
+) -> None:
+    del cli
+    env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
+    results = []
+    errors = []
+    canonical_cache = cache_root.resolve(strict=True)
+    identities = (
+        registered_sidecars
+        if registered_sidecars is not None
+        else proof_agent_identities([canonical_cache], project)
+    )
+    identities = [
+        identity
+        for identity in identities
+        if isinstance(identity, dict)
+        and Path(str(identity.get("cache_root", ""))).resolve(strict=False) == canonical_cache
+    ]
+    expected_state_files = {
+        Path(identity["state_file"]).resolve(strict=False)
+        for identity in identities
+        if isinstance(identity.get("state_file"), str)
+    }
+    discovered_state_files = {
+        path.resolve(strict=False)
+        for path in (canonical_cache / "sidecars").glob("*/retrieval-sidecars.json")
+    }
+    unexpected = sorted(str(path) for path in discovered_state_files - expected_state_files)
+    if unexpected:
+        error = f"proof cache contains unregistered sidecar state: {unexpected}"
+        results.append({"kind": "compose_state_validation", "error": error})
+        errors.append(error)
+    validated_states: list[tuple[dict, dict]] = []
+    for identity in identities:
+        try:
+            run_id = identity.get("run_id")
+            if run_id not in PROOF_AGENT_RUN_IDS:
+                raise RuntimeError(f"unapproved proof sidecar run id: {run_id!r}")
+            validated = validated_proof_compose_state(
+                canonical_cache,
+                project,
+                read_state,
+                run_id=run_id,
+                registered_identity=identity,
+                allow_missing_compose_file=True,
+            )
+            if validated is None:
+                continue
+            _, state = validated
+            validated_states.append((identity, state))
+            cleanup_proof_compose(
+                canonical_cache,
+                project,
+                env,
+                results,
+                run,
+                read_state,
+                run_id=run_id,
+                registered_identity=identity,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if not results or results[-1].get("error") != error:
+                results.append(
+                    {
+                        "kind": "compose_state_validation",
+                        "state_file": str(identity.get("state_file", "")),
+                        "error": error,
+                    }
+                )
+            errors.append(error)
+    seen_launches = set()
+    for _identity, state in validated_states:
+        launch = state.get("embedding_launch")
+        if (
+            not isinstance(launch, dict)
+            or state.get("embedding_launch_ownership", "owner") != "owner"
+        ):
+            continue
+        fingerprint = (launch.get("pid"), launch.get("launch_fingerprint_sha256"))
+        if fingerprint in seen_launches:
+            continue
+        seen_launches.add(fingerprint)
+        try:
+            results.append(
+                {
+                    "kind": "native_process_cleanup",
+                    "result": terminate_registered_native_process(launch),
+                }
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            results.append(
+                {
+                    "kind": "native_process_cleanup",
+                    "pid": launch.get("pid"),
+                    "error": error,
+                }
+            )
+            errors.append(error)
+    results.append(
+        {
+            "kind": "retrieval_down_skipped",
+            "reason": "trusted_direct_cleanup" if direct_only else "exact_registered_resource_cleanup",
+            "validated_sidecars": [identity for identity, _ in validated_states],
+        }
+    )
+    if errors:
+        write_json(
+            artifact,
+            {
+                "cache_root": str(cache_root),
+                "commands": results,
+                "removed": False,
+                "errors": errors,
+            },
+        )
+        raise RuntimeError(
+            "proof-owned sidecar cleanup had failures after attempting every registered resource: "
+            + "; ".join(errors)
+        )
     try:
         remove_tree_with_retry(cache_root)
     except OSError as exc:
@@ -463,23 +1240,49 @@ def cleanup_proof_cache_on_exit(
     artifact: Path,
     run=subprocess.run,
     read_state=read_json_file,
+    registered_sidecars: list[dict] | None = None,
 ):
     def cleanup(exc_type, exc, traceback) -> bool:
+        evidence_error = None
         try:
-            cleanup_proof_cache(cli, project, cache_root, artifact, run, read_state)
+            preserve_native_embedding_evidence(cache_root, artifact.parent, "native-final")
+        except Exception as preserve_exc:
+            evidence_error = preserve_exc
+        try:
+            cleanup_proof_cache(
+                cli,
+                project,
+                cache_root,
+                artifact,
+                run,
+                read_state,
+                registered_sidecars=registered_sidecars,
+            )
         except Exception as cleanup_exc:
             if exc is None:
                 raise
             if hasattr(exc, "add_note"):
                 exc.add_note(f"proof cleanup also failed: {type(cleanup_exc).__name__}: {cleanup_exc}")
+        if evidence_error is not None:
+            if exc is None:
+                raise evidence_error
+            if hasattr(exc, "add_note"):
+                exc.add_note(
+                    f"native evidence preservation also failed: "
+                    f"{type(evidence_error).__name__}: {evidence_error}"
+                )
         return False
 
     return cleanup
 
 
-def local_profile_environment(base: dict[str, str]) -> dict[str, str]:
-    """Keep explicit local commands and their default runtime in one namespace."""
-    return {**base, "CODESTORY_SIDECAR_PROFILE": "local"}
+def proof_agent_environment(base: dict[str, str], run_id: str) -> dict[str, str]:
+    """Keep proof sidecars out of the process-global local Compose namespace."""
+    return {
+        **base,
+        "CODESTORY_SIDECAR_PROFILE": "agent",
+        "CODESTORY_SIDECAR_RUN_ID": run_id,
+    }
 
 
 def require_plugin_manifest_version(plugin_root: Path, expected_version: str) -> None:
@@ -569,6 +1372,440 @@ def require_agent_ready(payload: object, layer: str, artifact: Path) -> None:
     require(isinstance(agent.get("full_repair"), list), layer, artifact, "agent readiness missing full_repair")
 
 
+def require_native_accelerator_ready(
+    payload: object,
+    layer: str,
+    artifact: Path,
+    expected_pid: int | None = None,
+) -> dict:
+    require_agent_ready(payload, layer, artifact)
+    require(isinstance(payload, dict), layer, artifact, "ready output is not a JSON object")
+    broker = payload.get("readiness_broker")
+    require(isinstance(broker, dict), layer, artifact, "ready output missing readiness_broker")
+    proof = broker.get("gpu_proof")
+    require(isinstance(proof, dict), layer, artifact, "ready output missing gpu_proof")
+    require(proof.get("proof_status") == "verified", layer, artifact, "native GPU proof is not verified")
+    require(
+        proof.get("meaningful_accelerator_work_proven") is True,
+        layer,
+        artifact,
+        "native GPU proof did not prove meaningful accelerator work",
+    )
+    require(proof.get("embed_smoke_ok") is True, layer, artifact, "native embed smoke did not pass")
+    require(proof.get("observation_source") == "native_log", layer, artifact, "GPU proof is not native-log-backed")
+    identity = proof.get("runtime_identity")
+    require(isinstance(identity, dict), layer, artifact, "GPU proof missing runtime identity")
+    launch = identity.get("embedding_launch")
+    require(isinstance(launch, dict), layer, artifact, "GPU proof missing native launch identity")
+    require(launch.get("launch_mode") == "native_spawned", layer, artifact, "embedding launch is not native_spawned")
+    pid = launch.get("pid")
+    require(isinstance(pid, int) and pid > 0, layer, artifact, "native launch pid is invalid")
+    require(
+        isinstance(launch.get("spawned_at_epoch_ms"), int)
+        and isinstance(launch.get("executable_path"), str)
+        and isinstance(launch.get("log_path"), str)
+        and isinstance(launch.get("launch_fingerprint_sha256"), str)
+        and len(launch["launch_fingerprint_sha256"]) == 64,
+        layer,
+        artifact,
+        "native launch identity is missing executable, start, log, or fingerprint evidence",
+    )
+    if expected_pid is not None:
+        require(pid == expected_pid, layer, artifact, f"native launch pid changed: expected {expected_pid}, got {pid}")
+    return launch
+
+
+def require_agent_not_ready(payload: object, layer: str, artifact: Path) -> None:
+    verdicts = payload.get("verdicts", []) if isinstance(payload, dict) else []
+    agent = next((item for item in verdicts if item.get("goal") == "agent_packet_search"), None)
+    require(agent is not None, layer, artifact, "missing agent_packet_search readiness verdict")
+    require(agent.get("status") != "ready", layer, artifact, "dead native endpoint still reported agent ready")
+    broker = payload.get("readiness_broker") if isinstance(payload, dict) else None
+    proof = broker.get("gpu_proof") if isinstance(broker, dict) else None
+    require(
+        isinstance(proof, dict) and proof.get("proof_status") == "gpu_unverified",
+        layer,
+        artifact,
+        "dead native endpoint did not invalidate GPU proof",
+    )
+
+
+def require_intel_default_backend_failure(payload: object, artifact: Path) -> None:
+    require(isinstance(payload, dict), "intel_default_backend", artifact, "bootstrap output is not an object")
+    state = payload.get("sidecar_state")
+    status = payload.get("project_status")
+    require(isinstance(state, dict), "intel_default_backend", artifact, "bootstrap output is missing sidecar_state")
+    require(isinstance(status, dict), "intel_default_backend", artifact, "bootstrap output is missing project_status")
+    require(payload.get("compose_started") is False, "intel_default_backend", artifact, "Intel default proof unexpectedly started Compose")
+    require(payload.get("embed_reachable") is False, "intel_default_backend", artifact, "Intel default proof unexpectedly reached an embedding backend")
+    require(status.get("retrieval_mode") != "full", "intel_default_backend", artifact, "Intel default proof incorrectly reported full retrieval")
+    require(isinstance(status.get("repair"), dict), "intel_default_backend", artifact, "Intel default failure is missing actionable repair guidance")
+    provider = state.get("embedding_accelerator_request_provider")
+    require(provider != "metal", "intel_default_backend", artifact, "Intel default proof made a Metal claim")
+    require(state.get("embedding_cpu_allowed") is False, "intel_default_backend", artifact, "Intel default proof silently allowed CPU retrieval")
+
+
+def require_intel_cpu_external_ready(payload: object, artifact: Path, endpoint: str) -> None:
+    require(isinstance(payload, dict), "intel_cpu_external", artifact, "bootstrap output is not an object")
+    state = payload.get("sidecar_state")
+    require(isinstance(state, dict), "intel_cpu_external", artifact, "bootstrap output is missing sidecar_state")
+    require(payload.get("compose_started") is False, "intel_cpu_external", artifact, "external endpoint proof unexpectedly started Compose")
+    require(payload.get("embed_reachable") is True, "intel_cpu_external", artifact, "explicit CPU/external embedding endpoint was not reachable")
+    require(state.get("embed_url") == endpoint, "intel_cpu_external", artifact, "sidecar state did not retain the explicit embedding endpoint")
+    require(state.get("embedding_device_policy") == "allow_cpu", "intel_cpu_external", artifact, "CPU policy was not labelled allow_cpu")
+    require(state.get("embedding_device_state") == "cpu", "intel_cpu_external", artifact, "CPU runtime was not labelled cpu")
+    require(state.get("embedding_device_observation_source") == "cpu_policy", "intel_cpu_external", artifact, "CPU runtime observation source is not cpu_policy")
+    require(state.get("embedding_cpu_allowed") is True, "intel_cpu_external", artifact, "CPU runtime did not report explicit CPU allowance")
+    require(state.get("embedding_accelerator_requested") is False, "intel_cpu_external", artifact, "CPU runtime still requested an accelerator")
+    require(state.get("embedding_accelerator_request_provider") is None, "intel_cpu_external", artifact, "CPU runtime retained an accelerator provider")
+    require("metal" not in json.dumps(payload).lower(), "intel_cpu_external", artifact, "Intel CPU/external proof made a Metal claim")
+
+
+@contextlib.contextmanager
+def embedding_probe_server():
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            length = int(self.headers.get("content-length", "0"))
+            if length:
+                self.rfile.read(length)
+            body = json.dumps({"data": [{"index": 0, "embedding": [0.0] * 768}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1/embeddings"
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=5)
+
+
+def wait_for_process_exit(pid: int, timeout_secs: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout_secs
+    while time.monotonic() < deadline:
+        try:
+            waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            if waited_pid == pid:
+                return
+        except ChildProcessError:
+            pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"native embedding pid {pid} did not exit after SIGTERM")
+
+
+def darwin_process_argv(pid: int) -> tuple[str, list[str]] | None:
+    if sys.platform != "darwin":
+        return None
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    libc.sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    libc.sysctl.restype = ctypes.c_int
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 8:
+        return None
+    buffer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    data = buffer.raw[: size.value]
+    argc = struct.unpack_from("=i", data, 0)[0]
+    if argc <= 0 or argc > 4096:
+        return None
+    cursor = 4
+
+    def read_c_string(offset: int) -> tuple[str, int] | None:
+        end = data.find(b"\0", offset)
+        if end < 0:
+            return None
+        return data[offset:end].decode("utf-8", errors="surrogateescape"), end + 1
+
+    executable_entry = read_c_string(cursor)
+    if executable_entry is None:
+        return None
+    executable, cursor = executable_entry
+    while cursor < len(data) and data[cursor] == 0:
+        cursor += 1
+    argv = []
+    for _ in range(argc):
+        entry = read_c_string(cursor)
+        if entry is None:
+            return None
+        argument, cursor = entry
+        argv.append(argument)
+    return executable, argv
+
+
+def registered_native_process_snapshot(launch: dict) -> dict:
+    pid = launch.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return {"pid": pid, "status": "invalid_pid"}
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "LC_ALL": "C"},
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return {"pid": pid, "status": "already_exited", "stderr": result.stderr}
+    start_text = result.stdout.strip()
+    executable = launch.get("executable_path")
+    arguments = launch.get("launch_args")
+    exact_process = darwin_process_argv(pid)
+    recorded_start = launch.get("spawned_at_epoch_ms")
+    observed_start = None
+    try:
+        parsed_start = datetime.datetime.strptime(start_text, "%a %b %d %H:%M:%S %Y")
+        observed_start = int(time.mktime(parsed_start.timetuple()) * 1000)
+    except ValueError:
+        pass
+    start_matches = (
+        isinstance(recorded_start, int)
+        and observed_start is not None
+        and abs(observed_start - recorded_start) <= 5_000
+    )
+    exact_executable = None
+    exact_argv = None
+    argv_matches = False
+    if exact_process is not None and isinstance(executable, str) and isinstance(arguments, list):
+        exact_executable, exact_argv = exact_process
+        argv_matches = (
+            os.path.realpath(exact_executable) == os.path.realpath(executable)
+            and exact_argv[1:] == [str(item) for item in arguments]
+        )
+    matches = argv_matches and start_matches
+    return {
+        "pid": pid,
+        "status": "matching" if matches else "identity_mismatch",
+        "observed_executable": exact_executable,
+        "observed_argv": exact_argv,
+        "observed_start": start_text,
+        "observed_start_epoch_ms": observed_start,
+        "recorded_spawned_at_epoch_ms": recorded_start,
+        "expected_executable": executable,
+        "expected_arguments": arguments,
+    }
+
+
+def terminate_registered_native_process(launch: dict) -> dict:
+    snapshot = registered_native_process_snapshot(launch)
+    if snapshot["status"] in {"already_exited", "invalid_pid"}:
+        return snapshot
+    if snapshot["status"] != "matching":
+        raise RuntimeError(
+            f"refusing to terminate native pid {snapshot.get('pid')}: registered identity no longer matches"
+        )
+    pid = snapshot["pid"]
+    os.kill(pid, signal.SIGTERM)
+    try:
+        wait_for_process_exit(pid)
+        snapshot["status"] = "terminated"
+    except TimeoutError:
+        os.kill(pid, signal.SIGKILL)
+        wait_for_process_exit(pid, timeout_secs=5)
+        snapshot["status"] = "killed"
+    return snapshot
+
+
+def port_reachability(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
+    cleanup_run = getattr(args, "run", subprocess.run)
+    candidate_root = Path(args.cleanup_proof_temp_root)
+    if candidate_root.is_symlink() or not candidate_root.is_dir():
+        raise RuntimeError(f"proof cleanup root is missing or unsafe: {candidate_root}")
+    root = candidate_root.resolve(strict=True)
+    runner_temp = os.environ.get("RUNNER_TEMP", "").strip()
+    if runner_temp:
+        canonical_runner_temp = Path(runner_temp).resolve(strict=True)
+        if root.parent != canonical_runner_temp or not root.name.startswith("codestory-metal-proof-owned-"):
+            raise RuntimeError(f"proof cleanup root is outside the exact runner temp boundary: {root}")
+    marker = root / PROOF_TEMP_OWNER_FILE
+    if marker.is_symlink() or not marker.is_file():
+        raise RuntimeError(f"proof cleanup root has no safe ownership marker: {root}")
+    ownership = read_json_file(marker)
+    if not isinstance(ownership, dict) or ownership.get("owner") != "codestory-macos-metal-proof":
+        raise RuntimeError(f"proof cleanup ownership marker is invalid: {marker}")
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    if repository and ownership.get("repository") != repository:
+        raise RuntimeError(
+            f"proof cleanup marker repository does not match {repository!r}: {marker}"
+        )
+    archive_name = ownership.get("archive_name")
+    archive_digest = ownership.get("archive_sha256")
+    if (
+        not isinstance(archive_name, str)
+        or Path(archive_name).name != archive_name
+        or not isinstance(archive_digest, str)
+        or len(archive_digest) != 64
+    ):
+        raise RuntimeError(f"proof cleanup marker has no bound archive identity: {marker}")
+    owned_archive = root / archive_name
+    if owned_archive.is_symlink() or not owned_archive.is_file():
+        raise RuntimeError(f"proof cleanup bound archive is missing or unsafe: {owned_archive}")
+    if sha256_file(owned_archive) != archive_digest:
+        raise RuntimeError(f"proof cleanup bound archive digest changed: {owned_archive}")
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir.is_relative_to(root):
+        raise RuntimeError("proof cleanup artifacts must be outside the removable proof root")
+    project_value = ownership.get("project")
+    project = (
+        Path(project_value).resolve(strict=False)
+        if isinstance(project_value, str)
+        else Path(args.project).resolve(strict=False)
+    )
+    results = {
+        "root": str(root),
+        "cache_cleanup": [],
+        "native_processes": [],
+        "ports": [],
+        "errors": [],
+    }
+    registered_sidecars = ownership.get("sidecars", [])
+    if not registered_sidecars or not isinstance(registered_sidecars, list) or not all(
+        isinstance(item, dict) for item in registered_sidecars
+    ):
+        raise RuntimeError(f"proof cleanup marker has invalid registered sidecars: {marker}")
+    recorded_launches = [
+        item for item in ownership.get("launches", []) if isinstance(item, dict)
+    ]
+    seen_pids = set()
+
+    def terminate_launches(launches: list[dict]) -> None:
+        for launch in launches:
+            fingerprint = (launch.get("pid"), launch.get("launch_fingerprint_sha256"))
+            if fingerprint in seen_pids:
+                continue
+            seen_pids.add(fingerprint)
+            try:
+                results["native_processes"].append(terminate_registered_native_process(launch))
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                results["native_processes"].append(
+                    {"pid": launch.get("pid"), "status": "failed", "error": error}
+                )
+                results["errors"].append(
+                    {"kind": "native_process", "pid": launch.get("pid"), "error": error}
+                )
+
+    # Marker-bound process identities are independent of ephemeral project and
+    # Compose files, so always attempt them before inspecting stale sidecar state.
+    terminate_launches(recorded_launches)
+    state_launches = []
+    for identity in registered_sidecars:
+        state_file = Path(str(identity.get("state_file", "")))
+        if not state_file.is_file() or state_file.is_symlink():
+            continue
+        try:
+            validated = validated_proof_compose_state(
+                Path(str(identity["cache_root"])),
+                Path(str(identity["project"])),
+                read_json_file,
+                run_id=str(identity["run_id"]),
+                registered_identity=identity,
+                allow_missing_compose_file=True,
+            )
+            if validated is not None:
+                launch = validated[1].get("embedding_launch")
+                if isinstance(launch, dict):
+                    state_launches.append(launch)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            results["errors"].append(
+                {
+                    "kind": "sidecar_state_validation",
+                    "state_file": str(state_file),
+                    "error": error,
+                }
+            )
+    terminate_launches(state_launches)
+    for index, value in enumerate(ownership.get("cache_roots", [])):
+        if not isinstance(value, str):
+            error = "proof cleanup marker contains a non-string cache root"
+            results["cache_cleanup"].append(
+                {"cache_root": repr(value), "status": "failed", "error": error}
+            )
+            results["errors"].append({"kind": "cache_cleanup", "error": error})
+            continue
+        cache = Path(value)
+        canonical = cache.resolve(strict=False)
+        if not canonical.is_relative_to(root) or not cache.name.startswith("codestory-packaged-"):
+            error = f"refusing unregistered proof cache cleanup: {cache}"
+            results["cache_cleanup"].append(
+                {"cache_root": str(cache), "status": "failed", "error": error}
+            )
+            results["errors"].append(
+                {"kind": "cache_cleanup", "cache_root": str(cache), "error": error}
+            )
+            continue
+        if not cache.exists():
+            results["cache_cleanup"].append({"cache_root": str(cache), "status": "already_removed"})
+            continue
+        artifact = out_dir / f"registered-cache-cleanup-{index}.json"
+        try:
+            preserve_native_embedding_evidence(cache, out_dir, f"registered-cache-{index}")
+            cleanup_proof_cache(
+                None,
+                project,
+                cache,
+                artifact,
+                run=cleanup_run,
+                registered_sidecars=registered_sidecars,
+                direct_only=True,
+            )
+            results["cache_cleanup"].append({"cache_root": str(cache), "status": "removed"})
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            results["cache_cleanup"].append(
+                {"cache_root": str(cache), "status": "failed", "error": error}
+            )
+            results["errors"].append({"kind": "cache_cleanup", "cache_root": str(cache), "error": error})
+    for port in ownership.get("ports", []):
+        if isinstance(port, int) and 0 < port <= 65535:
+            results["ports"].append({"port": port, "reachable_after_cleanup": port_reachability(port)})
+    remaining_ports = [item["port"] for item in results["ports"] if item["reachable_after_cleanup"]]
+    if remaining_ports:
+        results["errors"].append(
+            {"kind": "ports", "error": f"proof-owned ports remained reachable: {remaining_ports}"}
+        )
+    if not results["errors"]:
+        remove_tree_with_retry(root)
+        results["root_removed"] = not root.exists()
+    else:
+        results["root_removed"] = False
+    write_json(out_dir / "proof-owned-cleanup.json", results)
+    if results["errors"]:
+        raise RuntimeError(
+            "proof-owned cleanup had failures after attempting every resource: "
+            + "; ".join(item["error"] for item in results["errors"])
+        )
+
+
 def require_retrieval_full(payload: object, layer: str, artifact: Path) -> None:
     mode = payload.get("retrieval_mode") if isinstance(payload, dict) else None
     if mode is None and isinstance(payload, dict):
@@ -596,21 +1833,6 @@ def require_version(output: str, expected_version: str, archive: Path, artifact:
 def require_help(output: str, artifact: Path) -> None:
     require("Usage:" in output, "help", artifact, "codestory-cli --help output missing Usage")
     require("codestory-cli" in output, "help", artifact, "codestory-cli --help output missing binary name")
-
-
-def require_retrieval_index_ready(payload: object, layer: str, artifact: Path) -> None:
-    require(isinstance(payload, dict), layer, artifact, "retrieval index output is not a JSON object")
-    manifest = payload.get("manifest")
-    lexical_version = manifest.get("lexical_version") if isinstance(manifest, dict) else None
-    require(
-        lexical_version == "sqlite-fts5-v1",
-        layer,
-        artifact,
-        f"manifest.lexical_version is {lexical_version!r}, expected 'sqlite-fts5-v1'",
-    )
-    for field in ["qdrant_stubbed", "scip_stubbed"]:
-        value = payload.get(field)
-        require(value is False, layer, artifact, f"{field} is {value!r}, expected False")
 
 
 def require_search_full(payload: object, artifact: Path) -> None:
@@ -1723,25 +2945,59 @@ def run_gate(args: argparse.Namespace) -> None:
         tempfile.TemporaryDirectory(prefix="codestory-packaged-agent-proof-", dir=out_dir) as temp,
         contextlib.ExitStack() as cleanup_stack,
     ):
+        source_project = project
+        if getattr(args, "native_edge_cases", False):
+            edge_project = Path(temp) / "CodeStory project with spaces ü"
+            shutil.copytree(
+                source_project,
+                edge_project,
+                symlinks=True,
+                ignore=shutil.ignore_patterns(".git", "target"),
+            )
+            project = edge_project.resolve(strict=True)
         unpacked = Path(temp) / "unpacked"
         unpacked.mkdir()
         unpack_archive(archive, unpacked)
         cli = find_cli(unpacked)
         plugin_skill = find_plugin_skill(unpacked)
-        cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-proof-cache-"))
+        cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-proof-cache-")).resolve(strict=True)
         proof_cleanup_artifact = out_dir / "proof-cache-cleanup.json"
-        cleanup_stack.push(cleanup_proof_cache_on_exit(cli, project, cache_root, proof_cleanup_artifact))
+        proof_cleanup_sidecars = proof_agent_identities([cache_root], project)
+        cleanup_stack.push(
+            cleanup_proof_cache_on_exit(
+                cli,
+                project,
+                cache_root,
+                proof_cleanup_artifact,
+                registered_sidecars=proof_cleanup_sidecars,
+            )
+        )
         proof_env = proof_environment({**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)})
-        stdio_cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-stdio-cache-"))
+        stdio_cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-stdio-cache-")).resolve(strict=True)
         stdio_cleanup_artifact = out_dir / "stdio-cache-cleanup.json"
-        cleanup_stack.push(cleanup_proof_cache_on_exit(cli, project, stdio_cache_root, stdio_cleanup_artifact))
+        stdio_cleanup_sidecars = proof_agent_identities([stdio_cache_root], project)
+        cleanup_stack.push(
+            cleanup_proof_cache_on_exit(
+                cli,
+                project,
+                stdio_cache_root,
+                stdio_cleanup_artifact,
+                registered_sidecars=stdio_cleanup_sidecars,
+            )
+        )
         stdio_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(stdio_cache_root)}
+        register_proof_temp_ownership(project, [cache_root, stdio_cache_root], archive)
+
+        corrupt_server_seed = None
+        if getattr(args, "native_edge_cases", False):
+            corrupt_server_seed = seed_corrupt_managed_server(cache_root, project)
 
         summary = {
             "archive": str(archive),
             "cli": str(cli),
             "plugin_skill": str(plugin_skill),
             "project": str(project),
+            "source_project": str(source_project),
             "artifacts": {
                 "proof_cache_cleanup": str(proof_cleanup_artifact),
                 "stdio_cache_cleanup": str(stdio_cleanup_artifact),
@@ -1764,7 +3020,7 @@ def run_gate(args: argparse.Namespace) -> None:
         write_json(out_dir / "summary.json", summary)
 
         stdio_artifact = out_dir / "serve-stdio-status.json"
-        if args.version_only or args.managed_plugin_handoff:
+        if args.version_only or args.managed_plugin_handoff or getattr(args, "intel_runtime_policy", False):
             stdio_status_payload = stdio_status(
                 cli,
                 project,
@@ -1780,10 +3036,97 @@ def run_gate(args: argparse.Namespace) -> None:
         if args.version_only:
             return
 
+        if getattr(args, "intel_runtime_policy", False):
+            machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+            require(
+                sys.platform == "darwin" and machine == "x86_64",
+                "intel_runtime_host",
+                archive,
+                f"Intel runtime policy proof requires macOS x86_64, got {sys.platform}/{machine}",
+            )
+            default_env = proof_agent_environment(proof_env, PROOF_LOCAL_RUN_ID)
+            for name in (
+                "CODESTORY_EMBED_ALLOW_CPU",
+                "CODESTORY_EMBED_DEVICE_POLICY",
+                "CODESTORY_EMBED_DEVICE_PROVIDER",
+                "CODESTORY_EMBED_DEVICE_STATE",
+                "CODESTORY_EMBED_LLAMACPP_URL",
+                "CODESTORY_EMBED_SERVER_LAUNCH",
+            ):
+                default_env.pop(name, None)
+            default_env["CODESTORY_EMBED_BACKEND"] = "llamacpp"
+            default_artifact = out_dir / "intel-default-backend.json"
+            default_payload = run_command(
+                cli,
+                "intel_default_backend",
+                [
+                    "retrieval",
+                    "bootstrap",
+                    "--project",
+                    str(project),
+                    "--profile",
+                    "agent",
+                    "--run-id",
+                    PROOF_LOCAL_RUN_ID,
+                    "--skip-compose",
+                    "--wait-secs",
+                    "0",
+                    "--format",
+                    "json",
+                    "--output-file",
+                    str(default_artifact),
+                ],
+                default_artifact,
+                args.timeout_secs,
+                env=default_env,
+            )
+            require_intel_default_backend_failure(default_payload, default_artifact)
+            summary["artifacts"]["intel_default_backend"] = str(default_artifact)
+
+            with embedding_probe_server() as endpoint:
+                cpu_env = {
+                    **default_env,
+                    "CODESTORY_EMBED_ALLOW_CPU": "1",
+                    "CODESTORY_EMBED_LLAMACPP_URL": endpoint,
+                    "CODESTORY_EMBED_SERVER_LAUNCH": "external_endpoint",
+                }
+                cpu_artifact = out_dir / "intel-cpu-external.json"
+                cpu_payload = run_command(
+                    cli,
+                    "intel_cpu_external",
+                    [
+                        "retrieval",
+                        "bootstrap",
+                        "--project",
+                        str(project),
+                        "--profile",
+                        "agent",
+                        "--run-id",
+                        PROOF_LOCAL_RUN_ID,
+                        "--skip-compose",
+                        "--wait-secs",
+                        "0",
+                        "--format",
+                        "json",
+                        "--output-file",
+                        str(cpu_artifact),
+                    ],
+                    cpu_artifact,
+                    args.timeout_secs,
+                    env=cpu_env,
+                )
+                require_intel_cpu_external_ready(cpu_payload, cpu_artifact, endpoint)
+                summary["artifacts"]["intel_cpu_external"] = str(cpu_artifact)
+            write_json(out_dir / "summary.json", summary)
+            return
+
         if args.managed_plugin_handoff:
             convergence_project = Path(temp) / "managed-convergence-project"
             empty_model_dir = Path(temp) / "managed-convergence-empty-model"
             write_managed_convergence_fixture(convergence_project)
+            proof_cleanup_sidecars.extend(
+                proof_agent_identities([cache_root], convergence_project)
+            )
             empty_model_dir.mkdir()
             summary["managed_convergence_project"] = str(convergence_project)
             local_ready_artifact = out_dir / "managed-local-ready.json"
@@ -1849,6 +3192,7 @@ def run_gate(args: argparse.Namespace) -> None:
                 empty_model_dir,
                 archive,
             )
+            register_current_proof_runtime(cache_root)
             summary["artifacts"]["managed_plugin_convergence"] = str(plugin_artifact)
             summary["artifacts"]["managed_plugin_upgrade"] = str(
                 plugin_artifact.with_name("managed-plugin-upgrade.json")
@@ -1856,87 +3200,7 @@ def run_gate(args: argparse.Namespace) -> None:
             write_json(out_dir / "summary.json", summary)
             return
 
-        local_env = local_profile_environment(proof_env)
-        local_bootstrap_artifact = out_dir / "local-retrieval-bootstrap.json"
-        run_command(
-            cli,
-            "local_retrieval_bootstrap",
-            [
-                "retrieval",
-                "bootstrap",
-                "--project",
-                str(project),
-                "--profile",
-                "local",
-                "--format",
-                "json",
-                "--output-file",
-                str(local_bootstrap_artifact),
-            ],
-            local_bootstrap_artifact,
-            args.timeout_secs,
-            env=local_env,
-        )
-        summary["artifacts"]["local_retrieval_bootstrap"] = str(local_bootstrap_artifact)
-        write_json(out_dir / "summary.json", summary)
-
-        local_index_artifact = out_dir / "local-retrieval-index.json"
-        try:
-            local_index = run_command(
-                cli,
-                "local_retrieval_index",
-                [
-                    "retrieval",
-                    "index",
-                    "--project",
-                    str(project),
-                    "--profile",
-                    "local",
-                    "--refresh",
-                    "full",
-                    "--format",
-                    "json",
-                    "--output-file",
-                    str(local_index_artifact),
-                ],
-                local_index_artifact,
-                args.timeout_secs,
-                env=local_env,
-            )
-            require_retrieval_index_ready(local_index, "local_retrieval_index", local_index_artifact)
-        except GateFailure:
-            compose_diagnostics_artifact = out_dir / "local-retrieval-compose-diagnostics.json"
-            capture_proof_compose_diagnostics(cache_root, project, local_env, compose_diagnostics_artifact)
-            summary["artifacts"]["local_retrieval_compose_diagnostics"] = str(compose_diagnostics_artifact)
-            write_json(out_dir / "summary.json", summary)
-            raise
-        summary["artifacts"]["local_retrieval_index"] = str(local_index_artifact)
-        write_json(out_dir / "summary.json", summary)
-
-        local_status_artifact = out_dir / "local-retrieval-status.json"
-        local_status = run_command(
-            cli,
-            "local_retrieval_status",
-            [
-                "retrieval",
-                "status",
-                "--project",
-                str(project),
-                "--profile",
-                "local",
-                "--format",
-                "json",
-                "--output-file",
-                str(local_status_artifact),
-            ],
-            local_status_artifact,
-            args.timeout_secs,
-            env=local_env,
-        )
-        require_retrieval_full(local_status, "local_retrieval_status", local_status_artifact)
-        summary["artifacts"]["local_retrieval_status"] = str(local_status_artifact)
-        write_json(out_dir / "summary.json", summary)
-
+        local_env = proof_agent_environment(proof_env, PROOF_LOCAL_RUN_ID)
         ready_artifact = out_dir / "ready.json"
         ready = run_command(
             cli,
@@ -1955,11 +3219,130 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             ready_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_agent_ready(ready, "ready", ready_artifact)
+        register_current_proof_runtime(cache_root)
         summary["artifacts"]["ready"] = str(ready_artifact)
+        if corrupt_server_seed is not None:
+            corrupt_server_artifact = out_dir / "native-corrupt-server-repair.json"
+            require_managed_server_repaired(corrupt_server_seed, corrupt_server_artifact)
+            summary["artifacts"]["native_corrupt_server_repair"] = str(corrupt_server_artifact)
         write_json(out_dir / "summary.json", summary)
+
+        if getattr(args, "native_accelerator_lifecycle", False):
+            original_launch = require_native_accelerator_ready(ready, "native_ready", ready_artifact)
+            original_pid = original_launch["pid"]
+            register_proof_launch(original_launch)
+
+            survival_artifact = out_dir / "native-runtime-survival.json"
+            survival = run_command(
+                cli,
+                "native_runtime_survival",
+                [
+                    "ready",
+                    "--goal",
+                    "agent",
+                    "--project",
+                    str(project),
+                    "--format",
+                    "json",
+                    "--output-file",
+                    str(survival_artifact),
+                ],
+                survival_artifact,
+                args.timeout_secs,
+                env=local_env,
+            )
+            survival_launch = require_native_accelerator_ready(
+                survival,
+                "native_runtime_survival",
+                survival_artifact,
+                expected_pid=original_pid,
+            )
+            register_proof_launch(survival_launch)
+            summary["artifacts"]["native_runtime_survival"] = str(survival_artifact)
+            cold_warm_evidence = preserve_native_embedding_evidence(
+                cache_root,
+                out_dir,
+                "native-cold-warm",
+                required=True,
+                exact_launch=survival_launch,
+            )
+            summary["artifacts"]["native_cold_warm_launch"] = str(cold_warm_evidence)
+            write_json(out_dir / "summary.json", summary)
+
+            os.kill(original_pid, signal.SIGTERM)
+            try:
+                wait_for_process_exit(original_pid)
+            except TimeoutError as exc:
+                fail("native_runtime_shutdown", survival_artifact, str(exc))
+
+            blocked_artifact = out_dir / "native-runtime-dead-status.json"
+            blocked = run_command(
+                cli,
+                "native_runtime_dead_status",
+                [
+                    "ready",
+                    "--goal",
+                    "agent",
+                    "--project",
+                    str(project),
+                    "--format",
+                    "json",
+                    "--output-file",
+                    str(blocked_artifact),
+                ],
+                blocked_artifact,
+                args.timeout_secs,
+                env=local_env,
+            )
+            require_agent_not_ready(blocked, "native_runtime_dead_status", blocked_artifact)
+            summary["artifacts"]["native_runtime_dead_status"] = str(blocked_artifact)
+
+            recovery_artifact = out_dir / "native-runtime-recovery.json"
+            recovery = run_command(
+                cli,
+                "native_runtime_recovery",
+                [
+                    "ready",
+                    "--goal",
+                    "agent",
+                    "--repair",
+                    "--project",
+                    str(project),
+                    "--format",
+                    "json",
+                    "--output-file",
+                    str(recovery_artifact),
+                ],
+                recovery_artifact,
+                args.timeout_secs,
+                env=local_env,
+            )
+            recovered_launch = require_native_accelerator_ready(
+                recovery,
+                "native_runtime_recovery",
+                recovery_artifact,
+            )
+            recovered_pid = recovered_launch["pid"]
+            register_proof_launch(recovered_launch)
+            require(
+                recovered_pid != original_pid,
+                "native_runtime_recovery",
+                recovery_artifact,
+                "repair reused the terminated native embedding pid",
+            )
+            summary["artifacts"]["native_runtime_recovery"] = str(recovery_artifact)
+            recovery_evidence = preserve_native_embedding_evidence(
+                cache_root,
+                out_dir,
+                "native-recovery",
+                required=True,
+                exact_launch=recovered_launch,
+            )
+            summary["artifacts"]["native_recovery_launch"] = str(recovery_evidence)
+            write_json(out_dir / "summary.json", summary)
 
         doctor_artifact = out_dir / "doctor.json"
         doctor = run_command(
@@ -1968,7 +3351,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ["doctor", "--project", str(project), "--format", "json", "--output-file", str(doctor_artifact)],
             doctor_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_retrieval_full(doctor, "doctor", doctor_artifact)
         summary["artifacts"]["doctor"] = str(doctor_artifact)
@@ -1990,7 +3373,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             status_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_retrieval_full(status, "retrieval_status", status_artifact)
         summary["artifacts"]["retrieval_status"] = str(status_artifact)
@@ -2014,7 +3397,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             search_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_search_full(search, search_artifact)
         summary["artifacts"]["search"] = str(search_artifact)
@@ -2037,7 +3420,7 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             context_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_context_ready(context, context_artifact)
         summary["artifacts"]["context"] = str(context_artifact)
@@ -2062,18 +3445,18 @@ def run_gate(args: argparse.Namespace) -> None:
             ],
             packet_artifact,
             args.timeout_secs,
-            env=proof_env,
+            env=local_env,
         )
         require_packet_ready(packet, packet_artifact)
         summary["artifacts"]["packet"] = str(packet_artifact)
         write_json(out_dir / "summary.json", summary)
 
-        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
+        stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, local_env)
         require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
         allowed = stdio_status_payload.get("allowed_surfaces", {})
         if not all(allowed.get(name, {}).get("allowed") is True for name in ("packet", "search", "context")):
             shutil.copy2(stdio_artifact, out_dir / "serve-stdio-status-initial.json")
-            stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, proof_env)
+            stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, local_env)
         require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
         summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
         write_json(out_dir / "summary.json", summary)
@@ -2464,172 +3847,95 @@ def write_fake_plugin_launcher(plugin_root: Path) -> None:
     )
 
 
-def self_test() -> None:
-    base_environment = {"KEEP": "value", "CODESTORY_SIDECAR_PROFILE": "agent"}
-    owned_environment = proof_environment(base_environment)
-    if hasattr(os, "getuid") and hasattr(os, "getgid"):
-        assert owned_environment["CODESTORY_QDRANT_USER"] == f"{os.getuid()}:{os.getgid()}"
-        assert owned_environment["CODESTORY_QDRANT_SNAPSHOTS_PATH"] == "/qdrant/storage/snapshots"
-    local_environment = local_profile_environment(base_environment)
-    assert local_environment["KEEP"] == "value"
-    assert local_environment["CODESTORY_SIDECAR_PROFILE"] == "local"
-    assert base_environment["CODESTORY_SIDECAR_PROFILE"] == "agent"
+def expect_fake_gate_failure(
+    args: argparse.Namespace,
+    fail_layer: str,
+    expected_layer: str,
+    artifact_fragment: str,
+    failure_message: str,
+) -> None:
+    os.environ["CODESTORY_FAKE_FAIL_LAYER"] = fail_layer
+    try:
+        try:
+            run_gate(args)
+        except GateFailure as exc:
+            assert exc.layer == expected_layer
+            assert artifact_fragment in str(exc.artifact)
+        else:
+            raise AssertionError(failure_message)
+    finally:
+        os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
 
+
+def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-self-test-") as temp:
         root = Path(temp)
-        transient_cleanup_attempts = 0
-        original_rmtree = shutil.rmtree
+        evidence_cache = root / "native-evidence-cache"
+        evidence_cache.mkdir()
+        native_log = evidence_cache / "llama-server-native.log"
+        native_log.write_text("launch marker\n" + "x" * 256 + "\noffloaded 13/13 layers to GPU\n", encoding="utf-8")
+        write_json(
+            evidence_cache / "retrieval-sidecars.json",
+            {
+                "owner": "codestory",
+                "embedding_launch": {
+                    "launch_mode": "native_spawned",
+                    "pid": 1234,
+                    "log_path": str(native_log),
+                },
+            },
+        )
+        evidence_artifact = preserve_native_embedding_evidence(
+            evidence_cache,
+            root,
+            "native-evidence-self-test",
+            required=True,
+        )
+        assert evidence_artifact is not None and evidence_artifact.is_file()
+        assert (root / "native-evidence-self-test-llama-server-native.log").is_file()
+        bounded_artifact = root / "bounded-native.log"
+        bounded = bounded_file_copy(native_log, bounded_artifact, max_bytes=64)
+        assert bounded["truncated"] is True
+        bounded_body = bounded_artifact.read_text(encoding="utf-8")
+        assert "launch marker" in bounded_body and "offloaded 13/13" in bounded_body
 
-        class SimulatedWindowsLock(PermissionError):
-            winerror = 5
+        registration_payload = {"launches": [], "ports": []}
+        registered_launch = {
+            "launch_mode": "native_spawned",
+            "pid": 1234,
+            "launch_fingerprint_sha256": "1" * 64,
+        }
+        record_proof_runtime_identity(
+            registration_payload,
+            registered_launch,
+            [18080, 18080, 0, 65536, "18081"],
+        )
+        record_proof_runtime_identity(registration_payload, registered_launch, [18080])
+        assert registration_payload == {
+            "launches": [registered_launch],
+            "ports": [18080],
+        }
 
-        def transient_cleanup(path):
-            nonlocal transient_cleanup_attempts
-            transient_cleanup_attempts += 1
-            if transient_cleanup_attempts == 1:
-                raise SimulatedWindowsLock("simulated transient executable lock")
-            original_rmtree(path)
-
-        retry_root = root / "cleanup-retry"
-        retry_root.mkdir()
-        shutil.rmtree = transient_cleanup
-        try:
-            remove_tree_with_retry(retry_root, timeout_secs=1, platform="nt")
-        finally:
-            shutil.rmtree = original_rmtree
-        assert transient_cleanup_attempts == 2
-
-        persistent_root = root / "cleanup-persistent"
-        persistent_root.mkdir()
-
-        def persistent_cleanup(_path):
-            raise SimulatedWindowsLock("simulated persistent lock")
-
-        shutil.rmtree = persistent_cleanup
-        try:
-            try:
-                remove_tree_with_retry(persistent_root, timeout_secs=0, platform="nt")
-            except PermissionError:
-                pass
-            else:
-                raise AssertionError("persistent cleanup lock should remain fail-closed")
-        finally:
-            shutil.rmtree = original_rmtree
-            original_rmtree(persistent_root)
-
-        unclassified_root = root / "cleanup-unclassified"
-        unclassified_root.mkdir()
-        unclassified_attempts = 0
-
-        def unclassified_cleanup(_path):
-            nonlocal unclassified_attempts
-            unclassified_attempts += 1
-            raise PermissionError("simulated ACL failure")
-
-        shutil.rmtree = unclassified_cleanup
-        try:
-            try:
-                remove_tree_with_retry(unclassified_root, timeout_secs=1, platform="nt")
-            except PermissionError:
-                pass
-            else:
-                raise AssertionError("unclassified cleanup failures must not be retried")
-        finally:
-            shutil.rmtree = original_rmtree
-            original_rmtree(unclassified_root)
-        assert unclassified_attempts == 1
-
-        if os.name == "nt":
-            kernel32 = windows_process_api()
-            process_handle = kernel32.OpenProcess(0x00100000, False, os.getpid())
-            assert process_handle
-            try:
-                try:
-                    require_windows_process_exit(process_handle, os.getpid(), timeout_ms=0, kernel32=kernel32)
-                except RuntimeError:
-                    pass
-                else:
-                    raise AssertionError("an unterminated worker must remain a cleanup failure")
-            finally:
-                kernel32.CloseHandle(process_handle)
-
-            class FakeKernel32:
-                def __init__(self, waits, *, handle=123, terminate=True, last_error=5):
-                    self.waits = list(waits)
-                    self.handle = handle
-                    self.terminate = terminate
-                    self.last_error = last_error
-
-                def OpenProcess(self, _access, _inherit, _pid):
-                    return self.handle
-
-                def WaitForSingleObject(self, _handle, _timeout):
-                    return self.waits.pop(0)
-
-                def TerminateProcess(self, _handle, _exit_code):
-                    return self.terminate
-
-                def CloseHandle(self, _handle):
-                    return True
-
-            failed_wait = FakeKernel32([0xFFFFFFFF], last_error=6)
-            try:
-                require_windows_process_exit(123, 42, timeout_ms=0, kernel32=failed_wait)
-            except RuntimeError as exc:
-                assert "Windows error 6" in str(exc)
-            else:
-                raise AssertionError("WAIT_FAILED must remain a cleanup failure")
-
-            open_failure = FakeKernel32([], handle=None, last_error=5)
-            open_diagnostics = {}
-            try:
-                terminate_worker_pid(
-                    42,
-                    open_diagnostics,
-                    kernel32=open_failure,
-                    run=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 128, "", "not found"),
-                    platform="nt",
-                )
-            except RuntimeError as exc:
-                assert "Windows error 5" in str(exc)
-            else:
-                raise AssertionError("OpenProcess access failure must remain fail closed")
-            assert open_diagnostics["attempts"] == [
-                {"kind": "open_process", "success": False, "windows_error": 5}
-            ]
-
-            async_exit = FakeKernel32([258, 0])
-            async_diagnostics = {}
-
-            def timed_out_taskkill(*_args, **_kwargs):
-                raise subprocess.TimeoutExpired("taskkill", 10)
-
-            terminate_worker_pid(
-                42,
-                async_diagnostics,
-                kernel32=async_exit,
-                run=timed_out_taskkill,
-                platform="nt",
+        if sys.platform == "darwin":
+            probe_code = "import time; time.sleep(60)"
+            process_probe = subprocess.Popen(
+                [sys.executable, "-c", probe_code, "--exact-proof-child"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
-            assert async_diagnostics["status"] == "terminated_after_direct_termination"
-            assert "TimeoutExpired" in async_diagnostics["attempts"][1]["error"]
-
-            terminate_failure = FakeKernel32([258, 258], terminate=False, last_error=5)
-            terminate_diagnostics = {}
             try:
-                terminate_worker_pid(
-                    42,
-                    terminate_diagnostics,
-                    kernel32=terminate_failure,
-                    run=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, "", "denied"),
-                    platform="nt",
-                )
-            except RuntimeError as exc:
-                assert "Windows error 5" in str(exc)
-            else:
-                raise AssertionError("TerminateProcess failure must remain fail closed")
-            assert terminate_diagnostics["attempts"][1]["returncode"] == 1
-            assert terminate_diagnostics["attempts"][-1]["success"] is False
+                launch = {
+                    "pid": process_probe.pid,
+                    "spawned_at_epoch_ms": int(time.time() * 1000),
+                    "executable_path": sys.executable,
+                    "launch_args": ["-c", probe_code, "--exact-proof-child"],
+                }
+                assert registered_native_process_snapshot(launch)["status"] == "matching"
+                prefix_collision = {**launch, "launch_args": ["-c", probe_code, "--exact-proof"]}
+                assert registered_native_process_snapshot(prefix_collision)["status"] == "identity_mismatch"
+            finally:
+                process_probe.terminate()
+                process_probe.wait(timeout=5)
 
         stage = root / "pkg" / "codestory-cli-v9.9.9-test"
         stage.mkdir(parents=True)
@@ -2639,21 +3945,31 @@ def self_test() -> None:
         compose_file.parent.mkdir()
         compose_file.write_text("services: {}\n", encoding="utf-8")
 
-        def write_proof_compose_state(cache_root: Path, overrides: dict | None = None) -> Path:
+        def write_proof_compose_state(
+            cache_root: Path,
+            overrides: dict | None = None,
+            *,
+            state_project: Path = root,
+        ) -> Path:
             cache_root.mkdir()
-            (cache_root / "qdrant").mkdir()
-            (cache_root / "lexical").mkdir()
+            identity = proof_agent_identity(cache_root, state_project, PROOF_LOCAL_RUN_ID)
+            state_root = Path(identity["state_file"]).parent
+            (state_root / "qdrant").mkdir(parents=True)
+            (state_root / "lexical").mkdir()
+            (state_root / "scip").mkdir()
             state = {
                 "owner": "codestory",
-                "profile": "local",
-                "namespace": "codestory",
-                "compose_project": "codestory",
+                "profile": "agent",
+                "run_id": PROOF_LOCAL_RUN_ID,
+                "namespace": identity["namespace"],
+                "compose_project": identity["compose_project"],
                 "compose_file": str(compose_file),
-                "qdrant_data_dir": str(cache_root / "qdrant"),
-                "lexical_data_dir": str(cache_root / "lexical"),
+                "qdrant_data_dir": identity["qdrant_data_dir"],
+                "lexical_data_dir": identity["lexical_data_dir"],
+                "scip_artifacts_root": identity["scip_artifacts_root"],
             }
             state.update(overrides or {})
-            state_file = cache_root / "retrieval-sidecars.json"
+            state_file = Path(identity["state_file"])
             write_json(state_file, state)
             return state_file
 
@@ -2665,8 +3981,88 @@ def self_test() -> None:
         def successful_compose_cleanup(command, **kwargs):
             if command[0] == "docker":
                 compose_calls.append((command, kwargs["env"]))
-                return subprocess.CompletedProcess(command, 0, "stopped", "")
+                namespace = kwargs["env"]["CODESTORY_SIDECAR_NAMESPACE"]
+                qdrant_root = kwargs["env"]["CODESTORY_QDRANT_DATA_DIR"]
+                container_id = f"container-{fnv1a_hex(qdrant_root)}"
+                network_id = f"network-{fnv1a_hex(qdrant_root)}"
+                created = "2026-07-12T12:00:00Z"
+                if command[1:3] == ["container", "ls"]:
+                    stdout = json.dumps({"ID": container_id})
+                elif command[1:3] == ["network", "ls"]:
+                    stdout = json.dumps({"ID": network_id})
+                elif command[1:3] == ["container", "inspect"]:
+                    stdout = json.dumps(
+                        [
+                            {
+                                "Id": container_id,
+                                "Name": f"/{namespace}-qdrant",
+                                "Created": created,
+                                "Config": {
+                                    "Labels": {
+                                        "com.docker.compose.project": namespace,
+                                        "com.docker.compose.service": "qdrant",
+                                        "dev.codestory.owner": "codestory",
+                                        "dev.codestory.profile": "agent",
+                                        "dev.codestory.namespace": namespace,
+                                    }
+                                },
+                                "Mounts": [
+                                    {
+                                        "Type": "bind",
+                                        "Source": qdrant_root,
+                                        "Destination": "/qdrant/storage",
+                                    }
+                                ],
+                            }
+                        ]
+                    )
+                elif command[1:3] == ["network", "inspect"]:
+                    stdout = json.dumps(
+                        [
+                            {
+                                "Id": network_id,
+                                "Name": f"{namespace}_default",
+                                "Created": created,
+                                "Labels": {
+                                    "com.docker.compose.project": namespace,
+                                    "com.docker.compose.network": "default",
+                                },
+                                "Containers": {container_id: {"Name": f"{namespace}-qdrant"}},
+                            }
+                        ]
+                    )
+                else:
+                    stdout = "removed"
+                return subprocess.CompletedProcess(command, 0, stdout, "")
             return subprocess.run(command, **kwargs)
+
+        compose_state = read_json_file(
+            Path(proof_agent_identity(compose_cleanup_root, root, PROOF_LOCAL_RUN_ID)["state_file"])
+        )
+        registered_resources = docker_compose_resource_snapshot(
+            compose_state,
+            successful_compose_cleanup,
+        )
+        remaining_registered_resources = json.loads(json.dumps(registered_resources))
+        remaining_registered_resources["containers"] = []
+        remaining_registered_resources["networks"][0]["attached_container_ids"] = []
+        validate_proof_docker_resources(
+            compose_state,
+            remaining_registered_resources,
+            registered_resources,
+        )
+        foreign_remaining_resources = json.loads(json.dumps(remaining_registered_resources))
+        foreign_remaining_resources["networks"][0]["id"] = "unregistered-network"
+        try:
+            validate_proof_docker_resources(
+                compose_state,
+                foreign_remaining_resources,
+                registered_resources,
+            )
+        except RuntimeError as exc:
+            assert "absent from proof registration" in str(exc)
+        else:
+            raise AssertionError("partial cleanup retry must reject unregistered Docker IDs")
 
         cleanup_proof_cache(
             fake_cli,
@@ -2676,156 +4072,71 @@ def self_test() -> None:
             successful_compose_cleanup,
         )
         assert not compose_cleanup_root.exists()
-        assert compose_calls[0][0][-2:] == ["down", "--remove-orphans"]
-        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"] == "codestory"
+        removal_calls = [command for command, _env in compose_calls if "rm" in command]
+        assert removal_calls[0][1:4] == ["container", "rm", "-f"]
+        assert removal_calls[1][1:3] == ["network", "rm"]
+        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"].startswith("codestory-agent-")
+        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"] != "codestory"
         compose_cleanup = read_json_file(compose_cleanup_artifact)
         assert compose_cleanup["removed"] is True
-        assert compose_cleanup["commands"][0]["kind"] == "compose_down"
-
-        optional_lexical_root = root / "compose-cleanup-optional-lexical"
-        write_proof_compose_state(optional_lexical_root, {"lexical_data_dir": None})
-        optional_lexical_artifact = root / "compose-cleanup-optional-lexical.json"
-        try:
-            cleanup_proof_cache(fake_cli, root, optional_lexical_root, optional_lexical_artifact)
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("missing canonical and legacy lexical ownership must fail closed")
-        assert read_json_file(optional_lexical_artifact)["commands"][0]["kind"] == "compose_state_validation"
-        remove_tree_with_retry(optional_lexical_root)
-
-        legacy_lexical_root = root / "compose-cleanup-legacy-lexical"
-        write_proof_compose_state(
-            legacy_lexical_root,
-            {"lexical_data_dir": None, "zoekt_data_dir": str(legacy_lexical_root / "lexical")},
-        )
-        cleanup_proof_cache(
-            fake_cli,
-            root,
-            legacy_lexical_root,
-            root / "compose-cleanup-legacy-lexical.json",
-            successful_compose_cleanup,
+        assert any(
+            item.get("kind") == "docker_container_remove"
+            for item in compose_cleanup["commands"]
         )
 
-        failed_compose_root = root / "compose-cleanup-failed"
-        write_proof_compose_state(failed_compose_root)
-        failed_compose_artifact = root / "compose-cleanup-failed.json"
+        foreign_collision_root = root / "compose-cleanup-foreign-collision"
+        write_proof_compose_state(foreign_collision_root)
+        foreign_mount = root / "foreign-qdrant-cache"
+        foreign_mount.mkdir()
+        foreign_collision_calls = []
 
-        def failed_compose_cleanup(command, **kwargs):
-            if command[0] == "docker":
-                return subprocess.CompletedProcess(command, 17, "", "forced failure")
-            return subprocess.run(command, **kwargs)
+        def foreign_collision_cleanup(command, **kwargs):
+            foreign_collision_calls.append(command)
+            result = successful_compose_cleanup(command, **kwargs)
+            if command[0:3] == ["docker", "container", "inspect"]:
+                payload = json.loads(result.stdout)
+                payload[0]["Mounts"][0]["Source"] = str(foreign_mount)
+                return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+            return result
 
+        foreign_collision_artifact = root / "compose-cleanup-foreign-collision.json"
         try:
             cleanup_proof_cache(
                 fake_cli,
                 root,
-                failed_compose_root,
-                failed_compose_artifact,
-                failed_compose_cleanup,
+                foreign_collision_root,
+                foreign_collision_artifact,
+                foreign_collision_cleanup,
             )
         except RuntimeError as exc:
-            assert "Compose cleanup exited 17" in str(exc)
+            assert "foreign cache" in str(exc)
         else:
-            raise AssertionError("failed proof-owned Compose cleanup must remain fail-closed")
-        assert failed_compose_root.exists()
-        assert read_json_file(failed_compose_artifact)["removed"] is False
-        remove_tree_with_retry(failed_compose_root)
+            raise AssertionError("foreign Compose collision must fail closed")
+        assert foreign_collision_root.exists()
+        assert not any("rm" in command for command in foreign_collision_calls)
+        collision_cleanup = read_json_file(foreign_collision_artifact)
+        assert collision_cleanup["removed"] is False
+        assert any(
+            item.get("kind") == "docker_resource_validation"
+            for item in collision_cleanup["commands"]
+        )
+        remove_tree_with_retry(foreign_collision_root)
 
-        masked_failure_root = root / "compose-cleanup-primary-failure"
-        write_proof_compose_state(masked_failure_root)
-        masked_failure_artifact = root / "compose-cleanup-primary-failure.json"
-        primary_artifact = root / "primary-failure.json"
-        try:
-            with contextlib.ExitStack() as stack:
-                stack.push(
-                    cleanup_proof_cache_on_exit(
-                        fake_cli,
-                        root,
-                        masked_failure_root,
-                        masked_failure_artifact,
-                        failed_compose_cleanup,
-                    )
-                )
-                raise GateFailure("primary", primary_artifact, "primary gate failed")
-        except GateFailure as exc:
-            assert exc.layer == "primary"
-            assert any("proof cleanup also failed" in note for note in getattr(exc, "__notes__", []))
-        else:
-            raise AssertionError("proof cleanup must not mask the primary gate failure")
-        assert read_json_file(masked_failure_artifact)["removed"] is False
-        remove_tree_with_retry(masked_failure_root)
-
-        altered_compose_file = root / "altered-compose.yml"
-        altered_compose_file.write_text("services: {}\n", encoding="utf-8")
-        altered_qdrant = root / "altered-qdrant"
-        altered_qdrant.mkdir()
-        validation_cases = [
-            ("project", {"compose_project": "not-codestory"}),
-            ("file", {"compose_file": str(altered_compose_file)}),
-            ("path", {"qdrant_data_dir": str(altered_qdrant)}),
-            ("lexical-path", {"lexical_data_dir": str(altered_qdrant)}),
-            ("non-string", {"namespace": 7}),
-            ("lexical-non-string", {"lexical_data_dir": 7}),
-        ]
-        for label, overrides in validation_cases:
-            cache_root = root / f"compose-validation-{label}"
-            write_proof_compose_state(cache_root, overrides)
-            artifact = root / f"compose-validation-{label}.json"
-            try:
-                cleanup_proof_cache(fake_cli, root, cache_root, artifact)
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError(f"altered proof Compose {label} must fail closed")
-            validation = read_json_file(artifact)
-            assert validation["removed"] is False
-            assert validation["commands"][0]["kind"] == "compose_state_validation"
-            assert validation["commands"][0]["error"]
-            remove_tree_with_retry(cache_root)
-
-        malformed_root = root / "compose-validation-malformed"
-        malformed_state = write_proof_compose_state(malformed_root)
-        malformed_state.write_text("{", encoding="utf-8")
-        malformed_artifact = root / "compose-validation-malformed.json"
-        try:
-            cleanup_proof_cache(fake_cli, root, malformed_root, malformed_artifact)
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("malformed proof Compose state must fail closed")
-        assert "JSONDecodeError" in read_json_file(malformed_artifact)["commands"][0]["error"]
-        remove_tree_with_retry(malformed_root)
-
-        unreadable_root = root / "compose-validation-unreadable"
-        write_proof_compose_state(unreadable_root)
-        unreadable_artifact = root / "compose-validation-unreadable.json"
-
-        def unreadable_state(_path):
-            raise PermissionError("forced unreadable state")
-
-        try:
-            cleanup_proof_cache(
-                fake_cli,
-                root,
-                unreadable_root,
-                unreadable_artifact,
-                read_state=unreadable_state,
-            )
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("unreadable proof Compose state must fail closed")
-        assert "PermissionError" in read_json_file(unreadable_artifact)["commands"][0]["error"]
-        remove_tree_with_retry(unreadable_root)
+        no_compose_root = root / "no-compose-cleanup"
+        write_proof_compose_state(no_compose_root, {"compose_file": None})
+        no_compose_artifact = root / "no-compose-cleanup.json"
+        cleanup_proof_cache(fake_cli, root, no_compose_root, no_compose_artifact)
+        no_compose_cleanup = read_json_file(no_compose_artifact)
+        assert no_compose_cleanup["removed"] is True
+        assert no_compose_cleanup["commands"][0]["kind"] == "compose_down_skipped"
 
         symlink_root = root / "compose-validation-symlink"
         symlink_root.mkdir()
-        (symlink_root / "qdrant").mkdir()
-        (symlink_root / "lexical").mkdir()
+        symlink_identity = proof_agent_identity(symlink_root, root, PROOF_LOCAL_RUN_ID)
+        Path(symlink_identity["state_file"]).parent.mkdir(parents=True)
         symlink_target = root / "compose-validation-symlink-target.json"
         write_json(symlink_target, {"owner": "codestory"})
-        (symlink_root / "retrieval-sidecars.json").symlink_to(symlink_target)
+        Path(symlink_identity["state_file"]).symlink_to(symlink_target)
         symlink_artifact = root / "compose-validation-symlink.json"
         try:
             cleanup_proof_cache(fake_cli, root, symlink_root, symlink_artifact)
@@ -2836,6 +4147,18 @@ def self_test() -> None:
         assert "symlink" in read_json_file(symlink_artifact)["commands"][0]["error"]
         remove_tree_with_retry(symlink_root)
         symlink_target.unlink()
+
+        global_namespace_root = root / "compose-validation-global-local"
+        global_namespace_root.mkdir()
+        write_json(global_namespace_root / "retrieval-sidecars.json", {"owner": "codestory"})
+        global_namespace_artifact = root / "compose-validation-global-local.json"
+        try:
+            cleanup_proof_cache(fake_cli, root, global_namespace_root, global_namespace_artifact)
+        except RuntimeError as exc:
+            assert "global local-sidecar namespace" in str(exc)
+        else:
+            raise AssertionError("proof cleanup must refuse the global codestory namespace")
+        remove_tree_with_retry(global_namespace_root)
 
         skill = stage / PLUGIN_SKILL_RELATIVE
         skill.parent.mkdir(parents=True)
@@ -2848,6 +4171,189 @@ def self_test() -> None:
         checksum_file.write_text(f"{sha256_file(archive)}  {archive.name}\n", encoding="utf-8")
         project = root / "repo"
         project.mkdir()
+        registered_root = root / "codestory-metal-proof-owned-self-test"
+        registered_root.mkdir()
+        registered_archive = registered_root / archive.name
+        shutil.copyfile(archive, registered_archive)
+        registered_cache = registered_root / "codestory-packaged-proof-cache-self-test"
+        write_proof_compose_state(
+            registered_cache,
+            {"compose_file": None},
+            state_project=project,
+        )
+        registered_sidecars = proof_agent_identities([registered_cache], project)
+        write_json(
+            registered_root / PROOF_TEMP_OWNER_FILE,
+            {
+                "owner": "codestory-macos-metal-proof",
+                "repository": os.environ.get("GITHUB_REPOSITORY"),
+                "project": str(project),
+                "cache_roots": [str(registered_cache)],
+                "sidecars": registered_sidecars,
+                "launches": [],
+                "ports": [],
+                "archive_name": registered_archive.name,
+                "archive_sha256": sha256_file(registered_archive),
+            },
+        )
+        registered_cleanup_out = root / "registered-cleanup-out"
+        cleanup_registered_proof_temp_root(
+            argparse.Namespace(
+                project=str(project),
+                out_dir=str(registered_cleanup_out),
+                cleanup_proof_temp_root=str(registered_root),
+            )
+        )
+        assert not registered_root.exists()
+        registered_cleanup = read_json_file(registered_cleanup_out / "proof-owned-cleanup.json")
+        assert registered_cleanup["cache_cleanup"][0]["status"] == "removed"
+        registered_cache_cleanup = read_json_file(
+            registered_cleanup_out / "registered-cache-cleanup-0.json"
+        )
+        assert any(
+            item.get("kind") == "retrieval_down_skipped"
+            and item.get("reason") == "trusted_direct_cleanup"
+            for item in registered_cache_cleanup["commands"]
+        )
+
+        if sys.platform == "darwin":
+            retry_root = root / "codestory-metal-proof-owned-missing-edge"
+            retry_root.mkdir()
+            retry_archive = retry_root / archive.name
+            shutil.copyfile(archive, retry_archive)
+            vanished_project = root / "vanished edge project"
+            vanished_compose = vanished_project / "docker" / "retrieval-compose.yml"
+            vanished_compose.parent.mkdir(parents=True)
+            vanished_compose.write_text("services: {}\n", encoding="utf-8")
+            missing_compose_cache = retry_root / "codestory-packaged-proof-cache-missing-compose"
+            continuing_cache = retry_root / "codestory-packaged-proof-cache-continuing"
+            probe_code = "import time; time.sleep(60)"
+            cleanup_probe = subprocess.Popen(
+                [sys.executable, "-c", probe_code, "--registered-cleanup-child"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            launch = {
+                "launch_mode": "native_spawned",
+                "pid": cleanup_probe.pid,
+                "spawned_at_epoch_ms": int(time.time() * 1000),
+                "executable_path": sys.executable,
+                "launch_args": ["-c", probe_code, "--registered-cleanup-child"],
+                "launch_fingerprint_sha256": "1" * 64,
+            }
+            write_proof_compose_state(
+                missing_compose_cache,
+                {
+                    "compose_file": str(vanished_compose),
+                    "embedding_launch": launch,
+                    "embedding_launch_ownership": "owner",
+                },
+                state_project=vanished_project,
+            )
+            write_proof_compose_state(
+                continuing_cache,
+                {"compose_file": None},
+                state_project=vanished_project,
+            )
+            retry_sidecars = proof_agent_identities(
+                [missing_compose_cache, continuing_cache], vanished_project
+            )
+            missing_identity = next(
+                identity
+                for identity in retry_sidecars
+                if identity["cache_root"] == str(missing_compose_cache.resolve())
+                and identity["run_id"] == PROOF_LOCAL_RUN_ID
+            )
+            missing_identity["docker_resources"] = {
+                "compose_project": missing_identity["compose_project"],
+                "containers": [],
+                "networks": [],
+            }
+            write_json(
+                retry_root / PROOF_TEMP_OWNER_FILE,
+                {
+                    "owner": "codestory-macos-metal-proof",
+                    "repository": os.environ.get("GITHUB_REPOSITORY"),
+                    "project": str(vanished_project),
+                    "cache_roots": [str(missing_compose_cache), str(continuing_cache)],
+                    "sidecars": retry_sidecars,
+                    "launches": [launch],
+                    "ports": [],
+                    "archive_name": retry_archive.name,
+                    "archive_sha256": sha256_file(retry_archive),
+                },
+            )
+            remove_tree_with_retry(vanished_project)
+
+            def empty_registered_docker(command, **_kwargs):
+                if command[0:3] in (
+                    ["docker", "container", "ls"],
+                    ["docker", "network", "ls"],
+                ):
+                    return subprocess.CompletedProcess(command, 0, "[]", "")
+                raise AssertionError(f"unexpected registered cleanup Docker command: {command}")
+
+            retry_out = root / "registered-cleanup-missing-edge-out"
+            try:
+                cleanup_registered_proof_temp_root(
+                    argparse.Namespace(
+                        project=str(vanished_project),
+                        out_dir=str(retry_out),
+                        cleanup_proof_temp_root=str(retry_root),
+                        run=empty_registered_docker,
+                    )
+                )
+            finally:
+                if cleanup_probe.poll() is None:
+                    cleanup_probe.terminate()
+                    cleanup_probe.wait(timeout=5)
+            assert cleanup_probe.poll() is not None
+            retry_cleanup = read_json_file(retry_out / "proof-owned-cleanup.json")
+            assert retry_cleanup["root_removed"] is True
+            assert [item["status"] for item in retry_cleanup["cache_cleanup"]] == [
+                "removed",
+                "removed",
+            ]
+            assert retry_cleanup["native_processes"][0]["status"] == "terminated"
+
+        tampered_root = root / "codestory-metal-proof-owned-tampered"
+        tampered_root.mkdir()
+        tampered_archive = tampered_root / archive.name
+        shutil.copyfile(archive, tampered_archive)
+        tampered_cache = tampered_root / "codestory-packaged-proof-cache-tampered"
+        write_proof_compose_state(
+            tampered_cache,
+            {"compose_file": None},
+            state_project=project,
+        )
+        write_json(
+            tampered_root / PROOF_TEMP_OWNER_FILE,
+            {
+                "owner": "codestory-macos-metal-proof",
+                "repository": os.environ.get("GITHUB_REPOSITORY"),
+                "project": str(project),
+                "cache_roots": [str(tampered_cache)],
+                "sidecars": proof_agent_identities([tampered_cache], project),
+                "launches": [],
+                "ports": [],
+                "archive_name": tampered_archive.name,
+                "archive_sha256": "0" * 64,
+            },
+        )
+        try:
+            cleanup_registered_proof_temp_root(
+                argparse.Namespace(
+                    project=str(project),
+                    out_dir=str(root / "tampered-cleanup-out"),
+                    cleanup_proof_temp_root=str(tampered_root),
+                )
+            )
+        except RuntimeError as exc:
+            assert "archive digest changed" in str(exc)
+        else:
+            raise AssertionError("stale cleanup must reject a modified bound archive")
+        assert tampered_cache.exists()
+        remove_tree_with_retry(tampered_root)
         out_dir = root / "out"
         args = argparse.Namespace(
             archive=str(archive),
@@ -2868,9 +4374,8 @@ def self_test() -> None:
         assert read_json_file(out_dir / "proof-cache-cleanup.json")["removed"] is True
         assert read_json_file(out_dir / "stdio-cache-cleanup.json")["removed"] is True
         stdio_artifact = read_json_file(out_dir / "serve-stdio-status.json")
-        full_cache_root = read_json_file(out_dir / "local-retrieval-bootstrap.json")["cache_root"]
+        full_cache_root = stdio_artifact["status"]["cache_root"]
         assert Path(full_cache_root).name.startswith("codestory-packaged-proof-cache-")
-        assert stdio_artifact["status"]["cache_root"] == full_cache_root
         status_request = next(
             entry["request"]
             for entry in stdio_artifact["transcript"]
@@ -2878,387 +4383,13 @@ def self_test() -> None:
         )
         assert status_request["params"]["project"] == str(project.resolve())
 
-        version_only_out = root / "version-only-out"
-        version_only_args = argparse.Namespace(**vars(args))
-        version_only_args.out_dir = str(version_only_out)
-        version_only_args.version_only = True
-        run_gate(version_only_args)
-        version_only_summary = read_json_file(version_only_out / "summary.json")
-        assert version_only_summary["artifacts"].keys() == {
-            "checksum",
-            "version",
-            "help",
-            "serve_stdio",
-            "proof_cache_cleanup",
-            "stdio_cache_cleanup",
-        }
-        assert read_json_file(Path(version_only_args.out_dir) / "proof-cache-cleanup.json")["removed"] is True
-        assert read_json_file(Path(version_only_args.out_dir) / "stdio-cache-cleanup.json")["removed"] is True
-        assert not (version_only_out / "local-retrieval-bootstrap.json").exists()
-        version_only_status = read_json_file(version_only_out / "serve-stdio-status.json")["status"]
-        assert Path(version_only_status["cache_root"]).name.startswith("codestory-packaged-stdio-cache-")
-        assert version_only_status["cache_root"] != full_cache_root
-
-        bad_checksum = root / "BAD_SHA256SUMS.txt"
-        bad_checksum.write_text(f"{'0' * 64}  {archive.name}\n", encoding="utf-8")
-        bad_checksum_args = argparse.Namespace(**vars(version_only_args))
-        bad_checksum_args.out_dir = str(root / "bad-checksum-out")
-        bad_checksum_args.checksum_file = str(bad_checksum)
-        try:
-            run_gate(bad_checksum_args)
-        except GateFailure as exc:
-            assert exc.layer == "checksum"
-            assert exc.artifact.name == "archive-checksum.json"
-        else:
-            raise AssertionError("mismatched packaged checksum should fail the gate")
-
-        stale_out = root / "stale-out"
-        stale_out.mkdir()
-        stale_file = stale_out / "stale-plugin-stdio-status.json"
-        stale_file.write_text("stale", encoding="utf-8")
-        stale_args = argparse.Namespace(**vars(version_only_args))
-        stale_args.out_dir = str(stale_out)
-        run_gate(stale_args)
-        assert not stale_file.exists()
-        assert (stale_out / "summary.json").is_file()
-
-        delayed_stdio_project = root / "repo-delayed-stdio"
-        delayed_stdio_project.mkdir()
-        delayed_stdio_out = root / "delayed-stdio-out"
-        delayed_stdio_args = argparse.Namespace(**vars(args))
-        delayed_stdio_args.project = str(delayed_stdio_project)
-        delayed_stdio_args.out_dir = str(delayed_stdio_out)
-        delayed_status_worker = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-                if os.name == "nt"
-                else 0
-            ),
-            start_new_session=os.name != "nt",
+        expect_fake_gate_failure(
+            args,
+            "search",
+            "search",
+            "search.json.stdout.txt",
+            "forced fake search failure should fail the gate",
         )
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_first_blocked"
-        os.environ["CODESTORY_FAKE_STATUS_WORKER_PID"] = str(delayed_status_worker.pid)
-        try:
-            run_gate(delayed_stdio_args)
-            delayed_stdio_status = read_json_file(delayed_stdio_out / "serve-stdio-status.json")
-            delayed_status = delayed_stdio_status["status"]
-            assert delayed_status["allowed_surfaces"]["packet"]["allowed"] is True
-            assert (delayed_stdio_project / ".fake-serve-first-blocked-seen").is_file()
-            assert delayed_status_worker.poll() is None
-        finally:
-            terminate_worker_pid(delayed_status_worker.pid)
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-            os.environ.pop("CODESTORY_FAKE_STATUS_WORKER_PID", None)
-
-        retry_timeout_project = root / "repo-retry-timeout"
-        retry_timeout_project.mkdir()
-        retry_timeout_args = argparse.Namespace(**vars(args))
-        retry_timeout_args.project = str(retry_timeout_project)
-        retry_timeout_args.out_dir = str(root / "retry-timeout-out")
-        retry_timeout_args.timeout_secs = 5
-        retry_timeout_worker = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-                if os.name == "nt"
-                else 0
-            ),
-            start_new_session=os.name != "nt",
-        )
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_first_blocked_then_timeout"
-        os.environ["CODESTORY_FAKE_STATUS_WORKER_PID"] = str(retry_timeout_worker.pid)
-        try:
-            try:
-                run_gate(retry_timeout_args)
-            except GateFailure as exc:
-                assert exc.layer == "serve_stdio"
-                assert "serve-stdio-status.json" in str(exc.artifact)
-            else:
-                raise AssertionError("timed-out stdio readiness retry should fail the gate")
-            assert retry_timeout_worker.poll() is None
-        finally:
-            terminate_worker_pid(retry_timeout_worker.pid)
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-            os.environ.pop("CODESTORY_FAKE_STATUS_WORKER_PID", None)
-
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "search"
-        try:
-            try:
-                run_gate(args)
-            except GateFailure as exc:
-                assert exc.layer == "search"
-                assert "search.json.stdout.txt" in str(exc.artifact)
-            else:
-                raise AssertionError("forced fake search failure should fail the gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-
-        mismatch_args = argparse.Namespace(**vars(args))
-        mismatch_args.expected_version = "9.9.8"
-        try:
-            run_gate(mismatch_args)
-        except GateFailure as exc:
-            assert exc.layer == "version"
-            assert "version.txt" in str(exc.artifact)
-        else:
-            raise AssertionError("version mismatch should fail the gate")
-
-        plugin_root = root / "plugin"
-        plugin_manifest = plugin_root / ".codex-plugin" / "plugin.json"
-        plugin_manifest.parent.mkdir(parents=True)
-        plugin_manifest.write_text(json.dumps({"version": "9.9.8"}), encoding="utf-8")
-        try:
-            require_plugin_manifest_version(plugin_root, "9.9.9")
-        except GateFailure as exc:
-            assert exc.layer == "plugin_manifest"
-            assert exc.artifact == plugin_manifest
-        else:
-            raise AssertionError("plugin manifest version mismatch should fail the gate")
-
-        plugin_drift_args = argparse.Namespace(**vars(args))
-        plugin_drift_args.plugin_root = str(plugin_root)
-        try:
-            run_gate(plugin_drift_args)
-        except GateFailure as exc:
-            assert exc.layer == "plugin_manifest"
-            assert exc.artifact == plugin_manifest
-        else:
-            raise AssertionError("plugin-root drift should fail the packaged proof gate")
-
-        plugin_manifest.write_text(json.dumps({"version": "9.9.9"}), encoding="utf-8")
-        write_fake_plugin_launcher(plugin_root)
-        plugin_hidden_args = argparse.Namespace(**vars(args))
-        plugin_hidden_args.plugin_root = str(plugin_root)
-        plugin_hidden_args.out_dir = str(root / "plugin-hidden-out")
-        os.environ["CODESTORY_FAKE_PLUGIN_HIDE_RESOURCES"] = "1"
-        os.environ["CODESTORY_FAKE_PLUGIN_CLI"] = str(stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli"))
-        try:
-            try:
-                run_gate(plugin_hidden_args)
-            except GateFailure as exc:
-                assert exc.layer == "plugin_stdio"
-                assert "plugin-stdio-status.json" in str(exc.artifact)
-                artifact = read_json_file(exc.artifact)
-                assert artifact["server_advertised_mcp_resources"]["missing"] == ["codestory://agent-guide"]
-                assert artifact["status"]["plugin_runtime"]["cli_source"] == "direct_cli_launch"
-                hidden_cache_root = read_json_file(
-                    Path(plugin_hidden_args.out_dir) / "local-retrieval-bootstrap.json"
-                )["cache_root"]
-                assert artifact["status"]["cache_root"] == hidden_cache_root
-            else:
-                raise AssertionError("hidden plugin MCP resources should fail the plugin stdio gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_PLUGIN_HIDE_RESOURCES", None)
-            os.environ.pop("CODESTORY_FAKE_PLUGIN_CLI", None)
-
-        managed_args = argparse.Namespace(**vars(args))
-        managed_args.plugin_root = str(plugin_root)
-        managed_args.out_dir = str(root / "managed-plugin-out")
-        managed_args.managed_plugin_handoff = True
-        os.environ["CODESTORY_FAKE_PLUGIN_CLI"] = str(
-            stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli")
-        )
-        os.environ["CODESTORY_FAKE_PLUGIN_MANAGED"] = "1"
-        os.environ["CODESTORY_FAKE_LIST_CHANGED"] = "1"
-        try:
-            run_gate(managed_args)
-            managed_summary = read_json_file(Path(managed_args.out_dir) / "summary.json")
-            assert "managed_local_ground" in managed_summary["artifacts"]
-            assert "managed_plugin_convergence" in managed_summary["artifacts"]
-            assert "managed_plugin_upgrade" in managed_summary["artifacts"]
-            upgrade = read_json_file(Path(managed_args.out_dir) / "managed-plugin-upgrade.json")
-            assert upgrade["prior_version"] == "0.0.0"
-            assert upgrade["requested_version"] == "9.9.9"
-            assert upgrade["server_version"] == "9.9.9"
-            observational_artifact = Path(managed_args.out_dir) / "managed-convergence-status-observational.json"
-            assert read_json_file(observational_artifact)["status"]["index_freshness"]["status"] == "stale"
-            managed_artifact = Path(managed_args.out_dir) / "managed-plugin-convergence.json"
-            assert transcript_response(managed_artifact, "ground_activation")["result"]["structuredContent"]["stats"]
-            setup = structured_content_from_response(transcript_response(managed_artifact, "setup_poll_1"))
-            assert setup["active_repair"] is None
-            assert setup["last_worker_result"]["attempt_id"] == "fake-activation-attempt"
-            assert setup["last_worker_result"]["outcome"] == "failed"
-            assert {
-                key: setup["last_worker_result"][key]
-                for key in ("project_root", "profile", "run_id", "namespace")
-            } == {
-                "project_root": managed_summary["managed_convergence_project"],
-                "profile": "agent",
-                "run_id": "shared-agent",
-                "namespace": "fake-agent-namespace",
-            }
-            managed_status_after = status_from_resource_response(
-                transcript_response(managed_artifact, "status_after_convergence")
-            )
-            assert managed_status_after["index_publication"]["generation"] == 2
-            assert managed_status_after["allowed_surfaces"]["packet"]["allowed"] is False
-            managed_cache_root = read_json_file(Path(managed_args.out_dir) / "managed-local-ground.json")["cache_root"]
-            assert Path(managed_cache_root).name.startswith("codestory-packaged-proof-cache-")
-            assert managed_status_after["cache_root"] == managed_cache_root
-            managed_direct_status = read_json_file(Path(managed_args.out_dir) / "serve-stdio-status.json")["status"]
-            assert Path(managed_direct_status["cache_root"]).name.startswith("codestory-packaged-stdio-cache-")
-            assert managed_direct_status["cache_root"] != managed_cache_root
-        finally:
-            os.environ.pop("CODESTORY_FAKE_PLUGIN_MANAGED", None)
-            os.environ.pop("CODESTORY_FAKE_LIST_CHANGED", None)
-            os.environ.pop("CODESTORY_FAKE_PLUGIN_CLI", None)
-
-        policy_timeout_artifact = root / "policy-timeout" / "managed-plugin-handoff.json"
-        policy_timeout_artifact.parent.mkdir(parents=True)
-        os.environ["CODESTORY_FAKE_PLUGIN_CLI"] = str(
-            stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli")
-        )
-        os.environ["CODESTORY_FAKE_PLUGIN_POLICY_TIMEOUT"] = "1"
-        try:
-            try:
-                plugin_stdio_handoff(
-                    plugin_root,
-                    archive.parent,
-                    project,
-                    root / "policy-timeout-cache",
-                    policy_timeout_artifact,
-                    2,
-                    "9.9.9",
-                    stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli"),
-                    root / "policy-timeout-empty-model",
-                    archive,
-                )
-            except GateFailure as exc:
-                assert exc.layer == "managed_plugin_convergence"
-                assert exc.artifact.name == "managed-plugin-policy.json"
-                policy_timeout = read_json_file(exc.artifact)
-                assert "policy stdout before timeout" in policy_timeout["stdout"]
-                assert "policy stderr before timeout" in policy_timeout["stderr"]
-            else:
-                raise AssertionError("timed-out plugin policy enable should fail the gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_PLUGIN_POLICY_TIMEOUT", None)
-            os.environ.pop("CODESTORY_FAKE_PLUGIN_CLI", None)
-
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "doctor_stderr"
-        try:
-            try:
-                run_gate(args)
-            except GateFailure as exc:
-                assert exc.layer == "doctor"
-                assert "doctor.json.stderr.txt" in str(exc.artifact)
-            else:
-                raise AssertionError("stderr fake failure should point at stderr artifact")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "packet_weak"
-        try:
-            try:
-                run_gate(args)
-            except GateFailure as exc:
-                assert exc.layer == "packet"
-                assert "packet.json" in str(exc.artifact)
-            else:
-                raise AssertionError("weak fake packet should fail the gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "context_weak"
-        try:
-            try:
-                run_gate(args)
-            except GateFailure as exc:
-                assert exc.layer == "context"
-                assert "context.json" in str(exc.artifact)
-            else:
-                raise AssertionError("weak fake context should fail the gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "context_fallback"
-        try:
-            try:
-                run_gate(args)
-            except GateFailure as exc:
-                assert exc.layer == "context"
-                assert "context.json" in str(exc.artifact)
-            else:
-                raise AssertionError("fallback fake context should fail the gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-
-        fake_cli = stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli")
-        numeric_id_artifact = root / "stdio-numeric-id.json"
-        stdio_status_command(
-            [str(fake_cli), "serve", "--stdio", "--refresh", "none", "--project", str(project)],
-            numeric_id_artifact,
-            2,
-            project,
-            extra_requests=[{"jsonrpc": "2.0", "id": 1, "method": "resources/list"}],
-        )
-        numeric_id_payload = read_json_file(numeric_id_artifact)
-        assert any(
-            entry.get("request", {}).get("id") == 1
-            and entry.get("response", {}).get("id") == 1
-            for entry in numeric_id_payload["transcript"]
-        )
-
-        for mode in (
-            "wrong_id",
-            "error",
-            "out_of_order",
-            "non_object",
-            "server_request_collision",
-            "malformed_jsonrpc",
-            "malformed_method",
-            "malformed_tools",
-        ):
-            protocol_artifact = root / f"stdio-{mode}.json"
-            try:
-                stdio_status(
-                    fake_cli,
-                    project,
-                    protocol_artifact,
-                    2,
-                    {**os.environ, "CODESTORY_FAKE_INITIALIZE_MODE": mode},
-                )
-            except GateFailure as exc:
-                assert exc.layer == "serve_stdio"
-                assert exc.artifact == protocol_artifact
-                assert protocol_artifact.is_file()
-                protocol_stderr = protocol_artifact.with_suffix(protocol_artifact.suffix + ".stderr.txt")
-                assert protocol_stderr.is_file()
-                if mode == "malformed_jsonrpc":
-                    assert "synthetic protocol stderr" in protocol_stderr.read_text(encoding="utf-8")
-            else:
-                raise AssertionError(f"{mode} stdio response must fail correlation")
-
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "serve_timeout"
-        timeout_args = argparse.Namespace(**vars(args))
-        timeout_args.timeout_secs = 5
-        try:
-            try:
-                run_gate(timeout_args)
-            except GateFailure as exc:
-                assert exc.layer == "serve_stdio"
-                assert "serve-stdio-status.json" in str(exc.artifact)
-            else:
-                raise AssertionError("silent fake stdio server should fail the gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-
-        os.environ["CODESTORY_FAKE_FAIL_LAYER"] = "resources_hidden"
-        try:
-            try:
-                run_gate(args)
-            except GateFailure as exc:
-                assert exc.layer == "serve_stdio"
-                assert "serve-stdio-status.json" in str(exc.artifact)
-            else:
-                raise AssertionError("hidden MCP resources should fail the gate")
-        finally:
-            os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
 
     print("self-test passed")
 
@@ -3285,16 +4416,53 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Prove managed plugin provisioning, local ground, and background repair handoff without requiring full sidecars.",
     )
+    parser.add_argument(
+        "--native-accelerator-lifecycle",
+        action="store_true",
+        help="Require native accelerated runtime survival, dead-endpoint blocking, and repair recovery during the full proof.",
+    )
+    parser.add_argument(
+        "--native-edge-cases",
+        action="store_true",
+        help="Exercise spaces/Unicode paths and corrupt managed native installs.",
+    )
+    parser.add_argument(
+        "--intel-runtime-policy",
+        action="store_true",
+        help="On Intel macOS, prove default backend failure plus explicitly labelled CPU/external operation without Metal claims.",
+    )
+    parser.add_argument(
+        "--cleanup-proof-temp-root",
+        help="Clean only a marker-owned hardware-proof temp root and verify its registered processes and ports are gone.",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run script self-tests.")
     args = parser.parse_args()
-    if not args.self_test and not args.archive:
-        parser.error("--archive is required unless --self-test is set")
-    if not args.self_test and not args.expected_version:
-        parser.error("--expected-version is required unless --self-test is set")
+    if not args.self_test and not args.cleanup_proof_temp_root and not args.archive:
+        parser.error("--archive is required unless --self-test or cleanup mode is set")
+    if not args.self_test and not args.cleanup_proof_temp_root and not args.expected_version:
+        parser.error("--expected-version is required unless --self-test or cleanup mode is set")
     if args.managed_plugin_handoff and not args.plugin_root:
         parser.error("--plugin-root is required with --managed-plugin-handoff")
     if args.managed_plugin_handoff and args.version_only:
         parser.error("--managed-plugin-handoff and --version-only are mutually exclusive")
+    if args.intel_runtime_policy and (args.managed_plugin_handoff or args.version_only):
+        parser.error("--intel-runtime-policy is mutually exclusive with --managed-plugin-handoff and --version-only")
+    if args.native_accelerator_lifecycle and (args.managed_plugin_handoff or args.version_only):
+        parser.error("--native-accelerator-lifecycle requires the full packaged proof")
+    if args.native_accelerator_lifecycle and args.intel_runtime_policy:
+        parser.error("--native-accelerator-lifecycle and --intel-runtime-policy are mutually exclusive")
+    if args.native_accelerator_lifecycle and os.name == "nt":
+        parser.error("--native-accelerator-lifecycle is supported only on POSIX hosts")
+    if args.native_edge_cases and not args.native_accelerator_lifecycle:
+        parser.error("--native-edge-cases requires --native-accelerator-lifecycle")
+    if args.cleanup_proof_temp_root and (
+        args.native_accelerator_lifecycle
+        or args.native_edge_cases
+        or args.intel_runtime_policy
+        or args.managed_plugin_handoff
+        or args.version_only
+    ):
+        parser.error("--cleanup-proof-temp-root is a standalone cleanup mode")
     return args
 
 
@@ -3302,6 +4470,9 @@ def main() -> None:
     args = parse_args()
     if args.self_test:
         self_test()
+        return
+    if args.cleanup_proof_temp_root:
+        cleanup_registered_proof_temp_root(args)
         return
     try:
         run_gate(args)

@@ -17,6 +17,7 @@ pub(crate) struct CliStartupConfig {
 
 impl CliStartupConfig {
     pub(crate) fn from_process_env() -> Self {
+        crate::sidecar_runtime::prepare_cache_access();
         Self {
             user_home: std::env::var_os("USERPROFILE")
                 .or_else(|| std::env::var_os("HOME"))
@@ -25,7 +26,7 @@ impl CliStartupConfig {
                 .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(false),
             stdio_cache_root: std::env::var_os("CODESTORY_STDIO_CACHE_ROOT").map(PathBuf::from),
-            user_cache_root: codestory_retrieval::user_cache_root(),
+            user_cache_root: crate::sidecar_runtime::user_cache_root(),
             runtime_defaults: codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
         }
     }
@@ -211,7 +212,10 @@ static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) fn config_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     CONFIG_ENV_TEST_LOCK
         .lock()
-        .expect("config env test lock should not be poisoned")
+        // A failed assertion must not turn one environment-sensitive test into
+        // a cascade of unrelated mutex-poison failures. Test snapshots restore
+        // their variables during unwinding, so retaining the guard is safe.
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

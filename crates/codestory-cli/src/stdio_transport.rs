@@ -2986,7 +2986,7 @@ fn stdio_status_with_recent_sidecar_repair(
     recent: &mut Option<StdioRecentSidecarRepair>,
     project_root: &Path,
 ) -> serde_json::Value {
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = crate::sidecar_runtime::for_project_with_run_id(
         project_root,
         codestory_retrieval::SidecarProfile::Agent,
         Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
@@ -3966,7 +3966,7 @@ fn build_stdio_status_readiness(
 ) -> StdioStatusReadinessParts {
     let dirty_marker = stdio_dirty_marker_status(&runtime.project_root, &runtime.storage_path);
     let effective_freshness = stdio_effective_freshness(summary.freshness.as_ref(), &dirty_marker);
-    let selected_agent_sidecar = stdio_agent_sidecar_with_gpu_proof(
+    let selected_agent_sidecar = crate::agent_sidecar_with_gpu_proof(
         &sidecar.selected_agent_sidecar,
         broker.gpu_proof.as_ref(),
     );
@@ -4045,20 +4045,6 @@ fn build_stdio_status_readiness(
         dirty_marker,
         effective_freshness,
     }
-}
-
-fn stdio_agent_sidecar_with_gpu_proof(
-    sidecar: &args::DoctorSidecarStatusOutput,
-    gpu_proof: Option<&crate::readiness_broker::BrokerGpuProofSnapshot>,
-) -> args::DoctorSidecarStatusOutput {
-    let mut sidecar = sidecar.clone();
-    if sidecar.retrieval_mode == "full"
-        && gpu_proof.is_some_and(|proof| proof.proof_status == "gpu_unverified")
-    {
-        sidecar.retrieval_mode = "unavailable".to_string();
-        sidecar.degraded_reason = Some("gpu_unverified".to_string());
-    }
-    sidecar
 }
 
 fn build_stdio_status_broker(
@@ -4921,7 +4907,7 @@ fn stdio_sidecar_policy_updated_at(policy: Option<&serde_json::Value>) -> Option
 }
 
 pub(crate) fn stdio_sidecar_setup_status(project_root: &Path) -> serde_json::Value {
-    let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let sidecar = crate::sidecar_runtime::for_project_with_run_id(
         project_root,
         codestory_retrieval::SidecarProfile::Agent,
         Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
@@ -6449,7 +6435,7 @@ mod tests {
     #[test]
     fn sidecar_repair_enqueue_lock_is_single_flight() {
         let project = tempfile::tempdir().expect("project");
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             codestory_retrieval::SidecarProfile::Agent,
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
@@ -6528,20 +6514,45 @@ mod tests {
         let manual_proof = crate::readiness_broker::gpu_proof(input.clone());
         assert_eq!(manual_proof.proof_status, "gpu_unverified");
 
-        let blocked = stdio_agent_sidecar_with_gpu_proof(&sidecar, Some(&manual_proof));
+        let blocked = crate::agent_sidecar_with_gpu_proof(&sidecar, Some(&manual_proof));
 
         assert_eq!(blocked.retrieval_mode, "unavailable");
         assert_eq!(blocked.degraded_reason.as_deref(), Some("gpu_unverified"));
+        let missing = crate::agent_sidecar_with_gpu_proof(&sidecar, None);
+        assert_eq!(missing.retrieval_mode, "unavailable");
+        assert_eq!(missing.degraded_reason.as_deref(), Some("gpu_unverified"));
 
         let mut runtime_input = input;
         runtime_input.embedding_device_observation_source = Some("native_log".to_string());
-        let runtime_proof = crate::readiness_broker::gpu_proof(runtime_input);
+        let mut runtime_proof = crate::readiness_broker::gpu_proof(runtime_input);
         assert_eq!(runtime_proof.proof_status, "verified");
+        let unbound = crate::agent_sidecar_with_gpu_proof(&sidecar, Some(&runtime_proof));
+        assert_eq!(unbound.retrieval_mode, "unavailable");
+        assert_eq!(unbound.degraded_reason.as_deref(), Some("gpu_unverified"));
 
-        let allowed = stdio_agent_sidecar_with_gpu_proof(&sidecar, Some(&runtime_proof));
+        runtime_proof.runtime_identity = Some(crate::readiness_broker::BrokerGpuRuntimeIdentity {
+            workspace_id: "workspace-v2-test".to_string(),
+            profile: "agent".to_string(),
+            run_id: Some("agent-default".to_string()),
+            namespace: "codestory-agent-test".to_string(),
+            compose_project: "codestory-agent-test".to_string(),
+            embed_url: "http://127.0.0.1:18080".to_string(),
+            started_at_epoch_ms: 1,
+            embedding_launch: None,
+        });
+
+        let allowed = crate::agent_sidecar_with_gpu_proof(&sidecar, Some(&runtime_proof));
 
         assert_eq!(allowed.retrieval_mode, "full");
         assert_eq!(allowed.degraded_reason, None);
+
+        let mut cpu_allowed = sidecar;
+        cpu_allowed.embedding_device_policy = "allow_cpu".to_string();
+        cpu_allowed.embedding_device_state = "cpu".to_string();
+        cpu_allowed.embedding_cpu_allowed = true;
+        let degraded = crate::agent_sidecar_with_gpu_proof(&cpu_allowed, None);
+        assert_eq!(degraded.retrieval_mode, "full");
+        assert_eq!(degraded.embedding_device_state, "cpu");
     }
 
     fn broker_snapshot_with_native_resource(
@@ -6719,7 +6730,7 @@ mod tests {
     }
 
     fn write_live_durable_ready_repair(project_root: &Path, run_id: &str, phase: &str) {
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project_root,
             codestory_retrieval::SidecarProfile::Agent,
             Some(run_id),
@@ -6735,7 +6746,7 @@ mod tests {
     }
 
     fn clear_durable_ready_repair(project_root: &Path, run_id: &str) {
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project_root,
             codestory_retrieval::SidecarProfile::Agent,
             Some(run_id),
@@ -7098,7 +7109,7 @@ mod tests {
     #[test]
     fn stdio_native_embedding_same_project_reusable_lock_does_not_block_repair() {
         let project = tempfile::tempdir().expect("project");
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             codestory_retrieval::SidecarProfile::Agent,
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
@@ -7149,7 +7160,7 @@ mod tests {
     #[test]
     fn stdio_native_embedding_foreign_lock_blocks_repair() {
         let project = tempfile::tempdir().expect("project");
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             codestory_retrieval::SidecarProfile::Agent,
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
@@ -7202,7 +7213,7 @@ mod tests {
     #[test]
     fn stdio_native_embedding_stale_snapshot_does_not_block_repair() {
         let project = tempfile::tempdir().expect("project");
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             codestory_retrieval::SidecarProfile::Agent,
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
@@ -7880,7 +7891,7 @@ starting sidecar setup
             built_at_epoch_ms: 1,
             disk_bytes: None,
             degraded_modes_json: "[]".into(),
-            embedding_backend: Some(codestory_retrieval::embedding_runtime_id()),
+            embedding_backend: Some(crate::sidecar_runtime::embedding_runtime_id()),
             embedding_dim: Some(codestory_retrieval::RETRIEVAL_EMBEDDING_DIM as i32),
             sidecar_schema_version: Some(codestory_retrieval::SIDECAR_SCHEMA_VERSION),
             sidecar_input_hash: Some("hash-a".into()),
@@ -7897,7 +7908,7 @@ starting sidecar setup
             precise_semantic_import_producer: None,
         };
         let before_stale = stdio_mandatory_sidecar_fingerprint_from_status(
-            codestory_retrieval::embedding_runtime_id(),
+            crate::sidecar_runtime::embedding_runtime_id(),
             "state-file-stable",
             Ok(StdioSidecarStatusFingerprint {
                 retrieval_mode: "full".into(),
@@ -7929,7 +7940,7 @@ starting sidecar setup
         );
 
         let after_stale = stdio_mandatory_sidecar_fingerprint_from_status(
-            codestory_retrieval::embedding_runtime_id(),
+            crate::sidecar_runtime::embedding_runtime_id(),
             "state-file-stable",
             Ok(StdioSidecarStatusFingerprint {
                 retrieval_mode: "unavailable".into(),

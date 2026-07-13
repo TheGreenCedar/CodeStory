@@ -33,6 +33,22 @@
   aliases still share their existing workspace. Refresh/repair and stdio path
   ownership now use the shared filesystem-aware path comparator, and new
   refresh/repair state preserves native path case.
+- Made managed macOS readiness follow the selected Agent runtime end to end.
+  Bootstrap probes the allocated embedding endpoint instead of assuming port
+  `8080`, Darwin native-process identity uses the locale-stable process start
+  time together with executable and arguments, and a persisted `full` manifest
+  no longer permits agent packet/search after the live endpoint or verified
+  accelerator identity disappears.
+- Centralized CLI sidecar construction behind an early test-isolation gateway.
+  Default-concurrency tests now select a process-unique cache root before any
+  user-cache lookup and an architecture contract prevents new direct
+  constructors from bypassing that boundary.
+- Replaced the Windows-only Codex worktree bootstrap entrypoint with a Node.js
+  dispatcher that preserves the PowerShell implementation on Windows and uses
+  the equivalent POSIX setup on macOS and Linux. The POSIX path validates CLI
+  versions, preserves CLI selection plus release/build fallback order,
+  optionally uses `sccache`, rehydrates compatible caches, refreshes the index,
+  and reports best-effort sidecar readiness.
 - Opened the diagnostic MCP immediately on fresh managed-plugin startup while
   the existing single-flight installer provisions the exact CLI version in the
   background. Status now reports the in-process provisioning state, and the
@@ -128,6 +144,18 @@
 
 ### Added
 
+- Added macOS 15 workspace gates for both Apple Silicon and Intel, POSIX setup
+  self-tests, and a protected Apple Silicon packaged lifecycle proof covering
+  cold/warm managed Metal, PID reuse, endpoint death, readiness blocking,
+  recovery, packet/search, spaces/Unicode paths, corrupt model/server repair,
+  bounded native-log preservation, and marker-scoped cleanup that survives
+  interrupted hardware attempts. Mac release binaries are now Developer ID
+  signed from a protected environment with hardened runtime and a secure
+  timestamp, notarized before packaging, and checked after publication through
+  quarantined archive extraction, Gatekeeper, version, and help execution.
+  Signing and designated requirements are bound to Apple team `PKUJNR8D6F`,
+  while notarization proof is published separately so the binary artifact
+  layout remains stable.
 - Added one bounded reusable retrieval-stage scheduler for narrow and broad
   queries. Request deadlines and cancellation now propagate into sidecar work
   and query-embedding/Qdrant HTTP work; lexical and graph scans poll the shared

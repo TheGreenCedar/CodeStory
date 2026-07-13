@@ -14,6 +14,7 @@ const releaseWorkflow = path.join(workflowRoot, "release.yml");
 const postPublishReleaseSmoke = path.join(workflowRoot, "post-publish-release-smoke.yml");
 const packagedPlatformPr = path.join(workflowRoot, "packaged-platform-pr.yml");
 const packagedPlatformProof = path.join(workflowRoot, "packaged-platform-proof.yml");
+const macosMetalProof = path.join(workflowRoot, "macos-metal-proof.yml");
 const mainBranchSourceGuard = path.join(workflowRoot, "main-branch-source-guard.yml");
 
 function yamlJob(content, name) {
@@ -29,6 +30,14 @@ function namedStep(job, name) {
   if (start < 0) return [];
   const relativeEnd = job.slice(start + 1).findIndex((line) => /^      - /u.test(line));
   return job.slice(start, relativeEnd < 0 ? undefined : start + 1 + relativeEnd);
+}
+
+function requireContent(content, requirements, violationFor) {
+  for (const requirement of requirements) {
+    if (!content.includes(requirement)) {
+      violations.push(violationFor(requirement));
+    }
+  }
 }
 
 function managedPluginMatrixIsRequired(content, jobName, archiveLine) {
@@ -158,11 +167,7 @@ if (!fs.existsSync(closeDevIssues)) {
     '"state_reason=completed"',
   ];
 
-  for (const snippet of requiredSnippets) {
-    if (!content.includes(snippet)) {
-      violations.push(`close-dev-issues.yml must include ${snippet}`);
-    }
-  }
+  requireContent(content, requiredSnippets, snippet => `close-dev-issues.yml must include ${snippet}`);
 
   if (
     !content.includes(
@@ -191,14 +196,20 @@ if (!fs.existsSync(pluginStatic)) {
     ".github/workflows/post-publish-release-smoke.yml",
     ".github/workflows/packaged-platform-pr.yml",
     ".github/workflows/packaged-platform-proof.yml",
+    ".github/workflows/macos-metal-proof.yml",
+    "scripts/codex-worktree-setup.*",
+    "scripts/tests/codex-worktree-setup.test.mjs",
+    "scripts/setup-retrieval-env.*",
+    "macos-setup-static:",
+    "runs-on: macos-15",
+    "node scripts/setup-retrieval-env.mjs --self-test",
+    "node --test scripts/tests/codex-worktree-setup.test.mjs",
+    "node scripts/codex-worktree-setup.mjs --self-test",
+    "test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh",
     "scripts/install-codestory.ps1",
   ];
 
-  for (const snippet of requiredSnippets) {
-    if (!content.includes(snippet)) {
-      violations.push(`plugin-static.yml must include ${snippet}`);
-    }
-  }
+  requireContent(content, requiredSnippets, snippet => `plugin-static.yml must include ${snippet}`);
 }
 
 if (!fs.existsSync(rustCi)) {
@@ -214,13 +225,14 @@ if (!fs.existsSync(rustCi)) {
     "cargo check --workspace --locked",
     "cargo test --locked",
     "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "macos-workspace:",
+    "macos-15",
+    "macos-15-intel",
+    "asset_target: macos-arm64",
+    "asset_target: macos-x64",
   ];
 
-  for (const snippet of requiredSnippets) {
-    if (!content.includes(snippet)) {
-      violations.push(`rust-ci.yml must include ${snippet}`);
-    }
-  }
+  requireContent(content, requiredSnippets, snippet => `rust-ci.yml must include ${snippet}`);
 }
 
 if (!fs.existsSync(releaseWorkflow)) {
@@ -230,41 +242,45 @@ if (!fs.existsSync(releaseWorkflow)) {
   if (content.includes("rustup toolchain install stable")) {
     violations.push("release.yml release builds must not install floating stable Rust");
   }
-  for (const snippet of [
+  requireContent(content, [
     "uses: ./.github/workflows/packaged-platform-proof.yml",
+    "sign_macos: true",
+    "APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}",
+    "APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}",
+    "APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}",
+    "APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}",
+    "APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}",
+    "APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}",
+    "uses: ./.github/workflows/macos-metal-proof.yml",
+    "use_packaged_artifact: true",
     "version: ${{ needs.preflight.outputs.version }}",
     "uses: ./.github/workflows/post-publish-release-smoke.yml",
     "--notes-file target/release-assets/proof-boundaries.md",
     'if [ "${#assets[@]}" -ne 7 ]; then',
     "Expected six binary archives plus SHA256SUMS.txt",
     "macOS x64/arm64",
-    "live managed Metal endpoint survival remains open in #887",
-    "Older-glibc compatibility is unproven",
+    "gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof",
+    "Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.",
     "--generate-notes",
-  ]) {
-    if (!content.includes(snippet)) {
-      violations.push(`release.yml must include ${snippet}`);
-    }
-  }
-  for (const row of [
+  ], snippet => `release.yml must include ${snippet}`);
+  requireContent(content, [
+    "macos-metal-proof:\n    needs:\n      - preflight\n      - packaged-proof\n    uses: ./.github/workflows/macos-metal-proof.yml",
+    "needs:\n      - preflight\n      - packaged-proof\n      - macos-metal-proof\n    runs-on: ubuntu-latest",
     "needs:\n      - preflight\n      - publish\n    uses: ./.github/workflows/post-publish-release-smoke.yml",
-  ]) {
-    if (!content.includes(row)) {
-      violations.push(`release.yml must preserve release proof block ${row.split("\n")[0]}`);
-    }
-  }
+  ], row => `release.yml must preserve release proof block ${row.split("\n")[0]}`);
 }
 
 if (!fs.existsSync(packagedPlatformProof)) {
   violations.push("packaged-platform-proof.yml must own the reusable native package matrix");
 } else {
   const content = fs.readFileSync(packagedPlatformProof, "utf8");
-  for (const snippet of [
+  requireContent(content, [
     "workflow_call:",
     "contents: read",
     'RELEASE_RUST_TOOLCHAIN: "1.95.0"',
     'LINUX_GLIBC_BUILD_IMAGE: "rust:1.95.0-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf"',
     'LINUX_GLIBC_BASELINE_IMAGE: "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"',
+    'APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"',
     "Build Linux x64 at the glibc 2.31 baseline",
     "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
     'cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli"',
@@ -276,14 +292,36 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "- name: Prove managed plugin handoff",
     "--archive \"target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}\"",
     "--managed-plugin-handoff",
+    "sign_macos:",
+    "environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}",
+    "APPLE_DEVELOPER_ID_P12_BASE64",
+    "APPLE_NOTARY_KEY_P8_BASE64",
+    "umask 077",
+    "chmod 600 \"$work_dir/developer-id.p12\" \"$work_dir/notary-key.p8\"",
+    "--options runtime",
+    "--timestamp",
+    "xcrun notarytool submit",
+    "jq -e '.status == \"Accepted\"'",
+    "source=Notarized Developer ID",
+    "TeamIdentifier=${APPLE_DEVELOPER_TEAM_ID}",
+    '> "$proof_dir/designated-requirement.txt" 2>&1',
+    "subject\\\\.OU",
+    "macos-notarization-proof-${{ matrix.asset_target }}",
+    "--intel-runtime-policy",
+    "packaged-intel-policy-proof-${{ matrix.asset_target }}",
+    "if: matrix.asset_target == 'macos-x64'",
     "scripts/install-codestory.ps1 -SelfTest",
     "--checksum-file target/release-dist/SHA256SUMS.txt",
-  ]) {
-    if (!content.includes(snippet)) {
-      violations.push(`packaged-platform-proof.yml must include ${snippet}`);
-    }
+  ], snippet => `packaged-platform-proof.yml must include ${snippet}`);
+  const releaseAssetStart = content.indexOf("- name: Upload release asset");
+  const notarizationProofStart = content.indexOf("- name: Upload macOS notarization proof");
+  const releaseAssetBlock = releaseAssetStart >= 0
+    ? content.slice(releaseAssetStart, notarizationProofStart >= 0 ? notarizationProofStart : undefined)
+    : "";
+  if (releaseAssetBlock.includes("target/notarization-proof")) {
+    violations.push("packaged-platform-proof.yml must keep notarization evidence out of the flat binary release artifact");
   }
-  for (const row of [
+  requireContent(content, [
     "- os: ubuntu-latest\n            rust_target: x86_64-unknown-linux-gnu\n            asset_target: linux-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
     "- os: ubuntu-24.04-arm\n            rust_target: aarch64-unknown-linux-gnu\n            asset_target: linux-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
     "- os: windows-latest\n            rust_target: x86_64-pc-windows-msvc\n            asset_target: windows-x64\n            exe_suffix: \".exe\"\n            extension: zip",
@@ -291,11 +329,7 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "- os: macos-15-intel\n            rust_target: x86_64-apple-darwin\n            asset_target: macos-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
     "- os: macos-15\n            rust_target: aarch64-apple-darwin\n            asset_target: macos-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
     "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
-  ]) {
-    if (!content.includes(row)) {
-      violations.push(`packaged-platform-proof.yml must preserve native proof block ${row.split("\n")[0]}`);
-    }
-  }
+  ], row => `packaged-platform-proof.yml must preserve native proof block ${row.split("\n")[0]}`);
   requireManagedPluginStep(
     content,
     "build",
@@ -308,7 +342,7 @@ if (!fs.existsSync(postPublishReleaseSmoke)) {
   violations.push("post-publish-release-smoke.yml must exist for native published-asset proof");
 } else {
   const content = fs.readFileSync(postPublishReleaseSmoke, "utf8");
-  for (const snippet of [
+  requireContent(content, [
     "workflow_call:",
     "ubuntu-latest",
     "ubuntu-24.04-arm",
@@ -324,14 +358,22 @@ if (!fs.existsSync(postPublishReleaseSmoke)) {
     "--version-only",
     "- name: Prove managed plugin handoff",
     "--managed-plugin-handoff",
+    "Prove published macOS signature, notarization, and Gatekeeper acceptance",
+    "archive-quarantine.txt",
+    "extracted-binary-quarantine.txt",
+    "Authority=Developer ID Application:",
+    "source=Notarized Developer ID",
+    'APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"',
+    "TeamIdentifier=${APPLE_DEVELOPER_TEAM_ID}",
+    '> "$proof_dir/designated-requirement.txt" 2>&1',
+    "subject\\\\.OU",
+    "--intel-runtime-policy",
+    "target/post-publish-intel-policy-proof",
+    "if: matrix.asset_target == 'macos-x64'",
     "scripts/install-codestory.ps1 -SelfTest",
     "--checksum-file \"${{ steps.asset.outputs.checksum }}\"",
-  ]) {
-    if (!content.includes(snippet)) {
-      violations.push(`post-publish-release-smoke.yml must include ${snippet}`);
-    }
-  }
-  for (const row of [
+  ], snippet => `post-publish-release-smoke.yml must include ${snippet}`);
+  requireContent(content, [
     "- os: ubuntu-latest\n            asset_target: linux-x64\n            extension: tar.gz",
     "- os: ubuntu-24.04-arm\n            asset_target: linux-arm64\n            extension: tar.gz",
     "- os: windows-latest\n            asset_target: windows-x64\n            extension: zip",
@@ -339,11 +381,7 @@ if (!fs.existsSync(postPublishReleaseSmoke)) {
     "- os: macos-15-intel\n            asset_target: macos-x64\n            extension: tar.gz",
     "- os: macos-15\n            asset_target: macos-arm64\n            extension: tar.gz",
     "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
-  ]) {
-    if (!content.includes(row)) {
-      violations.push(`post-publish-release-smoke.yml must preserve native proof block ${row.split("\n")[0]}`);
-    }
-  }
+  ], row => `post-publish-release-smoke.yml must preserve native proof block ${row.split("\n")[0]}`);
   if (content.includes("sha256sum")) {
     violations.push("post-publish-release-smoke.yml must use the portable Python checksum gate");
   }
@@ -359,23 +397,55 @@ if (!fs.existsSync(packagedPlatformPr)) {
   violations.push("packaged-platform-pr.yml must run the native package matrix on implementation PRs");
 } else {
   const content = fs.readFileSync(packagedPlatformPr, "utf8");
-  for (const snippet of [
+  requireContent(content, [
     "pull_request:",
     "contents: read",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
     "version: ${{ needs.prepare.outputs.version }}",
     ".github/scripts/check-packaged-agent-proof.py",
     ".github/scripts/check-linux-glibc-baseline.sh",
+    ".github/scripts/check-workflow-policy.mjs",
+    ".github/workflows/macos-metal-proof.yml",
     ".github/workflows/post-publish-release-smoke.yml",
     ".github/workflows/packaged-platform-proof.yml",
-  ]) {
-    if (!content.includes(snippet)) {
-      violations.push(`packaged-platform-pr.yml must include ${snippet}`);
-    }
-  }
+    ".github/workflows/rust-ci.yml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/**",
+    "scripts/codex-worktree-setup.*",
+    "scripts/tests/codex-worktree-setup.test.mjs",
+    "scripts/setup-retrieval-env.*",
+    ".codex/environments/environment.toml",
+  ], snippet => `packaged-platform-pr.yml must include ${snippet}`);
   if (content.includes("contents: write") || content.includes("uses: ./.github/workflows/release.yml")) {
     violations.push("packaged-platform-pr.yml must not request release permissions or call the publishing workflow");
   }
+}
+
+if (!fs.existsSync(macosMetalProof)) {
+  violations.push("macos-metal-proof.yml must gate release assets on protected Apple Silicon hardware");
+} else {
+  const content = fs.readFileSync(macosMetalProof, "utf8");
+  requireContent(content, [
+    "workflow_call:",
+    "workflow_dispatch:",
+    "use_packaged_artifact:",
+    "runs-on: [self-hosted, macOS, ARM64, codestory-metal]",
+    "environment: macos-metal-release",
+    "actions/download-artifact@v8.0.1",
+    "name: codestory-cli-macos-arm64",
+    "node scripts/setup-retrieval-env.mjs --self-test",
+    "python3 --version",
+    "test \"$macos_major\" -ge 15",
+    "--native-accelerator-lifecycle",
+    "--native-edge-cases",
+    "CODESTORY_PROOF_TEMP_ROOT:",
+    "Clean and assert proof-owned hardware state",
+    "--cleanup-proof-temp-root",
+    "CODESTORY_EMBED_DEVICE_PROVIDER: metal",
+    "CODESTORY_EMBED_ALLOW_CPU: \"0\"",
+    "macos-arm64-metal-proof-${{ inputs.version }}",
+  ], snippet => `macos-metal-proof.yml must include ${snippet}`);
 }
 
 if (!fs.existsSync(mainBranchSourceGuard)) {
@@ -390,11 +460,7 @@ if (!fs.existsSync(mainBranchSourceGuard)) {
     "BASE_REPO",
   ];
 
-  for (const snippet of requiredSnippets) {
-    if (!content.includes(snippet)) {
-      violations.push(`main-branch-source-guard.yml must include ${snippet}`);
-    }
-  }
+  requireContent(content, requiredSnippets, snippet => `main-branch-source-guard.yml must include ${snippet}`);
 }
 
 if (violations.length > 0) {

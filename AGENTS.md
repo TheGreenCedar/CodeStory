@@ -18,11 +18,14 @@
 - Backend build/test: `cargo build`, `cargo test`, `cargo check`, `cargo fmt`, `cargo clippy`.
 - CLI runtime: `cargo run --release -p codestory-cli -- index --project .`.
 - Skill-first grounding: `cargo run --release -p codestory-cli -- ground --project .`.
-- Codex worktree setup runs `scripts/codex-worktree-setup.ps1` before the thread
-  starts: it resolves a ready CLI from `CODESTORY_CLI`, PATH, this worktree, or a
-  sibling worktree before building with `sccache`; then it tries `cache
-  rehydrate`, refreshes the SQLite index, and best-effort refreshes retrieval
-  sidecars/status.
+- Codex worktree setup runs `node scripts/codex-worktree-setup.mjs` before the
+  thread starts. The dispatcher uses the existing PowerShell implementation on
+  Windows and `scripts/codex-worktree-setup.sh` on macOS/Linux. Both resolve a
+  version-matched CLI from `CODESTORY_CLI`, PATH, the CodeStory install
+  directory, this worktree, or a sibling worktree before trying the current
+  release and then a release build with optional `sccache`; they then try
+  `cache rehydrate`, refresh the SQLite index, and best-effort repair/report
+  sidecar readiness.
 - Release version checks: `python .github/scripts/check-codestory-release.py --version <version>` and `node .github/scripts/check-workflow-policy.mjs`.
 - On Windows, the Codex npm shim should be invoked as `codex.cmd` (typically under `%APPDATA%\\npm`); using the extensionless `codex` shim can fail with `os error 193`.
 - In this PowerShell environment, large parallel file reads can truncate output; when investigating a single large file, prefer one direct read command (for example `Get-Content` or `cmd /c type`) before parallelizing.

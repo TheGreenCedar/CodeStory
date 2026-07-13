@@ -35,6 +35,7 @@ Run Cargo commands serially in this repo.
 | --- | --- |
 | Docs only | `git diff --check`, `node .github/scripts/check-doc-links.mjs` |
 | Routine code | `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| macOS workspace | On both `macos-15` and `macos-15-intel`: `cargo check --workspace --locked`, `cargo test --locked`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`; keep commands serialized within each job |
 | Concurrent publication | `cargo test -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture`; `rust-ci.yml` repeats this focused contract on Ubuntu, Windows, and macOS |
 | Publication fault recovery | `cargo test -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture`; `cargo test -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture`; `rust-ci.yml` repeats both proofs on Ubuntu, Windows, and macOS |
 | Release-blocking fidelity | `cargo test -p codestory-indexer --test fidelity_regression`, `cargo test -p codestory-indexer --test tictactoe_language_coverage`, `cargo test -p codestory-runtime --test retrieval_eval` |
@@ -85,6 +86,18 @@ Do not use `cargo test --workspace --all-targets` as the routine broad test
 gate. `--all-targets` expands into benchmark targets; Criterion benches are
 compiled or run through the bench lane below.
 
+The macOS CI merge bar runs the complete workspace lane independently on
+Apple Silicon (`macos-15`) and Intel (`macos-15-intel`). Mac setup changes must
+also pass the retrieval setup self-test, the Node dispatcher test, and the POSIX
+worktree setup self-test. Run locally from an isolated cache when changing these
+surfaces:
+
+```sh
+node scripts/setup-retrieval-env.mjs --self-test
+node --test scripts/tests/codex-worktree-setup.test.mjs
+node scripts/codex-worktree-setup.mjs --self-test
+```
+
 ## Release And Version Bumps
 
 `crates/codestory-cli/Cargo.toml` is the release version source. When bumping a
@@ -116,7 +129,10 @@ cross-platform `codestory-cli` archives, and `SHA256SUMS.txt`.
 
 Binary release assets are packaging evidence only. They are not packet/search
 readiness proof; keep using the sidecar evidence tiers below before claiming
-agent-facing packet/search readiness.
+agent-facing packet/search readiness. Release builds fail closed unless both
+Mac binaries are Developer ID signed with hardened runtime and secure timestamp
+and Apple notarization returns `Accepted` before the existing tarballs are
+created. The transient notarization ZIP is evidence input, not a published asset.
 
 Release and post-publish agent proof must also exercise the installed plugin
 launcher with `--plugin-root plugins/codestory`. The packaged proof fails if
@@ -132,14 +148,19 @@ plugin-launch surfaces call the same read-only reusable packaged-proof workflow
 as the release, so the native matrix is reviewed before publication without
 granting release permissions to pull-request code:
 
+Pull-request cells do not receive the protected Apple signing credentials, so
+their Mac archives prove packaging and runtime behavior but remain unsigned.
+Developer ID signing, notarization, and Gatekeeper checks apply to the release
+and post-publish cells only.
+
 | Asset | Native runner | Required packaged proof |
 | --- | --- | --- |
 | Linux x64 | `ubuntu-latest`, plus `ubuntu:20.04` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, the full-sidecar agent proof, and packaged-archive execution on glibc 2.31 |
 | Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
-| macOS x64 | `macos-15-intel` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
-| macOS arm64 | `macos-15` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
+| macOS x64 | `macos-15-intel` | Version and help (Developer ID signed/notarized in release and post-publish cells), stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, actionable failure without a backend, and explicitly labelled CPU/external operation when configured; never Metal |
+| macOS arm64 | `macos-15` | Version and help (Developer ID signed/notarized in release and post-publish cells), stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 
 The managed convergence proof on every native runner uses an isolated project
 with a complete publication, then introduces source drift while leaving the
@@ -160,6 +181,58 @@ stderr, and exit status for version, help, and stdio initialize, so loader or
 symbol-version failures fail the job without losing diagnostics. This does not
 claim musl support or extend the glibc baseline claim to Linux arm64.
 
+The separate protected Apple Silicon workflow runs the packaged CLI and plugin
+launcher on a self-hosted macOS 15 ARM64 runner. It is release-blocking and must
+preserve cold, warm, endpoint-death, and repaired status/log/packet artifacts.
+A passing run proves checksum-pinned model/server setup, `native_spawned` Metal,
+positive offload, a bounded live embed smoke, `gpu_proof=verified`, full
+retrieval, stable PID reuse across MCP restart, no duplicate server, readiness
+blocking after endpoint death, successful repair/recovery, packet/search, and
+proof-owned cleanup. The same protected run copies the repository and cache
+through spaces/Unicode paths, proves dynamic selection away from an occupied
+embedding port, reclaims a vanished lease, interrupts and recovers a proof-owned
+repair worker, and checksum-repairs corrupt model plus partial native-server
+installs. It preserves bounded current-launch logs and exact launch identity
+before marker-scoped cleanup; the following run also cleans a marker-owned prior
+attempt if cancellation prevented the prior `always()` step. Contract tests or
+hosted package smoke cannot replace this hardware evidence.
+
+An actual Mac host reboot remains a separate two-phase operator proof because a
+GitHub job cannot safely reboot its own self-hosted runner and resume the same
+job. Preserve the pre-reboot PID/launch/status bundle, reboot the protected host,
+then run the packaged warm/recovery workflow and attach the post-reboot
+status/packet/search bundle. Do not describe the automated hardware job alone as
+host-restart evidence.
+
+After publication, both Mac tarballs receive a download quarantine before
+extraction. Because command-line tar does not propagate that xattr, the proof
+records the archive quarantine and transfers the same event to the extracted
+binary before `codesign --verify`, online Gatekeeper `spctl` assessment,
+version, and help execution on each native architecture. Preserve the
+release-time `notarytool` result and post-publish quarantine,
+codesign/Gatekeeper artifacts. Signing/notary material is scoped to the
+protected `macos-release-signing` environment and written with owner-only
+permissions. Release-time and post-publish proof require both the reported
+`TeamIdentifier` and the designated-requirement certificate OU to match Apple
+team `PKUJNR8D6F`. A Mac release is blocked when those credentials are
+unavailable; publishing an unsigned fallback is not allowed.
+
+Provision the signing values as environment secrets on
+`macos-release-signing`, not only as repository secrets:
+
+- `APPLE_DEVELOPER_ID_P12_BASE64`
+- `APPLE_DEVELOPER_ID_P12_PASSWORD`
+- `APPLE_SIGNING_IDENTITY` (the exact `Developer ID Application` certificate
+  common name)
+- `APPLE_NOTARY_KEY_P8_BASE64`
+- `APPLE_NOTARY_KEY_ID`
+- `APPLE_NOTARY_ISSUER_ID`
+
+Create `macos-metal-release` with the required release protection rules, and
+authorize a protected Apple Silicon self-hosted runner labelled `macOS`,
+`ARM64`, and `codestory-metal`. Repository configuration is part of the release
+gate: a checkout containing these workflows is not sufficient on its own.
+
 Proof cleanup validates the exact current `lexical_data_dir`. During the v0.15
 migration window it accepts the removed `zoekt_data_dir` spelling only as
 read compatibility for an otherwise proof-owned state file; remove that alias
@@ -174,11 +247,15 @@ version must become the MCP server and active retention entry; the prior version
 must remain only as the verified rollback. This is deterministic upgrade
 convergence proof, not Apple Silicon endpoint-survival or older-glibc evidence.
 
-Release closeout is not complete until every published asset cell passes and
-the corresponding CodeStory plugin-source update is committed or merged in
-`TheGreenCedar/AgentPluginMarketplace`, followed by marketplace refresh and
-managed-plugin version/status readback. Source CI cannot substitute for that
-external pointer and installed-runtime proof.
+Release closeout is not complete until the Mac workspace jobs, protected Metal
+workflow, and every post-publish asset cell pass; a real fresh Codex install
+from the marketplace reaches the expected status/packet behavior; the separate
+two-phase protected-host reboot bundle is attached; and the
+corresponding CodeStory plugin-source update is committed or merged in
+`TheGreenCedar/AgentPluginMarketplace`. Finish with marketplace refresh plus
+installed managed-runtime path/version and project-scoped status readback.
+Source CI cannot substitute for that external pointer, fresh host install, or
+installed-runtime proof.
 
 ## Docs-Only Fast Path
 

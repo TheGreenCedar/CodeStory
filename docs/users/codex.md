@@ -17,6 +17,25 @@ Codex is the reference host for the managed MCP plugin path. See
 
 Surfaces and readiness: [Glossary](../glossary.md).
 
+## macOS requirements
+
+CodeStory supports macOS 15 and later on Apple Silicon and Intel Macs. Install
+the Xcode Command Line Tools and Node.js before using the managed plugin or
+source-worktree setup. Docker Desktop or another compatible Docker engine is
+required for managed Qdrant; make sure it is running before repairing
+packet/search retrieval.
+
+- Apple Silicon uses the checksum-pinned native `llama-server` and managed
+  Metal path. A healthy agent lane reports `launch_mode=native_spawned`, live
+  native-process identity, and verified GPU proof.
+- Intel Macs support the native CLI, plugin provisioning, local index, and
+  grounding. Packet/search requires either explicit CPU allowance or a trusted
+  external embedding endpoint under an explicit operator policy. Intel never
+  reports or implies managed Metal support.
+
+The plugin downloads the matching signed and notarized CLI. Contributors who
+build the CLI locally also need the Rust toolchain; normal plugin users do not.
+
 ## Install
 
 1. Open Codex in the repository you want to ground.
@@ -158,8 +177,8 @@ More pairs, anti-patterns, and language-flavored examples:
 | Windows x64 | Yes | Native Vulkan |
 | Windows arm64 | Yes | No managed accelerated sidecar cell; use a proven external endpoint or explicit degraded CPU opt-in |
 | Linux x64 / arm64 | Yes | Docker Vulkan with a verified `/dev/dri` render node |
-| macOS arm64 | Yes | Native Metal |
-| macOS x64 | Yes | No managed accelerated sidecar cell; use a proven external embedding endpoint or explicit degraded CPU opt-in |
+| macOS arm64 (macOS 15+) | Yes | Managed native Metal |
+| macOS x64 (macOS 15+) | Yes | No managed Metal cell; use a trusted external endpoint under explicit policy or explicit degraded CPU opt-in |
 
 Linux CUDA, HIP/ROCm, SYCL, and OpenVINO remain contract-only until packaging,
 launch, and live GPU evidence exist. A compatible version difference is
@@ -193,6 +212,13 @@ publishes a fresh schema-3 snapshot.
 | `recommended_next_calls` | Start with `agent-guide`, then use allowed tools | For packet/search blockers, follow the listed `sidecar_setup repair` and status read sequence; if tools are hidden, stop and report host visibility |
 
 Shared repair lanes: [Troubleshooting](troubleshooting.md).
+
+`retrieval_mode=full` describes the persisted retrieval manifest; it does not
+override live infrastructure. When acceleration is required, packet/search is
+allowed only while the selected endpoint is reachable, the native executable,
+arguments, and process-start identity still match, and GPU proof is `verified`.
+If the endpoint dies, status changes the agent lane to `repair_retrieval` and
+keeps local navigation available with actionable repair guidance.
 
 Optional Git dirty-marker hooks (local graph freshness after checkout/merge):
 

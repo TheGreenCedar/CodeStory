@@ -2431,11 +2431,14 @@ mod tests {
             endpoint: crate::config::SidecarLayout::embed_base_url(native_runtime.embed_http_port),
             pid: None,
             spawned_at_epoch_ms: None,
+            process_start_identity: None,
+            spawn_protocol: None,
             launch_args: Vec::new(),
             launch_fingerprint_sha256: Some("expected-fingerprint".into()),
             executable_source: None,
             executable_path: Some("llama-server".into()),
             model_path: Some("bge-base-en-v1.5.gguf".into()),
+            log_path: Some("llama-server-native.log".into()),
             requested_device: None,
         };
         let mut stale_native_launch = expected_native_launch.clone();

@@ -192,11 +192,11 @@ fn identity_has_consistent_scope(
     canonical_repository_id: Option<&str>,
     portable_reuse_eligible: bool,
 ) -> bool {
-    let portable_id = canonical_repository_id.unwrap_or(workspace_id);
-    let expected = if portable_reuse_eligible {
-        portable_id
+    let expected_project_id = canonical_repository_id.unwrap_or(workspace_id);
+    let expected_artifact_scope_id = if portable_reuse_eligible {
+        expected_project_id
     } else {
         workspace_id
     };
-    project_id == expected && artifact_scope_id == expected
+    project_id == expected_project_id && artifact_scope_id == expected_artifact_scope_id
 }

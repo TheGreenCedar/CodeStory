@@ -16,7 +16,7 @@ CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#
 | Symptom | Supported action | Check in output |
 | --- | --- | --- |
 | Repo map stale or blocked | Agent reads `codestory://status`, follows `recommended_next_calls`, then rereads status | Local graph surfaces are allowed after the reread |
-| Broad search blocked | Same MCP `sidecar_setup repair` loop | `packet`, `search`, or `context` allowed and `retrieval_mode` is `full` |
+| Broad search blocked | Same MCP `sidecar_setup repair` loop | `packet`, `search`, or `context` allowed, `retrieval_mode` is `full`, and any required live accelerator proof is verified |
 | MCP down, need handoff | Reload/fix host MCP; CLI can collect a debug transcript only | `codestory://status` becomes visible in the agent host |
 | Sidecar health | MCP status first; CLI `retrieval status` only for maintainer evidence | `retrieval_mode` is `full` before trusting packet/search |
 
@@ -174,7 +174,11 @@ codestory-cli retrieval status --project <repo> --format json
 codestory-cli fix --project <repo> --format json
 ```
 
-Require `retrieval_mode: "full"` before trusting packet/search evidence.
+Require `retrieval_mode: "full"` before trusting packet/search evidence. Under
+`accelerator_required`, also require a reachable selected embedding endpoint,
+matching native-process identity, and
+`readiness_broker.gpu_proof.proof_status=verified`; the persisted manifest does
+not override a dead or unverifiable runtime.
 Command table: [CLI reference - readiness and repair](cli-reference.md#readiness-and-repair).
 
 ### Apple Silicon acceleration
@@ -195,6 +199,12 @@ and device. A reachable endpoint or device inventory without both pieces stops
 with `gpu_unverified` instead of remaining in a long `repairing` state.
 Accelerator-required external endpoints intentionally remain unverified because
 CodeStory does not own their runtime log or process identity.
+
+If a previously healthy Metal endpoint exits, status retains
+`retrieval_mode=full` as the persisted-manifest classification but changes the
+agent lane to `repair_retrieval`, removes packet/search from allowed surfaces,
+and reports `gpu_unverified`. Follow the recommended repair call; do not delete
+the manifest or cache just to make the status field change.
 
 The old failure pattern is `accelerator_request_provider=vulkan`,
 `accelerator_request_device=Vulkan0`, Docker/Colima embed launch, and
@@ -220,6 +230,21 @@ CPU-backed embeddings are degraded and explicit. Use
 `CODESTORY_EMBED_ALLOW_CPU=1` or `CODESTORY_EMBED_DEVICE_POLICY=allow_cpu` only
 when CPU retrieval is acceptable for that machine; CPU opt-in is not the default
 Apple Silicon success path.
+
+### Intel macOS retrieval
+
+Intel macOS supports the signed native CLI, managed plugin provisioning, local
+index/ground, and cleanup, but has no managed Metal backend. Without a prepared
+embedding backend, agent status should fail with actionable acceleration
+guidance while local navigation remains available.
+
+For packet/search, either opt into degraded CPU execution explicitly or point
+`CODESTORY_EMBED_LLAMACPP_URL` at a trusted external llama.cpp-compatible
+endpoint and select an explicit CPU/external operator policy. Because CodeStory
+cannot bind provider-owned logs and PID identity to an external request, that
+endpoint cannot satisfy `accelerator_required`; use the explicit CPU allowance
+when accepting it. Status and evidence must label the path CPU/external and
+must never claim Metal on Intel.
 
 ## MCP visibility failure
 

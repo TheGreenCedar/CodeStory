@@ -5,13 +5,23 @@ on:
     paths:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/check-linux-glibc-baseline.sh
+      - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/package-codestory-release.py
+      - .github/workflows/macos-metal-proof.yml
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/post-publish-release-smoke.yml
       - .github/workflows/release.yml
+      - .github/workflows/rust-ci.yml
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
       - plugins/codestory/**
       - scripts/install-codestory.ps1
+      - scripts/codex-worktree-setup.*
+      - scripts/tests/codex-worktree-setup.test.mjs
+      - scripts/setup-retrieval-env.*
+      - .codex/environments/environment.toml
   workflow_dispatch:
 
 permissions:

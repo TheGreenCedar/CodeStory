@@ -181,23 +181,22 @@ fn current_gpu_runtime_identity(
         codestory_retrieval::SidecarProfile::Local
     };
     #[cfg(not(test))]
-    let runtime = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    let runtime = crate::sidecar_runtime::for_project_with_run_id(
         &input.project_root,
         profile,
         input.agent_run_id.as_deref(),
     );
     #[cfg(test)]
-    let runtime =
-        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
-            Some(&input.project_root),
-            profile,
-            input.agent_run_id.as_deref(),
-            &super::paths::broker_cache_root(),
-        );
+    let runtime = crate::sidecar_runtime::for_project_with_run_id_in_cache(
+        Some(&input.project_root),
+        profile,
+        input.agent_run_id.as_deref(),
+        &super::paths::broker_cache_root(),
+    );
     gpu_runtime_identity_for_sidecar(&runtime, &input.project_root, expected_project_identity)
 }
 
-fn gpu_runtime_identity_for_sidecar(
+pub(super) fn gpu_runtime_identity_for_sidecar(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     project_root: &std::path::Path,
     expected_project_identity: &codestory_workspace::ProjectIdentityV3,

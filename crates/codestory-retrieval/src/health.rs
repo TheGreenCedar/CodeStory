@@ -78,6 +78,10 @@ pub struct EmbeddingLaunchMetadata {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_at_epoch_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +92,8 @@ pub struct EmbeddingLaunchMetadata {
     pub executable_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_device: Option<String>,
 }
@@ -205,6 +211,9 @@ pub fn attach_repair_hint(
 fn repair_reason_code(degraded_reason: &str) -> String {
     if degraded_reason.starts_with("sidecar_manifest_stale:") {
         return "sidecar_manifest_stale".into();
+    }
+    if degraded_reason.starts_with("embedding_runtime_unavailable:") {
+        return "embedding_runtime_unavailable".into();
     }
     degraded_reason.to_string()
 }
@@ -416,19 +425,21 @@ pub fn unavailable_status_report_with_embedding_device(
     }
 }
 
-/// Local lexical storage plus Qdrant and embedding reachability before a project generation.
-pub fn probe_infrastructure_health(layout: &SidecarLayout) -> InfrastructureHealth {
-    let embedding_device = crate::embeddings::embedding_device_readiness();
-    probe_infrastructure_health_with_embedding_device(layout, &embedding_device)
+/// Runtime-scoped lexical storage plus Qdrant and embedding reachability before a project
+/// generation.
+pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> InfrastructureHealth {
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    probe_infrastructure_health_with_embedding_device(runtime, &embedding_device)
 }
 
 pub fn probe_infrastructure_health_with_embedding_device(
-    layout: &SidecarLayout,
+    runtime: &SidecarRuntimeConfig,
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> InfrastructureHealth {
+    let layout = &runtime.layout;
     let qdrant_client = QdrantClient::new(layout);
     let qdrant_probe = qdrant_client.list_collections_probe();
-    let embed_probe = crate::embeddings::probe_product_embedding_runtime();
+    let embed_probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
     InfrastructureHealth {
         lexical_ready: layout.lexical_data_dir.is_dir(),
         qdrant_reachable: qdrant_probe.reachable,

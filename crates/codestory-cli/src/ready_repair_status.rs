@@ -1,9 +1,6 @@
 use anyhow::Result;
 use codestory_contracts::api::{ApiError, ApiErrorDetails, CommandFailureEnvelope};
-use codestory_retrieval::{
-    DEFAULT_AGENT_RUN_ID, SidecarProfile, SidecarRuntimeConfig,
-    sidecar_runtime_for_project_with_run_id,
-};
+use codestory_retrieval::{DEFAULT_AGENT_RUN_ID, SidecarProfile, SidecarRuntimeConfig};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -776,7 +773,7 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
     project_root: &Path,
     run_id: Option<&str>,
 ) -> Vec<ReadyRepairCleanup> {
-    let default_sidecar = sidecar_runtime_for_project_with_run_id(
+    let default_sidecar = crate::sidecar_runtime::for_project_with_run_id(
         project_root,
         SidecarProfile::Agent,
         run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
@@ -1191,7 +1188,10 @@ fn probe_process_platform(pid: u32) -> ProcessProbe {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn probe_process_platform(pid: u32) -> ProcessProbe {
     let mut command = Command::new("ps");
-    command.args(["-o", "lstart=", "-p", &pid.to_string()]);
+    command
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .args(["-o", "lstart=", "-p", &pid.to_string()]);
     let Some(output) = bounded_process_probe_output(&mut command) else {
         return ProcessProbe::Unknown;
     };
@@ -1236,7 +1236,7 @@ fn read_ready_repair_status_file(path: &Path) -> Option<ReadyRepairStatus> {
 fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<PathBuf> {
     let mut paths = BTreeSet::new();
     if let Some(run_id) = run_id {
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project_root,
             SidecarProfile::Agent,
             Some(run_id),
@@ -1245,7 +1245,7 @@ fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<P
         return paths.into_iter().collect();
     }
 
-    let default_sidecar = sidecar_runtime_for_project_with_run_id(
+    let default_sidecar = crate::sidecar_runtime::for_project_with_run_id(
         project_root,
         SidecarProfile::Agent,
         Some(DEFAULT_AGENT_RUN_ID),
@@ -1351,7 +1351,7 @@ mod tests {
             embed_http_port: 8080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: Default::default(),
-            ..SidecarRuntimeConfig::local()
+            ..crate::sidecar_runtime::local()
         }
     }
 
@@ -1607,7 +1607,7 @@ mod tests {
     fn ready_repair_worker_result_round_trips() {
         let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some(DEFAULT_AGENT_RUN_ID),
@@ -1660,7 +1660,7 @@ mod tests {
     fn concurrent_terminal_write_and_abandoned_cleanup_preserve_terminal_result() {
         let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some(DEFAULT_AGENT_RUN_ID),
@@ -1713,7 +1713,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             let sidecar = sidecar.clone();
             let terminal = terminal.clone();
-            thread::spawn(move || {
+            crate::sidecar_runtime::spawn_with_cache_access(move || {
                 barrier.wait();
                 write_ready_repair_worker_result(&sidecar, &terminal).expect("terminal write");
             })
@@ -1721,7 +1721,7 @@ mod tests {
         let cleaner = {
             let barrier = Arc::clone(&barrier);
             let project_root = project.path().to_path_buf();
-            thread::spawn(move || {
+            crate::sidecar_runtime::spawn_with_cache_access(move || {
                 barrier.wait();
                 cleanup_abandoned_ready_repair_status(&project_root, Some(DEFAULT_AGENT_RUN_ID));
             })
@@ -2018,7 +2018,7 @@ mod tests {
     #[test]
     fn live_pid_stale_repair_status_is_preserved_and_reported_busy() {
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some("test-proof"),
@@ -2208,7 +2208,7 @@ mod tests {
     fn cleanup_abandoned_ready_repair_status_removes_dead_pid_status_and_stale_locks() {
         let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some("shared-agent"),

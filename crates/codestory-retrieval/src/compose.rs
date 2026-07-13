@@ -9,20 +9,28 @@ use crate::qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
     repair_qdrant_storage,
 };
-use crate::sidecar::{SidecarStateFile, sidecar_up_with_runtime_and_launch_metadata};
+#[cfg(test)]
+use crate::sidecar::sidecar_up_with_runtime_and_launch_metadata;
+use crate::sidecar::{
+    EmbeddingLaunchOwnership, SidecarStateFile,
+    sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_origin,
+};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 #[cfg(windows)]
 use std::io;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use thiserror::Error;
 
 /// Relative path from repository root to the retrieval compose file.
 pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
@@ -30,6 +38,11 @@ const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-
 const DOCKER_ADDRESS_POOL_EXHAUSTED_REASON: &str = "docker_address_pool_exhausted";
 const DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE: &str =
     "all predefined address pools have been fully subnetted";
+pub const NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON: &str = "native_embedding_port_bind_failed";
+pub const NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL: &str = "darwin_exec_gate_v1";
+const NATIVE_EMBEDDING_DARWIN_EXEC_GATE_TOKEN: &str = "codestory-native-launch-v1";
+#[cfg(target_os = "macos")]
+const NATIVE_EMBEDDING_DARWIN_EXEC_GATE_SCRIPT: &str = "IFS= read -r gate || exit 125; [ \"$gate\" = codestory-native-launch-v1 ] || exit 126; exec \"$@\"";
 const LINUX_VULKAN_RENDER_NODE: &str = "/dev/dri";
 const VULKAN_COMPOSE_OVERRIDE: &str =
     "services:\n  embed:\n    devices:\n      - /dev/dri:/dev/dri\n";
@@ -63,6 +76,11 @@ unsafe extern "system" {
     fn GetStdHandle(std_handle: u32) -> *mut std::ffi::c_void;
     fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
     fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn setsid() -> std::ffi::c_int;
 }
 
 #[cfg(windows)]
@@ -164,6 +182,39 @@ pub struct BootstrapSidecarsOptions {
     pub skip_compose: bool,
     pub wait_timeout: Duration,
     pub allow_native_embedding_spawn: bool,
+    /// A broker-verified native launch owned by this workspace. This permits a
+    /// later operation/profile to attach to the same process without treating
+    /// a reachable machine-global endpoint as ownerless.
+    pub reusable_native_embedding_launch: Option<crate::health::EmbeddingLaunchMetadata>,
+}
+
+/// Structured ownership evidence carried when a freshly spawned native process survives a
+/// pre-state cleanup failure. The CLI broker uses this to quarantine the exact launch instead of
+/// dropping its machine lock and allowing a duplicate process to start.
+#[derive(Debug, Error)]
+#[error("native embedding startup cleanup failed; exact launch must remain quarantined: {detail}")]
+pub struct NativeEmbeddingStartupCleanupFailure {
+    launch: crate::health::EmbeddingLaunchMetadata,
+    detail: String,
+}
+
+impl NativeEmbeddingStartupCleanupFailure {
+    pub fn new(launch: crate::health::EmbeddingLaunchMetadata, error: &anyhow::Error) -> Self {
+        Self {
+            launch,
+            detail: format!("{error:#}"),
+        }
+    }
+
+    pub fn launch(&self) -> &crate::health::EmbeddingLaunchMetadata {
+        &self.launch
+    }
+}
+
+pub fn native_embedding_startup_cleanup_failure(
+    error: &anyhow::Error,
+) -> Option<&NativeEmbeddingStartupCleanupFailure> {
+    error.downcast_ref::<NativeEmbeddingStartupCleanupFailure>()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,6 +229,7 @@ struct NativeEmbeddingServerLaunch {
 struct NativeEmbeddingSpawn {
     pid: u32,
     spawned_at_epoch_ms: i64,
+    newly_spawned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +302,7 @@ pub fn bootstrap_sidecars_with_runtime(
             skip_compose,
             wait_timeout,
             allow_native_embedding_spawn,
+            reusable_native_embedding_launch: None,
         },
         |_| {},
     )
@@ -259,7 +312,23 @@ pub fn bootstrap_sidecars_with_runtime_progress(
     runtime: &SidecarRuntimeConfig,
     repo_root: Option<&Path>,
     options: BootstrapSidecarsOptions,
+    progress: impl FnMut(&'static str),
+) -> Result<BootstrapReport> {
+    bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
+        runtime,
+        repo_root,
+        options,
+        progress,
+        |_| Ok(()),
+    )
+}
+
+pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
+    runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
+    options: BootstrapSidecarsOptions,
     mut progress: impl FnMut(&'static str),
+    mut observe_new_native_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
 ) -> Result<BootstrapReport> {
     let port_lease_heartbeat = runtime.start_port_lease_heartbeat()?;
     let BootstrapSidecarsOptions {
@@ -268,6 +337,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
         skip_compose,
         wait_timeout,
         allow_native_embedding_spawn,
+        reusable_native_embedding_launch,
     } = options;
     let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
@@ -284,39 +354,99 @@ pub fn bootstrap_sidecars_with_runtime_progress(
         Some(resolve_compose_file(repo_root, compose_file.as_deref())?)
     };
 
-    let compose_started = if let Some(path) = resolved_compose.as_ref() {
-        with_bootstrap_progress(&mut progress, "container startup", || {
-            docker_compose_up(path, repo_root, runtime, launch_mode, false)
-        })?;
-        true
-    } else {
-        false
-    };
+    let (compose_started, compose_owned_for_rollback) =
+        if let Some(path) = resolved_compose.as_ref() {
+            let compose_project_preexisting = docker_compose_project_has_containers(runtime)?;
+            start_compose_with_rollback(
+                !compose_project_preexisting,
+                || {
+                    with_bootstrap_progress(&mut progress, "container startup", || {
+                        docker_compose_up(path, repo_root, runtime, launch_mode, false)
+                    })
+                },
+                || docker_compose_down_for_runtime(path, runtime),
+            )?;
+            (true, !compose_project_preexisting)
+        } else {
+            (false, false)
+        };
     let native_embedding_spawn = if let Some(launch) = native_embedding.as_ref() {
-        with_bootstrap_progress(&mut progress, "model/bootstrap", || {
-            spawn_native_embedding_server(launch, runtime, allow_native_embedding_spawn)
-        })?
+        match with_bootstrap_progress(&mut progress, "model/bootstrap", || {
+            spawn_native_embedding_server(
+                launch,
+                runtime,
+                repo_root,
+                allow_native_embedding_spawn,
+                reusable_native_embedding_launch.as_ref(),
+                &mut observe_new_native_launch,
+            )
+        }) {
+            Ok(spawn) => spawn,
+            Err(error) => {
+                cleanup_pre_state_startup_for_runtime(
+                    runtime,
+                    resolved_compose.as_deref(),
+                    compose_owned_for_rollback,
+                    None,
+                    None,
+                )
+                .with_context(|| {
+                    format!("rollback sidecar startup after native embedding spawn failed: {error}")
+                })?;
+                return Err(error);
+            }
+        }
     } else {
         None
     };
 
-    let embedding_launch = native_embedding.as_ref().map(|launch| {
+    let mut embedding_launch = native_embedding.as_ref().map(|launch| {
         embedding_launch_metadata(launch, runtime, repo_root, native_embedding_spawn)
     });
-    let state = match sidecar_up_with_runtime_and_launch_metadata(
+    if let (Some(selected), Some(reused)) = (
+        embedding_launch.as_mut(),
+        reusable_native_embedding_launch.as_ref(),
+    ) && selected.pid == reused.pid
+    {
+        // The original current-launch log remains the proof source for the
+        // reused process. A profile-specific log path contains only the later
+        // attachment message and cannot prove startup/offload.
+        selected.log_path.clone_from(&reused.log_path);
+    }
+    let embedding_launch_ownership =
+        if native_embedding_spawn.is_some_and(|spawn| !spawn.newly_spawned) {
+            EmbeddingLaunchOwnership::Attached
+        } else {
+            EmbeddingLaunchOwnership::Owner
+        };
+    let state = match sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_origin(
         runtime,
         resolved_compose.as_deref(),
         embedding_launch.clone(),
+        embedding_launch_ownership,
+        compose_owned_for_rollback,
     ) {
         Ok(state) => state,
         Err(error) => {
-            if let Some(launch) = embedding_launch.as_ref()
-                && let Err(cleanup_error) =
-                    crate::sidecar::stop_native_embedding_process_for_launch(launch)
-            {
-                return Err(error).context(format!(
-                    "write retrieval-sidecars.json; native embedding cleanup failed: {cleanup_error}"
+            if let Err(cleanup_error) = cleanup_pre_state_startup_for_runtime(
+                runtime,
+                resolved_compose.as_deref(),
+                compose_owned_for_rollback,
+                embedding_launch.as_ref(),
+                native_embedding_spawn,
+            ) {
+                let error = error.context(format!(
+                    "write retrieval-sidecars.json; pre-state startup cleanup failed: {cleanup_error}"
                 ));
+                if native_embedding_spawn.is_some_and(|spawn| spawn.newly_spawned)
+                    && let Some(launch) = embedding_launch
+                {
+                    return Err(error.context(NativeEmbeddingStartupCleanupFailure::new(
+                        launch,
+                        &cleanup_error,
+                    )));
+                }
+                return Err(error);
             }
             return Err(error);
         }
@@ -324,10 +454,14 @@ pub fn bootstrap_sidecars_with_runtime_progress(
 
     let infrastructure = if !wait_timeout.is_zero() {
         with_bootstrap_progress(&mut progress, "model/bootstrap", || {
-            wait_for_infrastructure(&layout, wait_timeout)
+            wait_for_infrastructure(
+                runtime,
+                wait_timeout,
+                newly_spawned_native_launch(embedding_launch.as_ref(), native_embedding_spawn),
+            )
         })?
     } else {
-        probe_infrastructure_health(&layout)
+        probe_infrastructure_health(runtime)
     };
 
     if compose_started
@@ -339,7 +473,11 @@ pub fn bootstrap_sidecars_with_runtime_progress(
         })?;
         if !wait_timeout.is_zero() {
             let _ = with_bootstrap_progress(&mut progress, "model/bootstrap", || {
-                wait_for_infrastructure(&layout, wait_timeout)
+                wait_for_infrastructure(
+                    runtime,
+                    wait_timeout,
+                    newly_spawned_native_launch(embedding_launch.as_ref(), native_embedding_spawn),
+                )
             })?;
         }
     }
@@ -351,7 +489,7 @@ pub fn bootstrap_sidecars_with_runtime_progress(
 
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
-        &layout,
+        runtime,
         &embedding_device,
     );
     port_lease_heartbeat.finish()?;
@@ -376,6 +514,25 @@ fn with_bootstrap_progress<T>(
 ) -> Result<T> {
     progress(phase);
     action()
+}
+
+fn start_compose_with_rollback(
+    rollback_owned: bool,
+    start: impl FnOnce() -> Result<()>,
+    rollback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    match start() {
+        Ok(()) => Ok(()),
+        Err(start_error) if !rollback_owned => Err(start_error).context(
+            "preserved pre-existing exact Compose project after startup failure; automatic down would destroy infrastructure not created by this bootstrap",
+        ),
+        Err(start_error) => match rollback() {
+            Ok(()) => Err(start_error),
+            Err(rollback_error) => Err(start_error).context(format!(
+                "rollback exact Compose project after partial startup failed: {rollback_error:#}"
+            )),
+        },
+    }
 }
 
 pub fn resolve_compose_file(
@@ -441,6 +598,35 @@ pub fn docker_available() -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn docker_compose_project_has_containers(runtime: &SidecarRuntimeConfig) -> Result<bool> {
+    if !docker_available() {
+        bail!(
+            "docker is not available on PATH. Install Docker Desktop (Windows) or Docker Engine, then re-run bootstrap"
+        );
+    }
+    let output = Command::new("docker")
+        .arg("ps")
+        .arg("--all")
+        .arg("--quiet")
+        .arg("--filter")
+        .arg(format!(
+            "label=com.docker.compose.project={}",
+            runtime.compose_project
+        ))
+        .output()
+        .context("inspect exact Compose project before sidecar startup")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "inspect exact Compose project {} before sidecar startup failed (exit {:?}):\n{stdout}{stderr}",
+            runtime.compose_project,
+            output.status.code()
+        );
+    }
+    Ok(!output.stdout.iter().all(u8::is_ascii_whitespace))
 }
 
 fn docker_compose_up(
@@ -513,7 +699,10 @@ fn docker_compose_up(
             "CODESTORY_EMBED_MODEL_DIR",
             docker_bind_path(&embed_model_dir(repo_root, layout)?),
         )
-        .env("CODESTORY_EMBED_PORT", runtime.embed_http_port.to_string())
+        .env(
+            "CODESTORY_EMBED_PORT",
+            native_embedding_endpoint_port(runtime).to_string(),
+        )
         .env("CODESTORY_EMBED_LLAMACPP_URL", &runtime.embedding.endpoint)
         .env(
             "CODESTORY_EMBED_DEVICE_STATE",
@@ -669,10 +858,21 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
         return Ok(());
     }
     let Some(compose_file) = state.compose_file.as_ref().map(PathBuf::from) else {
+        // Legacy state may predate exact Compose-path publication. There is no owned path to
+        // retry, so retain the historical no-op behavior for that schema shape only.
         return Ok(());
     };
-    if !compose_file.is_file() || !docker_available() {
-        return Ok(());
+    if !compose_file.is_file() {
+        bail!(
+            "recorded sidecar Compose file is unavailable; preserving state for exact cleanup retry: {}",
+            compose_file.display()
+        );
+    }
+    if !docker_available() {
+        bail!(
+            "docker is unavailable while stopping recorded sidecar Compose project {}; preserving state for exact cleanup retry",
+            state.compose_project
+        );
     }
     let mut command = docker_compose_command()?;
     command
@@ -699,31 +899,92 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
     Ok(())
 }
 
+fn docker_compose_down_for_runtime(
+    compose_file: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<()> {
+    if !compose_file.is_file() {
+        bail!(
+            "compose rollback file is unavailable: {}",
+            compose_file.display()
+        );
+    }
+    if !docker_available() {
+        bail!("docker became unavailable before sidecar startup rollback");
+    }
+    let mut command = docker_compose_command()?;
+    command
+        .arg("compose")
+        .arg("-p")
+        .arg(&runtime.compose_project)
+        .arg("-f")
+        .arg(compose_file)
+        .arg("down")
+        .arg("--remove-orphans");
+    for (name, value) in compose_down_environment_for_parts(
+        &runtime.namespace,
+        &runtime.layout.qdrant_data_dir,
+        &runtime.layout.lexical_data_dir,
+        compose_file,
+    ) {
+        command.env(name, value);
+    }
+    let output = command
+        .output()
+        .context("spawn docker compose startup rollback")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "docker compose startup rollback failed for exact sidecar namespace {} (exit {:?}):\n{stdout}{stderr}",
+            runtime.namespace,
+            output.status.code()
+        );
+    }
+    Ok(())
+}
+
 fn compose_down_environment(state: &SidecarStateFile) -> Vec<(&'static str, String)> {
+    compose_down_environment_for_parts(
+        &state.namespace,
+        Path::new(&state.qdrant_data_dir),
+        Path::new(&state.lexical_data_dir),
+        state
+            .compose_file
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new("")),
+    )
+}
+
+fn compose_down_environment_for_parts(
+    namespace: &str,
+    qdrant_data_dir: &Path,
+    lexical_data_dir: &Path,
+    compose_file: &Path,
+) -> Vec<(&'static str, String)> {
     let mut environment = vec![
-        ("CODESTORY_SIDECAR_NAMESPACE", state.namespace.clone()),
+        ("CODESTORY_SIDECAR_NAMESPACE", namespace.to_string()),
         (
             "CODESTORY_QDRANT_DATA_DIR",
-            docker_bind_path(Path::new(&state.qdrant_data_dir)),
+            docker_bind_path(qdrant_data_dir),
         ),
         // Compose requires this variable while parsing the file. `down` does not
         // access the model mount, so an existing owned data path is sufficient.
         (
             "CODESTORY_EMBED_MODEL_DIR",
-            docker_bind_path(Path::new(&state.qdrant_data_dir)),
+            docker_bind_path(qdrant_data_dir),
         ),
     ];
     // Migration-only: emit the removed interpolation variable solely while parsing an
     // owned legacy compose file that still references it. Current compose files never do.
-    if state
-        .compose_file
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+    if std::fs::read_to_string(compose_file)
+        .ok()
         .is_some_and(|compose| compose.contains("CODESTORY_ZOEKT_DATA_DIR"))
     {
         environment.push((
             "CODESTORY_ZOEKT_DATA_DIR",
-            docker_bind_path(Path::new(&state.lexical_data_dir)),
+            docker_bind_path(lexical_data_dir),
         ));
     }
     environment
@@ -772,7 +1033,7 @@ fn native_embedding_server_launch(
     ))
 }
 
-pub(crate) fn expected_native_embedding_launch_metadata(
+pub fn expected_native_embedding_launch_metadata(
     repo_root: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<crate::health::EmbeddingLaunchMetadata>> {
@@ -833,7 +1094,7 @@ fn native_embedding_launch_args(model_path: &Path, runtime: &SidecarRuntimeConfi
             .as_ref()
             .and_then(|request| request.device.as_deref());
         let model = model_path.display().to_string();
-        let port = runtime.embed_http_port.to_string();
+        let port = native_embedding_endpoint_port(runtime).to_string();
         let mut args = Vec::new();
         let mut iter = backend.launch_args.into_iter().peekable();
         while let Some(arg) = iter.next() {
@@ -860,8 +1121,19 @@ fn native_embedding_launch_args(model_path: &Path, runtime: &SidecarRuntimeConfi
         "--host".to_string(),
         "127.0.0.1".to_string(),
         "--port".to_string(),
-        runtime.embed_http_port.to_string(),
+        native_embedding_endpoint_port(runtime).to_string(),
     ]
+}
+
+fn native_embedding_endpoint_port(runtime: &SidecarRuntimeConfig) -> u16 {
+    runtime
+        .embedding
+        .endpoint
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.strip_suffix("/v1/embeddings"))
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(runtime.embed_http_port)
 }
 
 fn embedding_launch_metadata(
@@ -875,9 +1147,15 @@ fn embedding_launch_metadata(
         launch_mode: EmbeddingServerLaunchMode::NativeSpawned
             .as_str()
             .to_string(),
-        endpoint: SidecarLayout::embed_base_url(runtime.embed_http_port),
+        endpoint: runtime.embedding.endpoint.clone(),
         pid: spawn.map(|spawn| spawn.pid),
         spawned_at_epoch_ms: spawn.map(|spawn| spawn.spawned_at_epoch_ms),
+        process_start_identity: spawn.and_then(|spawn| {
+            crate::sidecar::native_embedding_process_start_identity(spawn.pid)
+                .ok()
+                .flatten()
+        }),
+        spawn_protocol: None,
         launch_args: native_launch.args.clone(),
         launch_fingerprint_sha256: Some(native_embedding_launch_fingerprint(native_launch)),
         executable_source: Some(native_llama_executable_source(
@@ -886,6 +1164,7 @@ fn embedding_launch_metadata(
         )),
         executable_path: Some(native_launch.executable.display().to_string()),
         model_path: Some(native_launch.model_path.display().to_string()),
+        log_path: Some(native_launch.log_path.display().to_string()),
         requested_device: crate::embeddings::embedding_accelerator_request()
             .and_then(|request| request.device),
     }
@@ -1508,17 +1787,50 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn spawn_native_embedding_server(
     launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
     allow_spawn: bool,
+    reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+    observe_new_native_launch: &mut impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
 ) -> Result<Option<NativeEmbeddingSpawn>> {
     let probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
-    spawn_native_embedding_server_with_probe(launch, runtime, allow_spawn, probe)
+    spawn_native_embedding_server_with_probe_and_observer(
+        launch,
+        runtime,
+        repo_root,
+        allow_spawn,
+        reusable_launch,
+        probe,
+        observe_new_native_launch,
+    )
 }
 
+#[cfg(test)]
 fn spawn_native_embedding_server_with_probe(
     launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
     allow_spawn: bool,
+    reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
     probe: crate::embeddings::EmbeddingRuntimeProbe,
+) -> Result<Option<NativeEmbeddingSpawn>> {
+    spawn_native_embedding_server_with_probe_and_observer(
+        launch,
+        runtime,
+        None,
+        allow_spawn,
+        reusable_launch,
+        probe,
+        &mut |_| Ok(()),
+    )
+}
+
+fn spawn_native_embedding_server_with_probe_and_observer(
+    launch: &NativeEmbeddingServerLaunch,
+    runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
+    allow_spawn: bool,
+    reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+    probe: crate::embeddings::EmbeddingRuntimeProbe,
+    observe_new_native_launch: &mut impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
 ) -> Result<Option<NativeEmbeddingSpawn>> {
     if let Some(parent) = launch.log_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1526,7 +1838,12 @@ fn spawn_native_embedding_server_with_probe(
     }
     if native_embedding_server_reusable(&probe) {
         let mut log = open_native_embedding_log(&launch.log_path)?;
-        if let Some(spawn) = reusable_native_embedding_spawn_from_state(runtime, launch)? {
+        let reusable = if let Some(metadata) = reusable_launch {
+            reusable_native_embedding_spawn_from_metadata(runtime, launch, metadata)?
+        } else {
+            reusable_native_embedding_spawn_from_state(runtime, launch)?
+        };
+        if let Some(spawn) = reusable {
             writeln!(
                 log,
                 "reusing existing native llama.cpp embedding server pid={}: {}",
@@ -1579,11 +1896,80 @@ fn spawn_native_embedding_server_with_probe(
         "native llama.cpp embedding server Windows creation_flags=0x{NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS:08x}"
     )
     .ok();
+    #[cfg(target_os = "macos")]
+    writeln!(
+        log,
+        "native llama.cpp embedding server Darwin session detachment=setsid"
+    )
+    .ok();
+    let mut pending_launch = embedding_launch_metadata(launch, runtime, repo_root, None);
+    pending_launch.spawned_at_epoch_ms = Some(now_epoch_ms());
+    pending_launch.spawn_protocol = native_embedding_spawn_protocol().map(str::to_string);
+    observe_new_native_launch(&pending_launch)
+        .context("publish pending native embedding ownership before spawn")?;
     match spawn_native_embedding_server_once(launch, &log) {
-        Ok(pid) => Ok(Some(NativeEmbeddingSpawn {
-            pid,
-            spawned_at_epoch_ms: now_epoch_ms(),
-        })),
+        Ok(mut process) => {
+            let pid = process.pid();
+            let spawn = NativeEmbeddingSpawn {
+                pid,
+                spawned_at_epoch_ms: now_epoch_ms(),
+                newly_spawned: true,
+            };
+            let mut selected_launch =
+                embedding_launch_metadata(launch, runtime, repo_root, Some(spawn));
+            selected_launch.spawn_protocol = native_embedding_spawn_protocol().map(str::to_string);
+            if selected_launch.process_start_identity.is_none() {
+                let error = anyhow::anyhow!(
+                    "native embedding process start identity is unavailable immediately after spawn"
+                );
+                if let Err(cleanup_error) = process.abort() {
+                    let error = error.context(format!(
+                        "capture exact native embedding process start identity; cleanup failed: {cleanup_error}"
+                    ));
+                    return Err(error.context(NativeEmbeddingStartupCleanupFailure::new(
+                        selected_launch,
+                        &cleanup_error,
+                    )));
+                }
+                return Err(error);
+            }
+            if let Err(error) = observe_new_native_launch(&selected_launch) {
+                if let Err(cleanup_error) = process.abort() {
+                    let error = error.context(format!(
+                        "publish exact native embedding ownership after spawn; cleanup failed: {cleanup_error}"
+                    ));
+                    return Err(error.context(NativeEmbeddingStartupCleanupFailure::new(
+                        selected_launch,
+                        &cleanup_error,
+                    )));
+                }
+                return Err(error).context("publish exact native embedding ownership after spawn");
+            }
+            if let Err(error) = process.release_gate() {
+                let cleanup_error = process.abort().err();
+                let error = error.context("release native embedding Darwin exec gate");
+                if let Some(cleanup_error) = cleanup_error {
+                    return Err(error.context(NativeEmbeddingStartupCleanupFailure::new(
+                        selected_launch,
+                        &cleanup_error,
+                    )));
+                }
+                return Err(error);
+            }
+            if let Err(error) = wait_for_spawned_native_embedding_identity(&selected_launch) {
+                if let Err(cleanup_error) = process.abort() {
+                    let error = error.context(format!(
+                        "verify native embedding identity after exec gate; cleanup failed: {cleanup_error}"
+                    ));
+                    return Err(error.context(NativeEmbeddingStartupCleanupFailure::new(
+                        selected_launch,
+                        &cleanup_error,
+                    )));
+                }
+                return Err(error);
+            }
+            Ok(Some(spawn))
+        }
         Err(error) if native_embedding_breakaway_denied(&error) => Err(error).context(
             "native_embedding_breakaway_denied: host job object blocked CREATE_BREAKAWAY_FROM_JOB; native embedding cannot survive repair exit",
         ),
@@ -1605,23 +1991,107 @@ fn open_native_embedding_log(path: &Path) -> Result<File> {
         .with_context(|| format!("open native llama.cpp log {}", path.display()))
 }
 
+struct SpawnedNativeEmbeddingProcess {
+    child: Child,
+    gate: Option<ChildStdin>,
+}
+
+impl SpawnedNativeEmbeddingProcess {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn release_gate(&mut self) -> Result<()> {
+        let Some(mut gate) = self.gate.take() else {
+            return Ok(());
+        };
+        writeln!(gate, "{NATIVE_EMBEDDING_DARWIN_EXEC_GATE_TOKEN}")
+            .context("write native embedding Darwin exec gate token")?;
+        gate.flush()
+            .context("flush native embedding Darwin exec gate token")?;
+        Ok(())
+    }
+
+    fn abort(&mut self) -> Result<()> {
+        self.gate.take();
+        match self.child.kill() {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+            Err(error) => return Err(error).context("kill owned native embedding spawn"),
+        }
+        self.child
+            .wait()
+            .context("reap owned native embedding spawn")?;
+        Ok(())
+    }
+}
+
 fn spawn_native_embedding_server_once(
     launch: &NativeEmbeddingServerLaunch,
     log: &File,
-) -> std::io::Result<u32> {
+) -> std::io::Result<SpawnedNativeEmbeddingProcess> {
     let stdout = log.try_clone()?;
     let stderr = log.try_clone()?;
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(NATIVE_EMBEDDING_DARWIN_EXEC_GATE_SCRIPT)
+            .arg("codestory-native-gate")
+            .arg(&launch.executable)
+            .args(&launch.args)
+            .stdin(Stdio::piped());
+        command
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut command = Command::new(&launch.executable);
+    #[cfg(not(target_os = "macos"))]
+    command.args(&launch.args).stdin(Stdio::null());
     command
-        .args(&launch.args)
         .current_dir(launch.executable.parent().unwrap_or_else(|| Path::new(".")))
-        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     configure_native_embedding_command(&mut command);
     #[cfg(windows)]
     let _standard_handle_guard = WindowsStandardHandleInheritanceGuard::new()?;
-    command.spawn().map(|child| child.id())
+    let mut child = command.spawn()?;
+    #[cfg(target_os = "macos")]
+    let gate = child.stdin.take();
+    #[cfg(not(target_os = "macos"))]
+    let gate = None;
+    Ok(SpawnedNativeEmbeddingProcess { child, gate })
+}
+
+#[cfg(target_os = "macos")]
+fn native_embedding_spawn_protocol() -> Option<&'static str> {
+    Some(NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_embedding_spawn_protocol() -> Option<&'static str> {
+    None
+}
+
+fn wait_for_spawned_native_embedding_identity(
+    launch: &crate::health::EmbeddingLaunchMetadata,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match crate::sidecar::native_embedding_launch_identity_status(launch) {
+            crate::sidecar::NativeEmbeddingLaunchIdentityStatus::Matched { .. } => return Ok(()),
+            crate::sidecar::NativeEmbeddingLaunchIdentityStatus::NotRunning { pid } => {
+                bail!("native embedding pid {pid} exited before exact identity verification")
+            }
+            crate::sidecar::NativeEmbeddingLaunchIdentityStatus::Mismatched { reason, .. }
+            | crate::sidecar::NativeEmbeddingLaunchIdentityStatus::Unverified { reason, .. }
+                if Instant::now() >= deadline =>
+            {
+                bail!("native embedding identity did not converge after spawn: {reason}")
+            }
+            _ => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 fn native_embedding_server_reusable(probe: &crate::embeddings::EmbeddingRuntimeProbe) -> bool {
@@ -1642,7 +2112,7 @@ fn reusable_native_embedding_spawn_from_state(
 fn reusable_native_embedding_spawn_from_state_with_identity(
     runtime: &SidecarRuntimeConfig,
     launch: &NativeEmbeddingServerLaunch,
-    mut validate_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<u32>,
+    validate_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<u32>,
 ) -> Result<Option<NativeEmbeddingSpawn>> {
     let state_file = &runtime.layout.state_file;
     if !state_file.exists() {
@@ -1662,9 +2132,36 @@ fn reusable_native_embedding_spawn_from_state_with_identity(
     let Some(metadata) = state.embedding_launch.as_ref() else {
         return Ok(None);
     };
+    reusable_native_embedding_spawn_from_metadata_with_identity(
+        runtime,
+        launch,
+        metadata,
+        validate_launch,
+    )
+}
+
+fn reusable_native_embedding_spawn_from_metadata(
+    runtime: &SidecarRuntimeConfig,
+    launch: &NativeEmbeddingServerLaunch,
+    metadata: &crate::health::EmbeddingLaunchMetadata,
+) -> Result<Option<NativeEmbeddingSpawn>> {
+    reusable_native_embedding_spawn_from_metadata_with_identity(
+        runtime,
+        launch,
+        metadata,
+        crate::sidecar::ensure_native_embedding_launch_identity,
+    )
+}
+
+fn reusable_native_embedding_spawn_from_metadata_with_identity(
+    runtime: &SidecarRuntimeConfig,
+    launch: &NativeEmbeddingServerLaunch,
+    metadata: &crate::health::EmbeddingLaunchMetadata,
+    mut validate_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<u32>,
+) -> Result<Option<NativeEmbeddingSpawn>> {
     let launch_fingerprint = native_embedding_launch_fingerprint(launch);
     if metadata.launch_mode != EmbeddingServerLaunchMode::NativeSpawned.as_str()
-        || metadata.endpoint != SidecarLayout::embed_base_url(runtime.embed_http_port)
+        || metadata.endpoint != runtime.embedding.endpoint
         || metadata.launch_fingerprint_sha256.as_deref() != Some(launch_fingerprint.as_str())
     {
         return Ok(None);
@@ -1682,12 +2179,82 @@ fn reusable_native_embedding_spawn_from_state_with_identity(
     Ok(Some(NativeEmbeddingSpawn {
         pid,
         spawned_at_epoch_ms: metadata.spawned_at_epoch_ms.unwrap_or_else(now_epoch_ms),
+        newly_spawned: false,
     }))
+}
+
+fn cleanup_native_embedding_after_state_write_error(
+    launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+    spawn: Option<NativeEmbeddingSpawn>,
+    stop: impl FnOnce(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
+) -> Result<()> {
+    if !spawn.is_some_and(|spawn| spawn.newly_spawned) {
+        return Ok(());
+    }
+    let Some(launch) = launch else {
+        return Ok(());
+    };
+    stop(launch)
+}
+
+fn cleanup_pre_state_startup_for_runtime(
+    runtime: &SidecarRuntimeConfig,
+    compose_file: Option<&Path>,
+    compose_owned_for_rollback: bool,
+    launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+    spawn: Option<NativeEmbeddingSpawn>,
+) -> Result<()> {
+    cleanup_pre_state_startup_with(
+        compose_owned_for_rollback,
+        launch,
+        spawn,
+        crate::sidecar::stop_native_embedding_process_for_launch,
+        || {
+            let compose_file = compose_file
+                .context("started Compose sidecar has no resolved compose file for rollback")?;
+            docker_compose_down_for_runtime(compose_file, runtime)
+        },
+    )
+}
+
+fn cleanup_pre_state_startup_with(
+    compose_owned_for_rollback: bool,
+    launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+    spawn: Option<NativeEmbeddingSpawn>,
+    stop_native: impl FnOnce(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
+    rollback_compose: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = cleanup_native_embedding_after_state_write_error(launch, spawn, stop_native)
+    {
+        failures.push(format!("native embedding cleanup failed: {error:#}"));
+    }
+    if compose_owned_for_rollback && let Err(error) = rollback_compose() {
+        failures.push(format!("Compose rollback failed: {error:#}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", failures.join("; "))
+    }
 }
 
 fn configure_native_embedding_command(_command: &mut Command) {
     #[cfg(windows)]
     _command.creation_flags(NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS);
+    #[cfg(target_os = "macos")]
+    // SAFETY: this closure runs in the child after fork and calls only the async-signal-safe
+    // `setsid(2)` before exec. A fresh child is not a process-group leader, so `setsid` gives
+    // the native server its own session and process group without inserting a wrapper process.
+    unsafe {
+        _command.pre_exec(|| {
+            if setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
 }
 
 fn native_embedding_spawn_detail() -> &'static str {
@@ -1695,7 +2262,11 @@ fn native_embedding_spawn_detail() -> &'static str {
     {
         " with detached Windows creation flags including breakaway-from-job"
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        " in a detached Darwin session"
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         ""
     }
@@ -1817,26 +2388,112 @@ fn embed_model_dir_ready(path: &Path) -> bool {
         .is_file()
 }
 
+fn newly_spawned_native_launch(
+    launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+    spawn: Option<NativeEmbeddingSpawn>,
+) -> Option<&crate::health::EmbeddingLaunchMetadata> {
+    spawn
+        .is_some_and(|spawn| spawn.newly_spawned)
+        .then_some(launch)
+        .flatten()
+}
+
 fn wait_for_infrastructure(
-    layout: &SidecarLayout,
+    runtime: &SidecarRuntimeConfig,
     timeout: Duration,
+    newly_spawned_native: Option<&crate::health::EmbeddingLaunchMetadata>,
 ) -> Result<InfrastructureHealth> {
     let started = Instant::now();
     let poll = Duration::from_millis(500);
-    let mut last = probe_infrastructure_health(layout);
-    while started.elapsed() < timeout {
-        if last.lexical_ready && last.qdrant_reachable && last.embed_reachable {
+    let mut last = probe_infrastructure_health(runtime);
+    loop {
+        let native_log = newly_spawned_native
+            .and_then(|launch| launch.log_path.as_deref())
+            .map(Path::new);
+        if native_log.is_some_and(native_embedding_log_reports_bind_failure) {
+            bail!(
+                "{NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON}: native llama.cpp could not bind {}",
+                runtime.embedding.endpoint
+            );
+        }
+
+        if infrastructure_ready(&last)
+            && newly_spawned_native_readiness_confirmed(newly_spawned_native)?
+        {
             return Ok(last);
         }
-        thread::sleep(poll);
-        last = probe_infrastructure_health(layout);
+        if started.elapsed() >= timeout {
+            break;
+        }
+        thread::sleep(poll.min(timeout.saturating_sub(started.elapsed())));
+        last = probe_infrastructure_health(runtime);
+    }
+    if infrastructure_ready(&last) && newly_spawned_native.is_some() {
+        bail!(
+            "native_embedding_identity_unsettled: healthy embedding endpoint {} was not proven to belong to the newly spawned native launch",
+            runtime.embedding.endpoint
+        );
     }
     Ok(last)
+}
+
+fn newly_spawned_native_readiness_confirmed(
+    launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+) -> Result<bool> {
+    let Some(launch) = launch else {
+        return Ok(true);
+    };
+    let Some(log_path) = launch.log_path.as_deref().map(Path::new) else {
+        return Ok(false);
+    };
+    if !native_embedding_log_reports_listener(log_path, &launch.endpoint) {
+        return Ok(false);
+    }
+    crate::sidecar::ensure_native_embedding_launch_identity(launch)
+        .context("validate newly spawned native embedding readiness identity")?;
+    Ok(true)
+}
+
+fn native_embedding_log_reports_bind_failure(path: &Path) -> bool {
+    current_native_embedding_log_tail(path).is_some_and(|current_launch| {
+        current_launch.contains("address already in use")
+            || current_launch.contains("only one usage of each socket address")
+            || current_launch.contains("failed to bind")
+            || current_launch.contains("bind() failed")
+            || current_launch.contains("error while attempting to bind")
+    })
+}
+
+fn native_embedding_log_reports_listener(path: &Path, endpoint: &str) -> bool {
+    let Some(listener_url) = endpoint.strip_suffix("/v1/embeddings") else {
+        return false;
+    };
+    let expected = format!("listening on {}", listener_url.to_ascii_lowercase());
+    current_native_embedding_log_tail(path)
+        .is_some_and(|current_launch| current_launch.contains(&expected))
+}
+
+fn current_native_embedding_log_tail(path: &Path) -> Option<String> {
+    const MAX_LOG_TAIL_BYTES: u64 = 64 * 1024;
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(MAX_LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return None;
+    }
+    let mut tail = Vec::new();
+    if file.read_to_end(&mut tail).is_err() {
+        return None;
+    }
+    let tail = String::from_utf8_lossy(&tail).to_ascii_lowercase();
+    let current_launch_start = tail.rfind("starting native llama.cpp embedding server:")?;
+    Some(tail[current_launch_start..].to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{SocketAddr, TcpListener};
     use tempfile::tempdir;
 
     fn compose_test_runtime(root: &std::path::Path) -> SidecarRuntimeConfig {
@@ -1859,6 +2516,132 @@ mod tests {
             labels: std::collections::BTreeMap::new(),
             ..SidecarRuntimeConfig::local()
         }
+    }
+
+    fn one_shot_json_server(body: serde_json::Value) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
+        let address = listener.local_addr().expect("test HTTP server address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test HTTP request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read test HTTP request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len().saturating_sub(header_end) >= content_length {
+                    break;
+                }
+            }
+            let body = body.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write test HTTP response");
+        });
+        (address, handle)
+    }
+
+    #[test]
+    fn infrastructure_wait_uses_selected_runtime_embedding_endpoint() {
+        let root = tempdir().expect("root");
+        let (qdrant_address, qdrant_server) = one_shot_json_server(serde_json::json!({
+            "result": { "collections": [] },
+            "status": "ok",
+            "time": 0.0
+        }));
+        let (embedding_address, embedding_server) = one_shot_json_server(serde_json::json!({
+            "data": [{ "index": 0, "embedding": [0.1, 0.2, 0.3] }]
+        }));
+        let mut runtime = compose_test_runtime(root.path());
+        runtime.layout.qdrant_http_port = qdrant_address.port();
+        runtime.embed_http_port = embedding_address.port();
+        runtime.embedding.configuration_error = None;
+        runtime.embedding.backend = "llamacpp".to_string();
+        runtime.embedding.endpoint = format!("http://{embedding_address}/v1/embeddings");
+        runtime.embedding.expected_dim = Some(3);
+        runtime.embedding.allow_remote = false;
+        runtime.embedding.device_policy = "allow_cpu".to_string();
+        runtime
+            .layout
+            .ensure_data_dirs()
+            .expect("create infrastructure data dirs");
+
+        let health = wait_for_infrastructure(&runtime, Duration::from_secs(2), None)
+            .expect("selected runtime infrastructure health");
+
+        assert!(health.lexical_ready);
+        assert!(health.qdrant_reachable, "{}", health.qdrant_detail);
+        assert!(health.embed_reachable, "{}", health.embed_detail);
+        qdrant_server.join().expect("qdrant test server");
+        embedding_server.join().expect("embedding test server");
+    }
+
+    #[test]
+    fn compose_start_failure_rolls_back_exact_partial_startup() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let error = start_compose_with_rollback(
+            true,
+            || {
+                calls.borrow_mut().push("start");
+                bail!("partial_up_failed")
+            },
+            || {
+                calls.borrow_mut().push("rollback");
+                bail!("rollback_failed")
+            },
+        )
+        .expect_err("partial startup and rollback failure must both be reported");
+
+        assert_eq!(*calls.borrow(), ["start", "rollback"]);
+        let error = format!("{error:#}");
+        assert!(error.contains("partial_up_failed"), "{error}");
+        assert!(error.contains("rollback_failed"), "{error}");
+    }
+
+    #[test]
+    fn compose_start_failure_preserves_preexisting_exact_project() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let error = start_compose_with_rollback(
+            false,
+            || {
+                calls.borrow_mut().push("start");
+                bail!("up_failed")
+            },
+            || {
+                calls.borrow_mut().push("rollback");
+                Ok(())
+            },
+        )
+        .expect_err("pre-existing Compose project must be preserved");
+
+        assert_eq!(*calls.borrow(), ["start"]);
+        let error = format!("{error:#}");
+        assert!(error.contains("up_failed"), "{error}");
+        assert!(error.contains("preserved pre-existing"), "{error}");
     }
 
     #[test]
@@ -2663,6 +3446,7 @@ mod tests {
             Some(NativeEmbeddingSpawn {
                 pid: 1234,
                 spawned_at_epoch_ms: 456,
+                newly_spawned: true,
             }),
         );
         assert_eq!(metadata.provider, "llamacpp");
@@ -2800,7 +3584,7 @@ mod tests {
         std::fs::create_dir_all(launch.log_path.parent().expect("log parent")).expect("log parent");
         std::fs::write(&launch.log_path, b"existing launch output\n").expect("existing log");
 
-        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, false, probe)
+        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, false, None, probe)
             .expect_err("reuse-only lease must not fall through to spawn");
 
         let error_text = format!("{error:?}");
@@ -2839,9 +3623,21 @@ mod tests {
             detail: "llama.cpp embeddings unavailable".into(),
             elapsed_ms: Some(5),
         };
+        let mut observed = Vec::new();
 
-        spawn_native_embedding_server_with_probe(&launch, &runtime, true, probe)
-            .expect_err("missing executable must fail after rotation");
+        spawn_native_embedding_server_with_probe_and_observer(
+            &launch,
+            &runtime,
+            None,
+            true,
+            None,
+            probe,
+            &mut |metadata| {
+                observed.push(metadata.clone());
+                Ok(())
+            },
+        )
+        .expect_err("missing executable must fail after rotation");
 
         let current = std::fs::read_to_string(&launch.log_path).expect("current log");
         assert!(!current.contains("existing launch output"));
@@ -2853,6 +3649,25 @@ mod tests {
         )
         .expect("previous log");
         assert_eq!(previous, "existing launch output\n");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            observed.len(),
+            2,
+            "gated spawn publishes pending and exact wrapper ownership before exec"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(observed.len(), 1, "pending ownership precedes spawn");
+        assert_eq!(observed[0].pid, None);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            observed[0].spawn_protocol.as_deref(),
+            Some(NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL)
+        );
+        let expected_executable = launch.executable.display().to_string();
+        assert_eq!(
+            observed[0].executable_path.as_deref(),
+            Some(expected_executable.as_str())
+        );
     }
 
     #[test]
@@ -2878,7 +3693,7 @@ mod tests {
             elapsed_ms: Some(5),
         };
 
-        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, true, probe)
+        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, true, None, probe)
             .expect_err("missing executable must still be the terminal failure");
 
         let error = format!("{error:?}");
@@ -2909,6 +3724,7 @@ mod tests {
             Some(NativeEmbeddingSpawn {
                 pid: 4321,
                 spawned_at_epoch_ms: 123,
+                newly_spawned: true,
             }),
         );
         sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
@@ -2933,6 +3749,44 @@ mod tests {
     }
 
     #[test]
+    fn native_embedding_bind_failure_is_detected_from_current_log_tail() {
+        let temp = tempdir().expect("temp");
+        let log = temp.path().join("llama-server.log");
+        std::fs::write(
+            &log,
+            b"old failure: address already in use\nstarting native llama.cpp embedding server: fixture\nerror: failed to bind HTTP server: Address already in use\n",
+        )
+        .expect("write bind failure log");
+        assert!(native_embedding_log_reports_bind_failure(&log));
+
+        std::fs::write(
+            &log,
+            b"old failure: address already in use\nsrv  llama_server: listening on http://127.0.0.1:18080\nstarting native llama.cpp embedding server: fixture\nsrv  llama_server: listening on http://127.0.0.1:18081\n",
+        )
+        .expect("write healthy log");
+        assert!(!native_embedding_log_reports_bind_failure(&log));
+        assert!(native_embedding_log_reports_listener(
+            &log,
+            "http://127.0.0.1:18081/v1/embeddings"
+        ));
+        assert!(
+            !native_embedding_log_reports_listener(&log, "http://127.0.0.1:18080/v1/embeddings"),
+            "a stale prior-launch listener marker must not prove the current launch"
+        );
+
+        let mut boundary_log = b"x".to_vec();
+        boundary_log.extend_from_slice("ü".as_bytes());
+        let mut current_launch = b"starting native llama.cpp embedding server: fixture\nerror: failed to bind HTTP server: Address already in use\n".to_vec();
+        current_launch.resize(64 * 1024 - 1, b'x');
+        boundary_log.extend_from_slice(&current_launch);
+        std::fs::write(&log, boundary_log).expect("write Unicode-boundary bind failure log");
+        assert!(
+            native_embedding_log_reports_bind_failure(&log),
+            "a multibyte character split at the bounded tail must not hide the current launch"
+        );
+    }
+
+    #[test]
     fn native_embedding_reuse_rejects_identity_mismatch() {
         let _lock = crate::test_support::env_lock();
         let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
@@ -2953,6 +3807,7 @@ mod tests {
             Some(NativeEmbeddingSpawn {
                 pid: 4321,
                 spawned_at_epoch_ms: 123,
+                newly_spawned: true,
             }),
         );
         sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
@@ -2992,6 +3847,7 @@ mod tests {
             Some(NativeEmbeddingSpawn {
                 pid: 4321,
                 spawned_at_epoch_ms: 123,
+                newly_spawned: true,
             }),
         );
         launch_metadata.pid = None;

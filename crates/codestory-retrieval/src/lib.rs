@@ -45,9 +45,12 @@ pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
 pub use compose::{
     BootstrapReport, BootstrapSidecarsOptions, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory,
-    bootstrap_sidecars, bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime,
-    bootstrap_sidecars_with_runtime_progress, docker_available, embed_model_inventory,
-    resolve_compose_file,
+    NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL, NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON,
+    NativeEmbeddingStartupCleanupFailure, bootstrap_sidecars, bootstrap_sidecars_with_profile,
+    bootstrap_sidecars_with_runtime, bootstrap_sidecars_with_runtime_progress,
+    bootstrap_sidecars_with_runtime_progress_and_native_launch_observer, docker_available,
+    embed_model_inventory, expected_native_embedding_launch_metadata,
+    native_embedding_startup_cleanup_failure, resolve_compose_file,
 };
 pub use config::{
     DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
@@ -118,10 +121,13 @@ pub use ranker::rank_candidates;
 pub use retention::{GenerationRetentionApplyReport, GenerationRetentionPlan};
 pub use scip_client::ScipClient;
 pub use sidecar::{
-    NativeEmbeddingLaunchIdentityStatus, SidecarStateFile, ensure_native_embedding_launch_identity,
-    native_embedding_launch_identity_status, sidecar_down, sidecar_down_for_project,
+    EmbeddingLaunchOwnership, NativeEmbeddingLaunchIdentityStatus, SidecarStateFile,
+    ensure_native_embedding_launch_identity, native_embedding_launch_identity_status,
+    native_embedding_process_start_identity, sidecar_down,
+    sidecar_down_after_failed_bootstrap_for_runtime, sidecar_down_for_project,
     sidecar_down_for_runtime, sidecar_state_matches_runtime, sidecar_status, sidecar_up,
-    sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch, strict_sidecar_status,
+    sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch,
+    stop_native_embedding_process_for_launch, strict_sidecar_status,
     strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
