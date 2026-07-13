@@ -79,6 +79,8 @@ const WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
 #[cfg(windows)]
 const WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH: u64 = 504_911_232_000_000_000;
+#[cfg(windows)]
+const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 #[cfg(target_os = "macos")]
 const MACOS_CTL_KERN: std::ffi::c_int = 1;
 #[cfg(target_os = "macos")]
@@ -801,7 +803,7 @@ fn normalized_identity_path(path: &str) -> String {
 }
 
 #[cfg(windows)]
-pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String>> {
+fn windows_process_creation_time(pid: u32) -> Result<Option<WindowsFileTime>> {
     if pid == 0 {
         bail!("native embedding process pid must be greater than zero");
     }
@@ -831,20 +833,41 @@ pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String
         return Err(io::Error::last_os_error())
             .with_context(|| format!("query native embedding start identity for pid {pid}"));
     }
+    Ok(Some(creation_time))
+}
+
+#[cfg(windows)]
+pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String>> {
+    let Some(creation_time) = windows_process_creation_time(pid)? else {
+        return Ok(None);
+    };
     let ticks = windows_datetime_ticks_from_filetime(&creation_time)?;
     Ok(Some(format!("windows:{ticks}")))
 }
 
 #[cfg(windows)]
+fn windows_filetime_ticks(filetime: &WindowsFileTime) -> u64 {
+    (u64::from(filetime.high_date_time) << 32) | u64::from(filetime.low_date_time)
+}
+
+#[cfg(windows)]
 fn windows_datetime_ticks_from_filetime(filetime: &WindowsFileTime) -> Result<u64> {
-    let filetime_ticks =
-        (u64::from(filetime.high_date_time) << 32) | u64::from(filetime.low_date_time);
+    let filetime_ticks = windows_filetime_ticks(filetime);
     // Win32_Process.CreationDate exposes microseconds, so discard sub-microsecond
     // FILETIME ticks to preserve identities serialized by the previous CIM query.
     let legacy_filetime_ticks = filetime_ticks / 10 * 10;
     legacy_filetime_ticks
         .checked_add(WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH)
         .context("convert Windows process creation time to DateTime ticks")
+}
+
+#[cfg(windows)]
+fn windows_epoch_ms_from_filetime(filetime: &WindowsFileTime) -> Result<i64> {
+    let elapsed_ticks = windows_filetime_ticks(filetime)
+        .checked_sub(WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH)
+        .context("convert Windows process creation time to Unix epoch")?;
+    i64::try_from(elapsed_ticks / 10_000)
+        .context("convert Windows process creation time to epoch milliseconds")
 }
 
 #[cfg(target_os = "linux")]
@@ -885,12 +908,13 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
         executable_path: Option<String>,
         #[serde(rename = "CommandLine")]
         command_line: Option<String>,
-        #[serde(rename = "StartedAtEpochMs")]
-        started_at_epoch_ms: Option<i64>,
     }
 
+    let Some(creation_time) = windows_process_creation_time(pid)? else {
+        return Ok(None);
+    };
     let script = format!(
-        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $p) {{ exit 2 }}; $started=[int64](([Management.ManagementDateTimeConverter]::ToDateTime($p.CreationDate).ToUniversalTime() - [datetime]'1970-01-01').TotalMilliseconds); [pscustomobject]@{{ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine;StartedAtEpochMs=$started}} | ConvertTo-Json -Compress"
+        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $p) {{ exit 2 }}; [pscustomobject]@{{ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine}} | ConvertTo-Json -Compress"
     );
     let output = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
@@ -911,7 +935,7 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
         executable_path: info.executable_path,
         command_line: info.command_line,
         arguments: None,
-        started_at_epoch_ms: info.started_at_epoch_ms,
+        started_at_epoch_ms: Some(windows_epoch_ms_from_filetime(&creation_time)?),
     }))
 }
 
@@ -2013,8 +2037,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_native_embedding_start_identity_is_stable_and_compatible() -> Result<()> {
-        const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+    fn windows_native_embedding_identity_and_snapshot_are_stable_and_compatible() -> Result<()> {
         const DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH: u64 = 621_355_968_000_000_000;
 
         let unix_epoch_with_sub_microsecond_ticks = WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH + 8;
@@ -2026,8 +2049,12 @@ mod tests {
             windows_datetime_ticks_from_filetime(&unix_epoch)?,
             DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH
         );
+        assert_eq!(windows_epoch_ms_from_filetime(&unix_epoch)?, 0);
         assert!(native_embedding_process_start_identity(0).is_err());
 
+        let before_spawn_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
         let mut child = Command::new("cmd.exe")
             .args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 > nul"])
             .spawn()
@@ -2037,8 +2064,19 @@ mod tests {
                 .context("read Windows child process start identity immediately after spawn")?;
             let second = native_embedding_process_start_identity(child.id())?
                 .context("repeat Windows child process start identity read")?;
+            let snapshot = native_embedding_process_snapshot(child.id())?
+                .context("read Windows child process snapshot immediately after spawn")?;
+            let after_snapshot_epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64;
             assert!(first.starts_with("windows:"));
             assert_eq!(first, second);
+            assert!(
+                snapshot
+                    .started_at_epoch_ms
+                    .is_some_and(|started| started >= before_spawn_epoch_ms
+                        && started <= after_snapshot_epoch_ms)
+            );
             Ok(())
         })();
         let _ = child.kill();
