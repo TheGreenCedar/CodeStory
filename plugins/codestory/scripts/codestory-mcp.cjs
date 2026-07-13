@@ -186,9 +186,21 @@ function projectResolutionDiagnostics(projectResolution, nowMs = Date.now()) {
 }
 
 function resolveProjectRoot(options = {}) {
-  const explicit = existingProjectRoot(options.projectRoot || process.env.CODESTORY_PROJECT_ROOT);
-  if (explicit) {
-    return { projectRoot: explicit, source: options.projectRoot ? 'argument' : 'env' };
+  const argumentProvided = options.projectRootProvided
+    || (options.projectRoot !== null && options.projectRoot !== undefined);
+  const envProvided = Object.hasOwn(process.env, 'CODESTORY_PROJECT_ROOT');
+  if (argumentProvided || envProvided) {
+    const source = argumentProvided ? 'argument' : 'env';
+    const requestedRoot = argumentProvided ? options.projectRoot : process.env.CODESTORY_PROJECT_ROOT;
+    const explicit = existingProjectRoot(requestedRoot);
+    return explicit
+      ? { projectRoot: explicit, source }
+      : {
+          projectRoot: null,
+          source: `${source}_invalid`,
+          statePath: null,
+          reason: 'project_root_invalid',
+        };
   }
 
   const cwd = existingProjectRoot(options.cwd || launchCwd);
@@ -2647,7 +2659,10 @@ async function bootstrapStatus(projectRoot = launchCwd) {
 
 async function handleBootstrapStatusCommand(argv) {
   if (argv[2] !== 'bootstrap-status') return false;
-  const resolution = resolveProjectRoot({ projectRoot: optionValue(argv, '--project') });
+  const resolution = resolveProjectRoot({
+    projectRoot: optionValue(argv, '--project'),
+    projectRootProvided: argv.includes('--project'),
+  });
   try {
     if (!resolution.projectRoot) {
       const resolved = await resolveCli();

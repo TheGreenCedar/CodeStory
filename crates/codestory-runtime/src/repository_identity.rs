@@ -27,7 +27,8 @@ pub struct RepositoryIdentityReport {
 pub fn inspect_repository_identity(project_root: &Path) -> RepositoryIdentityReport {
     let root_derived_project_id = codestory_retrieval::project_id_for_root(project_root);
     let repository = codestory_workspace::inspect_repository_identity_v2(project_root);
-    let identity = codestory_workspace::project_identity_v3(project_root);
+    let identity =
+        codestory_workspace::project_identity_v3_from_repository(project_root, &repository);
     let legacy_alias_disposition = if identity.legacy_canonical_repository_id.is_some() {
         "safe"
     } else {

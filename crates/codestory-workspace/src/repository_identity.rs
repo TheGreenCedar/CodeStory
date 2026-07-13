@@ -186,6 +186,14 @@ pub fn project_identity_v2(project_root: &Path) -> ProjectIdentityV2 {
 /// Resolve the lossless V3 identity without migrating current consumers.
 pub fn project_identity_v3(project_root: &Path) -> ProjectIdentityV3 {
     let repository_identity = inspect_repository_identity_v2(project_root);
+    project_identity_v3_from_repository(project_root, &repository_identity)
+}
+
+/// Resolve the lossless V3 identity from an existing Git observation.
+pub fn project_identity_v3_from_repository(
+    project_root: &Path,
+    repository_identity: &RepositoryIdentityV2,
+) -> ProjectIdentityV3 {
     let root_identity = workspace_root_identity_v3(project_root);
     let project_id = repository_identity
         .canonical_repository_id
@@ -202,12 +210,12 @@ pub fn project_identity_v3(project_root: &Path) -> ProjectIdentityV3 {
         project_id,
         workspace_id: root_identity.workspace_id,
         artifact_scope_id,
-        canonical_repository_id: repository_identity.canonical_repository_id,
-        legacy_canonical_repository_id: repository_identity.legacy_canonical_repository_id,
+        canonical_repository_id: repository_identity.canonical_repository_id.clone(),
+        legacy_canonical_repository_id: repository_identity.legacy_canonical_repository_id.clone(),
         legacy_raw_root_project_id: root_identity.legacy_raw_root_project_id,
         normalized_root_project_id_alias: root_identity.normalized_root_project_id_alias,
         portable_reuse_eligible: repository_identity.portable_reuse_eligible,
-        portable_reuse_reason: repository_identity.portable_reuse_reason,
+        portable_reuse_reason: repository_identity.portable_reuse_reason.clone(),
     }
 }
 

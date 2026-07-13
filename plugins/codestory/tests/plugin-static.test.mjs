@@ -2254,7 +2254,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
   }
 });
 
-test("bootstrap-status fails open when plugin-root launch lacks project state", async () => {
+test("bootstrap-status rejects missing and invalid project selection", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-no-project-"));
@@ -2312,6 +2312,33 @@ test("bootstrap-status fails open when plugin-root launch lacks project state", 
     assert.equal(status.project_root, null);
     assert.equal(status.project_root_source, "request_argument_missing");
     assert.equal(status.readiness[0].goal, "project_root");
+
+    for (const explicit of [
+      { args: ["--project", join(dataDir, "missing-project")], env: {}, source: "argument_invalid" },
+      { args: [], env: { CODESTORY_PROJECT_ROOT: join(dataDir, "missing-project") }, source: "env_invalid" },
+    ]) {
+      const invalid = spawnSync(process.execPath, [launcher, "bootstrap-status", ...explicit.args], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          ...explicit.env,
+          CODESTORY_CLI: cliPath,
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_LOG: logFile,
+          TEST_OUT: marker,
+        },
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      assert.equal(invalid.status, 0, invalid.stderr);
+      const invalidStatus = JSON.parse(invalid.stdout.trim());
+      assert.equal(invalidStatus.ready, false);
+      assert.equal(invalidStatus.degraded_reason, "project_root_invalid");
+      assert.equal(invalidStatus.project_root, null);
+      assert.equal(invalidStatus.project_root_source, explicit.source);
+    }
+    await assert.rejects(access(marker));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
