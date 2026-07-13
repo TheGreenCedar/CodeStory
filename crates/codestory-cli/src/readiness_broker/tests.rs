@@ -820,23 +820,13 @@ fn borrower_down_leaves_owner_native_process_and_machine_lock_intact() {
         codestory_retrieval::SidecarProfile::Agent,
         Some("owner-agent"),
     );
-    let borrower_runtime = test_sidecar_runtime(
+    let mut borrower_runtime = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("borrower-agent"),
     );
-    let mut owner_state = native_sidecar_state(Some(now_epoch_ms()));
-    owner_state.project_identity = owner_runtime.project_identity.clone();
-    owner_state.profile = owner_runtime.profile.as_str().to_string();
-    owner_state.namespace = owner_runtime.namespace.clone();
-    owner_state.compose_project = owner_runtime.compose_project.clone();
-    owner_state.run_id = owner_runtime.run_id.clone();
-    owner_state.qdrant_http_port = owner_runtime.layout.qdrant_http_port;
-    owner_state.qdrant_grpc_port = owner_runtime.layout.qdrant_grpc_port;
-    owner_state.embed_http_port = owner_runtime.embed_http_port;
-    owner_state.embed_url = owner_runtime.embedding.endpoint.clone();
-    owner_state.embedding_launch_ownership = codestory_retrieval::EmbeddingLaunchOwnership::Owner;
     let shared_pid = std::process::id();
+    let mut owner_state = matching_native_sidecar_state(&owner_runtime, shared_pid);
     {
         let launch = owner_state.embedding_launch.as_mut().expect("owner launch");
         launch.pid = Some(shared_pid);
@@ -849,6 +839,9 @@ fn borrower_down_leaves_owner_native_process_and_machine_lock_intact() {
     owner_runtime
         .use_broker_verified_native_embedding_endpoint(owner_state.embed_http_port)
         .expect("owner endpoint");
+    borrower_runtime
+        .use_broker_verified_native_embedding_endpoint(owner_state.embed_http_port)
+        .expect("borrower endpoint");
 
     let mut lock = match try_acquire_machine_resource_lock(&resource, &owner_scope)
         .expect("acquire owner machine lock")
