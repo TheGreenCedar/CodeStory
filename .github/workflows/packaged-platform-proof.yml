@@ -7,6 +7,21 @@ on:
         description: Release version from crates/codestory-cli/Cargo.toml.
         required: true
         type: string
+      ref:
+        description: Exact source SHA to package.
+        required: false
+        default: ""
+        type: string
+      scope:
+        description: Native package matrix scope (macos or full).
+        required: false
+        default: full
+        type: string
+      proof_key:
+        description: Stable PR or integration identity for concurrency cancellation.
+        required: false
+        default: ""
+        type: string
       sign_macos:
         description: Require Developer ID signing and Apple notarization for macOS assets.
         required: false
@@ -28,6 +43,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: packaged-platform-proof-${{ inputs.proof_key || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   RELEASE_RUST_TOOLCHAIN: "1.95.0"
@@ -77,9 +96,12 @@ jobs:
             asset_target: macos-arm64
             exe_suffix: ""
             extension: tar.gz
+        exclude: ${{ fromJSON(inputs.scope == 'macos' && '[{"asset_target":"linux-x64"},{"asset_target":"linux-arm64"},{"asset_target":"windows-x64"},{"asset_target":"windows-arm64"}]' || '[]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install pinned Rust
         run: |
@@ -102,9 +124,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
+            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-
 
       - name: Build codestory-cli
         if: matrix.asset_target != 'linux-x64'
@@ -219,6 +241,12 @@ jobs:
             exit 1
           fi
           grep -F "source=Notarized Developer ID" "$proof_dir/spctl.txt"
+
+      - name: Execute notarized macOS CLI without signing credentials
+        if: runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        run: |
+          work_dir="$RUNNER_TEMP/codestory-notary-${{ matrix.asset_target }}"
           "$work_dir/codestory-cli-quarantined" --version
           "$work_dir/codestory-cli-quarantined" --help >/dev/null
 

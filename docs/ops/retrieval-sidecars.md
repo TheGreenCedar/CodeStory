@@ -550,9 +550,8 @@ expansion lanes are skipped for that query.
 path and not a full sidecar proof. Linux carries generic
 lint/runtime/search/retrieval contract slices plus the non-live packet/search
 fixture and baseline gate (`cargo test -p codestory-cli --test packet_search_eval`).
-Windows carries the
-manifest-missing bootstrap/status shape only when manually dispatched or when a
-PR has the `ci:windows-smoke` label.
+Windows carries the manifest-missing bootstrap/status shape only when manually
+dispatched; persistent PR labels do not allocate a Windows runner.
 
 The reduced CI sequence does not start real sidecars, fetch
 `bge-base-en-v1.5.Q8_0.gguf`, build the project manifest required for full mode,

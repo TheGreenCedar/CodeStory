@@ -11,6 +11,11 @@ on:
         description: Git ref to check out. Defaults to the caller SHA.
         required: false
         type: string
+      proof_key:
+        description: Stable PR, integration, or release identity for cancellation.
+        required: false
+        default: ""
+        type: string
       use_packaged_artifact:
         description: Download the signed macOS arm64 artifact produced by packaged-platform-proof.
         required: false
@@ -26,13 +31,17 @@ on:
         description: Git ref to check out. Defaults to the current SHA.
         required: false
         type: string
+      proof_key:
+        description: Stable proof identity for cancellation.
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: macos-metal-proof
-  cancel-in-progress: false
+  group: macos-metal-proof-${{ inputs.proof_key || inputs.ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   packaged-metal-lifecycle:
