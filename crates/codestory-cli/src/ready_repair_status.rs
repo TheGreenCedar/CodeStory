@@ -1784,7 +1784,7 @@ mod tests {
         let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
-        let sidecar = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id_in_cache(
             Some(project.path()),
             SidecarProfile::Agent,
             Some(DEFAULT_AGENT_RUN_ID),
