@@ -174,7 +174,8 @@ result remains diagnostic and is never inserted into the retrieval cache.
 Each runnable stage may use elapsed request slack after reserving the planned budgets of later
 stages, and the final planned stage may use whatever request budget remains. This keeps every lane
 bounded without stranding time in static allowances. Traces report each effective deadline, and
-the total request deadline still bounds cancellation and cache eligibility. Once a stage records
+the primary single-query request window is capped at 1.5 seconds; the total request deadline still
+bounds cancellation and cache eligibility. Once a stage records
 a blocking deadline, later request-deadline or marginal-gain exits retain that first reason so
 partial results cannot become packet-eligible or cacheable.
 

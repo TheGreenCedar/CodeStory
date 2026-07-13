@@ -20,9 +20,9 @@ import sys
 import tarfile
 import tempfile
 import threading
-import textwrap
 import time
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -286,68 +286,6 @@ def write_managed_convergence_fixture(project: Path) -> None:
     )
 
 
-def macos_arm64_backend(project: Path) -> dict:
-    metadata = project / "crates" / "codestory-retrieval" / "assets" / "llama-sidecar-backends.json"
-    payload = read_json_file(metadata)
-    backends = payload.get("backends", []) if isinstance(payload, dict) else []
-    backend = next(
-        (
-            item
-            for item in backends
-            if isinstance(item, dict) and item.get("id") == "macos-aarch64-metal"
-        ),
-        None,
-    )
-    if not isinstance(backend, dict):
-        raise RuntimeError(f"managed macOS arm64 backend is missing: {metadata}")
-    return backend
-
-
-def seed_corrupt_managed_server(cache_root: Path, project: Path) -> dict:
-    backend = macos_arm64_backend(project)
-    relative = backend.get("managed_cache_rel_dir")
-    executable_name = backend.get("executable_rel_path")
-    if not isinstance(relative, str) or not isinstance(executable_name, str):
-        raise RuntimeError("managed macOS backend has incomplete install metadata")
-    install_dir = cache_root / Path(relative)
-    executable = install_dir / executable_name
-    executable.parent.mkdir(parents=True, exist_ok=True)
-    executable.write_bytes(b"interrupted managed llama-server install\n")
-    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-    return {
-        "backend": backend["id"],
-        "executable": str(executable),
-        "expected_sha256": backend.get("executable_sha256"),
-    }
-
-
-def require_managed_server_repaired(seed: dict, artifact: Path) -> None:
-    executable = Path(seed["executable"])
-    expected = seed.get("expected_sha256")
-    actual = sha256_file(executable) if executable.is_file() else None
-    payload = {**seed, "actual_sha256": actual, "repaired": actual == expected}
-    write_json(artifact, payload)
-    require(
-        isinstance(expected, str) and actual == expected,
-        "native_corrupt_server_repair",
-        artifact,
-        "managed native server was not checksum-repaired after a partial install",
-    )
-
-
-def free_local_ports(count: int) -> list[int]:
-    listeners = []
-    try:
-        for _ in range(count):
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.bind(("127.0.0.1", 0))
-            listeners.append(listener)
-        return [listener.getsockname()[1] for listener in listeners]
-    finally:
-        for listener in listeners:
-            listener.close()
-
-
 def make_managed_convergence_fixture_stale(project: Path) -> None:
     time.sleep(0.05)
     (project / "src" / "lib.rs").write_text(
@@ -358,6 +296,19 @@ def make_managed_convergence_fixture_stale(project: Path) -> None:
         "pub fn discovered_after_publication() {}\n",
         encoding="utf-8",
     )
+
+
+def make_repository_convergence_copy_stale(project: Path) -> Path:
+    probe = project / "crates" / "codestory-cli" / "src" / "managed_convergence_probe.rs"
+    if not probe.parent.is_dir():
+        raise RuntimeError(
+            f"managed convergence proof cannot locate codestory-cli sources under {project}"
+        )
+    probe.write_text(
+        "pub fn discovered_by_grounding_convergence() -> &'static str { \"fresh\" }\n",
+        encoding="utf-8",
+    )
+    return probe
 
 
 def proof_ownership_snapshot(cache_root: Path) -> dict[str, str]:
@@ -449,7 +400,23 @@ def run_docker_json(
 def docker_created_epoch_ms(value: object) -> int | None:
     if not isinstance(value, str) or not value:
         return None
-    candidate = value.strip().replace("Z", "+00:00")
+    candidate = value.strip()
+    if "." in candidate:
+        prefix, fraction_and_zone = candidate.rsplit(".", 1)
+        fraction_length = next(
+            (
+                index
+                for index, character in enumerate(fraction_and_zone)
+                if not character.isdigit()
+            ),
+            len(fraction_and_zone),
+        )
+        candidate = (
+            f"{prefix}.{fraction_and_zone[:6]}"
+            f"{fraction_and_zone[fraction_length:]}"
+        )
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
     try:
         parsed = datetime.datetime.fromisoformat(candidate)
     except ValueError:
@@ -1130,6 +1097,13 @@ def cleanup_proof_cache(
         error = f"proof cache contains unregistered sidecar state: {unexpected}"
         results.append({"kind": "compose_state_validation", "error": error})
         errors.append(error)
+    worker_cleanup, worker_errors = cleanup_proof_owned_repair_workers(
+        canonical_cache,
+        project,
+        identities,
+    )
+    results.extend(worker_cleanup)
+    errors.extend(worker_errors)
     validated_states: list[tuple[dict, dict]] = []
     for identity in identities:
         try:
@@ -1355,6 +1329,70 @@ def run_command(
 def require(value: bool, layer: str, artifact: Path, message: str) -> None:
     if not value:
         fail(layer, artifact, message)
+
+
+def seed_stale_local_publication(
+    cli: Path,
+    project: Path,
+    out_dir: Path,
+    timeout_secs: int,
+    env: dict[str, str],
+    make_stale: Callable[[Path], object],
+) -> dict[str, str]:
+    ready_artifact = out_dir / "managed-local-ready.json"
+    run_command(
+        cli,
+        "managed_local_ready",
+        [
+            "ready",
+            "--goal",
+            "local",
+            "--repair",
+            "--project",
+            str(project),
+            "--format",
+            "json",
+            "--output-file",
+            str(ready_artifact),
+        ],
+        ready_artifact,
+        timeout_secs,
+        env=env,
+    )
+
+    ground_artifact = out_dir / "managed-local-ground.json"
+    ground = run_command(
+        cli,
+        "managed_local_ground",
+        [
+            "ground",
+            "--project",
+            str(project),
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--output-file",
+            str(ground_artifact),
+        ],
+        ground_artifact,
+        timeout_secs,
+        env=env,
+    )
+    require(
+        isinstance(ground, dict) and isinstance(ground.get("stats"), dict),
+        "managed_local_ground",
+        ground_artifact,
+        "managed local ground output is missing repository stats",
+    )
+    stale_result = make_stale(project)
+    stale_artifact = out_dir / "managed-local-stale.json"
+    write_json(stale_artifact, {"project": str(project), "mutation": str(stale_result)})
+    return {
+        "managed_local_ready": str(ready_artifact),
+        "managed_local_ground": str(ground_artifact),
+        "managed_local_stale": str(stale_artifact),
+    }
 
 
 def require_agent_ready(payload: object, layer: str, artifact: Path) -> None:
@@ -1859,32 +1897,6 @@ def require_packet_ready(payload: object, artifact: Path) -> None:
     )
 
 
-def require_context_ready(payload: object, artifact: Path) -> None:
-    require(isinstance(payload, dict), "context", artifact, "context output is not a JSON object")
-    context = payload.get("context")
-    require(isinstance(context, dict), "context", artifact, "context output missing context object")
-    retrieval_version = context.get("retrieval_version")
-    require(
-        retrieval_version == "sidecar",
-        "context",
-        artifact,
-        f"context retrieval_version is {retrieval_version!r}",
-    )
-    trace = context.get("retrieval_trace")
-    require(isinstance(trace, dict), "context", artifact, "context output missing context retrieval trace")
-    steps = trace.get("steps")
-    require(
-        isinstance(steps, list) and len(steps) > 0,
-        "context",
-        artifact,
-        "context retrieval trace has no steps",
-    )
-    shadow = trace.get("retrieval_shadow")
-    require(isinstance(shadow, dict), "context", artifact, "context retrieval trace missing retrieval shadow")
-    mode = shadow.get("retrieval_mode")
-    require(mode == "full", "context", artifact, f"context retrieval_shadow.retrieval_mode is {mode!r}")
-
-
 def write_stdio_artifact(artifact: Path, transcript: list[dict], stdout: str, stderr_path: Path, extra: dict | None = None) -> None:
     payload = {
         "transcript": transcript,
@@ -1947,6 +1959,50 @@ def windows_last_error(kernel32) -> int:
     return int(getattr(kernel32, "last_error", ctypes.get_last_error()))
 
 
+def process_start_identity_snapshot(
+    pid: int,
+    run=subprocess.run,
+    *,
+    platform: str | None = None,
+    system: str | None = None,
+) -> tuple[str, str | None]:
+    platform = platform or os.name
+    system = system or sys.platform
+    if pid <= 0:
+        return "invalid_pid", None
+    if system.startswith("linux"):
+        try:
+            stat_text = Path("/proc", str(pid), "stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return "already_exited", None
+        except OSError:
+            return "unknown", None
+        fields = stat_text.rsplit(") ", 1)
+        start = fields[1].split()[19] if len(fields) == 2 and len(fields[1].split()) > 19 else None
+        return ("running", f"linux:{start}") if start else ("unknown", None)
+    if platform == "nt":
+        script = f'$p=Get-CimInstance Win32_Process -Filter "ProcessId = {pid}" -ErrorAction Stop; if ($null -eq $p) {{ exit 2 }}; $p.CreationDate.ToUniversalTime().Ticks'
+        command, prefix, gone = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], "windows:", 2
+    else:
+        command, prefix, gone = ["ps", "-o", "lstart=", "-p", str(pid)], "unix:", 1
+    try:
+        result = run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2,
+            check=False,
+            text=True,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", None
+    if result.returncode == gone:
+        return "already_exited", None
+    identity = result.stdout.strip()
+    return ("running", f"{prefix}{identity}") if result.returncode == 0 and identity else ("unknown", None)
+
+
 def require_windows_process_exit(process_handle, pid: int, timeout_ms: int = 10_000, kernel32=None) -> None:
     kernel32 = kernel32 or windows_process_api()
     wait_result = kernel32.WaitForSingleObject(process_handle, timeout_ms)
@@ -1961,6 +2017,7 @@ def terminate_worker_pid(
     pid: int,
     diagnostics: dict | None = None,
     *,
+    expected_start_identity: str | None = None,
     kernel32=None,
     run=subprocess.run,
     platform: str | None = None,
@@ -1971,6 +2028,19 @@ def terminate_worker_pid(
     if pid <= 0:
         diagnostics["status"] = "invalid_pid"
         return
+    if expected_start_identity is not None:
+        identity_status, actual_start_identity = process_start_identity_snapshot(pid)
+        diagnostics["process_identity"] = {
+            "status": identity_status,
+            "start_identity": actual_start_identity,
+        }
+        if identity_status == "already_exited":
+            diagnostics["status"] = "already_exited"
+            return
+        if identity_status != "running":
+            raise RuntimeError(f"could not prove worker process {pid} start identity")
+        if actual_start_identity != expected_start_identity:
+            raise RuntimeError(f"refusing to terminate reused worker pid {pid}")
     if platform == "nt":
         kernel32 = kernel32 or windows_process_api()
         process_handle = None
@@ -2056,8 +2126,8 @@ def terminate_worker_pid(
         deadline = time.monotonic() + 10
         while True:
             try:
-                exited = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-                if exited is not None:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+                if waited_pid == pid:
                     diagnostics["status"] = "terminated"
                     return
             except ChildProcessError:
@@ -2074,26 +2144,73 @@ def terminate_worker_pid(
             time.sleep(0.1)
 
 
-def proof_started_repair_workers(responses: list[dict]) -> list[dict]:
-    responses_by_id = {response.get("id"): response for response in responses if isinstance(response, dict)}
-    repair = responses_by_id.get("repair", {}).get("result", {}).get("structuredContent", {})
-    if not isinstance(repair, dict) or repair.get("status") != "started":
-        return []
-    pid = repair.get("pid")
-    attempt_id = repair.get("attempt_id")
-    if not isinstance(pid, int) or not isinstance(attempt_id, str) or not attempt_id:
-        return []
-    status = status_from_resource_response(responses_by_id.get("status_after_repair", {}))
-    if not isinstance(status, dict):
-        return []
-    setup = status.get("sidecar_setup", {})
-    observed_attempts = {
-        (setup.get("active_repair") or {}).get("attempt_id"),
-        (setup.get("last_worker_result") or {}).get("attempt_id"),
-    }
-    if attempt_id not in observed_attempts:
-        return []
-    return [{"pid": pid, "attempt_id": attempt_id, "source": "proof_started_repair_response"}]
+def cleanup_proof_owned_repair_workers(
+    cache_root: Path,
+    project: Path,
+    registered_sidecars: list[dict] | None = None,
+) -> tuple[list[dict], list[str]]:
+    evidence = []
+    errors = []
+    canonical_cache = cache_root.resolve(strict=False)
+    identities = registered_sidecars or proof_agent_identities([canonical_cache], project)
+    for identity in identities:
+        item = None
+        try:
+            if (
+                not isinstance(identity, dict)
+                or Path(str(identity.get("cache_root", ""))).resolve(strict=False) != canonical_cache
+            ):
+                continue
+            path = Path(identity["state_file"]).with_name("ready-repair-enqueue.lock")
+            if not path.exists():
+                continue
+            if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(canonical_cache):
+                raise RuntimeError(f"proof ready-repair reservation is unsafe: {path}")
+            record = read_json_file(path)
+            if not isinstance(record, dict):
+                raise RuntimeError(f"proof ready-repair reservation is invalid: {path}")
+            if record.get("adopted") is not True:
+                continue
+            project_root = record.get("project_root")
+            expected = (identity["project"], identity["profile"], identity["run_id"], identity["namespace"])
+            observed = (
+                str(Path(project_root).resolve(strict=False)) if isinstance(project_root, str) else None,
+                record.get("profile"),
+                record.get("run_id"),
+                record.get("namespace"),
+            )
+            pid = record.get("pid")
+            attempt = record.get("token")
+            start = record.get("process_start_identity")
+            if observed != expected or not isinstance(pid, int) or pid <= 0:
+                raise RuntimeError("proof ready-repair reservation ownership changed")
+            if not isinstance(attempt, str) or not attempt or not isinstance(start, str) or not start:
+                raise RuntimeError("proof ready-repair reservation process identity is incomplete")
+            item = {
+                "kind": "ready_repair_worker_cleanup",
+                "pid": pid,
+                "attempt_id": attempt,
+                "process_start_identity": start,
+                "source": path.name,
+            }
+            evidence.append(item)
+            terminate_worker_pid(
+                pid,
+                item,
+                expected_start_identity=start,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if item is None:
+                evidence.append({
+                    "kind": "ready_repair_worker_validation",
+                    "state_file": str(identity.get("state_file", "")) if isinstance(identity, dict) else "",
+                    "error": error,
+                })
+            else:
+                item["error"] = error
+            errors.append(error)
+    return evidence, errors
 
 
 def read_stdio_line(stdout_queue: queue.Queue[str | None], timeout_secs: int) -> str | None:
@@ -2161,6 +2278,79 @@ def plugin_stdio_status(
         )
 
 
+def managed_convergence_request_plan(
+    project: Path,
+    require_ready: bool,
+    question: str,
+    query: str,
+) -> dict:
+    activation = {
+        "jsonrpc": "2.0",
+        "id": "ground_activation",
+        "method": "tools/call",
+        "params": {
+            "name": "ground",
+            "arguments": {"project": str(project), "budget": "strict"},
+        },
+    }
+    if not require_ready:
+        return {
+            "extra_requests": [
+                activation,
+                *[
+                    {
+                        "jsonrpc": "2.0",
+                        "id": f"setup_poll_{index}",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "sidecar_setup",
+                            "arguments": {"project": str(project), "action": "status"},
+                        },
+                        "_delay_before_secs": 2,
+                    }
+                    for index in range(1, 6)
+                ],
+                {
+                    "jsonrpc": "2.0",
+                    "id": "status_after_convergence",
+                    "method": "resources/read",
+                    "params": {"uri": STATUS_URI, "project": str(project)},
+                },
+            ]
+        }
+    return {
+        "extra_requests": [activation],
+        "poll_request": {
+            "jsonrpc": "2.0",
+            "id": "convergence_status",
+            "method": "resources/read",
+            "params": {"uri": STATUS_URI, "project": str(project)},
+        },
+        "poll_until": managed_status_response_is_ready,
+        "poll_interval_secs": 2,
+        "post_poll_requests": [
+            {
+                "jsonrpc": "2.0",
+                "id": "packet_after_convergence",
+                "method": "tools/call",
+                "params": {
+                    "name": "packet",
+                    "arguments": {"project": str(project), "question": question, "budget": "compact"},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": "search_after_convergence",
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"project": str(project), "query": query, "why": True},
+                },
+            },
+        ],
+    }
+
+
 def plugin_stdio_handoff(
     plugin_root: Path,
     release_dir: Path,
@@ -2170,12 +2360,21 @@ def plugin_stdio_handoff(
     timeout_secs: int,
     expected_version: str,
     archive_cli: Path,
-    empty_model_dir: Path,
+    model_dir: Path,
     archive: Path,
+    *,
+    require_ready: bool = False,
+    question: str = DEFAULT_QUESTION,
+    query: str = DEFAULT_QUERY,
 ) -> dict:
     require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
-    require(launcher.is_file(), "managed_plugin_convergence", artifact, f"plugin launcher is missing: {launcher}")
+    require(
+        launcher.is_file(),
+        "managed_plugin_convergence",
+        artifact,
+        f"plugin launcher is missing: {launcher}",
+    )
     with temporary_directory_with_retry("codestory-plugin-data-", artifact.parent) as data:
         plugin_data = Path(data)
         prior_version = "0.0.0"
@@ -2258,7 +2457,7 @@ def plugin_stdio_handoff(
             **os.environ,
             "CODESTORY_CLI": "",
             "CODESTORY_CACHE_ROOT": str(cache_root),
-            "CODESTORY_EMBED_MODEL_DIR": str(empty_model_dir),
+            "CODESTORY_EMBED_MODEL_DIR": str(model_dir),
             "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
             "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH": str(policy_path),
             "PLUGIN_DATA": str(plugin_data),
@@ -2287,6 +2486,7 @@ def plugin_stdio_handoff(
             expected_version,
             archive_cli,
         )
+        request_plan = managed_convergence_request_plan(project, require_ready, question, query)
         status = stdio_status_command(
             ["node", str(launcher)],
             artifact,
@@ -2295,39 +2495,18 @@ def plugin_stdio_handoff(
             layer="managed_plugin_convergence",
             cwd=project,
             env=plugin_env,
-            extra_requests=[
-                {
-                    "jsonrpc": "2.0",
-                    "id": "ground_activation",
-                    "method": "tools/call",
-                    "params": {
-                        "name": "ground",
-                        "arguments": {"project": str(project), "budget": "strict"},
-                    },
-                },
-                *[
-                    {
-                        "jsonrpc": "2.0",
-                        "id": f"setup_poll_{index}",
-                        "method": "tools/call",
-                        "params": {
-                            "name": "sidecar_setup",
-                            "arguments": {"project": str(project), "action": "status"},
-                        },
-                        "_delay_before_secs": 2,
-                    }
-                    for index in range(1, 6)
-                ],
-                {
-                    "jsonrpc": "2.0",
-                    "id": "status_after_convergence",
-                    "method": "resources/read",
-                    "params": {"uri": STATUS_URI, "project": str(project)},
-                },
-            ],
+            **request_plan,
             cleanup_status_workers=True,
         )
-        require_managed_plugin_convergence(status, artifact, expected_version, archive_cli)
+        if require_ready:
+            status = require_managed_plugin_ready_convergence(
+                status,
+                artifact,
+                expected_version,
+                archive_cli,
+            )
+        else:
+            require_managed_plugin_convergence(status, artifact, expected_version, archive_cli)
         retention = status.get("plugin_runtime", {}).get("managed_cli_retention", {})
         retained = retention.get("retained", []) if isinstance(retention, dict) else []
         require(
@@ -2359,8 +2538,14 @@ def stdio_status_command(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     extra_requests: list[dict] | None = None,
+    poll_request: dict | None = None,
+    poll_until: Callable[[dict], bool] | None = None,
+    poll_interval_secs: float = 1.0,
+    post_poll_requests: list[dict] | None = None,
     cleanup_status_workers: bool = False,
 ) -> dict:
+    if (poll_request is None) != (poll_until is None):
+        raise ValueError("poll_request and poll_until must be provided together")
     stderr_path = artifact.with_suffix(artifact.suffix + ".stderr.txt")
     process = subprocess.Popen(
         command,
@@ -2449,6 +2634,20 @@ def stdio_status_command(
                 stdio_fail(f"stdio MCP {phase} response must contain exactly one of result or error", {"invalid_response": response})
             return response
 
+    def send_request(request_spec: dict) -> dict:
+        request = dict(request_spec)
+        delay_before_secs = request.pop("_delay_before_secs", 0)
+        if delay_before_secs:
+            time.sleep(delay_before_secs)
+        entry = {"request": request}
+        transcript.append(entry)
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        response = read_correlated_response(request["id"], entry, f"request {request['id']}")
+        entry["response"] = response
+        responses.append(response)
+        return response
+
     try:
         initialize = {
             "jsonrpc": "2.0",
@@ -2511,17 +2710,27 @@ def stdio_status_command(
                     break
 
         for request_spec in requests:
-            request = dict(request_spec)
-            delay_before_secs = request.pop("_delay_before_secs", 0)
-            if delay_before_secs:
-                time.sleep(delay_before_secs)
-            entry = {"request": request}
-            transcript.append(entry)
-            process.stdin.write(json.dumps(request) + "\n")
-            process.stdin.flush()
-            response = read_correlated_response(request["id"], entry, f"request {request['id']}")
-            entry["response"] = response
-            responses.append(response)
+            send_request(request_spec)
+
+        if poll_request is not None and poll_until is not None:
+            poll_deadline = time.monotonic() + timeout_secs
+            poll_id = str(poll_request.get("id", "poll"))
+            attempt = 0
+            while True:
+                if attempt:
+                    remaining = poll_deadline - time.monotonic()
+                    if remaining <= 0:
+                        stdio_fail(f"stdio MCP poll {poll_id} timed out after {timeout_secs}s", {"timed_out": True})
+                    time.sleep(min(poll_interval_secs, remaining))
+                attempt += 1
+                request = {**poll_request, "id": f"{poll_id}_{attempt}"}
+                if poll_until(send_request(request)):
+                    break
+                if time.monotonic() >= poll_deadline:
+                    stdio_fail(f"stdio MCP poll {poll_id} timed out after {timeout_secs}s", {"timed_out": True})
+
+        for request_spec in post_poll_requests or []:
+            send_request(request_spec)
     finally:
         try:
             process.stdin.close()
@@ -2534,18 +2743,15 @@ def stdio_status_command(
                 terminate_process_tree(process)
             process_terminated = True
         worker_cleanup_artifact = artifact.with_name(f"{artifact.stem}-worker-cleanup.json")
-        worker_cleanup = []
-        owned_workers = proof_started_repair_workers(responses) if cleanup_status_workers else []
-        for worker in owned_workers:
-            evidence = dict(worker)
-            worker_cleanup.append(evidence)
-            try:
-                terminate_worker_pid(worker["pid"], evidence)
-            except Exception as exc:
-                evidence["error"] = f"{type(exc).__name__}: {exc}"
-                write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
-                raise
-            write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
+        cache_value = (env or os.environ).get("CODESTORY_CACHE_ROOT")
+        worker_cleanup, worker_errors = (
+            cleanup_proof_owned_repair_workers(Path(cache_value), project)
+            if cleanup_status_workers and cache_value
+            else ([], [])
+        )
+        write_json(worker_cleanup_artifact, {"workers": worker_cleanup})
+        if worker_errors:
+            raise RuntimeError("proof-owned repair worker cleanup failed: " + "; ".join(worker_errors))
         if process.poll() is None:
             process.kill()
             process.wait(timeout=2)
@@ -2732,6 +2938,36 @@ def status_from_resource_response(response: dict) -> dict | None:
     return status if isinstance(status, dict) else None
 
 
+def resource_statuses(responses: list[dict], request_prefix: str) -> list[dict]:
+    return [
+        status
+        for response in responses
+        if str(response.get("id", "")).startswith(request_prefix)
+        and isinstance(status := status_from_resource_response(response), dict)
+    ]
+
+
+def managed_status_is_ready(status: dict) -> bool:
+    surfaces = status.get("allowed_surfaces", {})
+    proof = status.get("readiness_broker", {}).get("gpu_proof", {})
+    return (
+        local_freshness_status(status) == "fresh"
+        and status.get("retrieval_mode") == "full"
+        and surfaces.get("packet", {}).get("allowed") is True
+        and surfaces.get("search", {}).get("allowed") is True
+        and proof.get("proof_status") == "verified"
+        and proof.get("meaningful_accelerator_work_proven") is True
+        and proof.get("embed_smoke_ok") is True
+        and proof.get("requested_provider") == "metal"
+        and proof.get("detected_provider") == "metal"
+    )
+
+
+def managed_status_response_is_ready(response: dict) -> bool:
+    status = status_from_resource_response(response)
+    return isinstance(status, dict) and managed_status_is_ready(status)
+
+
 def require_managed_binary_provenance(
     status: dict,
     artifact: Path,
@@ -2816,39 +3052,13 @@ def require_managed_observational_status(
     )
 
 
-def require_managed_plugin_convergence(
-    status_before: dict,
+def require_single_managed_repair(
+    setup_snapshots: list[dict],
+    expected_project: str | None,
+    expected_outcomes: set[str],
     artifact: Path,
-    expected_version: str,
-    archive_cli: Path,
-) -> None:
-    require_managed_observational_status(status_before, artifact, expected_version, archive_cli)
-    initial_generation = status_before["index_publication"]["generation"]
-    ground = transcript_response(artifact, "ground_activation") or {}
-    require(
-        structured_content_from_response(ground) is not None
-        and ground.get("result", {}).get("isError") is not True,
-        "managed_plugin_convergence",
-        artifact,
-        "ground activation did not serve a complete publication",
-    )
-    setup_snapshots = []
-    for request_id in (
-        "setup_poll_1",
-        "setup_poll_2",
-        "setup_poll_3",
-        "setup_poll_4",
-        "setup_poll_5",
-    ):
-        setup = structured_content_from_response(transcript_response(artifact, request_id) or {})
-        require(
-            isinstance(setup, dict),
-            "managed_plugin_convergence",
-            artifact,
-            f"{request_id} did not return sidecar setup status",
-        )
-        setup_snapshots.append(setup)
-    attempt_records = [
+) -> dict:
+    records = [
         record
         for setup in setup_snapshots
         for record in (setup.get("active_repair"), setup.get("last_worker_result"))
@@ -2856,26 +3066,26 @@ def require_managed_plugin_convergence(
         and isinstance(record.get("attempt_id"), str)
         and record.get("attempt_id")
     ]
-    attempt_ids = {record["attempt_id"] for record in attempt_records}
+    attempt_ids = {record["attempt_id"] for record in records}
+    namespaces = [record.get("namespace") for record in records]
     require(
         len(attempt_ids) == 1,
         "managed_plugin_convergence",
         artifact,
         f"ground activation did not retain exactly one repair attempt: {sorted(attempt_ids)}",
     )
-    expected_project = status_before.get("project_root")
-    namespaces = {record.get("namespace") for record in attempt_records}
     require(
         isinstance(expected_project, str)
         and expected_project
-        and len(namespaces) == 1
-        and all(isinstance(namespace, str) and namespace for namespace in namespaces)
         and all(
             record.get("project_root") == expected_project
             and record.get("profile") == "agent"
             and record.get("run_id") == "shared-agent"
-            for record in attempt_records
-        ),
+            and isinstance(record.get("namespace"), str)
+            and record.get("namespace")
+            for record in records
+        )
+        and len(set(namespaces)) == 1,
         "managed_plugin_convergence",
         artifact,
         "ground activation repair records did not preserve one durable project/profile/run/namespace identity",
@@ -2893,14 +3103,40 @@ def require_managed_plugin_convergence(
         isinstance(terminal, dict)
         and terminal.get("attempt_id") in attempt_ids
         and terminal.get("run_id") == "shared-agent"
-        and terminal.get("outcome") in {"failed", "succeeded"},
+        and terminal.get("outcome") in expected_outcomes,
         "managed_plugin_convergence",
         artifact,
-        "automatic shared-agent repair did not reach a durable terminal result",
+        f"automatic shared-agent repair did not finish with an expected outcome: {sorted(expected_outcomes)}",
     )
-    status_after = status_from_resource_response(
-        transcript_response(artifact, "status_after_convergence") or {}
+    return terminal
+
+
+def require_managed_ground_activation(
+    status_before: dict,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> int:
+    require_managed_observational_status(status_before, artifact, expected_version, archive_cli)
+    initial_generation = status_before["index_publication"]["generation"]
+    ground = transcript_response(artifact, "ground_activation") or {}
+    require(
+        structured_content_from_response(ground) is not None
+        and ground.get("result", {}).get("isError") is not True,
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation did not serve a complete publication",
     )
+    return initial_generation
+
+
+def require_managed_generation_advanced(
+    status_after: dict | None,
+    initial_generation: int,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> dict:
     require(
         isinstance(status_after, dict),
         "managed_plugin_convergence",
@@ -2916,6 +3152,53 @@ def require_managed_plugin_convergence(
         artifact,
         "ground activation did not publish a newer complete local generation",
     )
+    return status_after
+
+
+def require_managed_plugin_convergence(
+    status_before: dict,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> None:
+    initial_generation = require_managed_ground_activation(
+        status_before,
+        artifact,
+        expected_version,
+        archive_cli,
+    )
+    setup_snapshots = []
+    for request_id in (
+        "setup_poll_1",
+        "setup_poll_2",
+        "setup_poll_3",
+        "setup_poll_4",
+        "setup_poll_5",
+    ):
+        setup = structured_content_from_response(transcript_response(artifact, request_id) or {})
+        require(
+            isinstance(setup, dict),
+            "managed_plugin_convergence",
+            artifact,
+            f"{request_id} did not return sidecar setup status",
+        )
+        setup_snapshots.append(setup)
+    require_single_managed_repair(
+        setup_snapshots,
+        status_before.get("project_root"),
+        {"failed", "succeeded"},
+        artifact,
+    )
+    status_after = status_from_resource_response(
+        transcript_response(artifact, "status_after_convergence") or {}
+    )
+    status_after = require_managed_generation_advanced(
+        status_after,
+        initial_generation,
+        artifact,
+        expected_version,
+        archive_cli,
+    )
     gpu_proof = status_after.get("readiness_broker", {}).get("gpu_proof", {})
     require(
         status_after.get("allowed_surfaces", {}).get("packet", {}).get("allowed") is False
@@ -2929,6 +3212,91 @@ def require_managed_plugin_convergence(
         artifact,
         "accelerator-required packet/search opened without verified runtime smoke proof",
     )
+
+
+def require_managed_plugin_ready_convergence(
+    status_before: dict,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> dict:
+    initial_generation = require_managed_ground_activation(
+        status_before,
+        artifact,
+        expected_version,
+        archive_cli,
+    )
+
+    transcript = read_json_file(artifact).get("transcript", [])
+    tool_names = [
+        entry.get("request", {}).get("params", {}).get("name")
+        for entry in transcript
+        if entry.get("request", {}).get("method") == "tools/call"
+    ]
+    require(
+        tool_names == ["ground", "packet", "search"],
+        "managed_plugin_convergence",
+        artifact,
+        f"grounding-only proof invoked unexpected MCP tools: {tool_names}",
+    )
+    status_snapshots = resource_statuses(
+        [entry.get("response", {}) for entry in transcript],
+        "convergence_status_",
+    )
+    require(
+        status_snapshots and managed_status_is_ready(status_snapshots[-1]),
+        "managed_plugin_convergence",
+        artifact,
+        "grounding activation did not reach full verified packet/search readiness",
+    )
+
+    require_single_managed_repair(
+        [status.get("sidecar_setup", {}) for status in status_snapshots],
+        status_before.get("project_root"),
+        {"succeeded"},
+        artifact,
+    )
+
+    for status in [status_before, *status_snapshots]:
+        proof = status.get("readiness_broker", {}).get("gpu_proof", {})
+        if proof.get("proof_status") == "verified" and proof.get("embed_smoke_ok") is True:
+            continue
+        surfaces = status.get("allowed_surfaces", {})
+        require(
+            surfaces.get("packet", {}).get("allowed") is False
+            and surfaces.get("search", {}).get("allowed") is False,
+            "managed_plugin_convergence",
+            artifact,
+            "packet/search opened before verified GPU and embedding proof",
+        )
+
+    status_after = require_managed_generation_advanced(
+        status_snapshots[-1],
+        initial_generation,
+        artifact,
+        expected_version,
+        archive_cli,
+    )
+    proof = status_after.get("readiness_broker", {}).get("gpu_proof", {})
+    launch = proof.get("runtime_identity", {}).get("embedding_launch")
+    resource = status_after.get("readiness_broker", {}).get("resources", {}).get("native_embedding_runtime", {})
+    require(
+        managed_status_is_ready(status_after)
+        and proof.get("observation_source") == "native_log"
+        and isinstance(launch, dict)
+        and launch.get("launch_mode") == "native_spawned"
+        and isinstance(launch.get("pid"), int)
+        and resource.get("owner_pid") == launch.get("pid"),
+        "managed_plugin_convergence",
+        artifact,
+        "full retrieval did not retain verified matching native Metal runtime identity",
+    )
+
+    packet = structured_content_from_response(transcript_response(artifact, "packet_after_convergence") or {})
+    search = structured_content_from_response(transcript_response(artifact, "search_after_convergence") or {})
+    require_packet_ready(packet, artifact)
+    require_search_full(search, artifact)
+    return status_after
 
 
 def run_gate(args: argparse.Namespace) -> None:
@@ -2946,8 +3314,9 @@ def run_gate(args: argparse.Namespace) -> None:
         contextlib.ExitStack() as cleanup_stack,
     ):
         source_project = project
-        if getattr(args, "native_edge_cases", False):
-            edge_project = Path(temp) / "CodeStory project with spaces ü"
+        grounding_convergence = getattr(args, "managed_plugin_grounding_convergence", False)
+        if grounding_convergence:
+            edge_project = Path(temp) / "CodeStory managed grounding convergence"
             shutil.copytree(
                 source_project,
                 edge_project,
@@ -2987,10 +3356,6 @@ def run_gate(args: argparse.Namespace) -> None:
         )
         stdio_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(stdio_cache_root)}
         register_proof_temp_ownership(project, [cache_root, stdio_cache_root], archive)
-
-        corrupt_server_seed = None
-        if getattr(args, "native_edge_cases", False):
-            corrupt_server_seed = seed_corrupt_managed_server(cache_root, project)
 
         summary = {
             "archive": str(archive),
@@ -3129,55 +3494,16 @@ def run_gate(args: argparse.Namespace) -> None:
             )
             empty_model_dir.mkdir()
             summary["managed_convergence_project"] = str(convergence_project)
-            local_ready_artifact = out_dir / "managed-local-ready.json"
-            run_command(
-                cli,
-                "managed_local_ready",
-                [
-                    "ready",
-                    "--goal",
-                    "local",
-                    "--repair",
-                    "--project",
-                    str(convergence_project),
-                    "--format",
-                    "json",
-                    "--output-file",
-                    str(local_ready_artifact),
-                ],
-                local_ready_artifact,
-                args.timeout_secs,
-                env=proof_env,
+            summary["artifacts"].update(
+                seed_stale_local_publication(
+                    cli,
+                    convergence_project,
+                    out_dir,
+                    args.timeout_secs,
+                    proof_env,
+                    make_managed_convergence_fixture_stale,
+                )
             )
-            summary["artifacts"]["managed_local_ready"] = str(local_ready_artifact)
-
-            local_ground_artifact = out_dir / "managed-local-ground.json"
-            ground = run_command(
-                cli,
-                "managed_local_ground",
-                [
-                    "ground",
-                    "--project",
-                    str(convergence_project),
-                    "--refresh",
-                    "none",
-                    "--format",
-                    "json",
-                    "--output-file",
-                    str(local_ground_artifact),
-                ],
-                local_ground_artifact,
-                args.timeout_secs,
-                env=proof_env,
-            )
-            require(
-                isinstance(ground, dict) and isinstance(ground.get("stats"), dict),
-                "managed_local_ground",
-                local_ground_artifact,
-                "managed local ground output is missing repository stats",
-            )
-            summary["artifacts"]["managed_local_ground"] = str(local_ground_artifact)
-            make_managed_convergence_fixture_stale(convergence_project)
 
             plugin_artifact = out_dir / "managed-plugin-convergence.json"
             plugin_status = plugin_stdio_handoff(
@@ -3202,10 +3528,93 @@ def run_gate(args: argparse.Namespace) -> None:
 
         local_env = proof_agent_environment(proof_env, PROOF_LOCAL_RUN_ID)
         ready_artifact = out_dir / "ready.json"
-        ready = run_command(
-            cli,
-            "ready",
-            [
+        if grounding_convergence:
+            summary["artifacts"].update(
+                seed_stale_local_publication(
+                    cli,
+                    project,
+                    out_dir,
+                    args.timeout_secs,
+                    proof_env,
+                    make_repository_convergence_copy_stale,
+                )
+            )
+            model_dir = os.environ.get("CODESTORY_EMBED_MODEL_DIR", "").strip()
+            require(
+                bool(model_dir) and Path(model_dir).is_dir(),
+                "managed_plugin_convergence",
+                archive,
+                "grounding convergence requires a prepared CODESTORY_EMBED_MODEL_DIR",
+            )
+            plugin_artifact = out_dir / "managed-plugin-ready-convergence.json"
+            plugin_status = plugin_stdio_handoff(
+                Path(args.plugin_root).resolve(),
+                archive.parent,
+                project,
+                cache_root,
+                plugin_artifact,
+                args.timeout_secs,
+                args.expected_version,
+                cli,
+                Path(model_dir),
+                archive,
+                require_ready=True,
+                question=args.question,
+                query=args.query,
+            )
+            register_current_proof_runtime(cache_root)
+            summary["artifacts"]["managed_plugin_ready_convergence"] = str(plugin_artifact)
+            summary["artifacts"]["managed_plugin_upgrade"] = str(
+                plugin_artifact.with_name("managed-plugin-upgrade.json")
+            )
+
+            restart_artifact = out_dir / "managed-plugin-restart-status.json"
+            restart_status = plugin_stdio_status(
+                Path(args.plugin_root).resolve(),
+                archive.parent,
+                project,
+                restart_artifact,
+                args.timeout_secs,
+                args.expected_version,
+                cache_root,
+            )
+            require_plugin_stdio_ready(restart_status, restart_artifact, args.expected_version)
+            first_launch = (
+                plugin_status.get("readiness_broker", {})
+                .get("gpu_proof", {})
+                .get("runtime_identity", {})
+                .get("embedding_launch", {})
+            )
+            restart_launch = (
+                restart_status.get("readiness_broker", {})
+                .get("gpu_proof", {})
+                .get("runtime_identity", {})
+                .get("embedding_launch", {})
+            )
+            require(
+                isinstance(first_launch, dict)
+                and isinstance(restart_launch, dict)
+                and restart_launch.get("pid") == first_launch.get("pid")
+                and restart_launch.get("launch_fingerprint_sha256")
+                == first_launch.get("launch_fingerprint_sha256"),
+                "managed_plugin_restart",
+                restart_artifact,
+                "restarted MCP did not reuse the exact healthy native embedding runtime",
+            )
+            summary["artifacts"]["managed_plugin_restart"] = str(restart_artifact)
+            ready_args = [
+                "ready",
+                "--goal",
+                "agent",
+                "--project",
+                str(project),
+                "--format",
+                "json",
+                "--output-file",
+                str(ready_artifact),
+            ]
+        else:
+            ready_args = [
                 "ready",
                 "--goal",
                 "agent",
@@ -3216,7 +3625,11 @@ def run_gate(args: argparse.Namespace) -> None:
                 "json",
                 "--output-file",
                 str(ready_artifact),
-            ],
+            ]
+        ready = run_command(
+            cli,
+            "ready",
+            ready_args,
             ready_artifact,
             args.timeout_secs,
             env=local_env,
@@ -3224,10 +3637,6 @@ def run_gate(args: argparse.Namespace) -> None:
         require_agent_ready(ready, "ready", ready_artifact)
         register_current_proof_runtime(cache_root)
         summary["artifacts"]["ready"] = str(ready_artifact)
-        if corrupt_server_seed is not None:
-            corrupt_server_artifact = out_dir / "native-corrupt-server-repair.json"
-            require_managed_server_repaired(corrupt_server_seed, corrupt_server_artifact)
-            summary["artifacts"]["native_corrupt_server_repair"] = str(corrupt_server_artifact)
         write_json(out_dir / "summary.json", summary)
 
         if getattr(args, "native_accelerator_lifecycle", False):
@@ -3344,19 +3753,6 @@ def run_gate(args: argparse.Namespace) -> None:
             summary["artifacts"]["native_recovery_launch"] = str(recovery_evidence)
             write_json(out_dir / "summary.json", summary)
 
-        doctor_artifact = out_dir / "doctor.json"
-        doctor = run_command(
-            cli,
-            "doctor",
-            ["doctor", "--project", str(project), "--format", "json", "--output-file", str(doctor_artifact)],
-            doctor_artifact,
-            args.timeout_secs,
-            env=local_env,
-        )
-        require_retrieval_full(doctor, "doctor", doctor_artifact)
-        summary["artifacts"]["doctor"] = str(doctor_artifact)
-        write_json(out_dir / "summary.json", summary)
-
         status_artifact = out_dir / "retrieval-status.json"
         status = run_command(
             cli,
@@ -3403,29 +3799,6 @@ def run_gate(args: argparse.Namespace) -> None:
         summary["artifacts"]["search"] = str(search_artifact)
         write_json(out_dir / "summary.json", summary)
 
-        context_artifact = out_dir / "context.json"
-        context = run_command(
-            cli,
-            "context",
-            [
-                "context",
-                "--project",
-                str(project),
-                "--query",
-                args.context_query,
-                "--format",
-                "json",
-                "--output-file",
-                str(context_artifact),
-            ],
-            context_artifact,
-            args.timeout_secs,
-            env=local_env,
-        )
-        require_context_ready(context, context_artifact)
-        summary["artifacts"]["context"] = str(context_artifact)
-        write_json(out_dir / "summary.json", summary)
-
         packet_artifact = out_dir / "packet.json"
         packet = run_command(
             cli,
@@ -3453,10 +3826,6 @@ def run_gate(args: argparse.Namespace) -> None:
 
         stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, local_env)
         require_stdio_shape(stdio_status_payload, stdio_artifact, args.expected_version)
-        allowed = stdio_status_payload.get("allowed_surfaces", {})
-        if not all(allowed.get(name, {}).get("allowed") is True for name in ("packet", "search", "context")):
-            shutil.copy2(stdio_artifact, out_dir / "serve-stdio-status-initial.json")
-            stdio_status_payload = stdio_status(cli, project, stdio_artifact, args.timeout_secs, local_env)
         require_stdio_ready(stdio_status_payload, stdio_artifact, args.expected_version)
         summary["artifacts"]["serve_stdio"] = str(stdio_artifact)
         write_json(out_dir / "summary.json", summary)
@@ -3479,450 +3848,51 @@ def run_gate(args: argparse.Namespace) -> None:
     print(f"packaged agent proof passed; artifacts={out_dir}")
 
 
-def write_fake_cli(path: Path) -> None:
-    fake = path / "fake_cli.py"
-    fake.write_text(
-        textwrap.dedent(
-            r'''
-            import hashlib
-            import json
-            import os
-            import sys
-            import time
-
-            def emit(value):
-                if "--output-file" in sys.argv:
-                    out = sys.argv[sys.argv.index("--output-file") + 1]
-                    open(out, "w", encoding="utf-8").write(json.dumps(value))
-                else:
-                    print(json.dumps(value))
-
-            fail = os.environ.get("CODESTORY_FAKE_FAIL_LAYER")
-            if "--version" in sys.argv:
-                print("codestory-cli 9.9.9")
-                raise SystemExit(0)
-            if "--help" in sys.argv:
-                print("Usage: codestory-cli [OPTIONS] <COMMAND>")
-                raise SystemExit(0)
-            layer = sys.argv[1]
-            if layer == "retrieval" and len(sys.argv) > 2:
-                layer = "retrieval_" + sys.argv[2].replace("-", "_")
-            if fail == f"{layer}_stderr":
-                print("forced stderr failure", file=sys.stderr)
-                raise SystemExit(3)
-            if fail == layer:
-                print("forced failure")
-                raise SystemExit(2)
-            if layer == "ready":
-                emit({"verdicts": [{
-                    "goal": "agent_packet_search",
-                    "status": "ready",
-                    "summary": "ready",
-                    "minimum_next": [],
-                    "full_repair": [],
-                }]})
-            elif layer == "doctor":
-                emit({"retrieval_mode": "full"})
-            elif layer == "retrieval_bootstrap":
-                emit({
-                    "cache_root": os.environ.get("CODESTORY_CACHE_ROOT"),
-                    "project_status": {"retrieval_mode": "unavailable"},
-                })
-            elif layer == "retrieval_index":
-                emit({
-                    "manifest": {"lexical_version": "sqlite-fts5-v1"},
-                    "qdrant_stubbed": False,
-                    "scip_stubbed": False,
-                })
-            elif layer == "retrieval_status":
-                emit({"retrieval_mode": "full"})
-            elif layer == "retrieval_down":
-                emit({"stopped": True})
-            elif layer == "search":
-                emit({"retrieval_shadow": {"retrieval_mode": "full"}, "indexed_symbol_hits": [{"node_id": "1"}]})
-            elif layer == "context":
-                if fail == "context_weak":
-                    emit({"retrieval_trace": {"resolved_profile": "investigate"}})
-                elif fail == "context_fallback":
-                    emit({
-                        "context": {
-                            "retrieval_version": "sidecar",
-                            "retrieval_trace": {
-                                "steps": [{}],
-                                "retrieval_shadow": {"retrieval_mode": "fallback"},
-                            },
-                        },
-                    })
-                else:
-                    emit({
-                        "context": {
-                            "retrieval_version": "sidecar",
-                            "retrieval_trace": {
-                                "resolved_profile": "investigate",
-                                "steps": [{}],
-                                "retrieval_shadow": {"retrieval_mode": "full"},
-                            },
-                        },
-                    })
-            elif layer == "packet":
-                if fail == "packet_weak":
-                    emit({"sufficiency": {"status": "supported"}, "answer": {"retrieval_version": "fallback"}, "retrieval_trace_summary": {}})
-                else:
-                    emit({"sufficiency": {"status": "sufficient"}, "answer": {"retrieval_version": "sidecar"}, "retrieval_trace_summary": {}})
-            elif layer == "ground":
-                emit({
-                    "cache_root": os.environ.get("CODESTORY_CACHE_ROOT"),
-                    "root": os.getcwd(),
-                    "stats": {"file_count": 1, "node_count": 1},
-                })
-            elif layer == "serve":
-                marker = None
-                repair_attempt = None
-                ground_count = 0
-                managed_mode = os.environ.get("CODESTORY_FAKE_PLUGIN_MANAGED") == "1"
-                if fail in {"serve_first_blocked", "serve_first_blocked_then_timeout"}:
-                    try:
-                        project = sys.argv[sys.argv.index("--project") + 1]
-                        marker = os.path.join(project, ".fake-serve-first-blocked-seen")
-                    except (ValueError, IndexError):
-                        marker = os.path.join(os.getcwd(), ".fake-serve-first-blocked-seen")
-                for line in sys.stdin:
-                    request = json.loads(line)
-                    if fail == "serve_timeout":
-                        time.sleep(60)
-                        continue
-                    if request.get("method") == "notifications/initialized":
-                        if os.environ.get("CODESTORY_FAKE_LIST_CHANGED") == "1":
-                            for method in (
-                                "notifications/tools/list_changed",
-                                "notifications/resources/list_changed",
-                                "notifications/prompts/list_changed",
-                            ):
-                                print(json.dumps({"jsonrpc": "2.0", "method": method}), flush=True)
-                        continue
-                    if request.get("method") == "initialize":
-                        result = {
-                            "protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"),
-                            "capabilities": {
-                                "tools": {"listChanged": os.environ.get("CODESTORY_FAKE_LIST_CHANGED") == "1"},
-                                "resources": {"listChanged": False},
-                            },
-                            "serverInfo": {"name": "codestory", "version": "9.9.9"},
-                        }
-                    elif request.get("method") == "tools/list":
-                        result = {"tools": [{"name": "ground"}, {"name": "packet"}, {"name": "search"}, {"name": "context"}, {"name": "sidecar_setup"}]}
-                    elif request.get("method") == "resources/list":
-                        resources = [{"uri": "codestory://status", "name": "CodeStory runtime status"}]
-                        if fail != "resources_hidden":
-                            resources.append({"uri": "codestory://agent-guide", "name": "CodeStory agent guide"})
-                        result = {"resources": resources}
-                    elif request.get("method") == "tools/call" and request.get("params", {}).get("name") == "ground":
-                        repair_attempt = repair_attempt or "fake-activation-attempt"
-                        ground_count += 1
-                        ground = {
-                            "root": request.get("params", {}).get("arguments", {}).get("project"),
-                            "stats": {"file_count": 2, "node_count": 2},
-                        }
-                        result = {"content": [{"type": "text", "text": json.dumps(ground)}], "structuredContent": ground}
-                    elif request.get("method") == "tools/call" and request.get("params", {}).get("name") == "sidecar_setup":
-                        if request.get("params", {}).get("arguments", {}).get("action") == "status":
-                            setup = {
-                                "state": "enabled",
-                                "active_repair": None,
-                                "last_worker_result": ({
-                                    "attempt_id": repair_attempt,
-                                    "project_root": request.get("params", {}).get("arguments", {}).get("project"),
-                                    "profile": "agent",
-                                    "run_id": "shared-agent",
-                                    "namespace": "fake-agent-namespace",
-                                    "outcome": "failed",
-                                    "exit_code": 1,
-                                } if repair_attempt else None),
-                                "activation_triggered_repair": bool(repair_attempt),
-                            }
-                            result = {"content": [{"type": "text", "text": json.dumps(setup)}], "structuredContent": setup}
-                            response_id = request.get("id")
-                            print(json.dumps({"jsonrpc": "2.0", "id": response_id, "result": result}), flush=True)
-                            continue
-                        repair = {
-                            "status": "started",
-                            "mode": "background",
-                            "pid": os.getpid(),
-                            "attempt_id": "fake-attempt",
-                            "reservation_published": True,
-                            "recommended_next_calls": [{
-                                "method": "tools/call",
-                                "tool": "status",
-                                "arguments": {"project": os.getcwd()},
-                            }],
-                        }
-                        repair_attempt = repair["attempt_id"]
-                        result = {"content": [{"type": "text", "text": json.dumps(repair)}], "structuredContent": repair}
-                    else:
-                        if fail == "serve_first_blocked_then_timeout" and marker is not None and os.path.exists(marker):
-                            time.sleep(60)
-                            continue
-                        serve_allowed = True
-                        refresh_worker_pid = None
-                        if marker is not None and not os.path.exists(marker):
-                            refresh_worker_pid = int(os.environ["CODESTORY_FAKE_STATUS_WORKER_PID"])
-                            open(marker, "w", encoding="utf-8").write(str(refresh_worker_pid))
-                            serve_allowed = False
-                        elif marker is not None:
-                            refresh_worker_pid = int(open(marker, encoding="utf-8").read())
-                            try:
-                                os.kill(refresh_worker_pid, 0)
-                            except OSError:
-                                serve_allowed = False
-                        server_executable = os.environ.get("CODESTORY_FAKE_SERVER_EXECUTABLE", sys.argv[0])
-                        server_sha256 = hashlib.sha256(open(server_executable, "rb").read()).hexdigest()
-                        status = {
-                            "cache_root": os.environ.get("CODESTORY_CACHE_ROOT"),
-                            "project_root": request.get("params", {}).get("project", os.getcwd()),
-                            "effective_index_freshness": {"status": "fresh" if ground_count or not managed_mode else "stale"},
-                            "index_freshness": {"status": "fresh" if ground_count or not managed_mode else "stale"},
-                            "index_publication": {"generation": 2 if ground_count else 1},
-                            "readiness_broker": {
-                                "operations": ([{
-                                    "operation_kind": "local_graph_refresh",
-                                    "pid": refresh_worker_pid,
-                                    "status": "running",
-                                }] if refresh_worker_pid else []),
-                                "gpu_proof": {
-                                    "proof_status": "gpu_unverified",
-                                    "meaningful_accelerator_work_proven": False,
-                                    "embed_smoke_ok": False,
-                                },
-                            },
-                            "server_version": "9.9.9",
-                            "cli_version": "9.9.9",
-                            "server_executable": server_executable,
-                            "server_executable_sha256": server_sha256,
-                            "sidecar_contract_version": 1,
-                            "plugin_runtime": {
-                                "cli_source": "managed" if os.environ.get("CODESTORY_FAKE_PLUGIN_MANAGED") == "1" else "direct_cli_launch",
-                                "plugin_version": "9.9.9",
-                                "build_source": "github_release",
-                                "repo_ref": "v9.9.9",
-                                "cli_version": "9.9.9",
-                                "plugin_root": os.getcwd(),
-                                "managed_binary_path": server_executable,
-                                "managed_cli_retention": {
-                                    "active_version": "9.9.9",
-                                    "retained": [
-                                        {"version": "9.9.9", "reason": "active"},
-                                        {"version": "0.0.0", "reason": "rollback"},
-                                    ],
-                                },
-                            },
-                            "sidecar_setup": {
-                                "state": "enabled",
-                                "active_repair": None,
-                                "last_worker_result": ({
-                                    "attempt_id": repair_attempt,
-                                    "project_root": request.get("params", {}).get("project", os.getcwd()),
-                                    "profile": "agent",
-                                    "run_id": "shared-agent",
-                                    "namespace": "fake-agent-namespace",
-                                    "outcome": "failed",
-                                    "exit_code": 1,
-                                } if repair_attempt else None),
-                                "activation_triggered_repair": bool(repair_attempt),
-                            },
-                            "status_resource_auto_repair": None,
-                            "readiness_lanes": {
-                                "agent_packet_search": {"run_id": "shared-agent", "status": "blocked"},
-                            },
-                            "allowed_surfaces": {
-                                "ground": {"allowed": True},
-                                "packet": {"allowed": False if managed_mode else serve_allowed},
-                                "search": {"allowed": False if managed_mode else serve_allowed},
-                                "context": {"allowed": False if managed_mode else serve_allowed},
-                            },
-                        }
-                        result = {"contents": [{"uri": "codestory://status", "mimeType": "application/json", "text": json.dumps(status)}]}
-                    response_id = request.get("id")
-                    initialize_mode = os.environ.get("CODESTORY_FAKE_INITIALIZE_MODE")
-                    if request.get("method") == "initialize" and initialize_mode == "non_object":
-                        print(json.dumps([]), flush=True)
-                        continue
-                    if request.get("method") == "initialize" and initialize_mode == "wrong_id":
-                        response_id = "wrong-initialize"
-                    if request.get("method") == "initialize" and initialize_mode == "error":
-                        print(json.dumps({"jsonrpc": "2.0", "id": response_id, "error": {"code": -32000, "message": "synthetic initialize error"}}), flush=True)
-                        continue
-                    if request.get("method") == "initialize" and initialize_mode == "malformed_tools":
-                        result["capabilities"]["tools"] = []
-                    if request.get("method") == "initialize" and initialize_mode == "malformed_jsonrpc":
-                        print("synthetic protocol stderr", file=sys.stderr, flush=True)
-                    if request.get("method") == "tools/list" and initialize_mode == "out_of_order":
-                        response_id = "resources"
-                    if request.get("method") == "tools/list" and initialize_mode == "server_request_collision":
-                        print(json.dumps({"jsonrpc": "2.0", "id": response_id, "method": "sampling/createMessage", "params": {}}), flush=True)
-                        continue
-                    if request.get("method") == "tools/list" and initialize_mode == "malformed_method":
-                        print(json.dumps({"jsonrpc": "2.0", "method": 42}), flush=True)
-                        continue
-                    jsonrpc = "1.0" if request.get("method") == "initialize" and initialize_mode == "malformed_jsonrpc" else "2.0"
-                    print(json.dumps({"jsonrpc": jsonrpc, "id": response_id, "result": result}), flush=True)
-            else:
-                raise SystemExit(f"unknown fake layer: {layer}")
-            '''
-        ).lstrip(),
-        encoding="utf-8",
-    )
-    if os.name == "nt":
-        wrapper = path / "codestory-cli.cmd"
-        wrapper.write_text(f'@echo off\r\n"{sys.executable}" "%~dp0fake_cli.py" %*\r\n', encoding="utf-8")
-    else:
-        wrapper = path / "codestory-cli"
-        wrapper.write_text(f"#!{sys.executable}\nimport runpy\nrunpy.run_path({str(fake)!r}, run_name='__main__')\n", encoding="utf-8")
-        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
-
-
-def write_fake_plugin_launcher(plugin_root: Path) -> None:
-    launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
-    launcher.parent.mkdir(parents=True)
-    launcher.write_text(
-        textwrap.dedent(
-            r'''
-            const { spawn } = require('child_process');
-            const fs = require('fs');
-            const path = require('path');
-
-            if (process.argv[2] === 'sidecar-policy') {
-              if (process.env.CODESTORY_FAKE_PLUGIN_POLICY_TIMEOUT === '1') {
-                process.stdout.write('policy stdout before timeout\n');
-                process.stderr.write('policy stderr before timeout\n');
-                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60_000);
-              }
-              const policyIndex = process.argv.indexOf('--policy-file');
-              if (policyIndex >= 0 && process.argv[policyIndex + 1]) {
-                fs.writeFileSync(process.argv[policyIndex + 1], JSON.stringify({ state: 'enabled' }));
-              }
-              process.exit(0);
-            }
-
-            let cli = process.env.CODESTORY_FAKE_PLUGIN_CLI;
-            if (!cli) {
-              process.stderr.write('CODESTORY_FAKE_PLUGIN_CLI is required\n');
-              process.exit(2);
-            }
-            if (process.env.CODESTORY_FAKE_PLUGIN_MANAGED === '1') {
-              const managedDir = path.join(process.env.PLUGIN_DATA, 'codestory-cli', '9.9.9', 'bin');
-              fs.mkdirSync(managedDir, { recursive: true });
-              const sourceDir = path.dirname(cli);
-              const managedCli = path.join(managedDir, path.basename(cli));
-              fs.copyFileSync(cli, managedCli);
-              fs.copyFileSync(path.join(sourceDir, 'fake_cli.py'), path.join(managedDir, 'fake_cli.py'));
-              cli = managedCli;
-            }
-
-            const child = spawn(
-              cli,
-              ['serve', '--stdio', '--refresh', 'none', '--project', process.cwd()],
-              {
-                stdio: 'inherit',
-                shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli),
-                env: {
-                  ...process.env,
-                  CODESTORY_FAKE_FAIL_LAYER: process.env.CODESTORY_FAKE_PLUGIN_HIDE_RESOURCES === '1'
-                    ? 'resources_hidden'
-                    : process.env.CODESTORY_FAKE_FAIL_LAYER || '',
-                  CODESTORY_FAKE_SERVER_EXECUTABLE: cli,
-                },
-              },
-            );
-            child.on('exit', (code, signal) => {
-              if (signal) process.kill(process.pid, signal);
-              process.exit(code || 0);
-            });
-            child.on('error', (error) => {
-              process.stderr.write(`${error.message}\n`);
-              process.exit(1);
-            });
-            '''
-        ).lstrip(),
-        encoding="utf-8",
-    )
-
-
-def expect_fake_gate_failure(
-    args: argparse.Namespace,
-    fail_layer: str,
-    expected_layer: str,
-    artifact_fragment: str,
-    failure_message: str,
-) -> None:
-    os.environ["CODESTORY_FAKE_FAIL_LAYER"] = fail_layer
-    try:
-        try:
-            run_gate(args)
-        except GateFailure as exc:
-            assert exc.layer == expected_layer
-            assert artifact_fragment in str(exc.artifact)
-        else:
-            raise AssertionError(failure_message)
-    finally:
-        os.environ.pop("CODESTORY_FAKE_FAIL_LAYER", None)
-
-
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-self-test-") as temp:
         root = Path(temp)
+        artifact = root / "validator.json"
         runner_temp = os.environ.get("RUNNER_TEMP", "").strip()
         proof_root_parent = Path(runner_temp).resolve(strict=True) if runner_temp else root
 
-        def proof_owned_test_root(suffix: str) -> Path:
-            path = proof_root_parent / f"codestory-metal-proof-owned-{suffix}"
-            path.mkdir()
-            return path
+        assert docker_created_epoch_ms(
+            "2026-07-13T14:08:36.245344828Z"
+        ) == docker_created_epoch_ms("2026-07-13T14:08:36.245344Z")
 
-        evidence_cache = root / "native-evidence-cache"
-        evidence_cache.mkdir()
-        native_log = evidence_cache / "llama-server-native.log"
-        native_log.write_text("launch marker\n" + "x" * 256 + "\noffloaded 13/13 layers to GPU\n", encoding="utf-8")
-        write_json(
-            evidence_cache / "retrieval-sidecars.json",
+        require_agent_not_ready(
             {
-                "owner": "codestory",
-                "embedding_launch": {
-                    "launch_mode": "native_spawned",
-                    "pid": 1234,
-                    "log_path": str(native_log),
+                "verdicts": [{
+                    "goal": "agent_packet_search",
+                    "status": "repair_retrieval",
+                }],
+                "readiness_broker": {
+                    "gpu_proof": {"proof_status": "gpu_unverified"}
                 },
             },
+            "native_runtime_dead_status",
+            artifact,
         )
-        evidence_artifact = preserve_native_embedding_evidence(
-            evidence_cache,
-            root,
-            "native-evidence-self-test",
-            required=True,
-        )
-        assert evidence_artifact is not None and evidence_artifact.is_file()
-        assert (root / "native-evidence-self-test-llama-server-native.log").is_file()
-        bounded_artifact = root / "bounded-native.log"
-        bounded = bounded_file_copy(native_log, bounded_artifact, max_bytes=64)
-        assert bounded["truncated"] is True
-        bounded_body = bounded_artifact.read_text(encoding="utf-8")
-        assert "launch marker" in bounded_body and "offloaded 13/13" in bounded_body
 
-        registration_payload = {"launches": [], "ports": []}
-        registered_launch = {
-            "launch_mode": "native_spawned",
-            "pid": 1234,
-            "launch_fingerprint_sha256": "1" * 64,
-        }
-        record_proof_runtime_identity(
-            registration_payload,
-            registered_launch,
-            [18080, 18080, 0, 65536, "18081"],
-        )
-        record_proof_runtime_identity(registration_payload, registered_launch, [18080])
-        assert registration_payload == {
-            "launches": [registered_launch],
-            "ports": [18080],
-        }
+        with embedding_probe_server() as endpoint:
+            port = int(endpoint.split(":", 2)[2].split("/", 1)[0])
+            assert port_reachability(port)
+            require_intel_cpu_external_ready(
+                {
+                    "compose_started": False,
+                    "embed_reachable": True,
+                    "sidecar_state": {
+                        "embed_url": endpoint,
+                        "embedding_device_policy": "cpu_allowed",
+                        "embedding_device_state": "cpu",
+                        "embedding_device_observation_source": "cpu_policy",
+                        "embedding_cpu_allowed": True,
+                        "embedding_accelerator_requested": False,
+                        "embedding_accelerator_request_provider": None,
+                    },
+                },
+                artifact,
+                endpoint,
+            )
 
         if sys.platform == "darwin":
             probe_code = "import time; time.sleep(60)"
@@ -3932,23 +3902,28 @@ def self_test() -> None:
                 stderr=subprocess.DEVNULL,
             )
             try:
+                time.sleep(0.05)
+                observed_process = darwin_process_argv(process_probe.pid)
+                assert observed_process is not None
                 launch = {
                     "pid": process_probe.pid,
                     "spawned_at_epoch_ms": int(time.time() * 1000),
-                    "executable_path": sys.executable,
+                    "executable_path": observed_process[0],
                     "launch_args": ["-c", probe_code, "--exact-proof-child"],
                 }
                 assert registered_native_process_snapshot(launch)["status"] == "matching"
-                prefix_collision = {**launch, "launch_args": ["-c", probe_code, "--exact-proof"]}
-                assert registered_native_process_snapshot(prefix_collision)["status"] == "identity_mismatch"
+                wrong_argv = {
+                    **launch,
+                    "launch_args": ["-c", probe_code, "--exact-proof"],
+                }
+                assert (
+                    registered_native_process_snapshot(wrong_argv)["status"]
+                    == "identity_mismatch"
+                )
             finally:
                 process_probe.terminate()
                 process_probe.wait(timeout=5)
 
-        stage = root / "pkg" / "codestory-cli-v9.9.9-test"
-        stage.mkdir(parents=True)
-        write_fake_cli(stage)
-        fake_cli = find_cli(stage)
         compose_file = root / "docker" / "retrieval-compose.yml"
         compose_file.parent.mkdir()
         compose_file.write_text("services: {}\n", encoding="utf-8")
@@ -3958,13 +3933,14 @@ def self_test() -> None:
             overrides: dict | None = None,
             *,
             state_project: Path = root,
-        ) -> Path:
+        ) -> dict[str, str]:
             cache_root.mkdir()
-            identity = proof_agent_identity(cache_root, state_project, PROOF_LOCAL_RUN_ID)
+            identity = proof_agent_identity(
+                cache_root, state_project, PROOF_LOCAL_RUN_ID
+            )
             state_root = Path(identity["state_file"]).parent
-            (state_root / "qdrant").mkdir(parents=True)
-            (state_root / "lexical").mkdir()
-            (state_root / "scip").mkdir()
+            for name in ("qdrant", "lexical", "scip"):
+                (state_root / name).mkdir(parents=True, exist_ok=True)
             state = {
                 "owner": "codestory",
                 "profile": "agent",
@@ -3977,210 +3953,147 @@ def self_test() -> None:
                 "scip_artifacts_root": identity["scip_artifacts_root"],
             }
             state.update(overrides or {})
-            state_file = Path(identity["state_file"])
-            write_json(state_file, state)
-            return state_file
+            write_json(Path(identity["state_file"]), state)
+            return identity
 
-        compose_cleanup_root = root / "compose-cleanup"
-        write_proof_compose_state(compose_cleanup_root)
-        compose_cleanup_artifact = root / "compose-cleanup.json"
+        if os.name != "nt":
+            worker_cache = root / "ready-repair-cleanup"
+            identity = proof_agent_identity(worker_cache, root, PROOF_LOCAL_RUN_ID)
+            Path(identity["state_file"]).parent.mkdir(parents=True)
+            worker = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                status, start = process_start_identity_snapshot(worker.pid)
+                assert status == "running" and start
+                try:
+                    terminate_worker_pid(
+                        worker.pid,
+                        expected_start_identity=f"{start}-reused",
+                    )
+                except RuntimeError as exc:
+                    assert "reused worker pid" in str(exc)
+                else:
+                    raise AssertionError("PID reuse must fail closed")
+                write_json(
+                    Path(identity["state_file"]).with_name(
+                        "ready-repair-enqueue.lock"
+                    ),
+                    {
+                        "project_root": identity["project"],
+                        "profile": identity["profile"],
+                        "run_id": identity["run_id"],
+                        "namespace": identity["namespace"],
+                        "pid": worker.pid,
+                        "token": "proof-ground-activation",
+                        "process_start_identity": start,
+                        "adopted": True,
+                    },
+                )
+                cleanup, errors = cleanup_proof_owned_repair_workers(
+                    worker_cache, root, [identity]
+                )
+                worker.wait(timeout=5)
+                assert not errors and cleanup[0]["status"] == "terminated"
+            finally:
+                if worker.poll() is None:
+                    worker.terminate()
+                    worker.wait(timeout=5)
+
+        compose_cache = root / "compose-cleanup"
+        identity = write_proof_compose_state(compose_cache)
         compose_calls = []
 
-        def successful_compose_cleanup(command, **kwargs):
-            if command[0] == "docker":
-                compose_calls.append((command, kwargs["env"]))
-                namespace = kwargs["env"]["CODESTORY_SIDECAR_NAMESPACE"]
-                qdrant_root = kwargs["env"]["CODESTORY_QDRANT_DATA_DIR"]
-                container_id = f"container-{fnv1a_hex(qdrant_root)}"
-                network_id = f"network-{fnv1a_hex(qdrant_root)}"
-                created = "2026-07-12T12:00:00Z"
-                if command[1:3] == ["container", "ls"]:
-                    stdout = json.dumps({"ID": container_id})
-                elif command[1:3] == ["network", "ls"]:
-                    stdout = json.dumps({"ID": network_id})
-                elif command[1:3] == ["container", "inspect"]:
-                    stdout = json.dumps(
-                        [
-                            {
-                                "Id": container_id,
-                                "Name": f"/{namespace}-qdrant",
-                                "Created": created,
-                                "Config": {
-                                    "Labels": {
-                                        "com.docker.compose.project": namespace,
-                                        "com.docker.compose.service": "qdrant",
-                                        "dev.codestory.owner": "codestory",
-                                        "dev.codestory.profile": "agent",
-                                        "dev.codestory.namespace": namespace,
-                                    }
-                                },
-                                "Mounts": [
-                                    {
-                                        "Type": "bind",
-                                        "Source": qdrant_root,
-                                        "Destination": "/qdrant/storage",
-                                    }
-                                ],
-                            }
-                        ]
-                    )
-                elif command[1:3] == ["network", "inspect"]:
-                    stdout = json.dumps(
-                        [
-                            {
-                                "Id": network_id,
-                                "Name": f"{namespace}_default",
-                                "Created": created,
-                                "Labels": {
-                                    "com.docker.compose.project": namespace,
-                                    "com.docker.compose.network": "default",
-                                },
-                                "Containers": {container_id: {"Name": f"{namespace}-qdrant"}},
-                            }
-                        ]
-                    )
-                else:
-                    stdout = "removed"
-                return subprocess.CompletedProcess(command, 0, stdout, "")
-            return subprocess.run(command, **kwargs)
+        def fake_docker(command, **kwargs):
+            compose_calls.append(command)
+            namespace = kwargs["env"]["CODESTORY_SIDECAR_NAMESPACE"]
+            qdrant_root = kwargs["env"]["CODESTORY_QDRANT_DATA_DIR"]
+            container_id = f"container-{fnv1a_hex(qdrant_root)}"
+            network_id = f"network-{fnv1a_hex(qdrant_root)}"
+            if command[1:3] == ["container", "ls"]:
+                stdout = json.dumps({"ID": container_id})
+            elif command[1:3] == ["network", "ls"]:
+                stdout = json.dumps({"ID": network_id})
+            elif command[1:3] == ["container", "inspect"]:
+                stdout = json.dumps([{
+                    "Id": container_id,
+                    "Name": f"/{namespace}-qdrant",
+                    "Created": "2026-07-12T12:00:00Z",
+                    "Config": {"Labels": {
+                        "com.docker.compose.project": namespace,
+                        "com.docker.compose.service": "qdrant",
+                        "dev.codestory.owner": "codestory",
+                        "dev.codestory.profile": "agent",
+                        "dev.codestory.namespace": namespace,
+                    }},
+                    "Mounts": [{
+                        "Type": "bind",
+                        "Source": qdrant_root,
+                        "Destination": "/qdrant/storage",
+                    }],
+                }])
+            elif command[1:3] == ["network", "inspect"]:
+                stdout = json.dumps([{
+                    "Id": network_id,
+                    "Name": f"{namespace}_default",
+                    "Created": "2026-07-12T12:00:00Z",
+                    "Labels": {
+                        "com.docker.compose.project": namespace,
+                        "com.docker.compose.network": "default",
+                    },
+                    "Containers": {
+                        container_id: {"Name": f"{namespace}-qdrant"}
+                    },
+                }])
+            else:
+                stdout = "removed"
+            return subprocess.CompletedProcess(command, 0, stdout, "")
 
-        compose_state = read_json_file(
-            Path(proof_agent_identity(compose_cleanup_root, root, PROOF_LOCAL_RUN_ID)["state_file"])
-        )
-        registered_resources = docker_compose_resource_snapshot(
-            compose_state,
-            successful_compose_cleanup,
-        )
-        remaining_registered_resources = json.loads(json.dumps(registered_resources))
-        remaining_registered_resources["containers"] = []
-        remaining_registered_resources["networks"][0]["attached_container_ids"] = []
-        validate_proof_docker_resources(
-            compose_state,
-            remaining_registered_resources,
-            registered_resources,
-        )
-        foreign_remaining_resources = json.loads(json.dumps(remaining_registered_resources))
-        foreign_remaining_resources["networks"][0]["id"] = "unregistered-network"
-        try:
-            validate_proof_docker_resources(
-                compose_state,
-                foreign_remaining_resources,
-                registered_resources,
-            )
-        except RuntimeError as exc:
-            assert "absent from proof registration" in str(exc)
-        else:
-            raise AssertionError("partial cleanup retry must reject unregistered Docker IDs")
-
+        cleanup_artifact = root / "compose-cleanup.json"
         cleanup_proof_cache(
-            fake_cli,
+            None,
             root,
-            compose_cleanup_root,
-            compose_cleanup_artifact,
-            successful_compose_cleanup,
+            compose_cache,
+            cleanup_artifact,
+            fake_docker,
+            registered_sidecars=[identity],
         )
-        assert not compose_cleanup_root.exists()
-        removal_calls = [command for command, _env in compose_calls if "rm" in command]
-        assert removal_calls[0][1:4] == ["container", "rm", "-f"]
-        assert removal_calls[1][1:3] == ["network", "rm"]
-        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"].startswith("codestory-agent-")
-        assert compose_calls[0][1]["CODESTORY_SIDECAR_NAMESPACE"] != "codestory"
-        compose_cleanup = read_json_file(compose_cleanup_artifact)
-        assert compose_cleanup["removed"] is True
-        assert any(
-            item.get("kind") == "docker_container_remove"
-            for item in compose_cleanup["commands"]
-        )
+        assert not compose_cache.exists()
+        assert [command[1] for command in compose_calls if "rm" in command] == [
+            "container",
+            "network",
+        ]
 
-        foreign_collision_root = root / "compose-cleanup-foreign-collision"
-        write_proof_compose_state(foreign_collision_root)
-        foreign_mount = root / "foreign-qdrant-cache"
-        foreign_mount.mkdir()
-        foreign_collision_calls = []
-
-        def foreign_collision_cleanup(command, **kwargs):
-            foreign_collision_calls.append(command)
-            result = successful_compose_cleanup(command, **kwargs)
-            if command[0:3] == ["docker", "container", "inspect"]:
-                payload = json.loads(result.stdout)
-                payload[0]["Mounts"][0]["Source"] = str(foreign_mount)
-                return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
-            return result
-
-        foreign_collision_artifact = root / "compose-cleanup-foreign-collision.json"
+        global_cache = root / "global-local-cache"
+        global_cache.mkdir()
+        write_json(global_cache / "retrieval-sidecars.json", {"owner": "codestory"})
         try:
             cleanup_proof_cache(
-                fake_cli,
-                root,
-                foreign_collision_root,
-                foreign_collision_artifact,
-                foreign_collision_cleanup,
+                None, root, global_cache, root / "global-local-cleanup.json"
             )
-        except RuntimeError as exc:
-            assert "foreign cache" in str(exc)
-        else:
-            raise AssertionError("foreign Compose collision must fail closed")
-        assert foreign_collision_root.exists()
-        assert not any("rm" in command for command in foreign_collision_calls)
-        collision_cleanup = read_json_file(foreign_collision_artifact)
-        assert collision_cleanup["removed"] is False
-        assert any(
-            item.get("kind") == "docker_resource_validation"
-            for item in collision_cleanup["commands"]
-        )
-        remove_tree_with_retry(foreign_collision_root)
-
-        symlink_root = root / "compose-validation-symlink"
-        symlink_root.mkdir()
-        symlink_identity = proof_agent_identity(symlink_root, root, PROOF_LOCAL_RUN_ID)
-        Path(symlink_identity["state_file"]).parent.mkdir(parents=True)
-        symlink_target = root / "compose-validation-symlink-target.json"
-        write_json(symlink_target, {"owner": "codestory"})
-        Path(symlink_identity["state_file"]).symlink_to(symlink_target)
-        symlink_artifact = root / "compose-validation-symlink.json"
-        try:
-            cleanup_proof_cache(fake_cli, root, symlink_root, symlink_artifact)
-        except RuntimeError:
-            pass
-        else:
-            raise AssertionError("symlinked proof Compose state must fail closed")
-        assert "symlink" in read_json_file(symlink_artifact)["commands"][0]["error"]
-        remove_tree_with_retry(symlink_root)
-        symlink_target.unlink()
-
-        global_namespace_root = root / "compose-validation-global-local"
-        global_namespace_root.mkdir()
-        write_json(global_namespace_root / "retrieval-sidecars.json", {"owner": "codestory"})
-        global_namespace_artifact = root / "compose-validation-global-local.json"
-        try:
-            cleanup_proof_cache(fake_cli, root, global_namespace_root, global_namespace_artifact)
         except RuntimeError as exc:
             assert "global local-sidecar namespace" in str(exc)
         else:
-            raise AssertionError("proof cleanup must refuse the global codestory namespace")
-        remove_tree_with_retry(global_namespace_root)
+            raise AssertionError("proof cleanup must refuse the global namespace")
+        remove_tree_with_retry(global_cache)
 
-        skill = stage / PLUGIN_SKILL_RELATIVE
-        skill.parent.mkdir(parents=True)
-        skill.write_text("name: codestory-grounding\n", encoding="utf-8")
-        archive = root / "codestory-cli-v9.9.9-test.zip"
-        with zipfile.ZipFile(archive, "w") as handle:
-            for path in stage.rglob("*"):
-                handle.write(path, path.relative_to(stage.parent).as_posix())
-        checksum_file = root / "SHA256SUMS.txt"
-        checksum_file.write_text(f"{sha256_file(archive)}  {archive.name}\n", encoding="utf-8")
+        registered_root = (
+            proof_root_parent
+            / f"codestory-metal-proof-owned-self-test-{root.name}"
+        )
+        registered_root.mkdir()
         project = root / "repo"
         project.mkdir()
-        registered_root = proof_owned_test_root("self-test")
-        registered_archive = registered_root / archive.name
-        shutil.copyfile(archive, registered_archive)
+        archive = registered_root / "codestory-cli-v9.9.9-macos-arm64.tar.gz"
+        archive.write_bytes(b"packaged proof")
         registered_cache = registered_root / "codestory-packaged-proof-cache-self-test"
-        write_proof_compose_state(
+        registered_identity = write_proof_compose_state(
             registered_cache,
             {"compose_file": None},
             state_project=project,
         )
-        registered_sidecars = proof_agent_identities([registered_cache], project)
         write_json(
             registered_root / PROOF_TEMP_OWNER_FILE,
             {
@@ -4188,205 +4101,25 @@ def self_test() -> None:
                 "repository": os.environ.get("GITHUB_REPOSITORY"),
                 "project": str(project),
                 "cache_roots": [str(registered_cache)],
-                "sidecars": registered_sidecars,
+                "sidecars": [registered_identity],
                 "launches": [],
                 "ports": [],
-                "archive_name": registered_archive.name,
-                "archive_sha256": sha256_file(registered_archive),
+                "archive_name": archive.name,
+                "archive_sha256": sha256_file(archive),
             },
         )
-        registered_cleanup_out = root / "registered-cleanup-out"
+        cleanup_out = root / "registered-cleanup-out"
         cleanup_registered_proof_temp_root(
             argparse.Namespace(
                 project=str(project),
-                out_dir=str(registered_cleanup_out),
+                out_dir=str(cleanup_out),
                 cleanup_proof_temp_root=str(registered_root),
             )
         )
         assert not registered_root.exists()
-        registered_cleanup = read_json_file(registered_cleanup_out / "proof-owned-cleanup.json")
-        assert registered_cleanup["cache_cleanup"][0]["status"] == "removed"
-        registered_cache_cleanup = read_json_file(
-            registered_cleanup_out / "registered-cache-cleanup-0.json"
-        )
-        assert any(
-            item.get("kind") == "retrieval_down_skipped"
-            and item.get("reason") == "trusted_direct_cleanup"
-            for item in registered_cache_cleanup["commands"]
-        )
-
-        if sys.platform == "darwin":
-            retry_root = proof_owned_test_root("missing-edge")
-            retry_archive = retry_root / archive.name
-            shutil.copyfile(archive, retry_archive)
-            vanished_project = root / "vanished edge project"
-            vanished_compose = vanished_project / "docker" / "retrieval-compose.yml"
-            vanished_compose.parent.mkdir(parents=True)
-            vanished_compose.write_text("services: {}\n", encoding="utf-8")
-            missing_compose_cache = retry_root / "codestory-packaged-proof-cache-missing-compose"
-            continuing_cache = retry_root / "codestory-packaged-proof-cache-continuing"
-            probe_code = "import time; time.sleep(60)"
-            cleanup_probe = subprocess.Popen(
-                [sys.executable, "-c", probe_code, "--registered-cleanup-child"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            launch = {
-                "launch_mode": "native_spawned",
-                "pid": cleanup_probe.pid,
-                "spawned_at_epoch_ms": int(time.time() * 1000),
-                "executable_path": sys.executable,
-                "launch_args": ["-c", probe_code, "--registered-cleanup-child"],
-                "launch_fingerprint_sha256": "1" * 64,
-            }
-            write_proof_compose_state(
-                missing_compose_cache,
-                {
-                    "compose_file": str(vanished_compose),
-                    "embedding_launch": launch,
-                    "embedding_launch_ownership": "owner",
-                },
-                state_project=vanished_project,
-            )
-            write_proof_compose_state(
-                continuing_cache,
-                {"compose_file": None},
-                state_project=vanished_project,
-            )
-            retry_sidecars = proof_agent_identities(
-                [missing_compose_cache, continuing_cache], vanished_project
-            )
-            missing_identity = next(
-                identity
-                for identity in retry_sidecars
-                if identity["cache_root"] == str(missing_compose_cache.resolve())
-                and identity["run_id"] == PROOF_LOCAL_RUN_ID
-            )
-            missing_identity["docker_resources"] = {
-                "compose_project": missing_identity["compose_project"],
-                "containers": [],
-                "networks": [],
-            }
-            write_json(
-                retry_root / PROOF_TEMP_OWNER_FILE,
-                {
-                    "owner": "codestory-macos-metal-proof",
-                    "repository": os.environ.get("GITHUB_REPOSITORY"),
-                    "project": str(vanished_project),
-                    "cache_roots": [str(missing_compose_cache), str(continuing_cache)],
-                    "sidecars": retry_sidecars,
-                    "launches": [launch],
-                    "ports": [],
-                    "archive_name": retry_archive.name,
-                    "archive_sha256": sha256_file(retry_archive),
-                },
-            )
-            remove_tree_with_retry(vanished_project)
-
-            def empty_registered_docker(command, **_kwargs):
-                if command[0:3] in (
-                    ["docker", "container", "ls"],
-                    ["docker", "network", "ls"],
-                ):
-                    return subprocess.CompletedProcess(command, 0, "[]", "")
-                raise AssertionError(f"unexpected registered cleanup Docker command: {command}")
-
-            retry_out = root / "registered-cleanup-missing-edge-out"
-            try:
-                cleanup_registered_proof_temp_root(
-                    argparse.Namespace(
-                        project=str(vanished_project),
-                        out_dir=str(retry_out),
-                        cleanup_proof_temp_root=str(retry_root),
-                        run=empty_registered_docker,
-                    )
-                )
-            finally:
-                if cleanup_probe.poll() is None:
-                    cleanup_probe.terminate()
-                    cleanup_probe.wait(timeout=5)
-            assert cleanup_probe.poll() is not None
-            retry_cleanup = read_json_file(retry_out / "proof-owned-cleanup.json")
-            assert retry_cleanup["root_removed"] is True
-            assert [item["status"] for item in retry_cleanup["cache_cleanup"]] == [
-                "removed",
-                "removed",
-            ]
-            assert retry_cleanup["native_processes"][0]["status"] == "terminated"
-
-        tampered_root = proof_owned_test_root("tampered")
-        tampered_archive = tampered_root / archive.name
-        shutil.copyfile(archive, tampered_archive)
-        tampered_cache = tampered_root / "codestory-packaged-proof-cache-tampered"
-        write_proof_compose_state(
-            tampered_cache,
-            {"compose_file": None},
-            state_project=project,
-        )
-        write_json(
-            tampered_root / PROOF_TEMP_OWNER_FILE,
-            {
-                "owner": "codestory-macos-metal-proof",
-                "repository": os.environ.get("GITHUB_REPOSITORY"),
-                "project": str(project),
-                "cache_roots": [str(tampered_cache)],
-                "sidecars": proof_agent_identities([tampered_cache], project),
-                "launches": [],
-                "ports": [],
-                "archive_name": tampered_archive.name,
-                "archive_sha256": "0" * 64,
-            },
-        )
-        try:
-            cleanup_registered_proof_temp_root(
-                argparse.Namespace(
-                    project=str(project),
-                    out_dir=str(root / "tampered-cleanup-out"),
-                    cleanup_proof_temp_root=str(tampered_root),
-                )
-            )
-        except RuntimeError as exc:
-            assert "archive digest changed" in str(exc)
-        else:
-            raise AssertionError("stale cleanup must reject a modified bound archive")
-        assert tampered_cache.exists()
-        remove_tree_with_retry(tampered_root)
-        out_dir = root / "out"
-        args = argparse.Namespace(
-            archive=str(archive),
-            project=str(project),
-            out_dir=str(out_dir),
-            query=DEFAULT_QUERY,
-            context_query=DEFAULT_QUERY,
-            question=DEFAULT_QUESTION,
-            expected_version="9.9.9",
-            checksum_file=str(checksum_file),
-            plugin_root=None,
-            timeout_secs=30,
-            version_only=False,
-            managed_plugin_handoff=False,
-        )
-        run_gate(args)
-        assert (out_dir / "summary.json").is_file()
-        assert read_json_file(out_dir / "proof-cache-cleanup.json")["removed"] is True
-        assert read_json_file(out_dir / "stdio-cache-cleanup.json")["removed"] is True
-        stdio_artifact = read_json_file(out_dir / "serve-stdio-status.json")
-        full_cache_root = stdio_artifact["status"]["cache_root"]
-        assert Path(full_cache_root).name.startswith("codestory-packaged-proof-cache-")
-        status_request = next(
-            entry["request"]
-            for entry in stdio_artifact["transcript"]
-            if entry["request"].get("id") == "status"
-        )
-        assert status_request["params"]["project"] == str(project.resolve())
-
-        expect_fake_gate_failure(
-            args,
-            "search",
-            "search",
-            "search.json.stdout.txt",
-            "forced fake search failure should fail the gate",
-        )
+        cleanup = read_json_file(cleanup_out / "proof-owned-cleanup.json")
+        assert cleanup["root_removed"] is True
+        assert cleanup["cache_cleanup"][0]["status"] == "removed"
 
     print("self-test passed")
 
@@ -4397,7 +4130,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", default=".", help="Representative repository to prove against.")
     parser.add_argument("--out-dir", default="target/packaged-agent-proof", help="Artifact directory.")
     parser.add_argument("--query", default=DEFAULT_QUERY, help="Search proof query.")
-    parser.add_argument("--context-query", default=DEFAULT_QUERY, help="Context proof target query.")
     parser.add_argument("--question", default=DEFAULT_QUESTION, help="Packet proof question.")
     parser.add_argument("--expected-version", help="Expected codestory-cli version in the archive.")
     parser.add_argument("--checksum-file", help="SHA256SUMS file that must contain and match the archive.")
@@ -4419,9 +4151,9 @@ def parse_args() -> argparse.Namespace:
         help="Require native accelerated runtime survival, dead-endpoint blocking, and repair recovery during the full proof.",
     )
     parser.add_argument(
-        "--native-edge-cases",
+        "--managed-plugin-grounding-convergence",
         action="store_true",
-        help="Exercise spaces/Unicode paths and corrupt managed native installs.",
+        help="Reach initial full retrieval through managed-plugin grounding activation without explicit repair.",
     )
     parser.add_argument(
         "--intel-runtime-policy",
@@ -4440,6 +4172,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--expected-version is required unless --self-test or cleanup mode is set")
     if args.managed_plugin_handoff and not args.plugin_root:
         parser.error("--plugin-root is required with --managed-plugin-handoff")
+    if args.managed_plugin_grounding_convergence and not args.plugin_root:
+        parser.error("--plugin-root is required with --managed-plugin-grounding-convergence")
+    if args.managed_plugin_grounding_convergence and not args.native_accelerator_lifecycle:
+        parser.error("--managed-plugin-grounding-convergence requires --native-accelerator-lifecycle")
+    if args.managed_plugin_grounding_convergence and args.managed_plugin_handoff:
+        parser.error("--managed-plugin-grounding-convergence and --managed-plugin-handoff are mutually exclusive")
     if args.managed_plugin_handoff and args.version_only:
         parser.error("--managed-plugin-handoff and --version-only are mutually exclusive")
     if args.intel_runtime_policy and (args.managed_plugin_handoff or args.version_only):
@@ -4450,13 +4188,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--native-accelerator-lifecycle and --intel-runtime-policy are mutually exclusive")
     if args.native_accelerator_lifecycle and os.name == "nt":
         parser.error("--native-accelerator-lifecycle is supported only on POSIX hosts")
-    if args.native_edge_cases and not args.native_accelerator_lifecycle:
-        parser.error("--native-edge-cases requires --native-accelerator-lifecycle")
     if args.cleanup_proof_temp_root and (
         args.native_accelerator_lifecycle
-        or args.native_edge_cases
         or args.intel_runtime_policy
         or args.managed_plugin_handoff
+        or args.managed_plugin_grounding_convergence
         or args.version_only
     ):
         parser.error("--cleanup-proof-temp-root is a standalone cleanup mode")

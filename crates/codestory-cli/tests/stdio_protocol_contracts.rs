@@ -4177,6 +4177,7 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         json!("background"),
         "sidecar_setup repair should not wait for full repair inside the MCP request: {repair}"
     );
+    assert_eq!(repair["reservation_published"], json!(true), "{repair}");
     assert!(
         repair["debug_status_command"]
             .as_str()

@@ -110,7 +110,7 @@ jobs:
       version: ${{ needs.preflight.outputs.version }}
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
-      use_packaged_artifact: true
+      use_packaged_cli_artifact: true
 
   publish:
     name: Publish GitHub release
