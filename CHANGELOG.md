@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Kept promoted release-evidence drills on the dedicated Linux ARM64 runner,
+  made its CPU embedding policy explicit, and retained the raw repo-scale log
+  plus complete real-repository drill reports for review.
 - Rewrote the repository agent guide around the current request-scoped MCP
   workflow, crate ownership, identity/publication invariants, isolated test
   contract, maturity-routed verification, and claim-specific release proof.

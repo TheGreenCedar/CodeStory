@@ -474,6 +474,13 @@ hash, baseline id/hash, profile, metric, measured value, threshold, owner, ISO
 date, and rationale. Preserve the emitted decision JSON; it carries status,
 metric, decision, commit, and artifact paths/hashes.
 
+The dedicated Linux ARM64 evidence profile opts into CPU embeddings explicitly.
+Fresh measurements retain `repo-e2e-output.txt`, `stats.json`, and the complete
+real-repo drill report tree under the uploaded `release-evidence-<SHA>`
+artifact. `CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR` selects that durable
+drill directory; without it, the ignored harness keeps using a temporary
+directory for local runs.
+
 ## CLI Boundary And Output Changes
 
 ```sh
