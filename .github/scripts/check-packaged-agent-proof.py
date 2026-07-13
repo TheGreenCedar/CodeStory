@@ -1626,20 +1626,37 @@ def require_managed_plugin_convergence(
             f"{request_id} did not return sidecar setup status",
         )
         setup_snapshots.append(setup)
-    attempt_ids = {
-        attempt_id
+    attempt_records = [
+        record
         for setup in setup_snapshots
-        for attempt_id in (
-            (setup.get("active_repair") or {}).get("attempt_id"),
-            (setup.get("last_worker_result") or {}).get("attempt_id"),
-        )
-        if isinstance(attempt_id, str) and attempt_id
-    }
+        for record in (setup.get("active_repair"), setup.get("last_worker_result"))
+        if isinstance(record, dict)
+        and isinstance(record.get("attempt_id"), str)
+        and record.get("attempt_id")
+    ]
+    attempt_ids = {record["attempt_id"] for record in attempt_records}
     require(
         len(attempt_ids) == 1,
         "managed_plugin_convergence",
         artifact,
         f"ground activation did not retain exactly one repair attempt: {sorted(attempt_ids)}",
+    )
+    expected_project = status_before.get("project_root")
+    namespaces = {record.get("namespace") for record in attempt_records}
+    require(
+        isinstance(expected_project, str)
+        and expected_project
+        and len(namespaces) == 1
+        and all(isinstance(namespace, str) and namespace for namespace in namespaces)
+        and all(
+            record.get("project_root") == expected_project
+            and record.get("profile") == "agent"
+            and record.get("run_id") == "shared-agent"
+            for record in attempt_records
+        ),
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation repair records did not preserve one durable project/profile/run/namespace identity",
     )
     terminal = next(
         (
@@ -2231,7 +2248,10 @@ def write_fake_cli(path: Path) -> None:
                                 "active_repair": None,
                                 "last_worker_result": ({
                                     "attempt_id": repair_attempt,
+                                    "project_root": request.get("params", {}).get("arguments", {}).get("project"),
+                                    "profile": "agent",
                                     "run_id": "shared-agent",
+                                    "namespace": "fake-agent-namespace",
                                     "outcome": "failed",
                                     "exit_code": 1,
                                 } if repair_attempt else None),
@@ -2304,13 +2324,23 @@ def write_fake_cli(path: Path) -> None:
                                 "cli_version": "9.9.9",
                                 "plugin_root": os.getcwd(),
                                 "managed_binary_path": server_executable,
+                                "managed_cli_retention": {
+                                    "active_version": "9.9.9",
+                                    "retained": [
+                                        {"version": "9.9.9", "reason": "active"},
+                                        {"version": "0.0.0", "reason": "rollback"},
+                                    ],
+                                },
                             },
                             "sidecar_setup": {
                                 "state": "enabled",
                                 "active_repair": None,
                                 "last_worker_result": ({
                                     "attempt_id": repair_attempt,
+                                    "project_root": request.get("params", {}).get("project", os.getcwd()),
+                                    "profile": "agent",
                                     "run_id": "shared-agent",
+                                    "namespace": "fake-agent-namespace",
                                     "outcome": "failed",
                                     "exit_code": 1,
                                 } if repair_attempt else None),
@@ -3050,8 +3080,18 @@ def self_test() -> None:
             managed_artifact = Path(managed_args.out_dir) / "managed-plugin-convergence.json"
             assert transcript_response(managed_artifact, "ground_activation")["result"]["structuredContent"]["stats"]
             setup = structured_content_from_response(transcript_response(managed_artifact, "setup_poll_1"))
+            assert setup["active_repair"] is None
             assert setup["last_worker_result"]["attempt_id"] == "fake-activation-attempt"
             assert setup["last_worker_result"]["outcome"] == "failed"
+            assert {
+                key: setup["last_worker_result"][key]
+                for key in ("project_root", "profile", "run_id", "namespace")
+            } == {
+                "project_root": managed_summary["managed_convergence_project"],
+                "profile": "agent",
+                "run_id": "shared-agent",
+                "namespace": "fake-agent-namespace",
+            }
             managed_status_after = status_from_resource_response(
                 transcript_response(managed_artifact, "status_after_convergence")
             )
