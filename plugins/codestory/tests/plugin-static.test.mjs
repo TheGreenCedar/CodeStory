@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import { access, chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -647,6 +647,24 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(policy.state, "enabled");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("plugin path comparison uses file identity and platform missing-path rules", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-path-identity-"));
+  const executable = join(root, "codestory-cli");
+  const hardLink = join(root, "codestory-cli-link");
+  try {
+    await writeFile(executable, "fixture", "utf8");
+    await link(executable, hardLink);
+    assert.equal(launcherTest.sameFilesystemPath(executable, hardLink), true);
+    assert.equal(launcherTest.sameFilesystemPath(executable, join(root, "missing")), false);
+    assert.equal(
+      launcherTest.sameFilesystemPath(join(root, "Missing"), join(root, "missing")),
+      process.platform === "win32",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -2292,14 +2310,14 @@ test("bootstrap-status fails open when plugin-root launch lacks project state", 
     assert.equal(status.ready, false);
     assert.equal(status.degraded_reason, "project_root_unavailable");
     assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_missing");
+    assert.equal(status.project_root_source, "request_argument_missing");
     assert.equal(status.readiness[0].goal, "project_root");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("bootstrap-status carries Rust agent readiness into runtime truth", async () => {
+test("bootstrap-status binds Rust readiness to request-scoped project identity", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-agent-ready-"));
@@ -2313,12 +2331,18 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
       "const args = process.argv.slice(2);",
       "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
       "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'cache' && args[1] === 'identity') {",
+      "  const project = args[args.indexOf('--project') + 1];",
+      "  console.log(JSON.stringify({ project, project_identity_schema_version: 3, project_id: 'project-123', workspace_id: 'workspace-123', artifact_scope_id: 'project-123', portable_reuse_eligible: true, legacy_alias_disposition: 'unavailable_without_provenance', legacy_project_id: null }));",
+      "  process.exit(0);",
+      "}",
       "if (args[0] === 'ready' && args.includes('--goal') && args.includes('local')) {",
       "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'ready', summary: 'ready', minimum_next: [], full_repair: [] }], local_refresh: { state: 'fresh', reason: 'already_fresh', blocks_local_surfaces: false, readiness_status: 'ready', changed_file_count: 0, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'ready' && args.includes('--goal') && args.includes('agent')) {",
-      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'lexical_shard_unavailable' } }, readiness_broker: { schema_version: 2, project_id: 'project-123', persistence_status: 'observed' } }));",
+      "  const workspaceId = process.env.TEST_STALE_IDENTITY === '1' ? 'workspace-stale' : 'workspace-123';",
+      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'lexical_shard_unavailable' } }, readiness_broker: { schema_version: 3, identity: { project_identity_schema_version: 3, project_id: 'project-123', workspace_id: workspaceId }, project_id: 'project-123', persistence_status: 'observed' } }));",
       "  process.exit(0);",
       "}",
       "process.exit(2);",
@@ -2348,8 +2372,16 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
     assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
     assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
+    assert.equal(status.project_identity.project_identity_schema_version, 3);
+    assert.equal(status.project_identity.project_id, "project-123");
+    assert.equal(status.project_identity.workspace_id, "workspace-123");
     assert.deepEqual(status.readiness_broker, {
-      schema_version: 2,
+      schema_version: 3,
+      identity: {
+        project_identity_schema_version: 3,
+        project_id: "project-123",
+        workspace_id: "workspace-123",
+      },
       project_id: "project-123",
       persistence_status: "observed",
     });
@@ -2357,10 +2389,30 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.deepEqual(calls.map((args) => args.slice(0, 3)), [
       ["--version"],
+      ["cache", "identity", "--project"],
       ["ready", "--goal", "local"],
       ["ready", "--goal", "agent"],
     ]);
     assert.equal(calls.some((args) => args.includes("--repair")), false);
+
+    const stale = spawnSync(process.execPath, [launcher, "bootstrap-status", "--project", dataDir], {
+      cwd: pluginRoot,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_LOG: logFile,
+        TEST_STALE_IDENTITY: "1",
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(stale.status, 0, stale.stderr);
+    const staleStatus = JSON.parse(stale.stdout.trim());
+    assert.equal(staleStatus.ready, false);
+    assert.equal(staleStatus.degraded_reason, "readiness_broker_identity_mismatch");
+    assert.equal(staleStatus.project_root, await realpath(dataDir));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(binDir, { recursive: true, force: true });

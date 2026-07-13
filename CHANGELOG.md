@@ -8,6 +8,13 @@
   mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
   stale graph data current, while legacy and non-parser rows retain the
   existing metadata fallback.
+- Made plugin project selection strictly request-scoped. Diagnostic bootstrap
+  no longer falls back to hook-written global or thread state, managed
+  executable comparison uses native file identity with platform-appropriate
+  missing-path rules, and the plugin rejects readiness evidence whose schema-3
+  project/workspace identity differs from the selected repository. `cache
+  identity` now exposes the lossless project, workspace, artifact, and safe
+  legacy-alias disposition used by that verification.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and

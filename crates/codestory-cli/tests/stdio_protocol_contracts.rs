@@ -1785,6 +1785,18 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
         );
     }
     assert_ne!(first_status["storage_path"], second_status["storage_path"]);
+    assert_eq!(
+        first_status["readiness_broker"]["identity"]["project_identity_schema_version"],
+        3
+    );
+    assert_eq!(
+        second_status["readiness_broker"]["identity"]["project_identity_schema_version"],
+        3
+    );
+    assert_ne!(
+        first_status["readiness_broker"]["identity"]["project_id"],
+        second_status["readiness_broker"]["identity"]["project_id"]
+    );
     assert_ne!(
         first_status["readiness_broker"]["identity"]["workspace_id"],
         second_status["readiness_broker"]["identity"]["workspace_id"]
@@ -1801,6 +1813,7 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
     for pointer in [
         "/project_root",
         "/storage_path",
+        "/readiness_broker/identity/project_id",
         "/readiness_broker/identity/workspace_id",
         "/sidecar_retrieval/ownership/labels/dev.codestory.workspace_id",
         "/sidecar_retrieval/ownership/profile",

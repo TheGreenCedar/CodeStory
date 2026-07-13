@@ -386,6 +386,18 @@ fn render_cache_identity_markdown(output: &codestory_runtime::RepositoryIdentity
     let _ = writeln!(markdown, "project: `{}`", output.project);
     let _ = writeln!(
         markdown,
+        "project_identity_schema_version: `{}`",
+        output.project_identity_schema_version
+    );
+    let _ = writeln!(markdown, "project_id: `{}`", output.project_id);
+    let _ = writeln!(markdown, "workspace_id: `{}`", output.workspace_id);
+    let _ = writeln!(
+        markdown,
+        "artifact_scope_id: `{}`",
+        output.artifact_scope_id
+    );
+    let _ = writeln!(
+        markdown,
         "root_derived_project_id: `{}`",
         output.root_derived_project_id
     );
@@ -409,6 +421,16 @@ fn render_cache_identity_markdown(output: &codestory_runtime::RepositoryIdentity
             .normalized_repository_identity
             .as_deref()
             .unwrap_or("unavailable")
+    );
+    let _ = writeln!(
+        markdown,
+        "legacy_alias_disposition: `{}`",
+        output.legacy_alias_disposition
+    );
+    let _ = writeln!(
+        markdown,
+        "legacy_project_id: `{}`",
+        output.legacy_project_id.as_deref().unwrap_or("unavailable")
     );
     let _ = writeln!(
         markdown,
