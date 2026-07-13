@@ -444,6 +444,12 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
             true,
         ),
         (
+            "comment-split-import.mjs",
+            "export const corpus = import(\"./fetch-\" /* deliberate */ + \"holdout-repos.mjs\");\n",
+            "fetchholdoutreposmjs",
+            true,
+        ),
+        (
             "commented-import.mjs",
             "export const corpus = import(/* deliberate */ \"./fetch-holdout-repos.mjs\");\n",
             "fetch-holdout-repos.mjs",
@@ -466,6 +472,24 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
             "script=scripts/fetch-\\\nholdout-repos.mjs\nnode \"$script\"\n",
             "scriptsfetchholdoutreposmjs",
             true,
+        ),
+        (
+            "unquoted-eval.sh",
+            "corpus=benchmarks/ta\\\nsks/eval-probes.json\n",
+            "benchmarkstasks",
+            true,
+        ),
+        (
+            "workflow-command.yml",
+            "run: |\n  node scripts/fetch-\\\n  holdout-repos.mjs\n",
+            "scriptsfetchholdoutreposmjs",
+            true,
+        ),
+        (
+            "comment-only-import.mjs",
+            "// Do not import(\"./fetch-holdout-repos.mjs\") from release code.\n",
+            "",
+            false,
         ),
         (
             "prose.md",

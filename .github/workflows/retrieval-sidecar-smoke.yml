@@ -79,6 +79,9 @@ jobs:
             ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
             ${{ runner.os }}-cargo-stable-
 
+      - name: Generalization lint regression contracts
+        run: cargo test -p codestory-runtime --test retrieval_generalization_guard
+
       - name: Runtime sidecar and packet contract tests
         run: |
           cargo test -p codestory-runtime --lib agent::retrieval_primary::tests

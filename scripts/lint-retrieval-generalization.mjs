@@ -77,6 +77,13 @@ const corpusHarnessNonRustFiles = new Set([
 const executableJavaScriptExtensions = new Set([
   ".cjs", ".js", ".mjs", ".ts", ".tsx",
 ]);
+const continuationMarkersByExtension = new Map([
+  [".sh", "\\"],
+  [".ps1", "`"],
+  [".yml", "\\`"],
+  [".yaml", "\\`"],
+]);
+const javaScriptStringOrCommentPattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\/\*[\s\S]*?\*\/|\/\/[^\r\n]*)/g;
 const protectedNonRustExtensions = new Set([
   ...executableJavaScriptExtensions,
   ".json", ".md", ".ps1", ".py", ".sh", ".toml", ".yaml", ".yml",
@@ -206,6 +213,10 @@ const corpusHarnessDependencyRegexes = corpusHarnessDependencyPatternList.map(
 const corpusHarnessCompactPatternList = compactBoundaryPatterns(
   corpusHarnessDependencyPatternList,
 );
+const continuedDependencyCompactPatternList = new Set([
+  ...evalCorpusCompactPatternList,
+  ...corpusHarnessCompactPatternList,
+]);
 
 const bannedPatterns = [
   "payload_config",
@@ -1168,12 +1179,24 @@ function prepareProductionFile(filePath) {
 
 function prepareNonRustFile(filePath) {
   const production = readFileSync(filePath, "utf8");
+  const extension = path.extname(filePath).toLowerCase();
+  const staticSource = executableJavaScriptExtensions.has(extension)
+    ? maskJavaScriptComments(production)
+    : production;
   return {
     filePath,
     production,
     lines: production.split(/\r?\n/),
+    staticSource,
     literals: null,
   };
+}
+
+function maskJavaScriptComments(source) {
+  return source.replace(
+    javaScriptStringOrCommentPattern,
+    (token, stringLiteral) => stringLiteral ?? token.replace(/[^\r\n]/g, " "),
+  );
 }
 
 function scanCorpusHarnessImports(prepared) {
@@ -1181,13 +1204,9 @@ function scanCorpusHarnessImports(prepared) {
     return [];
   }
   const hits = [];
-  const trivia = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*`;
-  const importPattern = new RegExp(
-    `(?:\\bfrom${trivia}|\\bimport${trivia}\\(?${trivia}|\\brequire${trivia}\\(${trivia})["'\`]([^"'\`]+)["'\`]`,
-    "g",
-  );
+  const importPattern = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'`]([^"'`]+)["'`]/g;
   let match;
-  while ((match = importPattern.exec(prepared.production)) != null) {
+  while ((match = importPattern.exec(prepared.staticSource)) != null) {
     const modulePath = normalizeNativeSeparators(match[1]).split(/[?#]/, 1)[0];
     if (corpusHarnessDependencyRegexes.some((pattern) => pattern.test(modulePath))) {
       const line = prepared.production.slice(0, match.index).split(/\r?\n/).length;
@@ -1259,7 +1278,7 @@ function staticStringLiteralContent(literal) {
 }
 
 function scanProductionCompactPatterns(prepared, marker, minimumLiteralCount = 1) {
-  const production = prepared.production;
+  const production = prepared.staticSource ?? prepared.production;
   const markerLower = marker.toLowerCase();
   const hits = [];
   if (prepared.literals == null) {
@@ -1356,20 +1375,25 @@ function staticStringLiteralsOnLine(line) {
   return literals;
 }
 
-function scanShellContinuationHarnessDependencies(prepared) {
-  if (path.extname(prepared.filePath).toLowerCase() !== ".sh") {
+function scanContinuationDependencies(prepared) {
+  const continuationMarkers = continuationMarkersByExtension.get(
+    path.extname(prepared.filePath).toLowerCase(),
+  );
+  if (continuationMarkers == null) {
     return [];
   }
   const hits = [];
   for (let start = 0; start < prepared.lines.length; start += 1) {
-    if (!prepared.lines[start].endsWith("\\")) {
+    const firstMarker = prepared.lines[start].at(-1);
+    if (!continuationMarkers.includes(firstMarker)) {
       continue;
     }
     let end = start;
     let logicalLine = prepared.lines[end].slice(0, -1);
     while (end + 1 < prepared.lines.length) {
       end += 1;
-      const continues = prepared.lines[end].endsWith("\\");
+      const marker = prepared.lines[end].at(-1);
+      const continues = continuationMarkers.includes(marker);
       logicalLine += continues
         ? prepared.lines[end].slice(0, -1)
         : prepared.lines[end];
@@ -1378,9 +1402,15 @@ function scanShellContinuationHarnessDependencies(prepared) {
       }
     }
     const compactLine = logicalLine.replace(/[^a-zA-Z0-9]+/g, "").toLowerCase();
-    for (const marker of corpusHarnessCompactPatternList) {
-      if (compactLine.includes(marker)) {
-        hits.push(compactPatternHit(prepared.filePath, start + 1, end + 1, marker));
+    const compactPhysicalLines = prepared.lines
+      .slice(start, end + 1)
+      .map((line) => line.replace(/[^a-zA-Z0-9]+/g, "").toLowerCase());
+    for (const pattern of continuedDependencyCompactPatternList) {
+      if (
+        compactLine.includes(pattern)
+        && !compactPhysicalLines.some((line) => line.includes(pattern))
+      ) {
+        hits.push(compactPatternHit(prepared.filePath, start + 1, end + 1, pattern));
       }
     }
     start = end;
@@ -1540,10 +1570,10 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
     );
     failed = true;
   }
-  const shellContinuationHits = scanShellContinuationHarnessDependencies(prepared);
-  if (shellContinuationHits.length > 0) {
+  const continuationHits = scanContinuationDependencies(prepared);
+  if (continuationHits.length > 0) {
     console.error(
-      `Protected shell path constructs an evaluation/proof harness dependency ${path.relative(repoRoot, filePath)}:\n${shellContinuationHits.join("\n")}\n`,
+      `Protected non-Rust path constructs a continued evaluation/proof dependency ${path.relative(repoRoot, filePath)}:\n${continuationHits.join("\n")}\n`,
     );
     failed = true;
   }

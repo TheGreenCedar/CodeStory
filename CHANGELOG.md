@@ -21,8 +21,9 @@
   evaluation-corpus dependencies now fail in plugin launch/setup surfaces,
   worktree/install tooling, runtime configuration, release scripts/workflows,
   and the release evaluator across native separators, case variants,
-  comment-separated JavaScript imports, unquoted shell continuations, and
-  PowerShell continuations. The CI trigger covers the full protected inventory,
+  comment-separated JavaScript imports, unquoted shell continuations,
+  workflow-embedded shell continuations, and PowerShell continuations. The CI
+  trigger and focused regression contract cover the full protected inventory,
   and missing protected paths fail closed.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
