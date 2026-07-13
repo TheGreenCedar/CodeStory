@@ -388,8 +388,9 @@ wait_offline() {
 verify_runner() {
   owner_json >/dev/null
   profile_running
-  quiesce_runner
+  assert_not_busy
   assert_guest_idle
+  quiesce_runner
   write_host_attestation
   guest_verify
   start_runner
@@ -496,8 +497,8 @@ case "$command" in
     ensure_base_image
     assert_not_busy
     start_profile
-    quiesce_runner
     assert_guest_idle
+    quiesce_runner
     source_sha=$(sync_validation_source)
     model_seed=$(sync_model_seed)
     provision_guest "$source_sha" "$model_seed"
@@ -515,8 +516,9 @@ case "$command" in
     require_provisioning_eligibility
     ensure_base_image
     start_profile
-    quiesce_runner
+    assert_not_busy
     assert_guest_idle
+    quiesce_runner
     write_host_attestation
     guest_verify
     start_runner
