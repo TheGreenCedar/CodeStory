@@ -21,6 +21,10 @@
 
 ### Fixed
 
+- Made Mac notarization retain its submission ID and retry status queries
+  across transient Apple transport failures. Terminal rejection still fails
+  immediately with the notarization log retained, and polling now has an
+  explicit one-hour bound.
 - Made incremental freshness compare verified parser source hashes when file
   mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
   stale graph data current, while legacy and non-parser rows retain the

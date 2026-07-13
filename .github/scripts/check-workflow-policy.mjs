@@ -332,6 +332,7 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "--managed-plugin-handoff",
     "sign_macos:",
     "environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}",
+    "timeout-minutes: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60 }}",
     "APPLE_DEVELOPER_ID_P12_BASE64",
     "APPLE_NOTARY_KEY_P8_BASE64",
     "umask 077",
@@ -341,6 +342,14 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "--options runtime",
     "--timestamp",
     "xcrun notarytool submit",
+    "--no-wait",
+    "notarytool-submission-id.txt",
+    'xcrun notarytool info "$submission_id"',
+    "max_notary_attempts=120",
+    "notary_poll_seconds=30",
+    "Invalid|Rejected)",
+    'xcrun notarytool log "$submission_id"',
+    "Notarization timed out after",
     "jq -e '.status == \"Accepted\"'",
     "source=Notarized Developer ID",
     "TeamIdentifier=${APPLE_DEVELOPER_TEAM_ID}",
@@ -359,6 +368,18 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "codestory-cli-default-features",
     "matrix: ${{ fromJSON(inputs.scope == 'macos'",
   ], snippet => `packaged-platform-proof.yml must include ${snippet}`);
+  const macosSigningStep = namedStep(yamlJob(content, "build"), "Sign and notarize macOS CLI").join("\n");
+  const blockingNotaryWait = /^\s+--wait(?:\s|\\|$)/mu;
+  if (blockingNotaryWait.test(macosSigningStep)) {
+    violations.push("packaged-platform-proof.yml must poll notarization explicitly instead of using notarytool --wait");
+  }
+  const blockingWaitBypass = namedStep(
+    yamlJob(content.replace("--no-wait", "--wait"), "build"),
+    "Sign and notarize macOS CLI",
+  ).join("\n");
+  if (!blockingNotaryWait.test(blockingWaitBypass)) {
+    violations.push("packaged-platform-proof.yml blocking notary wait policy did not detect its bypass fixture");
+  }
   const releaseAssetStart = content.indexOf("- name: Upload release asset");
   const notarizationProofStart = content.indexOf("- name: Upload macOS notarization proof");
   const releaseAssetBlock = releaseAssetStart >= 0
