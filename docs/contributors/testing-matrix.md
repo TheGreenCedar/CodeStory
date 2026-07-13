@@ -211,14 +211,11 @@ retrieval before packet/search run through that same MCP session. A fresh MCP
 process must then reuse the exact native PID and launch fingerprint without a
 duplicate server. The remainder of the workflow proves readiness blocking after
 endpoint death, explicit recovery, packet/search, and proof-owned cleanup. The
-same protected run copies the repository and cache through spaces/Unicode paths,
-proves dynamic selection away from an occupied embedding port, reclaims a
-vanished lease, interrupts and recovers a proof-owned repair worker, and
-checksum-repairs corrupt model plus partial native-server installs. It preserves
-bounded current-launch logs and exact launch identity before marker-scoped
-cleanup; the following run also cleans a marker-owned prior attempt if
-cancellation prevented the prior `always()` step. Contract tests or hosted
-package smoke cannot replace this hardware evidence.
+same protected run proves dynamic endpoint selection, live process identity,
+and exact cache/process/container/port ownership before marker-scoped cleanup;
+the following run also cleans a marker-owned prior attempt if cancellation
+prevented the prior `always()` step. Contract tests or hosted package smoke
+cannot replace this hardware evidence.
 
 An actual Mac host reboot remains a separate two-phase operator proof because a
 GitHub job cannot safely reboot its own self-hosted runner and resume the same

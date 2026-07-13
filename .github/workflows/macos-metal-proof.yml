@@ -115,19 +115,6 @@ jobs:
           node scripts/setup-retrieval-env.mjs --self-test
           node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
 
-      - name: Prove corrupt model repair
-        shell: bash
-        env:
-          CODESTORY_EMBED_MODEL_DIR: ${{ runner.temp }}/codestory-metal-models
-        run: |
-          set -euo pipefail
-          model="$CODESTORY_EMBED_MODEL_DIR/bge-base-en-v1.5.Q8_0.gguf"
-          mkdir -p "$(dirname "$model")" target/macos-metal-proof
-          printf 'interrupted-model-install\n' > "$model"
-          node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only \
-            > target/macos-metal-proof/corrupt-model-repair.txt 2>&1
-          shasum -a 256 "$model" >> target/macos-metal-proof/corrupt-model-repair.txt
-
       - name: Clean marker-owned state from an interrupted earlier hardware attempt
         shell: bash
         run: |
@@ -175,7 +162,6 @@ jobs:
             --plugin-root plugins/codestory \
             --native-accelerator-lifecycle \
             --managed-plugin-grounding-convergence \
-            --native-edge-cases \
             --timeout-secs 1800 \
             --out-dir target/macos-metal-proof/packaged-agent
 

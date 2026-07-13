@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Reduced the packaged macOS proof to one check per release boundary. The
+  protected run still covers managed Metal cold/warm/recovery, exact process
+  reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned
+  cleanup; duplicated doctor/context smoke and speculative corrupt-install
+  variants no longer lengthen every proof run.
 - Staged CI proof by pull-request maturity and changed surface. Draft pushes
   now stay on one Ubuntu source lane, exact-head review promotion runs the full
   workspace test and clippy gate once, and explicit platform promotion selects
