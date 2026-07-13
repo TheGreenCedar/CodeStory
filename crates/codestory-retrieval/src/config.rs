@@ -3429,6 +3429,33 @@ mod tests {
         .expect("state");
     }
 
+    fn write_owned_agent_state(
+        root: &Path,
+        project: &Path,
+        namespace: &str,
+        run_id: &str,
+        ports: &SidecarPorts,
+    ) {
+        std::fs::create_dir_all(root.join(namespace)).expect("namespace");
+        std::fs::write(
+            root.join(namespace).join(SIDECAR_STATE_FILE_V3),
+            serde_json::to_vec(&serde_json::json!({
+                "project_identity": codestory_workspace::project_identity_v3(project),
+                "owner": "codestory",
+                "profile": "agent",
+                "namespace": namespace,
+                "compose_project": namespace,
+                "run_id": run_id,
+                "qdrant_http_port": ports.qdrant_http,
+                "qdrant_grpc_port": ports.qdrant_grpc,
+                "embed_http_port": ports.embed_http,
+                "embed_url": ports.embed_url,
+            }))
+            .expect("state"),
+        )
+        .expect("state");
+    }
+
     #[test]
     fn missing_owner_is_reclaimed_without_waiting_for_expiry() {
         let cache = tempdir().expect("cache");
@@ -3717,7 +3744,13 @@ mod tests {
             .get(&latest_namespace)
             .expect("latest lease")
             .ports;
-        write_owned_state(&root, &latest_namespace, latest_ports);
+        write_owned_agent_state(
+            &root,
+            project.path(),
+            &latest_namespace,
+            "run-255",
+            latest_ports,
+        );
         let retained_namespace_dirs = std::fs::read_dir(&root)
             .expect("sidecars root")
             .flatten()
