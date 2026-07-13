@@ -473,6 +473,18 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
             "uses: actions/github-script@v8\nwith:\n  script: |\n    const script = \"scripts/fetch-\" + \"holdout-repos.mjs\";\n",
         ),
         (
+            "direct-harness-import.mjs",
+            "import \"./scripts/codestory-agent-ab-benchmark.mjs\";\n",
+        ),
+        (
+            "constructed-harness-import.mjs",
+            "const harness = \"scripts/codestory-agent-ab-\" + \"benchmark.mjs\";\nawait import(harness);\n",
+        ),
+        (
+            "unapproved-policy-reference.mjs",
+            "const workflows = [\".github/workflows/retrieval-sidecar-smoke.yml\", \"unrelated.yml\"];\n",
+        ),
+        (
             "plugins/codestory/skills/codestory-grounding/SKILL.md",
             "Run `node scripts/fetch-holdout-repos.mjs` before grounding.\n",
         ),
@@ -499,6 +511,9 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         ("quoted-yaml-scalar.yml", "fetch-holdout-repos.mjs"),
         ("quoted-block-scalar.yml", "fetch-holdout-repos.mjs"),
         ("github-script.yml", "fetchholdoutreposmjs"),
+        ("direct-harness-import.mjs", "codestory-agent-ab-benchmark.mjs"),
+        ("constructed-harness-import.mjs", "codestoryagentabbenchmarkmjs"),
+        ("unapproved-policy-reference.mjs", "retrieval-sidecar-smoke.yml"),
         ("skill.md", "fetch-holdout-repos.mjs"),
         ("codestory.mdc", "benchmarks/tasks"),
     ] {

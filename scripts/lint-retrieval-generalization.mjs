@@ -89,11 +89,25 @@ const corpusSupportNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "setup-retrieval-env.ps1"),
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
 ].map((filePath) => path.resolve(filePath)));
-const allowedHarnessDependencyLines = [
-  ["drill-suite.md", "scripts/score-drill-ledger.mjs"],
-  ["retrieval-rollout.md", ".github/workflows/retrieval-sidecar-smoke.yml"],
-].map(([fileName, includes]) => ({
-  filePath: path.join(groundingSkillDir, "references", fileName),
+const allowedHarnessReferences = [
+  [
+    path.join(groundingSkillDir, "references", "drill-suite.md"),
+    "scripts/score-drill-ledger.mjs",
+  ],
+  [
+    path.join(groundingSkillDir, "references", "retrieval-rollout.md"),
+    ".github/workflows/retrieval-sidecar-smoke.yml",
+  ],
+  [
+    path.join(repoRoot, ".github", "scripts", "check-workflow-policy.mjs"),
+    "retrieval-sidecar-smoke.yml",
+  ],
+  [
+    path.join(repoRoot, ".github", "scripts", "route-ci-proof.mjs"),
+    ".github/workflows/retrieval-sidecar-smoke.yml",
+  ],
+].map(([filePath, includes]) => ({
+  filePath: path.resolve(filePath),
   includes,
 }));
 
@@ -1508,10 +1522,11 @@ function scanCorpusHarnessDependencies(prepared) {
     const normalizedLine = normalizeNativeSeparators(line.text, line.shellLike);
     const hasProtectedDependency = corpusHarnessDependencyRegexes.some((pattern) =>
       pattern.test(normalizedLine)
-      && !allowedHarnessDependencyLines.some(({ filePath, includes }) =>
-        path.resolve(prepared.filePath) === filePath
-        && line.text.includes(includes)
-        && pattern.test(includes)
+      && !harnessDependencyAllowed(
+        prepared,
+        line.startLine,
+        line.endLine,
+        (includes) => pattern.test(normalizeNativeSeparators(includes)),
       )
     );
     if (hasProtectedDependency) {
@@ -1521,6 +1536,26 @@ function scanCorpusHarnessDependencies(prepared) {
     }
   }
   return hits;
+}
+
+function harnessDependencyAllowed(prepared, startLine, endLine, markerMatches) {
+  const source = prepared.sourceLines.slice(startLine - 1, endLine).join("\n");
+  return allowedHarnessReferences.some(({ filePath, includes }) =>
+    path.resolve(prepared.filePath) === filePath
+    && source.includes(includes)
+    && markerMatches(includes)
+  );
+}
+
+function compactHarnessDependencyAllowed(prepared, literals, marker) {
+  return allowedHarnessReferences.some(({ filePath, includes }) => {
+    const includesCompact = compactProductionSource(normalizeNativeSeparators(includes));
+    return path.resolve(prepared.filePath) === filePath
+      && literals.some(({ literal }) =>
+        normalizeNativeSeparators(staticStringLiteralContent(literal)).includes(includes)
+      )
+      && (marker.includes(includesCompact) || includesCompact.includes(marker));
+  });
 }
 
 function scanProductionFile(prepared, patterns, combinedRe) {
@@ -1619,6 +1654,7 @@ function scanProductionCompactPatterns(
   marker,
   minimumLiteralCount = 1,
   allowSurroundingText = false,
+  matchAllowed = () => false,
 ) {
   const production = prepared.staticSource ?? prepared.production;
   const markerLower = marker.toLowerCase();
@@ -1641,14 +1677,21 @@ function scanProductionCompactPatterns(
       ) {
         break;
       }
+      const latestBoundary = compact.length;
       compact += compactProductionSource(literals[end].literal);
-      const containsMarker = allowSurroundingText
-        ? compact.includes(markerLower)
-        : compact === markerLower;
-      if (end - start + 1 >= minimumLiteralCount && containsMarker) {
-        hits.push(
-          compactPatternHit(prepared.filePath, literals[start].line, literals[end].line, marker),
+      const matchedRequiredLiterals = end - start + 1 >= minimumLiteralCount
+        && compactMarkerMatches(
+          compact,
+          markerLower,
+          allowSurroundingText,
+          minimumLiteralCount > 1 ? latestBoundary : null,
         );
+      if (matchedRequiredLiterals) {
+        if (!matchAllowed(literals.slice(start, end + 1), markerLower)) {
+          hits.push(
+            compactPatternHit(prepared.filePath, literals[start].line, literals[end].line, marker),
+          );
+        }
         break;
       }
       if (!allowSurroundingText && compact.length >= markerLower.length) {
@@ -1657,6 +1700,29 @@ function scanProductionCompactPatterns(
     }
   }
   return hits;
+}
+
+function compactMarkerMatches(compact, marker, allowSurroundingText, requiredBoundary) {
+  if (!allowSurroundingText) {
+    return compact === marker
+      && (
+        requiredBoundary == null
+        || (requiredBoundary > 0 && marker.length > requiredBoundary)
+      );
+  }
+  for (
+    let offset = compact.indexOf(marker);
+    offset >= 0;
+    offset = compact.indexOf(marker, offset + 1)
+  ) {
+    if (
+      requiredBoundary == null
+      || (offset < requiredBoundary && offset + marker.length > requiredBoundary)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function staticStringLiteralSpans(text) {
@@ -1907,7 +1973,13 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
     }
   }
   for (const pattern of corpusHarnessCompactPatternList) {
-    const hits = scanProductionCompactPatterns(prepared, pattern, 2, true);
+    const hits = scanProductionCompactPatterns(
+      prepared,
+      pattern,
+      2,
+      true,
+      (literals, marker) => compactHarnessDependencyAllowed(prepared, literals, marker),
+    );
     if (hits.length > 0) {
       console.error(
         `Constructed evaluation/proof harness dependency /${pattern}/ in protected non-Rust path ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`,
