@@ -438,6 +438,7 @@ if (!fs.existsSync(macosMetalProof)) {
     "python3 --version",
     "test \"$macos_major\" -ge 15",
     "--native-accelerator-lifecycle",
+    "--managed-plugin-grounding-convergence",
     "--native-edge-cases",
     "CODESTORY_PROOF_TEMP_ROOT:",
     "Clean and assert proof-owned hardware state",

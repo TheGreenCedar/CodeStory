@@ -74,6 +74,15 @@
   refresh or repair ownership, activates through `ground`, observes one
   terminal `shared-agent` attempt and a newer complete local generation, and
   keeps packet/search closed without verified accelerator smoke.
+- Changed the protected Apple Silicon cold lifecycle to reach its first full
+  Agent generation through the managed plugin's `ground` activation instead
+  of `ready --repair`. The exact packaged runtime must now move from a stale
+  local publication and absent sidecars to verified Metal, serve packet/search
+  through the same MCP session, and reuse the native process after MCP restart.
+  Managed repair now waits for the grounding-owned local refresh lock instead
+  of racing that refresh and failing `cache_busy` on larger repositories.
+  Release packaging remains compatible with the system Python shipped by
+  macOS 15, including Docker 29's nanosecond creation timestamps.
 - Expanded managed-plugin provisioning, local grounding, repair handoff, and
   proof cleanup from Windows x64 to every shipped native release asset in both
   pre-publish and post-publish matrices. Linux proof containers now write

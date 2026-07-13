@@ -23,6 +23,7 @@ import threading
 import textwrap
 import time
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -360,6 +361,19 @@ def make_managed_convergence_fixture_stale(project: Path) -> None:
     )
 
 
+def make_repository_convergence_copy_stale(project: Path) -> Path:
+    probe = project / "crates" / "codestory-cli" / "src" / "managed_convergence_probe.rs"
+    if not probe.parent.is_dir():
+        raise RuntimeError(
+            f"managed convergence proof cannot locate codestory-cli sources under {project}"
+        )
+    probe.write_text(
+        "pub fn discovered_by_grounding_convergence() -> &'static str { \"fresh\" }\n",
+        encoding="utf-8",
+    )
+    return probe
+
+
 def proof_ownership_snapshot(cache_root: Path) -> dict[str, str]:
     names = {
         "local-refresh.lock",
@@ -449,7 +463,23 @@ def run_docker_json(
 def docker_created_epoch_ms(value: object) -> int | None:
     if not isinstance(value, str) or not value:
         return None
-    candidate = value.strip().replace("Z", "+00:00")
+    candidate = value.strip()
+    if "." in candidate:
+        prefix, fraction_and_zone = candidate.rsplit(".", 1)
+        fraction_length = next(
+            (
+                index
+                for index, character in enumerate(fraction_and_zone)
+                if not character.isdigit()
+            ),
+            len(fraction_and_zone),
+        )
+        candidate = (
+            f"{prefix}.{fraction_and_zone[:6]}"
+            f"{fraction_and_zone[fraction_length:]}"
+        )
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
     try:
         parsed = datetime.datetime.fromisoformat(candidate)
     except ValueError:
@@ -1357,6 +1387,70 @@ def require(value: bool, layer: str, artifact: Path, message: str) -> None:
         fail(layer, artifact, message)
 
 
+def seed_stale_local_publication(
+    cli: Path,
+    project: Path,
+    out_dir: Path,
+    timeout_secs: int,
+    env: dict[str, str],
+    make_stale: Callable[[Path], object],
+) -> dict[str, str]:
+    ready_artifact = out_dir / "managed-local-ready.json"
+    run_command(
+        cli,
+        "managed_local_ready",
+        [
+            "ready",
+            "--goal",
+            "local",
+            "--repair",
+            "--project",
+            str(project),
+            "--format",
+            "json",
+            "--output-file",
+            str(ready_artifact),
+        ],
+        ready_artifact,
+        timeout_secs,
+        env=env,
+    )
+
+    ground_artifact = out_dir / "managed-local-ground.json"
+    ground = run_command(
+        cli,
+        "managed_local_ground",
+        [
+            "ground",
+            "--project",
+            str(project),
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+            "--output-file",
+            str(ground_artifact),
+        ],
+        ground_artifact,
+        timeout_secs,
+        env=env,
+    )
+    require(
+        isinstance(ground, dict) and isinstance(ground.get("stats"), dict),
+        "managed_local_ground",
+        ground_artifact,
+        "managed local ground output is missing repository stats",
+    )
+    stale_result = make_stale(project)
+    stale_artifact = out_dir / "managed-local-stale.json"
+    write_json(stale_artifact, {"project": str(project), "mutation": str(stale_result)})
+    return {
+        "managed_local_ready": str(ready_artifact),
+        "managed_local_ground": str(ground_artifact),
+        "managed_local_stale": str(stale_artifact),
+    }
+
+
 def require_agent_ready(payload: object, layer: str, artifact: Path) -> None:
     verdicts = payload.get("verdicts", []) if isinstance(payload, dict) else []
     agent = next((item for item in verdicts if item.get("goal") == "agent_packet_search"), None)
@@ -2161,6 +2255,79 @@ def plugin_stdio_status(
         )
 
 
+def managed_convergence_request_plan(
+    project: Path,
+    require_ready: bool,
+    question: str,
+    query: str,
+) -> dict:
+    activation = {
+        "jsonrpc": "2.0",
+        "id": "ground_activation",
+        "method": "tools/call",
+        "params": {
+            "name": "ground",
+            "arguments": {"project": str(project), "budget": "strict"},
+        },
+    }
+    if not require_ready:
+        return {
+            "extra_requests": [
+                activation,
+                *[
+                    {
+                        "jsonrpc": "2.0",
+                        "id": f"setup_poll_{index}",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "sidecar_setup",
+                            "arguments": {"project": str(project), "action": "status"},
+                        },
+                        "_delay_before_secs": 2,
+                    }
+                    for index in range(1, 6)
+                ],
+                {
+                    "jsonrpc": "2.0",
+                    "id": "status_after_convergence",
+                    "method": "resources/read",
+                    "params": {"uri": STATUS_URI, "project": str(project)},
+                },
+            ]
+        }
+    return {
+        "extra_requests": [activation],
+        "poll_request": {
+            "jsonrpc": "2.0",
+            "id": "convergence_status",
+            "method": "resources/read",
+            "params": {"uri": STATUS_URI, "project": str(project)},
+        },
+        "poll_until": managed_status_response_is_ready,
+        "poll_interval_secs": 2,
+        "post_poll_requests": [
+            {
+                "jsonrpc": "2.0",
+                "id": "packet_after_convergence",
+                "method": "tools/call",
+                "params": {
+                    "name": "packet",
+                    "arguments": {"project": str(project), "question": question, "budget": "compact"},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": "search_after_convergence",
+                "method": "tools/call",
+                "params": {
+                    "name": "search",
+                    "arguments": {"project": str(project), "query": query, "why": True},
+                },
+            },
+        ],
+    }
+
+
 def plugin_stdio_handoff(
     plugin_root: Path,
     release_dir: Path,
@@ -2170,12 +2337,21 @@ def plugin_stdio_handoff(
     timeout_secs: int,
     expected_version: str,
     archive_cli: Path,
-    empty_model_dir: Path,
+    model_dir: Path,
     archive: Path,
+    *,
+    require_ready: bool = False,
+    question: str = DEFAULT_QUESTION,
+    query: str = DEFAULT_QUERY,
 ) -> dict:
     require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
-    require(launcher.is_file(), "managed_plugin_convergence", artifact, f"plugin launcher is missing: {launcher}")
+    require(
+        launcher.is_file(),
+        "managed_plugin_convergence",
+        artifact,
+        f"plugin launcher is missing: {launcher}",
+    )
     with temporary_directory_with_retry("codestory-plugin-data-", artifact.parent) as data:
         plugin_data = Path(data)
         prior_version = "0.0.0"
@@ -2258,7 +2434,7 @@ def plugin_stdio_handoff(
             **os.environ,
             "CODESTORY_CLI": "",
             "CODESTORY_CACHE_ROOT": str(cache_root),
-            "CODESTORY_EMBED_MODEL_DIR": str(empty_model_dir),
+            "CODESTORY_EMBED_MODEL_DIR": str(model_dir),
             "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
             "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH": str(policy_path),
             "PLUGIN_DATA": str(plugin_data),
@@ -2287,6 +2463,7 @@ def plugin_stdio_handoff(
             expected_version,
             archive_cli,
         )
+        request_plan = managed_convergence_request_plan(project, require_ready, question, query)
         status = stdio_status_command(
             ["node", str(launcher)],
             artifact,
@@ -2295,39 +2472,18 @@ def plugin_stdio_handoff(
             layer="managed_plugin_convergence",
             cwd=project,
             env=plugin_env,
-            extra_requests=[
-                {
-                    "jsonrpc": "2.0",
-                    "id": "ground_activation",
-                    "method": "tools/call",
-                    "params": {
-                        "name": "ground",
-                        "arguments": {"project": str(project), "budget": "strict"},
-                    },
-                },
-                *[
-                    {
-                        "jsonrpc": "2.0",
-                        "id": f"setup_poll_{index}",
-                        "method": "tools/call",
-                        "params": {
-                            "name": "sidecar_setup",
-                            "arguments": {"project": str(project), "action": "status"},
-                        },
-                        "_delay_before_secs": 2,
-                    }
-                    for index in range(1, 6)
-                ],
-                {
-                    "jsonrpc": "2.0",
-                    "id": "status_after_convergence",
-                    "method": "resources/read",
-                    "params": {"uri": STATUS_URI, "project": str(project)},
-                },
-            ],
+            **request_plan,
             cleanup_status_workers=True,
         )
-        require_managed_plugin_convergence(status, artifact, expected_version, archive_cli)
+        if require_ready:
+            status = require_managed_plugin_ready_convergence(
+                status,
+                artifact,
+                expected_version,
+                archive_cli,
+            )
+        else:
+            require_managed_plugin_convergence(status, artifact, expected_version, archive_cli)
         retention = status.get("plugin_runtime", {}).get("managed_cli_retention", {})
         retained = retention.get("retained", []) if isinstance(retention, dict) else []
         require(
@@ -2359,8 +2515,14 @@ def stdio_status_command(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     extra_requests: list[dict] | None = None,
+    poll_request: dict | None = None,
+    poll_until: Callable[[dict], bool] | None = None,
+    poll_interval_secs: float = 1.0,
+    post_poll_requests: list[dict] | None = None,
     cleanup_status_workers: bool = False,
 ) -> dict:
+    if (poll_request is None) != (poll_until is None):
+        raise ValueError("poll_request and poll_until must be provided together")
     stderr_path = artifact.with_suffix(artifact.suffix + ".stderr.txt")
     process = subprocess.Popen(
         command,
@@ -2449,6 +2611,20 @@ def stdio_status_command(
                 stdio_fail(f"stdio MCP {phase} response must contain exactly one of result or error", {"invalid_response": response})
             return response
 
+    def send_request(request_spec: dict) -> dict:
+        request = dict(request_spec)
+        delay_before_secs = request.pop("_delay_before_secs", 0)
+        if delay_before_secs:
+            time.sleep(delay_before_secs)
+        entry = {"request": request}
+        transcript.append(entry)
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        response = read_correlated_response(request["id"], entry, f"request {request['id']}")
+        entry["response"] = response
+        responses.append(response)
+        return response
+
     try:
         initialize = {
             "jsonrpc": "2.0",
@@ -2511,17 +2687,27 @@ def stdio_status_command(
                     break
 
         for request_spec in requests:
-            request = dict(request_spec)
-            delay_before_secs = request.pop("_delay_before_secs", 0)
-            if delay_before_secs:
-                time.sleep(delay_before_secs)
-            entry = {"request": request}
-            transcript.append(entry)
-            process.stdin.write(json.dumps(request) + "\n")
-            process.stdin.flush()
-            response = read_correlated_response(request["id"], entry, f"request {request['id']}")
-            entry["response"] = response
-            responses.append(response)
+            send_request(request_spec)
+
+        if poll_request is not None and poll_until is not None:
+            poll_deadline = time.monotonic() + timeout_secs
+            poll_id = str(poll_request.get("id", "poll"))
+            attempt = 0
+            while True:
+                if attempt:
+                    remaining = poll_deadline - time.monotonic()
+                    if remaining <= 0:
+                        stdio_fail(f"stdio MCP poll {poll_id} timed out after {timeout_secs}s", {"timed_out": True})
+                    time.sleep(min(poll_interval_secs, remaining))
+                attempt += 1
+                request = {**poll_request, "id": f"{poll_id}_{attempt}"}
+                if poll_until(send_request(request)):
+                    break
+                if time.monotonic() >= poll_deadline:
+                    stdio_fail(f"stdio MCP poll {poll_id} timed out after {timeout_secs}s", {"timed_out": True})
+
+        for request_spec in post_poll_requests or []:
+            send_request(request_spec)
     finally:
         try:
             process.stdin.close()
@@ -2732,6 +2918,25 @@ def status_from_resource_response(response: dict) -> dict | None:
     return status if isinstance(status, dict) else None
 
 
+def managed_status_is_ready(status: dict) -> bool:
+    surfaces = status.get("allowed_surfaces", {})
+    proof = status.get("readiness_broker", {}).get("gpu_proof", {})
+    return (
+        local_freshness_status(status) == "fresh"
+        and status.get("retrieval_mode") == "full"
+        and surfaces.get("packet", {}).get("allowed") is True
+        and surfaces.get("search", {}).get("allowed") is True
+        and proof.get("proof_status") == "verified"
+        and proof.get("meaningful_accelerator_work_proven") is True
+        and proof.get("embed_smoke_ok") is True
+    )
+
+
+def managed_status_response_is_ready(response: dict) -> bool:
+    status = status_from_resource_response(response)
+    return isinstance(status, dict) and managed_status_is_ready(status)
+
+
 def require_managed_binary_provenance(
     status: dict,
     artifact: Path,
@@ -2816,6 +3021,72 @@ def require_managed_observational_status(
     )
 
 
+def require_single_managed_repair(
+    setup_snapshots: list[dict],
+    expected_project: str | None,
+    expected_outcome: str,
+    artifact: Path,
+) -> dict:
+    records = [
+        record
+        for setup in setup_snapshots
+        for record in (setup.get("active_repair"), setup.get("last_worker_result"))
+        if isinstance(record, dict)
+        and isinstance(record.get("attempt_id"), str)
+        and record.get("attempt_id")
+    ]
+    attempt_ids = {record["attempt_id"] for record in records}
+    require(
+        len(attempt_ids) == 1,
+        "managed_plugin_convergence",
+        artifact,
+        f"ground activation did not retain exactly one repair attempt: {sorted(attempt_ids)}",
+    )
+    require(
+        isinstance(expected_project, str)
+        and expected_project
+        and all(
+            record.get("project_root") == expected_project
+            and record.get("profile") == "agent"
+            and record.get("run_id") == "shared-agent"
+            and isinstance(record.get("namespace"), str)
+            and record.get("namespace")
+            for record in records
+        ),
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation repair records did not preserve one durable project/profile/run/namespace identity",
+    )
+    terminal = next(
+        (
+            setup.get("last_worker_result")
+            for setup in reversed(setup_snapshots)
+            if isinstance(setup.get("last_worker_result"), dict)
+            and setup.get("active_repair") is None
+        ),
+        None,
+    )
+    if terminal is None and expected_outcome == "succeeded":
+        final_setup = setup_snapshots[-1] if setup_snapshots else {}
+        require(
+            final_setup.get("active_repair") is None,
+            "managed_plugin_convergence",
+            artifact,
+            "automatic shared-agent repair remained active after readiness converged",
+        )
+        return records[-1]
+    require(
+        isinstance(terminal, dict)
+        and terminal.get("attempt_id") in attempt_ids
+        and terminal.get("run_id") == "shared-agent"
+        and terminal.get("outcome") == expected_outcome,
+        "managed_plugin_convergence",
+        artifact,
+        f"automatic shared-agent repair did not finish with outcome {expected_outcome!r}",
+    )
+    return terminal
+
+
 def require_managed_plugin_convergence(
     status_before: dict,
     artifact: Path,
@@ -2848,38 +3119,6 @@ def require_managed_plugin_convergence(
             f"{request_id} did not return sidecar setup status",
         )
         setup_snapshots.append(setup)
-    attempt_records = [
-        record
-        for setup in setup_snapshots
-        for record in (setup.get("active_repair"), setup.get("last_worker_result"))
-        if isinstance(record, dict)
-        and isinstance(record.get("attempt_id"), str)
-        and record.get("attempt_id")
-    ]
-    attempt_ids = {record["attempt_id"] for record in attempt_records}
-    require(
-        len(attempt_ids) == 1,
-        "managed_plugin_convergence",
-        artifact,
-        f"ground activation did not retain exactly one repair attempt: {sorted(attempt_ids)}",
-    )
-    expected_project = status_before.get("project_root")
-    namespaces = {record.get("namespace") for record in attempt_records}
-    require(
-        isinstance(expected_project, str)
-        and expected_project
-        and len(namespaces) == 1
-        and all(isinstance(namespace, str) and namespace for namespace in namespaces)
-        and all(
-            record.get("project_root") == expected_project
-            and record.get("profile") == "agent"
-            and record.get("run_id") == "shared-agent"
-            for record in attempt_records
-        ),
-        "managed_plugin_convergence",
-        artifact,
-        "ground activation repair records did not preserve one durable project/profile/run/namespace identity",
-    )
     terminal = next(
         (
             setup.get("last_worker_result")
@@ -2889,14 +3128,19 @@ def require_managed_plugin_convergence(
         ),
         None,
     )
+    require(isinstance(terminal, dict), "managed_plugin_convergence", artifact, "automatic repair has no terminal result")
+    outcome = terminal.get("outcome")
     require(
-        isinstance(terminal, dict)
-        and terminal.get("attempt_id") in attempt_ids
-        and terminal.get("run_id") == "shared-agent"
-        and terminal.get("outcome") in {"failed", "succeeded"},
+        outcome in {"failed", "succeeded"},
         "managed_plugin_convergence",
         artifact,
-        "automatic shared-agent repair did not reach a durable terminal result",
+        f"automatic repair has invalid terminal outcome {outcome!r}",
+    )
+    require_single_managed_repair(
+        setup_snapshots,
+        status_before.get("project_root"),
+        str(outcome),
+        artifact,
     )
     status_after = status_from_resource_response(
         transcript_response(artifact, "status_after_convergence") or {}
@@ -2931,6 +3175,103 @@ def require_managed_plugin_convergence(
     )
 
 
+def require_managed_plugin_ready_convergence(
+    status_before: dict,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> dict:
+    require_managed_observational_status(status_before, artifact, expected_version, archive_cli)
+    initial_generation = status_before["index_publication"]["generation"]
+    ground = transcript_response(artifact, "ground_activation") or {}
+    require(
+        structured_content_from_response(ground) is not None
+        and ground.get("result", {}).get("isError") is not True,
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation did not serve a complete publication",
+    )
+
+    transcript = read_json_file(artifact).get("transcript", [])
+    tool_names = [
+        entry.get("request", {}).get("params", {}).get("name")
+        for entry in transcript
+        if entry.get("request", {}).get("method") == "tools/call"
+    ]
+    require(
+        tool_names == ["ground", "packet", "search"],
+        "managed_plugin_convergence",
+        artifact,
+        f"grounding-only proof invoked unexpected MCP tools: {tool_names}",
+    )
+    status_snapshots = [
+        status
+        for entry in transcript
+        if str(entry.get("request", {}).get("id", "")).startswith("convergence_status_")
+        and isinstance(status := status_from_resource_response(entry.get("response", {})), dict)
+    ]
+    require(
+        status_snapshots and managed_status_is_ready(status_snapshots[-1]),
+        "managed_plugin_convergence",
+        artifact,
+        "grounding activation did not reach full verified packet/search readiness",
+    )
+
+    require_single_managed_repair(
+        [status.get("sidecar_setup", {}) for status in status_snapshots],
+        status_before.get("project_root"),
+        "succeeded",
+        artifact,
+    )
+
+    for status in [status_before, *status_snapshots]:
+        proof = status.get("readiness_broker", {}).get("gpu_proof", {})
+        if proof.get("proof_status") == "verified" and proof.get("embed_smoke_ok") is True:
+            continue
+        surfaces = status.get("allowed_surfaces", {})
+        require(
+            surfaces.get("packet", {}).get("allowed") is False
+            and surfaces.get("search", {}).get("allowed") is False,
+            "managed_plugin_convergence",
+            artifact,
+            "packet/search opened before verified GPU and embedding proof",
+        )
+
+    status_after = status_snapshots[-1]
+    require_managed_binary_provenance(status_after, artifact, expected_version, archive_cli)
+    require(
+        local_freshness_status(status_after) == "fresh"
+        and isinstance(status_after.get("index_publication", {}).get("generation"), int)
+        and status_after["index_publication"]["generation"] > initial_generation,
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation did not publish a newer complete local generation",
+    )
+    proof = status_after.get("readiness_broker", {}).get("gpu_proof", {})
+    launch = proof.get("runtime_identity", {}).get("embedding_launch")
+    resource = status_after.get("readiness_broker", {}).get("resources", {}).get("native_embedding_runtime", {})
+    require(
+        status_after.get("retrieval_mode") == "full"
+        and proof.get("proof_status") == "verified"
+        and proof.get("meaningful_accelerator_work_proven") is True
+        and proof.get("embed_smoke_ok") is True
+        and proof.get("observation_source") == "native_log"
+        and isinstance(launch, dict)
+        and launch.get("launch_mode") == "native_spawned"
+        and isinstance(launch.get("pid"), int)
+        and resource.get("owner_pid") == launch.get("pid"),
+        "managed_plugin_convergence",
+        artifact,
+        "full retrieval did not retain verified matching native Metal runtime identity",
+    )
+
+    packet = structured_content_from_response(transcript_response(artifact, "packet_after_convergence") or {})
+    search = structured_content_from_response(transcript_response(artifact, "search_after_convergence") or {})
+    require_packet_ready(packet, artifact)
+    require_search_full(search, artifact)
+    return status_after
+
+
 def run_gate(args: argparse.Namespace) -> None:
     archive = Path(args.archive).resolve()
     project = Path(args.project).resolve()
@@ -2946,8 +3287,13 @@ def run_gate(args: argparse.Namespace) -> None:
         contextlib.ExitStack() as cleanup_stack,
     ):
         source_project = project
-        if getattr(args, "native_edge_cases", False):
-            edge_project = Path(temp) / "CodeStory project with spaces ü"
+        grounding_convergence = getattr(args, "managed_plugin_grounding_convergence", False)
+        if getattr(args, "native_edge_cases", False) or grounding_convergence:
+            edge_project = Path(temp) / (
+                "CodeStory project with spaces ü"
+                if getattr(args, "native_edge_cases", False)
+                else "CodeStory managed grounding convergence"
+            )
             shutil.copytree(
                 source_project,
                 edge_project,
@@ -3129,55 +3475,16 @@ def run_gate(args: argparse.Namespace) -> None:
             )
             empty_model_dir.mkdir()
             summary["managed_convergence_project"] = str(convergence_project)
-            local_ready_artifact = out_dir / "managed-local-ready.json"
-            run_command(
-                cli,
-                "managed_local_ready",
-                [
-                    "ready",
-                    "--goal",
-                    "local",
-                    "--repair",
-                    "--project",
-                    str(convergence_project),
-                    "--format",
-                    "json",
-                    "--output-file",
-                    str(local_ready_artifact),
-                ],
-                local_ready_artifact,
-                args.timeout_secs,
-                env=proof_env,
+            summary["artifacts"].update(
+                seed_stale_local_publication(
+                    cli,
+                    convergence_project,
+                    out_dir,
+                    args.timeout_secs,
+                    proof_env,
+                    make_managed_convergence_fixture_stale,
+                )
             )
-            summary["artifacts"]["managed_local_ready"] = str(local_ready_artifact)
-
-            local_ground_artifact = out_dir / "managed-local-ground.json"
-            ground = run_command(
-                cli,
-                "managed_local_ground",
-                [
-                    "ground",
-                    "--project",
-                    str(convergence_project),
-                    "--refresh",
-                    "none",
-                    "--format",
-                    "json",
-                    "--output-file",
-                    str(local_ground_artifact),
-                ],
-                local_ground_artifact,
-                args.timeout_secs,
-                env=proof_env,
-            )
-            require(
-                isinstance(ground, dict) and isinstance(ground.get("stats"), dict),
-                "managed_local_ground",
-                local_ground_artifact,
-                "managed local ground output is missing repository stats",
-            )
-            summary["artifacts"]["managed_local_ground"] = str(local_ground_artifact)
-            make_managed_convergence_fixture_stale(convergence_project)
 
             plugin_artifact = out_dir / "managed-plugin-convergence.json"
             plugin_status = plugin_stdio_handoff(
@@ -3202,10 +3509,93 @@ def run_gate(args: argparse.Namespace) -> None:
 
         local_env = proof_agent_environment(proof_env, PROOF_LOCAL_RUN_ID)
         ready_artifact = out_dir / "ready.json"
-        ready = run_command(
-            cli,
-            "ready",
-            [
+        if grounding_convergence:
+            summary["artifacts"].update(
+                seed_stale_local_publication(
+                    cli,
+                    project,
+                    out_dir,
+                    args.timeout_secs,
+                    proof_env,
+                    make_repository_convergence_copy_stale,
+                )
+            )
+            model_dir = os.environ.get("CODESTORY_EMBED_MODEL_DIR", "").strip()
+            require(
+                bool(model_dir) and Path(model_dir).is_dir(),
+                "managed_plugin_convergence",
+                archive,
+                "grounding convergence requires a prepared CODESTORY_EMBED_MODEL_DIR",
+            )
+            plugin_artifact = out_dir / "managed-plugin-ready-convergence.json"
+            plugin_status = plugin_stdio_handoff(
+                Path(args.plugin_root).resolve(),
+                archive.parent,
+                project,
+                cache_root,
+                plugin_artifact,
+                args.timeout_secs,
+                args.expected_version,
+                cli,
+                Path(model_dir),
+                archive,
+                require_ready=True,
+                question=args.question,
+                query=args.query,
+            )
+            register_current_proof_runtime(cache_root)
+            summary["artifacts"]["managed_plugin_ready_convergence"] = str(plugin_artifact)
+            summary["artifacts"]["managed_plugin_upgrade"] = str(
+                plugin_artifact.with_name("managed-plugin-upgrade.json")
+            )
+
+            restart_artifact = out_dir / "managed-plugin-restart-status.json"
+            restart_status = plugin_stdio_status(
+                Path(args.plugin_root).resolve(),
+                archive.parent,
+                project,
+                restart_artifact,
+                args.timeout_secs,
+                args.expected_version,
+                cache_root,
+            )
+            require_plugin_stdio_ready(restart_status, restart_artifact, args.expected_version)
+            first_launch = (
+                plugin_status.get("readiness_broker", {})
+                .get("gpu_proof", {})
+                .get("runtime_identity", {})
+                .get("embedding_launch", {})
+            )
+            restart_launch = (
+                restart_status.get("readiness_broker", {})
+                .get("gpu_proof", {})
+                .get("runtime_identity", {})
+                .get("embedding_launch", {})
+            )
+            require(
+                isinstance(first_launch, dict)
+                and isinstance(restart_launch, dict)
+                and restart_launch.get("pid") == first_launch.get("pid")
+                and restart_launch.get("launch_fingerprint_sha256")
+                == first_launch.get("launch_fingerprint_sha256"),
+                "managed_plugin_restart",
+                restart_artifact,
+                "restarted MCP did not reuse the exact healthy native embedding runtime",
+            )
+            summary["artifacts"]["managed_plugin_restart"] = str(restart_artifact)
+            ready_args = [
+                "ready",
+                "--goal",
+                "agent",
+                "--project",
+                str(project),
+                "--format",
+                "json",
+                "--output-file",
+                str(ready_artifact),
+            ]
+        else:
+            ready_args = [
                 "ready",
                 "--goal",
                 "agent",
@@ -3216,7 +3606,11 @@ def run_gate(args: argparse.Namespace) -> None:
                 "json",
                 "--output-file",
                 str(ready_artifact),
-            ],
+            ]
+        ready = run_command(
+            cli,
+            "ready",
+            ready_args,
             ready_artifact,
             args.timeout_secs,
             env=local_env,
@@ -3873,6 +4267,17 @@ def self_test() -> None:
         runner_temp = os.environ.get("RUNNER_TEMP", "").strip()
         proof_root_parent = Path(runner_temp).resolve(strict=True) if runner_temp else root
 
+        for nanosecond, microsecond in (
+            ("2026-07-13T14:08:36.245344828Z", "2026-07-13T14:08:36.245344Z"),
+            (
+                "2026-07-13T10:08:36.224925968-04:00",
+                "2026-07-13T10:08:36.224925-04:00",
+            ),
+        ):
+            assert docker_created_epoch_ms(nanosecond) == docker_created_epoch_ms(
+                microsecond
+            )
+
         def proof_owned_test_root(suffix: str) -> Path:
             path = proof_root_parent / f"codestory-metal-proof-owned-{suffix}"
             path.mkdir()
@@ -3932,10 +4337,13 @@ def self_test() -> None:
                 stderr=subprocess.DEVNULL,
             )
             try:
+                time.sleep(0.05)
+                observed_process = darwin_process_argv(process_probe.pid)
+                assert observed_process is not None
                 launch = {
                     "pid": process_probe.pid,
                     "spawned_at_epoch_ms": int(time.time() * 1000),
-                    "executable_path": sys.executable,
+                    "executable_path": observed_process[0],
                     "launch_args": ["-c", probe_code, "--exact-proof-child"],
                 }
                 assert registered_native_process_snapshot(launch)["status"] == "matching"
@@ -4171,6 +4579,12 @@ def self_test() -> None:
         checksum_file.write_text(f"{sha256_file(archive)}  {archive.name}\n", encoding="utf-8")
         project = root / "repo"
         project.mkdir()
+        positive_plan = managed_convergence_request_plan(project, True, DEFAULT_QUESTION, DEFAULT_QUERY)
+        assert positive_plan["poll_request"]["method"] == "resources/read"
+        assert [request["params"]["name"] for request in positive_plan["post_poll_requests"]] == [
+            "packet",
+            "search",
+        ]
         registered_root = proof_owned_test_root("self-test")
         registered_archive = registered_root / archive.name
         shutil.copyfile(archive, registered_archive)
@@ -4231,11 +4645,14 @@ def self_test() -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            time.sleep(0.05)
+            cleanup_process = darwin_process_argv(cleanup_probe.pid)
+            assert cleanup_process is not None
             launch = {
                 "launch_mode": "native_spawned",
                 "pid": cleanup_probe.pid,
                 "spawned_at_epoch_ms": int(time.time() * 1000),
-                "executable_path": sys.executable,
+                "executable_path": cleanup_process[0],
                 "launch_args": ["-c", probe_code, "--registered-cleanup-child"],
                 "launch_fingerprint_sha256": "1" * 64,
             }
@@ -4419,6 +4836,11 @@ def parse_args() -> argparse.Namespace:
         help="Require native accelerated runtime survival, dead-endpoint blocking, and repair recovery during the full proof.",
     )
     parser.add_argument(
+        "--managed-plugin-grounding-convergence",
+        action="store_true",
+        help="Reach initial full retrieval through managed-plugin grounding activation without explicit repair.",
+    )
+    parser.add_argument(
         "--native-edge-cases",
         action="store_true",
         help="Exercise spaces/Unicode paths and corrupt managed native installs.",
@@ -4440,6 +4862,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--expected-version is required unless --self-test or cleanup mode is set")
     if args.managed_plugin_handoff and not args.plugin_root:
         parser.error("--plugin-root is required with --managed-plugin-handoff")
+    if args.managed_plugin_grounding_convergence and not args.plugin_root:
+        parser.error("--plugin-root is required with --managed-plugin-grounding-convergence")
+    if args.managed_plugin_grounding_convergence and not args.native_accelerator_lifecycle:
+        parser.error("--managed-plugin-grounding-convergence requires --native-accelerator-lifecycle")
+    if args.managed_plugin_grounding_convergence and args.managed_plugin_handoff:
+        parser.error("--managed-plugin-grounding-convergence and --managed-plugin-handoff are mutually exclusive")
     if args.managed_plugin_handoff and args.version_only:
         parser.error("--managed-plugin-handoff and --version-only are mutually exclusive")
     if args.intel_runtime_policy and (args.managed_plugin_handoff or args.version_only):
@@ -4457,6 +4885,7 @@ def parse_args() -> argparse.Namespace:
         or args.native_edge_cases
         or args.intel_runtime_policy
         or args.managed_plugin_handoff
+        or args.managed_plugin_grounding_convergence
         or args.version_only
     ):
         parser.error("--cleanup-proof-temp-root is a standalone cleanup mode")

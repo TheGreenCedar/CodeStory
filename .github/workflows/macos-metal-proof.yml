@@ -165,6 +165,7 @@ jobs:
             --project "${{ github.workspace }}" \
             --plugin-root plugins/codestory \
             --native-accelerator-lifecycle \
+            --managed-plugin-grounding-convergence \
             --native-edge-cases \
             --timeout-secs 1800 \
             --out-dir target/macos-metal-proof/packaged-agent

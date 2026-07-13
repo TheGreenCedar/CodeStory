@@ -123,6 +123,7 @@ const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
 const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
     "\n\n... bundle content truncated by context bundle byte cap\n";
 const READY_REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+const READY_REPAIR_LOCAL_REFRESH_WAIT: Duration = Duration::from_secs(5 * 60);
 const READY_REPAIR_EMBED_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_REPAIR_EMBED_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 const MAX_DRILL_JOBS: usize = 8;
@@ -2891,6 +2892,14 @@ fn repair_ready_state(
         };
     if let Some(reservation) = handoff_reservation.as_mut() {
         reservation.disarm();
+    }
+    if plugin_worker {
+        local_refresh_status::wait_for_local_refresh_lock_release(
+            &runtime.cache_root,
+            &runtime.project_root,
+            READY_REPAIR_LOCAL_REFRESH_WAIT,
+        )
+        .context("wait for local refresh before MCP ready repair")?;
     }
     if let Some(sidecar) = sidecar.as_ref()
         && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(

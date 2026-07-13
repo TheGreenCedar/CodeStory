@@ -184,18 +184,23 @@ claim musl support or extend the glibc baseline claim to Linux arm64.
 The separate protected Apple Silicon workflow runs the packaged CLI and plugin
 launcher on a self-hosted macOS 15 ARM64 runner. It is release-blocking and must
 preserve cold, warm, endpoint-death, and repaired status/log/packet artifacts.
-A passing run proves checksum-pinned model/server setup, `native_spawned` Metal,
-positive offload, a bounded live embed smoke, `gpu_proof=verified`, full
-retrieval, stable PID reuse across MCP restart, no duplicate server, readiness
-blocking after endpoint death, successful repair/recovery, packet/search, and
-proof-owned cleanup. The same protected run copies the repository and cache
-through spaces/Unicode paths, proves dynamic selection away from an occupied
-embedding port, reclaims a vanished lease, interrupts and recovers a proof-owned
-repair worker, and checksum-repairs corrupt model plus partial native-server
-installs. It preserves bounded current-launch logs and exact launch identity
-before marker-scoped cleanup; the following run also cleans a marker-owned prior
-attempt if cancellation prevented the prior `always()` step. Contract tests or
-hosted package smoke cannot replace this hardware evidence.
+The cold path seeds a complete local publication, makes it stale with Agent
+sidecars absent, confirms `codestory://status` changes no ownership, and invokes
+only managed MCP `ground`. Canonical status polling must observe one successful
+`shared-agent` attempt, a newer local generation, `native_spawned` Metal,
+positive offload, a bounded live embed smoke, `gpu_proof=verified`, and full
+retrieval before packet/search run through that same MCP session. A fresh MCP
+process must then reuse the exact native PID and launch fingerprint without a
+duplicate server. The remainder of the workflow proves readiness blocking after
+endpoint death, explicit recovery, packet/search, and proof-owned cleanup. The
+same protected run copies the repository and cache through spaces/Unicode paths,
+proves dynamic selection away from an occupied embedding port, reclaims a
+vanished lease, interrupts and recovers a proof-owned repair worker, and
+checksum-repairs corrupt model plus partial native-server installs. It preserves
+bounded current-launch logs and exact launch identity before marker-scoped
+cleanup; the following run also cleans a marker-owned prior attempt if
+cancellation prevented the prior `always()` step. Contract tests or hosted
+package smoke cannot replace this hardware evidence.
 
 An actual Mac host reboot remains a separate two-phase operator proof because a
 GitHub job cannot safely reboot its own self-hosted runner and resume the same
