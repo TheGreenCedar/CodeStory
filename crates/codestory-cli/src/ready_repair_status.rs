@@ -470,19 +470,6 @@ fn write_ready_repair_worker_result_locked(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn read_ready_repair_worker_result(
-    project_root: &Path,
-    run_id: Option<&str>,
-) -> Option<ReadyRepairWorkerResult> {
-    let sidecar = sidecar_runtime_for_project_with_run_id(
-        project_root,
-        SidecarProfile::Agent,
-        run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
-    );
-    read_ready_repair_worker_result_for_sidecar(&sidecar)
-}
-
 pub(crate) fn read_ready_repair_worker_result_for_sidecar(
     sidecar: &SidecarRuntimeConfig,
 ) -> Option<ReadyRepairWorkerResult> {
@@ -1618,6 +1605,7 @@ mod tests {
 
     #[test]
     fn ready_repair_worker_result_round_trips() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
         let sidecar = sidecar_runtime_for_project_with_run_id(
             project.path(),
@@ -1656,7 +1644,7 @@ mod tests {
             "terminal result should invalidate cached MCP status"
         );
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(result)
         );
         let _ = fs::remove_dir_all(
@@ -1670,6 +1658,7 @@ mod tests {
 
     #[test]
     fn concurrent_terminal_write_and_abandoned_cleanup_preserve_terminal_result() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
         let sidecar = sidecar_runtime_for_project_with_run_id(
             project.path(),
@@ -1742,7 +1731,7 @@ mod tests {
         cleaner.join().expect("abandoned cleaner");
 
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(terminal),
             "terminal success must win regardless of cleanup ordering"
         );
@@ -2217,6 +2206,7 @@ mod tests {
 
     #[test]
     fn cleanup_abandoned_ready_repair_status_removes_dead_pid_status_and_stale_locks() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
         let sidecar = sidecar_runtime_for_project_with_run_id(
             project.path(),
@@ -2273,7 +2263,7 @@ mod tests {
         )
         .expect("write stale project lock");
 
-        let cleanups = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+        let cleanups = cleanup_abandoned_ready_repair_status_for_sidecar(project.path(), &sidecar);
 
         assert_eq!(cleanups.len(), 1);
         assert!(cleanups[0].removed_status_path);
@@ -2291,7 +2281,7 @@ mod tests {
             active_ready_repair_status(project.path(), Some("shared-agent")).is_none(),
             "abandoned cleanup must leave no active repair"
         );
-        let result = read_ready_repair_worker_result(project.path(), Some("shared-agent"))
+        let result = read_ready_repair_worker_result_for_sidecar(&sidecar)
             .expect("abandoned cleanup terminal result");
         assert_eq!(result.attempt_id, "abandoned-test");
         assert_eq!(result.outcome, "abandoned");
@@ -2323,11 +2313,11 @@ mod tests {
         )
         .expect("recreate abandoned status");
 
-        let repeated = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+        let repeated = cleanup_abandoned_ready_repair_status_for_sidecar(project.path(), &sidecar);
 
         assert_eq!(repeated.len(), 1);
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some("shared-agent")),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(terminal),
             "cleanup must preserve an existing matching terminal result"
         );

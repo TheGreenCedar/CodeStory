@@ -710,6 +710,7 @@ fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
 }
 
 fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
+    let state_root = fixture.cache_dir.path().join("test-state");
     let mut command = test_support::cli_command();
     command
         .arg("serve")
@@ -722,7 +723,10 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .arg(fixture.cache_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .env("CODESTORY_CACHE_ROOT", state_root.join("cache"))
+        .env("CODESTORY_STDIO_CACHE_ROOT", state_root.join("stdio-cache"))
+        .env("CODESTORY_PLUGIN_DATA", state_root.join("plugin-data"));
     apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
     if let Some(version) = &fixture.latest_release_version {
         command.env("CODESTORY_LATEST_RELEASE_VERSION", version);
@@ -784,10 +788,7 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         child,
         stdin,
         stdout,
-        worker_roots: vec![
-            test_support::test_state_root(),
-            fixture.cache_dir.path().to_path_buf(),
-        ],
+        worker_roots: vec![fixture.cache_dir.path().to_path_buf()],
         preserve_fixture_roots: Some(Arc::clone(&fixture.workspace.preserve)),
     }
 }
@@ -813,7 +814,7 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         child,
         stdin,
         stdout,
-        worker_roots: vec![test_support::test_state_root(), cache_root.to_path_buf()],
+        worker_roots: vec![cache_root.to_path_buf()],
         preserve_fixture_roots: None,
     }
 }
@@ -840,7 +841,7 @@ fn spawn_multi_project_stdio_server_with_project_network_config(cache_root: &Pat
         child,
         stdin,
         stdout,
-        worker_roots: vec![test_support::test_state_root(), cache_root.to_path_buf()],
+        worker_roots: vec![cache_root.to_path_buf()],
         preserve_fixture_roots: None,
     }
 }
@@ -1323,7 +1324,7 @@ fn write_repair_status_fixture(
 ) -> PathBuf {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let sidecar = test_sidecar_runtime(&canonical_root, run_id);
+    let sidecar = test_sidecar_runtime(fixture, &canonical_root, run_id);
     let status_path = sidecar
         .layout
         .state_file
@@ -1360,12 +1361,20 @@ fn write_repair_status_fixture(
     status_path
 }
 
-fn test_sidecar_runtime(project: &Path, run_id: &str) -> codestory_retrieval::SidecarRuntimeConfig {
+fn test_sidecar_runtime(
+    fixture: &StdioFixture,
+    project: &Path,
+    run_id: &str,
+) -> codestory_retrieval::SidecarRuntimeConfig {
     codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
         Some(project),
         codestory_retrieval::SidecarProfile::Agent,
         Some(run_id),
-        &test_support::test_state_root().join("stdio-cache"),
+        &fixture
+            .cache_dir
+            .path()
+            .join("test-state")
+            .join("stdio-cache"),
     )
 }
 
@@ -3776,11 +3785,14 @@ fn ground_activation_enqueues_enabled_agent_repair() {
     fixture.ready_repair_worker_probe_exit_code = Some(0);
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let result_path =
-        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-            .layout
-            .state_file
-            .with_file_name("ready-repair-result.json");
+    let result_path = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    )
+    .layout
+    .state_file
+    .with_file_name("ready-repair-result.json");
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -3821,11 +3833,14 @@ fn repeated_grounding_cools_down_identical_failed_agent_repair_across_servers() 
     fixture.ready_repair_worker_probe_exit_code = Some(17);
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let result_path =
-        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-            .layout
-            .state_file
-            .with_file_name("ready-repair-result.json");
+    let result_path = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    )
+    .layout
+    .state_file
+    .with_file_name("ready-repair-result.json");
 
     let ground = |server: &mut StdioServer, id: &str| {
         let response = send_json(
@@ -4053,8 +4068,11 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     let policy_path = fixture.cache_dir.path().join("plugin-sidecar-policy.json");
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let repair_sidecar =
-        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
+    let repair_sidecar = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    );
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -4247,14 +4265,17 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
     fixture.ready_repair_worker_probe_exit_code = Some(0);
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let repair_sidecar =
-        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
+    let repair_sidecar = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    );
     let mutable_cache_sidecar =
         codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
             Some(&canonical_root),
             codestory_retrieval::SidecarProfile::Agent,
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-            &test_support::test_state_root().join("cache"),
+            &fixture.cache_dir.path().join("test-state").join("cache"),
         );
     assert_ne!(
         repair_sidecar.layout.state_file, mutable_cache_sidecar.layout.state_file,
