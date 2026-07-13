@@ -11,7 +11,7 @@ expected_host_model=Mac17,4
 expected_host_chip='Apple M5'
 expected_host_os=26.5.2
 expected_colima_version=0.10.3
-machine_fingerprint=colima-vz0.10.3/mac17.4/apple-m5/macos26.5.2/linux-arm64/4vcpu/17GiB
+machine_fingerprint=colima-vz0.10.3/mac17.4/apple-m5/macos26.5.2/linux-arm64/4vcpu/17GiB/no-host-mount-v1
 
 runner_version=2.335.1
 runner_sha256=6d1e85bfd1a506a8b17c1f1b9b57dba458ffed90898799aaa9f599520b0d9207
@@ -41,6 +41,7 @@ require_host_tools() {
   test "$(sw_vers -productVersion)" = "$expected_host_os"
   test "$(colima version | awk 'NR == 1 {print $3}')" = "$expected_colima_version"
   test "$(sysctl -n hw.memsize)" -ge 25769803776
+  test -z "$(git -C "$repo_root" status --porcelain)"
   gh auth status >/dev/null
 }
 
@@ -54,12 +55,10 @@ start_profile() {
   fi
   colima start --profile "$profile" \
     --cpu 4 --memory 17 --disk 80 \
-    --runtime docker --vm-type vz --mount-type virtiofs
+    --runtime docker --vm-type vz --mount-type virtiofs --mount none
 }
 
 provision_guest() {
-  local source_sha
-  source_sha=${CODESTORY_RELEASE_EVIDENCE_SHA:-$(git -C "$repo_root" rev-parse HEAD)}
   colima ssh --profile "$profile" -- env \
     RUNNER_ROOT="$runner_root" SOURCE_ROOT="$source_root" \
     RUNNER_VERSION="$runner_version" RUNNER_SHA256="$runner_sha256" \
@@ -68,7 +67,6 @@ provision_guest() {
     RUST_VERSION="$rust_version" RUSTUP_SHA256="$rustup_sha256" \
     MODEL_SHA256="$model_sha256" DRILL_COMMIT="$drill_commit" \
     QDRANT_IMAGE="$qdrant_image" LLAMA_IMAGE="$llama_image" \
-    SOURCE_SHA="$source_sha" \
     bash -s <<'GUEST'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -200,22 +198,29 @@ sudo -u codestory-runner jq -n --arg project "$drill_repo" '{
   }]
 }' | sudo -u codestory-runner tee "$manifest" >/dev/null
 
-checkout="$RUNNER_ROOT/validation/codestory"
-if ! sudo -u codestory-runner test -d "$checkout/.git"; then
-  sudo -u codestory-runner git clone --filter=blob:none --no-checkout \
-    https://github.com/TheGreenCedar/CodeStory.git "$checkout"
-fi
-sudo -u codestory-runner git -C "$checkout" fetch --depth 1 origin "$SOURCE_SHA"
-sudo -u codestory-runner git -C "$checkout" checkout --detach "$SOURCE_SHA"
-sudo -u codestory-runner env \
-  HOME="$RUNNER_ROOT/home" CARGO_HOME="$RUNNER_ROOT/cargo" \
-  RUSTUP_HOME="$RUNNER_ROOT/rustup" XDG_CACHE_HOME="$RUNNER_ROOT/cache/xdg" \
-  CODESTORY_EMBED_MODEL_DIR="$RUNNER_ROOT/models" \
-  node "$checkout/scripts/setup-retrieval-env.mjs" --check-only
-
 sudo -u codestory-runner docker pull "$QDRANT_IMAGE"
 sudo -u codestory-runner docker pull "$LLAMA_IMAGE"
 GUEST
+}
+
+sync_validation_source() {
+  local source_sha
+  source_sha=${CODESTORY_RELEASE_EVIDENCE_SHA:-$(git -C "$repo_root" rev-parse HEAD)}
+  vm sudo rm -rf "$runner_root/validation/codestory"
+  vm sudo install -d -o codestory-runner -g codestory-runner -m 0750 \
+    "$runner_root/validation/codestory"
+  git -C "$repo_root" archive --format=tar "$source_sha" \
+    | colima ssh --profile "$profile" -- sudo -u codestory-runner \
+      tar -xf - -C "$runner_root/validation/codestory"
+  printf '%s\n' "$source_sha" \
+    | colima ssh --profile "$profile" -- sudo -u codestory-runner \
+      tee "$runner_root/validation/source-sha" >/dev/null
+  vm sudo -u codestory-runner env \
+    HOME="$runner_root/home" CARGO_HOME="$runner_root/cargo" \
+    RUSTUP_HOME="$runner_root/rustup" XDG_CACHE_HOME="$runner_root/cache/xdg" \
+    CODESTORY_EMBED_MODEL_DIR="$runner_root/models" \
+    node "$runner_root/validation/codestory/scripts/setup-retrieval-env.mjs" \
+    --check-only
 }
 
 register_runner() {
@@ -266,9 +271,7 @@ REGISTER
 }
 
 verify_runner() {
-  local gate_script
   local runner_json
-  gate_script="$repo_root/scripts/codestory-release-evidence-gate.mjs"
   runner_json=
   for _ in {1..15}; do
     runner_json=$(gh api "repos/$repository/actions/runners" --jq \
@@ -283,10 +286,30 @@ verify_runner() {
     RUNNER_ROOT="$runner_root" MODEL_SHA256="$model_sha256" \
     DRILL_COMMIT="$drill_commit" QDRANT_IMAGE="$qdrant_image" \
     LLAMA_IMAGE="$llama_image" MACHINE_FINGERPRINT="$machine_fingerprint" \
-    GATE_SCRIPT="$gate_script" RUNNER_NAME="$runner_name" \
-    RUNNER_VERSION="$runner_version" \
+    RUNNER_NAME="$runner_name" RUNNER_VERSION="$runner_version" \
     bash -s <<'VERIFY'
 set -euo pipefail
+mount_table=$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | sort)
+printf '%s\n' "$mount_table"
+unexpected_host_mounts=$(printf '%s\n' "$mount_table" | awk '
+  $3 ~ /^(virtiofs|9p|fuse[.](sshfs|lima|osxfs|grpcfuse|virtiofs))$/ { print }
+  $1 == "/Users" || $1 ~ /^\/Users\// { print }
+')
+if [ -n "$unexpected_host_mounts" ]; then
+  echo "unexpected host-backed mount detected:" >&2
+  printf '%s\n' "$unexpected_host_mounts" >&2
+  exit 1
+fi
+for host_path in /Users /Users/albert; do
+  if sudo -u codestory-runner test -e "$host_path" \
+      || sudo -u codestory-runner test -r "$host_path" \
+      || sudo -u codestory-runner test -w "$host_path"; then
+    echo "host path is visible to the runner: $host_path" >&2
+    exit 1
+  fi
+done
+echo "host_mounts=none host_home_visible=false"
+
 sudo -u codestory-runner python3 - <<'PY'
 import os, shutil
 root = "/srv/codestory-release-evidence"
@@ -310,7 +333,7 @@ sudo -u codestory-runner docker image inspect "$LLAMA_IMAGE" \
   --format 'llama={{.Os}}/{{.Architecture}} {{.Id}}'
 actual=$(sudo -u codestory-runner env \
   CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT="$MACHINE_FINGERPRINT" \
-  node "$GATE_SCRIPT" fingerprint)
+  node "$RUNNER_ROOT/validation/codestory/scripts/codestory-release-evidence-gate.mjs" fingerprint)
 test "$actual" = "$MACHINE_FINGERPRINT"
 echo "machine_fingerprint=$actual"
 
@@ -322,8 +345,8 @@ model_bytes=$(sudo -u codestory-runner stat -c %s \
   "$RUNNER_ROOT/models/bge-base-en-v1.5.Q8_0.gguf")
 manifest_sha=$(sudo -u codestory-runner sha256sum \
   "$RUNNER_ROOT/drills/real-repo-drill-cases.json" | awk '{print $1}')
-source_sha=$(sudo -u codestory-runner git -C \
-  "$RUNNER_ROOT/validation/codestory" rev-parse HEAD)
+source_sha=$(sudo -u codestory-runner sed -n '1p' \
+  "$RUNNER_ROOT/validation/source-sha")
 qdrant_id=$(sudo -u codestory-runner docker image inspect "$QDRANT_IMAGE" \
   --format '{{.Id}}')
 llama_id=$(sudo -u codestory-runner docker image inspect "$LLAMA_IMAGE" \
@@ -378,7 +401,9 @@ sudo -u codestory-runner jq -n \
       configured_memory_gib: 17,
       configured_disk_gib: 80,
       observed_memory_bytes: $memory_bytes,
-      observed_workspace_free_bytes: $workspace_free_bytes
+      observed_workspace_free_bytes: $workspace_free_bytes,
+      host_mounts: [],
+      host_home_visible: false
     },
     toolchain: {
       node: $node,
@@ -436,6 +461,7 @@ case "$command" in
     require_host_tools
     start_profile
     provision_guest
+    sync_validation_source
     register_runner
     verify_runner
     ;;

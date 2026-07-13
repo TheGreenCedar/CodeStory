@@ -8,7 +8,9 @@
   release-evidence runner. The runner uses a stable provisioned machine
   identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64
   sidecars, an exact real-repository drill, isolated proof state, and explicit
-  verification, recovery, unregister, and destruction paths.
+  verification, recovery, unregister, and destruction paths. Colima host mounts
+  are disabled, validation source is copied into the guest, and verification
+  rejects host-home visibility or any unexpected host-backed mount.
 - Staged CI proof by pull-request maturity and changed surface. Draft pushes
   now stay on one Ubuntu source lane, exact-head review promotion runs the full
   workspace test and clippy gate once, and explicit platform promotion selects

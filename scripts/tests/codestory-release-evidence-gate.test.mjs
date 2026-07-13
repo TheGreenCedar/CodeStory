@@ -33,7 +33,7 @@ function reattest(candidate, artifact, filePath) {
 }
 
 test("fingerprint prefers a validated provisioned machine identity", () => {
-  const identity = "colima-vz0.10.3/mac17.4/apple-m5/macos26.5.2/linux-arm64/4vcpu/17GiB";
+  const identity = "colima-vz0.10.3/mac17.4/apple-m5/macos26.5.2/linux-arm64/4vcpu/17GiB/no-host-mount-v1";
   let result = spawnSync(process.execPath, [script, "fingerprint"], {
     encoding: "utf8",
     env: { ...process.env, CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: identity },
