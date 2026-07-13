@@ -25,6 +25,9 @@
 
 ### Fixed
 
+- Kept the protected Metal proof runnable when the platform-only source-call
+  job is intentionally skipped, while still requiring successful routing and
+  package production before protected hardware starts.
 - Made Mac notarization retain its submission ID and retry status queries
   across transient Apple transport failures. Terminal rejection still fails
   immediately with the notarization log retained, and polling now has an

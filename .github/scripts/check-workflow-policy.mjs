@@ -539,6 +539,7 @@ if (!fs.existsSync(packagedPlatformPr)) {
     "uses: ./.github/workflows/repo-scale-stats.yml",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
     "scope: ${{ needs.route.outputs.scope }}",
+    "always() &&\n      needs.route.result == 'success' &&\n      needs.packaged-proof.result == 'success' &&",
     "uses: ./.github/workflows/macos-metal-proof.yml",
     "use_packaged_cli_artifact: true",
     "dev/codestory-next moved from proved head",

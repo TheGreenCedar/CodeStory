@@ -237,7 +237,11 @@ jobs:
       sign_macos: false
 
   macos-metal-proof:
-    if: needs.route.outputs.scope == 'macos' || needs.route.outputs.scope == 'full'
+    if: >-
+      always() &&
+      needs.route.result == 'success' &&
+      needs.packaged-proof.result == 'success' &&
+      (needs.route.outputs.scope == 'macos' || needs.route.outputs.scope == 'full')
     needs:
       - route
       - packaged-proof
