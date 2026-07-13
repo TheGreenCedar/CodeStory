@@ -24,9 +24,10 @@
   direct harness commands/configuration, comment-separated JavaScript imports,
   unquoted shell continuations, workflow-embedded shell continuations, and
   PowerShell continuations. Comment-only JavaScript and hash-commented
-  shell/config text is ignored, while Markdown prose stays outside dependency
-  scanning. The CI trigger and focused regression contract cover the full
-  protected inventory, and missing protected paths fail closed.
+  shell/config text is ignored, while Markdown prose stays outside evaluation
+  and dependency scanning. The CI trigger and focused regression contract cover
+  the full protected inventory, including local composite actions, and missing
+  protected paths fail closed.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and

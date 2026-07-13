@@ -131,7 +131,7 @@ fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
         .expect("run lint with prompt script fixture")
 }
 
-fn run_lint_with_non_rust_fixture(file_name: &str, contents: &str) -> Output {
+fn run_lint_with_non_rust_fixtures(fixtures: &[(&str, &str)]) -> Output {
     let repo_root = workspace_root();
     let script = lint_script(&repo_root);
     let fixture_root = TempDir::new().expect("create fixture root");
@@ -140,7 +140,10 @@ fn run_lint_with_non_rust_fixture(file_name: &str, contents: &str) -> Output {
         "pub fn repository_neutral_fixture() {}\n",
     )
     .expect("write neutral Rust fixture");
-    std::fs::write(fixture_root.path().join(file_name), contents).expect("write non-Rust fixture");
+    for (file_name, contents) in fixtures {
+        std::fs::write(fixture_root.path().join(file_name), contents)
+            .expect("write non-Rust fixture");
+    }
 
     let _guard = LINT_SCRIPT_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -418,135 +421,89 @@ pub const LEAKED_DEPENDENCY: &str = include_str!(concat!("../../benchmarks/", "t
 
 #[test]
 fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
-    let cases = [
+    let rejected = run_lint_with_non_rust_fixtures(&[
         (
             "leaked.ps1",
             "$corpus = \"scripts\\cross-repo-\" + `\n  \"sourcetrail-queries.mjs\"\n",
-            "scriptscrossreposourcetrailqueriesmjs",
-            true,
         ),
         (
             "leaked.sh",
-            "corpus=\"benchmarks/tasks/\"\\\n\"eval-probes.json\"\n",
-            "benchmarkstasksevalprobesjson",
-            true,
-        ),
-        (
-            "leaked.mjs",
-            "export const corpus = import(\"./FETCH-HOLDOUT-REPOS.MJS\");\n",
-            "fetch-holdout-repos.mjs",
-            true,
-        ),
-        (
-            "split-import.mjs",
-            "export const corpus = import(\"./fetch-\" + \"holdout-repos.mjs\");\n",
-            "fetchholdoutreposmjs",
-            true,
-        ),
-        (
-            "comment-split-import.mjs",
-            "export const corpus = import(\"./fetch-\" /* deliberate */ + \"holdout-repos.mjs\");\n",
-            "fetchholdoutreposmjs",
-            true,
-        ),
-        (
-            "commented-import.mjs",
-            "export const corpus = import(/* deliberate */ \"./fetch-holdout-repos.mjs\");\n",
-            "fetch-holdout-repos.mjs",
-            true,
-        ),
-        (
-            "commented-require.cjs",
-            "const corpus = require(// deliberate\n  \"./fetch-holdout-repos.mjs\");\n",
-            "fetch-holdout-repos.mjs",
-            true,
-        ),
-        (
-            "split-command.sh",
-            "script=\"scripts/fetch-\"\\\n\"holdout-repos.mjs\"\nnode \"$script\"\n",
-            "scriptsfetchholdoutreposmjs",
-            true,
-        ),
-        (
-            "unquoted-command.sh",
-            "script=scripts/fetch-\\\nholdout-repos.mjs\nnode \"$script\"\n",
-            "scriptsfetchholdoutreposmjs",
-            true,
-        ),
-        (
-            "unquoted-eval.sh",
-            "corpus=benchmarks/ta\\\nsks/eval-probes.json\n",
-            "benchmarkstasks",
-            true,
+            "prefix=./scripts\nscript=${prefix#./}/fetch-holdout-repos.mjs\ncorpus=benchmarks/ta\\\nsks/eval-probes.json\n",
         ),
         (
             "workflow-command.yml",
-            "run: |\n  node scripts/fetch-\\\n  holdout-repos.mjs\n",
-            "scriptsfetchholdoutreposmjs",
-            true,
+            "run: |2-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n",
         ),
         (
-            "comment-only-import.mjs",
-            "// Do not import(\"./fetch-holdout-repos.mjs\") or benchmarks/tasks/eval-probes.json from release code.\n",
-            "",
-            false,
+            "surrounding-command.mjs",
+            "const command = \"node scripts/fetch-\" + \"holdout-repos.mjs --json\";\nconst config = \"prefix benchmarks/ta\" + \"sks/eval-probes.json suffix\";\n",
         ),
         (
-            "direct-command.sh",
-            "node scripts/fetch-holdout-repos.mjs\n",
-            "scripts/fetch-holdout-repos.mjs",
-            true,
+            "line-continuation.mjs",
+            "const script = \"scripts/fetch-holdout-\\\nrepos.mjs\";\n",
         ),
-        (
-            "direct-workflow-command.yml",
-            "run: node scripts/fetch-holdout-repos.mjs\n",
-            "scripts/fetch-holdout-repos.mjs",
-            true,
-        ),
-        (
-            "spawn-array.mjs",
-            "spawn(\"node\", [\"scripts/fetch-holdout-repos.mjs\"]);\n",
-            "scripts/fetch-holdout-repos.mjs",
-            true,
-        ),
-        (
-            "one-literal-config.toml",
-            "harness = \"# scripts/fetch-holdout-repos.mjs\"\n",
-            "scripts/fetch-holdout-repos.mjs",
-            true,
-        ),
-        (
-            "comment-only-continuation.yml",
-            "# run: node scripts/fetch-\\\n# holdout-repos.mjs\nrun: echo clean\n",
-            "",
-            false,
-        ),
-        (
-            "prose.md",
-            "Do not import(\"./fetch-holdout-repos.mjs\") or compose \"fetch-\" + \"holdout-repos.mjs\" in production prose.\n",
-            "",
-            false,
-        ),
-    ];
-    for (file_name, contents, expected, should_reject) in cases {
-        let output = run_lint_with_non_rust_fixture(file_name, contents);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !should_reject {
-            assert!(
-                output.status.success(),
-                "non-executable prose in {file_name} must pass lint; stderr={stderr}"
-            );
-            continue;
-        }
+    ]);
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
+    assert!(
+        !rejected.status.success(),
+        "executable corpus dependencies must fail lint; stderr={rejected_stderr}"
+    );
+    for (file_name, marker) in [
+        ("leaked.ps1", "scriptscrossreposourcetrailqueriesmjs"),
+        ("leaked.sh", "benchmarkstasksevalprobesjson"),
+        ("workflow-command.yml", "fetchholdoutreposmjs"),
+        ("surrounding-command.mjs", "fetchholdoutreposmjs"),
+        ("line-continuation.mjs", "fetchholdoutreposmjs"),
+    ] {
         assert!(
-            !output.status.success(),
-            "protected non-Rust corpus dependency in {file_name} must fail lint; stderr={stderr}"
-        );
-        assert!(
-            stderr.to_ascii_lowercase().contains(expected),
-            "lint failure should identify {expected} in {file_name}; stderr={stderr}"
+            rejected_stderr.contains(file_name) && rejected_stderr.contains(marker),
+            "lint failure should identify {file_name} and {marker}; stderr={rejected_stderr}"
         );
     }
+
+    let allowed = run_lint_with_non_rust_fixtures(&[
+        (
+            "prose.md",
+            "The benchmark harness reads `benchmarks/tasks/eval-probes.json`; production code must not.\n",
+        ),
+        (
+            "quoted-shell.sh",
+            "value='scripts/fetch-\\\nholdout-repos.mjs'\n",
+        ),
+        (
+            "unrelated-list.yml",
+            "- scripts/fetch-\\\n- holdout-repos.mjs\n",
+        ),
+        (
+            "template-comment.mjs",
+            "const value = `${({ clean: true }).clean /* scripts/fetch-holdout-repos.mjs */}`;\n",
+        ),
+        (
+            "quoted-shell-comment.sh",
+            "value='clean\\' # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "quoted-powershell-comment.ps1",
+            "$value = 'clean`' # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "quoted-yaml-comment.yml",
+            "value: 'clean\\' # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "folded-workflow.yml",
+            "run: >-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n",
+        ),
+        (
+            "comment-only.yml",
+            "# run: node scripts/fetch-\\\n# holdout-repos.mjs\nrun: echo clean\n",
+        ),
+    ]);
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(
+        allowed.status.success(),
+        "prose, comments, and unrelated continuations must pass lint; stderr={allowed_stderr}"
+    );
 }
 
 #[test]

@@ -7,12 +7,19 @@ on:
   pull_request:
     paths:
       - .codex/environments/**
+      - .github/actions/**
       - .github/scripts/**
       - .github/workflows/**
       - benchmarks/**
       - crates/**
       - docker/**
-      - docs/**
+      - docs/architecture/language-support.md
+      - docs/architecture/retrieval-*
+      - docs/contributors/testing-matrix.md
+      - docs/ops/retrieval-sidecars.md
+      - docs/testing/codestory-e2e-stats-log.md
+      - docs/testing/performance-review-playbook.md
+      - docs/testing/retrieval-architecture.md
       - plugins/codestory/**
       - scripts/**
   # Base-branch runs seed caches that sibling PRs are allowed to restore.
@@ -22,12 +29,19 @@ on:
       - dev/codestory-next
     paths:
       - .codex/environments/**
+      - .github/actions/**
       - .github/scripts/**
       - .github/workflows/**
       - benchmarks/**
       - crates/**
       - docker/**
-      - docs/**
+      - docs/architecture/language-support.md
+      - docs/architecture/retrieval-*
+      - docs/contributors/testing-matrix.md
+      - docs/ops/retrieval-sidecars.md
+      - docs/testing/codestory-e2e-stats-log.md
+      - docs/testing/performance-review-playbook.md
+      - docs/testing/retrieval-architecture.md
       - plugins/codestory/**
       - scripts/**
   workflow_dispatch:
