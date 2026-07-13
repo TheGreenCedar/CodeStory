@@ -26,8 +26,8 @@
   PowerShell continuations. Comment-only JavaScript and hash-commented
   shell/config text is ignored, while Markdown prose stays outside evaluation
   and dependency scanning. The CI trigger and focused regression contract cover
-  the full protected inventory, including local composite actions, and missing
-  protected paths fail closed.
+  the full protected inventory, including local composite actions and shipped
+  agent instruction surfaces, and missing protected paths fail closed.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and

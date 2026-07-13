@@ -29,9 +29,18 @@ const explicitNonRustScanRoots = (
   .split(path.delimiter)
   .filter(Boolean);
 
+const groundingSkillDir = path.join(
+  repoRoot,
+  "plugins",
+  "codestory",
+  "skills",
+  "codestory-grounding",
+);
+
 const protectedNonRustDirs = [
   path.join(repoRoot, "scripts"),
   path.join(repoRoot, ".github"),
+  path.join(repoRoot, ".cursor", "rules"),
   path.join(repoRoot, "plugins", "codestory"),
   path.join(repoRoot, "docker"),
   path.join(repoRoot, "crates", "codestory-retrieval", "assets"),
@@ -39,6 +48,8 @@ const protectedNonRustDirs = [
 
 const requiredProtectedNonRustFiles = [
   path.join(repoRoot, ".codex", "environments", "environment.toml"),
+  path.join(repoRoot, ".cursor", "rules", "codestory.mdc"),
+  path.join(groundingSkillDir, "SKILL.md"),
   path.join(repoRoot, "scripts", "codestory-evidence-provenance.mjs"),
   path.join(repoRoot, "scripts", "codestory-release-evidence-gate.mjs"),
   path.join(repoRoot, "scripts", "codex-worktree-setup.mjs"),
@@ -78,6 +89,13 @@ const corpusSupportNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "setup-retrieval-env.ps1"),
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
 ].map((filePath) => path.resolve(filePath)));
+const allowedHarnessDependencyLines = [
+  ["drill-suite.md", "scripts/score-drill-ledger.mjs"],
+  ["retrieval-rollout.md", ".github/workflows/retrieval-sidecar-smoke.yml"],
+].map(([fileName, includes]) => ({
+  filePath: path.join(groundingSkillDir, "references", fileName),
+  includes,
+}));
 
 const executableJavaScriptExtensions = new Set([
   ".cjs", ".js", ".mjs", ".ts", ".tsx",
@@ -89,8 +107,13 @@ const javaScriptStringOrCommentPattern = /("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[
 const javaScriptTemplateTokenPattern = /("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')|(\$\{|[{}])|(\/\*[\s\S]*?\*\/|\/\/[^\r\n]*)/g;
 const protectedNonRustExtensions = new Set([
   ...executableJavaScriptExtensions,
-  ".json", ".ps1", ".py", ".sh", ".toml", ".yaml", ".yml",
+  ".json", ".md", ".mdc", ".ps1", ".py", ".sh", ".toml", ".yaml", ".yml",
 ]);
+const agentInstructionExtensions = new Set([".md", ".mdc"]);
+const agentInstructionPathFragments = [
+  path.join("plugins", "codestory", "skills", "codestory-grounding"),
+  path.join(".cursor", "rules"),
+];
 
 const defaultNonRustScanRoots = protectedNonRustDirs;
 const usesDefaultNonRustScanRoots = explicitNonRustScanRoots.length === 0;
@@ -674,9 +697,16 @@ function walkFiles(root, predicate) {
 
 function walkProtectedNonRustFiles(root) {
   return walkFiles(root, (filePath) => {
-    if (!protectedNonRustExtensions.has(path.extname(filePath).toLowerCase())) {
+    const extension = path.extname(filePath).toLowerCase();
+    if (!protectedNonRustExtensions.has(extension)) {
       return false;
     }
+    if (
+      agentInstructionExtensions.has(extension)
+      && !agentInstructionPathFragments.some((fragment) =>
+        filePath.includes(`${path.sep}${fragment}${path.sep}`)
+      )
+    ) return false;
     if (!usesDefaultNonRustScanRoots) {
       return true;
     }
@@ -1265,6 +1295,13 @@ function maskHashComments(source, extension) {
       index += 1;
       continue;
     }
+    if (
+      source[index] === "'"
+      && (extension === ".yaml" || extension === ".yml")
+      && /[a-zA-Z0-9_]/.test(source[index - 1] ?? "")
+    ) {
+      continue;
+    }
     if (source[index] === "\"" || source[index] === "'") {
       const delimiter = source[index];
       quote = (extension === ".py" || extension === ".toml")
@@ -1305,12 +1342,19 @@ function logicalNonRustLines(lines, extension) {
       end + 1 < lines.length
       && lineContinuationMarker(text, extension, yamlScalarKinds?.[end]) != null
     ) {
-      text = yamlScalarKinds?.[end] === ">"
+      text = yamlScalarKinds?.[end]?.endsWith(">")
         ? `${text} ${lines[end + 1].trimStart()}`
         : text.slice(0, -1) + lines[end + 1].trimStart();
       end += 1;
     }
-    logicalLines.push({ text, startLine: start + 1, endLine: end + 1 });
+    logicalLines.push({
+      text,
+      startLine: start + 1,
+      endLine: end + 1,
+      shellLike: extension === ".sh"
+        || yamlScalarKinds?.[start]?.startsWith("run")
+        || isYamlRunLine(lines[start], extension),
+    });
     start = end;
   }
   return logicalLines;
@@ -1331,14 +1375,20 @@ function yamlBlockScalarKinds(lines) {
       blockIndent = null;
     }
     const header = line.trimStart().match(
-      /^[^#\n]+:\s*([|>])(?:[1-9][+-]?|[+-][1-9]?)?\s*$/,
+      /^([^#\n]+):\s*([|>])(?:[1-9][+-]?|[+-][1-9]?)?\s*$/,
     );
     if (header != null) {
       blockIndent = indent;
-      scalarKind = header[1];
+      const shellPrefix = /^(?:-\s*)?run$/.test(header[1].trim()) ? "run" : "";
+      scalarKind = `${shellPrefix}${header[2]}`;
     }
   }
   return scalarKinds;
+}
+
+function isYamlRunLine(line, extension) {
+  return (extension === ".yaml" || extension === ".yml")
+    && /^\s*(?:-\s*)?run\s*:/.test(line);
 }
 
 function lineContinuationMarker(line, extension, yamlScalarKind) {
@@ -1385,8 +1435,16 @@ function openQuoteAtEnd(text, escape) {
 function scanCorpusHarnessDependencies(prepared) {
   const hits = [];
   for (const line of prepared.logicalLines) {
-    const normalizedLine = normalizeNativeSeparators(line.text);
-    if (corpusHarnessDependencyRegexes.some((pattern) => pattern.test(normalizedLine))) {
+    const normalizedLine = normalizeNativeSeparators(line.text, line.shellLike);
+    const hasProtectedDependency = corpusHarnessDependencyRegexes.some((pattern) =>
+      pattern.test(normalizedLine)
+      && !allowedHarnessDependencyLines.some(({ filePath, includes }) =>
+        path.resolve(prepared.filePath) === filePath
+        && line.text.includes(includes)
+        && pattern.test(includes)
+      )
+    );
+    if (hasProtectedDependency) {
       hits.push(
         `${prepared.filePath}:${line.startLine}:${prepared.sourceLines[line.startLine - 1]}`,
       );
@@ -1404,7 +1462,7 @@ function scanProductionFile(prepared, patterns, combinedRe) {
   const sourceLines = prepared.sourceLines ?? prepared.lines;
   const hitsByPattern = new Map();
   for (const line of lines) {
-    const normalizedLine = normalizeNativeSeparators(line.text);
+    const normalizedLine = normalizeNativeSeparators(line.text, line.shellLike);
     if (!combinedRe.test(normalizedLine)) {
       continue;
     }
@@ -1445,8 +1503,9 @@ function compactProductionSource(text) {
     .toLowerCase();
 }
 
-function normalizeNativeSeparators(text) {
-  return text.replaceAll("\\", "/");
+function normalizeNativeSeparators(text, shellLike = false) {
+  const normalized = text.replaceAll("\\", "/");
+  return shellLike ? normalized.replace(/["']/g, "") : normalized;
 }
 
 function staticStringLiteralContent(literal) {

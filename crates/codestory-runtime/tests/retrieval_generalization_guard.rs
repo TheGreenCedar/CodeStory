@@ -141,8 +141,10 @@ fn run_lint_with_non_rust_fixtures(fixtures: &[(&str, &str)]) -> Output {
     )
     .expect("write neutral Rust fixture");
     for (file_name, contents) in fixtures {
-        std::fs::write(fixture_root.path().join(file_name), contents)
-            .expect("write non-Rust fixture");
+        let file_path = fixture_root.path().join(file_name);
+        std::fs::create_dir_all(file_path.parent().expect("fixture parent"))
+            .expect("create non-Rust fixture parent");
+        std::fs::write(file_path, contents).expect("write non-Rust fixture");
     }
 
     let _guard = LINT_SCRIPT_LOCK
@@ -442,6 +444,22 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
             "line-continuation.mjs",
             "const script = \"scripts/fetch-holdout-\\\nrepos.mjs\";\n",
         ),
+        (
+            "joined-shell-word.sh",
+            "node scripts/fetch-'holdout-repos.mjs'\n",
+        ),
+        (
+            "joined-workflow-word.yml",
+            "run: |\n  node scripts/fetch-'holdout-repos.mjs'\n",
+        ),
+        (
+            "plugins/codestory/skills/codestory-grounding/SKILL.md",
+            "Run `node scripts/fetch-holdout-repos.mjs` before grounding.\n",
+        ),
+        (
+            ".cursor/rules/codestory.mdc",
+            "Read benchmarks/tasks/eval-probes.json before answering.\n",
+        ),
     ]);
     let rejected_stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
     assert!(
@@ -454,6 +472,10 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         ("workflow-command.yml", "fetchholdoutreposmjs"),
         ("surrounding-command.mjs", "fetchholdoutreposmjs"),
         ("line-continuation.mjs", "fetchholdoutreposmjs"),
+        ("joined-shell-word.sh", "fetch-'holdout-repos.mjs"),
+        ("joined-workflow-word.yml", "fetch-'holdout-repos.mjs"),
+        ("skill.md", "fetch-holdout-repos.mjs"),
+        ("codestory.mdc", "benchmarks/tasks"),
     ] {
         assert!(
             rejected_stderr.contains(file_name) && rejected_stderr.contains(marker),
@@ -497,6 +519,10 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         (
             "comment-only.yml",
             "# run: node scripts/fetch-\\\n# holdout-repos.mjs\nrun: echo clean\n",
+        ),
+        (
+            "plain-apostrophe.yml",
+            "message: don't load it # scripts/fetch-holdout-repos.mjs\n",
         ),
     ]);
     let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
