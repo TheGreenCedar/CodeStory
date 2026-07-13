@@ -17,14 +17,18 @@ The approved host shape for the first v0.15 baseline is:
 | Colima | 0.10.3 |
 | Capacity | 4 vCPU, 17 GiB configured memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
-| Stable fingerprint | `colima-vz0.10.3/mac17.4/apple-m5/macos26.5.2/linux-arm64/4vcpu/17GiB/no-host-mount-v1` |
+| Stable profile ID | `codestory-release-evidence-linux-arm64-v1` |
+| Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
 | Model directory | `/srv/codestory-release-evidence/models` |
 | Drill manifest | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
 
-The workflow checks the guest-visible values rather than the Colima settings.
-The current profile exposes more than 16 GiB to Python and more than 20 GiB of
-free space to the runner workspace.
+The profile ID is a stable comparison key, not evidence about the current
+machine. Provisioning records the observed host, generated Colima VM shape,
+guest boot, native package manifest, and toolchain in one attestation. The
+workflow reruns the guest verifier and derives its fingerprint from the profile
+ID plus the checked-in contract hash. A stale host attestation from another VM
+boot is rejected.
 
 ## Provision and verify
 
@@ -44,8 +48,10 @@ Provisioning is idempotent. It:
 
 - creates the dedicated VM and service account;
 - disables Colima's default writable host-home mount;
-- verifies checksums before installing Node, Rust, GitHub CLI, and the Actions
-  runner;
+- verifies the checksum-pinned Colima base image before VM creation;
+- installs native packages from a fixed Ubuntu archive snapshot at exact
+  versions, then records the complete native package manifest;
+- verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
 - downloads and verifies the pinned BGE model;
 - prepares a source-backed `serde_json` drill at an exact commit;
@@ -55,10 +61,19 @@ Provisioning is idempotent. It:
   under the proof-owned volume.
 
 The tracked CodeStory source used by provisioning checks is streamed into the
-guest over SSH. No source checkout or tool is executed through a host mount.
-`verify` prints the guest mount table and fails if it finds a host-backed
-VirtioFS, 9p, SSHFS, Lima, osxfs, or gRPC FUSE mount; any `/Users` visibility is
-also a hard failure.
+guest over SSH. It replaces the previous validation tree atomically enough for
+the stopped runner, so untracked or modified validation files cannot survive a
+provisioning pass. No source or tool is executed through a host mount. `verify`
+prints the guest mount table and fails if it finds a host-backed VirtioFS, 9p,
+SSHFS, Lima, osxfs, or gRPC FUSE mount; any `/Users` visibility is also a hard
+failure.
+
+Provisioning first proves that an existing owned runner is idle. It requests a
+GitHub registration token only when the runner is unconfigured, checks the
+exact runner binary version and `.runner` repository/name identity, and leaves
+the systemd service disabled across VM boots. The host `start` command verifies
+and attests the current host and VM before starting the service. Starting the
+Colima profile directly therefore leaves the runner offline.
 
 The GitHub registration and removal tokens are short-lived and passed directly
 to the guest. They are never written to the repository or provisioning
@@ -72,14 +87,23 @@ scripts/codestory-release-evidence-runner.sh start
 scripts/codestory-release-evidence-runner.sh verify
 ```
 
-After a host restart, start the profile and require `verify` to show the runner
-online, both pinned images present as Linux ARM64, the exact model checksum, the
-clean drill commit, the stable fingerprint, and sufficient guest capacity.
+After a host restart, use the script's `start` command rather than `colima
+start`. Require `verify` to show the runner online, both pinned images present
+as Linux ARM64, the exact model checksum, the clean drill commit, a current-boot
+host attestation, the contract-derived fingerprint, and sufficient guest
+capacity.
 
 When intentionally changing the toolchain, runner, model, sidecar image, VM
 shape, or drill commit, update the pinned constants in the provisioning script
 and create a new approved baseline. Do not compare results across the identity
 change as though they came from the same machine profile.
+
+`stop`, `unregister`, and `destroy` deliberately do not require the pinned host
+OS, Colima version, a clean checkout, or a working GitHub login. They validate a
+durable ownership marker and exact local runner identity first. Without GitHub
+authentication, unregister stops the service and reports the still-offline
+remote record; destroy can still remove the proof-owned VM. A busy runner is
+never reprovisioned or unregistered.
 
 To unregister while preserving the VM and proof artifacts:
 

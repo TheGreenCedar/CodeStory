@@ -16,6 +16,7 @@ const METRICS = [
   "packet_seconds", "search_seconds", "indexing_seconds", "storage_growth_ratio",
 ];
 const SHA = /^[0-9a-f]{40}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const MACHINE_FINGERPRINT = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{2,199}$/;
 
@@ -38,6 +39,13 @@ function fullSha(value, label) {
   return normalized;
 }
 function sha256(bytes) { return createHash("sha256").update(bytes).digest("hex"); }
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  }
+  return value;
+}
 function readJson(filePath, label) {
   try { return JSON.parse(readFileSync(filePath, "utf8")); }
   catch (error) { fail(`failed to read ${label} ${filePath}: ${error.message}`); }
@@ -55,12 +63,23 @@ function git(args, cwd) {
   return result.stdout.trim();
 }
 function machineFingerprint() {
-  const provisioned = process.env.CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT?.trim();
-  if (provisioned) {
-    if (!MACHINE_FINGERPRINT.test(provisioned)) {
-      fail("CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT must be 3-200 portable identity characters");
+  const provisioningPath = process.env.CODESTORY_RELEASE_EVIDENCE_PROVISIONING?.trim();
+  if (provisioningPath) {
+    const provisioning = readJson(provisioningPath, "release-evidence provisioning");
+    if (provisioning.schema_version !== 2) fail("provisioning schema_version must be 2");
+    const profileId = text(provisioning.profile_id, "provisioning.profile_id");
+    const contractSha = text(provisioning.contract_sha256, "provisioning.contract_sha256");
+    if (!SHA256.test(contractSha)) fail("provisioning.contract_sha256 must be a SHA-256 digest");
+    const fingerprint = text(provisioning.fingerprint, "provisioning.fingerprint");
+    if (!MACHINE_FINGERPRINT.test(fingerprint) || fingerprint !== `${profileId}/${contractSha}`) {
+      fail("provisioning fingerprint does not match its profile and machine contract");
     }
-    return provisioned;
+    const observed = object(provisioning.observed_identity, "provisioning.observed_identity");
+    const observedSha = sha256(`${JSON.stringify(canonical(observed))}\n`);
+    if (observedSha !== provisioning.observed_identity_sha256) {
+      fail("provisioning observed identity attestation changed");
+    }
+    return fingerprint;
   }
   const cpu = os.cpus()[0]?.model?.trim() ?? "unknown";
   const memoryGiB = Math.round(os.totalmem() / 2 ** 30);

@@ -33,20 +33,36 @@ function reattest(candidate, artifact, filePath) {
 }
 
 test("fingerprint prefers a validated provisioned machine identity", () => {
-  const identity = "colima-vz0.10.3/mac17.4/apple-m5/macos26.5.2/linux-arm64/4vcpu/17GiB/no-host-mount-v1";
+  const dir = mkdtempSync(path.join(tmpdir(), "codestory-provisioning-"));
+  const profile = "codestory-release-evidence-linux-arm64-v1";
+  const contractSha = "1".repeat(64);
+  const observed = { guest: { arch: "aarch64" }, host: { model: "Mac17,4" } };
+  const observedSha = createHash("sha256").update(`${JSON.stringify(observed)}\n`).digest("hex");
+  const provisioning = path.join(dir, "provisioning.json");
+  writeFileSync(provisioning, JSON.stringify({
+    schema_version: 2,
+    profile_id: profile,
+    contract_sha256: contractSha,
+    fingerprint: `${profile}/${contractSha}`,
+    observed_identity: observed,
+    observed_identity_sha256: observedSha,
+  }));
   let result = spawnSync(process.execPath, [script, "fingerprint"], {
     encoding: "utf8",
-    env: { ...process.env, CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: identity },
+    env: { ...process.env, CODESTORY_RELEASE_EVIDENCE_PROVISIONING: provisioning },
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout.trim(), identity);
+  assert.equal(result.stdout.trim(), `${profile}/${contractSha}`);
 
+  const changed = JSON.parse(readFileSync(provisioning));
+  changed.observed_identity.guest.arch = "x86_64";
+  writeFileSync(provisioning, JSON.stringify(changed));
   result = spawnSync(process.execPath, [script, "fingerprint"], {
     encoding: "utf8",
-    env: { ...process.env, CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: "not portable" },
+    env: { ...process.env, CODESTORY_RELEASE_EVIDENCE_PROVISIONING: provisioning },
   });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /portable identity characters/);
+  assert.match(result.stderr, /observed identity attestation changed/);
 });
 
 test("checked-in candidate and report are deterministic and fully attested", () => {

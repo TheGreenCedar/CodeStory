@@ -114,8 +114,9 @@ candidate report.
 
 Provision, verify, recover, and unregister the dedicated Linux host using the
 [release-evidence runner runbook](../contributors/release-evidence-runner.md).
-Its root-provisioned fingerprint binds the virtual guest to the approved host
-profile when generic Linux CPU metadata is unavailable.
+Its fingerprint combines a stable profile ID with the checked-in machine
+contract hash. The workflow accepts that fingerprint only after the live guest
+matches the current-boot host attestation and pinned package/toolchain state.
 
 For maintainer reproduction, produce and evaluate from real raw artifacts:
 

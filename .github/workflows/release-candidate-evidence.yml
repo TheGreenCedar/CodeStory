@@ -56,35 +56,20 @@ jobs:
 
       - name: Record and validate runner provisioning
         if: inputs.source_run_id == ''
-        shell: python
+        shell: bash
         env:
           PROFILE: ${{ inputs.profile }}
           DRILL_MANIFEST: ${{ inputs.drill_manifest }}
           EMBEDDING_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
-          import json, os, pathlib, shutil
-          out = pathlib.Path("target/release-evidence")
-          out.mkdir(parents=True, exist_ok=True)
-          drill = pathlib.Path(os.environ["DRILL_MANIFEST"])
-          model = pathlib.Path(os.environ["EMBEDDING_MODEL_DIR"]) / "bge-base-en-v1.5.Q8_0.gguf"
-          memory_gib = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
-          disk_gib = shutil.disk_usage(".").free / 2**30
-          proof = {
-              "profile": os.environ["PROFILE"],
-              "runner_labels": ["self-hosted", "linux", "codestory-release-evidence"],
-              "drill_manifest": str(drill),
-              "drill_manifest_exists": drill.is_file(),
-              "embedding_model": str(model),
-              "embedding_model_exists": model.is_file(),
-              "memory_gib": round(memory_gib, 2),
-              "free_disk_gib": round(disk_gib, 2),
-          }
-          (out / "provisioning.json").write_text(json.dumps(proof, indent=2) + "\n")
-          assert proof["profile"]
-          assert proof["drill_manifest_exists"]
-          assert proof["embedding_model_exists"]
-          assert memory_gib >= 16
-          assert disk_gib >= 20
+          test -n "$PROFILE"
+          test "$DRILL_MANIFEST" = /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
+          test "$EMBEDDING_MODEL_DIR" = /srv/codestory-release-evidence/models
+          bash scripts/release-evidence/guest-verify.sh \
+            scripts/release-evidence/machine-contract.json
+          mkdir -p target/release-evidence
+          cp /srv/codestory-release-evidence/artifacts/provisioning.json \
+            target/release-evidence/provisioning.json
 
       - name: Build release CLI
         if: inputs.source_run_id == ''
@@ -94,6 +79,8 @@ jobs:
         if: inputs.source_run_id == ''
         id: machine
         shell: bash
+        env:
+          CODESTORY_RELEASE_EVIDENCE_PROVISIONING: ${{ github.workspace }}/target/release-evidence/provisioning.json
         run: echo "fingerprint=$(node scripts/codestory-release-evidence-gate.mjs fingerprint)" >> "$GITHUB_OUTPUT"
 
       - name: Produce full-sidecar repo evidence
