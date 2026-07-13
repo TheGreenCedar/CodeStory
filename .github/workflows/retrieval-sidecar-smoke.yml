@@ -6,68 +6,30 @@ name: retrieval-sidecar-smoke
 on:
   pull_request:
     paths:
-      - crates/codestory-retrieval/**
-      - crates/codestory-contracts/**
-      - crates/codestory-store/Cargo.toml
-      - crates/codestory-store/src/**
-      - crates/codestory-cli/src/retrieval.rs
-      - crates/codestory-cli/src/main.rs
-      - crates/codestory-cli/src/args.rs
-      - crates/codestory-cli/src/runtime.rs
-      - crates/codestory-cli/src/stdio_*.rs
-      - crates/codestory-cli/tests/fixtures/packet_search_eval/**
-      - crates/codestory-cli/tests/packet_search_eval.rs
-      - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
-      - crates/codestory-cli/tests/search_json_output.rs
-      - crates/codestory-cli/tests/stdio_protocol_contracts.rs
-      - crates/codestory-runtime/src/**
-      - crates/codestory-indexer/Cargo.toml
-      - crates/codestory-indexer/src/lib.rs
-      - scripts/lint-retrieval-generalization.mjs
-      - scripts/codestory-evidence-provenance.mjs
-      - scripts/codestory-release-evidence-gate.mjs
-      - scripts/tests/codestory-release-evidence-gate.test.mjs
-      - benchmarks/release-evidence/**
-      - scripts/**retrieval**
-      - docs/ops/retrieval-sidecars.md
-      - docs/architecture/retrieval-*.md
-      - docs/testing/retrieval-architecture.md
-      - docker/retrieval-compose.yml
-      - .github/workflows/retrieval-sidecar-smoke.yml
+      - .codex/environments/**
+      - .github/scripts/**
+      - .github/workflows/**
+      - benchmarks/**
+      - crates/**
+      - docker/**
+      - docs/**
+      - plugins/codestory/**
+      - scripts/**
   # Base-branch runs seed caches that sibling PRs are allowed to restore.
   push:
     branches:
       - main
       - dev/codestory-next
     paths:
-      - crates/codestory-retrieval/**
-      - crates/codestory-contracts/**
-      - crates/codestory-store/Cargo.toml
-      - crates/codestory-store/src/**
-      - crates/codestory-cli/src/retrieval.rs
-      - crates/codestory-cli/src/main.rs
-      - crates/codestory-cli/src/args.rs
-      - crates/codestory-cli/src/runtime.rs
-      - crates/codestory-cli/src/stdio_*.rs
-      - crates/codestory-cli/tests/fixtures/packet_search_eval/**
-      - crates/codestory-cli/tests/packet_search_eval.rs
-      - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
-      - crates/codestory-cli/tests/search_json_output.rs
-      - crates/codestory-cli/tests/stdio_protocol_contracts.rs
-      - crates/codestory-runtime/src/**
-      - crates/codestory-indexer/Cargo.toml
-      - crates/codestory-indexer/src/lib.rs
-      - scripts/lint-retrieval-generalization.mjs
-      - scripts/codestory-evidence-provenance.mjs
-      - scripts/codestory-release-evidence-gate.mjs
-      - scripts/tests/codestory-release-evidence-gate.test.mjs
-      - benchmarks/release-evidence/**
-      - scripts/**retrieval**
-      - docs/ops/retrieval-sidecars.md
-      - docs/architecture/retrieval-*.md
-      - docs/testing/retrieval-architecture.md
-      - docker/retrieval-compose.yml
-      - .github/workflows/retrieval-sidecar-smoke.yml
+      - .codex/environments/**
+      - .github/scripts/**
+      - .github/workflows/**
+      - benchmarks/**
+      - crates/**
+      - docker/**
+      - docs/**
+      - plugins/codestory/**
+      - scripts/**
   workflow_dispatch:
 
 concurrency:

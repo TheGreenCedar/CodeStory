@@ -423,31 +423,67 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
             "leaked.ps1",
             "$corpus = \"scripts\\cross-repo-\" + `\n  \"sourcetrail-queries.mjs\"\n",
             "scriptscrossreposourcetrailqueriesmjs",
+            true,
         ),
         (
             "leaked.sh",
             "corpus=\"benchmarks/tasks/\"\\\n\"eval-probes.json\"\n",
             "benchmarkstasksevalprobesjson",
+            true,
         ),
         (
             "leaked.mjs",
             "export const corpus = import(\"./FETCH-HOLDOUT-REPOS.MJS\");\n",
             "fetch-holdout-repos.mjs",
+            true,
         ),
         (
             "split-import.mjs",
             "export const corpus = import(\"./fetch-\" + \"holdout-repos.mjs\");\n",
             "fetchholdoutreposmjs",
+            true,
+        ),
+        (
+            "commented-import.mjs",
+            "export const corpus = import(/* deliberate */ \"./fetch-holdout-repos.mjs\");\n",
+            "fetch-holdout-repos.mjs",
+            true,
+        ),
+        (
+            "commented-require.cjs",
+            "const corpus = require(// deliberate\n  \"./fetch-holdout-repos.mjs\");\n",
+            "fetch-holdout-repos.mjs",
+            true,
         ),
         (
             "split-command.sh",
             "script=\"scripts/fetch-\"\\\n\"holdout-repos.mjs\"\nnode \"$script\"\n",
             "scriptsfetchholdoutreposmjs",
+            true,
+        ),
+        (
+            "unquoted-command.sh",
+            "script=scripts/fetch-\\\nholdout-repos.mjs\nnode \"$script\"\n",
+            "scriptsfetchholdoutreposmjs",
+            true,
+        ),
+        (
+            "prose.md",
+            "Do not import(\"./fetch-holdout-repos.mjs\") from production code.\n",
+            "",
+            false,
         ),
     ];
-    for (file_name, contents, expected) in cases {
+    for (file_name, contents, expected, should_reject) in cases {
         let output = run_lint_with_non_rust_fixture(file_name, contents);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if !should_reject {
+            assert!(
+                output.status.success(),
+                "non-executable prose in {file_name} must pass lint; stderr={stderr}"
+            );
+            continue;
+        }
         assert!(
             !output.status.success(),
             "protected non-Rust corpus dependency in {file_name} must fail lint; stderr={stderr}"

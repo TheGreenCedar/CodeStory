@@ -74,9 +74,12 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, ".github", "workflows", "retrieval-sidecar-smoke.yml"),
 ].map((filePath) => path.resolve(filePath)));
 
+const executableJavaScriptExtensions = new Set([
+  ".cjs", ".js", ".mjs", ".ts", ".tsx",
+]);
 const protectedNonRustExtensions = new Set([
-  ".cjs", ".js", ".json", ".md", ".mjs", ".ps1", ".py", ".sh", ".toml", ".ts",
-  ".tsx", ".yaml", ".yml",
+  ...executableJavaScriptExtensions,
+  ".json", ".md", ".ps1", ".py", ".sh", ".toml", ".yaml", ".yml",
 ]);
 
 const defaultNonRustScanRoots = protectedNonRustDirs;
@@ -1174,8 +1177,15 @@ function prepareNonRustFile(filePath) {
 }
 
 function scanCorpusHarnessImports(prepared) {
+  if (!executableJavaScriptExtensions.has(path.extname(prepared.filePath).toLowerCase())) {
+    return [];
+  }
   const hits = [];
-  const importPattern = /(?:\bfrom\s+|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'`]([^"'`]+)["'`]/g;
+  const trivia = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*`;
+  const importPattern = new RegExp(
+    `(?:\\bfrom${trivia}|\\bimport${trivia}\\(?${trivia}|\\brequire${trivia}\\(${trivia})["'\`]([^"'\`]+)["'\`]`,
+    "g",
+  );
   let match;
   while ((match = importPattern.exec(prepared.production)) != null) {
     const modulePath = normalizeNativeSeparators(match[1]).split(/[?#]/, 1)[0];
@@ -1346,6 +1356,38 @@ function staticStringLiteralsOnLine(line) {
   return literals;
 }
 
+function scanShellContinuationHarnessDependencies(prepared) {
+  if (path.extname(prepared.filePath).toLowerCase() !== ".sh") {
+    return [];
+  }
+  const hits = [];
+  for (let start = 0; start < prepared.lines.length; start += 1) {
+    if (!prepared.lines[start].endsWith("\\")) {
+      continue;
+    }
+    let end = start;
+    let logicalLine = prepared.lines[end].slice(0, -1);
+    while (end + 1 < prepared.lines.length) {
+      end += 1;
+      const continues = prepared.lines[end].endsWith("\\");
+      logicalLine += continues
+        ? prepared.lines[end].slice(0, -1)
+        : prepared.lines[end];
+      if (!continues) {
+        break;
+      }
+    }
+    const compactLine = logicalLine.replace(/[^a-zA-Z0-9]+/g, "").toLowerCase();
+    for (const marker of corpusHarnessCompactPatternList) {
+      if (compactLine.includes(marker)) {
+        hits.push(compactPatternHit(prepared.filePath, start + 1, end + 1, marker));
+      }
+    }
+    start = end;
+  }
+  return hits;
+}
+
 function lineAllowedForPattern(pattern, line) {
   return allowedPatternLines.some(
     (allowed) => allowed.pattern === pattern && line.includes(allowed.includes),
@@ -1495,6 +1537,13 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
   if (harnessImportHits.length > 0) {
     console.error(
       `Protected non-Rust path imports an evaluation/proof harness ${path.relative(repoRoot, filePath)}:\n${harnessImportHits.join("\n")}\n`,
+    );
+    failed = true;
+  }
+  const shellContinuationHits = scanShellContinuationHarnessDependencies(prepared);
+  if (shellContinuationHits.length > 0) {
+    console.error(
+      `Protected shell path constructs an evaluation/proof harness dependency ${path.relative(repoRoot, filePath)}:\n${shellContinuationHits.join("\n")}\n`,
     );
     failed = true;
   }
