@@ -115,7 +115,27 @@ remote_by_name() {
 
 remote_by_id() {
   local runner_id=$1
-  gh api "repos/$repository/actions/runners/$runner_id" 2>/dev/null || true
+  gh api "repos/$repository/actions/runners/$runner_id"
+}
+
+remote_by_id_or_absent() {
+  local runner_id=$1
+  local error
+  local remote
+  error=$(mktemp)
+  if remote=$(gh api "repos/$repository/actions/runners/$runner_id" 2>"$error"); then
+    rm -f "$error"
+    printf '%s\n' "$remote"
+    return
+  fi
+  if grep -Fq 'HTTP 404' "$error"; then
+    rm -f "$error"
+    printf 'null\n'
+    return
+  fi
+  cat "$error" >&2
+  rm -f "$error"
+  return 1
 }
 
 assert_remote_exact() {
@@ -149,7 +169,11 @@ assert_not_busy() {
     echo "runner name is already registered without a local ownership marker" >&2
     exit 1
   fi
-  owner_id=$(jq -er '.runner_id' "$owner_path")
+  owner_id=$(jq -r '.runner_id' "$owner_path")
+  if test "$owner_id" = null; then
+    echo "runner name is registered but the ownership marker has no runner ID" >&2
+    exit 1
+  fi
   remote=$(jq -c '.[0]' <<<"$remotes")
   assert_remote_exact "$remote" "$owner_id"
   test "$(jq -r '.busy' <<<"$remote")" = false || {
@@ -330,35 +354,78 @@ wait_online() {
   printf '%s\n' "$remote"
 }
 
+wait_offline() {
+  local runner_id
+  local remote
+  runner_id=$(jq -r '.runner_id' "$owner_path")
+  if test "$runner_id" = null; then
+    remote=$(remote_by_name)
+    test "$(jq 'length' <<<"$remote")" -eq 0
+    return
+  fi
+  for _ in {1..20}; do
+    remote=$(remote_by_id "$runner_id")
+    if test "$(jq -r '.status' <<<"$remote")" = offline; then break; fi
+    sleep 1
+  done
+  assert_remote_exact "$remote" "$runner_id"
+  test "$(jq -r '.status' <<<"$remote")" = offline
+  test "$(jq -r '.busy' <<<"$remote")" = false
+}
+
 verify_runner() {
   owner_json >/dev/null
   profile_running
-  assert_not_busy
+  quiesce_runner
   write_host_attestation
   guest_verify
+  start_runner
   wait_online
 }
 
 stop_local_runner() {
-  if ! colima ssh --profile "$profile" -- test -f \
+  if ! colima ssh --profile "$profile" -- sudo test -f \
       "$runner_root/validation/codestory/scripts/release-evidence/guest-runner.sh"; then
-    return 0
+    test "$(jq -r '.runner_id' "$owner_path")" = null
+    return
   fi
   colima ssh --profile "$profile" -- sudo bash \
     "$runner_root/validation/codestory/scripts/release-evidence/guest-runner.sh" stop \
     "$runner_root/validation/codestory/scripts/release-evidence/machine-contract.json"
+  test "$(runner_inspect | jq -r '.service_active')" = false
+}
+
+quiesce_runner() {
+  assert_not_busy
+  stop_local_runner
+  wait_offline
 }
 
 unregister_runner() {
   local state
   local runner_id
   local remote
-  local remote_cleanup=0
+  local confirmed_absent
   profile_exists || return 0
   owner_json >/dev/null
   if ! profile_running; then colima start --profile "$profile"; fi
   if ! state=$(runner_inspect); then return 1; fi
-  if test "$(jq -r '.configured' <<<"$state")" != true; then return 0; fi
+  if test "$(jq -r '.configured' <<<"$state")" != true; then
+    if test "$(jq -r '.runner_id' "$owner_path")" != null; then
+      echo "local runner is unconfigured but the ownership marker retains a runner ID" >&2
+      return 1
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+      echo "GitHub authentication unavailable; retaining the proof-owned VM until remote absence is confirmed" >&2
+      return 1
+    fi
+    remote=$(remote_by_name)
+    if test "$(jq 'length' <<<"$remote")" -ne 0; then
+      echo "runner name remains registered without an owned runner ID" >&2
+      return 1
+    fi
+    return 0
+  fi
   if test "$(jq -r '.exact' <<<"$state")" != true; then
     echo "local runner identity does not match the ownership contract" >&2
     return 1
@@ -368,47 +435,45 @@ unregister_runner() {
     echo "local runner ID does not match the durable ownership marker" >&2
     return 1
   fi
-  if gh auth status >/dev/null 2>&1; then
-    remote=$(remote_by_id "$runner_id")
-    if test -n "$remote"; then
-      if ! assert_remote_exact "$remote" "$runner_id"; then
-        echo "remote runner identity does not match the durable ownership marker" >&2
-        return 1
-      fi
-      if test "$(jq -r '.busy' <<<"$remote")" = true; then
-        echo "runner $runner_id is busy; refusing to unregister it" >&2
-        return 2
-      fi
-      gh api --method DELETE "repos/$repository/actions/runners/$runner_id"
-    fi
-  else
-    remote_cleanup=1
-    echo "GitHub authentication unavailable; containing locally and leaving the remote runner offline" >&2
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "GitHub authentication unavailable; runner, credentials, and VM left unchanged" >&2
+    return 1
   fi
-  if ! stop_local_runner; then return 1; fi
-  if test "$remote_cleanup" -eq 0; then
-    if ! colima ssh --profile "$profile" -- sudo bash \
-      "$runner_root/validation/codestory/scripts/release-evidence/guest-runner.sh" forget \
-      "$runner_root/validation/codestory/scripts/release-evidence/machine-contract.json"; then
+  remote=$(remote_by_id_or_absent "$runner_id")
+  confirmed_absent=false
+  if test "$remote" = null; then
+    stop_local_runner
+    confirmed_absent=true
+  else
+    if ! assert_remote_exact "$remote" "$runner_id"; then
+      echo "remote runner identity does not match the durable ownership marker" >&2
       return 1
     fi
-    write_ownership null
+    if test "$(jq -r '.busy' <<<"$remote")" = true; then
+      echo "runner $runner_id is busy; refusing to unregister it" >&2
+      return 2
+    fi
+    quiesce_runner
+    gh api --method DELETE "repos/$repository/actions/runners/$runner_id"
+    if test "$(remote_by_id_or_absent "$runner_id")" != null; then
+      echo "runner $runner_id still exists after deletion" >&2
+      return 1
+    fi
+    confirmed_absent=true
   fi
-  return "$remote_cleanup"
+  test "$confirmed_absent" = true
+  colima ssh --profile "$profile" -- sudo bash \
+    "$runner_root/validation/codestory/scripts/release-evidence/guest-runner.sh" forget \
+    "$runner_root/validation/codestory/scripts/release-evidence/machine-contract.json"
+  write_ownership null
 }
 
 destroy_runner() {
-  local cleanup_status=0
   profile_exists || return 0
   owner_json >/dev/null
-  set +e
   unregister_runner
-  cleanup_status=$?
-  set -e
-  if test "$cleanup_status" -eq 2; then return 2; fi
   colima stop --profile "$profile" >/dev/null 2>&1 || true
   colima delete --profile "$profile" --force --data
-  return "$cleanup_status"
 }
 
 command=${1:-}
@@ -418,8 +483,7 @@ case "$command" in
     ensure_base_image
     assert_not_busy
     start_profile
-    assert_not_busy
-    stop_local_runner 2>/dev/null || true
+    quiesce_runner
     source_sha=$(sync_validation_source)
     model_seed=$(sync_model_seed)
     provision_guest "$source_sha" "$model_seed"
@@ -437,6 +501,7 @@ case "$command" in
     require_provisioning_eligibility
     ensure_base_image
     start_profile
+    quiesce_runner
     write_host_attestation
     guest_verify
     start_runner
@@ -444,7 +509,16 @@ case "$command" in
     ;;
   stop)
     require_lifecycle_tools
-    if profile_exists; then owner_json >/dev/null; colima stop --profile "$profile"; fi
+    if profile_exists; then
+      owner_json >/dev/null
+      if profile_running; then
+        quiesce_runner
+        colima stop --profile "$profile"
+      else
+        assert_not_busy
+        wait_offline
+      fi
+    fi
     ;;
   unregister)
     require_lifecycle_tools

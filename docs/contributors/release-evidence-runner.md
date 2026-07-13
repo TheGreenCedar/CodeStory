@@ -80,7 +80,9 @@ GitHub registration token only when the runner is unconfigured, checks the
 exact runner binary version and `.runner` repository/name identity, and leaves
 the systemd service disabled across VM boots. The host `start` command verifies
 and attests the current host and VM before starting the service. Starting the
-Colima profile directly therefore leaves the runner offline.
+Colima profile directly therefore leaves the runner offline. Provision, verify,
+start, and stop all quiesce the exact runner first and confirm that GitHub sees
+it offline and idle before changing validation or proof state.
 
 The GitHub registration and removal tokens are short-lived and passed directly
 to the guest. They are never written to the repository or provisioning
@@ -106,11 +108,14 @@ and create a new approved baseline. Do not compare results across the identity
 change as though they came from the same machine profile.
 
 `stop`, `unregister`, and `destroy` deliberately do not require the pinned host
-OS, Colima version, a clean checkout, or a working GitHub login. They validate a
-durable ownership marker and exact local runner identity first. Without GitHub
-authentication, unregister stops the service and reports the still-offline
-remote record; destroy can still remove the proof-owned VM. A busy runner is
-never reprovisioned or unregistered.
+OS, Colima version, or a clean checkout. They validate the durable ownership
+marker and exact local and remote runner identity first. `stop` requires GitHub
+access so it cannot stop a runner whose busy state is unknown. If GitHub access
+is unavailable during unregister, the script leaves the runner, credentials,
+ownership marker, and proof-owned VM unchanged. `destroy` removes the VM only
+after GitHub confirms that the runner was deleted or already absent. API
+failures never count as absence, and a busy runner is never reprovisioned,
+stopped, unregistered, or destroyed.
 
 To unregister while preserving the VM and proof artifacts:
 

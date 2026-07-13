@@ -15,7 +15,9 @@
   ownership-scoped, and release evidence rejects stale identity attestations,
   host-home visibility, or any unexpected host-backed mount. Checksum-verified
   model bytes can stream over SSH from the normal CodeStory cache when the
-  pinned upstream download is unavailable.
+  pinned upstream download is unavailable. Lifecycle mutations now require the
+  exact runner to be offline and idle, treat GitHub API failures as failures,
+  and retain credentials and VM state until remote deletion is confirmed.
 - Reduced the packaged macOS proof to one check per release boundary. The
   protected run still covers managed Metal cold/warm/recovery, exact process
   reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned
