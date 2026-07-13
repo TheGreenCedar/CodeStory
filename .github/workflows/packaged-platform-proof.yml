@@ -167,13 +167,18 @@ jobs:
             -s \
             -k "$keychain_password" \
             "$keychain"
+          security list-keychains -d user -s "$keychain"
           security find-identity -v -p codesigning "$keychain" | tee "$proof_dir/signing-identities.txt"
+          signing_hash="$(awk -v identity="$APPLE_SIGNING_IDENTITY" \
+            'index($0, "\"" identity "\"") { print $2; exit }' \
+            "$proof_dir/signing-identities.txt")"
+          grep -Eq '^[0-9A-Fa-f]{40}$' <<<"$signing_hash"
           codesign \
             --force \
             --options runtime \
             --timestamp \
             --keychain "$keychain" \
-            --sign "$APPLE_SIGNING_IDENTITY" \
+            --sign "$signing_hash" \
             "$bin"
           codesign --verify --strict --verbose=2 "$bin"
           codesign -dv --verbose=4 "$bin" 2> "$proof_dir/codesign-details.txt"

@@ -336,6 +336,8 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "APPLE_NOTARY_KEY_P8_BASE64",
     "umask 077",
     "chmod 600 \"$work_dir/developer-id.p12\" \"$work_dir/notary-key.p8\"",
+    "security list-keychains -d user -s \"$keychain\"",
+    "--sign \"$signing_hash\"",
     "--options runtime",
     "--timestamp",
     "xcrun notarytool submit",
