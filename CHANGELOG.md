@@ -8,10 +8,13 @@
   generation artifact scopes to project identity schema 3. Legacy schema-2
   state is discovered for inventory but never reused or destructively cleaned;
   mismatched state fails closed. Runtime state also binds the non-secret
-  endpoint origin and a full-endpoint SHA-256 fingerprint, external endpoints
-  cannot supply managed GPU proof, and identity drift aborts publication and
-  query instead of mixing artifact scopes. Native executable ownership now uses
-  filesystem identity instead of case-folded path text.
+  endpoint origin and an install-keyed full-endpoint HMAC-SHA256 fingerprint,
+  external endpoints cannot supply managed GPU proof, and identity drift aborts
+  publication and query instead of mixing artifact scopes. Managed native state
+  also binds its launch endpoint and port arguments before reuse or cleanup, and
+  failed bootstrap cleanup removes its exact schema-3 state before preserving
+  owned schema-2 inventory. Native executable ownership now uses filesystem
+  identity instead of case-folded path text.
 - Made incremental freshness compare verified parser source hashes when file
   mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
   stale graph data current, while legacy and non-parser rows retain the

@@ -6548,8 +6548,7 @@ mod tests {
             compose_project: "codestory-agent-test".to_string(),
             embed_url: "http://127.0.0.1:18080".to_string(),
             embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
-            embedding_endpoint_fingerprint_sha256:
-                codestory_retrieval::embedding_endpoint_fingerprint_sha256("http://127.0.0.1:18080"),
+            embedding_endpoint_fingerprint_sha256: "hmac-sha256:fixture".to_string(),
             started_at_epoch_ms: 1,
             embedding_launch: None,
         });

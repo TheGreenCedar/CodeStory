@@ -222,6 +222,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let ownership = runtime.ownership();
+    let embedding_endpoint_fingerprint = runtime.embedding_endpoint_fingerprint()?;
     let state = SidecarStateFile {
         project_identity: runtime.project_identity.clone(),
         owner: "codestory".into(),
@@ -234,9 +235,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_
         embed_http_port: ownership.ports.embed_http,
         embed_url: ownership.ports.embed_url,
         embedding_endpoint_origin: Some(ownership.embedding_endpoint_origin),
-        embedding_endpoint_fingerprint_sha256: Some(
-            ownership.embedding_endpoint_fingerprint_sha256,
-        ),
+        embedding_endpoint_fingerprint_sha256: Some(embedding_endpoint_fingerprint),
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
         embedding_device_observation_source: embedding_device.observation_source.into(),
@@ -353,6 +352,7 @@ pub fn validate_sidecar_state_matches_runtime(
     runtime: &SidecarRuntimeConfig,
 ) -> Result<()> {
     let ownership = runtime.ownership();
+    let embedding_endpoint_fingerprint = runtime.embedding_endpoint_fingerprint()?;
     let ports = &ownership.ports;
     let exact = state.owner == "codestory"
         && state.namespace == runtime.namespace
@@ -365,7 +365,8 @@ pub fn validate_sidecar_state_matches_runtime(
         && state.embed_url == ports.embed_url
         && state.embedding_endpoint_origin == Some(ownership.embedding_endpoint_origin)
         && state.embedding_endpoint_fingerprint_sha256.as_deref()
-            == Some(ownership.embedding_endpoint_fingerprint_sha256.as_str())
+            == Some(embedding_endpoint_fingerprint.as_str())
+        && managed_native_launch_matches_selected_runtime(state, runtime)
         && crate::config::project_identity_matches_runtime(
             state.project_identity.as_ref(),
             runtime.project_identity.as_ref(),
@@ -376,6 +377,44 @@ pub fn validate_sidecar_state_matches_runtime(
         );
     }
     Ok(())
+}
+
+fn managed_native_launch_matches_selected_runtime(
+    state: &SidecarStateFile,
+    runtime: &SidecarRuntimeConfig,
+) -> bool {
+    let Some(launch) = state.embedding_launch.as_ref() else {
+        return true;
+    };
+    if launch.launch_mode != crate::config::EmbeddingServerLaunchMode::NativeSpawned.as_str() {
+        return true;
+    }
+    runtime.embedding.endpoint_origin == crate::config::EmbeddingEndpointOrigin::ManagedSidecar
+        && launch.endpoint == state.embed_url
+        && launch.endpoint == runtime.embedding.endpoint
+        && crate::config::local_embedding_endpoint_port(&launch.endpoint)
+            == Some(state.embed_http_port)
+        && native_launch_port(&launch.launch_args) == Some(state.embed_http_port)
+}
+
+fn native_launch_port(launch_args: &[String]) -> Option<u16> {
+    let mut positions = launch_args
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.as_str() == "--port");
+    let (index, _) = positions.next()?;
+    if positions.next().is_some()
+        || launch_args
+            .iter()
+            .any(|argument| argument.starts_with("--port="))
+    {
+        return None;
+    }
+    launch_args
+        .get(index + 1)?
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
 }
 
 fn reusable_embedding_launch_from_state(
@@ -415,12 +454,6 @@ fn sidecar_down_for_runtime_inner(
     preserve_preexisting_compose: bool,
 ) -> Result<()> {
     let layout = &runtime.layout;
-    if let Some(legacy_state_file) = crate::config::legacy_agent_state_file_for_runtime(runtime) {
-        anyhow::bail!(
-            "legacy project-identity-v2 sidecar state was discovered and preserved at {}; inspect it with `codestory-cli sidecar inventory --project <repo> --format json` before provenance-aware cleanup",
-            legacy_state_file.display()
-        );
-    }
     if layout.state_file.exists() {
         let contents = std::fs::read_to_string(&layout.state_file)
             .with_context(|| format!("read sidecar state {}", layout.state_file.display()))?;
@@ -439,6 +472,17 @@ fn sidecar_down_for_runtime_inner(
         }
         stop_native_embedding_process_for_state(&state)?;
         std::fs::remove_file(&layout.state_file).context("remove retrieval-sidecars.json")?;
+    }
+    if let Some(legacy_state_file) = crate::config::legacy_agent_state_file_for_runtime(runtime) {
+        let message = format!(
+            "legacy project-identity-v2 sidecar state was discovered and preserved at {}; inspect it with `codestory-cli sidecar inventory --project <repo> --format json` before provenance-aware cleanup",
+            legacy_state_file.display()
+        );
+        if preserve_preexisting_compose {
+            tracing::warn!(legacy_state_file = %legacy_state_file.display(), "{message}");
+        } else {
+            anyhow::bail!(message);
+        }
     }
     Ok(())
 }
@@ -1599,7 +1643,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
-        SidecarRuntimeConfig {
+        let mut runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
@@ -1617,7 +1661,10 @@ mod tests {
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: BTreeMap::new(),
             ..SidecarRuntimeConfig::local()
-        }
+        };
+        runtime.embedding.endpoint = SidecarLayout::embed_base_url(runtime.embed_http_port);
+        runtime.embedding.endpoint_origin = crate::config::EmbeddingEndpointOrigin::ManagedSidecar;
+        runtime
     }
 
     fn live_embedding_runtime(
@@ -1755,8 +1802,9 @@ mod tests {
             state.embedding_endpoint_origin,
             Some(crate::config::EmbeddingEndpointOrigin::ManagedSidecar)
         );
-        let expected_endpoint_fingerprint =
-            crate::config::embedding_endpoint_fingerprint_sha256(&runtime.embedding.endpoint);
+        let expected_endpoint_fingerprint = runtime
+            .embedding_endpoint_fingerprint()
+            .expect("keyed endpoint fingerprint");
         assert_eq!(
             state.embedding_endpoint_fingerprint_sha256.as_deref(),
             Some(expected_endpoint_fingerprint.as_str())
@@ -1765,6 +1813,26 @@ mod tests {
         foreign_endpoint_state.embedding_endpoint_fingerprint_sha256 = Some("foreign".to_string());
         assert!(!sidecar_state_matches_runtime(
             &foreign_endpoint_state,
+            &runtime
+        ));
+        let mut foreign_launch_endpoint = state.clone();
+        foreign_launch_endpoint
+            .embedding_launch
+            .as_mut()
+            .expect("native launch")
+            .endpoint = "http://127.0.0.1:18081/v1/embeddings".to_string();
+        assert!(!sidecar_state_matches_runtime(
+            &foreign_launch_endpoint,
+            &runtime
+        ));
+        let mut foreign_launch_port = state.clone();
+        foreign_launch_port
+            .embedding_launch
+            .as_mut()
+            .expect("native launch")
+            .launch_args = vec!["--port".to_string(), "18081".to_string()];
+        assert!(!sidecar_state_matches_runtime(
+            &foreign_launch_port,
             &runtime
         ));
         assert_eq!(state.embedding_launch, Some(launch.clone()));
@@ -1895,6 +1963,29 @@ mod tests {
         )
         .expect("publish failed-attempt state");
         assert!(!state.compose_started_by_bootstrap);
+        let legacy_state_file = crate::config::legacy_agent_state_path_for_runtime(&runtime)
+            .expect("calculated legacy state path");
+        let legacy_namespace = legacy_state_file
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("legacy namespace");
+        let legacy_identity = codestory_workspace::project_identity_v2(root.path());
+        std::fs::create_dir_all(legacy_state_file.parent().expect("legacy state parent"))
+            .expect("legacy state directory");
+        std::fs::write(
+            &legacy_state_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "project_identity": legacy_identity,
+                "owner": "codestory",
+                "profile": "agent",
+                "namespace": legacy_namespace,
+                "compose_project": legacy_namespace,
+                "run_id": runtime.run_id,
+            }))
+            .expect("legacy state json"),
+        )
+        .expect("legacy state");
         let empty_path = root.path().join("empty-path");
         std::fs::create_dir(&empty_path).expect("empty PATH");
         let _path = EnvGuard::set("PATH", &empty_path.display().to_string());
@@ -1905,6 +1996,10 @@ mod tests {
         assert!(
             !runtime.layout.state_file.exists(),
             "failed attempt state must be removed after preserving pre-existing Compose"
+        );
+        assert!(
+            legacy_state_file.exists(),
+            "legacy state must remain preserved"
         );
     }
 

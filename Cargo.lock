@@ -535,6 +535,7 @@ dependencies = [
  "codestory-workspace",
  "directories",
  "fs4",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

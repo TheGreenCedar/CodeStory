@@ -462,9 +462,10 @@ Agent namespaces and generation roots use these schema-3 ids. Legacy schema-2
 state is discoverable through inventory but is never reused or destructively
 cleaned by a schema-3 runtime. Missing, mismatched, and foreign identity fails
 closed and rebuilds; use the inventory report for provenance-aware cleanup.
-Persisted state also binds the endpoint origin and full-endpoint SHA-256
-fingerprint, so redacted endpoints with different credentials cannot share
-ownership or managed GPU proof.
+Persisted state also binds the endpoint origin and an install-keyed full-endpoint
+HMAC-SHA256 fingerprint, so redacted endpoints with different credentials cannot
+share ownership or managed GPU proof without exposing an offline credential
+guessing oracle. The HMAC key remains private in the trusted cache.
 Sidecar artifacts are content-addressed by:
 
 ```text

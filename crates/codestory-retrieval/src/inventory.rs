@@ -1155,11 +1155,7 @@ mod tests {
             embed_http_port: 21004,
             embed_url: "http://127.0.0.1:21004/v1/embeddings".to_string(),
             embedding_endpoint_origin: Some(crate::config::EmbeddingEndpointOrigin::ManagedSidecar),
-            embedding_endpoint_fingerprint_sha256: Some(
-                crate::config::embedding_endpoint_fingerprint_sha256(
-                    "http://127.0.0.1:21004/v1/embeddings",
-                ),
-            ),
+            embedding_endpoint_fingerprint_sha256: Some("hmac-sha256:fixture".to_string()),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
             embedding_device_observation_source: "sidecar_unobserved".to_string(),

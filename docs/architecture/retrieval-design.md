@@ -64,9 +64,10 @@ Runtime rules:
   indexing, query embedding, readiness/status, runtime search, and summary
   generation consume that retained value. Managed sidecar endpoints are
   derived from the selected profile/run ports; external endpoints retain their
-  trusted origin. Persisted state records that origin plus a SHA-256 fingerprint
-  of the full endpoint while exposing only the redacted endpoint. Request
-  handlers never activate endpoints by mutating process environment variables.
+  trusted origin. Persisted state records that origin plus an install-keyed
+  HMAC-SHA256 fingerprint of the full endpoint while exposing only the redacted
+  endpoint. The key remains private in the trusted cache. Request handlers never
+  activate endpoints by mutating process environment variables.
 
 ## Generation And Reuse
 
