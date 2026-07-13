@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 
 use codestory_contracts::events::{Event, EventBus};
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -744,6 +745,7 @@ struct PreparedIndexInput {
     compilation_info: Option<compilation_database::CompilationInfo>,
     language_config: LanguageConfig,
     artifact_cache_key: Option<String>,
+    content_hash: String,
 }
 
 enum PreparedIndexWork {
@@ -1568,6 +1570,7 @@ impl WorkspaceIndexer {
             .projections()
             .flush_projection_batch(codestory_store::ProjectionBatch {
                 files: &batched_storage.files,
+                file_content_hashes: &batched_storage.file_content_hashes,
                 nodes: &batched_storage.nodes,
                 edges: &batched_storage.edges,
                 occurrences: &batched_storage.occurrences,
@@ -1740,6 +1743,7 @@ impl WorkspaceIndexer {
                 return Err(local_storage);
             }
         };
+        let content_hash = source_content_hash(&bytes);
         // Decode before building the cache key so source-aware header detection can choose
         // the same parser that will be used for indexing.
         let source = match String::from_utf8(bytes) {
@@ -1774,6 +1778,7 @@ impl WorkspaceIndexer {
                 compilation_info,
                 language_config,
                 artifact_cache_key,
+                content_hash,
             }));
         };
         let Some(cache_key) = artifact_cache_key.as_ref() else {
@@ -1785,6 +1790,7 @@ impl WorkspaceIndexer {
                 compilation_info,
                 language_config,
                 artifact_cache_key,
+                content_hash,
             }));
         };
 
@@ -1798,13 +1804,17 @@ impl WorkspaceIndexer {
                         language_config.language_name,
                         flags,
                     );
-                    if let Some(file_info) = artifact.files.first_mut() {
-                        file_info.modification_time = file_modification_time(&full_path);
-                    }
+                    verify_cached_artifact_source(
+                        &mut artifact,
+                        &full_path,
+                        language_config.language_name,
+                        &content_hash,
+                    )?;
                     stats.artifact_cache_hits += 1;
                     if existing_projection_id.is_some() {
                         if let Some(file_info) = artifact.files.first()
-                            && let Err(error) = storage.update_file_metadata(file_info)
+                            && let Err(error) =
+                                storage.update_file_metadata(file_info, Some(&content_hash))
                         {
                             let mut local_storage = IntermediateStorage::default();
                             let file_id = NodeId(file_info.id);
@@ -1842,9 +1852,16 @@ impl WorkspaceIndexer {
                         return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
                     }
                     Self::seed_symbol_table_from_nodes(symbol_table, &artifact.nodes);
-                    Ok(PreparedIndexWork::Immediate(
-                        artifact.into_intermediate_storage(),
-                    ))
+                    let mut local_storage = artifact.into_intermediate_storage();
+                    if let Some(file_info) = local_storage.files.first() {
+                        local_storage
+                            .file_content_hashes
+                            .push(codestory_store::FileContentHash {
+                                file_id: file_info.id,
+                                content_hash,
+                            });
+                    }
+                    Ok(PreparedIndexWork::Immediate(local_storage))
                 }
                 Err(_) => {
                     stats.artifact_cache_invalid_entries += 1;
@@ -1856,6 +1873,7 @@ impl WorkspaceIndexer {
                         compilation_info,
                         language_config,
                         artifact_cache_key,
+                        content_hash,
                     }))
                 }
             },
@@ -1868,6 +1886,7 @@ impl WorkspaceIndexer {
                     compilation_info,
                     language_config,
                     artifact_cache_key,
+                    content_hash,
                 }))
             }
             Err(_) => {
@@ -1879,6 +1898,7 @@ impl WorkspaceIndexer {
                     compilation_info,
                     language_config,
                     artifact_cache_key,
+                    content_hash,
                 }))
             }
         }
@@ -1936,14 +1956,33 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedIndexInput,
         symbol_table: &Arc<SymbolTable>,
     ) -> PreparedIndexJobResult {
-        match index_file(
+        let index_result = index_file(
             &prepared_input.full_path,
             &prepared_input.source,
             &prepared_input.language_config,
             prepared_input.compilation_info.clone(),
             Some(Arc::clone(symbol_table)),
-        ) {
-            Ok(index_result) => {
+        );
+        let modification_time =
+            match verify_source_snapshot(&prepared_input.full_path, &prepared_input.content_hash) {
+                Ok(modification_time) => modification_time,
+                Err(error) => {
+                    return PreparedIndexJobResult {
+                        local_storage: changed_source_storage(
+                            &prepared_input.full_path,
+                            prepared_input.language_config.language_name,
+                            error,
+                        ),
+                        cache_write: None,
+                    };
+                }
+            };
+
+        match index_result {
+            Ok(mut index_result) => {
+                if let Some(file_info) = index_result.files.first_mut() {
+                    file_info.modification_time = modification_time;
+                }
                 let artifact = CachedIndexArtifact::from_index_result(index_result);
                 let cache_write = prepared_input
                     .artifact_cache_path
@@ -1958,14 +1997,22 @@ impl WorkspaceIndexer {
                                 artifact_blob,
                             })
                     });
-                let local_storage = artifact.into_intermediate_storage();
+                let mut local_storage = artifact.into_intermediate_storage();
+                if let Some(file_info) = local_storage.files.first() {
+                    local_storage
+                        .file_content_hashes
+                        .push(codestory_store::FileContentHash {
+                            file_id: file_info.id,
+                            content_hash: prepared_input.content_hash.clone(),
+                        });
+                }
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write,
                 }
             }
             Err(e) => {
-                let local_storage = incomplete_file_storage(
+                let mut local_storage = incomplete_file_storage(
                     &prepared_input.full_path,
                     Some(&prepared_input.source),
                     prepared_input.language_config.language_name,
@@ -1978,6 +2025,15 @@ impl WorkspaceIndexer {
                         index_step: codestory_contracts::graph::IndexStep::Indexing,
                     },
                 );
+                if let Some(file_info) = local_storage.files.first_mut() {
+                    file_info.modification_time = modification_time;
+                    local_storage
+                        .file_content_hashes
+                        .push(codestory_store::FileContentHash {
+                            file_id: file_info.id,
+                            content_hash: prepared_input.content_hash.clone(),
+                        });
+                }
                 PreparedIndexJobResult {
                     local_storage,
                     cache_write: None,
@@ -1991,6 +2047,74 @@ impl WorkspaceIndexer {
             symbol_table.insert(node.id.0, node.kind);
         }
     }
+}
+
+fn source_content_hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| anyhow!("failed to re-open {}: {error}", path.display()))?;
+    let before = file
+        .metadata()
+        .map_err(|error| anyhow!("failed to inspect {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .map_err(|error| anyhow!("failed to re-read {}: {error}", path.display()))?;
+    let after = file
+        .metadata()
+        .map_err(|error| anyhow!("failed to re-inspect {}: {error}", path.display()))?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        return Err(anyhow!("metadata changed during the verification read"));
+    }
+    let actual_hash = source_content_hash(&bytes);
+    if actual_hash != expected_hash {
+        return Err(anyhow!("content changed after the indexing read"));
+    }
+    Ok(after
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64)
+}
+
+#[allow(clippy::result_large_err)]
+fn verify_cached_artifact_source(
+    artifact: &mut CachedIndexArtifact,
+    path: &Path,
+    language: &str,
+    expected_hash: &str,
+) -> std::result::Result<(), IntermediateStorage> {
+    let modification_time = verify_source_snapshot(path, expected_hash)
+        .map_err(|error| changed_source_storage(path, language, error))?;
+    if let Some(file_info) = artifact.files.first_mut() {
+        file_info.modification_time = modification_time;
+    }
+    Ok(())
+}
+
+fn changed_source_storage(
+    path: &Path,
+    language: impl Into<String>,
+    error: anyhow::Error,
+) -> IntermediateStorage {
+    incomplete_file_storage(
+        path,
+        None,
+        language,
+        codestory_contracts::graph::ErrorInfo {
+            message: format!(
+                "Source changed while indexing {}; retry required: {error}",
+                path.display()
+            ),
+            file_id: None,
+            line: None,
+            column: None,
+            is_fatal: false,
+            index_step: codestory_contracts::graph::IndexStep::Indexing,
+        },
+    )
 }
 
 fn incremental_resolution_target_node_kinds() -> &'static [NodeKind] {
@@ -19391,6 +19515,17 @@ mod tests {
     use std::collections::HashSet;
     use tempfile::tempdir;
 
+    fn overwrite_preserving_mtime(path: &Path, source: &str) -> Result<()> {
+        let modified = std::fs::metadata(path)?.modified()?;
+        std::fs::write(path, source)?;
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+        assert_eq!(std::fs::metadata(path)?.modified()?, modified);
+        Ok(())
+    }
+
     #[derive(Debug)]
     struct RawGraphContract {
         nodes: HashSet<(String, String)>,
@@ -20068,13 +20203,11 @@ public:
 
         let dir = tempdir()?;
         let f1 = dir.path().join("main.rs");
-        fs::write(
-            &f1,
-            r#"
+        let source = r#"
             struct Foo { x: i32 }
             fn bar() {}
-        "#,
-        )?;
+        "#;
+        fs::write(&f1, source)?;
 
         let mut storage = Storage::new_in_memory().unwrap();
         let bus = EventBus::new();
@@ -20090,6 +20223,14 @@ public:
         };
 
         indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+
+        let file_id = WorkspaceIndexer::canonical_file_node_id_for_path(&f1);
+        assert_eq!(
+            storage.get_file_content_hash(file_id)?.as_deref(),
+            Some(source_content_hash(source.as_bytes()).as_str())
+        );
+        let cached_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+        assert_eq!(cached_stats.artifact_cache_hits, 1);
 
         // Check verification
         let nodes = storage.get_nodes().unwrap();
@@ -20121,6 +20262,72 @@ public:
         assert!(saw_started, "expected IndexingStarted event");
         assert!(saw_complete, "expected IndexingComplete event");
 
+        Ok(())
+    }
+
+    #[test]
+    fn parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("changed.rs");
+        let original = "fn original() {}\n";
+        std::fs::write(&path, original)?;
+        let prepared = PreparedIndexInput {
+            full_path: path.clone(),
+            artifact_cache_path: Some(path.with_extension("artifact")),
+            source: original.to_string(),
+            compilation_info: None,
+            language_config: get_language_for_ext("rs").expect("rust config"),
+            artifact_cache_key: Some("old-source".to_string()),
+            content_hash: source_content_hash(original.as_bytes()),
+        };
+        overwrite_preserving_mtime(&path, "fn replaced() {}\n")?;
+
+        let result = WorkspaceIndexer::new(dir.path().to_path_buf())
+            .execute_prepared_index(&prepared, &Arc::new(SymbolTable::new()));
+
+        assert!(result.cache_write.is_none());
+        assert!(result.local_storage.file_content_hashes.is_empty());
+        assert_eq!(result.local_storage.files.len(), 1);
+        assert!(!result.local_storage.files[0].complete);
+        assert!(result.local_storage.errors.iter().any(|error| {
+            error.message.contains("Source changed while indexing")
+                && error.message.contains("retry required")
+        }));
+        assert!(
+            result
+                .local_storage
+                .nodes
+                .iter()
+                .all(|node| node.serialized_name != "original")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_cache_result_changed_with_restored_mtime_is_rejected() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cached.rs");
+        let original = "fn cached_original() {}\n";
+        std::fs::write(&path, original)?;
+        let config = get_language_for_ext("rs").expect("rust config");
+        let mut artifact = CachedIndexArtifact::from_index_result(index_file(
+            &path, original, &config, None, None,
+        )?);
+        let content_hash = source_content_hash(original.as_bytes());
+        overwrite_preserving_mtime(&path, "fn cached_replaced() {}\n")?;
+
+        let rejected = verify_cached_artifact_source(
+            &mut artifact,
+            &path,
+            config.language_name,
+            &content_hash,
+        )
+        .expect_err("changed cached source must be rejected");
+
+        assert!(rejected.file_content_hashes.is_empty());
+        assert_eq!(rejected.files.len(), 1);
+        assert!(!rejected.files[0].complete);
+        assert!(rejected.errors[0].message.contains("retry required"));
         Ok(())
     }
 
@@ -21937,6 +22144,7 @@ jobs:
             .projections()
             .flush_projection_batch(codestory_store::ProjectionBatch {
                 files: &local.files,
+                file_content_hashes: &local.file_content_hashes,
                 nodes: &local.nodes,
                 edges: &local.edges,
                 occurrences: &local.occurrences,

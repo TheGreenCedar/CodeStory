@@ -174,6 +174,39 @@ fn schema_18_migrates_to_empty_publication_identity_without_synthesis() -> Resul
 }
 
 #[test]
+fn schema_19_adds_nullable_file_content_hash_without_losing_rows() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("file-content-hash-v19-migration");
+    {
+        let conn = rusqlite::Connection::open(&path)?;
+        conn.execute_batch(
+            "CREATE TABLE file (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                language TEXT,
+                modification_time INTEGER,
+                indexed INTEGER DEFAULT 0,
+                complete INTEGER DEFAULT 0,
+                line_count INTEGER DEFAULT 0,
+                file_role TEXT NOT NULL DEFAULT 'source'
+            );
+            INSERT INTO file (
+                id, path, language, modification_time, indexed, complete, line_count, file_role
+            ) VALUES (7, 'src/lib.rs', 'rust', 42, 1, 1, 3, 'source');
+            PRAGMA user_version = 19;",
+        )?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(storage.schema_version()?, 20);
+    assert_eq!(storage.get_files()?.len(), 1);
+    assert_eq!(storage.get_file_content_hash(7)?, None);
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
+    Ok(())
+}
+
+#[test]
 fn incomplete_incremental_begin_failure_keeps_clean_schema_and_no_marker()
 -> Result<(), StorageError> {
     let path = unique_temp_db_path("incomplete-begin-rollback");
@@ -464,6 +497,7 @@ fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), Stor
 
     storage.flush_projection_batch(ProjectionBatch {
         files: &[],
+        file_content_hashes: &[],
         nodes: &[definition],
         edges: &[],
         occurrences: &[],
@@ -577,18 +611,66 @@ fn test_update_file_metadata_preserves_resolution_support_snapshot() -> Result<(
     })?;
     storage.put_resolution_support_snapshot(1, br#"{"hot":true}"#)?;
 
-    storage.update_file_metadata(&FileInfo {
-        id: 11,
-        path: PathBuf::from("src/lib.rs"),
-        language: "rust".to_string(),
-        modification_time: 2,
-        indexed: true,
-        complete: true,
-        line_count: 10,
-        file_role: FileRole::Source,
-    })?;
+    storage.update_file_metadata(
+        &FileInfo {
+            id: 11,
+            path: PathBuf::from("src/lib.rs"),
+            language: "rust".to_string(),
+            modification_time: 2,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+            file_role: FileRole::Source,
+        },
+        None,
+    )?;
 
     assert!(storage.has_ready_resolution_support_snapshot(1)?);
+    Ok(())
+}
+
+#[test]
+fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let files = [FileInfo {
+        id: 17,
+        path: PathBuf::from("src/snapshot.rs"),
+        language: "rust".to_string(),
+        modification_time: 9,
+        indexed: true,
+        complete: true,
+        line_count: 4,
+        file_role: FileRole::Source,
+    }];
+    let hashes = [FileContentHash {
+        file_id: 17,
+        content_hash: "sha256:first".to_string(),
+    }];
+
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &hashes,
+        nodes: &[],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+    assert_eq!(
+        storage.get_file_content_hash(17)?.as_deref(),
+        Some("sha256:first")
+    );
+
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &[],
+        nodes: &[],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+    assert_eq!(storage.get_file_content_hash(17)?, None);
     Ok(())
 }
 
@@ -1768,11 +1850,11 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
 }
 
 #[test]
-fn current_schema_keeps_v19_manifest_column_rollback_compatible() -> Result<(), StorageError> {
-    let db_path = unique_temp_db_path("v19-manifest-rollback-contract");
+fn current_schema_keeps_manifest_column_rollback_compatible() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("current-manifest-rollback-contract");
     let _ = std::fs::remove_file(&db_path);
     let storage = Storage::open(&db_path)?;
-    assert_eq!(storage.schema_version()?, 19);
+    assert_eq!(storage.schema_version()?, 20);
     let columns = storage
         .conn
         .prepare("PRAGMA table_info(retrieval_index_manifest)")?

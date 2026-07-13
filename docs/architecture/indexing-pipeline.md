@@ -129,13 +129,20 @@ The cache key includes:
 - feature-flag values that affect graph shape
 - compilation metadata when present and root-relative enough to be portable
 
-A cache hit can reuse the serialized indexing artifact and turn it back into `IntermediateStorage`. A cache miss sends the file through parse and extract work.
+A cache hit can reuse the serialized indexing artifact and turn it back into
+`IntermediateStorage`. A cache miss sends the file through parse and extract
+work. Before either result is accepted, the indexer re-reads the source and
+compares its SHA-256 hash with the bytes used to build the cache key or parser
+input. A mismatch, including one hidden by a restored timestamp, becomes an
+incomplete file-level retry error; stale graph output and artifact-cache writes
+are discarded.
 
 ### 6. Parse and extract run in parallel
 
 Cache misses become `PreparedIndexInput` values and are parsed in parallel. Each file produces `IntermediateStorage`, which is the in-memory shape of a future store flush:
 
 - file metadata
+- verified parser source hashes
 - nodes
 - edges
 - occurrences
@@ -153,13 +160,18 @@ As file results are merged, `WorkspaceIndexer::run` flushes batches once file, n
 Projection flushes write more than the core graph:
 
 - files
+- nullable verified parser source hashes
 - nodes
 - edges
 - occurrences
 - component access tuples
 - callable projection state
 
-The store flush path invalidates grounding snapshots as part of persistence. Projection flush is both a write boundary and a derived-state invalidation boundary.
+The store flush path writes the verified hash beside the file row and clears it
+when a refreshed row has no verified parser content identity. Modification time
+is captured only after the verification read matches. The same flush invalidates
+grounding snapshots as part of persistence. Projection flush is both a write
+boundary and a derived-state invalidation boundary.
 
 ### 8. Resolution happens after flushes
 
@@ -318,6 +330,9 @@ remain the primary reference when you are learning the pipeline.
 If you change indexing behavior, review or run the suites that guard it:
 
 - `cargo test -p codestory-indexer --test fidelity_regression`
+- `cargo test -p codestory-indexer parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached`
+- `cargo test -p codestory-indexer artifact_cache_result_changed_with_restored_mtime_is_rejected`
+- `cargo test -p codestory-store projection_batch_round_trips_and_clears_file_content_hash`
 - `cargo test -p codestory-indexer --test tictactoe_language_coverage`
 - `cargo test -p codestory-indexer --test integration`
 - targeted resolution suites under `crates/codestory-indexer/tests/`
