@@ -4,9 +4,23 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
+const NUMERIC_IDENTIFIER = /^\d+$/u;
+const STRICT_NUMERIC_IDENTIFIER = /^(?:0|[1-9]\d*)$/u;
+
+function isStrictSemver(version) {
+  if (!VERSION_PATTERN.test(version)) return false;
+  const withoutBuild = version.split("+", 1)[0];
+  const prereleaseStart = withoutBuild.indexOf("-");
+  if (prereleaseStart < 0) return true;
+  return withoutBuild
+    .slice(prereleaseStart + 1)
+    .split(".")
+    .every(identifier =>
+      !NUMERIC_IDENTIFIER.test(identifier) || STRICT_NUMERIC_IDENTIFIER.test(identifier));
+}
 
 export function extractReleaseNotes(changelog, version) {
-  if (!VERSION_PATTERN.test(version)) {
+  if (!isStrictSemver(version)) {
     throw new Error(`release version must be strict semver, got ${JSON.stringify(version)}`);
   }
 
@@ -65,7 +79,7 @@ function main(argv) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     main(process.argv.slice(2));
   } catch (error) {
