@@ -175,6 +175,14 @@ replacement and host reload.
 
 ### Readiness broker fields
 
+Broker schema 3 scopes processes, operations, locks, snapshots, and verified
+GPU runtime evidence with the lossless workspace identity. On case-sensitive
+filesystems, roots that differ only by case remain separate; Windows aliases
+for the same existing path remain one workspace. Schema 1/2 state is consulted
+only when its recorded root and repository provenance map unambiguously to the
+requested workspace. Otherwise CodeStory leaves that state isolated and
+publishes a fresh schema-3 snapshot.
+
 | Field | Healthy value | Action value |
 | --- | --- | --- |
 | `readiness_broker.reconciliation.status` | `clean` or `observed` | `active_repair` means wait and reread status; `stale_state_cleaned` means retry repair once |

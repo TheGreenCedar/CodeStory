@@ -20,6 +20,9 @@ const PROJECT_IDENTITY_OBSERVATION_CACHE_TTL: Duration = Duration::from_secs(1);
 static PROJECT_IDENTITY_OBSERVATION_CACHE: OnceLock<
     Mutex<HashMap<PathBuf, (Instant, ProjectIdentityV2)>>,
 > = OnceLock::new();
+static PROJECT_IDENTITY_V3_OBSERVATION_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, (Instant, ProjectIdentityV3)>>,
+> = OnceLock::new();
 
 /// Git-derived identity used to decide whether portable sidecar cache reuse is
 /// safe for a project root.
@@ -74,6 +77,7 @@ pub struct ProjectIdentityV3 {
     pub workspace_id: String,
     pub artifact_scope_id: String,
     pub canonical_repository_id: Option<String>,
+    #[serde(default)]
     pub legacy_canonical_repository_id: Option<String>,
     pub legacy_raw_root_project_id: Option<String>,
     pub normalized_root_project_id_alias: Option<String>,
@@ -223,6 +227,26 @@ pub fn cached_project_identity_v2(project_root: &Path) -> ProjectIdentityV2 {
         return identity.clone();
     }
     let identity = project_identity_v2(project_root);
+    cache.insert(key, (Instant::now(), identity.clone()));
+    identity
+}
+
+/// Resolve lossless identity for repeated observational status reads.
+///
+/// Mutating paths must use `project_identity_v3` so dirtiness changes are
+/// observed immediately.
+pub fn cached_project_identity_v3(project_root: &Path) -> ProjectIdentityV3 {
+    let key = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let cache = PROJECT_IDENTITY_V3_OBSERVATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached_at, identity)) = cache.get(&key)
+        && cached_at.elapsed() < PROJECT_IDENTITY_OBSERVATION_CACHE_TTL
+    {
+        return identity.clone();
+    }
+    let identity = project_identity_v3(project_root);
     cache.insert(key, (Instant::now(), identity.clone()));
     identity
 }

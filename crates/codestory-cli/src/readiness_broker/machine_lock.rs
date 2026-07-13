@@ -12,10 +12,14 @@ use super::paths::{
     machine_resource_reaper_takeover_lock_path, now_epoch_ms,
 };
 use super::scope::broker_operation_id;
-use super::scope::{BROKER_SCHEMA_VERSION, LEGACY_BROKER_SCHEMA_VERSION, effective_scope_identity};
+use super::scope::{
+    BROKER_SCHEMA_VERSION, BROKER_SCHEMA_VERSION_V2, LEGACY_BROKER_SCHEMA_VERSION,
+    effective_scope_identity,
+};
 use super::types::{BrokerResourceSnapshot, BrokerScope};
 
-pub(crate) const MACHINE_LOCK_SCHEMA_VERSION: u32 = 2;
+pub(crate) const MACHINE_LOCK_SCHEMA_VERSION: u32 = 3;
+pub(crate) const MACHINE_LOCK_SCHEMA_VERSION_V2: u32 = 2;
 pub(crate) const MACHINE_LOCK_STALE_TTL: Duration = Duration::from_secs(20 * 60);
 pub(crate) const MACHINE_REAPER_LOCK_STALE_TTL: Duration = Duration::from_secs(2 * 60);
 pub(crate) const NATIVE_EMBEDDING_RESOURCE: &str = "native_embedding_runtime";
@@ -454,6 +458,7 @@ fn machine_lock_has_valid_identity(lock: &BrokerMachineResourceLockFile) -> bool
     }
     match lock.schema_version {
         MACHINE_LOCK_SCHEMA_VERSION => lock.scope.schema_version == BROKER_SCHEMA_VERSION,
+        MACHINE_LOCK_SCHEMA_VERSION_V2 => lock.scope.schema_version == BROKER_SCHEMA_VERSION_V2,
         LEGACY_BROKER_SCHEMA_VERSION => lock.scope.schema_version == LEGACY_BROKER_SCHEMA_VERSION,
         _ => false,
     }
@@ -468,7 +473,9 @@ pub(crate) fn read_machine_resource_reaper_lock_file(
         .filter(|lock: &BrokerMachineResourceReaperLockFile| {
             matches!(
                 lock.schema_version,
-                LEGACY_BROKER_SCHEMA_VERSION | MACHINE_LOCK_SCHEMA_VERSION
+                LEGACY_BROKER_SCHEMA_VERSION
+                    | MACHINE_LOCK_SCHEMA_VERSION_V2
+                    | MACHINE_LOCK_SCHEMA_VERSION
             )
         })
 }

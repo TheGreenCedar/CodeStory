@@ -470,19 +470,6 @@ fn write_ready_repair_worker_result_locked(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn read_ready_repair_worker_result(
-    project_root: &Path,
-    run_id: Option<&str>,
-) -> Option<ReadyRepairWorkerResult> {
-    let sidecar = sidecar_runtime_for_project_with_run_id(
-        project_root,
-        SidecarProfile::Agent,
-        run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
-    );
-    read_ready_repair_worker_result_for_sidecar(&sidecar)
-}
-
 pub(crate) fn read_ready_repair_worker_result_for_sidecar(
     sidecar: &SidecarRuntimeConfig,
 ) -> Option<ReadyRepairWorkerResult> {
@@ -1005,7 +992,7 @@ fn read_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -1030,7 +1017,7 @@ fn read_abandoned_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -1051,7 +1038,7 @@ fn read_stale_live_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -1315,11 +1302,7 @@ fn clean_path_text(path: &Path) -> String {
         .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn same_path_text(left: &Path, right: &Path) -> bool {
-    clean_path_text(left) == clean_path_text(right)
+        .to_string()
 }
 
 fn path_fingerprint(path: &Path) -> String {
@@ -1622,6 +1605,7 @@ mod tests {
 
     #[test]
     fn ready_repair_worker_result_round_trips() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
         let sidecar = sidecar_runtime_for_project_with_run_id(
             project.path(),
@@ -1660,7 +1644,7 @@ mod tests {
             "terminal result should invalidate cached MCP status"
         );
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(result)
         );
         let _ = fs::remove_dir_all(
@@ -1674,6 +1658,7 @@ mod tests {
 
     #[test]
     fn concurrent_terminal_write_and_abandoned_cleanup_preserve_terminal_result() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
         let sidecar = sidecar_runtime_for_project_with_run_id(
             project.path(),
@@ -1746,7 +1731,7 @@ mod tests {
         cleaner.join().expect("abandoned cleaner");
 
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(terminal),
             "terminal success must win regardless of cleanup ordering"
         );
@@ -2221,6 +2206,7 @@ mod tests {
 
     #[test]
     fn cleanup_abandoned_ready_repair_status_removes_dead_pid_status_and_stale_locks() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
         let sidecar = sidecar_runtime_for_project_with_run_id(
             project.path(),
@@ -2277,7 +2263,7 @@ mod tests {
         )
         .expect("write stale project lock");
 
-        let cleanups = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+        let cleanups = cleanup_abandoned_ready_repair_status_for_sidecar(project.path(), &sidecar);
 
         assert_eq!(cleanups.len(), 1);
         assert!(cleanups[0].removed_status_path);
@@ -2295,7 +2281,7 @@ mod tests {
             active_ready_repair_status(project.path(), Some("shared-agent")).is_none(),
             "abandoned cleanup must leave no active repair"
         );
-        let result = read_ready_repair_worker_result(project.path(), Some("shared-agent"))
+        let result = read_ready_repair_worker_result_for_sidecar(&sidecar)
             .expect("abandoned cleanup terminal result");
         assert_eq!(result.attempt_id, "abandoned-test");
         assert_eq!(result.outcome, "abandoned");
@@ -2327,13 +2313,22 @@ mod tests {
         )
         .expect("recreate abandoned status");
 
-        let repeated = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+        let repeated = cleanup_abandoned_ready_repair_status_for_sidecar(project.path(), &sidecar);
 
         assert_eq!(repeated.len(), 1);
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some("shared-agent")),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(terminal),
             "cleanup must preserve an existing matching terminal result"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_ready_repair_root_preserves_unix_case() {
+        let parent = tempfile::tempdir().expect("parent");
+        let project = parent.path().join("CaseSensitiveProject");
+        fs::create_dir_all(&project).expect("project");
+        assert!(clean_path_text(&project).ends_with("CaseSensitiveProject"));
     }
 }

@@ -385,7 +385,7 @@ fn renew_local_refresh_status_with_hook(
     if status.schema_version != LOCAL_REFRESH_STATUS_SCHEMA_VERSION
         || status.status != "refreshing"
         || status.phase != phase
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
         || status.pid != owner.pid
         || status.process_start_identity != owner.process_start_identity
         || status.owner_token.as_deref() != Some(owner.token.as_str())
@@ -402,7 +402,7 @@ fn renew_local_refresh_status_with_hook(
 fn local_refresh_lock_matches(path: &Path, project_root: &Path, owner: &LocalRefreshOwner) -> bool {
     read_local_refresh_lock_file(path).is_some_and(|lock| {
         lock.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
-            && same_path_text(Path::new(&lock.project_root), project_root)
+            && codestory_workspace::same_workspace_path(Path::new(&lock.project_root), project_root)
             && lock.token == owner.token
             && lock.pid == owner.pid
             && lock.process_start_identity == owner.process_start_identity
@@ -429,11 +429,14 @@ pub(crate) fn cleanup_stale_local_refresh_state(
     let status = read_local_refresh_status_file(&status_path).filter(|status| {
         status.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
             && status.status == "refreshing"
-            && same_path_text(Path::new(&status.project_root), project_root)
+            && codestory_workspace::same_workspace_path(
+                Path::new(&status.project_root),
+                project_root,
+            )
     });
     let lock = read_local_refresh_lock_file(&lock_path).filter(|lock| {
         lock.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
-            && same_path_text(Path::new(&lock.project_root), project_root)
+            && codestory_workspace::same_workspace_path(Path::new(&lock.project_root), project_root)
     });
     let status_owner_state = status.as_ref().map(|status| {
         crate::ready_repair_status::process_owner_state(
@@ -587,7 +590,7 @@ fn read_local_refresh_status(
     let status = read_local_refresh_status_file(path)?;
     if status.schema_version != LOCAL_REFRESH_STATUS_SCHEMA_VERSION
         || status.status != "refreshing"
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -617,7 +620,7 @@ fn local_refresh_status_matches_lock(
     project_root: &Path,
 ) -> bool {
     lock.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
-        && same_path_text(Path::new(&lock.project_root), project_root)
+        && codestory_workspace::same_workspace_path(Path::new(&lock.project_root), project_root)
         && status.owner_token.as_deref() == Some(lock.token.as_str())
         && status.pid == lock.pid
         && status.process_start_identity == lock.process_start_identity
@@ -641,11 +644,7 @@ fn clean_path_text(path: &Path) -> String {
         .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn same_path_text(left: &Path, right: &Path) -> bool {
-    clean_path_text(left) == clean_path_text(right)
+        .to_string()
 }
 
 fn path_fingerprint(path: &Path) -> String {
@@ -1341,5 +1340,14 @@ mod tests {
         assert_eq!(cleanup.reason, "stale_status_and_lock");
         assert!(cleanup.removed_status_path);
         assert!(cleanup.removed_lock_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_local_refresh_root_preserves_unix_case() {
+        let parent = tempfile::tempdir().expect("parent");
+        let project = parent.path().join("CaseSensitiveProject");
+        fs::create_dir_all(&project).expect("project");
+        assert!(clean_path_text(&project).ends_with("CaseSensitiveProject"));
     }
 }

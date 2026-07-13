@@ -9500,6 +9500,7 @@ mod tests {
 
     #[test]
     fn ready_repair_waits_for_native_log_before_liveness_failure() {
+        let _env_lock = crate::config::config_env_test_lock();
         let _env = EnvVarSnapshot::clear(&[
             "CODESTORY_EMBED_SERVER_LAUNCH",
             "CODESTORY_EMBED_ALLOW_CPU",

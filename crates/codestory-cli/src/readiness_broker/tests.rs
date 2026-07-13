@@ -8,6 +8,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, SystemTime};
 use tempfile::tempdir;
@@ -20,6 +21,33 @@ fn cleanup_machine_resource(resource: &str) {
     let _ = fs::remove_file(machine_resource_lock_path(resource));
     let _ = fs::remove_file(machine_resource_reaper_lock_path(resource));
     let _ = fs::remove_file(machine_resource_reaper_takeover_lock_path(resource));
+}
+
+fn run_git(project: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(project)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_git_project(project: &Path, remote: &str) {
+    run_git(project, &["init", "--quiet"]);
+    run_git(
+        project,
+        &["config", "user.email", "codestory@example.invalid"],
+    );
+    run_git(project, &["config", "user.name", "CodeStory Test"]);
+    run_git(
+        project,
+        &["commit", "--allow-empty", "--quiet", "-m", "initial"],
+    );
+    run_git(project, &["remote", "add", "origin", remote]);
 }
 
 fn test_scope(project: &Path, run_id: &str) -> BrokerScope {
@@ -112,13 +140,13 @@ fn set_file_age(path: &Path, age: Duration) {
 }
 
 fn sample_snapshot(project: &Path) -> ReadinessBrokerSnapshot {
-    let canonical_root = clean_path_text(project);
-    let canonical_root_hash = hash_text(&canonical_root);
+    let identity = codestory_workspace::project_identity_v3(project);
+    let canonical_root_hash = identity.workspace_id.clone();
     ReadinessBrokerSnapshot {
         schema_version: BROKER_SCHEMA_VERSION,
-        identity: Some(codestory_workspace::project_identity_v2(project)),
+        identity: Some(identity.clone()),
         install_id: "test-install".to_string(),
-        project_id: codestory_workspace::project_identity_v2(project).project_id,
+        project_id: identity.project_id,
         canonical_root_hash,
         workspace_root: clean_path(project),
         cli_version: "9.9.9".to_string(),
@@ -207,7 +235,7 @@ fn verified_gpu_proof_input(embed_smoke_ok: Option<bool>) -> BrokerGpuProofInput
 
 fn gpu_runtime_identity(project: &Path, started_at_epoch_ms: i64) -> BrokerGpuRuntimeIdentity {
     BrokerGpuRuntimeIdentity {
-        workspace_id: codestory_workspace::workspace_id_for_root(project),
+        workspace_id: codestory_workspace::workspace_id_v3_for_root(project),
         profile: "agent".to_string(),
         run_id: Some("shared-agent".to_string()),
         namespace: "codestory-test".to_string(),
@@ -346,9 +374,57 @@ fn broker_scope_carries_project_and_run_identity() {
     assert_eq!(scope.project_id, identity.project_id);
     assert_eq!(
         identity.workspace_id,
-        codestory_workspace::workspace_id_for_root(project.path())
+        codestory_workspace::workspace_id_v3_for_root(project.path())
     );
     assert_eq!(scope.cli_version, "9.9.9");
+}
+
+#[test]
+fn broker_persistence_preserves_non_default_repository_ports() {
+    let first = tempdir().expect("first project");
+    let second = tempdir().expect("second project");
+    init_git_project(
+        first.path(),
+        "ssh://git@example.com:2222/Org/CaseSensitive.git",
+    );
+    init_git_project(
+        second.path(),
+        "ssh://git@example.com:2200/Org/CaseSensitive.git",
+    );
+
+    let first = test_scope(first.path(), "shared-agent");
+    let second = test_scope(second.path(), "shared-agent");
+    assert_ne!(first.project_id, second.project_id);
+    assert_ne!(
+        first.identity.unwrap().canonical_repository_id,
+        second.identity.unwrap().canonical_repository_id
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn broker_scope_keeps_case_distinct_unix_roots_separate() {
+    let parent = tempdir().expect("parent");
+    let upper = parent.path().join("Project");
+    let lower = parent.path().join("project");
+    fs::create_dir_all(&upper).expect("upper project");
+    fs::create_dir_all(&lower).expect("lower project");
+
+    let upper = test_scope(&upper, "shared-agent");
+    let lower = test_scope(&lower, "shared-agent");
+    assert_ne!(upper.canonical_root_hash, lower.canonical_root_hash);
+    assert_ne!(broker_operation_id(&upper), broker_operation_id(&lower));
+}
+
+#[cfg(windows)]
+#[test]
+fn broker_scope_treats_windows_case_alias_as_one_workspace() {
+    let project = tempdir().expect("project");
+    let alias = PathBuf::from(project.path().to_string_lossy().to_ascii_uppercase());
+    let original = test_scope(project.path(), "shared-agent");
+    let alias = test_scope(&alias, "shared-agent");
+    assert_eq!(original.canonical_root_hash, alias.canonical_root_hash);
+    assert_eq!(broker_operation_id(&original), broker_operation_id(&alias));
 }
 
 #[test]
@@ -691,7 +767,7 @@ fn machine_resource_lock_reclaims_dead_owner() {
     cleanup_machine_resource(&resource);
     let old_scope = test_scope(project.path(), "dead");
     let new_scope = test_scope(project.path(), "new");
-    write_machine_lock(&resource, &old_scope, u32::MAX);
+    write_machine_lock(&resource, &old_scope, exited_process_id());
 
     let acquired =
         try_acquire_machine_resource_lock(&resource, &new_scope).expect("reclaim dead owner");
@@ -984,6 +1060,36 @@ fn snapshot_file_round_trips_json() {
 }
 
 #[test]
+fn v2_snapshot_identity_maps_only_to_its_proven_workspace() {
+    let project = tempdir().expect("project");
+    let other = tempdir().expect("other project");
+    let legacy_identity = codestory_workspace::project_identity_v2(project.path());
+    let legacy_hash = hash_text(&clean_path_text(project.path()));
+    let mut value = serde_json::to_value(sample_snapshot(project.path())).expect("snapshot json");
+    value["schema_version"] = BROKER_SCHEMA_VERSION_V2.into();
+    value["identity"] = serde_json::to_value(&legacy_identity).expect("legacy identity json");
+    value["project_id"] = legacy_identity.project_id.clone().into();
+    value["canonical_root_hash"] = legacy_hash.into();
+
+    let parsed: ReadinessBrokerSnapshot =
+        serde_json::from_value(value.clone()).expect("parse v2 snapshot");
+    let effective = parsed.effective_identity().expect("map v2 identity");
+    assert_eq!(
+        effective.workspace_id,
+        codestory_workspace::workspace_id_v3_for_root(project.path())
+    );
+    assert_eq!(
+        effective.project_identity_schema_version,
+        codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION
+    );
+
+    value["workspace_root"] = clean_path(other.path()).into();
+    let mismatched: ReadinessBrokerSnapshot =
+        serde_json::from_value(value).expect("parse mismatched v2 snapshot");
+    assert!(mismatched.effective_identity().is_none());
+}
+
+#[test]
 fn snapshot_file_uses_unique_temp_names_for_same_process_writers() {
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("snapshot.json");
@@ -1033,7 +1139,7 @@ fn write_ready_repair_status_file(
     let status = serde_json::json!({
         "schema_version": 1,
         "status": "repairing",
-        "project_root": clean_path_text(project),
+        "project_root": producer_path_text(project),
         "profile": "agent",
         "run_id": run_id,
         "namespace": sidecar.namespace,
@@ -1051,18 +1157,45 @@ fn write_ready_repair_status_file(
     path
 }
 
+fn producer_path_text(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn exited_process_id() -> u32 {
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "exit", "0"])
+        .spawn()
+        .expect("spawn short-lived process");
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived process");
+    let pid = child.id();
+    child.wait().expect("wait for short-lived process");
+    pid
+}
+
 fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
     let status_path = cache_root.join("local-refresh-status.json");
     let lock_path = cache_root.join("local-refresh.lock");
     let old_started = now_epoch_ms() - 180_000;
+    let dead_pid = exited_process_id();
     fs::write(
         &status_path,
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
             "status": "refreshing",
-            "project_root": clean_path_text(project),
+            "project_root": producer_path_text(project),
             "phase": "incremental_index",
-            "pid": u32::MAX,
+            "pid": dead_pid,
             "started_at_epoch_ms": old_started,
             "updated_at_epoch_ms": old_started,
             "last_failure_reason": null
@@ -1074,8 +1207,8 @@ fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
         &lock_path,
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
-            "project_root": clean_path_text(project),
-            "pid": u32::MAX,
+            "project_root": producer_path_text(project),
+            "pid": dead_pid,
             "started_at_epoch_ms": old_started,
             "token": "stale"
         }))
@@ -1118,7 +1251,7 @@ fn reconcile_before_enqueue_cleans_abandoned_repair_for_dead_pid() {
     let status_path = write_ready_repair_status_file(
         project.path(),
         run_id,
-        u32::MAX,
+        exited_process_id(),
         now_epoch_ms(),
         "graph artifact",
     );
@@ -1170,13 +1303,13 @@ fn reconcile_before_enqueue_for_sidecar_keeps_abandoned_cleanup_in_retained_root
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": 1,
             "status": "repairing",
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "profile": "agent",
             "run_id": run_id,
             "namespace": retained_sidecar.namespace,
             "compose_project": retained_sidecar.compose_project,
             "phase": "graph artifact",
-            "pid": u32::MAX,
+            "pid": exited_process_id(),
             "started_at_epoch_ms": now_epoch_ms(),
             "updated_at_epoch_ms": now_epoch_ms()
         }))
@@ -1292,7 +1425,7 @@ fn reconcile_before_enqueue_reports_live_stale_local_refresh_without_cleanup() {
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
             "status": "refreshing",
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "phase": "incremental_index",
             "pid": std::process::id(),
             "started_at_epoch_ms": old,
@@ -1306,7 +1439,7 @@ fn reconcile_before_enqueue_reports_live_stale_local_refresh_without_cleanup() {
         cache.path().join("local-refresh.lock"),
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "pid": std::process::id(),
             "started_at_epoch_ms": old,
             "token": "live-stale"
@@ -1343,7 +1476,7 @@ fn reconcile_before_enqueue_preserves_renewed_live_local_refresh_owner() {
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
             "status": "refreshing",
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "phase": "incremental_index",
             "pid": std::process::id(),
             "owner_token": "renewed-live",
@@ -1358,7 +1491,7 @@ fn reconcile_before_enqueue_preserves_renewed_live_local_refresh_owner() {
         cache.path().join("local-refresh.lock"),
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "pid": std::process::id(),
             "started_at_epoch_ms": old,
             "token": "renewed-live"
@@ -1492,7 +1625,7 @@ fn refresh_broker_snapshot_final_success_omits_running_ops_after_repair_cleared(
 fn observe_broker_snapshot_is_stable_and_does_not_publish() {
     let project = tempdir().expect("project");
     let cache = tempdir().expect("cache");
-    let canonical_root_hash = hash_text(&clean_path_text(project.path()));
+    let canonical_root_hash = codestory_workspace::workspace_id_v3_for_root(project.path());
     let snapshot_path = broker_snapshot_path(&canonical_root_hash);
     let _ = fs::remove_file(&snapshot_path);
 
@@ -1514,6 +1647,31 @@ fn observe_broker_snapshot_is_stable_and_does_not_publish() {
     assert_eq!(first.updated_at_epoch_ms, 0);
     assert_eq!(first.persistence_status, "observed");
     assert!(!snapshot_path.exists());
+}
+
+#[test]
+fn broker_snapshot_a_b_a_keeps_workspace_state_isolated() {
+    let project_a = tempdir().expect("project a");
+    let project_b = tempdir().expect("project b");
+    let cache = tempdir().expect("cache");
+    let input = |project: &Path| BrokerSnapshotInput {
+        project_root: project.to_path_buf(),
+        cache_root: cache.path().to_path_buf(),
+        agent_run_id: Some("shared-agent".to_string()),
+        cli_version: "9.9.9".to_string(),
+        gpu_proof: None,
+        reconciliation: None,
+    };
+
+    let first_a = refresh_broker_snapshot(input(project_a.path()));
+    let snapshot_b = refresh_broker_snapshot(input(project_b.path()));
+    let second_a = observe_broker_snapshot(input(project_a.path()));
+
+    assert_ne!(first_a.canonical_root_hash, snapshot_b.canonical_root_hash);
+    assert_ne!(first_a.snapshot_path, snapshot_b.snapshot_path);
+    assert_eq!(second_a.persistence_status, "persisted");
+    assert_eq!(second_a.canonical_root_hash, first_a.canonical_root_hash);
+    assert_eq!(second_a.updated_at_epoch_ms, first_a.updated_at_epoch_ms);
 }
 
 #[test]
@@ -1647,19 +1805,23 @@ fn observe_broker_snapshot_invalidates_verified_smoke_for_changed_runtime_identi
 }
 
 #[test]
-fn legacy_snapshot_observation_is_read_only_and_refresh_migrates_to_v2() {
+fn legacy_snapshot_observation_is_read_only_and_refresh_migrates_to_v3() {
     let project = tempdir().expect("project");
     let cache = tempdir().expect("cache");
     let canonical_root_hash = hash_text(&clean_path_text(project.path()));
-    let snapshot_path = broker_snapshot_path(&canonical_root_hash);
-    fs::create_dir_all(snapshot_path.parent().expect("snapshot parent"))
+    let legacy_snapshot_path = broker_snapshot_path(&canonical_root_hash);
+    let snapshot_path = broker_snapshot_path(&codestory_workspace::workspace_id_v3_for_root(
+        project.path(),
+    ));
+    fs::create_dir_all(legacy_snapshot_path.parent().expect("snapshot parent"))
         .expect("create snapshot parent");
     let mut legacy = sample_snapshot(project.path());
     legacy.schema_version = LEGACY_BROKER_SCHEMA_VERSION;
     legacy.identity = None;
     legacy.project_id = format!("codestory-{}", &canonical_root_hash[..16]);
+    legacy.canonical_root_hash = canonical_root_hash;
     let legacy_json = serde_json::to_vec_pretty(&legacy).expect("serialize legacy snapshot");
-    fs::write(&snapshot_path, &legacy_json).expect("write legacy snapshot");
+    fs::write(&legacy_snapshot_path, &legacy_json).expect("write legacy snapshot");
     let input = || BrokerSnapshotInput {
         project_root: project.path().to_path_buf(),
         cache_root: cache.path().to_path_buf(),
@@ -1673,7 +1835,7 @@ fn legacy_snapshot_observation_is_read_only_and_refresh_migrates_to_v2() {
     assert_eq!(observed.schema_version, BROKER_SCHEMA_VERSION);
     assert_eq!(observed.persistence_status, "observed");
     assert_eq!(
-        fs::read(&snapshot_path).expect("legacy snapshot remains"),
+        fs::read(&legacy_snapshot_path).expect("legacy snapshot remains"),
         legacy_json,
         "observational reads must not migrate persisted state"
     );
@@ -1686,9 +1848,14 @@ fn legacy_snapshot_observation_is_read_only_and_refresh_migrates_to_v2() {
     assert_eq!(migrated["schema_version"], BROKER_SCHEMA_VERSION);
     assert_eq!(
         migrated["identity"]["workspace_id"],
-        codestory_workspace::workspace_id_for_root(project.path())
+        codestory_workspace::workspace_id_v3_for_root(project.path())
+    );
+    assert_eq!(
+        fs::read(&legacy_snapshot_path).expect("legacy snapshot remains isolated"),
+        legacy_json
     );
     let _ = fs::remove_file(snapshot_path);
+    let _ = fs::remove_file(legacy_snapshot_path);
 }
 
 #[test]
@@ -1699,10 +1866,8 @@ fn legacy_machine_lock_derives_identity_without_rewriting() {
     let mut scope = test_scope(project.path(), "shared-agent");
     scope.schema_version = LEGACY_BROKER_SCHEMA_VERSION;
     scope.identity = None;
-    scope.project_id = format!(
-        "codestory-{}",
-        &hash_text(&clean_path_text(project.path()))[..16]
-    );
+    scope.canonical_root_hash = hash_text(&clean_path_text(project.path()));
+    scope.project_id = format!("codestory-{}", &scope.canonical_root_hash[..16]);
     let lock = BrokerMachineResourceLockFile {
         schema_version: LEGACY_BROKER_SCHEMA_VERSION,
         resource: resource.clone(),
@@ -1722,7 +1887,50 @@ fn legacy_machine_lock_derives_identity_without_rewriting() {
     let identity = effective_scope_identity(&parsed.scope).expect("derive legacy identity");
     assert_eq!(
         identity.workspace_id,
-        codestory_workspace::workspace_id_for_root(project.path())
+        codestory_workspace::workspace_id_v3_for_root(project.path())
+    );
+    assert_eq!(fs::read(&path).expect("lock remains"), legacy_json);
+    cleanup_machine_resource(&resource);
+}
+
+#[test]
+fn v2_machine_lock_maps_to_v3_without_rewriting() {
+    let project = tempdir().expect("project");
+    let resource = unique_resource("v2-identity");
+    cleanup_machine_resource(&resource);
+    let legacy_identity = codestory_workspace::project_identity_v2(project.path());
+    let mut scope = test_scope(project.path(), "shared-agent");
+    scope.schema_version = BROKER_SCHEMA_VERSION_V2;
+    scope.identity = Some(
+        serde_json::from_value(serde_json::to_value(&legacy_identity).expect("v2 identity json"))
+            .expect("v2 identity compatibility"),
+    );
+    scope.project_id = legacy_identity.project_id;
+    scope.canonical_root_hash = hash_text(&clean_path_text(project.path()));
+    let lock = BrokerMachineResourceLockFile {
+        schema_version: MACHINE_LOCK_SCHEMA_VERSION_V2,
+        resource: resource.clone(),
+        operation_id: broker_operation_id(&scope),
+        scope,
+        pid: std::process::id(),
+        started_at_epoch_ms: now_epoch_ms(),
+        token: "v2-token".to_string(),
+        native_embedding_launch: None,
+    };
+    let path = machine_resource_lock_path(&resource);
+    fs::create_dir_all(path.parent().expect("lock parent")).expect("create lock parent");
+    let legacy_json = serde_json::to_vec_pretty(&lock).expect("serialize v2 lock");
+    fs::write(&path, &legacy_json).expect("write v2 lock");
+
+    let parsed = read_machine_resource_lock_file(&path).expect("read v2 machine lock");
+    let identity = effective_scope_identity(&parsed.scope).expect("map v2 identity");
+    assert_eq!(
+        identity.workspace_id,
+        codestory_workspace::workspace_id_v3_for_root(project.path())
+    );
+    assert_eq!(
+        identity.project_identity_schema_version,
+        codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION
     );
     assert_eq!(fs::read(&path).expect("lock remains"), legacy_json);
     cleanup_machine_resource(&resource);

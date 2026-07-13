@@ -888,6 +888,7 @@ mod tests {
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
         let _device = EnvGuard::remove("CODESTORY_EMBED_DEVICE_STATE");
+        let _host_detection = EnvGuard::set("CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT", "1");
         let sidecar = SidecarRuntimeConfig::local();
 
         let error = ensure_retrieval_index_embedding_policy(&sidecar)
