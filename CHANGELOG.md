@@ -25,6 +25,9 @@
 
 ### Fixed
 
+- Recognized current llama.cpp's logger-prefixed Metal device inventory so
+  native offload proof remains bound to the selected provider and current
+  launch even when `ggml_metal_init` reports later in startup.
 - Included the aggregate release checksum manifest in reusable package
   artifacts so protected hardware and installation proofs can provision the
   exact packaged CLI without falling back to a network release lookup.

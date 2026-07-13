@@ -1097,8 +1097,10 @@ fn observe_metal_runtime(text: &str) -> MetalRuntimeObservation {
 
 fn metal_runtime_event(line: &str) -> Option<bool> {
     let line = line.trim_start();
+    let prefixed_mtl_device = line.contains("- mtl0") && line.contains(": apple");
     let metal_line = line.starts_with("mtl0")
         || line.starts_with("mtl :")
+        || prefixed_mtl_device
         || line.contains("ggml_metal_init")
         || line.contains("metal backend");
     if !metal_line {
@@ -1130,7 +1132,8 @@ fn metal_runtime_event(line: &str) -> Option<bool> {
     ]
     .iter()
     .any(|marker| line.contains(marker));
-    (line.starts_with("mtl0") || line.starts_with("mtl :") || affirmative).then_some(true)
+    (line.starts_with("mtl0") || line.starts_with("mtl :") || prefixed_mtl_device || affirmative)
+        .then_some(true)
 }
 
 fn selected_backend_log_markers() -> Vec<String> {
@@ -2252,6 +2255,17 @@ mod tests {
             "ggml_metal_init: found device Metal0: Apple M5\noffloaded 13/13 layers to GPU\n";
         assert!(runtime_log_proves_requested_accelerator(
             metal_log, &request
+        ));
+        assert!(runtime_log_proves_requested_accelerator(
+            "0.06 I common_param:   - MTL0 : Apple M5\n\
+             load_tensors: offloaded 13/13 layers to GPU\n\
+             ggml_metal_init: found device: Apple M5\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\noffloaded 13/13 layers to GPU\n\
+             0.06 I common_param:   - MTL0 : Apple M5\n",
+            &request,
         ));
         assert_eq!(
             observed_embedding_provider_from_text(metal_log),
