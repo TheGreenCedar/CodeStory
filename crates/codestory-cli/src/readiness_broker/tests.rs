@@ -767,7 +767,7 @@ fn machine_resource_lock_reclaims_dead_owner() {
     cleanup_machine_resource(&resource);
     let old_scope = test_scope(project.path(), "dead");
     let new_scope = test_scope(project.path(), "new");
-    write_machine_lock(&resource, &old_scope, u32::MAX);
+    write_machine_lock(&resource, &old_scope, exited_process_id());
 
     let acquired =
         try_acquire_machine_resource_lock(&resource, &new_scope).expect("reclaim dead owner");
@@ -1167,10 +1167,27 @@ fn producer_path_text(path: &Path) -> String {
         .to_string()
 }
 
+fn exited_process_id() -> u32 {
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "exit", "0"])
+        .spawn()
+        .expect("spawn short-lived process");
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived process");
+    let pid = child.id();
+    child.wait().expect("wait for short-lived process");
+    pid
+}
+
 fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
     let status_path = cache_root.join("local-refresh-status.json");
     let lock_path = cache_root.join("local-refresh.lock");
     let old_started = now_epoch_ms() - 180_000;
+    let dead_pid = exited_process_id();
     fs::write(
         &status_path,
         serde_json::to_string(&serde_json::json!({
@@ -1178,7 +1195,7 @@ fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
             "status": "refreshing",
             "project_root": producer_path_text(project),
             "phase": "incremental_index",
-            "pid": u32::MAX,
+            "pid": dead_pid,
             "started_at_epoch_ms": old_started,
             "updated_at_epoch_ms": old_started,
             "last_failure_reason": null
@@ -1191,7 +1208,7 @@ fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
             "project_root": producer_path_text(project),
-            "pid": u32::MAX,
+            "pid": dead_pid,
             "started_at_epoch_ms": old_started,
             "token": "stale"
         }))
@@ -1234,7 +1251,7 @@ fn reconcile_before_enqueue_cleans_abandoned_repair_for_dead_pid() {
     let status_path = write_ready_repair_status_file(
         project.path(),
         run_id,
-        u32::MAX,
+        exited_process_id(),
         now_epoch_ms(),
         "graph artifact",
     );
@@ -1292,7 +1309,7 @@ fn reconcile_before_enqueue_for_sidecar_keeps_abandoned_cleanup_in_retained_root
             "namespace": retained_sidecar.namespace,
             "compose_project": retained_sidecar.compose_project,
             "phase": "graph artifact",
-            "pid": u32::MAX,
+            "pid": exited_process_id(),
             "started_at_epoch_ms": now_epoch_ms(),
             "updated_at_epoch_ms": now_epoch_ms()
         }))
