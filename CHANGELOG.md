@@ -348,6 +348,10 @@
   handoff, and installer ownership proof. Release notes and contributor
   guidance now preserve Apple Silicon, Windows arm64 acceleration,
   older-glibc, marketplace, and full-sidecar proof boundaries.
+- Declared glibc 2.31 as the minimum supported Linux x64 userspace and added a
+  pinned Debian Bullseye build plus Ubuntu 20.04 packaged-archive execution
+  gate for version, help, and stdio initialization with retained loader and
+  symbol diagnostics.
 - Kept strict sidecar readiness fail-closed on interrupted index-run markers
   without globally rejecting completed generations that contain parser-partial
   files or repeatedly refreshing unchanged parser-partial inputs; parser

@@ -134,7 +134,7 @@ granting release permissions to pull-request code:
 
 | Asset | Native runner | Required packaged proof |
 | --- | --- | --- |
-| Linux x64 | `ubuntu-latest` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, and the full-sidecar agent proof |
+| Linux x64 | `ubuntu-latest`, plus `ubuntu:20.04` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, the full-sidecar agent proof, and packaged-archive execution on glibc 2.31 |
 | Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
@@ -151,8 +151,14 @@ The terminal repair may be a fail-closed result on hosted hardware; this does
 not prove full sidecars or GPU execution. macOS x64
 package execution does not make Apple Silicon acceleration claims. macOS arm64
 package execution does not close #887; live managed Metal endpoint survival
-still needs reporter or equivalent Apple Silicon hardware evidence. Current
-Ubuntu execution does not prove older-glibc compatibility.
+still needs reporter or equivalent Apple Silicon hardware evidence. The
+minimum supported GNU/Linux userspace is glibc 2.31, proven by executing
+the Linux x64 build in a digest-pinned Rust 1.95.0 Debian Bullseye container,
+then executing the packaged archive in a digest-pinned `ubuntu:20.04`
+container. The baseline probe records the container's glibc version and captures stdout,
+stderr, and exit status for version, help, and stdio initialize, so loader or
+symbol-version failures fail the job without losing diagnostics. This does not
+claim musl support or extend the glibc baseline claim to Linux arm64.
 
 Proof cleanup validates the exact current `lexical_data_dir`. During the v0.15
 migration window it accepts the removed `zoekt_data_dir` spelling only as
