@@ -506,11 +506,15 @@ if (!fs.existsSync(packagedPlatformPr)) {
     "uses: ./.github/workflows/repo-scale-stats.yml",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
     "scope: ${{ needs.route.outputs.scope }}",
-    "sign_macos: true",
+    "sign_macos: false",
     "uses: ./.github/workflows/macos-metal-proof.yml",
     "use_packaged_artifact: true",
     "dev/codestory-next moved from proved head",
   ], snippet => `packaged-platform-pr.yml must include ${snippet}`);
+  const packagedProofJob = yamlJob(content, "packaged-proof").join("\n");
+  if (packagedProofJob.includes("secrets: inherit")) {
+    violations.push("packaged-platform-pr.yml must not expose release signing secrets to PR or integration proof");
+  }
   if ((content.match(/branches\/dev\/codestory-next/gu) ?? []).length < 2) {
     violations.push("packaged-platform-pr.yml must verify the dev head before and after integration proof");
   }

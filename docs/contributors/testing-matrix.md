@@ -223,6 +223,15 @@ then run the packaged warm/recovery workflow and attach the post-reboot
 status/packet/search bundle. Do not describe the automated hardware job alone as
 host-restart evidence.
 
+PR and integration proofs deliberately package unsigned Mac candidates and do
+not enter the `macos-release-signing` environment. The protected Metal job uses
+that exact unsigned package for functional lifecycle proof. Only the
+main-triggered release workflow requests Developer ID credentials; it signs and
+notarizes each Mac binary once before publication, and the resulting artifact is
+the one published and checked again after download. Apple service availability
+therefore cannot block review, while a signing or notarization failure still
+blocks the release before any Mac asset is published.
+
 After publication, both Mac tarballs receive a download quarantine before
 extraction. Because command-line tar does not propagate that xattr, the proof
 records the archive quarantine and transfers the same event to the extracted

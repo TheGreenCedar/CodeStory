@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Moved Developer ID signing and Apple notarization out of pull-request and
+  integration proof. Those lanes now test the exact unsigned Mac packages,
+  including Metal lifecycle behavior; the main-triggered release signs and
+  notarizes once before publication and still fails closed on any Apple error.
 - Rewrote the repository agent guide around the current request-scoped MCP
   workflow, crate ownership, identity/publication invariants, isolated test
   contract, maturity-routed verification, and claim-specific release proof.
