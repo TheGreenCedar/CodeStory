@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 /// The inventory is the storage half of incremental refresh planning. Callers
 /// should pass records from this facade to `codestory-workspace` without
 /// rewriting paths or mtimes; freshness comparisons depend on the stored file
-/// ids and millisecond timestamps staying intact.
+/// ids, millisecond timestamps, and verified parser content hashes staying
+/// intact.
 pub struct FileStore<'a> {
     storage: &'a Store,
 }
@@ -38,6 +39,7 @@ impl<'a> FileStore<'a> {
 
     /// Return the compact inventory contract consumed by refresh planning.
     pub fn inventory(&self) -> Result<Vec<StoredFileRecord>, StorageError> {
+        let content_hashes = self.storage.get_file_content_hashes()?;
         let retry_required_file_ids = self
             .storage
             .get_errors(None)?
@@ -52,6 +54,7 @@ impl<'a> FileStore<'a> {
                     id: file.id,
                     path: file.path,
                     modification_time: file.modification_time,
+                    content_hash: content_hashes.get(&file.id).cloned(),
                     indexed: file.indexed,
                     complete: file.complete,
                     retry_required: !file.complete && retry_required_file_ids.contains(&file.id),
@@ -71,18 +74,22 @@ mod tests {
     fn inventory_retries_file_errors_but_not_parser_partial_coverage() {
         let storage = Store::new_in_memory().expect("storage");
         for id in [1, 2] {
-            storage
-                .insert_file(&FileInfo {
-                    id,
-                    path: PathBuf::from(format!("src/{id}.rs")),
-                    language: "rust".into(),
-                    modification_time: 1,
-                    indexed: true,
-                    complete: false,
-                    line_count: 1,
-                    file_role: FileRole::Source,
-                })
-                .expect("file");
+            let file = FileInfo {
+                id,
+                path: PathBuf::from(format!("src/{id}.rs")),
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: false,
+                line_count: 1,
+                file_role: FileRole::Source,
+            };
+            storage.insert_file(&file).expect("file");
+            if id == 1 {
+                storage
+                    .update_file_metadata(&file, Some("sha256-fixture"))
+                    .expect("file hash");
+            }
         }
         storage
             .insert_error(&ErrorInfo {
@@ -109,6 +116,13 @@ mod tests {
                 .find(|file| file.id == 2)
                 .unwrap()
                 .retry_required
+        );
+        assert_eq!(
+            inventory
+                .iter()
+                .find(|file| file.id == 1)
+                .and_then(|file| file.content_hash.as_deref()),
+            Some("sha256-fixture")
         );
     }
 }

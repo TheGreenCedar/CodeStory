@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Made incremental freshness compare verified parser source hashes when file
+  mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
+  stale graph data current, while legacy and non-parser rows retain the
+  existing metadata fallback.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and
