@@ -162,6 +162,12 @@ state and bounded Qdrant logs before cleanup so the primary failure remains
 diagnosable; cleanup failure is retained as secondary evidence and must not
 replace the primary gate failure.
 
+Each native managed-plugin handoff also starts with a verified prior managed
+CLI whose executable can answer only its version probe. The requested packaged
+version must become the MCP server and active retention entry; the prior version
+must remain only as the verified rollback. This is deterministic upgrade
+convergence proof, not Apple Silicon endpoint-survival or older-glibc evidence.
+
 Release closeout is not complete until every published asset cell passes and
 the corresponding CodeStory plugin-source update is committed or merged in
 `TheGreenCedar/AgentPluginMarketplace`, followed by marketplace refresh and

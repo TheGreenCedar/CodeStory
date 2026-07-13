@@ -949,12 +949,54 @@ def plugin_stdio_handoff(
     expected_version: str,
     archive_cli: Path,
     empty_model_dir: Path,
+    archive: Path,
 ) -> dict:
     require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
     require(launcher.is_file(), "managed_plugin_convergence", artifact, f"plugin launcher is missing: {launcher}")
     with temporary_directory_with_retry("codestory-plugin-data-", artifact.parent) as data:
         plugin_data = Path(data)
+        prior_version = "0.0.0"
+        archive_suffix = archive.name.removeprefix(f"codestory-cli-v{expected_version}-")
+        extension = ".zip" if archive_suffix.endswith(".zip") else ".tar.gz"
+        target = archive_suffix.removesuffix(extension)
+        require(
+            target and target != archive_suffix,
+            "managed_plugin_convergence",
+            artifact,
+            f"could not derive release target from {archive.name}",
+        )
+        prior_dir = plugin_data / "codestory-cli" / prior_version
+        prior_bin = prior_dir / "bin" / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli")
+        prior_bin.parent.mkdir(parents=True)
+        if os.name == "nt":
+            prior_bin.write_text(
+                f"@echo off\r\nif \"%1\"==\"--version\" (echo codestory-cli {prior_version}& exit /b 0)\r\nexit /b 90\r\n",
+                encoding="utf-8",
+            )
+        else:
+            prior_bin.write_text(
+                f"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codestory-cli {prior_version}'; exit 0; fi\nexit 90\n",
+                encoding="utf-8",
+            )
+            prior_bin.chmod(prior_bin.stat().st_mode | stat.S_IXUSR)
+        prior_archive = f"codestory-cli-v{prior_version}-{target}{extension}"
+        write_json(
+            prior_dir / "manifest.json",
+            {
+                "path": prior_bin.relative_to(prior_dir).as_posix(),
+                "sha256": sha256_file(prior_bin),
+                "version": prior_version,
+                "build_source": "github_release",
+                "repo_ref": f"v{prior_version}",
+                "archive": prior_archive,
+                "archive_url": (release_dir / prior_archive).resolve().as_uri(),
+                "archive_sha256": "0" * 64,
+                "target": target,
+                "provisioned_at": "1970-01-01T00:00:00.000Z",
+                "stdio_initialize_verified": True,
+            },
+        )
         policy_path = plugin_data / "sidecar-setup-policy.json"
         policy_artifact = artifact.with_name("managed-plugin-policy.json")
         try:
@@ -1064,6 +1106,25 @@ def plugin_stdio_handoff(
             cleanup_status_workers=True,
         )
         require_managed_plugin_convergence(status, artifact, expected_version, archive_cli)
+        retention = status.get("plugin_runtime", {}).get("managed_cli_retention", {})
+        retained = retention.get("retained", []) if isinstance(retention, dict) else []
+        require(
+            retention.get("active_version") == expected_version
+            and any(item.get("version") == prior_version and item.get("reason") == "rollback" for item in retained),
+            "managed_plugin_convergence",
+            artifact,
+            "managed upgrade did not retain the verified prior version as rollback",
+        )
+        write_json(
+            artifact.with_name("managed-plugin-upgrade.json"),
+            {
+                "prior_version": prior_version,
+                "requested_version": expected_version,
+                "server_version": status.get("server_version"),
+                "server_executable": status.get("server_executable"),
+                "retention": retention,
+            },
+        )
         return status
 
 
@@ -1565,20 +1626,37 @@ def require_managed_plugin_convergence(
             f"{request_id} did not return sidecar setup status",
         )
         setup_snapshots.append(setup)
-    attempt_ids = {
-        attempt_id
+    attempt_records = [
+        record
         for setup in setup_snapshots
-        for attempt_id in (
-            (setup.get("active_repair") or {}).get("attempt_id"),
-            (setup.get("last_worker_result") or {}).get("attempt_id"),
-        )
-        if isinstance(attempt_id, str) and attempt_id
-    }
+        for record in (setup.get("active_repair"), setup.get("last_worker_result"))
+        if isinstance(record, dict)
+        and isinstance(record.get("attempt_id"), str)
+        and record.get("attempt_id")
+    ]
+    attempt_ids = {record["attempt_id"] for record in attempt_records}
     require(
         len(attempt_ids) == 1,
         "managed_plugin_convergence",
         artifact,
         f"ground activation did not retain exactly one repair attempt: {sorted(attempt_ids)}",
+    )
+    expected_project = status_before.get("project_root")
+    namespaces = {record.get("namespace") for record in attempt_records}
+    require(
+        isinstance(expected_project, str)
+        and expected_project
+        and len(namespaces) == 1
+        and all(isinstance(namespace, str) and namespace for namespace in namespaces)
+        and all(
+            record.get("project_root") == expected_project
+            and record.get("profile") == "agent"
+            and record.get("run_id") == "shared-agent"
+            for record in attempt_records
+        ),
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation repair records did not preserve one durable project/profile/run/namespace identity",
     )
     terminal = next(
         (
@@ -1769,8 +1847,12 @@ def run_gate(args: argparse.Namespace) -> None:
                 args.expected_version,
                 cli,
                 empty_model_dir,
+                archive,
             )
             summary["artifacts"]["managed_plugin_convergence"] = str(plugin_artifact)
+            summary["artifacts"]["managed_plugin_upgrade"] = str(
+                plugin_artifact.with_name("managed-plugin-upgrade.json")
+            )
             write_json(out_dir / "summary.json", summary)
             return
 
@@ -2166,7 +2248,10 @@ def write_fake_cli(path: Path) -> None:
                                 "active_repair": None,
                                 "last_worker_result": ({
                                     "attempt_id": repair_attempt,
+                                    "project_root": request.get("params", {}).get("arguments", {}).get("project"),
+                                    "profile": "agent",
                                     "run_id": "shared-agent",
+                                    "namespace": "fake-agent-namespace",
                                     "outcome": "failed",
                                     "exit_code": 1,
                                 } if repair_attempt else None),
@@ -2239,13 +2324,23 @@ def write_fake_cli(path: Path) -> None:
                                 "cli_version": "9.9.9",
                                 "plugin_root": os.getcwd(),
                                 "managed_binary_path": server_executable,
+                                "managed_cli_retention": {
+                                    "active_version": "9.9.9",
+                                    "retained": [
+                                        {"version": "9.9.9", "reason": "active"},
+                                        {"version": "0.0.0", "reason": "rollback"},
+                                    ],
+                                },
                             },
                             "sidecar_setup": {
                                 "state": "enabled",
                                 "active_repair": None,
                                 "last_worker_result": ({
                                     "attempt_id": repair_attempt,
+                                    "project_root": request.get("params", {}).get("project", os.getcwd()),
+                                    "profile": "agent",
                                     "run_id": "shared-agent",
+                                    "namespace": "fake-agent-namespace",
                                     "outcome": "failed",
                                     "exit_code": 1,
                                 } if repair_attempt else None),
@@ -2975,13 +3070,28 @@ def self_test() -> None:
             managed_summary = read_json_file(Path(managed_args.out_dir) / "summary.json")
             assert "managed_local_ground" in managed_summary["artifacts"]
             assert "managed_plugin_convergence" in managed_summary["artifacts"]
+            assert "managed_plugin_upgrade" in managed_summary["artifacts"]
+            upgrade = read_json_file(Path(managed_args.out_dir) / "managed-plugin-upgrade.json")
+            assert upgrade["prior_version"] == "0.0.0"
+            assert upgrade["requested_version"] == "9.9.9"
+            assert upgrade["server_version"] == "9.9.9"
             observational_artifact = Path(managed_args.out_dir) / "managed-convergence-status-observational.json"
             assert read_json_file(observational_artifact)["status"]["index_freshness"]["status"] == "stale"
             managed_artifact = Path(managed_args.out_dir) / "managed-plugin-convergence.json"
             assert transcript_response(managed_artifact, "ground_activation")["result"]["structuredContent"]["stats"]
             setup = structured_content_from_response(transcript_response(managed_artifact, "setup_poll_1"))
+            assert setup["active_repair"] is None
             assert setup["last_worker_result"]["attempt_id"] == "fake-activation-attempt"
             assert setup["last_worker_result"]["outcome"] == "failed"
+            assert {
+                key: setup["last_worker_result"][key]
+                for key in ("project_root", "profile", "run_id", "namespace")
+            } == {
+                "project_root": managed_summary["managed_convergence_project"],
+                "profile": "agent",
+                "run_id": "shared-agent",
+                "namespace": "fake-agent-namespace",
+            }
             managed_status_after = status_from_resource_response(
                 transcript_response(managed_artifact, "status_after_convergence")
             )
@@ -3016,6 +3126,7 @@ def self_test() -> None:
                     "9.9.9",
                     stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli"),
                     root / "policy-timeout-empty-model",
+                    archive,
                 )
             except GateFailure as exc:
                 assert exc.layer == "managed_plugin_convergence"
