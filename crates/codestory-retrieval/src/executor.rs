@@ -449,14 +449,7 @@ impl<'a> QueryExecutor<'a> {
             )
             .unwrap_or(u64::MAX)
             .max(1);
-            let later_stage_reserve_ms = stages[index + 1..]
-                .iter()
-                .map(|stage| stage.budget_ms)
-                .sum::<u64>();
-            stage.budget_ms = stage
-                .budget_ms
-                .max(remaining_budget_ms.saturating_sub(later_stage_reserve_ms))
-                .min(remaining_budget_ms);
+            stage.budget_ms = effective_stage_budget_ms(stages, index, remaining_budget_ms);
 
             let stage_started = Instant::now();
             let before_score = candidate_mass(candidates);
@@ -755,6 +748,21 @@ fn is_broad_query(shape: crate::query_features::QueryShape) -> bool {
         crate::query_features::QueryShape::NaturalLanguage
             | crate::query_features::QueryShape::Mixed
     )
+}
+
+fn effective_stage_budget_ms(
+    stages: &[PlannedStage],
+    index: usize,
+    remaining_budget_ms: u64,
+) -> u64 {
+    let later_stage_reserve_ms = stages[index + 1..]
+        .iter()
+        .map(|stage| stage.budget_ms)
+        .sum::<u64>();
+    stages[index]
+        .budget_ms
+        .max(remaining_budget_ms.saturating_sub(later_stage_reserve_ms))
+        .min(remaining_budget_ms)
 }
 
 fn scale_stage_budgets(stages: &mut [PlannedStage], total_budget_ms: u64) {
@@ -1491,6 +1499,47 @@ mod tests {
                 .all(|hit| hit.file_path != "src/slow_graph.rs"),
             "timed-out graph hits must not merge late into this query: {:?}",
             result.hits
+        );
+    }
+
+    #[test]
+    fn observed_cold_stages_fit_primary_request_window() {
+        const PRIMARY_QUERY_BUDGET_MS: u64 = 1_500;
+
+        fn assert_observed_stages_fit(query: &str, observed: &[(RetrievalStageKind, u64)]) {
+            let features = classify_query(query);
+            let plan = crate::planner::plan_query(&features, RetrievalDegradedMode::Full);
+            let mut remaining_ms = PRIMARY_QUERY_BUDGET_MS;
+
+            for &(kind, observed_ms) in observed {
+                let index = plan
+                    .stages
+                    .iter()
+                    .position(|stage| stage.kind == kind)
+                    .expect("observed stage is planned");
+                let admitted_ms = effective_stage_budget_ms(&plan.stages, index, remaining_ms);
+                assert!(
+                    observed_ms <= admitted_ms,
+                    "{kind:?} needs {observed_ms}ms but receives {admitted_ms}ms in {plan:?}"
+                );
+                remaining_ms = remaining_ms.saturating_sub(observed_ms);
+            }
+        }
+
+        assert_observed_stages_fit(
+            "How does indexing feed packet retrieval?",
+            &[
+                (RetrievalStageKind::Stage1Lexical, 574),
+                (RetrievalStageKind::Stage2ScipExpand, 433),
+            ],
+        );
+        assert_observed_stages_fit(
+            "WorkspaceIndexer",
+            &[
+                (RetrievalStageKind::Stage0ScipAnchor, 632),
+                (RetrievalStageKind::Stage1Lexical, 84),
+                (RetrievalStageKind::Stage2ScipExpand, 202),
+            ],
         );
     }
 
