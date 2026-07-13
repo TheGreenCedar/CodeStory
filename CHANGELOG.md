@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Rewrote the repository agent guide around the current request-scoped MCP
+  workflow, crate ownership, identity/publication invariants, isolated test
+  contract, maturity-routed verification, and claim-specific release proof.
 - Staged CI proof by pull-request maturity and changed surface. Draft pushes
   now stay on one Ubuntu source lane, exact-head review promotion runs the full
   workspace test and clippy gate once, and explicit platform promotion selects
