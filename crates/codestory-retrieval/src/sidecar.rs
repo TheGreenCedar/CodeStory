@@ -802,6 +802,9 @@ fn normalized_identity_path(path: &str) -> String {
 
 #[cfg(windows)]
 pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String>> {
+    if pid == 0 {
+        bail!("native embedding process pid must be greater than zero");
+    }
     let raw_handle = unsafe { OpenProcess(WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if raw_handle.is_null() {
         let error = io::Error::last_os_error();
@@ -836,7 +839,10 @@ pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String
 fn windows_datetime_ticks_from_filetime(filetime: &WindowsFileTime) -> Result<u64> {
     let filetime_ticks =
         (u64::from(filetime.high_date_time) << 32) | u64::from(filetime.low_date_time);
-    filetime_ticks
+    // Win32_Process.CreationDate exposes microseconds, so discard sub-microsecond
+    // FILETIME ticks to preserve identities serialized by the previous CIM query.
+    let legacy_filetime_ticks = filetime_ticks / 10 * 10;
+    legacy_filetime_ticks
         .checked_add(WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH)
         .context("convert Windows process creation time to DateTime ticks")
 }
@@ -2011,14 +2017,16 @@ mod tests {
         const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
         const DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH: u64 = 621_355_968_000_000_000;
 
+        let unix_epoch_with_sub_microsecond_ticks = WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH + 8;
         let unix_epoch = WindowsFileTime {
-            low_date_time: WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH as u32,
-            high_date_time: (WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH >> 32) as u32,
+            low_date_time: unix_epoch_with_sub_microsecond_ticks as u32,
+            high_date_time: (unix_epoch_with_sub_microsecond_ticks >> 32) as u32,
         };
         assert_eq!(
             windows_datetime_ticks_from_filetime(&unix_epoch)?,
             DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH
         );
+        assert!(native_embedding_process_start_identity(0).is_err());
 
         let mut child = Command::new("cmd.exe")
             .args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 > nul"])
