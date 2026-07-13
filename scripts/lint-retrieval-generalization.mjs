@@ -1,12 +1,11 @@
 #!/usr/bin/env node
 /**
- * CI guard: ban repo-specific path literals in retrieval integration production code.
- * Scope is Rust production retrieval integration files. Benchmark/eval harness
- * scripts and the env-gated eval probe module intentionally live outside this
- * guard because their manifests name holdout repos; keep that boundary explicit
- * instead of treating them as product code.
- * Scans Rust files after masking `#[cfg(test)]` items/modules so test fixtures
- * do not define the production contract.
+ * CI guard: keep production and release-control code independent from checked
+ * evaluation/query corpora. Rust production is checked for derived corpus
+ * content and structural paths after masking `#[cfg(test)]` items. Inventoried
+ * non-Rust product/release surfaces are checked for direct and adjacent/split
+ * corpus dependencies. Explicit benchmark/proof harnesses remain outside the
+ * protected scan because they must load those corpora.
  */
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
@@ -24,6 +23,85 @@ const explicitScanRoots = (
 )
   .split(path.delimiter)
   .filter(Boolean);
+const explicitNonRustScanRoots = (
+  process.env.CODESTORY_RETRIEVAL_GENERALIZATION_NON_RUST_SCAN_ROOTS ?? ""
+)
+  .split(path.delimiter)
+  .filter(Boolean);
+
+const protectedNonRustDirs = [
+  path.join(repoRoot, "scripts"),
+  path.join(repoRoot, ".github", "scripts"),
+  path.join(repoRoot, ".github", "workflows"),
+  path.join(repoRoot, "plugins", "codestory"),
+  path.join(repoRoot, "docker"),
+  path.join(repoRoot, "crates", "codestory-retrieval", "assets"),
+];
+
+const requiredProtectedNonRustFiles = [
+  path.join(repoRoot, "scripts", "codestory-evidence-provenance.mjs"),
+  path.join(repoRoot, "scripts", "codestory-release-evidence-gate.mjs"),
+  path.join(repoRoot, "scripts", "codex-worktree-setup.mjs"),
+  path.join(repoRoot, "scripts", "codex-worktree-setup.ps1"),
+  path.join(repoRoot, "scripts", "codex-worktree-setup.sh"),
+  path.join(repoRoot, "scripts", "install-codestory.ps1"),
+  path.join(repoRoot, ".github", "scripts", "check-codestory-release.py"),
+  path.join(repoRoot, ".github", "scripts", "detect-codestory-release.py"),
+  path.join(repoRoot, ".github", "scripts", "package-codestory-release.py"),
+  path.join(repoRoot, ".github", "workflows", "auto-release.yml"),
+  path.join(repoRoot, ".github", "workflows", "release.yml"),
+];
+
+const corpusHarnessNonRustFiles = new Set([
+  path.join(repoRoot, "scripts", "autoresearch-pipeline-score.mjs"),
+  path.join(repoRoot, "scripts", "codestory-agent-ab-benchmark.mjs"),
+  path.join(repoRoot, "scripts", "codestory-agent-ab-score.mjs"),
+  path.join(repoRoot, "scripts", "codestory-agent-value-score.mjs"),
+  path.join(repoRoot, "scripts", "codestory-benchmark-contract.mjs"),
+  path.join(repoRoot, "scripts", "codestory-language-holdout-integrity.mjs"),
+  path.join(repoRoot, "scripts", "codestory-manual-friction-check.mjs"),
+  path.join(repoRoot, "scripts", "cross-repo-sourcetrail-queries.mjs"),
+  path.join(repoRoot, "scripts", "fetch-holdout-repos.mjs"),
+  path.join(repoRoot, "scripts", "lint-retrieval-generalization.mjs"),
+  path.join(repoRoot, "scripts", "measure-peak-memory.ps1"),
+  path.join(repoRoot, "scripts", "prove-drill-packet-parity.mjs"),
+  path.join(repoRoot, "scripts", "score-drill-ledger.mjs"),
+  path.join(repoRoot, "scripts", "setup-retrieval-env.mjs"),
+  path.join(repoRoot, "scripts", "setup-retrieval-env.ps1"),
+  path.join(repoRoot, ".github", "workflows", "release-candidate-evidence.yml"),
+  path.join(repoRoot, ".github", "workflows", "retrieval-sidecar-smoke.yml"),
+].map((filePath) => path.resolve(filePath)));
+const corpusHarnessModuleNames = new Set(
+  [...corpusHarnessNonRustFiles]
+    .filter((filePath) => [".cjs", ".js", ".mjs"].includes(path.extname(filePath)))
+    .map((filePath) => path.basename(filePath)),
+);
+
+const protectedNonRustExtensions = new Set([
+  ".cjs", ".js", ".json", ".md", ".mjs", ".ps1", ".py", ".sh", ".toml", ".ts",
+  ".tsx", ".yaml", ".yml",
+]);
+
+const defaultNonRustScanRoots = protectedNonRustDirs;
+const usesDefaultNonRustScanRoots = explicitNonRustScanRoots.length === 0;
+const nonRustScanRoots = usesDefaultNonRustScanRoots
+  ? defaultNonRustScanRoots
+  : explicitNonRustScanRoots.filter((root) => root && existsSync(root));
+
+if (usesDefaultNonRustScanRoots) {
+  const missingProtectedPaths = [
+    ...defaultNonRustScanRoots,
+    ...requiredProtectedNonRustFiles,
+    ...corpusHarnessNonRustFiles,
+  ].filter((requiredPath) => !existsSync(requiredPath));
+  if (missingProtectedPaths.length > 0) {
+    console.error("lint-retrieval-generalization: missing protected non-Rust path(s)");
+    for (const missingPath of missingProtectedPaths) {
+      console.error(`  ${path.relative(repoRoot, missingPath)}`);
+    }
+    process.exit(2);
+  }
+}
 
 const structuralScanDirs = readdirSync(path.join(repoRoot, "crates"), { withFileTypes: true })
   .filter((entry) => entry.isDirectory() && entry.name !== "codestory-bench")
@@ -117,6 +195,11 @@ if (scanDirs.length === 0 && productionOnlyFiles.length === 0) {
   process.exit(2);
 }
 
+const evalCorpusBoundaryPatternList = evalCorpusBoundaryPatterns();
+const evalCorpusCompactPatternList = evalCorpusCompactPatterns(
+  evalCorpusBoundaryPatternList,
+);
+
 const bannedPatterns = [
   "payload_config",
   "freelancer",
@@ -206,7 +289,7 @@ const bannedPatterns = [
   "nvm",
   "install\\.sh\\s+nvm",
   "bash_completion\\s+__nvm",
-  ...evalCorpusBoundaryPatterns(),
+  ...evalCorpusBoundaryPatternList,
   ...benchmarkManifestDerivedPatterns(),
   ...benchmarkEvalProbeDerivedPatterns(),
   ...benchmarkScriptPromptDerivedPatterns(),
@@ -234,7 +317,7 @@ const bannedCompactPatterns = [
   "datarequest",
   "sessiondelegate",
   "sourceanimatecss",
-  ...evalCorpusCompactPatterns(),
+  ...evalCorpusCompactPatternList,
 ];
 
 const allowedPatternLines = [
@@ -262,11 +345,12 @@ function evalCorpusBoundaryPatterns() {
   return [
     ...evalCorpusRoots.map((root) => path.relative(repoRoot, root).replaceAll(path.sep, "/")),
     ...corpusFiles.map((filePath) => path.relative(repoRoot, filePath).replaceAll(path.sep, "/")),
+    ...benchmarkIdentityScriptFiles.map((filePath) => path.basename(filePath)),
   ].map(escapeRegExp);
 }
 
-function evalCorpusCompactPatterns() {
-  return evalCorpusBoundaryPatterns()
+function evalCorpusCompactPatterns(boundaryPatterns) {
+  return boundaryPatterns
     .map((pattern) => compactProductionSource(pattern.replaceAll("\\", "")))
     .filter((pattern) => pattern.length >= 12);
 }
@@ -439,13 +523,13 @@ function addEvalProbeSourceQueryMarkers(markers, source) {
   let arrayMatch;
   while ((arrayMatch = queryArrayCall.exec(source)) != null) {
     const body = arrayMatch[1];
-    const literals = rustStringLiteralSpans(body);
+    const literals = staticStringLiteralSpans(body);
     if (literals.length === 0 || rustArrayNonLiteralRemainder(body, literals).trim() !== "") {
       throw new Error("eval probe source query array contains an unparsed entry");
     }
     for (const { literal } of literals) {
       parsedLiteralCount += 1;
-      addSpecificMarker(markers, rustStringLiteralContent(literal), {
+      addSpecificMarker(markers, staticStringLiteralContent(literal), {
         allowSpecificComposite: true,
       });
     }
@@ -556,6 +640,28 @@ function walkFiles(root, predicate) {
     }
   }
   return files;
+}
+
+function walkProtectedNonRustFiles(root) {
+  return walkFiles(root, (filePath) => {
+    if (!protectedNonRustExtensions.has(path.extname(filePath).toLowerCase())) {
+      return false;
+    }
+    if (!usesDefaultNonRustScanRoots) {
+      return true;
+    }
+    if (corpusHarnessNonRustFiles.has(path.resolve(filePath))) {
+      return false;
+    }
+    const segments = path.relative(repoRoot, filePath).split(path.sep);
+    const baseName = path.basename(filePath);
+    return (
+      !segments.includes("tests")
+      && !segments.includes("fixtures")
+      && !baseName.startsWith("test-")
+      && !baseName.includes(".test.")
+    );
+  });
 }
 
 function addSpecificMarker(markers, value, options = {}) {
@@ -1046,6 +1152,34 @@ function prepareProductionFile(filePath) {
   };
 }
 
+function prepareNonRustFile(filePath) {
+  const production = readFileSync(filePath, "utf8");
+  return {
+    filePath,
+    production,
+    lines: production.split(/\r?\n/),
+    literals: null,
+  };
+}
+
+function scanCorpusHarnessImports(prepared) {
+  const hits = [];
+  const importPattern = /(?:\bfrom\s+|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'`]([^"'`]+)["'`]/g;
+  let match;
+  while ((match = importPattern.exec(prepared.production)) != null) {
+    const moduleName = path.posix.basename(
+      match[1].split(/[?#]/, 1)[0].replaceAll("\\", "/"),
+    );
+    if (corpusHarnessModuleNames.has(moduleName)) {
+      const line = prepared.production.slice(0, match.index).split(/\r?\n/).length;
+      hits.push(
+        `${prepared.filePath}:${line}:${match[0].replace(/\s+/g, " ")}`,
+      );
+    }
+  }
+  return hits;
+}
+
 function scanProductionFile(prepared, patterns, combinedRe) {
   const lines = prepared.lines;
   const hitsByPattern = new Map();
@@ -1069,7 +1203,7 @@ function scanProductionStringLiterals(prepared, pattern, re) {
   const lines = prepared.lines;
   const hits = [];
   for (let index = 0; index < lines.length; index += 1) {
-    for (const literal of rustStringLiteralsOnLine(lines[index])) {
+    for (const literal of staticStringLiteralsOnLine(lines[index])) {
       if (re.test(literal) && !lineAllowedForPattern(pattern, lines[index])) {
         hits.push(`${prepared.filePath}:${index + 1}:${lines[index]}`);
         break;
@@ -1080,13 +1214,13 @@ function scanProductionStringLiterals(prepared, pattern, re) {
 }
 
 function compactProductionSource(text) {
-  return rustStringLiteralContent(text)
+  return staticStringLiteralContent(text)
     .replace(/["'`]/g, "")
     .replace(/[^a-zA-Z0-9]+/g, "")
     .toLowerCase();
 }
 
-function rustStringLiteralContent(literal) {
+function staticStringLiteralContent(literal) {
   const raw = literal.match(/^b?r(#+)?"([\s\S]*)"(#*)$/);
   if (raw && (raw[1] ?? "") === raw[3]) {
     return raw[2];
@@ -1102,7 +1236,7 @@ function scanProductionCompactPatterns(prepared, marker) {
   const markerLower = marker.toLowerCase();
   const hits = [];
   if (prepared.literals == null) {
-    prepared.literals = rustStringLiteralSpans(production);
+    prepared.literals = staticStringLiteralSpans(production);
   }
   const literals = prepared.literals;
   for (let start = 0; start < literals.length; start += 1) {
@@ -1131,7 +1265,7 @@ function scanProductionCompactPatterns(prepared, marker) {
   return hits;
 }
 
-function rustStringLiteralSpans(text) {
+function staticStringLiteralSpans(text) {
   const literals = [];
   const lineStarts = [0];
   for (let index = 0; index < text.length; index += 1) {
@@ -1140,7 +1274,7 @@ function rustStringLiteralSpans(text) {
     }
   }
 
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
+  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g;
   let match;
   while ((match = stringLiteral.exec(text)) != null) {
     literals.push({
@@ -1168,7 +1302,10 @@ function lineNumberAtOffset(lineStarts, offset) {
 }
 
 function literalJoinGapAllowsCompactScan(gap) {
-  return /^[\s,]*$/.test(gap);
+  const withoutJoinCalls = gap
+    .replace(/\.(?:concat|join)\s*\(/g, "")
+    .replace(/\bpath\.(?:join|resolve)\s*\(/g, "");
+  return /^[\s,+()[\].]*$/.test(withoutJoinCalls);
 }
 
 function compactPatternHit(filePath, startLine, endLine, marker) {
@@ -1179,9 +1316,9 @@ function compactPatternHit(filePath, startLine, endLine, marker) {
   );
 }
 
-function rustStringLiteralsOnLine(line) {
+function staticStringLiteralsOnLine(line) {
   const literals = [];
-  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g;
+  const stringLiteral = /(?:b?r#*"[^"]*"#*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)/g;
   let match;
   while ((match = stringLiteral.exec(line)) != null) {
     literals.push(match[0]);
@@ -1284,7 +1421,7 @@ for (const filePath of [...scanFiles].sort()) {
   }
 }
 
-const corpusRegexPatterns = evalCorpusBoundaryPatterns().map((pattern) => ({
+const corpusRegexPatterns = evalCorpusBoundaryPatternList.map((pattern) => ({
   pattern,
   re: new RegExp(pattern, "i"),
 }));
@@ -1307,7 +1444,7 @@ for (const filePath of [...structuralFiles].sort()) {
       failed = true;
     }
   }
-  for (const pattern of evalCorpusCompactPatterns()) {
+  for (const pattern of evalCorpusCompactPatternList) {
     const hits = scanProductionCompactPatterns(prepared, pattern);
     if (hits.length > 0) {
       console.error(`Constructed production dependency on eval/query corpus /${pattern}/ in ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`);
@@ -1316,13 +1453,58 @@ for (const filePath of [...structuralFiles].sort()) {
   }
 }
 
+const protectedNonRustScanFiles = new Set();
+for (const root of nonRustScanRoots) {
+  for (const filePath of walkProtectedNonRustFiles(root)) {
+    protectedNonRustScanFiles.add(filePath);
+  }
+}
+if (protectedNonRustScanFiles.size === 0) {
+  console.error("lint-retrieval-generalization: no protected non-Rust files found");
+  process.exit(2);
+}
+
+for (const filePath of [...protectedNonRustScanFiles].sort()) {
+  const prepared = prepareNonRustFile(filePath);
+  const harnessImportHits = scanCorpusHarnessImports(prepared);
+  if (harnessImportHits.length > 0) {
+    console.error(
+      `Protected non-Rust path imports an evaluation/proof harness ${path.relative(repoRoot, filePath)}:\n${harnessImportHits.join("\n")}\n`,
+    );
+    failed = true;
+  }
+  const productionHits = scanProductionFile(
+    prepared,
+    corpusRegexPatterns,
+    corpusCombinedRegex,
+  );
+  for (const { pattern } of corpusRegexPatterns) {
+    const hits = productionHits.get(pattern) ?? [];
+    if (hits.length > 0) {
+      console.error(
+        `Banned eval/query pattern /${pattern}/ in protected non-Rust path ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`,
+      );
+      failed = true;
+    }
+  }
+  for (const pattern of evalCorpusCompactPatternList) {
+    const hits = scanProductionCompactPatterns(prepared, pattern);
+    if (hits.length > 0) {
+      console.error(
+        `Constructed eval/query dependency /${pattern}/ in protected non-Rust path ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`,
+      );
+      failed = true;
+    }
+  }
+}
+
 if (failed) {
   console.error(
-    "retrieval generalization lint failed: remove repo-specific literals from retrieval integration code",
+    "retrieval generalization lint failed: remove eval/query dependencies from protected product paths",
   );
   process.exit(1);
 }
 
 console.log(
-  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${bannedPatterns.length} patterns)`,
+  `lint-retrieval-generalization: ok (${scanDirs.length} retrieval dir(s), ${scanFiles.size} retrieval file(s), ${structuralFiles.size} production file(s), ${protectedNonRustScanFiles.size} protected non-Rust file(s), ${bannedPatterns.length} patterns)`,
 );

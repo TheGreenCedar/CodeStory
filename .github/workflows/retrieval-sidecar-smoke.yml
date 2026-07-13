@@ -24,6 +24,7 @@ on:
       - crates/codestory-indexer/Cargo.toml
       - crates/codestory-indexer/src/lib.rs
       - scripts/lint-retrieval-generalization.mjs
+      - scripts/codestory-evidence-provenance.mjs
       - scripts/codestory-release-evidence-gate.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs
       - benchmarks/release-evidence/**
@@ -57,6 +58,7 @@ on:
       - crates/codestory-indexer/Cargo.toml
       - crates/codestory-indexer/src/lib.rs
       - scripts/lint-retrieval-generalization.mjs
+      - scripts/codestory-evidence-provenance.mjs
       - scripts/codestory-release-evidence-gate.mjs
       - scripts/tests/codestory-release-evidence-gate.test.mjs
       - benchmarks/release-evidence/**

@@ -131,6 +131,37 @@ fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
         .expect("run lint with prompt script fixture")
 }
 
+fn run_lint_with_non_rust_fixture(contents: &str) -> Output {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let fixture_root = TempDir::new().expect("create fixture root");
+    std::fs::write(
+        fixture_root.path().join("neutral.rs"),
+        "pub fn repository_neutral_fixture() {}\n",
+    )
+    .expect("write neutral Rust fixture");
+    std::fs::write(fixture_root.path().join("leaked.mjs"), contents)
+        .expect("write non-Rust fixture");
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    Command::new("node")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
+            fixture_root.path(),
+        )
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_NON_RUST_SCAN_ROOTS",
+            fixture_root.path(),
+        )
+        .output()
+        .expect("run lint with non-Rust fixture")
+}
+
 #[test]
 fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let repo_root = workspace_root();
@@ -382,6 +413,32 @@ pub const LEAKED_DEPENDENCY: &str = include_str!(concat!("../../benchmarks/", "t
         assert!(
             stderr.to_lowercase().contains(expected),
             "lint failure should identify constructed boundary {expected}; stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
+    let output = run_lint_with_non_rust_fixture(
+        r#"
+export const directCorpus = import(
+  "./fetch-holdout-repos.mjs"
+);
+export const splitCorpus = ["scripts/", "cross-repo-sourcetrail-queries.mjs"].join("");
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "protected non-Rust corpus dependencies must fail lint; stderr={stderr}"
+    );
+    for expected in [
+        "fetch-holdout-repos.mjs",
+        "scriptscrossreposourcetrailqueriesmjs",
+    ] {
+        assert!(
+            stderr.to_ascii_lowercase().contains(expected),
+            "lint failure should identify non-Rust corpus dependency {expected}; stderr={stderr}"
         );
     }
 }

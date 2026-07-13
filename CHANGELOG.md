@@ -15,6 +15,12 @@
   project/workspace identity differs from the selected repository. `cache
   identity` now exposes the lossless project, workspace, artifact, and safe
   legacy-alias disposition used by that verification.
+- Separated release-evidence provenance validation from the benchmark corpus
+  loader and expanded the generalization guard across the repository-controlled
+  non-Rust product and release-control boundary. Direct and adjacent/split
+  evaluation-corpus dependencies now fail in plugin launch/setup surfaces,
+  worktree/install tooling, runtime configuration, release scripts/workflows,
+  and the release evaluator; missing protected paths fail closed.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and
