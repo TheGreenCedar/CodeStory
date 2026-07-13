@@ -71,9 +71,15 @@ function requireManagedPluginStep(content, jobName, workflowName, archiveLine) {
   if (!managedPluginMatrixIsRequired(content, jobName, archiveLine)) {
     violations.push(`${workflowName} must run the managed plugin handoff unconditionally in every matrix cell`);
   }
+  const matrixBypass = content.includes("      matrix: ${{ fromJSON")
+    ? content.replace(
+        /^      matrix: \$\{\{ fromJSON.*$/mu,
+        "      matrix:\n        exclude:\n          - os: never",
+      )
+    : content.replace("      matrix:\n", "      matrix:\n        exclude:\n          - os: never\n");
   const policyBypasses = [
     ["fail-fast", content.replace("      fail-fast: false\n", "")],
-    ["matrix exclude", content.replace("      matrix:\n", "      matrix:\n        exclude:\n          - os: never\n")],
+    ["matrix exclude", matrixBypass],
     ["job if", content.replace(`  ${jobName}:\n`, `  ${jobName}:\n    if: always()\n`)],
     [
       "job continue-on-error",
@@ -349,7 +355,7 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "ref:",
     "cancel-in-progress: true",
     "codestory-cli-default-features",
-    "exclude: ${{ fromJSON(inputs.scope == 'macos'",
+    "matrix: ${{ fromJSON(inputs.scope == 'macos'",
   ], snippet => `packaged-platform-proof.yml must include ${snippet}`);
   const releaseAssetStart = content.indexOf("- name: Upload release asset");
   const notarizationProofStart = content.indexOf("- name: Upload macOS notarization proof");
@@ -359,13 +365,35 @@ if (!fs.existsSync(packagedPlatformProof)) {
   if (releaseAssetBlock.includes("target/notarization-proof")) {
     violations.push("packaged-platform-proof.yml must keep notarization evidence out of the flat binary release artifact");
   }
+  const matrixMatch = content.match(
+    /^      matrix: \$\{\{ fromJSON\(inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\) \}\}$/mu,
+  );
+  const expectedFullMatrix = {
+    include: [
+      { os: "ubuntu-latest", rust_target: "x86_64-unknown-linux-gnu", asset_target: "linux-x64", exe_suffix: "", extension: "tar.gz" },
+      { os: "ubuntu-24.04-arm", rust_target: "aarch64-unknown-linux-gnu", asset_target: "linux-arm64", exe_suffix: "", extension: "tar.gz" },
+      { os: "windows-latest", rust_target: "x86_64-pc-windows-msvc", asset_target: "windows-x64", exe_suffix: ".exe", extension: "zip" },
+      { os: "windows-11-arm", rust_target: "aarch64-pc-windows-msvc", asset_target: "windows-arm64", exe_suffix: ".exe", extension: "zip" },
+      { os: "macos-15-intel", rust_target: "x86_64-apple-darwin", asset_target: "macos-x64", exe_suffix: "", extension: "tar.gz" },
+      { os: "macos-15", rust_target: "aarch64-apple-darwin", asset_target: "macos-arm64", exe_suffix: "", extension: "tar.gz" },
+    ],
+  };
+  const expectedMacMatrix = {
+    include: expectedFullMatrix.include.filter(row => row.asset_target.startsWith("macos-")),
+  };
+  try {
+    const macMatrix = matrixMatch && JSON.parse(matrixMatch[1]);
+    const fullMatrix = matrixMatch && JSON.parse(matrixMatch[2]);
+    if (JSON.stringify(macMatrix) !== JSON.stringify(expectedMacMatrix)) {
+      violations.push("packaged-platform-proof.yml macos scope must contain exactly the two Mac package rows");
+    }
+    if (JSON.stringify(fullMatrix) !== JSON.stringify(expectedFullMatrix)) {
+      violations.push("packaged-platform-proof.yml full scope must contain exactly all six native package rows");
+    }
+  } catch {
+    violations.push("packaged-platform-proof.yml package matrices must be valid JSON objects");
+  }
   requireContent(content, [
-    "- os: ubuntu-latest\n            rust_target: x86_64-unknown-linux-gnu\n            asset_target: linux-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
-    "- os: ubuntu-24.04-arm\n            rust_target: aarch64-unknown-linux-gnu\n            asset_target: linux-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
-    "- os: windows-latest\n            rust_target: x86_64-pc-windows-msvc\n            asset_target: windows-x64\n            exe_suffix: \".exe\"\n            extension: zip",
-    "- os: windows-11-arm\n            rust_target: aarch64-pc-windows-msvc\n            asset_target: windows-arm64\n            exe_suffix: \".exe\"\n            extension: zip",
-    "- os: macos-15-intel\n            rust_target: x86_64-apple-darwin\n            asset_target: macos-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
-    "- os: macos-15\n            rust_target: aarch64-apple-darwin\n            asset_target: macos-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
     "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
   ], row => `packaged-platform-proof.yml must preserve native proof block ${row.split("\n")[0]}`);
   requireManagedPluginStep(
