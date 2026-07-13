@@ -197,7 +197,7 @@ fn schema_19_adds_nullable_file_content_hash_without_losing_rows() -> Result<(),
     }
 
     let storage = Storage::open(&path)?;
-    assert_eq!(storage.schema_version()?, 20);
+    assert_eq!(storage.schema_version()?, 21);
     assert_eq!(storage.get_files()?.len(), 1);
     assert_eq!(storage.get_file_content_hash(7)?, None);
 
@@ -246,6 +246,40 @@ fn transient_incomplete_schema_fence_requires_marker() -> Result<(), StorageErro
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
+fn interrupted_v19_run_migrates_manifest_column_without_clearing_fence() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("interrupted-v19-manifest-migration");
+    {
+        let storage = Storage::open(&path)?;
+        storage.get_connection().execute(
+            "ALTER TABLE retrieval_index_manifest RENAME COLUMN lexical_version TO zoekt_version",
+            [],
+        )?;
+        storage.begin_incremental_run()?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(
+        Storage::database_schema_version(&path)?,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(storage.has_incomplete_incremental_run()?);
+    let columns = storage
+        .conn
+        .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(columns.iter().any(|column| column == "lexical_version"));
+    assert!(!columns.iter().any(|column| column == "zoekt_version"));
+    storage.finish_incremental_run()?;
+    assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
     Ok(())
 }
 
@@ -1780,7 +1814,8 @@ fn live_open_migrates_v17_llm_doc_columns_before_secondary_indexes() -> Result<(
 }
 
 #[test]
-fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), StorageError> {
+fn live_open_migrates_v18_manifest_to_lexical_schema_without_losing_rows()
+-> Result<(), StorageError> {
     let db_path = unique_temp_db_path("v18-precise-semantic-manifest-repair");
     let _ = std::fs::remove_file(&db_path);
     {
@@ -1815,7 +1850,7 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
                 qdrant_collection,
                 built_at_epoch_ms,
                 degraded_modes_json
-            ) VALUES ('proj', 'zoekt', 'collection', 1, '[]')",
+            ) VALUES ('proj', 'legacy-v1', 'collection', 1, '[]')",
             [],
         )?;
         conn.pragma_update(None, "user_version", 18)?;
@@ -1828,7 +1863,7 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     for column in [
-        "zoekt_version",
+        "lexical_version",
         "precise_semantic_import_status",
         "precise_semantic_import_reason",
         "precise_semantic_import_revision",
@@ -1836,12 +1871,12 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
     ] {
         assert!(columns.iter().any(|existing| existing == column));
     }
-    assert!(!columns.iter().any(|existing| existing == "lexical_version"));
+    assert!(!columns.iter().any(|existing| existing == "zoekt_version"));
     let manifest = storage
         .get_retrieval_index_manifest("proj")?
         .expect("manifest survives repair");
     assert_eq!(manifest.project_id, "proj");
-    assert_eq!(manifest.lexical_version, "zoekt");
+    assert_eq!(manifest.lexical_version, "legacy-v1");
     assert_eq!(manifest.precise_semantic_import_status, None);
 
     drop(storage);
@@ -1850,21 +1885,93 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
 }
 
 #[test]
-fn current_schema_keeps_manifest_column_rollback_compatible() -> Result<(), StorageError> {
-    let db_path = unique_temp_db_path("current-manifest-rollback-contract");
+fn current_schema_uses_only_lexical_manifest_column() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v21-lexical-manifest-contract");
     let _ = std::fs::remove_file(&db_path);
     let storage = Storage::open(&db_path)?;
-    assert_eq!(storage.schema_version()?, 20);
+    assert_eq!(storage.schema_version()?, 21);
     let columns = storage
         .conn
         .prepare("PRAGMA table_info(retrieval_index_manifest)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
-    assert!(columns.iter().any(|column| column == "zoekt_version"));
-    assert!(!columns.iter().any(|column| column == "lexical_version"));
+    assert!(columns.iter().any(|column| column == "lexical_version"));
+    assert!(!columns.iter().any(|column| column == "zoekt_version"));
 
     drop(storage);
     let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_column()
+-> Result<(), StorageError> {
+    for source_version in [19, 20] {
+        let db_path = unique_temp_db_path(&format!("v{source_version}-lexical-manifest-migration"));
+        let _ = std::fs::remove_file(&db_path);
+        {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE retrieval_index_manifest (
+                project_id TEXT PRIMARY KEY,
+                zoekt_version TEXT NOT NULL,
+                qdrant_collection TEXT NOT NULL,
+                scip_revision TEXT,
+                built_at_epoch_ms INTEGER NOT NULL,
+                disk_bytes INTEGER,
+                degraded_modes_json TEXT NOT NULL DEFAULT '[]',
+                embedding_backend TEXT,
+                embedding_dim INTEGER,
+                sidecar_schema_version INTEGER,
+                sidecar_input_hash TEXT,
+                sidecar_generation TEXT,
+                projection_count INTEGER,
+                symbol_doc_count INTEGER,
+                dense_projection_count INTEGER,
+                semantic_policy_version TEXT,
+                graph_artifact_hash TEXT,
+                dense_reason_counts_json TEXT,
+                precise_semantic_import_status TEXT,
+                precise_semantic_import_reason TEXT,
+                precise_semantic_import_revision TEXT,
+                precise_semantic_import_producer TEXT
+            );
+            INSERT INTO retrieval_index_manifest (
+                project_id, zoekt_version, qdrant_collection,
+                built_at_epoch_ms, degraded_modes_json
+            ) VALUES ('proj', 'legacy-v1', 'collection', 1, '[]');",
+            )?;
+            conn.pragma_update(None, "user_version", source_version)?;
+        }
+
+        let mut storage = Storage::open(&db_path)?;
+        let mut manifest = storage
+            .get_retrieval_index_manifest("proj")?
+            .expect("legacy manifest row survives migration");
+        assert_eq!(manifest.lexical_version, "legacy-v1");
+        manifest.lexical_version = "sqlite-fts5-v1".into();
+        storage.upsert_retrieval_index_manifest(&manifest)?;
+        drop(storage);
+
+        let storage = Storage::open(&db_path)?;
+        let columns = storage
+            .conn
+            .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(columns.iter().any(|column| column == "lexical_version"));
+        assert!(!columns.iter().any(|column| column == "zoekt_version"));
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")?
+                .expect("updated manifest")
+                .lexical_version,
+            "sqlite-fts5-v1"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&db_path);
+    }
     Ok(())
 }
 
@@ -1876,7 +1983,7 @@ fn live_open_preserves_correct_v18_manifest_precise_semantic_values() -> Result<
         let mut storage = Storage::open(&db_path)?;
         storage.upsert_retrieval_index_manifest(&RetrievalIndexManifest {
             project_id: "proj".into(),
-            lexical_version: "zoekt".into(),
+            lexical_version: "legacy-v1".into(),
             qdrant_collection: "collection".into(),
             scip_revision: None,
             built_at_epoch_ms: 1,

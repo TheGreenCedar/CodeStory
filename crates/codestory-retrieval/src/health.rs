@@ -130,7 +130,6 @@ pub struct RetrievalStatusReport {
     pub embedding_cpu_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_launch: Option<EmbeddingLaunchMetadata>,
-    #[serde(alias = "zoekt")]
     pub lexical: ComponentHealth,
     pub qdrant: ComponentHealth,
     pub scip: ComponentHealth,

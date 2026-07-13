@@ -241,7 +241,7 @@ const TABLE_STATEMENTS: &[&str] = &[
     ) VALUES (1, 0, 0, NULL, NULL)",
     "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
         project_id TEXT PRIMARY KEY,
-        zoekt_version TEXT NOT NULL,
+        lexical_version TEXT NOT NULL,
         qdrant_collection TEXT NOT NULL,
         scip_revision TEXT,
         built_at_epoch_ms INTEGER NOT NULL,
@@ -455,6 +455,12 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         if stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION {
             storage.set_schema_version(20)?;
         }
+    }
+    // The interrupted-incremental sentinel sits outside the sequential version range, so inspect
+    // the actual columns instead of skipping this idempotent rename while an older run recovers.
+    migrate_v21_retrieval_manifest_lexical_version(&storage.conn)?;
+    if stored_version < 21 {
+        storage.set_schema_version(21)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -684,6 +690,30 @@ pub(super) fn migrate_v14_retrieval_index_manifest(conn: &Connection) -> Result<
         [],
     )?;
     Ok(())
+}
+
+pub(super) fn migrate_v21_retrieval_manifest_lexical_version(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    let columns = table_columns(conn, "retrieval_index_manifest")?;
+    let has_legacy = columns.iter().any(|column| column == "zoekt_version");
+    let has_lexical = columns.iter().any(|column| column == "lexical_version");
+    match (has_legacy, has_lexical) {
+        (true, false) => {
+            conn.execute(
+                "ALTER TABLE retrieval_index_manifest RENAME COLUMN zoekt_version TO lexical_version",
+                [],
+            )?;
+            Ok(())
+        }
+        (false, true) => Ok(()),
+        (true, true) => Err(StorageError::Other(
+            "retrieval_index_manifest contains both legacy and lexical version columns".to_string(),
+        )),
+        (false, false) => Err(StorageError::Other(
+            "retrieval_index_manifest is missing lexical_version".to_string(),
+        )),
+    }
 }
 
 fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {
@@ -962,17 +992,23 @@ pub(super) fn try_add_column(
         .split_whitespace()
         .next()
         .ok_or_else(|| StorageError::Other("missing column name in migration".to_string()))?;
-    let pragma = format!("PRAGMA table_info({table})");
-    let mut stmt = conn.prepare(&pragma)?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let existing_name: String = row.get(1)?;
-        if existing_name == column_name {
-            return Ok(());
-        }
+    if table_columns(conn, table)?
+        .iter()
+        .any(|existing| existing == column_name)
+    {
+        return Ok(());
     }
 
     let sql = format!("ALTER TABLE {table} ADD COLUMN {column_sql}");
     conn.execute(&sql, [])?;
     Ok(())
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, StorageError> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let columns = stmt
+        .query_map([], |row| row.get(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(columns)
 }

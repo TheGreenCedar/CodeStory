@@ -32,7 +32,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 20;
+const SCHEMA_VERSION: u32 = 21;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;

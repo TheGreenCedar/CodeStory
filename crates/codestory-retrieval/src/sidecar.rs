@@ -26,7 +26,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 60 * 1000;
-const LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT: usize = 4_096;
+const LEGACY_LEXICAL_MIGRATION_ENTRY_LIMIT: usize = 4_096;
 #[cfg(not(windows))]
 const NATIVE_EMBEDDING_STOP_WAIT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
@@ -86,6 +86,7 @@ pub struct SidecarStateFile {
     pub embedding_launch: Option<EmbeddingLaunchMetadata>,
     #[serde(default = "default_sidecar_image_pins")]
     pub sidecar_images: SidecarImagePins,
+    // v0.15 migration-only read alias; serialization is canonical. Remove the alias in v0.16.
     #[serde(alias = "zoekt_data_dir")]
     pub lexical_data_dir: String,
     pub qdrant_data_dir: String,
@@ -123,7 +124,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata(
 ) -> Result<SidecarStateFile> {
     runtime.ensure_ports_allocated()?;
     let layout = &runtime.layout;
-    cleanup_owned_legacy_zoekt(layout)?;
+    cleanup_owned_legacy_lexical_artifacts(layout)?;
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let state = SidecarStateFile {
@@ -179,7 +180,7 @@ pub(crate) fn persist_embedding_container_identity(path: &Path, identity: &str) 
         .context("persist embedding container identity")
 }
 
-fn cleanup_owned_legacy_zoekt(layout: &SidecarLayout) -> Result<()> {
+fn cleanup_owned_legacy_lexical_artifacts(layout: &SidecarLayout) -> Result<()> {
     let Ok(raw) = std::fs::read_to_string(&layout.state_file) else {
         return Ok(());
     };
@@ -197,11 +198,11 @@ fn cleanup_owned_legacy_zoekt(layout: &SidecarLayout) -> Result<()> {
     if !legacy_state_matches {
         return Ok(());
     }
-    let mut remaining = LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT;
+    let mut remaining = LEGACY_LEXICAL_MIGRATION_ENTRY_LIMIT;
     if !remove_tree_bounded(&legacy_root, &mut remaining)? {
         eprintln!(
-            "CodeStory legacy Zoekt cleanup reached its {}-entry limit; remaining owned data will be retried",
-            LEGACY_ZOEKT_CLEANUP_ENTRY_LIMIT
+            "CodeStory legacy lexical migration cleanup reached its {}-entry limit; remaining owned data will be retried",
+            LEGACY_LEXICAL_MIGRATION_ENTRY_LIMIT
         );
     }
     Ok(())
@@ -219,12 +220,12 @@ fn remove_tree_bounded(path: &Path, remaining: &mut usize) -> Result<bool> {
     *remaining -= 1;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         std::fs::remove_file(path)
-            .with_context(|| format!("remove legacy Zoekt artifact {}", path.display()))?;
+            .with_context(|| format!("remove legacy lexical artifact {}", path.display()))?;
         return Ok(true);
     }
     let mut complete = true;
     for entry in std::fs::read_dir(path)
-        .with_context(|| format!("read legacy Zoekt directory {}", path.display()))?
+        .with_context(|| format!("read legacy lexical directory {}", path.display()))?
     {
         if !remove_tree_bounded(&entry?.path(), remaining)? {
             complete = false;
@@ -233,7 +234,7 @@ fn remove_tree_bounded(path: &Path, remaining: &mut usize) -> Result<bool> {
     }
     if complete {
         std::fs::remove_dir(path)
-            .with_context(|| format!("remove empty legacy Zoekt directory {}", path.display()))?;
+            .with_context(|| format!("remove empty legacy lexical directory {}", path.display()))?;
     }
     Ok(complete)
 }
@@ -1331,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_state_reads_legacy_zoekt_data_dir_without_reemitting_it() {
+    fn sidecar_state_reads_legacy_lexical_data_dir_without_reemitting_it() {
         let root = TempDir::new().expect("root");
         let runtime = test_runtime(&root);
         let state = sidecar_up_with_runtime(&runtime, None).expect("state");
@@ -1348,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_removes_only_state_proven_owned_legacy_zoekt_data() {
+    fn upgrade_removes_only_state_proven_owned_legacy_lexical_data() {
         let root = TempDir::new().expect("root");
         let runtime = test_runtime(&root);
         let legacy = root.path().join("zoekt");
@@ -1364,7 +1365,7 @@ mod tests {
         )
         .expect("state");
 
-        cleanup_owned_legacy_zoekt(&runtime.layout).expect("cleanup");
+        cleanup_owned_legacy_lexical_artifacts(&runtime.layout).expect("cleanup");
 
         assert!(!legacy.exists());
 
@@ -1378,7 +1379,7 @@ mod tests {
             .expect("foreign state json"),
         )
         .expect("foreign state");
-        cleanup_owned_legacy_zoekt(&runtime.layout).expect("skip foreign");
+        cleanup_owned_legacy_lexical_artifacts(&runtime.layout).expect("skip foreign");
         assert!(legacy.exists());
     }
 
