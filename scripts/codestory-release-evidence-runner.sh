@@ -11,6 +11,7 @@ repository=$(get '.repository')
 runner_name=$(get '.runner.name')
 runner_version=$(get '.runner.version')
 runner_root=$(get '.runner.root')
+guest_owner_path="$runner_root/artifacts/ownership.json"
 model_name=$(get '.assets.model.name')
 model_sha=$(get '.assets.model.sha256')
 model_source=${CODESTORY_RELEASE_EVIDENCE_MODEL_SEED:-"$HOME/Library/Caches/dev.codestory.codestory/retrieval/models/$model_name"}
@@ -102,7 +103,7 @@ write_ownership() {
   install -m 0600 "$tmp" "$owner_path"
   if profile_running && colima ssh --profile "$profile" -- test -d "$runner_root"; then
     colima ssh --profile "$profile" -- sudo -u codestory-runner \
-      tee "$runner_root/ownership.json" <"$tmp" >/dev/null
+      tee "$guest_owner_path" <"$tmp" >/dev/null
   fi
   rm -f "$tmp"
 }

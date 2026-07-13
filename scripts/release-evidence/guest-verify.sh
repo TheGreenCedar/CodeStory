@@ -53,7 +53,7 @@ print(f"memory_gib={memory_gib:.4f} workspace_free_gib={disk_gib:.2f}")
 PY
 
 host_attestation="$runner_root/artifacts/host-attestation.json"
-ownership="$runner_root/ownership.json"
+ownership="$runner_root/artifacts/ownership.json"
 test -f "$host_attestation"
 test -f "$ownership"
 boot_id=$(sed -n '1p' /proc/sys/kernel/random/boot_id)
