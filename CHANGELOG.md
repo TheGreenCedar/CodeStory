@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Kept promoted repo-scale stats as a correctness gate while making its
+  wall-clock measurements telemetry. Hardware-bound timing limits remain in
+  the release-evidence gate, so shared hosted runners no longer fail a Mac
+  platform proof for crossing a local-machine threshold by scheduler noise.
 - Staged CI proof by pull-request maturity and changed surface. Draft pushes
   now stay on one Ubuntu source lane, exact-head review promotion runs the full
   workspace test and clippy gate once, and explicit platform promotion selects
