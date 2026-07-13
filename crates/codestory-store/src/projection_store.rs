@@ -1,4 +1,4 @@
-use crate::{FileInfo, ProjectionFlushBreakdown, StorageError, Store};
+use crate::{FileContentHash, FileInfo, ProjectionFlushBreakdown, StorageError, Store};
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, Node, NodeId, Occurrence,
 };
@@ -16,6 +16,7 @@ pub struct ProjectionStore<'a> {
 /// Borrowed indexer output ready to persist as one projection flush.
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
+    pub file_content_hashes: &'a [FileContentHash],
     pub nodes: &'a [Node],
     pub edges: &'a [Edge],
     pub occurrences: &'a [Occurrence],
@@ -45,6 +46,7 @@ impl<'a> ProjectionStore<'a> {
         self.storage
             .flush_projection_batch(crate::storage_impl::ProjectionBatch {
                 files: batch.files,
+                file_content_hashes: batch.file_content_hashes,
                 nodes: batch.nodes,
                 edges: batch.edges,
                 occurrences: batch.occurrences,

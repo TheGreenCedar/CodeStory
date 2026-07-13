@@ -601,6 +601,7 @@ jobs:
             .projections()
             .flush_projection_batch(ProjectionBatch {
                 files: &projected.files,
+                file_content_hashes: &[],
                 nodes: &projected.nodes,
                 edges: &projected.edges,
                 occurrences: &projected.occurrences,

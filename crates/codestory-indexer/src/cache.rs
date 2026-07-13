@@ -38,6 +38,7 @@ impl CachedIndexArtifact {
     pub(crate) fn into_intermediate_storage(self) -> IntermediateStorage {
         IntermediateStorage {
             files: self.files,
+            file_content_hashes: Vec::new(),
             nodes: self.nodes,
             edges: self.edges,
             occurrences: self.occurrences,

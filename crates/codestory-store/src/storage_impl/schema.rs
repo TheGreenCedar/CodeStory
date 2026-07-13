@@ -50,7 +50,8 @@ const TABLE_STATEMENTS: &[&str] = &[
         indexed INTEGER DEFAULT 0,
         complete INTEGER DEFAULT 0,
         line_count INTEGER DEFAULT 0,
-        file_role TEXT NOT NULL DEFAULT 'source'
+        file_role TEXT NOT NULL DEFAULT 'source',
+        content_hash TEXT
     )",
     "CREATE TABLE IF NOT EXISTS incomplete_index_run (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -449,6 +450,12 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
         // ponytail: v18 caches can be stamped current while missing additive columns; drop the rerun once v18-stamped caches are rebuilt.
         migrate_v18_ast_first_symbol_docs(&storage.conn)?;
     }
+    if stored_version < 20 || stored_version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION {
+        migrate_v20_file_content_hash(&storage.conn)?;
+        if stored_version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION {
+            storage.set_schema_version(20)?;
+        }
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -648,6 +655,10 @@ pub(super) fn migrate_v18_ast_first_symbol_docs(conn: &Connection) -> Result<(),
         "precise_semantic_import_producer TEXT",
     )?;
     Ok(())
+}
+
+pub(super) fn migrate_v20_file_content_hash(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(conn, "file", "content_hash TEXT")
 }
 
 pub(super) fn migrate_v14_retrieval_index_manifest(conn: &Connection) -> Result<(), StorageError> {

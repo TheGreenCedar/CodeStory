@@ -10,6 +10,7 @@ use codestory_contracts::graph::{
 #[derive(Default)]
 pub struct IntermediateStorage {
     pub files: Vec<codestory_store::FileInfo>,
+    pub file_content_hashes: Vec<codestory_store::FileContentHash>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub occurrences: Vec<Occurrence>,
@@ -53,6 +54,7 @@ impl IntermediateStorage {
     /// Merge another accumulator into this one, preserving insertion order.
     pub fn merge(&mut self, other: IntermediateStorage) {
         self.files.extend(other.files);
+        self.file_content_hashes.extend(other.file_content_hashes);
         self.nodes.extend(other.nodes);
         self.edges.extend(other.edges);
         self.occurrences.extend(other.occurrences);
@@ -66,6 +68,7 @@ impl IntermediateStorage {
     /// Remove all accumulated projection data and errors.
     pub fn clear(&mut self) {
         self.files.clear();
+        self.file_content_hashes.clear();
         self.nodes.clear();
         self.edges.clear();
         self.occurrences.clear();

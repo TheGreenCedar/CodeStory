@@ -6,7 +6,8 @@ use codestory_contracts::graph::{
 use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
-    Connection, MAIN_DB, OpenFlags, Result, Row, params, params_from_iter, types::Value,
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, params, params_from_iter,
+    types::Value,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -31,7 +32,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 19;
+const SCHEMA_VERSION: u32 = 20;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -476,6 +477,7 @@ pub struct ProjectionFlushBreakdown {
 
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
+    pub file_content_hashes: &'a [FileContentHash],
     pub nodes: &'a [Node],
     pub edges: &'a [Edge],
     pub occurrences: &'a [Occurrence],
@@ -505,6 +507,13 @@ pub struct FileInfo {
     pub line_count: u32,
     #[serde(default)]
     pub file_role: FileRole,
+}
+
+/// Verified content identity for one parser-backed file projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileContentHash {
+    pub file_id: i64,
+    pub content_hash: String,
 }
 
 /// Heuristic role assigned to a file for ranking and summaries.
@@ -1713,7 +1722,11 @@ impl Storage {
         Ok(())
     }
 
-    pub fn update_file_metadata(&self, info: &FileInfo) -> Result<(), StorageError> {
+    pub fn update_file_metadata(
+        &self,
+        info: &FileInfo,
+        content_hash: Option<&str>,
+    ) -> Result<(), StorageError> {
         self.conn.execute(
             "UPDATE file
              SET path = ?2,
@@ -1722,7 +1735,8 @@ impl Storage {
                  indexed = ?5,
                  complete = ?6,
                  line_count = ?7,
-                 file_role = ?8
+                 file_role = ?8,
+                 content_hash = ?9
              WHERE id = ?1",
             params![
                 info.id,
@@ -1733,10 +1747,24 @@ impl Storage {
                 i32::from(info.complete),
                 info.line_count,
                 info.file_role.as_str(),
+                content_hash,
             ],
         )?;
         self.mark_grounding_snapshots_dirty()?;
         Ok(())
+    }
+
+    /// Read the verified parser source hash stored with one file projection.
+    pub fn get_file_content_hash(&self, file_id: i64) -> Result<Option<String>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT content_hash FROM file WHERE id = ?1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(StorageError::from)
     }
 
     pub fn refresh_grounding_summary_snapshots(&self) -> Result<(), StorageError> {
@@ -3193,6 +3221,7 @@ impl Storage {
     ) -> Result<ProjectionFlushBreakdown, StorageError> {
         let mut breakdown = ProjectionFlushBreakdown::default();
         if batch.files.is_empty()
+            && batch.file_content_hashes.is_empty()
             && batch.nodes.is_empty()
             && batch.edges.is_empty()
             && batch.occurrences.is_empty()
@@ -3214,6 +3243,11 @@ impl Storage {
             .collect::<HashMap<_, _>>();
         let nodes_prepare_ms = clamp_i64_to_u32(nodes_prepare_started.elapsed().as_millis() as i64);
 
+        let file_content_hashes = batch
+            .file_content_hashes
+            .iter()
+            .map(|identity| (identity.file_id, identity.content_hash.as_str()))
+            .collect::<HashMap<_, _>>();
         let tx = self.conn.transaction()?;
 
         if !batch.files.is_empty() {
@@ -3225,14 +3259,15 @@ impl Storage {
 
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
-                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                     modification_time=excluded.modification_time,
                     indexed=excluded.indexed,
                     complete=excluded.complete,
                     line_count=excluded.line_count,
-                    file_role=excluded.file_role",
+                    file_role=excluded.file_role,
+                    content_hash=excluded.content_hash",
             )?;
             for info in batch.files {
                 stmt.execute(params![
@@ -3244,6 +3279,7 @@ impl Storage {
                     i32::from(info.complete),
                     info.line_count,
                     info.file_role.as_str(),
+                    file_content_hashes.get(&info.id).copied(),
                 ])?;
             }
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);

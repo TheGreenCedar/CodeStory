@@ -10,6 +10,12 @@
 - Made agent-facing commands select the Agent sidecar by default, and bound the
   live packet/drill parity gate plus drill's packet execution to the same
   explicit Agent run instead of preflighting an unrelated Local generation.
+- Prevented parser and artifact-cache results from publishing graph data for
+  source bytes that changed during indexing. Parser-backed projections now
+  persist the SHA-256 identity of the bytes actually indexed, stamp file
+  metadata only after a matching verification read, and leave an incomplete
+  retry error instead of accepting stale output even when the file's timestamp
+  is restored.
 - Opened the diagnostic MCP immediately on fresh managed-plugin startup while
   the existing single-flight installer provisions the exact CLI version in the
   background. Status now reports the in-process provisioning state, and the
