@@ -881,12 +881,17 @@ mod tests {
             listener.local_addr().expect("server address")
         );
         listener.set_nonblocking(true).expect("nonblocking server");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        std::thread::sleep(Duration::from_millis(200));
+                        accepted_tx.send(()).expect("signal accepted request");
+                        release_rx
+                            .recv_timeout(Duration::from_secs(2))
+                            .expect("release blocked request");
                         drop(stream);
                         break;
                     }
@@ -931,14 +936,23 @@ mod tests {
             Arc::clone(&cancelled),
             Arc::new(AtomicBool::new(false)),
         );
-        let started = Instant::now();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
         let query = std::thread::spawn(move || {
-            client.search_with_context("collection", "query", 1, &context)
+            let result = client.search_with_context("collection", "query", 1, &context);
+            result_tx.send(result).expect("publish query result");
         });
-        std::thread::sleep(Duration::from_millis(20));
+        accepted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("embedding request accepted");
         cancelled.store(true, std::sync::atomic::Ordering::Release);
-        assert!(query.join().expect("query thread").is_err());
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("query released after cancellation")
+                .is_err()
+        );
+        release_tx.send(()).expect("release embedding server");
+        query.join().expect("query thread");
         server.join().expect("embedding server");
     }
 

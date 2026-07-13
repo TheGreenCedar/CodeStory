@@ -344,7 +344,7 @@ fn ensure_local_profile_handoff(
         default_sidecar,
     )
     .context("retrieval local/default status after index")?;
-    if status.retrieval_mode != "full" {
+    if !status.is_live_ready() {
         anyhow::bail!(
             "retrieval profile handoff failed: local/default status after index is mode={} reason={}; indexed_project_id={} sidecar={}",
             status.retrieval_mode,

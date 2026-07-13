@@ -1188,7 +1188,7 @@ fn run_ci_agent_smoke(project: &ProjectArgs) -> SmokeOutput {
 
     let start = Instant::now();
     let sidecar = doctor_sidecar_status(&runtime);
-    if sidecar.retrieval_mode == "full" {
+    if doctor_sidecar_status_is_live_ready(&sidecar) {
         smoke_pass(
             &mut output,
             "sidecar_full_mode",
@@ -2425,8 +2425,8 @@ pub(crate) fn agent_sidecar_with_gpu_proof(
     let mut sidecar = sidecar.clone();
     if agent_surface_requires_identity_bound_gpu_proof(&sidecar)
         && !gpu_proof.is_some_and(identity_bound_gpu_proof_is_verified)
+        && sidecar.degraded_reason.is_none()
     {
-        sidecar.retrieval_mode = "unavailable".to_string();
         sidecar.degraded_reason = Some("gpu_unverified".to_string());
     }
     sidecar
@@ -2452,10 +2452,12 @@ fn ensure_agent_surface_gpu_proof(runtime: &RuntimeContext, surface: &str) -> Re
         },
         &sidecar,
     );
-    if broker
-        .gpu_proof
-        .as_ref()
-        .is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, &sidecar))
+    let live_degraded_reason = status.degraded_reason.clone();
+    if live_degraded_reason.is_none()
+        && broker
+            .gpu_proof
+            .as_ref()
+            .is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, &sidecar))
     {
         return Ok(());
     }
@@ -2471,9 +2473,16 @@ fn ensure_agent_surface_gpu_proof(runtime: &RuntimeContext, surface: &str) -> Re
         .as_ref()
         .map(|proof| proof.proof_status.as_str())
         .unwrap_or("missing");
-    let message = format!(
-        "gpu_unverified: `{surface}` requires identity-bound accelerator smoke proof for the selected agent runtime; current broker proof is `{proof_status}`"
-    );
+    let degraded_reason = live_degraded_reason.unwrap_or_else(|| "gpu_unverified".to_string());
+    let message = if degraded_reason == "gpu_unverified" {
+        format!(
+            "gpu_unverified: `{surface}` requires identity-bound accelerator smoke proof for the selected agent runtime; current broker proof is `{proof_status}`"
+        )
+    } else {
+        format!(
+            "{degraded_reason}: `{surface}` requires a live selected agent runtime with matching process identity and verified accelerator proof"
+        )
+    };
     Err(StructuredCommandFailure {
         envelope: CommandFailureEnvelope::new(ApiError::retrieval_unavailable(
             message,
@@ -2481,7 +2490,7 @@ fn ensure_agent_surface_gpu_proof(runtime: &RuntimeContext, surface: &str) -> Re
             next_commands,
         ))
         .with_context(serde_json::json!({
-            "degraded_reason": "gpu_unverified",
+            "degraded_reason": degraded_reason,
             "profile": sidecar.profile.as_str(),
             "run_id": sidecar.run_id,
             "namespace": sidecar.namespace,
@@ -2524,6 +2533,10 @@ fn agent_surface_requires_identity_bound_gpu_proof(status: &DoctorSidecarStatusO
     status.retrieval_mode == "full"
         && status.embedding_device_policy == "accelerator_required"
         && !status.embedding_cpu_allowed
+}
+
+fn doctor_sidecar_status_is_live_ready(status: &DoctorSidecarStatusOutput) -> bool {
+    status.retrieval_mode == "full" && status.degraded_reason.is_none()
 }
 
 fn fix_status(output: &ReadyOutput) -> &'static str {
@@ -3382,7 +3395,7 @@ fn ready_repair_observed_infrastructure(
 fn ensure_ready_repair_full_sidecar(
     report: &codestory_retrieval::RetrievalStatusReport,
 ) -> Result<()> {
-    if report.retrieval_mode == "full" {
+    if report.is_live_ready() {
         return Ok(());
     }
     let reason = report.degraded_reason.as_deref().unwrap_or("unknown");
@@ -7421,7 +7434,7 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
     ) {
         Ok(report) => {
             let status = doctor_sidecar_status_from_report(report, Some(&sidecar));
-            let handoff_failure = (status.retrieval_mode == "full")
+            let handoff_failure = doctor_sidecar_status_is_live_ready(&status)
                 .then(|| doctor_sidecar_profile_handoff_failure(runtime))
                 .flatten();
             apply_sidecar_profile_handoff(status, handoff_failure)
@@ -7569,7 +7582,7 @@ fn lane_scoped_agent_readiness_sidecar(
     fallback: &DoctorSidecarStatusOutput,
     agent_status: DoctorSidecarStatusOutput,
 ) -> DoctorSidecarStatusOutput {
-    if agent_status.retrieval_mode == "full" {
+    if doctor_sidecar_status_is_live_ready(&agent_status) {
         return agent_status;
     }
     if fallback.profile.as_deref() == Some("agent")
@@ -7732,7 +7745,7 @@ fn readiness_lane_status(
     sidecar: &DoctorSidecarStatusOutput,
     verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
 ) -> ReadinessStatusDto {
-    let sidecar_status = if sidecar.retrieval_mode == "full" {
+    let sidecar_status = if doctor_sidecar_status_is_live_ready(sidecar) {
         ReadinessStatusDto::Ready
     } else {
         ReadinessStatusDto::RepairRetrieval
@@ -7772,10 +7785,10 @@ fn lane_next_command(
         return Some(command.clone());
     }
     match lane {
-        "agent_packet_search" if sidecar.retrieval_mode != "full" => Some(
+        "agent_packet_search" if !doctor_sidecar_status_is_live_ready(sidecar) => Some(
             agent_ready_repair_command(project_arg, sidecar.run_id.as_deref()),
         ),
-        "local_default" if sidecar.retrieval_mode != "full" => Some(format!(
+        "local_default" if !doctor_sidecar_status_is_live_ready(sidecar) => Some(format!(
             "codestory-cli retrieval index --project {project_arg} --profile local --refresh full --format json"
         )),
         _ => Some(retrieval_status_command(sidecar, project_arg)),
@@ -7820,10 +7833,7 @@ fn apply_sidecar_profile_handoff(
     mut status: DoctorSidecarStatusOutput,
     handoff_failure: Option<String>,
 ) -> DoctorSidecarStatusOutput {
-    if status.retrieval_mode == "full"
-        && let Some(reason) = handoff_failure
-    {
-        status.retrieval_mode = "unavailable".to_string();
+    if let Some(reason) = handoff_failure {
         status.degraded_reason = Some(reason);
     }
     status
@@ -7843,7 +7853,7 @@ fn doctor_sidecar_profile_handoff_failure(runtime: &RuntimeContext) -> Option<St
         ),
     );
     match local {
-        Ok(report) if report.retrieval_mode == "full" => None,
+        Ok(report) if report.is_live_ready() => None,
         Ok(report) => Some(format!(
             "profile_handoff_mismatch: active profile={} namespace={} is full but local/default profile is mode={} reason={}",
             active.profile.as_str(),
@@ -8119,7 +8129,7 @@ fn doctor_check(
 }
 
 fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutput {
-    if sidecar.retrieval_mode == "full" {
+    if doctor_sidecar_status_is_live_ready(sidecar) {
         let device_note = if sidecar.embedding_cpu_allowed {
             format!(
                 " embedding device policy allows CPU-backed mode (observed_device={}).",
@@ -9867,7 +9877,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_profile_handoff_downgrades_full_readiness() {
+    fn sidecar_profile_handoff_preserves_full_manifest_classification() {
         let status = DoctorSidecarStatusOutput {
             profile: Some("agent".to_string()),
             run_id: Some("run".to_string()),
@@ -9898,7 +9908,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(downgraded.retrieval_mode, "unavailable");
+        assert_eq!(downgraded.retrieval_mode, "full");
         assert_eq!(
             downgraded.degraded_reason.as_deref(),
             Some(
@@ -10009,7 +10019,7 @@ mod tests {
         let sidecar = DoctorSidecarStatusOutput {
             profile: Some("agent".to_string()),
             run_id: Some("run".to_string()),
-            retrieval_mode: "unavailable".to_string(),
+            retrieval_mode: "full".to_string(),
             degraded_reason: Some("embedding_runtime_unavailable: connection refused".to_string()),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "accelerated".to_string(),
@@ -10049,7 +10059,7 @@ mod tests {
         );
 
         assert_eq!(lane.status, ReadinessStatusDto::RepairRetrieval);
-        assert_eq!(lane.sidecar_mode, "unavailable");
+        assert_eq!(lane.sidecar_mode, "full");
         assert!(
             lane.degraded_reason
                 .as_deref()

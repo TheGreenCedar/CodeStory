@@ -206,6 +206,7 @@ fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval
     }
 }
 
+#[cfg(target_os = "macos")]
 fn native_launch_for_pid(pid: u32) -> codestory_retrieval::EmbeddingLaunchMetadata {
     let mut launch = native_sidecar_state(Some(now_epoch_ms()))
         .embedding_launch

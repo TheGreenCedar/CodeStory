@@ -991,7 +991,7 @@ fn native_embedding_macos_process_identity(pid: u32) -> Result<(String, Vec<Stri
     Ok((executable_path, arguments))
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn native_embedding_macos_argv_from_procargs(bytes: &[u8]) -> Result<Vec<String>> {
     let argc_size = std::mem::size_of::<std::ffi::c_int>();
     let argc_bytes: [u8; std::mem::size_of::<std::ffi::c_int>()] = bytes
@@ -2296,7 +2296,7 @@ mod tests {
         let report = strict_sidecar_status(project.path(), Some(&storage_path))
             .expect("sidecar status report");
 
-        assert_eq!(report.retrieval_mode, "unavailable");
+        assert_eq!(report.retrieval_mode, "full");
         assert!(
             report
                 .degraded_reason
@@ -2304,6 +2304,10 @@ mod tests {
                 .unwrap_or_default()
                 .starts_with("embedding_runtime_unavailable:"),
             "live infrastructure failure must win before manifest classification: {report:?}"
+        );
+        assert_eq!(
+            report.repair.as_ref().map(|repair| repair.reason.as_str()),
+            Some("embedding_runtime_unavailable")
         );
     }
 
@@ -2497,7 +2501,8 @@ mod tests {
         let changed =
             strict_sidecar_status_for_runtime(project.path(), Some(&storage_path), runtime.clone())
                 .expect("changed sidecar status");
-        assert_eq!(changed.retrieval_mode, "unavailable");
+        assert_eq!(changed.retrieval_mode, "full");
+        assert!(!changed.is_live_ready());
         assert!(
             changed
                 .degraded_reason
@@ -2511,7 +2516,8 @@ mod tests {
         let removed =
             strict_sidecar_status_for_runtime(project.path(), Some(&storage_path), runtime)
                 .expect("removed sidecar status");
-        assert_eq!(removed.retrieval_mode, "unavailable");
+        assert_eq!(removed.retrieval_mode, "full");
+        assert!(!removed.is_live_ready());
         assert!(
             removed
                 .degraded_reason
@@ -2638,7 +2644,8 @@ mod tests {
             strict_sidecar_status_for_runtime(project.path(), Some(&storage_path), runtime)
                 .expect("strict status");
 
-        assert_eq!(report.retrieval_mode, "unavailable");
+        assert_eq!(report.retrieval_mode, "full");
+        assert!(!report.is_live_ready());
         assert!(
             report
                 .degraded_reason
@@ -2697,7 +2704,8 @@ mod tests {
             strict_sidecar_status_for_runtime(project.path(), Some(&storage_path), runtime)
                 .expect("strict status");
 
-        assert_eq!(report.retrieval_mode, "unavailable");
+        assert_eq!(report.retrieval_mode, "full");
+        assert!(!report.is_live_ready());
         assert!(
             report
                 .degraded_reason

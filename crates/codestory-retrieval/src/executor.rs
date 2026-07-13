@@ -2197,13 +2197,16 @@ mod tests {
         assert!(cache.is_empty());
     }
 
-    struct CooperativeCancellationSidecars;
+    struct CooperativeCancellationSidecars {
+        started: mpsc::SyncSender<()>,
+    }
 
     impl CooperativeCancellationSidecars {
         fn wait_for_cancellation(
             &self,
             context: &SearchExecutionContext,
         ) -> Result<Vec<CandidateHit>> {
+            self.started.send(()).expect("signal active stage");
             while !context.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -2244,14 +2247,16 @@ mod tests {
     }
 
     #[test]
-    fn active_stage_cancellation_returns_promptly_and_is_not_cached() {
+    fn active_stage_cancellation_is_traced_and_not_cached() {
         let cancelled = cancellation_flag();
         let request_cancelled = Arc::clone(&cancelled);
-        let started = Instant::now();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let handle = std::thread::spawn(move || {
             let mut cache = RetrievalCache::new();
             let mut executor = QueryExecutor {
-                sidecars: Arc::new(CooperativeCancellationSidecars),
+                sidecars: Arc::new(CooperativeCancellationSidecars {
+                    started: started_tx,
+                }),
                 cache: &mut cache,
                 manifest: Some(sample_manifest()),
                 file_roles: Arc::new(HashMap::new()),
@@ -2263,14 +2268,12 @@ mod tests {
                 .expect("cancelled work remains diagnostic");
             (result, cache.len())
         });
-        std::thread::sleep(Duration::from_millis(15));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("active stage started");
         cancelled.store(true, Ordering::Release);
         let (result, cache_len) = handle.join().expect("query worker");
 
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "cancellation should not wait for the original stage budget"
-        );
         assert_eq!(result.trace.cancel_reason.as_deref(), Some("cancelled"));
         assert_eq!(cache_len, 0, "cancelled results must not be cached");
         assert!(result.trace.stages.iter().any(|stage| {

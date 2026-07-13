@@ -16,6 +16,7 @@ use crate::sidecar::{
     sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_origin,
 };
 use anyhow::{Context, Result, bail};
+use fs4::fs_std::FileExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -173,6 +174,66 @@ pub struct BootstrapReport {
     pub compose_started: bool,
     pub compose_file: Option<PathBuf>,
     pub storage_repair: QdrantStorageRepairReport,
+}
+
+#[derive(Debug, Error)]
+#[error("{source}")]
+struct ComposeBootstrapLockedError {
+    #[source]
+    source: anyhow::Error,
+    _lock: File,
+}
+
+fn compose_bootstrap_lock_path(compose_project: &str) -> PathBuf {
+    let key = format!("{:x}", Sha256::digest(compose_project.as_bytes()));
+    std::env::temp_dir()
+        .join("codestory-compose-bootstrap-locks")
+        .join(format!("{key}.lock"))
+}
+
+fn open_compose_bootstrap_lock(compose_project: &str) -> Result<File> {
+    let path = compose_bootstrap_lock_path(compose_project);
+    fs::create_dir_all(path.parent().expect("lock path has a parent"))
+        .with_context(|| format!("create Compose bootstrap lock dir for {compose_project}"))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open Compose bootstrap lock {}", path.display()))
+}
+
+fn acquire_compose_bootstrap_lock(compose_project: &str) -> Result<File> {
+    let file = open_compose_bootstrap_lock(compose_project)?;
+    FileExt::lock_exclusive(&file)
+        .with_context(|| format!("lock Compose project {compose_project} startup"))?;
+    Ok(file)
+}
+
+#[cfg(test)]
+fn try_acquire_compose_bootstrap_lock(compose_project: &str) -> Result<Option<File>> {
+    let file = open_compose_bootstrap_lock(compose_project)?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(true) => Ok(Some(file)),
+        Ok(false) => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("try lock Compose project {compose_project} startup")),
+    }
+}
+
+fn hold_compose_bootstrap_lock_on_error(
+    error: anyhow::Error,
+    lock: &mut Option<File>,
+) -> anyhow::Error {
+    match lock.take() {
+        Some(lock) => ComposeBootstrapLockedError {
+            source: error,
+            _lock: lock,
+        }
+        .into(),
+        None => error,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -353,10 +414,19 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
     } else {
         Some(resolve_compose_file(repo_root, compose_file.as_deref())?)
     };
+    // Docker Compose project names are daemon-global. Keep the exact ownership probe, startup,
+    // and any caller-side failure cleanup serialized for this project.
+    let mut compose_bootstrap_lock = resolved_compose
+        .as_ref()
+        .map(|_| acquire_compose_bootstrap_lock(&runtime.compose_project))
+        .transpose()?;
+    let mut hold_compose_lock =
+        |error| hold_compose_bootstrap_lock_on_error(error, &mut compose_bootstrap_lock);
 
     let (compose_started, compose_owned_for_rollback) =
         if let Some(path) = resolved_compose.as_ref() {
-            let compose_project_preexisting = docker_compose_project_has_containers(runtime)?;
+            let compose_project_preexisting =
+                docker_compose_project_has_containers(runtime).map_err(&mut hold_compose_lock)?;
             start_compose_with_rollback(
                 !compose_project_preexisting,
                 || {
@@ -365,7 +435,8 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
                     })
                 },
                 || docker_compose_down_for_runtime(path, runtime),
-            )?;
+            )
+            .map_err(&mut hold_compose_lock)?;
             (true, !compose_project_preexisting)
         } else {
             (false, false)
@@ -392,8 +463,9 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
                 )
                 .with_context(|| {
                     format!("rollback sidecar startup after native embedding spawn failed: {error}")
-                })?;
-                return Err(error);
+                })
+                .map_err(&mut hold_compose_lock)?;
+                return Err(hold_compose_lock(error));
             }
         }
     } else {
@@ -441,14 +513,13 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
                 if native_embedding_spawn.is_some_and(|spawn| spawn.newly_spawned)
                     && let Some(launch) = embedding_launch
                 {
-                    return Err(error.context(NativeEmbeddingStartupCleanupFailure::new(
-                        launch,
-                        &cleanup_error,
+                    return Err(hold_compose_lock(error.context(
+                        NativeEmbeddingStartupCleanupFailure::new(launch, &cleanup_error),
                     )));
                 }
-                return Err(error);
+                return Err(hold_compose_lock(error));
             }
-            return Err(error);
+            return Err(hold_compose_lock(error));
         }
     };
 
@@ -459,7 +530,8 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
                 wait_timeout,
                 newly_spawned_native_launch(embedding_launch.as_ref(), native_embedding_spawn),
             )
-        })?
+        })
+        .map_err(&mut hold_compose_lock)?
     } else {
         probe_infrastructure_health(runtime)
     };
@@ -470,7 +542,8 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
     {
         with_bootstrap_progress(&mut progress, "container refresh", || {
             docker_compose_up(path, repo_root, runtime, launch_mode, true)
-        })?;
+        })
+        .map_err(&mut hold_compose_lock)?;
         if !wait_timeout.is_zero() {
             let _ = with_bootstrap_progress(&mut progress, "model/bootstrap", || {
                 wait_for_infrastructure(
@@ -478,13 +551,16 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
                     wait_timeout,
                     newly_spawned_native_launch(embedding_launch.as_ref(), native_embedding_spawn),
                 )
-            })?;
+            })
+            .map_err(&mut hold_compose_lock)?;
         }
     }
 
     if compose_started && launch_mode == EmbeddingServerLaunchMode::DockerComposeEmbed {
-        let identity = crate::embeddings::running_embedding_container_identity(runtime)?;
-        crate::sidecar::persist_embedding_container_identity(&layout.state_file, &identity)?;
+        let identity = crate::embeddings::running_embedding_container_identity(runtime)
+            .map_err(&mut hold_compose_lock)?;
+        crate::sidecar::persist_embedding_container_identity(&layout.state_file, &identity)
+            .map_err(&mut hold_compose_lock)?;
     }
 
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
@@ -492,7 +568,9 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
         runtime,
         &embedding_device,
     );
-    port_lease_heartbeat.finish()?;
+    port_lease_heartbeat
+        .finish()
+        .map_err(&mut hold_compose_lock)?;
 
     Ok(BootstrapReport {
         state,
@@ -2055,7 +2133,9 @@ fn spawn_native_embedding_server_once(
     configure_native_embedding_command(&mut command);
     #[cfg(windows)]
     let _standard_handle_guard = WindowsStandardHandleInheritanceGuard::new()?;
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
+    #[cfg(target_os = "macos")]
+    let mut child = child;
     #[cfg(target_os = "macos")]
     let gate = child.stdin.take();
     #[cfg(not(target_os = "macos"))]
@@ -2516,6 +2596,39 @@ mod tests {
             labels: std::collections::BTreeMap::new(),
             ..SidecarRuntimeConfig::local()
         }
+    }
+
+    #[test]
+    fn failed_bootstrap_error_retains_compose_lock_through_caller_cleanup() {
+        let root = tempdir().expect("root");
+        let mut runtime = compose_test_runtime(root.path());
+        runtime.compose_project = format!(
+            "test-{}",
+            &format!(
+                "{:x}",
+                Sha256::digest(root.path().as_os_str().as_encoded_bytes())
+            )[..16]
+        );
+
+        let mut lock = Some(
+            acquire_compose_bootstrap_lock(&runtime.compose_project).expect("first Compose lock"),
+        );
+        let error = hold_compose_bootstrap_lock_on_error(anyhow::anyhow!("failed"), &mut lock);
+        assert!(lock.is_none(), "returned error must own the Compose lock");
+        assert!(
+            try_acquire_compose_bootstrap_lock(&runtime.compose_project)
+                .expect("contending Compose lock")
+                .is_none(),
+            "a concurrent bootstrap must wait while caller-side cleanup handles the error"
+        );
+
+        drop(error);
+        assert!(
+            try_acquire_compose_bootstrap_lock(&runtime.compose_project)
+                .expect("Compose lock after cleanup")
+                .is_some(),
+            "the next bootstrap may inspect ownership only after cleanup completes"
+        );
     }
 
     fn one_shot_json_server(body: serde_json::Value) -> (SocketAddr, thread::JoinHandle<()>) {

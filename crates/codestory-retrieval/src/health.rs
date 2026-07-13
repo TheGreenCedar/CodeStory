@@ -145,6 +145,13 @@ pub struct RetrievalStatusReport {
     pub manifest: Option<codestory_store::RetrievalIndexManifest>,
 }
 
+impl RetrievalStatusReport {
+    /// Whether the persisted full-retrieval classification is also live and usable now.
+    pub fn is_live_ready(&self) -> bool {
+        self.retrieval_mode == "full" && self.degraded_reason.is_none()
+    }
+}
+
 pub fn attach_manifest_contract(
     mut report: RetrievalStatusReport,
     source_root: &Path,
@@ -161,7 +168,7 @@ pub fn attach_repair_hint(
     project_root: &Path,
     runtime: Option<&SidecarRuntimeConfig>,
 ) -> RetrievalStatusReport {
-    if report.retrieval_mode == "full" {
+    if report.is_live_ready() {
         return report;
     }
     let reason = repair_reason_code(
@@ -310,6 +317,11 @@ fn parse_degraded_modes(manifest: &codestory_store::RetrievalIndexManifest) -> V
         .unwrap_or_else(|_| vec!["degraded_modes_json_invalid".into()])
 }
 
+fn manifest_classifies_full(manifest: &codestory_store::RetrievalIndexManifest) -> bool {
+    manifest_has_current_sidecar_contract(&manifest.project_id, manifest)
+        && parse_degraded_modes(manifest).is_empty()
+}
+
 fn component_status_label(component: &ComponentHealth) -> String {
     if let Some(reason) = component.degraded_reason.as_ref() {
         return reason.clone();
@@ -387,6 +399,10 @@ pub fn unavailable_status_report_with_embedding_device(
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> RetrievalStatusReport {
     let reason = reason.into();
+    let retrieval_mode = manifest
+        .as_ref()
+        .filter(|manifest| manifest_classifies_full(manifest))
+        .map_or("unavailable", |_| "full");
     let manifest_vector_embedding_backend = manifest
         .as_ref()
         .and_then(|manifest| manifest.embedding_backend.clone());
@@ -394,7 +410,7 @@ pub fn unavailable_status_report_with_embedding_device(
         .as_ref()
         .and_then(|manifest| manifest.embedding_dim);
     RetrievalStatusReport {
-        retrieval_mode: "unavailable".into(),
+        retrieval_mode: retrieval_mode.into(),
         ownership: None,
         sidecar_images: default_sidecar_image_pins(),
         degraded_reason: Some(reason.clone()),
@@ -807,10 +823,15 @@ pub fn probe_sidecar_health_for_runtime(
         capabilities: scip_capabilities,
     };
 
-    let (mode, degraded_reason) = crate::mode::derive_degraded_mode(&lexical, &qdrant, &scip);
+    let (live_mode, degraded_reason) = crate::mode::derive_degraded_mode(&lexical, &qdrant, &scip);
+    let retrieval_mode = if manifest_classifies_full(&manifest) {
+        "full"
+    } else {
+        live_mode.as_str()
+    };
 
     RetrievalStatusReport {
-        retrieval_mode: mode.as_str().into(),
+        retrieval_mode: retrieval_mode.into(),
         ownership: None,
         sidecar_images: default_sidecar_image_pins(),
         degraded_reason,
@@ -1024,7 +1045,8 @@ mod tests {
         let report = probe_sidecar_health(&layout, "testproject", Some(manifest));
 
         assert!(!report.lexical.capabilities.lexical);
-        assert_ne!(report.retrieval_mode, "full");
+        assert_eq!(report.retrieval_mode, "full");
+        assert!(!report.is_live_ready());
     }
 
     #[test]
@@ -1091,7 +1113,8 @@ mod tests {
             report.lexical.degraded_reason.as_deref(),
             Some("lexical_source_coverage_empty")
         );
-        assert_ne!(report.retrieval_mode, "full");
+        assert_eq!(report.retrieval_mode, "full");
+        assert!(!report.is_live_ready());
     }
 
     #[test]

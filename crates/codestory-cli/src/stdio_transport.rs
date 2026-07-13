@@ -6516,18 +6516,28 @@ mod tests {
 
         let blocked = crate::agent_sidecar_with_gpu_proof(&sidecar, Some(&manual_proof));
 
-        assert_eq!(blocked.retrieval_mode, "unavailable");
+        assert_eq!(blocked.retrieval_mode, "full");
         assert_eq!(blocked.degraded_reason.as_deref(), Some("gpu_unverified"));
         let missing = crate::agent_sidecar_with_gpu_proof(&sidecar, None);
-        assert_eq!(missing.retrieval_mode, "unavailable");
+        assert_eq!(missing.retrieval_mode, "full");
         assert_eq!(missing.degraded_reason.as_deref(), Some("gpu_unverified"));
+
+        let mut dead_endpoint = sidecar.clone();
+        dead_endpoint.degraded_reason =
+            Some("embedding_runtime_unavailable: connection refused".to_string());
+        let dead_endpoint = crate::agent_sidecar_with_gpu_proof(&dead_endpoint, None);
+        assert_eq!(dead_endpoint.retrieval_mode, "full");
+        assert_eq!(
+            dead_endpoint.degraded_reason.as_deref(),
+            Some("embedding_runtime_unavailable: connection refused")
+        );
 
         let mut runtime_input = input;
         runtime_input.embedding_device_observation_source = Some("native_log".to_string());
         let mut runtime_proof = crate::readiness_broker::gpu_proof(runtime_input);
         assert_eq!(runtime_proof.proof_status, "verified");
         let unbound = crate::agent_sidecar_with_gpu_proof(&sidecar, Some(&runtime_proof));
-        assert_eq!(unbound.retrieval_mode, "unavailable");
+        assert_eq!(unbound.retrieval_mode, "full");
         assert_eq!(unbound.degraded_reason.as_deref(), Some("gpu_unverified"));
 
         runtime_proof.runtime_identity = Some(crate::readiness_broker::BrokerGpuRuntimeIdentity {

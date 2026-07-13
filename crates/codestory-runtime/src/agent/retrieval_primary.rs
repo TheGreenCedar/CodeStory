@@ -265,7 +265,9 @@ fn sidecar_mode_can_serve_primary(mode: &str) -> bool {
 }
 
 fn sidecar_status_can_serve_primary(status: &SidecarModeStatus) -> bool {
-    status.profile.as_deref() == Some("agent") && sidecar_mode_can_serve_primary(&status.mode)
+    status.profile.as_deref() == Some("agent")
+        && sidecar_mode_can_serve_primary(&status.mode)
+        && status.degraded_reason.is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2352,12 +2354,18 @@ mod tests {
             mode: "full".into(),
             degraded_reason: None,
         };
+        let agent_full_but_dead = SidecarModeStatus {
+            profile: Some("agent".into()),
+            mode: "full".into(),
+            degraded_reason: Some("embedding_runtime_unavailable: connection refused".into()),
+        };
 
         assert!(
             !sidecar_status_can_serve_primary(&local_full),
             "local/default full sidecar must not serve packet/search/context primary retrieval"
         );
         assert!(sidecar_status_can_serve_primary(&agent_full));
+        assert!(!sidecar_status_can_serve_primary(&agent_full_but_dead));
         assert!(!sidecar_status_can_serve_primary(&missing_profile_full));
     }
 
@@ -2416,7 +2424,7 @@ mod tests {
 
         let status = sidecar_mode_status_for_runtime(project.path(), &storage_path, &runtime);
 
-        assert_eq!(status.mode, "unavailable");
+        assert_eq!(status.mode, "full");
         let reason = status.degraded_reason.expect("unavailable reason");
         assert!(
             reason.starts_with("embedding_runtime_unavailable:"),

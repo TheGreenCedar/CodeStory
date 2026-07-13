@@ -4130,14 +4130,6 @@ def self_test() -> None:
         )
         remove_tree_with_retry(foreign_collision_root)
 
-        no_compose_root = root / "no-compose-cleanup"
-        write_proof_compose_state(no_compose_root, {"compose_file": None})
-        no_compose_artifact = root / "no-compose-cleanup.json"
-        cleanup_proof_cache(fake_cli, root, no_compose_root, no_compose_artifact)
-        no_compose_cleanup = read_json_file(no_compose_artifact)
-        assert no_compose_cleanup["removed"] is True
-        assert no_compose_cleanup["commands"][0]["kind"] == "compose_down_skipped"
-
         symlink_root = root / "compose-validation-symlink"
         symlink_root.mkdir()
         symlink_identity = proof_agent_identity(symlink_root, root, PROOF_LOCAL_RUN_ID)

@@ -39,6 +39,9 @@
   time together with executable and arguments, and a persisted `full` manifest
   no longer permits agent packet/search after the live endpoint or verified
   accelerator identity disappears.
+- Serialized same-project Compose bootstraps through ownership probing,
+  startup, and failure cleanup so one concurrent attempt cannot roll back
+  containers created by another.
 - Centralized CLI sidecar construction behind an early test-isolation gateway.
   Default-concurrency tests now select a process-unique cache root before any
   user-cache lookup and an architecture contract prevents new direct
