@@ -129,6 +129,7 @@ pub use sidecar::{
     sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch,
     stop_native_embedding_process_for_launch, strict_sidecar_status,
     strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
+    validate_sidecar_state_matches_runtime,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
 

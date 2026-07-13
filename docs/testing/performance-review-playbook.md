@@ -80,9 +80,9 @@ regression risk, but it is not answer-quality proof.
 
 | Gate | Current metric or threshold | Command that proves it | Source |
 | --- | --- | --- | --- |
-| Repeat refresh | `repeat_semantic_docs_embedded == 0`; repeat graph phase `< 20s`; repeat semantic reuse phase `< 3s`; release-significant convergence changes use the approved machine-profile budget | `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture`; release gate below | `crates/codestory-cli/tests/codestory_repo_e2e_stats.rs`, `benchmarks/release-evidence/approved-baselines.json` |
+| Repeat refresh | Promoted stats require `repeat_semantic_docs_embedded == 0` and record wall-clock telemetry with living-baseline warnings. Release evidence separately requires repeat graph `< 20s`, repeat semantic reuse `< 3s`, and full-refresh convergence within the approved machine-profile budget. | Run `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` for correctness and telemetry; use `scripts/codestory-release-evidence-gate.mjs` for hardware-bound timing proof. | `crates/codestory-cli/tests/codestory_repo_e2e_stats.rs`, `scripts/codestory-release-evidence-gate.mjs`, `benchmarks/release-evidence/repo-stats-contract.json`, `benchmarks/release-evidence/approved-baselines.json` |
 | Retrieval status | After sidecar indexing, `retrieval_mode == "full"` and `retrieval status --format json` reports current manifest provenance: source root, input hash, generation, schema, graph hash, symbol-doc count, dense-anchor count, degraded modes, and lane provenance. Non-`full` status is diagnostic only. | `codestory-cli retrieval bootstrap --project <repo> --format json`; `codestory-cli retrieval index --project <repo> --refresh full --format json`; `codestory-cli retrieval status --project <repo> --format json` | `docs/ops/retrieval-sidecars.md`, `crates/codestory-retrieval/src/sidecar.rs`, `crates/codestory-runtime/src/agent/retrieval_primary.rs` |
-| Packet runtime | Product sidecar query budget defaults to `1,000ms`; packet batch budget defaults to `18,000ms` and is capped at `120,000ms`; packet runs must report `packet_latency.sla_missed == false` for product evidence. North-star targets are retrieval p50 `<= 250ms`, p90 `<= 600ms`, p99 `<= 1,000ms`, and worst-case packet wall `<= 1,500ms`, but those targets become promotion proof only inside a quality-gated benchmark run. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite local-real --repeats 1 --codestory-cli target/release/codestory-cli --timeout-ms 300000` | `crates/codestory-runtime/src/agent/retrieval_primary.rs`, `crates/codestory-retrieval/src/planner.rs`, `scripts/codestory-agent-ab-benchmark.mjs`, `docs/testing/retrieval-architecture.md` |
+| Packet runtime | Product sidecar query budget defaults to `1,500ms`; packet batch budget defaults to `18,000ms` and is capped at `120,000ms`; packet runs must report `packet_latency.sla_missed == false` for product evidence. North-star targets are retrieval p50 `<= 250ms`, p90 `<= 600ms`, p99 `<= 1,000ms`, and worst-case packet wall `<= 1,500ms`, but those targets become promotion proof only inside a quality-gated benchmark run. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite local-real --repeats 1 --codestory-cli target/release/codestory-cli --timeout-ms 300000` | `crates/codestory-runtime/src/agent/retrieval_primary.rs`, `crates/codestory-retrieval/src/planner.rs`, `scripts/codestory-agent-ab-benchmark.mjs`, `docs/testing/retrieval-architecture.md` |
 | Benchmark promotion | `--publishable` requires at least 3 repeats, sidecar-primary retrieval, no diagnostic extra probes, no failed rows, token usage, clean preludes, manifest quality gates when present, packet-first compliance, sufficient packets with no unresolved diagnostics, and the explicit `--max-source-reads-after-packet` budget. Holdout/local task quality thresholds live in the task manifests; stats-log timing rows do not promote answer quality. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --packet-runtime-mode cold-cli --task-suite holdout-retrieval --materialize-repos --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli target/release/codestory-cli --timeout-ms 180000` | `scripts/codestory-agent-ab-benchmark.mjs`, `scripts/codestory-benchmark-contract.mjs`, `benchmarks/tasks/`, `docs/testing/retrieval-architecture.md` |
 
 Current telemetry snapshot from `docs/testing/codestory-e2e-stats-log.md`
@@ -152,10 +152,11 @@ local-cache provenance validators, and distinct exact `1..N` repeats matching
 the top-level modes/repeat contract. It also
 rechecks the raw stats object's `full_sidecar` tier, index/ground/search modes,
 manifest counts/hash/policy, zero index errors, and zero repeat embeddings.
-Repeat graph, semantic, and full-refresh limits are re-evaluated from the shared
-`repo-stats-contract.json`, whose values are asserted against the Rust harness
-constants so the downloaded-artifact gate cannot drift from the surviving
-release assertions.
+The promoted Rust stats run treats wall-clock variation as telemetry and emits
+living-baseline warnings while retaining those correctness assertions. The
+hardware-bound release-evidence gate separately re-evaluates repeat graph,
+semantic, and full-refresh limits from `repo-stats-contract.json` before an
+artifact can become release-eligible.
 
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
@@ -170,12 +171,40 @@ ordinary CI but are explicitly `release_eligible: false`. A product profile must
 be created from provisioned raw evidence and explicitly approved before a
 release workflow can adopt this gate.
 
-The corpus boundary is deliberately precise: it scans Rust production files in
-all non-benchmark crates for direct path strings and adjacent/split literal
-construction such as `concat!` and `include_str!`. It does not prove arbitrary
-runtime path generation, non-Rust production surfaces, environment/config
-indirection, or dependencies hidden behind external processes. Those surfaces
-remain explicit follow-up audit scope rather than being claimed as covered.
+The corpus boundary is deliberately precise. The generalization lint scans Rust
+production files in all non-benchmark crates for copied corpus content, direct
+paths, and adjacent/split literal construction. It also scans the following
+repository-controlled non-Rust surfaces for direct and adjacent/split
+dependencies on every inventoried evaluation/query corpus:
+
+The inventory is executable rather than documentation-only. Supported text and
+configuration files under `scripts/`, `.github/scripts/`,
+`.github/workflows/`, the shipped plugin, retrieval Compose configuration, and
+native backend metadata enter the protected scan by default. The tracked Codex
+environment definition is a required protected file. Only the explicit
+corpus/proof harness list, the named release-detector unit-test harness, and
+test/fixture directories are excluded; there are no blanket test-filename
+exceptions. Missing required protected or harness paths fail the lint so moves
+require review.
+
+| Classification | Protected or allowed surface | Static contract |
+| --- | --- | --- |
+| Product launch and setup | Plugin manifests, hooks, MCP launcher, grounding skill guidance/setup scripts, Codex environment/worktree setup, and the Windows installer | Protected; the configured directories are scanned recursively, while test and fixture directories are excluded. |
+| Runtime configuration | Retrieval Compose configuration and native sidecar backend metadata | Protected; new supported text/config files under those directories enter the scan automatically. |
+| Release control | Release/auto-release workflows, version detection/checking, package assembly, the release-evidence evaluator, and shared provenance validation | Protected; required files must exist, and protected non-Rust modules cannot import an explicitly classified corpus/proof harness module. |
+| Explicit corpus and test harnesses | Task manifests, packet/repo benchmark drivers and scorers, holdout provisioning, release-candidate measurement, the retrieval-sidecar contract workflow, the release-detector unit test, and test fixtures | Allowed to load evaluation corpora or exercise protected code; these paths are evidence producers/tests, not product or release-decision logic. Other scripts and workflows remain protected by default. |
+| Environment and generated inputs | Environment values, downloaded manifests/models, generated evidence, and workflow artifacts | Static code paths are protected where listed above. Runtime values and generated bytes require the existing schema, hash, identity, and provenance checks. |
+| External processes | Git, Docker/Qdrant, embedding servers, and agent executables | Static command construction is protected where it is part of a listed surface. The external executable's internal behavior is outside this repository scan. |
+
+The release evaluator now imports repository/cache provenance checks from
+`scripts/codestory-evidence-provenance.mjs`, a corpus-neutral module shared with
+the benchmark harness. It no longer loads the packet benchmark module—and its
+query catalog—as a transitive release-control dependency.
+
+This guard does not prove arbitrary runtime string generation, environment
+values, generated content, or external-process behavior. Those boundaries stay
+fail closed through the release-evidence attestation/runtime checks where a
+machine-verifiable contract exists; otherwise they remain explicit non-claims.
 
 Do not promote importable or rebuildable graph/sidecar artifacts in this slice.
 A follow-up PR for that idea must require provenance before reuse: source root,

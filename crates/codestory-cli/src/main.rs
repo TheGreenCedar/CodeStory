@@ -123,6 +123,7 @@ const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
 const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
     "\n\n... bundle content truncated by context bundle byte cap\n";
 const READY_REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+const READY_REPAIR_LOCAL_REFRESH_WAIT: Duration = Duration::from_secs(5 * 60);
 const READY_REPAIR_EMBED_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_REPAIR_EMBED_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 const MAX_DRILL_JOBS: usize = 8;
@@ -2892,6 +2893,18 @@ fn repair_ready_state(
     if let Some(reservation) = handoff_reservation.as_mut() {
         reservation.disarm();
     }
+    let local_refresh_handoff = if plugin_worker {
+        Some(
+            local_refresh_status::wait_for_local_refresh_lock(
+                &runtime.cache_root,
+                &runtime.project_root,
+                READY_REPAIR_LOCAL_REFRESH_WAIT,
+            )
+            .context("wait for local refresh before MCP ready repair")?,
+        )
+    } else {
+        None
+    };
     if let Some(sidecar) = sidecar.as_ref()
         && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
@@ -2961,6 +2974,7 @@ fn repair_ready_state(
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
+    drop(local_refresh_handoff);
     if !agent_goal {
         return Ok(None);
     }
@@ -9617,6 +9631,10 @@ mod tests {
             namespace: sidecar.namespace.clone(),
             compose_project: sidecar.compose_project.clone(),
             embed_url: codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port),
+            embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+            embedding_endpoint_fingerprint_sha256: sidecar
+                .ownership()
+                .embedding_endpoint_fingerprint_sha256,
             started_at_epoch_ms: 1,
             embedding_launch: Some(codestory_retrieval::EmbeddingLaunchMetadata {
                 provider: "vulkan".into(),

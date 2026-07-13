@@ -105,6 +105,9 @@ fn runtime_identity_supports_proof(
         || identity.namespace.is_empty()
         || identity.compose_project.is_empty()
         || identity.embed_url.is_empty()
+        || identity.embedding_endpoint_origin
+            != codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar
+        || identity.embedding_endpoint_fingerprint_sha256.is_empty()
         || identity.started_at_epoch_ms <= 0
     {
         return false;

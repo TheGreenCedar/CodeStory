@@ -167,6 +167,10 @@ fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval
         qdrant_grpc_port: 37033,
         embed_http_port: 37040,
         embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+        embedding_endpoint_origin: Some(
+            codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+        ),
+        embedding_endpoint_fingerprint_sha256: Some("hmac-sha256:fixture".to_string()),
         embedding_device_policy: "accelerator_required".to_string(),
         embedding_device_state: "gpu_verified".to_string(),
         embedding_device_observation_source: "test".to_string(),
@@ -216,23 +220,34 @@ fn native_launch_for_pid(pid: u32) -> codestory_retrieval::EmbeddingLaunchMetada
 }
 
 #[cfg(target_os = "macos")]
-fn spawn_macos_native_process_fixture() -> (
+fn spawn_macos_native_process_fixture(
+    endpoint: &str,
+    port: u16,
+) -> (
     std::process::Child,
     codestory_retrieval::EmbeddingLaunchMetadata,
 ) {
+    let launch_args = vec![
+        "-c".to_string(),
+        "while :; do sleep 30; done".to_string(),
+        "codestory-native".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
     let spawned_at_epoch_ms = now_epoch_ms();
-    let child = Command::new("/bin/sleep")
-        .arg("30")
+    let child = Command::new("/bin/bash")
+        .args(&launch_args)
         .spawn()
         .expect("spawn native-process fixture");
     let mut launch = native_launch_for_pid(child.id());
+    launch.endpoint = endpoint.to_string();
     launch.spawned_at_epoch_ms = Some(spawned_at_epoch_ms);
     launch.process_start_identity =
         codestory_retrieval::native_embedding_process_start_identity(child.id())
             .expect("query native-process fixture start identity");
-    launch.executable_path = Some("/bin/sleep".to_string());
-    launch.launch_args = vec!["30".to_string()];
-    launch.launch_fingerprint_sha256 = Some("sleep-fixture".to_string());
+    launch.executable_path = Some("/bin/bash".to_string());
+    launch.launch_args = launch_args;
+    launch.launch_fingerprint_sha256 = Some("shell-fixture".to_string());
     launch.model_path = None;
     launch.log_path = None;
     (child, launch)
@@ -263,6 +278,8 @@ fn gpu_runtime_identity(project: &Path, started_at_epoch_ms: i64) -> BrokerGpuRu
         namespace: "codestory-test".to_string(),
         compose_project: "codestory-test".to_string(),
         embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+        embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+        embedding_endpoint_fingerprint_sha256: "hmac-sha256:fixture".to_string(),
         started_at_epoch_ms,
         embedding_launch: None,
     }
@@ -297,6 +314,9 @@ fn matching_native_sidecar_state(
     state.qdrant_grpc_port = sidecar.layout.qdrant_grpc_port;
     state.embed_http_port = sidecar.ownership().ports.embed_http;
     state.embed_url = sidecar.embedding.endpoint.clone();
+    state.embedding_endpoint_origin = Some(sidecar.embedding.endpoint_origin);
+    state.embedding_endpoint_fingerprint_sha256 =
+        Some(sidecar.ownership().embedding_endpoint_fingerprint_sha256);
     if let Some(launch) = state.embedding_launch.as_mut() {
         launch.endpoint = state.embed_url.clone();
         launch.pid = Some(pid);
@@ -734,6 +754,9 @@ fn warm_reused_agent_state_binds_exact_broker_runtime_identity() {
     state.qdrant_grpc_port = initial.layout.qdrant_grpc_port;
     state.embed_http_port = shared_embed_port;
     state.embed_url = initial.embedding.endpoint.clone();
+    state.embedding_endpoint_origin = Some(initial.embedding.endpoint_origin);
+    state.embedding_endpoint_fingerprint_sha256 =
+        Some(initial.ownership().embedding_endpoint_fingerprint_sha256);
     state.started_at_epoch_ms = now_epoch_ms();
     if let Some(launch) = state.embedding_launch.as_mut() {
         launch.endpoint = state.embed_url.clone();
@@ -775,6 +798,17 @@ fn warm_reused_agent_state_binds_exact_broker_runtime_identity() {
     assert_eq!(identity.profile, "agent");
     assert_eq!(identity.run_id.as_deref(), Some(run_id));
     assert_eq!(identity.embed_url, state.embed_url);
+
+    let mut external = warm.clone();
+    external.embedding.endpoint =
+        "https://embedding.example/v1/embeddings?token=secret".to_string();
+    external.embedding.endpoint_origin =
+        codestory_retrieval::EmbeddingEndpointOrigin::ProcessEnvironment;
+    external.embedding.server_launch = Some("external_endpoint".to_string());
+    assert!(
+        gpu_runtime_identity_for_sidecar(&external, project.path(), &expected_identity).is_none(),
+        "external endpoints must never supply managed broker GPU identity"
+    );
 }
 
 #[test]
@@ -788,23 +822,13 @@ fn borrower_down_leaves_owner_native_process_and_machine_lock_intact() {
         codestory_retrieval::SidecarProfile::Agent,
         Some("owner-agent"),
     );
-    let borrower_runtime = test_sidecar_runtime(
+    let mut borrower_runtime = test_sidecar_runtime(
         project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("borrower-agent"),
     );
-    let mut owner_state = native_sidecar_state(Some(now_epoch_ms()));
-    owner_state.project_identity = owner_runtime.project_identity.clone();
-    owner_state.profile = owner_runtime.profile.as_str().to_string();
-    owner_state.namespace = owner_runtime.namespace.clone();
-    owner_state.compose_project = owner_runtime.compose_project.clone();
-    owner_state.run_id = owner_runtime.run_id.clone();
-    owner_state.qdrant_http_port = owner_runtime.layout.qdrant_http_port;
-    owner_state.qdrant_grpc_port = owner_runtime.layout.qdrant_grpc_port;
-    owner_state.embed_http_port = owner_runtime.embed_http_port;
-    owner_state.embed_url = owner_runtime.embedding.endpoint.clone();
-    owner_state.embedding_launch_ownership = codestory_retrieval::EmbeddingLaunchOwnership::Owner;
     let shared_pid = std::process::id();
+    let mut owner_state = matching_native_sidecar_state(&owner_runtime, shared_pid);
     {
         let launch = owner_state.embedding_launch.as_mut().expect("owner launch");
         launch.pid = Some(shared_pid);
@@ -817,6 +841,9 @@ fn borrower_down_leaves_owner_native_process_and_machine_lock_intact() {
     owner_runtime
         .use_broker_verified_native_embedding_endpoint(owner_state.embed_http_port)
         .expect("owner endpoint");
+    borrower_runtime
+        .use_broker_verified_native_embedding_endpoint(owner_state.embed_http_port)
+        .expect("borrower endpoint");
 
     let mut lock = match try_acquire_machine_resource_lock(&resource, &owner_scope)
         .expect("acquire owner machine lock")
@@ -1082,7 +1109,10 @@ fn aborted_pre_handoff_owner_exactly_stops_published_native_child_before_reacqui
     let status = launcher.wait().expect("wait abrupt launcher exit");
     assert_eq!(status.code(), Some(99));
 
-    let (mut native_child, launch) = spawn_macos_native_process_fixture();
+    let (mut native_child, launch) = spawn_macos_native_process_fixture(
+        &sidecar.embedding.endpoint,
+        sidecar.ownership().ports.embed_http,
+    );
     let mut state = matching_native_sidecar_state(&sidecar, native_child.id());
     state.embedding_launch = Some(launch);
     fs::create_dir_all(

@@ -14,19 +14,69 @@
   disabled, validation source is copied into the guest, lifecycle cleanup is
   ownership-scoped, and release evidence rejects stale identity attestations,
   host-home visibility, or any unexpected host-backed mount.
+- Reduced the packaged macOS proof to one check per release boundary. The
+  protected run still covers managed Metal cold/warm/recovery, exact process
+  reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned
+  cleanup; duplicated doctor/context smoke and speculative corrupt-install
+  variants no longer lengthen every proof run.
 - Staged CI proof by pull-request maturity and changed surface. Draft pushes
   now stay on one Ubuntu source lane, exact-head review promotion runs the full
   workspace test and clippy gate once, and explicit platform promotion selects
   no package matrix, the two Mac targets, or all six native targets. Promoted
-  heads run repo-scale stats once; signed package artifacts are built once per
-  target and reused by package smoke, notarization, install, and protected
-  Apple Silicon proof. Per-proof concurrency cancels stale heads, while the
-  integrated platform dispatcher verifies successful exact-head source proof,
-  and its integration mode proves the current `dev/codestory-next` merge result
-  before rechecking that dev did not move during the gate.
+  heads run repo-scale stats once and reuse each selected unsigned package for
+  package and install checks, with the Mac arm64 candidate also used for
+  protected Metal proof. The main-triggered release signs and notarizes Mac
+  binaries once before packaging and publication, failing closed on any Apple
+  error. Per-proof concurrency cancels stale heads, and the integration
+  dispatcher proves the current `dev/codestory-next` merge result before
+  rechecking that dev did not move during the gate.
+- Rewrote the repository agent guide around the current request-scoped MCP
+  workflow, crate ownership, identity/publication invariants, isolated test
+  contract, maturity-routed verification, and claim-specific release proof.
+- Kept promoted repo-scale stats as a correctness gate while making its
+  wall-clock measurements telemetry. Hardware-bound timing limits remain in
+  the release-evidence gate, so shared hosted runners no longer fail a Mac
+  platform proof for crossing a local-machine threshold by scheduler noise.
 
 ### Fixed
 
+- Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
+  generation artifact scopes to project identity schema 3. Legacy schema-2
+  state is discovered for inventory but never reused or destructively cleaned;
+  new Local and Agent state uses explicit `v3` namespaces and filenames so it
+  cannot collide with unversioned state. Mismatched state fails closed. Runtime
+  state also binds the non-secret
+  endpoint origin and an install-keyed full-endpoint HMAC-SHA256 fingerprint,
+  whose key is initialized once under a private lock and atomically published
+  with owner-only permissions,
+  external endpoints cannot supply managed GPU proof, and identity drift aborts
+  publication and query instead of mixing artifact scopes. Managed native state
+  also binds its launch endpoint and port arguments before reuse or cleanup, and
+  failed bootstrap cleanup removes its exact schema-3 state before preserving
+  owned schema-2 inventory. Native executable ownership now uses filesystem
+  identity instead of case-folded path text, requires an exact persisted process
+  start identity, and reconciles terminal repair results from the compatible
+  schema-2 coordination path during migration.
+- Recognized current llama.cpp's logger-prefixed Metal device inventory so
+  native offload proof remains bound to the selected provider and current
+  launch even when `ggml_metal_init` reports later in startup.
+- Included the aggregate release checksum manifest in reusable package
+  artifacts so protected hardware and installation proofs can provision the
+  exact packaged CLI without falling back to a network release lookup.
+- Kept the protected Metal proof runnable when the platform-only source-call
+  job is intentionally skipped, while still requiring successful routing and
+  package production before protected hardware starts.
+- Made Mac notarization retain its submission ID and retry status queries
+  across transient Apple transport failures. Terminal rejection still fails
+  immediately with the notarization log retained, and polling now has an
+  explicit one-hour bound.
+- Replaced the Windows native embedding process-start identity CIM probe with
+  the native process creation time. Immediate identity reads and snapshot start
+  times no longer depend on CIM convergence and retain the existing serialized
+  identity format.
+- Raised the bounded primary sidecar query window to 1.5 seconds so cold SCIP
+  and lexical stages can borrow enough request slack to complete without
+  changing incomplete or cancelled trace eligibility.
 - Made incremental freshness compare verified parser source hashes when file
   mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
   stale graph data current, while legacy and non-parser rows retain the
@@ -38,6 +88,23 @@
   project/workspace identity differs from the selected repository. `cache
   identity` now exposes the lossless project, workspace, artifact, and safe
   legacy-alias disposition used by that verification.
+- Separated release-evidence provenance validation from the benchmark corpus
+  loader and expanded the generalization guard across the repository-controlled
+  non-Rust product and release-control boundary. Direct and adjacent/split
+  evaluation-corpus dependencies now fail in plugin launch/setup surfaces,
+  worktree/install tooling, runtime configuration, release scripts/workflows,
+  and the release evaluator across native separators, case variants,
+  direct harness commands/configuration, comment-separated JavaScript imports,
+  unquoted shell continuations, workflow-embedded shell continuations, and
+  PowerShell continuations. Comment-only JavaScript and hash-commented
+  shell/config text is ignored, while Markdown prose stays outside evaluation
+  and dependency scanning. The CI trigger and focused regression contract cover
+  the full protected inventory, including local composite actions and shipped
+  agent instruction surfaces, and missing protected paths fail closed. Exact
+  release-policy references to the retrieval smoke workflow are allowed only
+  by file, literal, and use; every direct or constructed occurrence is checked,
+  and constructed dependencies must span the literals that form the matched
+  harness marker.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and
@@ -97,6 +164,21 @@
   refresh or repair ownership, activates through `ground`, observes one
   terminal `shared-agent` attempt and a newer complete local generation, and
   keeps packet/search closed without verified accelerator smoke.
+- Changed the protected Apple Silicon cold lifecycle to reach its first full
+  Agent generation through the managed plugin's `ground` activation instead
+  of `ready --repair`. The exact packaged runtime must now move from a stale
+  local publication and absent sidecars to verified Metal, serve packet/search
+  through the same MCP session, and reuse the native process after MCP restart.
+  Managed repair now retains the grounding-owned local refresh lock through
+  its index open instead of racing a second refresh and failing `cache_busy` on
+  larger repositories. Runtime-log proof records Metal as the detected
+  provider before packet/search can open, but only when a Metal runtime-init
+  marker and positive offload agree; requested-provider text and package paths
+  do not count. MCP now waits for the child to adopt its cache-owned repair
+  reservation before publishing the handoff, and proof cleanup trusts that
+  reservation even when the grounding response or first status poll fails.
+  Release packaging remains compatible with the system Python shipped by
+  macOS 15, including Docker 29's nanosecond creation timestamps.
 - Expanded managed-plugin provisioning, local grounding, repair handoff, and
   proof cleanup from Windows x64 to every shipped native release asset in both
   pre-publish and post-publish matrices. Linux proof containers now write

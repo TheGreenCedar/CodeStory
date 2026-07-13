@@ -1,9 +1,15 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use fs4::fs_std::FileExt;
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
+use std::fmt::Write as _;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -40,6 +46,14 @@ const LLAMA_SIDECAR_BACKENDS_JSON: &str = include_str!("../assets/llama-sidecar-
 const TEST_HOST_PLATFORM_ENV: &str = "CODESTORY_TEST_HOST_PLATFORM";
 const AGENT_PORT_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 const AGENT_PORT_REGISTRY_SCHEMA_VERSION: u32 = 2;
+pub(crate) const LOCAL_SIDECAR_NAMESPACE_V3: &str = "codestory-v3";
+pub(crate) const AGENT_SIDECAR_NAMESPACE_PREFIX_V3: &str = "codestory-agent-v3-";
+pub(crate) const SIDECAR_STATE_FILE_V3: &str = "retrieval-sidecars-v3.json";
+pub(crate) const LEGACY_SIDECAR_STATE_FILE: &str = "retrieval-sidecars.json";
+const EMBEDDING_ENDPOINT_FINGERPRINT_KEY_FILE: &str = "embedding-endpoint-fingerprint-hmac.key";
+const EMBEDDING_ENDPOINT_FINGERPRINT_KEY_LOCK_FILE: &str =
+    "embedding-endpoint-fingerprint-hmac.lock";
+const EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES: usize = 32;
 #[cfg(test)]
 const PORT_LEASE_ABORT_BASE_ENV: &str = "CODESTORY_TEST_PORT_LEASE_ABORT_BASE";
 #[cfg(test)]
@@ -312,7 +326,7 @@ pub struct SidecarPorts {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SidecarOwnership {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV3>,
     pub owner: String,
     pub profile: String,
     pub namespace: String,
@@ -322,12 +336,13 @@ pub struct SidecarOwnership {
     pub ports: SidecarPorts,
     #[serde(default)]
     pub embedding_endpoint_origin: EmbeddingEndpointOrigin,
+    pub embedding_endpoint_fingerprint_sha256: String,
     pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SidecarRuntimeConfig {
-    pub project_identity: Option<codestory_workspace::ProjectIdentityV2>,
+    pub project_identity: Option<codestory_workspace::ProjectIdentityV3>,
     pub layout: SidecarLayout,
     pub profile: SidecarProfile,
     pub run_id: Option<String>,
@@ -573,17 +588,34 @@ impl SidecarRuntimeConfig {
     ) -> Self {
         let base = cache_root.to_path_buf();
         let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id, defaults));
-        let namespace = namespace_for(project_root, profile, run_id.as_deref());
+        let project_identity = project_root.map(codestory_workspace::project_identity_v3);
+        let namespace = namespace_for(project_identity.as_ref(), profile, run_id.as_deref());
         let state_file = match profile {
-            SidecarProfile::Local => base.join("retrieval-sidecars.json"),
+            SidecarProfile::Local => base.join(SIDECAR_STATE_FILE_V3),
             SidecarProfile::Agent => base
                 .join("sidecars")
                 .join(&namespace)
-                .join("retrieval-sidecars.json"),
+                .join(SIDECAR_STATE_FILE_V3),
         };
-        let stored = read_ports_from_state(&state_file);
-        let stored_native_embedding =
-            profile == SidecarProfile::Agent && sidecar_state_uses_native_embedding(&state_file);
+        let embedding_selection =
+            embedding_runtime_config(DEFAULT_EMBED_HTTP_PORT, defaults, overrides);
+        let stored_value = read_sidecar_state_value(&state_file);
+        let stored_value = stored_value.filter(|value| {
+            sidecar_state_matches_runtime_selection(
+                value,
+                project_identity.as_ref(),
+                profile,
+                &namespace,
+                run_id.as_deref(),
+                &embedding_selection,
+                cache_root,
+            )
+        });
+        let stored = stored_value.as_ref().and_then(sidecar_ports_from_value);
+        let stored_native_embedding = profile == SidecarProfile::Agent
+            && stored_value
+                .as_ref()
+                .is_some_and(sidecar_state_uses_native_embedding);
         let configured_ports = [
             env_port(
                 defaults,
@@ -663,15 +695,16 @@ impl SidecarRuntimeConfig {
         let cleanup_command = project_root
             .map(|path| retrieval_command("down", path, profile, run_id.as_deref(), None))
             .unwrap_or_else(|| "codestory-cli retrieval down".to_string());
-        let project_identity = project_root.map(codestory_workspace::cached_project_identity_v2);
         let mut labels = BTreeMap::new();
         labels.insert("dev.codestory.owner".into(), "codestory".into());
         labels.insert("dev.codestory.profile".into(), profile.as_str().into());
         labels.insert("dev.codestory.namespace".into(), namespace.clone());
         if let Some(project_root) = project_root {
-            let hash = project_hash(project_root);
-            labels.insert("dev.codestory.project_hash".into(), hash.clone());
             if let Some(identity) = project_identity.as_ref() {
+                labels.insert(
+                    "dev.codestory.project_hash".into(),
+                    identity.workspace_id.clone(),
+                );
                 labels.insert(
                     "dev.codestory.project_id".into(),
                     identity.project_id.clone(),
@@ -750,8 +783,50 @@ impl SidecarRuntimeConfig {
                 embed_url: redacted_embedding_endpoint(&self.embedding.endpoint),
             },
             embedding_endpoint_origin: self.embedding.endpoint_origin,
+            embedding_endpoint_fingerprint_sha256: self
+                .embedding_endpoint_fingerprint()
+                .unwrap_or_default(),
             labels: self.labels.clone(),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn legacy_state_path_for_compatibility(&self) -> Option<PathBuf> {
+        legacy_state_path_for_runtime(self)
+    }
+
+    pub(crate) fn embedding_endpoint_fingerprint(&self) -> Result<String> {
+        let cache_root = self
+            .cache_root()
+            .context("derive cache root for the embedding endpoint fingerprint key")?;
+        embedding_endpoint_fingerprint_sha256(&self.embedding.endpoint, cache_root)
+    }
+
+    fn cache_root(&self) -> Option<&Path> {
+        match self.profile {
+            SidecarProfile::Local => self.layout.state_file.parent(),
+            SidecarProfile::Agent => self.layout.state_file.ancestors().nth(3),
+        }
+    }
+
+    pub(crate) fn validated_project_identity(
+        &self,
+        project_root: &Path,
+    ) -> Result<codestory_workspace::ProjectIdentityV3> {
+        let current = codestory_workspace::project_identity_v3(project_root);
+        let Some(retained) = self.project_identity.as_ref() else {
+            return Ok(current);
+        };
+        if retained != &current {
+            anyhow::bail!(
+                "project identity changed after sidecar runtime selection: retained_workspace_id={} retained_artifact_scope_id={} current_workspace_id={} current_artifact_scope_id={}; rebuild the runtime before publishing or querying retrieval artifacts",
+                retained.workspace_id,
+                retained.artifact_scope_id,
+                current.workspace_id,
+                current.artifact_scope_id,
+            );
+        }
+        Ok(retained.clone())
     }
 
     pub(crate) fn ensure_ports_allocated(&self) -> Result<()> {
@@ -1287,37 +1362,101 @@ fn auto_runtime_selection(
 }
 
 fn namespace_for(
-    project_root: Option<&Path>,
+    project_identity: Option<&codestory_workspace::ProjectIdentityV3>,
     profile: SidecarProfile,
     run_id: Option<&str>,
 ) -> String {
-    match (profile, project_root) {
-        (SidecarProfile::Local, _) => "codestory".into(),
-        (SidecarProfile::Agent, Some(path)) => {
+    match (profile, project_identity) {
+        (SidecarProfile::Local, _) => LOCAL_SIDECAR_NAMESPACE_V3.into(),
+        (SidecarProfile::Agent, Some(identity)) => {
             format!(
-                "codestory-agent-{}-{}",
-                project_hash(path),
+                "{AGENT_SIDECAR_NAMESPACE_PREFIX_V3}{}-{}",
+                identity.workspace_id,
                 run_id.unwrap_or("run")
             )
         }
         (SidecarProfile::Agent, None) => format!(
-            "codestory-agent-{}-{}",
+            "{AGENT_SIDECAR_NAMESPACE_PREFIX_V3}{}-{}",
             std::process::id(),
             run_id.unwrap_or("run")
         ),
     }
 }
 
-fn project_hash(project_root: &Path) -> String {
-    fnv1a_hex(project_root.to_string_lossy().as_bytes())
+fn agent_namespace_prefix(project_root: &Path) -> String {
+    format!(
+        "{AGENT_SIDECAR_NAMESPACE_PREFIX_V3}{}-",
+        codestory_workspace::workspace_id_v3_for_root(project_root)
+    )
 }
 
-fn agent_namespace_prefix(project_root: &Path) -> String {
-    format!("codestory-agent-{}-", project_hash(project_root))
+fn legacy_agent_namespace_prefix(project_root: &Path) -> String {
+    format!(
+        "codestory-agent-{}-",
+        fnv1a_hex(project_root.to_string_lossy().as_bytes())
+    )
+}
+
+pub(crate) fn legacy_state_file_for_runtime(runtime: &SidecarRuntimeConfig) -> Option<PathBuf> {
+    let path = legacy_state_path_for_runtime(runtime)?;
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() {
+        return None;
+    }
+    let legacy_namespace = match runtime.profile {
+        SidecarProfile::Local => "codestory",
+        SidecarProfile::Agent => path.parent()?.file_name()?.to_str()?,
+    };
+    let value = read_sidecar_state_value(&path)?;
+    let project_identity_matches = match runtime.labels.get("dev.codestory.workspace_root") {
+        Some(project_root) => value
+            .get("project_identity")
+            .cloned()
+            .and_then(|identity| serde_json::from_value(identity).ok())
+            .is_some_and(|stored: codestory_workspace::ProjectIdentityV2| {
+                stored == codestory_workspace::project_identity_v2(Path::new(project_root))
+            }),
+        None => value
+            .get("project_identity")
+            .is_none_or(serde_json::Value::is_null),
+    };
+    let owned_legacy_state = value.get("owner").and_then(serde_json::Value::as_str)
+        == Some("codestory")
+        && value.get("profile").and_then(serde_json::Value::as_str)
+            == Some(runtime.profile.as_str())
+        && value.get("namespace").and_then(serde_json::Value::as_str) == Some(legacy_namespace)
+        && value
+            .get("compose_project")
+            .and_then(serde_json::Value::as_str)
+            == Some(legacy_namespace)
+        && value.get("run_id").and_then(serde_json::Value::as_str) == runtime.run_id.as_deref()
+        && project_identity_matches;
+    owned_legacy_state.then_some(path)
+}
+
+pub(crate) fn legacy_state_path_for_runtime(runtime: &SidecarRuntimeConfig) -> Option<PathBuf> {
+    let cache_root = runtime.cache_root()?;
+    let path = match runtime.profile {
+        SidecarProfile::Local => cache_root.join(LEGACY_SIDECAR_STATE_FILE),
+        SidecarProfile::Agent => {
+            let project_root = Path::new(runtime.labels.get("dev.codestory.workspace_root")?);
+            let legacy_namespace = format!(
+                "{}{}",
+                legacy_agent_namespace_prefix(project_root),
+                runtime.run_id.as_deref().unwrap_or("run")
+            );
+            cache_root
+                .join("sidecars")
+                .join(legacy_namespace)
+                .join(LEGACY_SIDECAR_STATE_FILE)
+        }
+    };
+    (path != runtime.layout.state_file).then_some(path)
 }
 
 fn latest_agent_run_id_in_cache(project_root: &Path, cache_root: &Path) -> Option<String> {
     let prefix = agent_namespace_prefix(project_root);
+    let project_identity = codestory_workspace::project_identity_v3(project_root);
     let sidecars_root = cache_root.join("sidecars");
     let entries = std::fs::read_dir(sidecars_root).ok()?;
     let mut newest: Option<(std::time::SystemTime, String)> = None;
@@ -1335,14 +1474,26 @@ fn latest_agent_run_id_in_cache(project_root: &Path, cache_root: &Path) -> Optio
         else {
             continue;
         };
-        let state_file = entry.path().join("retrieval-sidecars.json");
-        if !state_file.is_file() {
+        let state_file = entry.path().join(SIDECAR_STATE_FILE_V3);
+        let Ok(metadata) = std::fs::symlink_metadata(&state_file) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
             continue;
         }
-        let modified = state_file
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let Some(value) = read_sidecar_state_value(&state_file) else {
+            continue;
+        };
+        if !current_v3_state_ownership_matches(&value, &namespace)
+            || value.get("run_id").and_then(serde_json::Value::as_str) != Some(run_id.as_str())
+            || !project_identity_matches_runtime(
+                sidecar_state_project_identity(&value).as_ref(),
+                Some(&project_identity),
+            )
+        {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         if newest
             .as_ref()
             .is_none_or(|(current, _)| modified > *current)
@@ -1374,6 +1525,150 @@ pub(crate) fn redacted_embedding_endpoint(endpoint: &str) -> String {
     format!("{scheme}://{host}{}", &path[..path_end])
 }
 
+fn embedding_endpoint_fingerprint_sha256(endpoint: &str, cache_root: &Path) -> Result<String> {
+    let key = embedding_endpoint_fingerprint_key(cache_root)?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+    let digest = hmac::sign(&key, endpoint.as_bytes());
+    let mut fingerprint = String::with_capacity("hmac-sha256:".len() + 64);
+    fingerprint.push_str("hmac-sha256:");
+    for byte in digest.as_ref() {
+        write!(&mut fingerprint, "{byte:02x}").expect("write endpoint fingerprint to string");
+    }
+    Ok(fingerprint)
+}
+
+fn embedding_endpoint_fingerprint_key(cache_root: &Path) -> Result<[u8; 32]> {
+    std::fs::create_dir_all(cache_root)
+        .with_context(|| format!("create CodeStory cache root {}", cache_root.display()))?;
+    let lock_path = cache_root.join(EMBEDDING_ENDPOINT_FINGERPRINT_KEY_LOCK_FILE);
+    let lock = open_private_regular_file(&lock_path, true)?;
+    FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("lock endpoint fingerprint key {}", lock_path.display()))?;
+    let path = cache_root.join(EMBEDDING_ENDPOINT_FINGERPRINT_KEY_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => validate_private_regular_metadata(&path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut key = [0_u8; EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES];
+            SystemRandom::new()
+                .fill(&mut key)
+                .map_err(|_| anyhow::anyhow!("generate endpoint fingerprint key"))?;
+            codestory_workspace::atomic_file::write_file_atomic(
+                &path,
+                "embedding-endpoint-fingerprint-key",
+                |file| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                            .context("set endpoint fingerprint key mode to 0600")?;
+                    }
+                    file.write_all(&key)
+                        .context("write endpoint fingerprint key temporary file")
+                },
+                |temp_path| {
+                    let metadata = std::fs::symlink_metadata(temp_path).with_context(|| {
+                        format!("inspect endpoint fingerprint key {}", temp_path.display())
+                    })?;
+                    validate_private_regular_metadata(temp_path, &metadata)?;
+                    if metadata.len() != EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES as u64 {
+                        bail!("endpoint fingerprint key temporary file has an invalid length");
+                    }
+                    Ok(())
+                },
+            )
+            .with_context(|| format!("publish endpoint fingerprint key {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect endpoint fingerprint key {}", path.display()));
+        }
+    }
+    read_private_fingerprint_key(&path)
+}
+
+fn open_private_regular_file(path: &Path, initialize: bool) -> Result<File> {
+    let file = if initialize {
+        let mut options = private_file_open_options();
+        match options.create_new(true).open(path) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                private_file_open_options().open(path)
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        private_file_open_options().open(path)
+    }
+    .with_context(|| format!("open private file {}", path.display()))?;
+    let path_metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect private file {}", path.display()))?;
+    validate_private_regular_metadata(path, &path_metadata)?;
+    let file_metadata = file
+        .metadata()
+        .with_context(|| format!("inspect opened private file {}", path.display()))?;
+    if !file_metadata.file_type().is_file() {
+        bail!("private file {} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            bail!(
+                "private file {} changed while it was opened",
+                path.display()
+            );
+        }
+    }
+    Ok(file)
+}
+
+fn private_file_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+fn validate_private_regular_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    if !metadata.file_type().is_file() {
+        bail!("private file {} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "private file {} is accessible outside its owner (mode {:o})",
+                path.display(),
+                mode & 0o777
+            );
+        }
+    }
+    Ok(())
+}
+
+fn read_private_fingerprint_key(path: &Path) -> Result<[u8; 32]> {
+    let file = open_private_regular_file(path, false)?;
+    let mut bytes = Vec::with_capacity(EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES + 1);
+    file.take((EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read endpoint fingerprint key {}", path.display()))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!(
+            "endpoint fingerprint key {} has {} bytes; expected {}",
+            path.display(),
+            bytes.len(),
+            EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES
+        )
+    })
+}
+
 fn default_agent_run_id() -> String {
     DEFAULT_AGENT_RUN_ID.to_string()
 }
@@ -1401,26 +1696,129 @@ fn normalized_label_component(value: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn read_ports_from_state(path: &Path) -> Option<SidecarPorts> {
-    let value =
-        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()?;
-    sidecar_ports_from_value(&value)
+fn read_sidecar_state_value(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-fn sidecar_state_uses_native_embedding(path: &Path) -> bool {
-    serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).unwrap_or_default())
-        .ok()
-        .and_then(|value| {
-            value
-                .get("embedding_launch")?
-                .get("launch_mode")?
-                .as_str()
-                .map(str::to_string)
-        })
+fn sidecar_state_project_identity(
+    value: &serde_json::Value,
+) -> Option<codestory_workspace::ProjectIdentityV3> {
+    serde_json::from_value(value.get("project_identity")?.clone()).ok()
+}
+
+pub(crate) fn current_v3_state_ownership_matches(
+    value: &serde_json::Value,
+    discovered_namespace: &str,
+) -> bool {
+    let profile = value.get("profile").and_then(serde_json::Value::as_str);
+    let project_identity = sidecar_state_project_identity(value);
+    let current_generation = project_identity.as_ref().is_some_and(|identity| {
+        identity.project_identity_schema_version
+            == codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION
+    });
+    let profile_matches = (discovered_namespace == LOCAL_SIDECAR_NAMESPACE_V3
+        && profile == Some("local")
+        && (project_identity.is_none() || current_generation))
+        || (discovered_namespace.starts_with(AGENT_SIDECAR_NAMESPACE_PREFIX_V3)
+            && profile == Some("agent")
+            && current_generation);
+    profile_matches
+        && value.get("owner").and_then(serde_json::Value::as_str) == Some("codestory")
+        && value.get("namespace").and_then(serde_json::Value::as_str) == Some(discovered_namespace)
+        && value
+            .get("compose_project")
+            .and_then(serde_json::Value::as_str)
+            == Some(discovered_namespace)
+}
+
+pub(crate) fn project_identity_matches_runtime(
+    stored: Option<&codestory_workspace::ProjectIdentityV3>,
+    current: Option<&codestory_workspace::ProjectIdentityV3>,
+) -> bool {
+    match (stored, current) {
+        (None, None) => true,
+        (Some(stored), Some(current))
+            if stored.project_identity_schema_version
+                == codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION =>
+        {
+            stored == current
+        }
+        _ => false,
+    }
+}
+
+fn sidecar_state_matches_runtime_selection(
+    value: &serde_json::Value,
+    project_identity: Option<&codestory_workspace::ProjectIdentityV3>,
+    profile: SidecarProfile,
+    namespace: &str,
+    run_id: Option<&str>,
+    embedding: &EmbeddingRuntimeConfig,
+    cache_root: &Path,
+) -> bool {
+    value.get("owner").and_then(serde_json::Value::as_str) == Some("codestory")
+        && value.get("profile").and_then(serde_json::Value::as_str) == Some(profile.as_str())
+        && value.get("namespace").and_then(serde_json::Value::as_str) == Some(namespace)
+        && value
+            .get("compose_project")
+            .and_then(serde_json::Value::as_str)
+            == Some(namespace)
+        && value.get("run_id").and_then(serde_json::Value::as_str) == run_id
+        && project_identity_matches_runtime(
+            sidecar_state_project_identity(value).as_ref(),
+            project_identity,
+        )
+        && sidecar_state_embedding_selection_matches(value, embedding, cache_root)
+}
+
+fn sidecar_state_embedding_selection_matches(
+    value: &serde_json::Value,
+    embedding: &EmbeddingRuntimeConfig,
+    cache_root: &Path,
+) -> bool {
+    let stored_origin = value
+        .get("embedding_endpoint_origin")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let stored_endpoint = value.get("embed_url").and_then(serde_json::Value::as_str);
+    let stored_fingerprint = value
+        .get("embedding_endpoint_fingerprint_sha256")
+        .and_then(serde_json::Value::as_str);
+    if stored_origin != Some(embedding.endpoint_origin) {
+        return false;
+    }
+    match embedding.endpoint_origin {
+        EmbeddingEndpointOrigin::ManagedSidecar => stored_endpoint.is_some_and(|endpoint| {
+            let Ok(endpoint_fingerprint) =
+                embedding_endpoint_fingerprint_sha256(endpoint, cache_root)
+            else {
+                return false;
+            };
+            local_embedding_endpoint_port(endpoint).is_some()
+                && stored_fingerprint == Some(endpoint_fingerprint.as_str())
+        }),
+        _ => {
+            let Ok(expected_fingerprint) =
+                embedding_endpoint_fingerprint_sha256(&embedding.endpoint, cache_root)
+            else {
+                return false;
+            };
+            let expected_endpoint = redacted_embedding_endpoint(&embedding.endpoint);
+            stored_endpoint == Some(expected_endpoint.as_str())
+                && stored_fingerprint == Some(expected_fingerprint.as_str())
+        }
+    }
+}
+
+fn sidecar_state_uses_native_embedding(value: &serde_json::Value) -> bool {
+    value
+        .get("embedding_launch")
+        .and_then(|launch| launch.get("launch_mode"))
+        .and_then(serde_json::Value::as_str)
         .is_some_and(|mode| mode == EmbeddingServerLaunchMode::NativeSpawned.as_str())
 }
 
-fn local_embedding_endpoint_port(endpoint: &str) -> Option<u16> {
+pub(crate) fn local_embedding_endpoint_port(endpoint: &str) -> Option<u16> {
     endpoint
         .strip_prefix("http://127.0.0.1:")
         .and_then(|rest| rest.strip_suffix("/v1/embeddings"))
@@ -1828,7 +2226,7 @@ fn sidecar_state_owns_ports(root: &Path, namespace: &str, ports: &SidecarPorts) 
 }
 
 fn owned_sidecar_state_ports(root: &Path, namespace: &str) -> Result<Option<SidecarPorts>> {
-    let path = root.join(namespace).join("retrieval-sidecars.json");
+    let path = root.join(namespace).join(SIDECAR_STATE_FILE_V3);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2459,6 +2857,7 @@ pub fn dir_size_bytes(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     #[test]
@@ -2502,7 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn project_runtime_exposes_v2_identity_without_changing_namespace_contract() {
+    fn project_runtime_exposes_v3_identity_and_namespace() {
         let _lock = crate::test_support::env_lock();
         let project = tempdir().expect("project");
         let _cache = EnvGuard::set(
@@ -2512,6 +2911,11 @@ mod tests {
         let runtime =
             SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
         let identity = runtime.project_identity.as_ref().expect("project identity");
+
+        assert_eq!(
+            identity.project_identity_schema_version,
+            codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION
+        );
 
         assert_eq!(
             runtime.labels.get("dev.codestory.project_id"),
@@ -2526,11 +2930,10 @@ mod tests {
             Some(&identity.artifact_scope_id)
         );
         assert!(
-            runtime.namespace.starts_with(&format!(
-                "codestory-agent-{}-",
-                project_hash(project.path())
-            )),
-            "0.14 identity metadata must not rename existing sidecar namespaces"
+            runtime
+                .namespace
+                .starts_with(&format!("codestory-agent-v3-{}-", identity.workspace_id)),
+            "agent namespaces must use the lossless workspace identity"
         );
         assert_eq!(
             runtime.ownership().project_identity.as_ref(),
@@ -2584,13 +2987,22 @@ mod tests {
         );
         std::fs::create_dir_all(first.layout.state_file.parent().expect("state parent"))
             .expect("state dir");
+        let ownership = first.ownership();
         std::fs::write(
             &first.layout.state_file,
             serde_json::to_vec(&serde_json::json!({
+                "project_identity": first.project_identity,
+                "owner": "codestory",
+                "profile": first.profile.as_str(),
+                "namespace": first.namespace,
+                "compose_project": first.compose_project,
+                "run_id": first.run_id,
                 "qdrant_http_port": first.layout.qdrant_http_port,
                 "qdrant_grpc_port": first.layout.qdrant_grpc_port,
                 "embed_http_port": first.embed_http_port,
-                "embed_url": SidecarLayout::embed_base_url(first.embed_http_port),
+                "embed_url": ownership.ports.embed_url,
+                "embedding_endpoint_origin": ownership.embedding_endpoint_origin,
+                "embedding_endpoint_fingerprint_sha256": ownership.embedding_endpoint_fingerprint_sha256,
             }))
             .expect("state json"),
         )
@@ -2611,6 +3023,136 @@ mod tests {
             first.layout.qdrant_grpc_port
         );
         assert_eq!(second.embed_http_port, first.embed_http_port);
+    }
+
+    #[test]
+    fn schema_two_identity_is_never_accepted_as_runtime_identity() {
+        let project = tempdir().expect("project");
+        let current = codestory_workspace::project_identity_v3(project.path());
+        let legacy = codestory_workspace::project_identity_v2(project.path());
+        let stored: codestory_workspace::ProjectIdentityV3 = serde_json::from_value(
+            serde_json::to_value(&legacy).expect("serialize legacy identity"),
+        )
+        .expect("read legacy identity through migration shape");
+
+        assert!(!project_identity_matches_runtime(
+            Some(&stored),
+            Some(&current)
+        ));
+        assert!(project_identity_matches_runtime(
+            Some(&current),
+            Some(&current)
+        ));
+    }
+
+    #[test]
+    fn retained_runtime_identity_fails_closed_after_reobservation_drift() {
+        let project = tempdir().expect("project");
+        let mut runtime = SidecarRuntimeConfig::for_project_profile_with_run_id(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("identity-drift"),
+        );
+        let retained = runtime
+            .validated_project_identity(project.path())
+            .expect("matching retained identity");
+        assert_eq!(
+            retained,
+            codestory_workspace::project_identity_v3(project.path())
+        );
+
+        runtime
+            .project_identity
+            .as_mut()
+            .expect("retained identity")
+            .artifact_scope_id = "stale-artifact-scope".to_string();
+        let error = runtime
+            .validated_project_identity(project.path())
+            .expect_err("identity drift must fail closed");
+
+        assert!(format!("{error:#}").contains("project identity changed"));
+    }
+
+    #[test]
+    fn legacy_agent_namespace_is_discovered_but_not_selected() {
+        let cache = tempdir().expect("cache");
+        let project = tempdir().expect("project");
+        let noncanonical_project = project.path().join(".");
+        let run_id = "legacy-run";
+        let legacy_namespace = format!(
+            "{}{}",
+            legacy_agent_namespace_prefix(&noncanonical_project),
+            run_id
+        );
+        let legacy_state_file = cache
+            .path()
+            .join("sidecars")
+            .join(&legacy_namespace)
+            .join(LEGACY_SIDECAR_STATE_FILE);
+        std::fs::create_dir_all(legacy_state_file.parent().expect("legacy state parent"))
+            .expect("legacy state directory");
+        std::fs::write(&legacy_state_file, b"{}\n").expect("legacy state file");
+
+        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(&noncanonical_project),
+            SidecarProfile::Agent,
+            Some(run_id),
+            cache.path(),
+        );
+
+        assert_eq!(legacy_state_file_for_runtime(&runtime), None);
+        let legacy_identity = codestory_workspace::project_identity_v2(&noncanonical_project);
+        std::fs::write(
+            &legacy_state_file,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "project_identity": legacy_identity,
+                "owner": "codestory",
+                "profile": "agent",
+                "namespace": legacy_namespace,
+                "compose_project": legacy_namespace,
+                "run_id": run_id,
+            }))
+            .expect("owned legacy state json"),
+        )
+        .expect("owned legacy state");
+
+        assert_eq!(
+            legacy_state_file_for_runtime(&runtime).as_ref(),
+            Some(&legacy_state_file)
+        );
+        assert_ne!(runtime.layout.state_file, legacy_state_file);
+        assert_eq!(
+            latest_agent_run_id_in_cache(&noncanonical_project, cache.path()),
+            None
+        );
+
+        let v3_run_id = "current-run";
+        let v3_runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            Some(&noncanonical_project),
+            SidecarProfile::Agent,
+            Some(v3_run_id),
+            cache.path(),
+        );
+        std::fs::create_dir_all(
+            v3_runtime
+                .layout
+                .state_file
+                .parent()
+                .expect("v3 state parent"),
+        )
+        .expect("v3 state directory");
+        let mut v3_state = serde_json::to_value(v3_runtime.ownership()).expect("v3 ownership");
+        v3_state["run_id"] = serde_json::json!(v3_run_id);
+        std::fs::write(
+            &v3_runtime.layout.state_file,
+            serde_json::to_vec_pretty(&v3_state).expect("owned v3 state json"),
+        )
+        .expect("owned v3 state");
+
+        assert_eq!(
+            latest_agent_run_id_in_cache(&noncanonical_project, cache.path()).as_deref(),
+            Some(v3_run_id)
+        );
     }
 
     #[test]
@@ -2878,10 +3420,37 @@ mod tests {
     fn write_owned_state(root: &Path, namespace: &str, ports: &SidecarPorts) {
         std::fs::create_dir_all(root.join(namespace)).expect("namespace");
         std::fs::write(
-            root.join(namespace).join("retrieval-sidecars.json"),
+            root.join(namespace).join(SIDECAR_STATE_FILE_V3),
             serde_json::to_vec(&serde_json::json!({
                 "owner": "codestory",
                 "namespace": namespace,
+                "qdrant_http_port": ports.qdrant_http,
+                "qdrant_grpc_port": ports.qdrant_grpc,
+                "embed_http_port": ports.embed_http,
+                "embed_url": ports.embed_url,
+            }))
+            .expect("state"),
+        )
+        .expect("state");
+    }
+
+    fn write_owned_agent_state(
+        root: &Path,
+        project: &Path,
+        namespace: &str,
+        run_id: &str,
+        ports: &SidecarPorts,
+    ) {
+        std::fs::create_dir_all(root.join(namespace)).expect("namespace");
+        std::fs::write(
+            root.join(namespace).join(SIDECAR_STATE_FILE_V3),
+            serde_json::to_vec(&serde_json::json!({
+                "project_identity": codestory_workspace::project_identity_v3(project),
+                "owner": "codestory",
+                "profile": "agent",
+                "namespace": namespace,
+                "compose_project": namespace,
+                "run_id": run_id,
                 "qdrant_http_port": ports.qdrant_http,
                 "qdrant_grpc_port": ports.qdrant_grpc,
                 "embed_http_port": ports.embed_http,
@@ -3043,7 +3612,7 @@ mod tests {
         )
         .expect("registry");
         std::fs::write(
-            root.join(namespace).join("retrieval-sidecars.json"),
+            root.join(namespace).join(SIDECAR_STATE_FILE_V3),
             serde_json::to_vec(&serde_json::json!({
                 "owner": "codestory",
                 "namespace": namespace,
@@ -3089,7 +3658,7 @@ mod tests {
         let cache = tempdir().expect("cache");
         let root = cache.path().join("sidecars").join("current");
         std::fs::create_dir_all(&root).expect("namespace");
-        std::fs::write(root.join("retrieval-sidecars.json"), b"{").expect("state");
+        std::fs::write(root.join(SIDECAR_STATE_FILE_V3), b"{").expect("state");
 
         let error = allocate_agent_ports_in_registry_at(cache.path(), "current", [None; 3], 100)
             .expect_err("malformed state must fail closed");
@@ -3180,7 +3749,13 @@ mod tests {
             .get(&latest_namespace)
             .expect("latest lease")
             .ports;
-        write_owned_state(&root, &latest_namespace, latest_ports);
+        write_owned_agent_state(
+            &root,
+            project.path(),
+            &latest_namespace,
+            "run-255",
+            latest_ports,
+        );
         let retained_namespace_dirs = std::fs::read_dir(&root)
             .expect("sidecars root")
             .flatten()
@@ -3396,7 +3971,7 @@ mod tests {
         assert_eq!(selected.layout.qdrant_http_port, DEFAULT_QDRANT_HTTP_PORT);
         assert_eq!(
             selected.layout.state_file,
-            cache.path().join("retrieval-sidecars.json")
+            cache.path().join(SIDECAR_STATE_FILE_V3)
         );
         assert_eq!(selected.embedding, retained.embedding);
         assert!(!selected.layout.state_file.starts_with(poison_cache.path()));
@@ -3422,10 +3997,17 @@ mod tests {
 
     #[test]
     fn ownership_redacts_external_embedding_endpoint_secrets() {
-        let mut runtime = SidecarRuntimeConfig::local();
+        let cache = tempdir().expect("cache");
+        let mut runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            None,
+            SidecarProfile::Local,
+            None,
+            cache.path(),
+        );
         runtime.embedding.endpoint =
             "http://username-secret:password-secret@127.0.0.1:8080/v1/embeddings?token=query-secret#fragment-secret"
                 .into();
+        runtime.embedding.endpoint_origin = EmbeddingEndpointOrigin::ProcessEnvironment;
 
         let ownership = runtime.ownership();
 
@@ -3440,6 +4022,101 @@ mod tests {
             "fragment-secret",
         ] {
             assert!(!ownership.ports.embed_url.contains(secret));
+        }
+        assert_eq!(
+            ownership.embedding_endpoint_fingerprint_sha256,
+            runtime
+                .embedding_endpoint_fingerprint()
+                .expect("keyed endpoint fingerprint")
+        );
+        assert!(
+            ownership
+                .embedding_endpoint_fingerprint_sha256
+                .starts_with("hmac-sha256:")
+        );
+        assert_ne!(
+            ownership.embedding_endpoint_fingerprint_sha256,
+            format!(
+                "{:x}",
+                Sha256::digest(runtime.embedding.endpoint.as_bytes())
+            )
+        );
+        let mut restarted = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+            None,
+            SidecarProfile::Local,
+            None,
+            cache.path(),
+        );
+        restarted.embedding.endpoint = runtime.embedding.endpoint.clone();
+        restarted.embedding.endpoint_origin = runtime.embedding.endpoint_origin;
+        let retained = restarted.ownership();
+        assert_eq!(
+            retained.embedding_endpoint_fingerprint_sha256,
+            ownership.embedding_endpoint_fingerprint_sha256
+        );
+
+        runtime.embedding.endpoint =
+            "http://different-user:different-password@127.0.0.1:8080/v1/embeddings?token=different"
+                .into();
+        let different_secret = runtime.ownership();
+        assert_eq!(different_secret.ports.embed_url, ownership.ports.embed_url);
+        assert_ne!(
+            different_secret.embedding_endpoint_fingerprint_sha256,
+            ownership.embedding_endpoint_fingerprint_sha256
+        );
+    }
+
+    #[test]
+    fn endpoint_fingerprint_key_publication_is_atomic_and_rejects_unsafe_files() {
+        let cache = tempdir().expect("cache");
+        let cache = std::sync::Arc::new(cache.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = [(), ()].map(|()| {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                embedding_endpoint_fingerprint_key(&cache).expect("fingerprint key")
+            })
+        });
+        let keys = workers.map(|worker| worker.join().expect("fingerprint worker"));
+        let key_path = cache.join(EMBEDDING_ENDPOINT_FINGERPRINT_KEY_FILE);
+
+        assert_eq!(keys[0], keys[1]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            assert_eq!(
+                std::fs::metadata(&key_path)
+                    .expect("key metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            let unsafe_cache = tempdir().expect("unsafe cache");
+            let unsafe_key = unsafe_cache
+                .path()
+                .join(EMBEDDING_ENDPOINT_FINGERPRINT_KEY_FILE);
+            let external = unsafe_cache.path().join("external-key");
+            std::fs::write(&external, [7_u8; EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES])
+                .expect("external key");
+            symlink(&external, &unsafe_key).expect("key symlink");
+            assert!(embedding_endpoint_fingerprint_key(unsafe_cache.path()).is_err());
+            assert_eq!(
+                std::fs::read(&external).expect("external key remains"),
+                [7_u8; EMBEDDING_ENDPOINT_FINGERPRINT_KEY_BYTES]
+            );
+            std::fs::remove_file(&unsafe_key).expect("remove symlink");
+            let lock_path = unsafe_cache
+                .path()
+                .join(EMBEDDING_ENDPOINT_FINGERPRINT_KEY_LOCK_FILE);
+            std::fs::remove_file(&lock_path).expect("remove initialized lock");
+            let dangling_target = unsafe_cache.path().join("dangling-lock-target");
+            symlink(&dangling_target, &lock_path).expect("dangling lock symlink");
+            assert!(embedding_endpoint_fingerprint_key(unsafe_cache.path()).is_err());
+            assert!(!dangling_target.exists());
         }
     }
 

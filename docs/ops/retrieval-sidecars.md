@@ -222,7 +222,7 @@ not match your machine. On Windows PowerShell, set them with `$env:NAME =
 built binary.
 
 `retrieval bootstrap` may start Docker Compose, create sidecar cache dirs, write
-`retrieval-sidecars.json`, and repair CodeStory-owned local sidecar state. For a
+`retrieval-sidecars-v3.json`, and repair CodeStory-owned local sidecar state. For a
 no-change prerequisite check, run:
 
 ```sh
@@ -388,9 +388,13 @@ Cache-root and profile layout:
 | Windows default | `%LOCALAPPDATA%\codestory\codestory\cache` |
 | macOS default | `~/Library/Caches/dev.codestory.codestory` |
 | Linux default | `$XDG_CACHE_HOME/codestory`, normally `~/.cache/codestory` |
-| Local profile | `<cache>/{lexical,qdrant,scip,retrieval-sidecars.json}` with configurable Qdrant/embed ports |
-| Managed Agent profile | `<cache>/sidecars/<namespace>/{lexical,qdrant,scip,retrieval-sidecars.json}` with dynamic or persisted Qdrant/embed ports |
+| Local profile | `<cache>/{lexical,qdrant,scip,retrieval-sidecars-v3.json}` in namespace `codestory-v3`, with configurable Qdrant/embed ports |
+| Managed Agent profile | `<cache>/sidecars/codestory-agent-v3-<workspace>-<run>/{lexical,qdrant,scip,retrieval-sidecars-v3.json}` with dynamic or persisted Qdrant/embed ports |
 | Agent port registry | `<cache>/sidecars/port-allocations.json`, with atomic `port-leases/<namespace>.json` recovery records |
+
+Unversioned `retrieval-sidecars.json` files and pre-v3 Agent namespaces remain
+visible to inventory, but current runtimes never select, overwrite, or clean
+them automatically.
 
 Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
 `target/retrieval-models` are accepted only after pinned size and SHA-256
@@ -449,16 +453,23 @@ To refresh an image pin safely:
 
 ### Manifest and generation contract
 
-CodeStory 0.14 separates three identities:
+CodeStory separates three schema-3 identities:
 
 - `project_id` identifies the logical repository when a canonical Git remote is
   available, otherwise it falls back to the workspace id.
-- `workspace_id` is the existing FNV-1a hash of the canonical workspace root and
-  scopes live processes, locks, ports, and local state.
+- `workspace_id` is the FNV-1a hash of the canonical workspace root's native OS
+  bytes/code units and scopes live processes, locks, ports, and local state.
 - `artifact_scope_id` uses `project_id` only when portable reuse is eligible;
   dirty or unidentified workspaces fail closed to `workspace_id`.
 
-Existing namespace and manifest paths are not renamed during the 0.14 upgrade.
+Agent namespaces and generation roots use these schema-3 ids. Legacy schema-2
+state is discoverable through inventory but is never reused or destructively
+cleaned by a schema-3 runtime. Missing, mismatched, and foreign identity fails
+closed and rebuilds; use the inventory report for provenance-aware cleanup.
+Persisted state also binds the endpoint origin and an install-keyed full-endpoint
+HMAC-SHA256 fingerprint, so redacted endpoints with different credentials cannot
+share ownership or managed GPU proof without exposing an offline credential
+guessing oracle. The HMAC key remains private in the trusted cache.
 Sidecar artifacts are content-addressed by:
 
 ```text

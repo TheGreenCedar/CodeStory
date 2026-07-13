@@ -60,6 +60,7 @@ const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
 const STDIO_RECENT_REPAIR_TTL: Duration = Duration::from_secs(30);
 const STDIO_READY_REPAIR_OUTPUT_TAIL_BYTES: usize = 32 * 1024;
 const STDIO_READY_REPAIR_RESERVATION_HEARTBEAT: Duration = Duration::from_secs(5);
+const STDIO_READY_REPAIR_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
 const STDIO_AUTO_REPAIR_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
@@ -5365,8 +5366,20 @@ fn handle_stdio_sidecar_repair(
         .stderr(Stdio::piped())
         .spawn()
     {
-        Ok(child) => {
+        Ok(mut child) => {
             let child_pid = child.id();
+            if let Err(error) =
+                crate::ready_repair_status::wait_for_ready_repair_reservation_adoption(
+                    &repair_sidecar,
+                    &attempt_id,
+                    child_pid,
+                    STDIO_READY_REPAIR_HANDOFF_TIMEOUT,
+                )
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return serde_json::json!({"error": format!("ready repair worker handoff failed: {error:#}")});
+            }
             reservation.disarm();
             monitor_stdio_ready_repair_worker(
                 child,
@@ -6547,6 +6560,8 @@ mod tests {
             namespace: "codestory-agent-test".to_string(),
             compose_project: "codestory-agent-test".to_string(),
             embed_url: "http://127.0.0.1:18080".to_string(),
+            embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+            embedding_endpoint_fingerprint_sha256: "hmac-sha256:fixture".to_string(),
             started_at_epoch_ms: 1,
             embedding_launch: None,
         });

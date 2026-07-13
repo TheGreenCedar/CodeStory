@@ -35,6 +35,39 @@ function namedStep(job, name) {
   return job.slice(start, relativeEnd < 0 ? undefined : start + 1 + relativeEnd);
 }
 
+function yamlJobWithValue(job, key) {
+  const withStart = job.indexOf("    with:");
+  if (withStart < 0) return undefined;
+  const relativeEnd = job.slice(withStart + 1).findIndex((line) => /^    \S/u.test(line));
+  const withLines = job.slice(
+    withStart + 1,
+    relativeEnd < 0 ? undefined : withStart + 1 + relativeEnd,
+  );
+  const prefix = `      ${key}:`;
+  const values = withLines
+    .filter((line) => line.startsWith(prefix))
+    .map((line) => line.slice(prefix.length).trim());
+  return values.length === 1 ? values[0] : undefined;
+}
+
+function packagedPrSigningPolicyViolations(content) {
+  const found = [];
+  const packagedProofJob = yamlJob(content, "packaged-proof");
+  if (yamlJobWithValue(packagedProofJob, "sign_macos") !== "false") {
+    found.push("named packaged-proof job must set with.sign_macos to false");
+  }
+  if (packagedProofJob.some((line) => /^    secrets:/u.test(line))) {
+    found.push("named packaged-proof job must not receive caller secrets");
+  }
+  if (/\bAPPLE_[A-Z0-9_]+\b/u.test(content)) {
+    found.push("must not reference Apple secret identifiers");
+  }
+  if (content.includes("macos-release-signing")) {
+    found.push("must not reference the release signing environment");
+  }
+  return found;
+}
+
 function requireContent(content, requirements, violationFor) {
   for (const requirement of requirements) {
     if (!content.includes(requirement)) {
@@ -71,9 +104,15 @@ function requireManagedPluginStep(content, jobName, workflowName, archiveLine) {
   if (!managedPluginMatrixIsRequired(content, jobName, archiveLine)) {
     violations.push(`${workflowName} must run the managed plugin handoff unconditionally in every matrix cell`);
   }
+  const matrixBypass = content.includes("      matrix: ${{ fromJSON")
+    ? content.replace(
+        /^      matrix: \$\{\{ fromJSON.*$/mu,
+        "      matrix:\n        exclude:\n          - os: never",
+      )
+    : content.replace("      matrix:\n", "      matrix:\n        exclude:\n          - os: never\n");
   const policyBypasses = [
     ["fail-fast", content.replace("      fail-fast: false\n", "")],
-    ["matrix exclude", content.replace("      matrix:\n", "      matrix:\n        exclude:\n          - os: never\n")],
+    ["matrix exclude", matrixBypass],
     ["job if", content.replace(`  ${jobName}:\n`, `  ${jobName}:\n    if: always()\n`)],
     [
       "job continue-on-error",
@@ -284,7 +323,7 @@ if (!fs.existsSync(releaseWorkflow)) {
     "APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}",
     "APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}",
     "uses: ./.github/workflows/macos-metal-proof.yml",
-    "use_packaged_artifact: true",
+    "use_packaged_cli_artifact: true",
     "version: ${{ needs.preflight.outputs.version }}",
     "uses: ./.github/workflows/post-publish-release-smoke.yml",
     "--notes-file target/release-assets/proof-boundaries.md",
@@ -326,13 +365,24 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "--managed-plugin-handoff",
     "sign_macos:",
     "environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}",
+    "timeout-minutes: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60 }}",
     "APPLE_DEVELOPER_ID_P12_BASE64",
     "APPLE_NOTARY_KEY_P8_BASE64",
     "umask 077",
     "chmod 600 \"$work_dir/developer-id.p12\" \"$work_dir/notary-key.p8\"",
+    "security list-keychains -d user -s \"$keychain\"",
+    "--sign \"$signing_hash\"",
     "--options runtime",
     "--timestamp",
     "xcrun notarytool submit",
+    "--no-wait",
+    "notarytool-submission-id.txt",
+    'xcrun notarytool info "$submission_id"',
+    "max_notary_attempts=120",
+    "notary_poll_seconds=30",
+    "Invalid|Rejected)",
+    'xcrun notarytool log "$submission_id"',
+    "Notarization timed out after",
     "jq -e '.status == \"Accepted\"'",
     "source=Notarized Developer ID",
     "TeamIdentifier=${APPLE_DEVELOPER_TEAM_ID}",
@@ -349,8 +399,20 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "ref:",
     "cancel-in-progress: true",
     "codestory-cli-default-features",
-    "exclude: ${{ fromJSON(inputs.scope == 'macos'",
+    "matrix: ${{ fromJSON(inputs.scope == 'macos'",
   ], snippet => `packaged-platform-proof.yml must include ${snippet}`);
+  const macosSigningStep = namedStep(yamlJob(content, "build"), "Sign and notarize macOS CLI").join("\n");
+  const blockingNotaryWait = /^\s+--wait(?:\s|\\|$)/mu;
+  if (blockingNotaryWait.test(macosSigningStep)) {
+    violations.push("packaged-platform-proof.yml must poll notarization explicitly instead of using notarytool --wait");
+  }
+  const blockingWaitBypass = namedStep(
+    yamlJob(content.replace("--no-wait", "--wait"), "build"),
+    "Sign and notarize macOS CLI",
+  ).join("\n");
+  if (!blockingNotaryWait.test(blockingWaitBypass)) {
+    violations.push("packaged-platform-proof.yml blocking notary wait policy did not detect its bypass fixture");
+  }
   const releaseAssetStart = content.indexOf("- name: Upload release asset");
   const notarizationProofStart = content.indexOf("- name: Upload macOS notarization proof");
   const releaseAssetBlock = releaseAssetStart >= 0
@@ -359,13 +421,38 @@ if (!fs.existsSync(packagedPlatformProof)) {
   if (releaseAssetBlock.includes("target/notarization-proof")) {
     violations.push("packaged-platform-proof.yml must keep notarization evidence out of the flat binary release artifact");
   }
+  if (!releaseAssetBlock.includes("target/release-dist/SHA256SUMS.txt")) {
+    violations.push("packaged-platform-proof.yml must include SHA256SUMS.txt in each reusable package artifact");
+  }
+  const matrixMatch = content.match(
+    /^      matrix: \$\{\{ fromJSON\(inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\) \}\}$/mu,
+  );
+  const expectedFullMatrix = {
+    include: [
+      { os: "ubuntu-latest", rust_target: "x86_64-unknown-linux-gnu", asset_target: "linux-x64", exe_suffix: "", extension: "tar.gz" },
+      { os: "ubuntu-24.04-arm", rust_target: "aarch64-unknown-linux-gnu", asset_target: "linux-arm64", exe_suffix: "", extension: "tar.gz" },
+      { os: "windows-latest", rust_target: "x86_64-pc-windows-msvc", asset_target: "windows-x64", exe_suffix: ".exe", extension: "zip" },
+      { os: "windows-11-arm", rust_target: "aarch64-pc-windows-msvc", asset_target: "windows-arm64", exe_suffix: ".exe", extension: "zip" },
+      { os: "macos-15-intel", rust_target: "x86_64-apple-darwin", asset_target: "macos-x64", exe_suffix: "", extension: "tar.gz" },
+      { os: "macos-15", rust_target: "aarch64-apple-darwin", asset_target: "macos-arm64", exe_suffix: "", extension: "tar.gz" },
+    ],
+  };
+  const expectedMacMatrix = {
+    include: expectedFullMatrix.include.filter(row => row.asset_target.startsWith("macos-")),
+  };
+  try {
+    const macMatrix = matrixMatch && JSON.parse(matrixMatch[1]);
+    const fullMatrix = matrixMatch && JSON.parse(matrixMatch[2]);
+    if (JSON.stringify(macMatrix) !== JSON.stringify(expectedMacMatrix)) {
+      violations.push("packaged-platform-proof.yml macos scope must contain exactly the two Mac package rows");
+    }
+    if (JSON.stringify(fullMatrix) !== JSON.stringify(expectedFullMatrix)) {
+      violations.push("packaged-platform-proof.yml full scope must contain exactly all six native package rows");
+    }
+  } catch {
+    violations.push("packaged-platform-proof.yml package matrices must be valid JSON objects");
+  }
   requireContent(content, [
-    "- os: ubuntu-latest\n            rust_target: x86_64-unknown-linux-gnu\n            asset_target: linux-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
-    "- os: ubuntu-24.04-arm\n            rust_target: aarch64-unknown-linux-gnu\n            asset_target: linux-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
-    "- os: windows-latest\n            rust_target: x86_64-pc-windows-msvc\n            asset_target: windows-x64\n            exe_suffix: \".exe\"\n            extension: zip",
-    "- os: windows-11-arm\n            rust_target: aarch64-pc-windows-msvc\n            asset_target: windows-arm64\n            exe_suffix: \".exe\"\n            extension: zip",
-    "- os: macos-15-intel\n            rust_target: x86_64-apple-darwin\n            asset_target: macos-x64\n            exe_suffix: \"\"\n            extension: tar.gz",
-    "- os: macos-15\n            rust_target: aarch64-apple-darwin\n            asset_target: macos-arm64\n            exe_suffix: \"\"\n            extension: tar.gz",
     "if: matrix.asset_target == 'windows-x64'\n        shell: pwsh\n        run: pwsh -File scripts/install-codestory.ps1 -SelfTest",
   ], row => `packaged-platform-proof.yml must preserve native proof block ${row.split("\n")[0]}`);
   requireManagedPluginStep(
@@ -455,11 +542,49 @@ if (!fs.existsSync(packagedPlatformPr)) {
     "uses: ./.github/workflows/repo-scale-stats.yml",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
     "scope: ${{ needs.route.outputs.scope }}",
-    "sign_macos: true",
+    "always() &&\n      needs.route.result == 'success' &&\n      needs.packaged-proof.result == 'success' &&",
     "uses: ./.github/workflows/macos-metal-proof.yml",
-    "use_packaged_artifact: true",
+    "use_packaged_cli_artifact: true",
     "dev/codestory-next moved from proved head",
   ], snippet => `packaged-platform-pr.yml must include ${snippet}`);
+  for (const violation of packagedPrSigningPolicyViolations(content)) {
+    violations.push(`packaged-platform-pr.yml ${violation}`);
+  }
+  const signingPolicyMutations = [
+    [
+      "sign_macos true",
+      content.replace("      sign_macos: false", "      sign_macos: true"),
+    ],
+    [
+      "explicit secrets mapping",
+      content.replace(
+        "      sign_macos: false",
+        "      sign_macos: false\n    secrets:\n      PACKAGE_PROOF_TOKEN: ${{ secrets.PACKAGE_PROOF_TOKEN }}",
+      ),
+    ],
+    [
+      "inherited secrets",
+      content.replace("      sign_macos: false", "      sign_macos: false\n    secrets: inherit"),
+    ],
+    [
+      "Apple secret identifier",
+      content.replace("      sign_macos: false", "      sign_macos: false\n    # APPLE_NOTARY_KEY_ID"),
+    ],
+    [
+      "release signing environment",
+      content.replace(
+        "  packaged-proof:\n",
+        "  packaged-proof:\n    environment: macos-release-signing\n",
+      ),
+    ],
+  ];
+  for (const [name, candidate] of signingPolicyMutations) {
+    if (candidate === content) {
+      violations.push(`packaged-platform-pr.yml could not apply ${name} policy mutation`);
+    } else if (packagedPrSigningPolicyViolations(candidate).length === 0) {
+      violations.push(`packaged-platform-pr.yml signing policy accepted ${name} mutation`);
+    }
+  }
   if ((content.match(/branches\/dev\/codestory-next/gu) ?? []).length < 2) {
     violations.push("packaged-platform-pr.yml must verify the dev head before and after integration proof");
   }
@@ -479,7 +604,7 @@ if (!fs.existsSync(macosMetalProof)) {
   requireContent(content, [
     "workflow_call:",
     "workflow_dispatch:",
-    "use_packaged_artifact:",
+    "use_packaged_cli_artifact:",
     "runs-on: [self-hosted, macOS, ARM64, codestory-metal]",
     "environment: macos-metal-release",
     "actions/download-artifact@v8.0.1",
@@ -488,7 +613,7 @@ if (!fs.existsSync(macosMetalProof)) {
     "python3 --version",
     "test \"$macos_major\" -ge 15",
     "--native-accelerator-lifecycle",
-    "--native-edge-cases",
+    "--managed-plugin-grounding-convergence",
     "CODESTORY_PROOF_TEMP_ROOT:",
     "Clean and assert proof-owned hardware state",
     "--cleanup-proof-temp-root",

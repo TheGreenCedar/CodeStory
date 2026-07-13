@@ -5,10 +5,10 @@ use crate::embeddings::{EmbeddingDeviceReadiness, embedding_device_readiness_for
 use crate::executor::{QueryExecutor, QueryResult, cancellation_flag};
 use crate::generation::manifest_unavailable_reason_for_runtime;
 use crate::health::probe_sidecar_health_for_runtime;
-use crate::index::{query_fingerprint, sidecar_project_id_for_root};
+use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::query_features::classify_query;
-use crate::sidecar::validate_strict_sidecar_readiness;
+use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
 use crate::sidecar_search::LiveSidecarSearch;
 use crate::sidecar_search::SidecarSearch;
 use anyhow::{Context, Result, bail};
@@ -317,16 +317,19 @@ fn load_query_context(
 ) -> Result<QueryContext> {
     let embedding_device = embedding_device_readiness_for_runtime(runtime);
     let layout = runtime.layout.clone();
-    let project_id = sidecar_project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
     let (manifest, file_roles) = if storage_path.exists() {
         let storage = Store::open(storage_path).context("open storage for query")?;
         let manifest = storage
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
         if let Some(manifest) = manifest.as_ref() {
-            if let Err(error) =
-                validate_strict_sidecar_readiness(project_root, storage_path, &storage)
-            {
+            if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
+                project_root,
+                storage_path,
+                &storage,
+                runtime,
+            ) {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
                 );

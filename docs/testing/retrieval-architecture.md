@@ -158,7 +158,7 @@ Non-claims:
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
 | Packet integration | `codestory-runtime/src/agent/retrieval_primary.rs` | Primary sidecar path, diagnostic traces, promotion warnings |
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
-| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Derives banned identities, prompts, claims, paths, and query/probe phrases from benchmark manifests, script prompt/query catalogs, and the eval-only probe manifest/source, then scans Rust production retrieval trees after masking test-only items (CI via Rust guard test); missing, malformed, or partially parsed corpora fail closed |
+| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Derives banned identities, prompts, claims, paths, and query/probe phrases from benchmark manifests, script prompt/query catalogs, and the eval-only probe manifest/source. It scans Rust production retrieval trees after masking test-only items and structurally scans the inventoried non-Rust product/release-control boundary for direct or adjacent/split corpus dependencies (CI via the Rust guard test); missing protected paths and missing, malformed, or partially parsed corpora fail closed. |
 
 All planned retrieval stages use the same fixed-capacity worker pool, including
 symbol-like and natural-language queries. Each job carries the request deadline
@@ -174,7 +174,8 @@ result remains diagnostic and is never inserted into the retrieval cache.
 Each runnable stage may use elapsed request slack after reserving the planned budgets of later
 stages, and the final planned stage may use whatever request budget remains. This keeps every lane
 bounded without stranding time in static allowances. Traces report each effective deadline, and
-the total request deadline still bounds cancellation and cache eligibility. Once a stage records
+the primary single-query request window is capped at 1.5 seconds; the total request deadline still
+bounds cancellation and cache eligibility. Once a stage records
 a blocking deadline, later request-deadline or marginal-gain exits retain that first reason so
 partial results cannot become packet-eligible or cacheable.
 

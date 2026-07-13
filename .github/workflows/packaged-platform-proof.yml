@@ -61,42 +61,13 @@ jobs:
     # The six APPLE_* credentials are an environment-scoped release contract;
     # repository-only secrets are not the supported signing configuration.
     environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60 }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            asset_target: linux-x64
-            exe_suffix: ""
-            extension: tar.gz
-          - os: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-            asset_target: linux-arm64
-            exe_suffix: ""
-            extension: tar.gz
-          - os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            asset_target: windows-x64
-            exe_suffix: ".exe"
-            extension: zip
-          - os: windows-11-arm
-            rust_target: aarch64-pc-windows-msvc
-            asset_target: windows-arm64
-            exe_suffix: ".exe"
-            extension: zip
-          - os: macos-15-intel
-            rust_target: x86_64-apple-darwin
-            asset_target: macos-x64
-            exe_suffix: ""
-            extension: tar.gz
-          - os: macos-15
-            rust_target: aarch64-apple-darwin
-            asset_target: macos-arm64
-            exe_suffix: ""
-            extension: tar.gz
-        exclude: ${{ fromJSON(inputs.scope == 'macos' && '[{"asset_target":"linux-x64"},{"asset_target":"linux-arm64"},{"asset_target":"windows-x64"},{"asset_target":"windows-arm64"}]' || '[]') }}
+      # GitHub applies matrix exclusions before includes, so an include-only
+      # matrix must select the complete row set rather than trying to exclude
+      # rows after the fact.
+      matrix: ${{ fromJSON(inputs.scope == 'macos' && '{"include":[{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-24.04-arm","rust_target":"aarch64-unknown-linux-gnu","asset_target":"linux-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","asset_target":"windows-arm64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -196,13 +167,18 @@ jobs:
             -s \
             -k "$keychain_password" \
             "$keychain"
+          security list-keychains -d user -s "$keychain"
           security find-identity -v -p codesigning "$keychain" | tee "$proof_dir/signing-identities.txt"
+          signing_hash="$(awk -v identity="$APPLE_SIGNING_IDENTITY" \
+            'index($0, "\"" identity "\"") { print $2; exit }' \
+            "$proof_dir/signing-identities.txt")"
+          grep -Eq '^[0-9A-Fa-f]{40}$' <<<"$signing_hash"
           codesign \
             --force \
             --options runtime \
             --timestamp \
             --keychain "$keychain" \
-            --sign "$APPLE_SIGNING_IDENTITY" \
+            --sign "$signing_hash" \
             "$bin"
           codesign --verify --strict --verbose=2 "$bin"
           codesign -dv --verbose=4 "$bin" 2> "$proof_dir/codesign-details.txt"
@@ -219,8 +195,86 @@ jobs:
             --key "$work_dir/notary-key.p8" \
             --key-id "$APPLE_NOTARY_KEY_ID" \
             --issuer "$APPLE_NOTARY_ISSUER_ID" \
-            --wait \
-            --output-format json | tee "$proof_dir/notarytool-result.json"
+            --no-wait \
+            --output-format json | tee "$proof_dir/notarytool-submission.json"
+          submission_id="$(jq -er \
+            '.id | select(type == "string" and test("^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$"))' \
+            "$proof_dir/notarytool-submission.json")"
+          printf '%s\n' "$submission_id" > "$proof_dir/notarytool-submission-id.txt"
+
+          notary_accepted=false
+          max_notary_attempts=120
+          notary_poll_seconds=30
+          notary_poll_log="$proof_dir/notarytool-poll.log"
+          for attempt in $(seq 1 "$max_notary_attempts"); do
+            notary_info="$work_dir/notarytool-info.json"
+            notary_error="$work_dir/notarytool-info-error.txt"
+            if xcrun notarytool info "$submission_id" \
+              --key "$work_dir/notary-key.p8" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --output-format json > "$notary_info" 2> "$notary_error"
+            then
+              if notary_status="$(jq -er '.status | select(type == "string")' "$notary_info")"
+              then
+                cp "$notary_info" "$proof_dir/notarytool-result.json"
+                printf 'attempt=%s status=%s\n' "$attempt" "$notary_status" >> "$notary_poll_log"
+                case "$notary_status" in
+                  Accepted)
+                    notary_accepted=true
+                    break
+                    ;;
+                  "In Progress")
+                    ;;
+                  Invalid|Rejected)
+                    notary_log_retained=false
+                    for log_attempt in 1 2 3; do
+                      if xcrun notarytool log "$submission_id" \
+                        --key "$work_dir/notary-key.p8" \
+                        --key-id "$APPLE_NOTARY_KEY_ID" \
+                        --issuer "$APPLE_NOTARY_ISSUER_ID" \
+                        "$proof_dir/notarytool-log.json" \
+                        >> "$notary_poll_log" 2>&1 \
+                        && [ -s "$proof_dir/notarytool-log.json" ]
+                      then
+                        notary_log_retained=true
+                        break
+                      fi
+                      if [ "$log_attempt" -lt 3 ]; then
+                        sleep 5
+                      fi
+                    done
+                    if [ "$notary_log_retained" != true ]; then
+                      printf 'Apple rejected submission %s, but its notarization log could not be retrieved.\n' \
+                        "$submission_id" > "$proof_dir/notarytool-log-unavailable.txt"
+                    fi
+                    cat "$proof_dir/notarytool-result.json"
+                    echo "::error::Apple rejected notarization submission $submission_id with status $notary_status"
+                    exit 1
+                    ;;
+                  *)
+                    cat "$proof_dir/notarytool-result.json"
+                    echo "::error::Apple returned unexpected notarization status '$notary_status' for $submission_id"
+                    exit 1
+                    ;;
+                esac
+              else
+                printf 'attempt=%s malformed_info_response\n' "$attempt" >> "$notary_poll_log"
+                cat "$notary_info" >> "$notary_poll_log"
+              fi
+            else
+              printf 'attempt=%s transport_error\n' "$attempt" >> "$notary_poll_log"
+              cat "$notary_error" >> "$notary_poll_log"
+            fi
+            if [ "$attempt" -lt "$max_notary_attempts" ]; then
+              sleep "$notary_poll_seconds"
+            fi
+          done
+          if [ "$notary_accepted" != true ]; then
+            tail -n 40 "$notary_poll_log" || true
+            echo "::error::Notarization timed out after $((max_notary_attempts * notary_poll_seconds / 60)) minutes for submission $submission_id"
+            exit 1
+          fi
           jq -e '.status == "Accepted"' "$proof_dir/notarytool-result.json"
 
           cp "$bin" "$work_dir/codestory-cli-quarantined"
@@ -415,6 +469,7 @@ jobs:
             target/release-dist/*.tar.gz
             target/release-dist/*.zip
             target/release-dist/*.sha256
+            target/release-dist/SHA256SUMS.txt
           if-no-files-found: error
 
       - name: Upload macOS notarization proof

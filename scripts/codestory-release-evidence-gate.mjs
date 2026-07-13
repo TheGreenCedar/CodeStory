@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import {
   cacheProvenanceBlockers,
   repoProvenanceBlockers,
-} from "./codestory-agent-ab-benchmark.mjs";
+} from "./codestory-evidence-provenance.mjs";
 
 const METRICS = [
   "status_seconds", "local_grounding_seconds", "convergence_seconds",
