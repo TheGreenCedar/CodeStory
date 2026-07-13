@@ -1139,7 +1139,7 @@ fn write_ready_repair_status_file(
     let status = serde_json::json!({
         "schema_version": 1,
         "status": "repairing",
-        "project_root": clean_path_text(project),
+        "project_root": producer_path_text(project),
         "profile": "agent",
         "run_id": run_id,
         "namespace": sidecar.namespace,
@@ -1157,6 +1157,16 @@ fn write_ready_repair_status_file(
     path
 }
 
+fn producer_path_text(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
 fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
     let status_path = cache_root.join("local-refresh-status.json");
     let lock_path = cache_root.join("local-refresh.lock");
@@ -1166,7 +1176,7 @@ fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
             "status": "refreshing",
-            "project_root": clean_path_text(project),
+            "project_root": producer_path_text(project),
             "phase": "incremental_index",
             "pid": u32::MAX,
             "started_at_epoch_ms": old_started,
@@ -1180,7 +1190,7 @@ fn write_stale_local_refresh(cache_root: &Path, project: &Path) {
         &lock_path,
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
-            "project_root": clean_path_text(project),
+            "project_root": producer_path_text(project),
             "pid": u32::MAX,
             "started_at_epoch_ms": old_started,
             "token": "stale"
@@ -1276,7 +1286,7 @@ fn reconcile_before_enqueue_for_sidecar_keeps_abandoned_cleanup_in_retained_root
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema_version": 1,
             "status": "repairing",
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "profile": "agent",
             "run_id": run_id,
             "namespace": retained_sidecar.namespace,
@@ -1398,7 +1408,7 @@ fn reconcile_before_enqueue_reports_live_stale_local_refresh_without_cleanup() {
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
             "status": "refreshing",
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "phase": "incremental_index",
             "pid": std::process::id(),
             "started_at_epoch_ms": old,
@@ -1412,7 +1422,7 @@ fn reconcile_before_enqueue_reports_live_stale_local_refresh_without_cleanup() {
         cache.path().join("local-refresh.lock"),
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "pid": std::process::id(),
             "started_at_epoch_ms": old,
             "token": "live-stale"
@@ -1449,7 +1459,7 @@ fn reconcile_before_enqueue_preserves_renewed_live_local_refresh_owner() {
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
             "status": "refreshing",
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "phase": "incremental_index",
             "pid": std::process::id(),
             "owner_token": "renewed-live",
@@ -1464,7 +1474,7 @@ fn reconcile_before_enqueue_preserves_renewed_live_local_refresh_owner() {
         cache.path().join("local-refresh.lock"),
         serde_json::to_string(&serde_json::json!({
             "schema_version": 1,
-            "project_root": clean_path_text(project.path()),
+            "project_root": producer_path_text(project.path()),
             "pid": std::process::id(),
             "started_at_epoch_ms": old,
             "token": "renewed-live"
