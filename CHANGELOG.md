@@ -15,6 +15,12 @@
   background. Status now reports the in-process provisioning state, and the
   launcher hands the next request to the verified stdio runtime without a host
   restart.
+- Changed six-platform managed acceptance from an explicit repair handoff to
+  the real grounding convergence path. The proof now seeds a complete local
+  publication, makes it stale with sidecars absent, proves status changes no
+  refresh or repair ownership, activates through `ground`, observes one
+  terminal `shared-agent` attempt and a newer complete local generation, and
+  keeps packet/search closed without verified accelerator smoke.
 - Expanded managed-plugin provisioning, local grounding, repair handoff, and
   proof cleanup from Windows x64 to every shipped native release asset in both
   pre-publish and post-publish matrices. Linux proof containers now write

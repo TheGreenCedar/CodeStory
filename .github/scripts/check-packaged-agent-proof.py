@@ -166,6 +166,45 @@ def proof_environment(base: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def write_managed_convergence_fixture(project: Path) -> None:
+    (project / "src").mkdir(parents=True)
+    (project / "Cargo.toml").write_text(
+        '[package]\nname = "managed-convergence-fixture"\nversion = "0.1.0"\nedition = "2024"\n',
+        encoding="utf-8",
+    )
+    (project / "src" / "lib.rs").write_text(
+        "pub fn complete_publication() -> &'static str { \"initial\" }\n",
+        encoding="utf-8",
+    )
+
+
+def make_managed_convergence_fixture_stale(project: Path) -> None:
+    time.sleep(0.05)
+    (project / "src" / "lib.rs").write_text(
+        "pub fn complete_publication() -> &'static str { \"refreshed\" }\n",
+        encoding="utf-8",
+    )
+    (project / "src" / "new_after_publication.rs").write_text(
+        "pub fn discovered_after_publication() {}\n",
+        encoding="utf-8",
+    )
+
+
+def proof_ownership_snapshot(cache_root: Path) -> dict[str, str]:
+    names = {
+        "local-refresh.lock",
+        "local-refresh-status.json",
+        "ready-repair-enqueue.lock",
+        "ready-repair-result.json",
+        "ready-repair-status.json",
+    }
+    return {
+        str(path.relative_to(cache_root)): sha256_file(path)
+        for path in cache_root.rglob("*")
+        if path.is_file() and path.name in names
+    }
+
+
 def validated_proof_compose_state(cache_root: Path, project: Path, read_state) -> tuple[Path, dict] | None:
     if cache_root.is_symlink() or project.is_symlink():
         raise RuntimeError("proof cache and project roots must not be symlinks")
@@ -909,10 +948,11 @@ def plugin_stdio_handoff(
     timeout_secs: int,
     expected_version: str,
     archive_cli: Path,
+    empty_model_dir: Path,
 ) -> dict:
     require_plugin_manifest_version(plugin_root, expected_version)
     launcher = plugin_root / "scripts" / "codestory-mcp.cjs"
-    require(launcher.is_file(), "managed_plugin_handoff", artifact, f"plugin launcher is missing: {launcher}")
+    require(launcher.is_file(), "managed_plugin_convergence", artifact, f"plugin launcher is missing: {launcher}")
     with temporary_directory_with_retry("codestory-plugin-data-", artifact.parent) as data:
         plugin_data = Path(data)
         policy_path = plugin_data / "sidecar-setup-policy.json"
@@ -937,7 +977,7 @@ def plugin_stdio_handoff(
                     "stderr": captured_text(getattr(exc, "stderr", None)),
                 },
             )
-            fail("managed_plugin_handoff", policy_artifact, f"plugin sidecar policy enable failed: {exc}")
+            fail("managed_plugin_convergence", policy_artifact, f"plugin sidecar policy enable failed: {exc}")
         write_json(
             policy_artifact,
             {"returncode": policy.returncode, "stdout": policy.stdout, "stderr": policy.stderr},
@@ -946,46 +986,84 @@ def plugin_stdio_handoff(
             policy.returncode == 0
             and policy_path.is_file()
             and read_json_file(policy_path).get("state") == "enabled",
-            "managed_plugin_handoff",
+            "managed_plugin_convergence",
             policy_artifact,
             "plugin sidecar policy enable failed",
         )
-        status_after = {
-            "jsonrpc": "2.0",
-            "id": "status_after_repair",
-            "method": "resources/read",
-            "params": {"uri": STATUS_URI, "project": str(project)},
-        }
+        plugin_env = proof_environment({
+            **os.environ,
+            "CODESTORY_CLI": "",
+            "CODESTORY_CACHE_ROOT": str(cache_root),
+            "CODESTORY_EMBED_MODEL_DIR": str(empty_model_dir),
+            "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
+            "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH": str(policy_path),
+            "PLUGIN_DATA": str(plugin_data),
+        })
+        ownership_before_status = proof_ownership_snapshot(cache_root)
+        observational_artifact = artifact.with_name("managed-convergence-status-observational.json")
+        observational_status = stdio_status_command(
+            ["node", str(launcher)],
+            observational_artifact,
+            timeout_secs,
+            project,
+            layer="managed_plugin_convergence",
+            cwd=project,
+            env=plugin_env,
+        )
+        ownership_after_status = proof_ownership_snapshot(cache_root)
+        require(
+            ownership_after_status == ownership_before_status,
+            "managed_plugin_convergence",
+            observational_artifact,
+            "observational status changed local-refresh or ready-repair ownership files",
+        )
+        require_managed_observational_status(
+            observational_status,
+            observational_artifact,
+            expected_version,
+            archive_cli,
+        )
         status = stdio_status_command(
             ["node", str(launcher)],
             artifact,
             timeout_secs,
             project,
-            layer="managed_plugin_handoff",
+            layer="managed_plugin_convergence",
             cwd=project,
-            env=proof_environment({
-                **os.environ,
-                "CODESTORY_CLI": "",
-                "CODESTORY_CACHE_ROOT": str(cache_root),
-                "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
-                "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH": str(policy_path),
-                "PLUGIN_DATA": str(plugin_data),
-            }),
+            env=plugin_env,
             extra_requests=[
                 {
                     "jsonrpc": "2.0",
-                    "id": "repair",
+                    "id": "ground_activation",
                     "method": "tools/call",
                     "params": {
-                        "name": "sidecar_setup",
-                        "arguments": {"project": str(project), "action": "repair"},
+                        "name": "ground",
+                        "arguments": {"project": str(project), "budget": "strict"},
                     },
                 },
-                status_after,
+                *[
+                    {
+                        "jsonrpc": "2.0",
+                        "id": f"setup_poll_{index}",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "sidecar_setup",
+                            "arguments": {"project": str(project), "action": "status"},
+                        },
+                        "_delay_before_secs": 2,
+                    }
+                    for index in range(1, 6)
+                ],
+                {
+                    "jsonrpc": "2.0",
+                    "id": "status_after_convergence",
+                    "method": "resources/read",
+                    "params": {"uri": STATUS_URI, "project": str(project)},
+                },
             ],
             cleanup_status_workers=True,
         )
-        require_managed_plugin_handoff(status, artifact, expected_version, archive_cli)
+        require_managed_plugin_convergence(status, artifact, expected_version, archive_cli)
         return status
 
 
@@ -1149,7 +1227,11 @@ def stdio_status_command(
                 if method == "notifications/tools/list_changed":
                     break
 
-        for request in requests:
+        for request_spec in requests:
+            request = dict(request_spec)
+            delay_before_secs = request.pop("_delay_before_secs", 0)
+            if delay_before_secs:
+                time.sleep(delay_before_secs)
             entry = {"request": request}
             transcript.append(entry)
             process.stdin.write(json.dumps(request) + "\n")
@@ -1367,13 +1449,13 @@ def status_from_resource_response(response: dict) -> dict | None:
     return status if isinstance(status, dict) else None
 
 
-def require_managed_plugin_handoff(
+def require_managed_binary_provenance(
     status: dict,
     artifact: Path,
     expected_version: str,
     archive_cli: Path,
 ) -> None:
-    require_plugin_provenance(status, artifact, expected_version, "managed_plugin_handoff")
+    require_plugin_provenance(status, artifact, expected_version, "managed_plugin_convergence")
     plugin_runtime = status["plugin_runtime"]
     managed_binary = Path(plugin_runtime.get("managed_binary_path", ""))
     server_executable = Path(status.get("server_executable", ""))
@@ -1381,7 +1463,7 @@ def require_managed_plugin_handoff(
         managed_binary.is_file()
         and server_executable.is_file()
         and managed_binary.samefile(server_executable),
-        "managed_plugin_handoff",
+        "managed_plugin_convergence",
         artifact,
         "managed_binary_path does not identify the executable serving MCP",
     )
@@ -1389,75 +1471,163 @@ def require_managed_plugin_handoff(
     server_sha256 = sha256_file(server_executable)
     require(
         archive_sha256 == server_sha256 == status.get("server_executable_sha256"),
-        "managed_plugin_handoff",
+        "managed_plugin_convergence",
         artifact,
         "managed MCP executable does not match the packaged archive binary",
     )
+
+
+def local_freshness_status(status: dict) -> str | None:
+    for name in ("effective_index_freshness", "index_freshness"):
+        value = status.get(name, {}).get("status")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def structured_content_from_response(response: dict) -> dict | None:
+    content = response.get("result", {}).get("structuredContent")
+    return content if isinstance(content, dict) else None
+
+
+def require_managed_observational_status(
+    status: dict,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> None:
+    require_managed_binary_provenance(status, artifact, expected_version, archive_cli)
     require(
-        status.get("allowed_surfaces", {}).get("ground", {}).get("allowed") is True,
-        "managed_plugin_handoff",
+        local_freshness_status(status) == "stale",
+        "managed_plugin_convergence",
         artifact,
-        "managed plugin status did not allow local ground",
+        f"status did not observe the seeded project as stale: {local_freshness_status(status)!r}",
     )
-    repair_response = transcript_response(artifact, "repair") or {}
-    repair = repair_response.get("result", {}).get("structuredContent")
-    require(isinstance(repair, dict), "managed_plugin_handoff", artifact, "repair response missing structuredContent")
-    repair_status = repair.get("status")
     require(
-        repair_status in {"started", "already_running"},
-        "managed_plugin_handoff",
+        isinstance(status.get("index_publication", {}).get("generation"), int),
+        "managed_plugin_convergence",
         artifact,
-        f"repair status is {repair_status!r}, expected started or already_running",
+        "stale status did not retain a complete published generation",
     )
-    if repair_status == "started":
+    require(
+        not status.get("readiness_broker", {}).get("operations"),
+        "managed_plugin_convergence",
+        artifact,
+        "observational status reported a running readiness operation",
+    )
+    setup = status.get("sidecar_setup", {})
+    require(
+        setup.get("active_repair") is None
+        and setup.get("last_worker_result") is None
+        and status.get("status_resource_auto_repair") is None,
+        "managed_plugin_convergence",
+        artifact,
+        "observational status started or reported a repair attempt",
+    )
+    require(
+        status.get("allowed_surfaces", {}).get("packet", {}).get("allowed") is False
+        and status.get("allowed_surfaces", {}).get("search", {}).get("allowed") is False,
+        "managed_plugin_convergence",
+        artifact,
+        "missing sidecars did not keep packet/search fail closed",
+    )
+
+
+def require_managed_plugin_convergence(
+    status_before: dict,
+    artifact: Path,
+    expected_version: str,
+    archive_cli: Path,
+) -> None:
+    require_managed_observational_status(status_before, artifact, expected_version, archive_cli)
+    initial_generation = status_before["index_publication"]["generation"]
+    ground = transcript_response(artifact, "ground_activation") or {}
+    require(
+        structured_content_from_response(ground) is not None
+        and ground.get("result", {}).get("isError") is not True,
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation did not serve a complete publication",
+    )
+    setup_snapshots = []
+    for request_id in (
+        "setup_poll_1",
+        "setup_poll_2",
+        "setup_poll_3",
+        "setup_poll_4",
+        "setup_poll_5",
+    ):
+        setup = structured_content_from_response(transcript_response(artifact, request_id) or {})
         require(
-            isinstance(repair.get("attempt_id"), str)
-            and isinstance(repair.get("pid"), int)
-            and repair.get("reservation_published") is True,
-            "managed_plugin_handoff",
+            isinstance(setup, dict),
+            "managed_plugin_convergence",
             artifact,
-            "started repair did not publish an attempt reservation",
+            f"{request_id} did not return sidecar setup status",
         )
-    repair_setup = repair.get("sidecar_setup") or {}
-    attempt_id = repair.get("attempt_id") or (repair_setup.get("active_repair") or {}).get("attempt_id")
-    require(
-        isinstance(attempt_id, str) and len(attempt_id) > 0,
-        "managed_plugin_handoff",
-        artifact,
-        "repair response did not identify its attempt",
-    )
-    next_calls = repair.get("recommended_next_calls", [])
-    require(
-        any(
-            isinstance(call, dict)
-            and call.get("method") == "tools/call"
-            and call.get("tool") == "status"
-            and call.get("arguments", {}).get("project")
-            for call in next_calls
-        ),
-        "managed_plugin_handoff",
-        artifact,
-        "repair response did not point back to project-scoped status",
-    )
-    status_after_response = transcript_response(artifact, "status_after_repair") or {}
-    status_after = status_from_resource_response(status_after_response)
-    require(
-        isinstance(status_after, dict),
-        "managed_plugin_handoff",
-        artifact,
-        "status read after repair handoff failed",
-    )
-    require_plugin_provenance(status_after, artifact, expected_version, "managed_plugin_handoff")
-    setup = status_after.get("sidecar_setup", {})
-    observed_attempts = {
-        (setup.get("active_repair") or {}).get("attempt_id"),
-        (setup.get("last_worker_result") or {}).get("attempt_id"),
+        setup_snapshots.append(setup)
+    attempt_ids = {
+        attempt_id
+        for setup in setup_snapshots
+        for attempt_id in (
+            (setup.get("active_repair") or {}).get("attempt_id"),
+            (setup.get("last_worker_result") or {}).get("attempt_id"),
+        )
+        if isinstance(attempt_id, str) and attempt_id
     }
     require(
-        attempt_id in observed_attempts,
-        "managed_plugin_handoff",
+        len(attempt_ids) == 1,
+        "managed_plugin_convergence",
         artifact,
-        f"repair attempt {attempt_id!r} was not observable in post-handoff status",
+        f"ground activation did not retain exactly one repair attempt: {sorted(attempt_ids)}",
+    )
+    terminal = next(
+        (
+            setup.get("last_worker_result")
+            for setup in reversed(setup_snapshots)
+            if isinstance(setup.get("last_worker_result"), dict)
+            and setup.get("active_repair") is None
+        ),
+        None,
+    )
+    require(
+        isinstance(terminal, dict)
+        and terminal.get("attempt_id") in attempt_ids
+        and terminal.get("run_id") == "shared-agent"
+        and terminal.get("outcome") in {"failed", "succeeded"},
+        "managed_plugin_convergence",
+        artifact,
+        "automatic shared-agent repair did not reach a durable terminal result",
+    )
+    status_after = status_from_resource_response(
+        transcript_response(artifact, "status_after_convergence") or {}
+    )
+    require(
+        isinstance(status_after, dict),
+        "managed_plugin_convergence",
+        artifact,
+        "status after ground activation was unavailable",
+    )
+    require_managed_binary_provenance(status_after, artifact, expected_version, archive_cli)
+    require(
+        local_freshness_status(status_after) == "fresh"
+        and isinstance(status_after.get("index_publication", {}).get("generation"), int)
+        and status_after["index_publication"]["generation"] > initial_generation,
+        "managed_plugin_convergence",
+        artifact,
+        "ground activation did not publish a newer complete local generation",
+    )
+    gpu_proof = status_after.get("readiness_broker", {}).get("gpu_proof", {})
+    require(
+        status_after.get("allowed_surfaces", {}).get("packet", {}).get("allowed") is False
+        and status_after.get("allowed_surfaces", {}).get("search", {}).get("allowed") is False
+        and (
+            gpu_proof.get("proof_status") != "verified"
+            or gpu_proof.get("meaningful_accelerator_work_proven") is not True
+            or gpu_proof.get("embed_smoke_ok") is not True
+        ),
+        "managed_plugin_convergence",
+        artifact,
+        "accelerator-required packet/search opened without verified runtime smoke proof",
     )
 
 
@@ -1533,6 +1703,11 @@ def run_gate(args: argparse.Namespace) -> None:
             return
 
         if args.managed_plugin_handoff:
+            convergence_project = Path(temp) / "managed-convergence-project"
+            empty_model_dir = Path(temp) / "managed-convergence-empty-model"
+            write_managed_convergence_fixture(convergence_project)
+            empty_model_dir.mkdir()
+            summary["managed_convergence_project"] = str(convergence_project)
             local_ready_artifact = out_dir / "managed-local-ready.json"
             run_command(
                 cli,
@@ -1543,7 +1718,7 @@ def run_gate(args: argparse.Namespace) -> None:
                     "local",
                     "--repair",
                     "--project",
-                    str(project),
+                    str(convergence_project),
                     "--format",
                     "json",
                     "--output-file",
@@ -1562,7 +1737,7 @@ def run_gate(args: argparse.Namespace) -> None:
                 [
                     "ground",
                     "--project",
-                    str(project),
+                    str(convergence_project),
                     "--refresh",
                     "none",
                     "--format",
@@ -1581,19 +1756,21 @@ def run_gate(args: argparse.Namespace) -> None:
                 "managed local ground output is missing repository stats",
             )
             summary["artifacts"]["managed_local_ground"] = str(local_ground_artifact)
+            make_managed_convergence_fixture_stale(convergence_project)
 
-            plugin_artifact = out_dir / "managed-plugin-handoff.json"
+            plugin_artifact = out_dir / "managed-plugin-convergence.json"
             plugin_status = plugin_stdio_handoff(
                 Path(args.plugin_root).resolve(),
                 archive.parent,
-                project,
+                convergence_project,
                 cache_root,
                 plugin_artifact,
                 args.timeout_secs,
                 args.expected_version,
                 cli,
+                empty_model_dir,
             )
-            summary["artifacts"]["managed_plugin_handoff"] = str(plugin_artifact)
+            summary["artifacts"]["managed_plugin_convergence"] = str(plugin_artifact)
             write_json(out_dir / "summary.json", summary)
             return
 
@@ -1936,6 +2113,8 @@ def write_fake_cli(path: Path) -> None:
             elif layer == "serve":
                 marker = None
                 repair_attempt = None
+                ground_count = 0
+                managed_mode = os.environ.get("CODESTORY_FAKE_PLUGIN_MANAGED") == "1"
                 if fail in {"serve_first_blocked", "serve_first_blocked_then_timeout"}:
                     try:
                         project = sys.argv[sys.argv.index("--project") + 1]
@@ -1966,13 +2145,37 @@ def write_fake_cli(path: Path) -> None:
                             "serverInfo": {"name": "codestory", "version": "9.9.9"},
                         }
                     elif request.get("method") == "tools/list":
-                        result = {"tools": [{"name": "packet"}, {"name": "search"}, {"name": "context"}, {"name": "sidecar_setup"}]}
+                        result = {"tools": [{"name": "ground"}, {"name": "packet"}, {"name": "search"}, {"name": "context"}, {"name": "sidecar_setup"}]}
                     elif request.get("method") == "resources/list":
                         resources = [{"uri": "codestory://status", "name": "CodeStory runtime status"}]
                         if fail != "resources_hidden":
                             resources.append({"uri": "codestory://agent-guide", "name": "CodeStory agent guide"})
                         result = {"resources": resources}
+                    elif request.get("method") == "tools/call" and request.get("params", {}).get("name") == "ground":
+                        repair_attempt = repair_attempt or "fake-activation-attempt"
+                        ground_count += 1
+                        ground = {
+                            "root": request.get("params", {}).get("arguments", {}).get("project"),
+                            "stats": {"file_count": 2, "node_count": 2},
+                        }
+                        result = {"content": [{"type": "text", "text": json.dumps(ground)}], "structuredContent": ground}
                     elif request.get("method") == "tools/call" and request.get("params", {}).get("name") == "sidecar_setup":
+                        if request.get("params", {}).get("arguments", {}).get("action") == "status":
+                            setup = {
+                                "state": "enabled",
+                                "active_repair": None,
+                                "last_worker_result": ({
+                                    "attempt_id": repair_attempt,
+                                    "run_id": "shared-agent",
+                                    "outcome": "failed",
+                                    "exit_code": 1,
+                                } if repair_attempt else None),
+                                "activation_triggered_repair": bool(repair_attempt),
+                            }
+                            result = {"content": [{"type": "text", "text": json.dumps(setup)}], "structuredContent": setup}
+                            response_id = request.get("id")
+                            print(json.dumps({"jsonrpc": "2.0", "id": response_id, "result": result}), flush=True)
+                            continue
                         repair = {
                             "status": "started",
                             "mode": "background",
@@ -2007,12 +2210,21 @@ def write_fake_cli(path: Path) -> None:
                         server_sha256 = hashlib.sha256(open(server_executable, "rb").read()).hexdigest()
                         status = {
                             "cache_root": os.environ.get("CODESTORY_CACHE_ROOT"),
+                            "project_root": request.get("params", {}).get("project", os.getcwd()),
+                            "effective_index_freshness": {"status": "fresh" if ground_count or not managed_mode else "stale"},
+                            "index_freshness": {"status": "fresh" if ground_count or not managed_mode else "stale"},
+                            "index_publication": {"generation": 2 if ground_count else 1},
                             "readiness_broker": {
                                 "operations": ([{
                                     "operation_kind": "local_graph_refresh",
                                     "pid": refresh_worker_pid,
                                     "status": "running",
                                 }] if refresh_worker_pid else []),
+                                "gpu_proof": {
+                                    "proof_status": "gpu_unverified",
+                                    "meaningful_accelerator_work_proven": False,
+                                    "embed_smoke_ok": False,
+                                },
                             },
                             "server_version": "9.9.9",
                             "cli_version": "9.9.9",
@@ -2029,14 +2241,25 @@ def write_fake_cli(path: Path) -> None:
                                 "managed_binary_path": server_executable,
                             },
                             "sidecar_setup": {
-                                "active_repair": {"attempt_id": repair_attempt} if repair_attempt else None,
-                                "last_worker_result": None,
+                                "state": "enabled",
+                                "active_repair": None,
+                                "last_worker_result": ({
+                                    "attempt_id": repair_attempt,
+                                    "run_id": "shared-agent",
+                                    "outcome": "failed",
+                                    "exit_code": 1,
+                                } if repair_attempt else None),
+                                "activation_triggered_repair": bool(repair_attempt),
+                            },
+                            "status_resource_auto_repair": None,
+                            "readiness_lanes": {
+                                "agent_packet_search": {"run_id": "shared-agent", "status": "blocked"},
                             },
                             "allowed_surfaces": {
                                 "ground": {"allowed": True},
-                                "packet": {"allowed": serve_allowed},
-                                "search": {"allowed": serve_allowed},
-                                "context": {"allowed": serve_allowed},
+                                "packet": {"allowed": False if managed_mode else serve_allowed},
+                                "search": {"allowed": False if managed_mode else serve_allowed},
+                                "context": {"allowed": False if managed_mode else serve_allowed},
                             },
                         }
                         result = {"contents": [{"uri": "codestory://status", "mimeType": "application/json", "text": json.dumps(status)}]}
@@ -2751,24 +2974,19 @@ def self_test() -> None:
             run_gate(managed_args)
             managed_summary = read_json_file(Path(managed_args.out_dir) / "summary.json")
             assert "managed_local_ground" in managed_summary["artifacts"]
-            assert "managed_plugin_handoff" in managed_summary["artifacts"]
-            managed_artifact = Path(managed_args.out_dir) / "managed-plugin-handoff.json"
-            assert transcript_response(managed_artifact, "repair")["result"]["structuredContent"]["status"] == "started"
+            assert "managed_plugin_convergence" in managed_summary["artifacts"]
+            observational_artifact = Path(managed_args.out_dir) / "managed-convergence-status-observational.json"
+            assert read_json_file(observational_artifact)["status"]["index_freshness"]["status"] == "stale"
+            managed_artifact = Path(managed_args.out_dir) / "managed-plugin-convergence.json"
+            assert transcript_response(managed_artifact, "ground_activation")["result"]["structuredContent"]["stats"]
+            setup = structured_content_from_response(transcript_response(managed_artifact, "setup_poll_1"))
+            assert setup["last_worker_result"]["attempt_id"] == "fake-activation-attempt"
+            assert setup["last_worker_result"]["outcome"] == "failed"
             managed_status_after = status_from_resource_response(
-                transcript_response(managed_artifact, "status_after_repair")
+                transcript_response(managed_artifact, "status_after_convergence")
             )
-            assert managed_status_after["sidecar_setup"]["active_repair"]["attempt_id"] == "fake-attempt"
-            worker_cleanup = read_json_file(
-                Path(managed_args.out_dir) / "managed-plugin-handoff-worker-cleanup.json"
-            )["workers"]
-            assert worker_cleanup[0]["source"] == "proof_started_repair_response"
-            assert worker_cleanup[0]["attempt_id"] == "fake-attempt"
-            assert worker_cleanup[0]["status"] in {
-                "already_exited",
-                "terminated",
-                "terminated_after_taskkill",
-                "terminated_after_direct_termination",
-            }
+            assert managed_status_after["index_publication"]["generation"] == 2
+            assert managed_status_after["allowed_surfaces"]["packet"]["allowed"] is False
             managed_cache_root = read_json_file(Path(managed_args.out_dir) / "managed-local-ground.json")["cache_root"]
             assert Path(managed_cache_root).name.startswith("codestory-packaged-proof-cache-")
             assert managed_status_after["cache_root"] == managed_cache_root
@@ -2797,9 +3015,10 @@ def self_test() -> None:
                     2,
                     "9.9.9",
                     stage / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli"),
+                    root / "policy-timeout-empty-model",
                 )
             except GateFailure as exc:
-                assert exc.layer == "managed_plugin_handoff"
+                assert exc.layer == "managed_plugin_convergence"
                 assert exc.artifact.name == "managed-plugin-policy.json"
                 policy_timeout = read_json_file(exc.artifact)
                 assert "policy stdout before timeout" in policy_timeout["stdout"]
