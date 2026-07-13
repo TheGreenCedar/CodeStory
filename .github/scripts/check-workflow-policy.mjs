@@ -16,6 +16,9 @@ const packagedPlatformPr = path.join(workflowRoot, "packaged-platform-pr.yml");
 const packagedPlatformProof = path.join(workflowRoot, "packaged-platform-proof.yml");
 const macosMetalProof = path.join(workflowRoot, "macos-metal-proof.yml");
 const mainBranchSourceGuard = path.join(workflowRoot, "main-branch-source-guard.yml");
+const sourceProof = path.join(workflowRoot, "source-proof.yml");
+const repoScaleStats = path.join(workflowRoot, "repo-scale-stats.yml");
+const retrievalSidecarSmoke = path.join(workflowRoot, "retrieval-sidecar-smoke.yml");
 
 function yamlJob(content, name) {
   const lines = content.split(/\r?\n/u);
@@ -53,7 +56,11 @@ function managedPluginMatrixIsRequired(content, jobName, archiveLine) {
     job.length === 0 ||
     job.some((line) => /^    (?:if|continue-on-error):/u.test(line)) ||
     !job.includes("      fail-fast: false") ||
-    job.some((line) => /^\s+exclude:/u.test(line)) ||
+    job.some(
+      (line) =>
+        /^\s+exclude:/u.test(line) &&
+        !line.includes("fromJSON(inputs.scope == 'macos'"),
+    ) ||
     step.length === 0 ||
     step.some((line) => /^        (?:if|continue-on-error):/u.test(line)) ||
     required.some((line) => !step.includes(line))
@@ -101,7 +108,16 @@ for (const file of fs
   const workflowPath = path.join(workflowRoot, file);
   const content = fs.readFileSync(workflowPath, "utf8");
 
+  if (/^  pull_request(?:_target)?:/mu.test(content)) {
+    if (!/^concurrency:/mu.test(content) || !/^  cancel-in-progress: true$/mu.test(content)) {
+      violations.push(`${file} pull-request runs must cancel stale work`);
+    }
+  }
+
   content.split(/\r?\n/).forEach((line, index) => {
+    if (/^\s+key:/u.test(line) && line.includes("github.sha")) {
+      violations.push(`${file}:${index + 1} Cargo cache keys must not include commit SHA`);
+    }
     const match = line.match(/\buses:\s*['"]?([^'"\s#]+)['"]?/);
     if (!match) return;
 
@@ -187,25 +203,23 @@ if (!fs.existsSync(pluginStatic)) {
     "dev/codestory-next",
     "node --test plugins/codestory/tests/plugin-static.test.mjs",
     "node .github/scripts/check-workflow-policy.mjs",
+    "node .github/scripts/route-ci-proof.mjs --self-test",
     "python .github/scripts/check-packaged-agent-proof.py --self-test",
     "python .github/scripts/package-codestory-release.py --self-test",
     "python .github/scripts/check-codestory-release.py --version",
     ".github/scripts/check-packaged-agent-proof.py",
     ".github/scripts/package-codestory-release.py",
+    ".github/scripts/route-ci-proof.mjs",
     ".github/workflows/release.yml",
     ".github/workflows/post-publish-release-smoke.yml",
     ".github/workflows/packaged-platform-pr.yml",
     ".github/workflows/packaged-platform-proof.yml",
     ".github/workflows/macos-metal-proof.yml",
+    ".github/workflows/source-proof.yml",
+    ".github/workflows/repo-scale-stats.yml",
     "scripts/codex-worktree-setup.*",
     "scripts/tests/codex-worktree-setup.test.mjs",
     "scripts/setup-retrieval-env.*",
-    "macos-setup-static:",
-    "runs-on: macos-15",
-    "node scripts/setup-retrieval-env.mjs --self-test",
-    "node --test scripts/tests/codex-worktree-setup.test.mjs",
-    "node scripts/codex-worktree-setup.mjs --self-test",
-    "test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh",
     "scripts/install-codestory.ps1",
   ];
 
@@ -220,19 +234,37 @@ if (!fs.existsSync(rustCi)) {
     "Cargo.lock",
     "Cargo.toml",
     "crates/**",
-    "dev/codestory-next",
     "cargo fmt --check",
     "cargo check --workspace --locked",
-    "cargo test --locked",
-    "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-    "macos-workspace:",
-    "macos-15",
-    "macos-15-intel",
-    "asset_target: macos-arm64",
-    "asset_target: macos-x64",
+    "cargo clippy --workspace --lib --locked -- -D warnings",
+    "Prove focused publication contracts",
+    "workspace-default-features",
+    "cancel-in-progress: true",
   ];
 
   requireContent(content, requiredSnippets, snippet => `rust-ci.yml must include ${snippet}`);
+  if (content.includes("macos-") || content.includes("windows-") || content.includes("push:")) {
+    violations.push("rust-ci.yml draft pushes must use one Ubuntu-only lane");
+  }
+}
+
+if (!fs.existsSync(sourceProof)) {
+  violations.push("source-proof.yml must own exact-head full source proof");
+} else {
+  const content = fs.readFileSync(sourceProof, "utf8");
+  requireContent(content, [
+    "types: [labeled, synchronize]",
+    "review-accepted",
+    'test "$EVENT_HEAD_REPO" = "$GITHUB_REPOSITORY"',
+    'test "$current_head" = "$EVENT_HEAD_SHA"',
+    "name: full-source-gate",
+    "cargo test --workspace --locked",
+    "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "cancel-in-progress: true",
+  ], snippet => `source-proof.yml must include ${snippet}`);
+  if (content.includes("pull_request_target:")) {
+    violations.push("source-proof.yml must not execute pull-request code through pull_request_target");
+  }
 }
 
 if (!fs.existsSync(releaseWorkflow)) {
@@ -312,6 +344,12 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "if: matrix.asset_target == 'macos-x64'",
     "scripts/install-codestory.ps1 -SelfTest",
     "--checksum-file target/release-dist/SHA256SUMS.txt",
+    "scope:",
+    "proof_key:",
+    "ref:",
+    "cancel-in-progress: true",
+    "codestory-cli-default-features",
+    "exclude: ${{ fromJSON(inputs.scope == 'macos'",
   ], snippet => `packaged-platform-proof.yml must include ${snippet}`);
   const releaseAssetStart = content.indexOf("- name: Upload release asset");
   const notarizationProofStart = content.indexOf("- name: Upload macOS notarization proof");
@@ -394,30 +432,42 @@ if (!fs.existsSync(postPublishReleaseSmoke)) {
 }
 
 if (!fs.existsSync(packagedPlatformPr)) {
-  violations.push("packaged-platform-pr.yml must run the native package matrix on implementation PRs");
+  violations.push("packaged-platform-pr.yml must orchestrate explicitly promoted platform proof");
 } else {
   const content = fs.readFileSync(packagedPlatformPr, "utf8");
   requireContent(content, [
-    "pull_request:",
-    "contents: read",
+    "types: [labeled, synchronize]",
+    "platform-proof",
+    "workflow_dispatch:",
+    "options: [platform, integration]",
+    "expected_head_sha:",
+    "actions: read",
+    'test "$head_repo" = "$GITHUB_REPOSITORY"',
+    'test "$current_head" = "$expected_head"',
+    "actions/runs?head_sha=$HEAD_SHA",
+    '.path == ".github/workflows/source-proof.yml"',
+    ".head_repository.full_name == $repo",
+    '.name == "full-source-gate" and .conclusion == "success"',
+    'test "$INPUT_HEAD_SHA" = "$dev_head"',
+    "node .github/scripts/route-ci-proof.mjs --stdin",
+    "scope=full",
+    "uses: ./.github/workflows/source-proof.yml",
+    "uses: ./.github/workflows/repo-scale-stats.yml",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
-    "version: ${{ needs.prepare.outputs.version }}",
-    ".github/scripts/check-packaged-agent-proof.py",
-    ".github/scripts/check-linux-glibc-baseline.sh",
-    ".github/scripts/check-workflow-policy.mjs",
-    ".github/workflows/macos-metal-proof.yml",
-    ".github/workflows/post-publish-release-smoke.yml",
-    ".github/workflows/packaged-platform-proof.yml",
-    ".github/workflows/rust-ci.yml",
-    "Cargo.toml",
-    "Cargo.lock",
-    "crates/**",
-    "scripts/codex-worktree-setup.*",
-    "scripts/tests/codex-worktree-setup.test.mjs",
-    "scripts/setup-retrieval-env.*",
-    ".codex/environments/environment.toml",
+    "scope: ${{ needs.route.outputs.scope }}",
+    "sign_macos: true",
+    "uses: ./.github/workflows/macos-metal-proof.yml",
+    "use_packaged_artifact: true",
+    "dev/codestory-next moved from proved head",
   ], snippet => `packaged-platform-pr.yml must include ${snippet}`);
-  if (content.includes("contents: write") || content.includes("uses: ./.github/workflows/release.yml")) {
+  if ((content.match(/branches\/dev\/codestory-next/gu) ?? []).length < 2) {
+    violations.push("packaged-platform-pr.yml must verify the dev head before and after integration proof");
+  }
+  if (
+    content.includes("contents: write") ||
+    content.includes("uses: ./.github/workflows/release.yml") ||
+    content.includes("pull_request_target:")
+  ) {
     violations.push("packaged-platform-pr.yml must not request release permissions or call the publishing workflow");
   }
 }
@@ -446,7 +496,36 @@ if (!fs.existsSync(macosMetalProof)) {
     "CODESTORY_EMBED_DEVICE_PROVIDER: metal",
     "CODESTORY_EMBED_ALLOW_CPU: \"0\"",
     "macos-arm64-metal-proof-${{ inputs.version }}",
+    "proof_key:",
+    "cancel-in-progress: true",
   ], snippet => `macos-metal-proof.yml must include ${snippet}`);
+}
+
+if (!fs.existsSync(repoScaleStats)) {
+  violations.push("repo-scale-stats.yml must own promoted-head stats proof");
+} else {
+  const content = fs.readFileSync(repoScaleStats, "utf8");
+  requireContent(content, [
+    "workflow_call:",
+    "cargo build --release --locked -p codestory-cli",
+    "cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture",
+    "repo-scale-stats-${{ inputs.proof_key }}",
+    "actions/upload-artifact@v7.0.1",
+    "codestory-cli-default-features",
+    "cancel-in-progress: true",
+  ], snippet => `repo-scale-stats.yml must include ${snippet}`);
+}
+
+if (!fs.existsSync(retrievalSidecarSmoke)) {
+  violations.push("retrieval-sidecar-smoke.yml must exist");
+} else {
+  const windowsJob = yamlJob(fs.readFileSync(retrievalSidecarSmoke, "utf8"), "windows-manifest-missing");
+  if (
+    !windowsJob.includes("    if: github.event_name == 'workflow_dispatch'") ||
+    windowsJob.some(line => line.includes("labels"))
+  ) {
+    violations.push("retrieval-sidecar-smoke.yml Windows proof must be workflow_dispatch-only");
+  }
 }
 
 if (!fs.existsSync(mainBranchSourceGuard)) {
