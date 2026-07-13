@@ -13,6 +13,8 @@ permissions:
 
 env:
   RELEASE_RUST_TOOLCHAIN: "1.95.0"
+  LINUX_GLIBC_BUILD_IMAGE: "rust:1.95.0-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf"
+  LINUX_GLIBC_BASELINE_IMAGE: "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"
 
 jobs:
   build:
@@ -83,7 +85,20 @@ jobs:
             ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
 
       - name: Build codestory-cli
+        if: matrix.asset_target != 'linux-x64'
         run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
+
+      - name: Build Linux x64 at the glibc 2.31 baseline
+        if: matrix.asset_target == 'linux-x64'
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            --env CARGO_HOME=/cargo \
+            --volume "$HOME/.cargo:/cargo" \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
+            cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
 
       - name: Smoke codestory-cli
         if: runner.os != 'Windows'
@@ -112,6 +127,27 @@ jobs:
             --target "${{ matrix.asset_target }}" \
             --binary "$bin" \
             --out-dir target/release-dist
+
+      - name: Prove Linux x64 glibc 2.31 baseline
+        if: matrix.asset_target == 'linux-x64'
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "${{ env.LINUX_GLIBC_BASELINE_IMAGE }}" \
+            bash .github/scripts/check-linux-glibc-baseline.sh \
+              "target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz" \
+              "${{ inputs.version }}" \
+              target/linux-glibc-baseline \
+              "glibc 2.31"
+
+      - name: Upload Linux glibc baseline proof
+        if: always() && matrix.asset_target == 'linux-x64'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: linux-glibc-2.31-baseline-proof
+          path: target/linux-glibc-baseline
+          if-no-files-found: error
 
       - name: Smoke packaged release asset
         if: runner.os != 'Windows'

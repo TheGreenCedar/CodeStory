@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/check-linux-glibc-baseline.sh
       - .github/scripts/package-codestory-release.py
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
