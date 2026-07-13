@@ -7,6 +7,7 @@ const scopeRank = new Map([
   ["macos", 1],
   ["full", 2],
 ]);
+const coordinatorScopes = new Set(["windows", ...scopeRank.keys()]);
 
 const macosSurfaces = [
   /^\.github\/workflows\/macos-/u,
@@ -55,9 +56,10 @@ export function classifyProofScope(paths) {
 export function selectProofScope(paths, requested = "auto") {
   const inferred = classifyProofScope(paths);
   if (requested === "auto" || requested === "") return inferred;
-  if (!scopeRank.has(requested)) {
+  if (!coordinatorScopes.has(requested)) {
     throw new Error(`unsupported proof scope: ${requested}`);
   }
+  if (requested === "windows") return requested;
   return scopeRank.get(requested) > scopeRank.get(inferred) ? requested : inferred;
 }
 
@@ -107,6 +109,9 @@ function selfTest() {
   }
   if (selectProofScope(fixtures[2].paths, "macos") !== "full") {
     throw new Error("explicit promotion must not narrow an inferred scope");
+  }
+  if (selectProofScope(fixtures[2].paths, "windows") !== "windows") {
+    throw new Error("coordinator Windows proof must select only Windows x64 packaging");
   }
 }
 

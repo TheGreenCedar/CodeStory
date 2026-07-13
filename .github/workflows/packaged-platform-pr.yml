@@ -20,11 +20,11 @@ on:
         required: true
         type: string
       scope:
-        description: Auto-detect proof scope or widen it explicitly.
+        description: Auto-detect proof scope or select a coordinator package scope.
         required: true
         default: auto
         type: choice
-        options: [auto, macos, full]
+        options: [auto, windows, macos, full]
 
 permissions:
   actions: read
@@ -301,7 +301,11 @@ jobs:
             require_result "$METAL_RESULT" skipped macos-metal-proof
           else
             require_result "$PACKAGE_RESULT" success packaged-proof
-            require_result "$METAL_RESULT" success macos-metal-proof
+            if [ "$SCOPE" = windows ]; then
+              require_result "$METAL_RESULT" skipped macos-metal-proof
+            else
+              require_result "$METAL_RESULT" success macos-metal-proof
+            fi
           fi
           if [ "$MODE" = integration ]; then
             current_dev="$(gh api "repos/$GITHUB_REPOSITORY/branches/dev/codestory-next" --jq '.commit.sha')"
