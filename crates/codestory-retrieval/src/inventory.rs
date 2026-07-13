@@ -1,5 +1,9 @@
 use crate::compose::{EmbedModelInventory, embed_model_inventory};
-use crate::config::{SidecarRuntimeConfig, user_cache_root};
+use crate::config::{
+    AGENT_SIDECAR_NAMESPACE_PREFIX_V3, LEGACY_SIDECAR_STATE_FILE, LOCAL_SIDECAR_NAMESPACE_V3,
+    SIDECAR_STATE_FILE_V3, SidecarRuntimeConfig, current_v3_state_ownership_matches,
+    user_cache_root,
+};
 use crate::generation::{
     manifest_has_current_sidecar_contract, manifest_unavailable_reason_for_runtime,
 };
@@ -392,7 +396,7 @@ fn generation_retention_plan_for_storage(
 ) -> Result<GenerationRetentionPlan> {
     let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
     let layout = &runtime.layout;
-    let project_id = crate::index::sidecar_project_id_for_root(project_root);
+    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, &runtime)?;
     let (_lock, unrooted_state) = inventory_retention_view(layout, &project_id)?;
     Ok(build_generation_retention_plan(
         storage_path,
@@ -423,7 +427,7 @@ fn apply_generation_retention_for_storage(
     cache_root: &Path,
 ) -> Result<GenerationRetentionApplyReport> {
     let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    let project_id = crate::index::sidecar_project_id_for_root(project_root);
+    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, &runtime)?;
     let _lock = GenerationRetentionLock::acquire(&runtime.layout.state_file, &project_id)
         .context("lock sidecar generation retention apply")?;
     let plan = build_generation_retention_plan(
@@ -618,9 +622,16 @@ fn remove_path(
 
 fn discover_state_candidates(cache_root: &Path) -> Vec<StateCandidate> {
     let mut candidates = Vec::new();
-    let local = cache_root.join("retrieval-sidecars.json");
-    if local.exists() {
-        candidates.push(read_state_candidate("codestory".to_string(), local));
+    let local_v3 = cache_root.join(SIDECAR_STATE_FILE_V3);
+    if local_v3.exists() {
+        candidates.push(read_state_candidate(
+            LOCAL_SIDECAR_NAMESPACE_V3.to_string(),
+            local_v3,
+        ));
+    }
+    let legacy_local = cache_root.join(LEGACY_SIDECAR_STATE_FILE);
+    if legacy_local.exists() {
+        candidates.push(read_state_candidate("codestory".to_string(), legacy_local));
     }
     let sidecars_root = cache_root.join("sidecars");
     if let Ok(entries) = std::fs::read_dir(&sidecars_root) {
@@ -632,7 +643,7 @@ fn discover_state_candidates(cache_root: &Path) -> Vec<StateCandidate> {
             if !namespace.starts_with("codestory-") {
                 continue;
             }
-            let state_path = entry.path().join("retrieval-sidecars.json");
+            let state_path = entry.path().join(state_file_name(&namespace));
             candidates.push(if state_path.exists() {
                 read_state_candidate(namespace, state_path)
             } else {
@@ -657,7 +668,7 @@ fn read_state_candidate(namespace: String, state_path: PathBuf) -> StateCandidat
         });
     match parsed {
         Ok(state) => StateCandidate {
-            namespace: state.namespace.clone(),
+            namespace,
             state_path,
             state: Some(state),
             read_error: None,
@@ -691,12 +702,32 @@ fn add_resource_only_candidates(
             state_path: cache_root
                 .join("sidecars")
                 .join(&namespace)
-                .join("retrieval-sidecars.json"),
+                .join(state_file_name(&namespace)),
             namespace,
             state: None,
             read_error: Some("no state file for matching Docker resource".to_string()),
         });
     }
+}
+
+fn is_v3_sidecar_namespace(namespace: &str) -> bool {
+    namespace == LOCAL_SIDECAR_NAMESPACE_V3
+        || namespace.starts_with(AGENT_SIDECAR_NAMESPACE_PREFIX_V3)
+}
+
+fn state_file_name(namespace: &str) -> &'static str {
+    if is_v3_sidecar_namespace(namespace) {
+        SIDECAR_STATE_FILE_V3
+    } else {
+        LEGACY_SIDECAR_STATE_FILE
+    }
+}
+
+fn current_cleanup_candidate(candidate: &StateCandidate) -> bool {
+    candidate.state.as_ref().is_some_and(|state| {
+        serde_json::to_value(state)
+            .is_ok_and(|value| current_v3_state_ownership_matches(&value, &candidate.namespace))
+    })
 }
 
 fn matching_resources(
@@ -802,7 +833,17 @@ fn inventory_entry(
         &containers,
         &networks,
     );
-    let (safe_candidate_reason, blocking_reason) = candidate_reasons(status, &reasons);
+    let (safe_candidate_reason, blocking_reason) = if current_cleanup_candidate(&candidate) {
+        candidate_reasons(status, &reasons)
+    } else {
+        (
+            None,
+            Some(
+                "state ownership, namespace, profile, or project generation is not an exact V3 match; inventory-only"
+                    .to_string(),
+            ),
+        )
+    };
 
     SidecarInventoryEntry {
         namespace: candidate.namespace,
@@ -1143,17 +1184,20 @@ mod tests {
     }
 
     fn state(namespace: &str, root: &Path, started_at_epoch_ms: i64) -> SidecarStateFile {
+        let agent = namespace.starts_with(AGENT_SIDECAR_NAMESPACE_PREFIX_V3);
         SidecarStateFile {
-            project_identity: None,
+            project_identity: agent.then(|| codestory_workspace::project_identity_v3(root)),
             owner: "codestory".to_string(),
-            profile: "agent".to_string(),
+            profile: if agent { "agent" } else { "local" }.to_string(),
             namespace: namespace.to_string(),
             compose_project: namespace.to_string(),
-            run_id: Some("test".to_string()),
+            run_id: agent.then(|| "test".to_string()),
             qdrant_http_port: 21002,
             qdrant_grpc_port: 21003,
             embed_http_port: 21004,
             embed_url: "http://127.0.0.1:21004/v1/embeddings".to_string(),
+            embedding_endpoint_origin: Some(crate::config::EmbeddingEndpointOrigin::ManagedSidecar),
+            embedding_endpoint_fingerprint_sha256: Some("hmac-sha256:fixture".to_string()),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
             embedding_device_observation_source: "sidecar_unobserved".to_string(),
@@ -1285,11 +1329,11 @@ mod tests {
     fn stale_state_dirs_are_safe_dry_run_candidates() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-stale-test";
+        let namespace = "codestory-agent-v3-stale-test";
         let root = cache.path().join("sidecars").join(namespace);
         let state = state(namespace, &root, 0);
         create_state_dirs(&state);
-        write_state(&root.join("retrieval-sidecars.json"), &state);
+        write_state(&root.join(SIDECAR_STATE_FILE_V3), &state);
 
         let report = test_inventory(
             project.path(),
@@ -1319,11 +1363,11 @@ mod tests {
     fn live_matching_resources_block_cleanup_and_report_ports() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-live-test";
+        let namespace = "codestory-agent-v3-live-test";
         let root = cache.path().join("sidecars").join(namespace);
         let state = state(namespace, &root, 100);
         create_state_dirs(&state);
-        write_state(&root.join("retrieval-sidecars.json"), &state);
+        write_state(&root.join(SIDECAR_STATE_FILE_V3), &state);
 
         let report = test_inventory(
             project.path(),
@@ -1357,11 +1401,11 @@ mod tests {
     fn missing_model_file_marks_inventory_incomplete() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-missing-model";
+        let namespace = "codestory-agent-v3-missing-model";
         let root = cache.path().join("sidecars").join(namespace);
         let state = state(namespace, &root, 100);
         create_state_dirs(&state);
-        write_state(&root.join("retrieval-sidecars.json"), &state);
+        write_state(&root.join(SIDECAR_STATE_FILE_V3), &state);
 
         let report = test_inventory(
             project.path(),
@@ -1387,10 +1431,10 @@ mod tests {
     }
 
     #[test]
-    fn resource_without_state_is_orphaned_when_owned_by_codestory() {
+    fn resource_without_state_is_orphaned_but_inventory_only() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-resource-only";
+        let namespace = "codestory-agent-v3-resource-only";
 
         let report = test_inventory(
             project.path(),
@@ -1408,18 +1452,24 @@ mod tests {
         let entry = &report.namespaces[0];
         assert_eq!(entry.namespace, namespace);
         assert_eq!(entry.state, SidecarInventoryState::Orphaned);
-        assert!(entry.safe_candidate_reason.is_some());
+        assert!(entry.safe_candidate_reason.is_none());
+        assert!(
+            entry
+                .blocking_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("inventory-only"))
+        );
     }
 
     #[test]
     fn unlabeled_compose_network_matches_only_through_owned_state() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-compose-network";
+        let namespace = "codestory-agent-v3-compose-network";
         let root = cache.path().join("sidecars").join(namespace);
         let state = state(namespace, &root, 100);
         create_state_dirs(&state);
-        write_state(&root.join("retrieval-sidecars.json"), &state);
+        write_state(&root.join(SIDECAR_STATE_FILE_V3), &state);
 
         let report = test_inventory(
             project.path(),
@@ -1444,15 +1494,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ownership_is_not_a_cleanup_candidate() {
+    fn mismatched_v3_state_is_not_a_cleanup_candidate() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-unknown-owner";
+        let namespace = "codestory-agent-v3-mismatched-state";
         let root = cache.path().join("sidecars").join(namespace);
         let mut state = state(namespace, &root, 100);
-        state.owner = "someone-else".to_string();
+        state.compose_project = "codestory-agent-v3-other-state".to_string();
         create_state_dirs(&state);
-        write_state(&root.join("retrieval-sidecars.json"), &state);
+        write_state(&root.join(SIDECAR_STATE_FILE_V3), &state);
 
         let report = test_inventory(
             project.path(),
@@ -1466,18 +1516,24 @@ mod tests {
         );
 
         let entry = &report.namespaces[0];
-        assert_eq!(entry.state, SidecarInventoryState::Unknown);
+        assert_eq!(entry.state, SidecarInventoryState::Orphaned);
         assert!(entry.safe_candidate_reason.is_none());
-        assert!(entry.blocking_reason.as_deref().unwrap().contains("owner"));
+        assert!(
+            entry
+                .blocking_reason
+                .as_deref()
+                .unwrap()
+                .contains("exact V3")
+        );
     }
 
     #[test]
     fn dry_run_inventory_does_not_delete_state_files() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-no-delete";
+        let namespace = "codestory-agent-v3-no-delete";
         let root = cache.path().join("sidecars").join(namespace);
-        let state_path = root.join("retrieval-sidecars.json");
+        let state_path = root.join(SIDECAR_STATE_FILE_V3);
         let state = state(namespace, &root, 0);
         create_state_dirs(&state);
         write_state(&state_path, &state);
@@ -1501,24 +1557,28 @@ mod tests {
     fn apply_removes_only_safe_candidates() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let stale_namespace = "codestory-agent-stale-apply";
-        let live_namespace = "codestory-agent-live-apply";
-        let unknown_namespace = "codestory-agent-unknown-apply";
+        let stale_namespace = "codestory-agent-v3-stale-apply";
+        let live_namespace = "codestory-agent-v3-live-apply";
+        let unknown_namespace = "codestory-agent-v3-unknown-apply";
+        let legacy_path = cache.path().join(LEGACY_SIDECAR_STATE_FILE);
+        let legacy = state("codestory", cache.path(), 0);
+        create_state_dirs(&legacy);
+        write_state(&legacy_path, &legacy);
 
         let stale_root = cache.path().join("sidecars").join(stale_namespace);
-        let stale_path = stale_root.join("retrieval-sidecars.json");
+        let stale_path = stale_root.join(SIDECAR_STATE_FILE_V3);
         let stale = state(stale_namespace, &stale_root, 0);
         create_state_dirs(&stale);
         write_state(&stale_path, &stale);
 
         let live_root = cache.path().join("sidecars").join(live_namespace);
-        let live_path = live_root.join("retrieval-sidecars.json");
+        let live_path = live_root.join(SIDECAR_STATE_FILE_V3);
         let live = state(live_namespace, &live_root, 100);
         create_state_dirs(&live);
         write_state(&live_path, &live);
 
         let unknown_root = cache.path().join("sidecars").join(unknown_namespace);
-        let unknown_path = unknown_root.join("retrieval-sidecars.json");
+        let unknown_path = unknown_root.join(SIDECAR_STATE_FILE_V3);
         let mut unknown = state(unknown_namespace, &unknown_root, 100);
         unknown.owner = "someone-else".to_string();
         create_state_dirs(&unknown);
@@ -1555,6 +1615,8 @@ mod tests {
             unknown_path.exists(),
             "unknown owner state file must stay blocked"
         );
+        assert!(legacy_path.exists(), "legacy local state must stay blocked");
+        assert!(Path::new(&legacy.lexical_data_dir).exists());
         assert!(
             report
                 .blocked
@@ -1569,17 +1631,24 @@ mod tests {
                 .any(|blocked| blocked.namespace == unknown_namespace
                     && blocked.reason.contains("owner"))
         );
+        assert!(
+            report
+                .blocked
+                .iter()
+                .any(|blocked| blocked.namespace == "codestory"
+                    && blocked.reason.contains("inventory-only"))
+        );
     }
 
     #[test]
     fn apply_does_not_remove_foreign_resource_with_matching_namespace() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-foreign-resource";
+        let namespace = "codestory-agent-v3-foreign-resource";
         let root = cache.path().join("sidecars").join(namespace);
         let state = state(namespace, &root, 0);
         create_state_dirs(&state);
-        write_state(&root.join("retrieval-sidecars.json"), &state);
+        write_state(&root.join(SIDECAR_STATE_FILE_V3), &state);
 
         let mut remover = FsSidecarGcRemover;
         let report = apply_inventory(
@@ -1610,9 +1679,9 @@ mod tests {
     fn apply_refuses_live_namespaces() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-live-refused";
+        let namespace = "codestory-agent-v3-live-refused";
         let root = cache.path().join("sidecars").join(namespace);
-        let state_path = root.join("retrieval-sidecars.json");
+        let state_path = root.join(SIDECAR_STATE_FILE_V3);
         let state = state(namespace, &root, 100);
         create_state_dirs(&state);
         write_state(&state_path, &state);
@@ -1642,9 +1711,9 @@ mod tests {
     fn apply_refuses_unknown_ownership() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-unknown-refused";
+        let namespace = "codestory-agent-v3-unknown-refused";
         let root = cache.path().join("sidecars").join(namespace);
-        let state_path = root.join("retrieval-sidecars.json");
+        let state_path = root.join(SIDECAR_STATE_FILE_V3);
         let mut state = state(namespace, &root, 0);
         state.owner = "someone-else".to_string();
         create_state_dirs(&state);
@@ -1676,9 +1745,9 @@ mod tests {
     fn apply_reports_partial_failures() {
         let project = tempdir().expect("project");
         let cache = tempdir().expect("cache");
-        let namespace = "codestory-agent-partial-failure";
+        let namespace = "codestory-agent-v3-partial-failure";
         let root = cache.path().join("sidecars").join(namespace);
-        let state_path = root.join("retrieval-sidecars.json");
+        let state_path = root.join(SIDECAR_STATE_FILE_V3);
         let state = state(namespace, &root, 0);
         create_state_dirs(&state);
         write_state(&state_path, &state);

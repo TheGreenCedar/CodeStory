@@ -9631,6 +9631,10 @@ mod tests {
             namespace: sidecar.namespace.clone(),
             compose_project: sidecar.compose_project.clone(),
             embed_url: codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port),
+            embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+            embedding_endpoint_fingerprint_sha256: sidecar
+                .ownership()
+                .embedding_endpoint_fingerprint_sha256,
             started_at_epoch_ms: 1,
             embedding_launch: Some(codestory_retrieval::EmbeddingLaunchMetadata {
                 provider: "vulkan".into(),

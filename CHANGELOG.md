@@ -30,6 +30,23 @@
 
 ### Fixed
 
+- Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
+  generation artifact scopes to project identity schema 3. Legacy schema-2
+  state is discovered for inventory but never reused or destructively cleaned;
+  new Local and Agent state uses explicit `v3` namespaces and filenames so it
+  cannot collide with unversioned state. Mismatched state fails closed. Runtime
+  state also binds the non-secret
+  endpoint origin and an install-keyed full-endpoint HMAC-SHA256 fingerprint,
+  whose key is initialized once under a private lock and atomically published
+  with owner-only permissions,
+  external endpoints cannot supply managed GPU proof, and identity drift aborts
+  publication and query instead of mixing artifact scopes. Managed native state
+  also binds its launch endpoint and port arguments before reuse or cleanup, and
+  failed bootstrap cleanup removes its exact schema-3 state before preserving
+  owned schema-2 inventory. Native executable ownership now uses filesystem
+  identity instead of case-folded path text, requires an exact persisted process
+  start identity, and reconciles terminal repair results from the compatible
+  schema-2 coordination path during migration.
 - Recognized current llama.cpp's logger-prefixed Metal device inventory so
   native offload proof remains bound to the selected provider and current
   launch even when `ggml_metal_init` reports later in startup.

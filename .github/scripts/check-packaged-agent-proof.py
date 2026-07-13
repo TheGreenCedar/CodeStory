@@ -35,6 +35,8 @@ PLUGIN_SKILL_RELATIVE = Path("plugins/codestory/skills/codestory-grounding/SKILL
 PROOF_TEMP_OWNER_FILE = ".codestory-macos-metal-proof-owner.json"
 PROOF_LOCAL_RUN_ID = "shared-agent"
 PROOF_AGENT_RUN_IDS = (PROOF_LOCAL_RUN_ID,)
+SIDECAR_STATE_FILE_V3 = "retrieval-sidecars-v3.json"
+LEGACY_SIDECAR_STATE_FILE = "retrieval-sidecars.json"
 
 
 class GateFailure(Exception):
@@ -181,7 +183,7 @@ def preserve_native_embedding_evidence(
     required: bool = False,
     exact_launch: dict | None = None,
 ) -> Path | None:
-    state_file = cache_root / "retrieval-sidecars.json"
+    state_file = cache_root / SIDECAR_STATE_FILE_V3
     metadata_artifact = out_dir / f"{label}-native-launch.json"
     launch = exact_launch
     if launch is None:
@@ -326,18 +328,28 @@ def proof_ownership_snapshot(cache_root: Path) -> dict[str, str]:
     }
 
 
-def fnv1a_hex(value: str) -> str:
+def fnv1a_bytes(value: bytes) -> str:
     digest = 0xCBF29CE484222325
-    for byte in os.fsencode(value):
+    for byte in value:
         digest ^= byte
         digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return f"{digest:016x}"
 
 
+def fnv1a_hex(value: str) -> str:
+    return fnv1a_bytes(os.fsencode(value))
+
+
+def workspace_id_v3_for_path(path: Path) -> str:
+    encoded = str(path).encode("utf-16le") if os.name == "nt" else os.fsencode(path)
+    return fnv1a_bytes(encoded)
+
+
 def proof_agent_identity(cache_root: Path, project: Path, run_id: str) -> dict[str, str]:
     canonical_cache = cache_root.resolve(strict=False)
     canonical_project = project.resolve(strict=False)
-    namespace = f"codestory-agent-{fnv1a_hex(str(canonical_project))}-{run_id}"
+    workspace_id = workspace_id_v3_for_path(canonical_project)
+    namespace = f"codestory-agent-v3-{workspace_id}-{run_id}"
     state_root = canonical_cache / "sidecars" / namespace
     return {
         "cache_root": str(canonical_cache),
@@ -346,7 +358,7 @@ def proof_agent_identity(cache_root: Path, project: Path, run_id: str) -> dict[s
         "run_id": run_id,
         "namespace": namespace,
         "compose_project": namespace,
-        "state_file": str(state_root / "retrieval-sidecars.json"),
+        "state_file": str(state_root / SIDECAR_STATE_FILE_V3),
         "qdrant_data_dir": str(state_root / "qdrant"),
         "lexical_data_dir": str(state_root / "lexical"),
         "scip_artifacts_root": str(state_root / "scip"),
@@ -809,11 +821,14 @@ def validated_proof_compose_state(
         raise RuntimeError("proof cache and project roots must not be symlinks")
     cache_root = cache_root.resolve(strict=True)
     project = project.resolve(strict=registered_identity is None)
-    local_state = cache_root / "retrieval-sidecars.json"
-    if local_state.exists() or local_state.is_symlink():
-        raise RuntimeError(
-            f"proof cleanup refuses the global local-sidecar namespace: {local_state}"
-        )
+    for local_state in (
+        cache_root / SIDECAR_STATE_FILE_V3,
+        cache_root / LEGACY_SIDECAR_STATE_FILE,
+    ):
+        if local_state.exists() or local_state.is_symlink():
+            raise RuntimeError(
+                f"proof cleanup refuses the global local-sidecar namespace: {local_state}"
+            )
     expected = registered_identity or proof_agent_identity(cache_root, project, run_id)
     required_identity = proof_agent_identity(cache_root, Path(expected.get("project", project)), run_id)
     for name in (
@@ -830,7 +845,9 @@ def validated_proof_compose_state(
     ):
         if expected.get(name) != required_identity[name]:
             raise RuntimeError(f"registered proof sidecar identity changed {name!r}")
-    if expected["namespace"] == "codestory" or not expected["namespace"].startswith("codestory-agent-"):
+    if expected["namespace"] == "codestory-v3" or not expected["namespace"].startswith(
+        "codestory-agent-v3-"
+    ):
         raise RuntimeError("proof sidecar namespace is not isolated from the global local namespace")
     state_file = Path(expected["state_file"])
     canonical_state_file = state_file.resolve(strict=False)
@@ -1090,7 +1107,7 @@ def cleanup_proof_cache(
     }
     discovered_state_files = {
         path.resolve(strict=False)
-        for path in (canonical_cache / "sidecars").glob("*/retrieval-sidecars.json")
+        for path in (canonical_cache / "sidecars").glob(f"*/{SIDECAR_STATE_FILE_V3}")
     }
     unexpected = sorted(str(path) for path in discovered_state_files - expected_state_files)
     if unexpected:
@@ -3852,6 +3869,7 @@ def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="codestory-packaged-proof-self-test-") as temp:
         root = Path(temp)
         artifact = root / "validator.json"
+        assert fnv1a_bytes(r"C:\CodeStory".encode("utf-16le")) == "bf15b1ad4ccb5afe"
         runner_temp = os.environ.get("RUNNER_TEMP", "").strip()
         proof_root_parent = Path(runner_temp).resolve(strict=True) if runner_temp else root
 
@@ -3895,26 +3913,32 @@ def self_test() -> None:
             )
 
         if sys.platform == "darwin":
-            probe_code = "import time; time.sleep(60)"
+            probe_executable = "/bin/sleep"
+            probe_arguments = ["60"]
             process_probe = subprocess.Popen(
-                [sys.executable, "-c", probe_code, "--exact-proof-child"],
+                [probe_executable, *probe_arguments],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             try:
-                time.sleep(0.05)
-                observed_process = darwin_process_argv(process_probe.pid)
-                assert observed_process is not None
+                identity_deadline = time.monotonic() + 2
+                while True:
+                    observed_process = darwin_process_argv(process_probe.pid)
+                    if observed_process is not None:
+                        break
+                    if process_probe.poll() is not None or time.monotonic() >= identity_deadline:
+                        raise AssertionError("Darwin process identity did not stabilize")
+                    time.sleep(0.05)
                 launch = {
                     "pid": process_probe.pid,
                     "spawned_at_epoch_ms": int(time.time() * 1000),
                     "executable_path": observed_process[0],
-                    "launch_args": ["-c", probe_code, "--exact-proof-child"],
+                    "launch_args": probe_arguments,
                 }
                 assert registered_native_process_snapshot(launch)["status"] == "matching"
                 wrong_argv = {
                     **launch,
-                    "launch_args": ["-c", probe_code, "--exact-proof"],
+                    "launch_args": ["6"],
                 }
                 assert (
                     registered_native_process_snapshot(wrong_argv)["status"]
@@ -4004,6 +4028,8 @@ def self_test() -> None:
 
         compose_cache = root / "compose-cleanup"
         identity = write_proof_compose_state(compose_cache)
+        assert identity["namespace"].startswith("codestory-agent-v3-")
+        assert Path(identity["state_file"]).name == SIDECAR_STATE_FILE_V3
         compose_calls = []
 
         def fake_docker(command, **kwargs):
@@ -4066,18 +4092,19 @@ def self_test() -> None:
             "network",
         ]
 
-        global_cache = root / "global-local-cache"
-        global_cache.mkdir()
-        write_json(global_cache / "retrieval-sidecars.json", {"owner": "codestory"})
-        try:
-            cleanup_proof_cache(
-                None, root, global_cache, root / "global-local-cleanup.json"
-            )
-        except RuntimeError as exc:
-            assert "global local-sidecar namespace" in str(exc)
-        else:
-            raise AssertionError("proof cleanup must refuse the global namespace")
-        remove_tree_with_retry(global_cache)
+        for state_file_name in (SIDECAR_STATE_FILE_V3, LEGACY_SIDECAR_STATE_FILE):
+            global_cache = root / f"global-local-cache-{state_file_name}"
+            global_cache.mkdir()
+            write_json(global_cache / state_file_name, {"owner": "codestory"})
+            try:
+                cleanup_proof_cache(
+                    None, root, global_cache, root / "global-local-cleanup.json"
+                )
+            except RuntimeError as exc:
+                assert "global local-sidecar namespace" in str(exc)
+            else:
+                raise AssertionError("proof cleanup must refuse the global namespace")
+            remove_tree_with_retry(global_cache)
 
         registered_root = (
             proof_root_parent

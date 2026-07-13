@@ -148,6 +148,10 @@ pub(crate) struct BrokerGpuRuntimeIdentity {
     pub(crate) namespace: String,
     pub(crate) compose_project: String,
     pub(crate) embed_url: String,
+    #[serde(default)]
+    pub(crate) embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin,
+    #[serde(default)]
+    pub(crate) embedding_endpoint_fingerprint_sha256: String,
     pub(crate) started_at_epoch_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) embedding_launch: Option<codestory_retrieval::EmbeddingLaunchMetadata>,

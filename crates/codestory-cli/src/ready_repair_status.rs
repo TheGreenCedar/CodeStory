@@ -523,22 +523,35 @@ fn write_ready_repair_worker_result_locked(
 pub(crate) fn read_ready_repair_worker_result_for_sidecar(
     sidecar: &SidecarRuntimeConfig,
 ) -> Option<ReadyRepairWorkerResult> {
-    fs::read_to_string(ready_repair_result_path(sidecar))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+    read_ready_repair_worker_results_for_sidecar(sidecar)
+        .into_iter()
+        .max_by_key(|result| result.finished_at_epoch_ms)
 }
 
 fn ready_repair_terminal_result_matches(sidecar: &SidecarRuntimeConfig, attempt_id: &str) -> bool {
-    fs::read_to_string(ready_repair_result_path(sidecar))
-        .ok()
-        .and_then(|text| serde_json::from_str::<ReadyRepairWorkerResult>(&text).ok())
-        .is_some_and(|result| {
+    read_ready_repair_worker_results_for_sidecar(sidecar)
+        .into_iter()
+        .any(|result| {
             result.attempt_id == attempt_id
                 && matches!(
                     result.outcome.as_str(),
                     "succeeded" | "failed" | "abandoned"
                 )
         })
+}
+
+fn read_ready_repair_worker_results_for_sidecar(
+    sidecar: &SidecarRuntimeConfig,
+) -> Vec<ReadyRepairWorkerResult> {
+    ready_repair_result_paths_for_sidecar(sidecar)
+        .into_iter()
+        .filter_map(|path| {
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .filter(|result| ready_repair_result_path_matches_sidecar(sidecar, &path, result))
+        })
+        .collect()
 }
 
 pub(crate) fn try_acquire_ready_repair_lock(
@@ -929,13 +942,28 @@ fn cleanup_abandoned_ready_repair_status_from_paths(
 
 #[cfg(test)]
 pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> String {
-    ready_repair_status_cache_fingerprint_for_paths(ready_repair_status_paths(project_root, None))
+    let sidecar = crate::sidecar_runtime::for_project_with_run_id(
+        project_root,
+        SidecarProfile::Agent,
+        Some(DEFAULT_AGENT_RUN_ID),
+    );
+    ready_repair_status_cache_fingerprint_for_sidecar(&sidecar)
 }
 
 pub(crate) fn ready_repair_status_cache_fingerprint_for_sidecar(
     sidecar: &SidecarRuntimeConfig,
 ) -> String {
-    ready_repair_status_cache_fingerprint_for_paths(ready_repair_status_paths_for_sidecar(sidecar))
+    let mut fingerprint = ready_repair_status_cache_fingerprint_for_paths(
+        ready_repair_status_paths_for_sidecar(sidecar),
+    );
+    let current_result_path = ready_repair_result_path(sidecar);
+    for path in ready_repair_result_paths_for_sidecar(sidecar) {
+        if path != current_result_path {
+            fingerprint.push(';');
+            fingerprint.push_str(&path_fingerprint(&path));
+        }
+    }
+    fingerprint
 }
 
 fn ready_repair_status_cache_fingerprint_for_paths(paths: Vec<PathBuf>) -> String {
@@ -993,6 +1021,41 @@ fn ready_repair_result_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
         .layout
         .state_file
         .with_file_name(READY_REPAIR_RESULT_FILE)
+}
+
+fn ready_repair_result_paths_for_sidecar(sidecar: &SidecarRuntimeConfig) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::from([ready_repair_result_path(sidecar)]);
+    if let Some(legacy_state_path) = sidecar.legacy_state_path_for_compatibility() {
+        paths.insert(legacy_state_path.with_file_name(READY_REPAIR_RESULT_FILE));
+    }
+    paths.into_iter().collect()
+}
+
+fn ready_repair_result_path_matches_sidecar(
+    sidecar: &SidecarRuntimeConfig,
+    path: &Path,
+    result: &ReadyRepairWorkerResult,
+) -> bool {
+    if path == ready_repair_result_path(sidecar) {
+        return true;
+    }
+    let Some(legacy_state_path) = sidecar.legacy_state_path_for_compatibility() else {
+        return false;
+    };
+    let expected_namespace = legacy_state_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    let expected_project = sidecar
+        .labels
+        .get("dev.codestory.workspace_root")
+        .map(|project| clean_path_text(Path::new(project)));
+    path == legacy_state_path.with_file_name(READY_REPAIR_RESULT_FILE)
+        && result.schema_version == READY_REPAIR_STATUS_SCHEMA_VERSION
+        && expected_project.as_deref() == Some(result.project_root.as_str())
+        && result.profile == sidecar.profile.as_str()
+        && result.run_id == sidecar.run_id
+        && expected_namespace == Some(result.namespace.as_str())
 }
 
 fn ready_repair_reservation_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
@@ -1714,6 +1777,72 @@ mod tests {
                 .parent()
                 .expect("sidecar state parent"),
         );
+    }
+
+    #[test]
+    fn current_runtime_reconciles_compatible_legacy_worker_result() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id_in_cache(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some(DEFAULT_AGENT_RUN_ID),
+            cache.path(),
+        );
+        let legacy_state_path = sidecar
+            .legacy_state_path_for_compatibility()
+            .expect("legacy compatibility path");
+        let legacy_result_path = legacy_state_path.with_file_name(READY_REPAIR_RESULT_FILE);
+        fs::create_dir_all(legacy_result_path.parent().expect("legacy result parent"))
+            .expect("legacy result directory");
+        let result = ReadyRepairWorkerResult {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: "legacy-compatible-attempt".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some(DEFAULT_AGENT_RUN_ID.to_string()),
+            namespace: legacy_state_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .expect("legacy namespace")
+                .to_string(),
+            pid: 42,
+            started_at_epoch_ms: 100,
+            finished_at_epoch_ms: 200,
+            outcome: "succeeded".to_string(),
+            auto_retry_fingerprint: None,
+            exit_code: Some(0),
+            wait_error: None,
+            terminal_envelope: None,
+            stdout_tail: "done".to_string(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let fingerprint_before = ready_repair_status_cache_fingerprint_for_sidecar(&sidecar);
+
+        crate::file_state::write_json_atomic(
+            &legacy_result_path,
+            "legacy-ready-repair-result",
+            &result,
+        )
+        .expect("legacy worker result");
+
+        assert_ne!(
+            ready_repair_status_cache_fingerprint_for_sidecar(&sidecar),
+            fingerprint_before,
+            "compatible terminal result should invalidate cached MCP status"
+        );
+        assert_eq!(
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
+            Some(result)
+        );
+        assert!(ready_repair_terminal_result_matches(
+            &sidecar,
+            "legacy-compatible-attempt"
+        ));
     }
 
     #[test]
