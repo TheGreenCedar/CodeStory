@@ -17,6 +17,7 @@ The approved host shape for the first v0.15 baseline is:
 | Colima | 0.10.3 |
 | Capacity | 4 vCPU, 17 GiB configured memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
+| Host Docker context | never activated by the evidence profile |
 | Stable profile ID | `codestory-release-evidence-linux-arm64-v1` |
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
@@ -48,6 +49,7 @@ Provisioning is idempotent. It:
 
 - creates the dedicated VM and service account;
 - disables Colima's default writable host-home mount;
+- leaves the caller's active Docker context unchanged;
 - verifies the checksum-pinned Colima base image before VM creation;
 - installs native packages from a fixed Ubuntu archive snapshot at exact
   versions, then records the complete native package manifest;
@@ -68,7 +70,9 @@ the stopped runner, so untracked or modified validation files cannot survive a
 provisioning pass. No source or tool is executed through a host mount. `verify`
 prints the guest mount table and fails if it finds a host-backed VirtioFS, 9p,
 SSHFS, Lima, osxfs, or gRPC FUSE mount; any `/Users` visibility is also a hard
-failure.
+failure. Provision, verify, start, and the workflow preflight also require the
+dedicated VM to have no running containers. CodeStory sidecars may start only
+after that preflight as part of the active evidence job.
 
 The model seed also crosses SSH rather than a host mount. Its default source is
 `~/Library/Caches/dev.codestory.codestory/retrieval/models/`; set

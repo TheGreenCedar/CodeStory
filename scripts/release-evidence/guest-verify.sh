@@ -28,11 +28,17 @@ if test -n "$unexpected_host_mounts"; then
   exit 1
 fi
 for host_path in /Users /Users/albert; do
-  if test -e "$host_path" || test -r "$host_path" || test -w "$host_path"; then
+  if test -r "$host_path" || test -w "$host_path"; then
     echo "host path is visible to the runner: $host_path" >&2
     exit 1
   fi
 done
+running_containers=$(docker ps --format '{{.ID}} {{.Names}} {{.Image}}')
+if test -n "$running_containers"; then
+  echo "dedicated evidence VM has running containers:" >&2
+  printf '%s\n' "$running_containers" >&2
+  exit 1
+fi
 mountpoint -q "$runner_root"
 echo "host_mounts=none host_home_visible=false"
 

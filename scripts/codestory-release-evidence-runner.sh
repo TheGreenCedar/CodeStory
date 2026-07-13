@@ -202,6 +202,7 @@ assert_vm_config() {
     .cpu == $contract[0].vm.cpus and .memory == $contract[0].vm.memory_gib and
     .disk == $contract[0].vm.data_disk_gib and .arch == $contract[0].vm.architecture and
     .runtime == $contract[0].vm.runtime and .vmType == $contract[0].vm.type and
+    .autoActivate == $contract[0].vm.activate_host_context and
     .mountType == $contract[0].vm.mount_type and (.mounts // []) == []
     ' <<<"$colima" >/dev/null
 }
@@ -214,7 +215,7 @@ start_profile() {
     fresh=true
   fi
   if ! profile_running; then
-    colima start --profile "$profile" --cpu "$(get '.vm.cpus')" \
+    colima start --profile "$profile" --activate=false --cpu "$(get '.vm.cpus')" \
       --memory "$(get '.vm.memory_gib')" --disk "$(get '.vm.data_disk_gib')" \
       --root-disk "$(get '.vm.root_disk_gib')" --runtime "$(get '.vm.runtime')" \
       --arch "$(get '.vm.architecture')" --vm-type "$(get '.vm.type')" \
@@ -332,6 +333,17 @@ guest_verify() {
     "$runner_root/validation/codestory/scripts/release-evidence/machine-contract.json"
 }
 
+assert_guest_idle() {
+  local containers
+  containers=$(colima ssh --profile "$profile" -- docker ps \
+    --format '{{.ID}} {{.Names}} {{.Image}}')
+  if test -n "$containers"; then
+    echo "dedicated evidence VM has running containers; refusing to continue:" >&2
+    printf '%s\n' "$containers" >&2
+    return 1
+  fi
+}
+
 start_runner() {
   colima ssh --profile "$profile" -- sudo bash \
     "$runner_root/validation/codestory/scripts/release-evidence/guest-runner.sh" start \
@@ -377,6 +389,7 @@ verify_runner() {
   owner_json >/dev/null
   profile_running
   quiesce_runner
+  assert_guest_idle
   write_host_attestation
   guest_verify
   start_runner
@@ -408,7 +421,7 @@ unregister_runner() {
   local confirmed_absent
   profile_exists || return 0
   owner_json >/dev/null
-  if ! profile_running; then colima start --profile "$profile"; fi
+  if ! profile_running; then colima start --profile "$profile" --activate=false; fi
   if ! state=$(runner_inspect); then return 1; fi
   if test "$(jq -r '.configured' <<<"$state")" != true; then
     if test "$(jq -r '.runner_id' "$owner_path")" != null; then
@@ -484,6 +497,7 @@ case "$command" in
     assert_not_busy
     start_profile
     quiesce_runner
+    assert_guest_idle
     source_sha=$(sync_validation_source)
     model_seed=$(sync_model_seed)
     provision_guest "$source_sha" "$model_seed"
@@ -502,6 +516,7 @@ case "$command" in
     ensure_base_image
     start_profile
     quiesce_runner
+    assert_guest_idle
     write_host_attestation
     guest_verify
     start_runner

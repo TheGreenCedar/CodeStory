@@ -30,6 +30,7 @@
     "type": "vz",
     "architecture": "aarch64",
     "runtime": "docker",
+    "activate_host_context": false,
     "mount_type": "virtiofs",
     "host_mounts": [],
     "cpus": 4,

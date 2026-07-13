@@ -17,7 +17,9 @@
   model bytes can stream over SSH from the normal CodeStory cache when the
   pinned upstream download is unavailable. Lifecycle mutations now require the
   exact runner to be offline and idle, treat GitHub API failures as failures,
-  and retain credentials and VM state until remote deletion is confirmed.
+  and retain credentials and VM state until remote deletion is confirmed. The
+  evidence profile no longer becomes the host's active Docker context, and
+  lifecycle and workflow preflights reject competing containers in its VM.
 - Reduced the packaged macOS proof to one check per release boundary. The
   protected run still covers managed Metal cold/warm/recovery, exact process
   reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned

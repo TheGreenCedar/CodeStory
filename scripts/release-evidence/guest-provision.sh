@@ -12,6 +12,12 @@ test "$model_seed" = - || test "$model_seed" = /tmp/codestory-release-evidence-m
 actual_contract_sha=$(sha256sum "$contract" | awk '{print $1}')
 test "$actual_contract_sha" = "$expected_contract_sha"
 
+if test -e /Users; then
+  test ! -L /Users
+  test "$(findmnt -rn -o TARGET -T /Users)" = /
+  sudo chmod 000 /Users
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 printf '%s\n' \
   "APT::Snapshot \"$bootstrap_snapshot\";" \
