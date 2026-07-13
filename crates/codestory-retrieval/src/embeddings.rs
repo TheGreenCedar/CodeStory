@@ -899,11 +899,7 @@ fn runtime_log_proves_requested_accelerator(
     let text = text.to_ascii_lowercase();
     let provider = request.provider.to_ascii_lowercase();
     let provider_offload_proven = if provider == "metal" {
-        let mut metal_initialized = false;
-        text.lines().any(|line| {
-            metal_initialized |= line_reports_metal_evidence(line);
-            metal_initialized && line_reports_gpu_offload(line) == Some(true)
-        })
+        observe_metal_runtime(&text).offload_proven
     } else {
         let provider_seen = text.contains(&provider)
             || crate::config::selected_llama_sidecar_backend(&request.provider).is_some_and(
@@ -1024,19 +1020,22 @@ fn observed_embedding_device_state(
 }
 
 fn observed_embedding_provider_from_text(text: &str) -> Option<&'static str> {
-    text.to_ascii_lowercase()
-        .lines()
-        .any(line_reports_metal_evidence)
+    observe_metal_runtime(text)
+        .provider_observed
         .then_some("metal")
 }
 
 fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     let mut saw_cpu = false;
     let mut saw_accelerated = false;
-    let mut saw_metal = false;
     let text = text.to_ascii_lowercase();
     let log_markers = selected_backend_log_markers();
     let metal_requested = log_markers.iter().any(|marker| marker == "metal");
+    let metal = if metal_requested {
+        observe_metal_runtime(&text)
+    } else {
+        MetalRuntimeObservation::default()
+    };
     for line in text.lines() {
         if line_reports_gpu_offload(line) == Some(true) {
             saw_accelerated = true;
@@ -1048,9 +1047,6 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         {
             saw_accelerated = true;
         }
-        if metal_requested && line_reports_metal_evidence(line) {
-            saw_metal = true;
-        }
         saw_cpu |= line_reports_gpu_offload(line) == Some(false)
             || line.contains("n_gpu_layers = 0")
             || line.contains("using cpu")
@@ -1061,8 +1057,9 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         "accelerated"
     } else if saw_cpu {
         "cpu"
-    } else if saw_metal
-        || (!log_markers.is_empty()
+    } else if metal.provider_observed
+        || (!metal_requested
+            && !log_markers.is_empty()
             && log_markers
                 .iter()
                 .all(|marker| text.contains(&marker.to_ascii_lowercase())))
@@ -1073,8 +1070,40 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     }
 }
 
-fn line_reports_metal_evidence(line: &str) -> bool {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MetalRuntimeObservation {
+    provider_observed: bool,
+    offload_proven: bool,
+}
+
+fn observe_metal_runtime(text: &str) -> MetalRuntimeObservation {
+    let mut observation = MetalRuntimeObservation::default();
+    let text = text.to_ascii_lowercase();
+    for line in text.lines() {
+        match metal_runtime_event(line) {
+            Some(true) => observation.provider_observed = true,
+            Some(false) => {
+                observation = MetalRuntimeObservation::default();
+                continue;
+            }
+            None => {}
+        }
+        if observation.provider_observed && line_reports_gpu_offload(line) == Some(true) {
+            observation.offload_proven = true;
+        }
+    }
+    observation
+}
+
+fn metal_runtime_event(line: &str) -> Option<bool> {
     let line = line.trim_start();
+    let metal_line = line.starts_with("mtl0")
+        || line.starts_with("mtl :")
+        || line.contains("ggml_metal_init")
+        || line.contains("metal backend");
+    if !metal_line {
+        return None;
+    }
     let rejected = [
         "fail",
         "error",
@@ -1088,6 +1117,9 @@ fn line_reports_metal_evidence(line: &str) -> bool {
     ]
     .iter()
     .any(|marker| line.contains(marker));
+    if rejected {
+        return Some(false);
+    }
     let affirmative = [
         "found device",
         "picking default device",
@@ -1098,11 +1130,7 @@ fn line_reports_metal_evidence(line: &str) -> bool {
     ]
     .iter()
     .any(|marker| line.contains(marker));
-    !rejected
-        && (line.starts_with("mtl0")
-            || line.starts_with("mtl :")
-            || ((line.contains("ggml_metal_init") || line.contains("metal backend"))
-                && affirmative))
+    (line.starts_with("mtl0") || line.starts_with("mtl :") || affirmative).then_some(true)
 }
 
 fn selected_backend_log_markers() -> Vec<String> {
@@ -2226,7 +2254,7 @@ mod tests {
             metal_log, &request
         ));
         assert_eq!(
-            observed_embedding_provider_from_text(metal_log).as_deref(),
+            observed_embedding_provider_from_text(metal_log),
             Some("metal")
         );
         assert!(!runtime_log_proves_requested_accelerator(
@@ -2237,6 +2265,18 @@ mod tests {
             "ggml_metal_init: failed to initialize Metal backend\nvulkan backend ready\noffloaded 13/13 layers to GPU\n",
             &request,
         ));
+        let invalidated_metal_log = "ggml_metal_init: found device Metal0: Apple M5\n\
+ggml_metal_init: failed to initialize Metal backend\n\
+vulkan backend ready\n\
+offloaded 13/13 layers to GPU\n";
+        assert!(!runtime_log_proves_requested_accelerator(
+            invalidated_metal_log,
+            &request,
+        ));
+        assert_eq!(
+            observed_embedding_provider_from_text(invalidated_metal_log),
+            None
+        );
 
         let device = EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
