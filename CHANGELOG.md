@@ -61,6 +61,23 @@
   project/workspace identity differs from the selected repository. `cache
   identity` now exposes the lossless project, workspace, artifact, and safe
   legacy-alias disposition used by that verification.
+- Separated release-evidence provenance validation from the benchmark corpus
+  loader and expanded the generalization guard across the repository-controlled
+  non-Rust product and release-control boundary. Direct and adjacent/split
+  evaluation-corpus dependencies now fail in plugin launch/setup surfaces,
+  worktree/install tooling, runtime configuration, release scripts/workflows,
+  and the release evaluator across native separators, case variants,
+  direct harness commands/configuration, comment-separated JavaScript imports,
+  unquoted shell continuations, workflow-embedded shell continuations, and
+  PowerShell continuations. Comment-only JavaScript and hash-commented
+  shell/config text is ignored, while Markdown prose stays outside evaluation
+  and dependency scanning. The CI trigger and focused regression contract cover
+  the full protected inventory, including local composite actions and shipped
+  agent instruction surfaces, and missing protected paths fail closed. Exact
+  release-policy references to the retrieval smoke workflow are allowed only
+  by file, literal, and use; every direct or constructed occurrence is checked,
+  and constructed dependencies must span the literals that form the matched
+  harness marker.
 - Added deterministic prior-version managed CLI upgrade proof to every native
   managed-lifecycle cell. The gate now starts with a verified older install,
   requires the requested packaged binary to serve status and grounding, and
