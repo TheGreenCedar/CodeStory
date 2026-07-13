@@ -35,6 +35,39 @@ function namedStep(job, name) {
   return job.slice(start, relativeEnd < 0 ? undefined : start + 1 + relativeEnd);
 }
 
+function yamlJobWithValue(job, key) {
+  const withStart = job.indexOf("    with:");
+  if (withStart < 0) return undefined;
+  const relativeEnd = job.slice(withStart + 1).findIndex((line) => /^    \S/u.test(line));
+  const withLines = job.slice(
+    withStart + 1,
+    relativeEnd < 0 ? undefined : withStart + 1 + relativeEnd,
+  );
+  const prefix = `      ${key}:`;
+  const values = withLines
+    .filter((line) => line.startsWith(prefix))
+    .map((line) => line.slice(prefix.length).trim());
+  return values.length === 1 ? values[0] : undefined;
+}
+
+function packagedPrSigningPolicyViolations(content) {
+  const found = [];
+  const packagedProofJob = yamlJob(content, "packaged-proof");
+  if (yamlJobWithValue(packagedProofJob, "sign_macos") !== "false") {
+    found.push("named packaged-proof job must set with.sign_macos to false");
+  }
+  if (/^\s+secrets:\s*(?:#.*)?$/mu.test(content)) {
+    found.push("must not contain a secrets block");
+  }
+  if (/\bAPPLE_[A-Z0-9_]+\b/u.test(content)) {
+    found.push("must not reference Apple secret identifiers");
+  }
+  if (content.includes("macos-release-signing")) {
+    found.push("must not reference the release signing environment");
+  }
+  return found;
+}
+
 function requireContent(content, requirements, violationFor) {
   for (const requirement of requirements) {
     if (!content.includes(requirement)) {
@@ -290,7 +323,7 @@ if (!fs.existsSync(releaseWorkflow)) {
     "APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}",
     "APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}",
     "uses: ./.github/workflows/macos-metal-proof.yml",
-    "use_packaged_artifact: true",
+    "use_packaged_cli_artifact: true",
     "version: ${{ needs.preflight.outputs.version }}",
     "uses: ./.github/workflows/post-publish-release-smoke.yml",
     "--notes-file target/release-assets/proof-boundaries.md",
@@ -506,14 +539,43 @@ if (!fs.existsSync(packagedPlatformPr)) {
     "uses: ./.github/workflows/repo-scale-stats.yml",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
     "scope: ${{ needs.route.outputs.scope }}",
-    "sign_macos: false",
     "uses: ./.github/workflows/macos-metal-proof.yml",
-    "use_packaged_artifact: true",
+    "use_packaged_cli_artifact: true",
     "dev/codestory-next moved from proved head",
   ], snippet => `packaged-platform-pr.yml must include ${snippet}`);
-  const packagedProofJob = yamlJob(content, "packaged-proof").join("\n");
-  if (packagedProofJob.includes("secrets: inherit")) {
-    violations.push("packaged-platform-pr.yml must not expose release signing secrets to PR or integration proof");
+  for (const violation of packagedPrSigningPolicyViolations(content)) {
+    violations.push(`packaged-platform-pr.yml ${violation}`);
+  }
+  const signingPolicyMutations = [
+    [
+      "sign_macos true",
+      content.replace("      sign_macos: false", "      sign_macos: true"),
+    ],
+    [
+      "explicit secrets mapping",
+      content.replace(
+        "      sign_macos: false",
+        "      sign_macos: false\n    secrets:\n      PACKAGE_PROOF_TOKEN: ${{ secrets.PACKAGE_PROOF_TOKEN }}",
+      ),
+    ],
+    [
+      "Apple secret identifier",
+      content.replace("      sign_macos: false", "      sign_macos: false\n    # APPLE_NOTARY_KEY_ID"),
+    ],
+    [
+      "release signing environment",
+      content.replace(
+        "  packaged-proof:\n",
+        "  packaged-proof:\n    environment: macos-release-signing\n",
+      ),
+    ],
+  ];
+  for (const [name, candidate] of signingPolicyMutations) {
+    if (candidate === content) {
+      violations.push(`packaged-platform-pr.yml could not apply ${name} policy mutation`);
+    } else if (packagedPrSigningPolicyViolations(candidate).length === 0) {
+      violations.push(`packaged-platform-pr.yml signing policy accepted ${name} mutation`);
+    }
   }
   if ((content.match(/branches\/dev\/codestory-next/gu) ?? []).length < 2) {
     violations.push("packaged-platform-pr.yml must verify the dev head before and after integration proof");
@@ -534,7 +596,7 @@ if (!fs.existsSync(macosMetalProof)) {
   requireContent(content, [
     "workflow_call:",
     "workflow_dispatch:",
-    "use_packaged_artifact:",
+    "use_packaged_cli_artifact:",
     "runs-on: [self-hosted, macOS, ARM64, codestory-metal]",
     "environment: macos-metal-release",
     "actions/download-artifact@v8.0.1",

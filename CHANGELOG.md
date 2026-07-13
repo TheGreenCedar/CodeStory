@@ -4,10 +4,17 @@
 
 ### Changed
 
-- Moved Developer ID signing and Apple notarization out of pull-request and
-  integration proof. Those lanes now test the exact unsigned Mac packages,
-  including Metal lifecycle behavior; the main-triggered release signs and
-  notarizes once before publication and still fails closed on any Apple error.
+- Staged CI proof by pull-request maturity and changed surface. Draft pushes
+  now stay on one Ubuntu source lane, exact-head review promotion runs the full
+  workspace test and clippy gate once, and explicit platform promotion selects
+  no package matrix, the two Mac targets, or all six native targets. Promoted
+  heads run repo-scale stats once and reuse each selected unsigned package for
+  package and install checks, with the Mac arm64 candidate also used for
+  protected Metal proof. The main-triggered release signs and notarizes Mac
+  binaries once before packaging and publication, failing closed on any Apple
+  error. Per-proof concurrency cancels stale heads, and the integration
+  dispatcher proves the current `dev/codestory-next` merge result before
+  rechecking that dev did not move during the gate.
 - Rewrote the repository agent guide around the current request-scoped MCP
   workflow, crate ownership, identity/publication invariants, isolated test
   contract, maturity-routed verification, and claim-specific release proof.
@@ -15,16 +22,6 @@
   wall-clock measurements telemetry. Hardware-bound timing limits remain in
   the release-evidence gate, so shared hosted runners no longer fail a Mac
   platform proof for crossing a local-machine threshold by scheduler noise.
-- Staged CI proof by pull-request maturity and changed surface. Draft pushes
-  now stay on one Ubuntu source lane, exact-head review promotion runs the full
-  workspace test and clippy gate once, and explicit platform promotion selects
-  no package matrix, the two Mac targets, or all six native targets. Promoted
-  heads run repo-scale stats once; signed package artifacts are built once per
-  target and reused by package smoke, notarization, install, and protected
-  Apple Silicon proof. Per-proof concurrency cancels stale heads, while the
-  integrated platform dispatcher verifies successful exact-head source proof,
-  and its integration mode proves the current `dev/codestory-next` merge result
-  before rechecking that dev did not move during the gate.
 
 ### Fixed
 

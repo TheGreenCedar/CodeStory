@@ -246,7 +246,7 @@ jobs:
       version: ${{ needs.route.outputs.version }}
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
-      use_packaged_artifact: true
+      use_packaged_cli_artifact: true
 
   closeout:
     if: always() && needs.route.result != 'skipped'

@@ -16,8 +16,8 @@ on:
         required: false
         default: ""
         type: string
-      use_packaged_artifact:
-        description: Download the signed macOS arm64 artifact produced by packaged-platform-proof.
+      use_packaged_cli_artifact:
+        description: Download the macOS arm64 package artifact produced by packaged-platform-proof.
         required: false
         default: false
         type: boolean
@@ -78,14 +78,14 @@ jobs:
           docker info >/dev/null
 
       - name: Install pinned Rust
-        if: ${{ !inputs.use_packaged_artifact }}
+        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
 
       - name: Build and package native CLI
-        if: ${{ !inputs.use_packaged_artifact }}
+        if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
@@ -99,8 +99,8 @@ jobs:
             --binary target/release/codestory-cli \
             --out-dir target/release-dist
 
-      - name: Download signed and notarized packaged CLI
-        if: inputs.use_packaged_artifact
+      - name: Download packaged CLI artifact
+        if: inputs.use_packaged_cli_artifact
         uses: actions/download-artifact@v8.0.1
         with:
           name: codestory-cli-macos-arm64

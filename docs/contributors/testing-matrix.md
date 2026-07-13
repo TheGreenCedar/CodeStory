@@ -143,16 +143,20 @@ the active plugin runtime plus observed and missing server-advertised MCP
 resources. This proves the installed plugin launcher advertises the resources;
 it is not Codex host/model visibility proof.
 
-Packaged acceptance builds each selected native target once and reuses that
-artifact for package smoke, signing/notarization, install checks, and the
-protected Apple Silicon lifecycle. Draft pushes never start this matrix. A
+Packaged acceptance compiles each selected native target once. PR and
+integration invocations package unsigned Mac candidates and reuse them for
+package smoke, install checks, and protected Apple Silicon lifecycle proof.
+Release invocation signs and notarizes each Mac binary after that single build
+and before packaging, then reuses the signed archive for release checks and
+publication. Its Metal job runs the same archive only for functional lifecycle
+proof; signing evidence comes from the signing and post-publish checks. Draft
+pushes never start this matrix. A
 same-repository `platform-proof` label or coordinator dispatch rechecks the
 exact PR head and requires a completed successful `full-source-gate` job for
-that SHA, then routes script/test-guard-only changes to `none`, Mac
-lifecycle changes to the two Mac targets, and cross-platform runtime or
-packaging changes to all six targets. Forks are rejected before checkout and no
-proof lane uses `pull_request_target` to execute PR code. Mac package promotion
-uses the protected signing environment; unavailable credentials fail the proof.
+that SHA, then routes script/test-guard-only changes to `none`, Mac lifecycle
+changes to the two Mac targets, and cross-platform runtime or packaging changes
+to all six targets. Forks are rejected before checkout and no proof lane uses
+`pull_request_target` to execute PR code.
 
 The `review-accepted` label runs the full Ubuntu source gate once for that exact
 head; the persistent label alone does not authorize later heads. After merge,
@@ -170,8 +174,8 @@ SHA.
 | Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
-| macOS x64 | `macos-15-intel` | Version and help (Developer ID signed/notarized in release and post-publish cells), stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, actionable failure without a backend, and explicitly labelled CPU/external operation when configured; never Metal |
-| macOS arm64 | `macos-15` | Version and help (Developer ID signed/notarized in release and post-publish cells), stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
+| macOS x64 | `macos-15-intel` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, actionable failure without a backend, and explicitly labelled CPU/external operation when configured; never Metal |
+| macOS arm64 | `macos-15` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 
 The managed convergence proof on every native runner uses an isolated project
 with a complete publication, then introduces source drift while leaving the
