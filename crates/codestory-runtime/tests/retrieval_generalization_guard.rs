@@ -434,6 +434,16 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
             "export const corpus = import(\"./FETCH-HOLDOUT-REPOS.MJS\");\n",
             "fetch-holdout-repos.mjs",
         ),
+        (
+            "split-import.mjs",
+            "export const corpus = import(\"./fetch-\" + \"holdout-repos.mjs\");\n",
+            "fetchholdoutreposmjs",
+        ),
+        (
+            "split-command.sh",
+            "script=\"scripts/fetch-\"\\\n\"holdout-repos.mjs\"\nnode \"$script\"\n",
+            "scriptsfetchholdoutreposmjs",
+        ),
     ];
     for (file_name, contents, expected) in cases {
         let output = run_lint_with_non_rust_fixture(file_name, contents);

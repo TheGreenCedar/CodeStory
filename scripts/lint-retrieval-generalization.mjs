@@ -73,11 +73,6 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, ".github", "workflows", "release-candidate-evidence.yml"),
   path.join(repoRoot, ".github", "workflows", "retrieval-sidecar-smoke.yml"),
 ].map((filePath) => path.resolve(filePath)));
-const corpusHarnessModuleNames = new Set(
-  [...corpusHarnessNonRustFiles]
-    .filter((filePath) => [".cjs", ".js", ".mjs"].includes(path.extname(filePath)))
-    .map((filePath) => path.basename(filePath).toLowerCase()),
-);
 
 const protectedNonRustExtensions = new Set([
   ".cjs", ".js", ".json", ".md", ".mjs", ".ps1", ".py", ".sh", ".toml", ".ts",
@@ -198,8 +193,15 @@ if (scanDirs.length === 0 && productionOnlyFiles.length === 0) {
 }
 
 const evalCorpusBoundaryPatternList = evalCorpusBoundaryPatterns();
-const evalCorpusCompactPatternList = evalCorpusCompactPatterns(
+const evalCorpusCompactPatternList = compactBoundaryPatterns(
   evalCorpusBoundaryPatternList,
+);
+const corpusHarnessDependencyPatternList = corpusHarnessDependencyPatterns();
+const corpusHarnessDependencyRegexes = corpusHarnessDependencyPatternList.map(
+  (pattern) => new RegExp(`(?:^|/)${pattern}$`, "i"),
+);
+const corpusHarnessCompactPatternList = compactBoundaryPatterns(
+  corpusHarnessDependencyPatternList,
 );
 
 const bannedPatterns = [
@@ -351,7 +353,17 @@ function evalCorpusBoundaryPatterns() {
   ].map(escapeRegExp);
 }
 
-function evalCorpusCompactPatterns(boundaryPatterns) {
+function corpusHarnessDependencyPatterns() {
+  const paths = new Set(
+    [...corpusHarnessNonRustFiles].flatMap((filePath) => [
+      path.relative(repoRoot, filePath).replaceAll(path.sep, "/"),
+      path.basename(filePath),
+    ]),
+  );
+  return [...paths].map(escapeRegExp);
+}
+
+function compactBoundaryPatterns(boundaryPatterns) {
   return boundaryPatterns
     .map((pattern) => compactProductionSource(pattern.replaceAll("\\", "")))
     .filter((pattern) => pattern.length >= 12);
@@ -1166,10 +1178,8 @@ function scanCorpusHarnessImports(prepared) {
   const importPattern = /(?:\bfrom\s+|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'`]([^"'`]+)["'`]/g;
   let match;
   while ((match = importPattern.exec(prepared.production)) != null) {
-    const moduleName = path.posix.basename(
-      normalizeNativeSeparators(match[1]).split(/[?#]/, 1)[0],
-    ).toLowerCase();
-    if (corpusHarnessModuleNames.has(moduleName)) {
+    const modulePath = normalizeNativeSeparators(match[1]).split(/[?#]/, 1)[0];
+    if (corpusHarnessDependencyRegexes.some((pattern) => pattern.test(modulePath))) {
       const line = prepared.production.slice(0, match.index).split(/\r?\n/).length;
       hits.push(
         `${prepared.filePath}:${line}:${match[0].replace(/\s+/g, " ")}`,
@@ -1238,7 +1248,7 @@ function staticStringLiteralContent(literal) {
   return literal;
 }
 
-function scanProductionCompactPatterns(prepared, marker) {
+function scanProductionCompactPatterns(prepared, marker, minimumLiteralCount = 1) {
   const production = prepared.production;
   const markerLower = marker.toLowerCase();
   const hits = [];
@@ -1258,7 +1268,7 @@ function scanProductionCompactPatterns(prepared, marker) {
         break;
       }
       compact += compactProductionSource(literals[end].literal);
-      if (compact === markerLower) {
+      if (end - start + 1 >= minimumLiteralCount && compact === markerLower) {
         hits.push(
           compactPatternHit(prepared.filePath, literals[start].line, literals[end].line, marker),
         );
@@ -1507,6 +1517,15 @@ for (const filePath of [...protectedNonRustScanFiles].sort()) {
     if (hits.length > 0) {
       console.error(
         `Constructed eval/query dependency /${pattern}/ in protected non-Rust path ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`,
+      );
+      failed = true;
+    }
+  }
+  for (const pattern of corpusHarnessCompactPatternList) {
+    const hits = scanProductionCompactPatterns(prepared, pattern, 2);
+    if (hits.length > 0) {
+      console.error(
+        `Constructed evaluation/proof harness dependency /${pattern}/ in protected non-Rust path ${path.relative(repoRoot, filePath)}:\n${hits.join("\n")}\n`,
       );
       failed = true;
     }
