@@ -64,8 +64,9 @@ Runtime rules:
   indexing, query embedding, readiness/status, runtime search, and summary
   generation consume that retained value. Managed sidecar endpoints are
   derived from the selected profile/run ports; external endpoints retain their
-  trusted origin. Request handlers never activate endpoints by mutating process
-  environment variables.
+  trusted origin. Persisted state records that origin plus a SHA-256 fingerprint
+  of the full endpoint while exposing only the redacted endpoint. Request
+  handlers never activate endpoints by mutating process environment variables.
 
 ## Generation And Reuse
 
@@ -93,10 +94,11 @@ current remote spelling alone; migration requires persisted provenance.
 
 The schema-2/schema-3 contract is exposed through
 `inspect_repository_identity_v2` and `project_identity_v3`. Legacy
-project-identity-v2 sidecar state is accepted only when its complete identity
-is internally consistent and its workspace id maps to the current exact root.
-Repository aliases alone never authorize reuse; unknown, missing, or ambiguous
-identity state rebuilds in the schema-3 scope.
+project-identity-v2 sidecar state is discovered for inventory and
+provenance-aware operator cleanup, but never reused, attached to GPU proof, or
+destructively cleaned through a schema-3 runtime. Unknown, missing, mismatched,
+or ambiguous identity state rebuilds in the schema-3 scope. A retained runtime
+also aborts if re-observation changes its workspace or artifact scope.
 
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
 dense-anchor rows, semantic file-role metadata, sidecar schema version, lexical

@@ -167,6 +167,14 @@ fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval
         qdrant_grpc_port: 37033,
         embed_http_port: 37040,
         embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+        embedding_endpoint_origin: Some(
+            codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+        ),
+        embedding_endpoint_fingerprint_sha256: Some(
+            codestory_retrieval::embedding_endpoint_fingerprint_sha256(
+                "http://127.0.0.1:37040/v1/embeddings",
+            ),
+        ),
         embedding_device_policy: "accelerator_required".to_string(),
         embedding_device_state: "gpu_verified".to_string(),
         embedding_device_observation_source: "test".to_string(),
@@ -263,6 +271,11 @@ fn gpu_runtime_identity(project: &Path, started_at_epoch_ms: i64) -> BrokerGpuRu
         namespace: "codestory-test".to_string(),
         compose_project: "codestory-test".to_string(),
         embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
+        embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+        embedding_endpoint_fingerprint_sha256:
+            codestory_retrieval::embedding_endpoint_fingerprint_sha256(
+                "http://127.0.0.1:37040/v1/embeddings",
+            ),
         started_at_epoch_ms,
         embedding_launch: None,
     }
@@ -297,6 +310,10 @@ fn matching_native_sidecar_state(
     state.qdrant_grpc_port = sidecar.layout.qdrant_grpc_port;
     state.embed_http_port = sidecar.ownership().ports.embed_http;
     state.embed_url = sidecar.embedding.endpoint.clone();
+    state.embedding_endpoint_origin = Some(sidecar.embedding.endpoint_origin);
+    state.embedding_endpoint_fingerprint_sha256 = Some(
+        codestory_retrieval::embedding_endpoint_fingerprint_sha256(&sidecar.embedding.endpoint),
+    );
     if let Some(launch) = state.embedding_launch.as_mut() {
         launch.endpoint = state.embed_url.clone();
         launch.pid = Some(pid);
@@ -734,6 +751,10 @@ fn warm_reused_agent_state_binds_exact_broker_runtime_identity() {
     state.qdrant_grpc_port = initial.layout.qdrant_grpc_port;
     state.embed_http_port = shared_embed_port;
     state.embed_url = initial.embedding.endpoint.clone();
+    state.embedding_endpoint_origin = Some(initial.embedding.endpoint_origin);
+    state.embedding_endpoint_fingerprint_sha256 = Some(
+        codestory_retrieval::embedding_endpoint_fingerprint_sha256(&initial.embedding.endpoint),
+    );
     state.started_at_epoch_ms = now_epoch_ms();
     if let Some(launch) = state.embedding_launch.as_mut() {
         launch.endpoint = state.embed_url.clone();
@@ -775,6 +796,17 @@ fn warm_reused_agent_state_binds_exact_broker_runtime_identity() {
     assert_eq!(identity.profile, "agent");
     assert_eq!(identity.run_id.as_deref(), Some(run_id));
     assert_eq!(identity.embed_url, state.embed_url);
+
+    let mut external = warm.clone();
+    external.embedding.endpoint =
+        "https://embedding.example/v1/embeddings?token=secret".to_string();
+    external.embedding.endpoint_origin =
+        codestory_retrieval::EmbeddingEndpointOrigin::ProcessEnvironment;
+    external.embedding.server_launch = Some("external_endpoint".to_string());
+    assert!(
+        gpu_runtime_identity_for_sidecar(&external, project.path(), &expected_identity).is_none(),
+        "external endpoints must never supply managed broker GPU identity"
+    );
 }
 
 #[test]

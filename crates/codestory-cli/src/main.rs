@@ -9617,6 +9617,11 @@ mod tests {
             namespace: sidecar.namespace.clone(),
             compose_project: sidecar.compose_project.clone(),
             embed_url: codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port),
+            embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+            embedding_endpoint_fingerprint_sha256:
+                codestory_retrieval::embedding_endpoint_fingerprint_sha256(
+                    &codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port),
+                ),
             started_at_epoch_ms: 1,
             embedding_launch: Some(codestory_retrieval::EmbeddingLaunchMetadata {
                 provider: "vulkan".into(),
@@ -9826,7 +9831,6 @@ mod tests {
         let root = tempdir().expect("temp dir");
         let sidecar = codestory_retrieval::SidecarRuntimeConfig {
             project_identity: None,
-            accepted_legacy_project_identity: None,
             layout: codestory_retrieval::SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,

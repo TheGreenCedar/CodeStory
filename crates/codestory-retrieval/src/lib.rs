@@ -58,9 +58,9 @@ pub use config::{
     EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN, RetrievalRuntimeConfig, SidecarImagePins,
     SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile, SidecarRuntimeConfig,
     SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
-    default_sidecar_image_pins, embedding_server_launch_mode,
-    embedding_server_launch_mode_for_runtime, sidecar_runtime_auto, sidecar_runtime_for_project,
-    sidecar_runtime_for_project_with_run_id, user_cache_root,
+    default_sidecar_image_pins, embedding_endpoint_fingerprint_sha256,
+    embedding_server_launch_mode, embedding_server_launch_mode_for_runtime, sidecar_runtime_auto,
+    sidecar_runtime_for_project, sidecar_runtime_for_project_with_run_id, user_cache_root,
 };
 #[cfg(feature = "test-support")]
 pub use config::{
@@ -129,6 +129,7 @@ pub use sidecar::{
     sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch,
     stop_native_embedding_process_for_launch, strict_sidecar_status,
     strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
+    validate_sidecar_state_matches_runtime,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};
 

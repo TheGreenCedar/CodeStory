@@ -403,14 +403,16 @@ fn embedding_device_readiness_with_observed_state(
 fn observe_sidecar_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    let (text, source) = if crate::config::embedding_server_launch_mode_for_runtime(runtime)
-        .ok()
-        .is_some_and(|mode| mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned)
-    {
-        return observe_native_embedding_device_state(runtime);
-    } else {
-        (read_container_embedding_log(runtime)?, "sidecar_log")
-    };
+    let (text, source) =
+        match crate::config::embedding_server_launch_mode_for_runtime(runtime).ok()? {
+            crate::config::EmbeddingServerLaunchMode::NativeSpawned => {
+                return observe_native_embedding_device_state(runtime);
+            }
+            crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed => {
+                (read_container_embedding_log(runtime)?, "sidecar_log")
+            }
+            crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => return None,
+        };
     match observed_embedding_device_state_from_text(&text) {
         "unknown" => None,
         state => Some(EmbeddingDeviceObservation { state, source }),
@@ -2767,7 +2769,6 @@ mod tests {
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
-            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
@@ -2818,7 +2819,6 @@ mod tests {
         let root = tempfile::TempDir::new().expect("temp dir");
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
-            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,

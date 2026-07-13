@@ -286,6 +286,14 @@ fn read_sidecar_state_file(
         .with_context(|| format!("read {}", sidecar.layout.state_file.display()))?;
     let state = serde_json::from_str(&contents)
         .with_context(|| format!("parse {}", sidecar.layout.state_file.display()))?;
+    codestory_retrieval::validate_sidecar_state_matches_runtime(&state, sidecar).with_context(
+        || {
+            format!(
+                "preserve mismatched sidecar state {} before native lease cleanup",
+                sidecar.layout.state_file.display()
+            )
+        },
+    )?;
     Ok(Some(state))
 }
 

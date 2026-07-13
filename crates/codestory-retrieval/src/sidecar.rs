@@ -10,7 +10,7 @@ use crate::health::{
     EmbeddingLaunchMetadata, RetrievalStatusReport, attach_manifest_contract, attach_repair_hint,
     probe_sidecar_health_for_runtime, unavailable_status_report_with_embedding_device,
 };
-use crate::index::{compute_sidecar_input_fingerprint_for_runtime, sidecar_project_id_for_root};
+use crate::index::{compute_sidecar_input_fingerprint_for_runtime, sidecar_project_id_for_runtime};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
@@ -92,6 +92,10 @@ pub struct SidecarStateFile {
     pub embed_http_port: u16,
     #[serde(default = "default_embed_url")]
     pub embed_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_endpoint_origin: Option<crate::config::EmbeddingEndpointOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_endpoint_fingerprint_sha256: Option<String>,
     #[serde(default = "default_embedding_device_policy")]
     pub embedding_device_policy: String,
     #[serde(default = "default_embedding_device_state")]
@@ -217,7 +221,7 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_
     cleanup_owned_legacy_lexical_artifacts(layout)?;
     layout.ensure_data_dirs()?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
-    let published_embedding = runtime.ownership().ports;
+    let ownership = runtime.ownership();
     let state = SidecarStateFile {
         project_identity: runtime.project_identity.clone(),
         owner: "codestory".into(),
@@ -227,8 +231,12 @@ pub(crate) fn sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_
         run_id: runtime.run_id.clone(),
         qdrant_http_port: layout.qdrant_http_port,
         qdrant_grpc_port: layout.qdrant_grpc_port,
-        embed_http_port: published_embedding.embed_http,
-        embed_url: published_embedding.embed_url,
+        embed_http_port: ownership.ports.embed_http,
+        embed_url: ownership.ports.embed_url,
+        embedding_endpoint_origin: Some(ownership.embedding_endpoint_origin),
+        embedding_endpoint_fingerprint_sha256: Some(
+            ownership.embedding_endpoint_fingerprint_sha256,
+        ),
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
         embedding_device_observation_source: embedding_device.observation_source.into(),
@@ -337,8 +345,16 @@ pub fn sidecar_state_matches_runtime(
     state: &SidecarStateFile,
     runtime: &SidecarRuntimeConfig,
 ) -> bool {
-    let ports = runtime.ownership().ports;
-    state.owner == "codestory"
+    validate_sidecar_state_matches_runtime(state, runtime).is_ok()
+}
+
+pub fn validate_sidecar_state_matches_runtime(
+    state: &SidecarStateFile,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<()> {
+    let ownership = runtime.ownership();
+    let ports = &ownership.ports;
+    let exact = state.owner == "codestory"
         && state.namespace == runtime.namespace
         && state.compose_project == runtime.compose_project
         && state.profile == runtime.profile.as_str()
@@ -347,11 +363,19 @@ pub fn sidecar_state_matches_runtime(
         && state.qdrant_grpc_port == ports.qdrant_grpc
         && state.embed_http_port == ports.embed_http
         && state.embed_url == ports.embed_url
+        && state.embedding_endpoint_origin == Some(ownership.embedding_endpoint_origin)
+        && state.embedding_endpoint_fingerprint_sha256.as_deref()
+            == Some(ownership.embedding_endpoint_fingerprint_sha256.as_str())
         && crate::config::project_identity_matches_runtime(
             state.project_identity.as_ref(),
             runtime.project_identity.as_ref(),
-            runtime.accepted_legacy_project_identity.as_ref(),
-        )
+        );
+    if !exact {
+        anyhow::bail!(
+            "sidecar state does not exactly match the retained runtime owner/profile/namespace/run/project/ports/endpoint contract"
+        );
+    }
+    Ok(())
 }
 
 fn reusable_embedding_launch_from_state(
@@ -391,20 +415,29 @@ fn sidecar_down_for_runtime_inner(
     preserve_preexisting_compose: bool,
 ) -> Result<()> {
     let layout = &runtime.layout;
+    if let Some(legacy_state_file) = crate::config::legacy_agent_state_file_for_runtime(runtime) {
+        anyhow::bail!(
+            "legacy project-identity-v2 sidecar state was discovered and preserved at {}; inspect it with `codestory-cli sidecar inventory --project <repo> --format json` before provenance-aware cleanup",
+            legacy_state_file.display()
+        );
+    }
     if layout.state_file.exists() {
-        if let Some(state) = std::fs::read_to_string(&layout.state_file)
-            .ok()
-            .and_then(|contents| serde_json::from_str::<SidecarStateFile>(&contents).ok())
-            && state.owner == "codestory"
-            && state.namespace == runtime.namespace
+        let contents = std::fs::read_to_string(&layout.state_file)
+            .with_context(|| format!("read sidecar state {}", layout.state_file.display()))?;
+        let state: SidecarStateFile = serde_json::from_str(&contents)
+            .with_context(|| format!("parse sidecar state {}", layout.state_file.display()))?;
+        validate_sidecar_state_matches_runtime(&state, runtime).with_context(|| {
+            format!(
+                "preserving mismatched sidecar state at {}; inspect it with `codestory-cli sidecar inventory --project <repo> --format json`",
+                layout.state_file.display()
+            )
+        })?;
+        if runtime.profile == SidecarProfile::Agent
+            && (!preserve_preexisting_compose || state.compose_started_by_bootstrap)
         {
-            if runtime.profile == SidecarProfile::Agent
-                && (!preserve_preexisting_compose || state.compose_started_by_bootstrap)
-            {
-                crate::compose::docker_compose_down_for_state(&state)?;
-            }
-            stop_native_embedding_process_for_state(&state)?;
+            crate::compose::docker_compose_down_for_state(&state)?;
         }
+        stop_native_embedding_process_for_state(&state)?;
         std::fs::remove_file(&layout.state_file).context("remove retrieval-sidecars.json")?;
     }
     Ok(())
@@ -1150,7 +1183,7 @@ fn sidecar_status_inner_with_runtime(
         probe
     });
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
-    let project_id = sidecar_project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_runtime(project_root, &runtime)?;
     let manifest = if let Some(path) = storage_path.filter(|path| path.exists()) {
         let storage = Store::open(path).context("open storage for manifest")?;
         let manifest = storage
@@ -1320,30 +1353,43 @@ fn enrich_status_with_semantic_doc_stats(
     report
 }
 
+#[cfg(test)]
 pub(crate) fn validate_strict_sidecar_readiness(
     project_root: &Path,
     storage_path: &Path,
     storage: &Store,
 ) -> Result<()> {
-    let project_id = sidecar_project_id_for_root(project_root);
+    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
+    validate_strict_sidecar_readiness_for_runtime(project_root, storage_path, storage, &runtime)
+}
+
+pub(crate) fn validate_strict_sidecar_readiness_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    storage: &Store,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<()> {
+    let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
     let Some(manifest) = storage
         .get_retrieval_index_manifest(&project_id)
         .context("load retrieval manifest for strict readiness")?
     else {
         return Ok(());
     };
-    if let Some(reason) = strict_readiness_unavailable_reason(
+    if let Some(reason) = strict_readiness_unavailable_reason_for_runtime(
         project_root,
         storage_path,
         storage,
         &project_id,
         &manifest,
+        runtime,
     )? {
         anyhow::bail!("sidecar_manifest_stale: {reason}");
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn strict_readiness_unavailable_reason(
     project_root: &Path,
     storage_path: &Path,
@@ -1555,7 +1601,6 @@ mod tests {
     fn test_runtime(root: &TempDir) -> SidecarRuntimeConfig {
         SidecarRuntimeConfig {
             project_identity: None,
-            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
@@ -1706,6 +1751,22 @@ mod tests {
             &state,
             &foreign_qdrant_runtime
         ));
+        assert_eq!(
+            state.embedding_endpoint_origin,
+            Some(crate::config::EmbeddingEndpointOrigin::ManagedSidecar)
+        );
+        let expected_endpoint_fingerprint =
+            crate::config::embedding_endpoint_fingerprint_sha256(&runtime.embedding.endpoint);
+        assert_eq!(
+            state.embedding_endpoint_fingerprint_sha256.as_deref(),
+            Some(expected_endpoint_fingerprint.as_str())
+        );
+        let mut foreign_endpoint_state = state.clone();
+        foreign_endpoint_state.embedding_endpoint_fingerprint_sha256 = Some("foreign".to_string());
+        assert!(!sidecar_state_matches_runtime(
+            &foreign_endpoint_state,
+            &runtime
+        ));
         assert_eq!(state.embedding_launch, Some(launch.clone()));
         assert_eq!(
             state.embedding_accelerator_request_provider.as_deref(),
@@ -1761,6 +1822,26 @@ mod tests {
         sidecar_down_for_runtime(&runtime).expect("borrower down must not stop shared pid");
 
         assert!(!runtime.layout.state_file.exists());
+    }
+
+    #[test]
+    fn sidecar_down_preserves_state_that_does_not_match_runtime() {
+        let _lock = crate::test_support::env_lock();
+        let root = TempDir::new().expect("root");
+        let runtime = test_runtime(&root);
+        let mut state = sidecar_up_with_runtime(&runtime, None).expect("write state");
+        state.qdrant_http_port += 1;
+        std::fs::write(
+            &runtime.layout.state_file,
+            serde_json::to_vec_pretty(&state).expect("state json"),
+        )
+        .expect("replace state");
+
+        let error = sidecar_down_for_runtime(&runtime)
+            .expect_err("mismatched state must not authorize destructive cleanup");
+
+        assert!(format!("{error:#}").contains("preserving mismatched sidecar state"));
+        assert!(runtime.layout.state_file.exists());
     }
 
     #[test]

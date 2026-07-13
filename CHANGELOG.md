@@ -6,8 +6,11 @@
 
 - Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
   generation artifact scopes to project identity schema 3. Legacy schema-2
-  state is reused only for the same workspace; missing, foreign, or ambiguous
-  identity state fails closed, and native executable ownership now uses
+  state is discovered for inventory but never reused or destructively cleaned;
+  mismatched state fails closed. Runtime state also binds the non-secret
+  endpoint origin and a full-endpoint SHA-256 fingerprint, external endpoints
+  cannot supply managed GPU proof, and identity drift aborts publication and
+  query instead of mixing artifact scopes. Native executable ownership now uses
   filesystem identity instead of case-folded path text.
 - Made incremental freshness compare verified parser source hashes when file
   mtimes match. Same-timestamp edits now schedule reindexing instead of leaving

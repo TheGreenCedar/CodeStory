@@ -458,10 +458,13 @@ CodeStory separates three schema-3 identities:
 - `artifact_scope_id` uses `project_id` only when portable reuse is eligible;
   dirty or unidentified workspaces fail closed to `workspace_id`.
 
-Agent namespaces and generation roots use these schema-3 ids. A legacy
-schema-2 state file is reused only when it proves the same exact workspace and
-has an internally consistent repository/artifact scope; repository aliases,
-missing identity, and foreign roots fail closed and rebuild.
+Agent namespaces and generation roots use these schema-3 ids. Legacy schema-2
+state is discoverable through inventory but is never reused or destructively
+cleaned by a schema-3 runtime. Missing, mismatched, and foreign identity fails
+closed and rebuilds; use the inventory report for provenance-aware cleanup.
+Persisted state also binds the endpoint origin and full-endpoint SHA-256
+fingerprint, so redacted endpoints with different credentials cannot share
+ownership or managed GPU proof.
 Sidecar artifacts are content-addressed by:
 
 ```text

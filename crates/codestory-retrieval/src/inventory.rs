@@ -392,7 +392,7 @@ fn generation_retention_plan_for_storage(
 ) -> Result<GenerationRetentionPlan> {
     let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
     let layout = &runtime.layout;
-    let project_id = crate::index::sidecar_project_id_for_root(project_root);
+    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, &runtime)?;
     let (_lock, unrooted_state) = inventory_retention_view(layout, &project_id)?;
     Ok(build_generation_retention_plan(
         storage_path,
@@ -423,7 +423,7 @@ fn apply_generation_retention_for_storage(
     cache_root: &Path,
 ) -> Result<GenerationRetentionApplyReport> {
     let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    let project_id = crate::index::sidecar_project_id_for_root(project_root);
+    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, &runtime)?;
     let _lock = GenerationRetentionLock::acquire(&runtime.layout.state_file, &project_id)
         .context("lock sidecar generation retention apply")?;
     let plan = build_generation_retention_plan(
@@ -1154,6 +1154,12 @@ mod tests {
             qdrant_grpc_port: 21003,
             embed_http_port: 21004,
             embed_url: "http://127.0.0.1:21004/v1/embeddings".to_string(),
+            embedding_endpoint_origin: Some(crate::config::EmbeddingEndpointOrigin::ManagedSidecar),
+            embedding_endpoint_fingerprint_sha256: Some(
+                crate::config::embedding_endpoint_fingerprint_sha256(
+                    "http://127.0.0.1:21004/v1/embeddings",
+                ),
+            ),
             embedding_device_policy: "accelerator_required".to_string(),
             embedding_device_state: "unknown".to_string(),
             embedding_device_observation_source: "sidecar_unobserved".to_string(),

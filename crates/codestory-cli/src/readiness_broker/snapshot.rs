@@ -201,6 +201,11 @@ pub(super) fn gpu_runtime_identity_for_sidecar(
     project_root: &std::path::Path,
     expected_project_identity: &codestory_workspace::ProjectIdentityV3,
 ) -> Option<BrokerGpuRuntimeIdentity> {
+    if codestory_retrieval::embedding_server_launch_mode_for_runtime(runtime).ok()?
+        == codestory_retrieval::EmbeddingServerLaunchMode::ExternalEndpoint
+    {
+        return None;
+    }
     let state: codestory_retrieval::SidecarStateFile =
         serde_json::from_slice(&fs::read(&runtime.layout.state_file).ok()?).ok()?;
     if !codestory_retrieval::sidecar_state_matches_runtime(&state, runtime) {
@@ -223,6 +228,7 @@ pub(super) fn gpu_runtime_identity_for_sidecar(
             return None;
         }
     }
+    let ownership = runtime.ownership();
     Some(BrokerGpuRuntimeIdentity {
         workspace_id: expected_project_identity.workspace_id.clone(),
         profile: state.profile,
@@ -230,6 +236,8 @@ pub(super) fn gpu_runtime_identity_for_sidecar(
         namespace: state.namespace,
         compose_project: state.compose_project,
         embed_url: state.embed_url,
+        embedding_endpoint_origin: ownership.embedding_endpoint_origin,
+        embedding_endpoint_fingerprint_sha256: ownership.embedding_endpoint_fingerprint_sha256,
         started_at_epoch_ms: state.started_at_epoch_ms,
         embedding_launch: state.embedding_launch,
     })

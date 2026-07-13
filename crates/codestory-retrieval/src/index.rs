@@ -96,6 +96,15 @@ pub fn sidecar_project_id_for_root(project_root: &Path) -> String {
     codestory_workspace::project_identity_v3(project_root).artifact_scope_id
 }
 
+pub(crate) fn sidecar_project_id_for_runtime(
+    project_root: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<String> {
+    Ok(runtime
+        .validated_project_identity(project_root)?
+        .artifact_scope_id)
+}
+
 pub fn repair_project_qdrant_collection(
     project_root: &Path,
     storage_path: &Path,
@@ -113,7 +122,7 @@ pub fn repair_project_qdrant_collection_for_runtime(
         return Ok(None);
     }
 
-    let project_id = sidecar_project_id_for_root(project_root);
+    let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
     let storage = Store::open(storage_path).context("open storage for qdrant project repair")?;
     let Some(manifest) = storage
         .get_retrieval_index_manifest(&project_id)
@@ -218,12 +227,9 @@ pub fn finalize_index_for_runtime_with_progress(
     mut progress: impl FnMut(&'static str),
 ) -> Result<FinalizeIndexOutcome> {
     let layout = runtime.layout.clone();
-    let project_id = sidecar_project_id_for_root(project_root);
-    let workspace_id = runtime
-        .project_identity
-        .as_ref()
-        .map(|identity| identity.workspace_id.clone())
-        .unwrap_or_else(|| codestory_workspace::workspace_id_v3_for_root(project_root));
+    let project_identity = runtime.validated_project_identity(project_root)?;
+    let project_id = project_identity.artifact_scope_id;
+    let workspace_id = project_identity.workspace_id;
     let global_gc_state_file = global_generation_gc_state_file(runtime);
     let _global_gc_lock = GenerationRetentionLock::acquire_shared(
         &global_gc_state_file,
@@ -1918,7 +1924,6 @@ mod tests {
 
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
-            accepted_legacy_project_identity: None,
             layout: SidecarLayout {
                 qdrant_http_port: 9,
                 qdrant_grpc_port: 10,
