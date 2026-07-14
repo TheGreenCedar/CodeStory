@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Delegated worktree setup now prepares and reports the local repository map
+  without attempting full retrieval or printing backend repair instructions.
+  Maintainers can request that separate proof explicitly with
+  `--full-retrieval-proof` (or `-FullRetrievalProof` in PowerShell).
+
 ## 0.15.0
 
 ### Highlights

@@ -99,6 +99,11 @@ node scripts/setup-retrieval-env.mjs --self-test
 node --test scripts/tests/codex-worktree-setup.test.mjs
 ```
 
+The shared worktree suite proves that normal setup stops after the local
+repository map and that only `--full-retrieval-proof` enters the full retrieval
+lane. The adapter smoke verifies forwarding only; platform scripts do not own a
+second setup implementation.
+
 ## Release And Version Bumps
 
 `crates/codestory-cli/Cargo.toml` is the release version source. When bumping a

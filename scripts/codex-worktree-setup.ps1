@@ -5,6 +5,7 @@ param(
     [string]$PrHeadRef = $env:CODESTORY_PR_HEAD_REF,
     [switch]$BranchHeadProof,
     [switch]$ResolveCliOnly,
+    [switch]$FullRetrievalProof,
     [switch]$SelfTest,
     [switch]$Help
 )
@@ -20,6 +21,7 @@ $arguments = @("--project", $Project, "--intended-base-ref", $IntendedBaseRef)
 if ($PrHeadRef) { $arguments += @("--pr-head-ref", $PrHeadRef) }
 if ($BranchHeadProof) { $arguments += "--branch-head-proof" }
 if ($ResolveCliOnly) { $arguments += "--resolve-cli-only" }
+if ($FullRetrievalProof) { $arguments += "--full-retrieval-proof" }
 if ($SelfTest) { $arguments += "--self-test" }
 if ($Help) { $arguments += "--help" }
 
