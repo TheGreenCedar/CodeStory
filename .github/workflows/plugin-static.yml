@@ -10,6 +10,9 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/check-workflow-policy.test.mjs
+      - package.json
+      - package-lock.json
       - .github/scripts/route-ci-proof.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
@@ -39,6 +42,9 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/check-workflow-policy.test.mjs
+      - package.json
+      - package-lock.json
       - .github/scripts/route-ci-proof.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
@@ -73,11 +79,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install workflow policy dependencies
+        run: npm ci --ignore-scripts
+
       - name: Check plugin static wiring
         run: node --test plugins/codestory/tests/plugin-static.test.mjs
 
       - name: Check workflow policy
-        run: node .github/scripts/check-workflow-policy.mjs
+        run: |
+          node .github/scripts/check-workflow-policy.mjs
+          node --test .github/scripts/check-workflow-policy.test.mjs
 
       - name: Check CI proof routing fixtures
         run: node .github/scripts/route-ci-proof.mjs --self-test

@@ -103,27 +103,17 @@ const allowedHarnessReferences = [
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
     "retrieval-sidecar-smoke.yml",
-    "const retrievalSidecarSmoke = path.join(workflowRoot, \"retrieval-sidecar-smoke.yml\");",
-  ],
-  [
-    path.join(".github", "scripts", "check-workflow-policy.mjs"),
-    "retrieval-sidecar-smoke.yml",
-    "violations.push(\"retrieval-sidecar-smoke.yml must exist\");",
-  ],
-  [
-    path.join(".github", "scripts", "check-workflow-policy.mjs"),
-    "retrieval-sidecar-smoke.yml",
-    "violations.push(\"retrieval-sidecar-smoke.yml Windows proof must be workflow_dispatch-only\");",
+    'const retrievalFile = "retrieval-sidecar-smoke.yml";',
   ],
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
     ".github/workflows/release-candidate-evidence.yml",
-    "const releaseCandidateEvidence = path.join(workflowRoot, \"release-candidate-evidence.yml\");",
+    'const evidenceFile = "release-candidate-evidence.yml";',
   ],
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
     ".github/workflows/release-candidate-evidence.yml",
-    "\"uses: ./.github/workflows/release-candidate-evidence.yml\",",
+    'add(violations, evidence.uses === "./.github/workflows/release-candidate-evidence.yml", `${releaseFile} release-evidence must call the evidence workflow`);',
   ],
   [
     path.join(".github", "workflows", "packaged-platform-pr.yml"),

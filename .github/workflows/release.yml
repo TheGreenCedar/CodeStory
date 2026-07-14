@@ -41,7 +41,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Enforce third-party action pinning
+      - name: Install workflow policy dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Enforce workflow policy
         run: node .github/scripts/check-workflow-policy.mjs
 
   preflight:
