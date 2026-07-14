@@ -24,6 +24,9 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
+        required: false
 
 permissions:
   actions: read

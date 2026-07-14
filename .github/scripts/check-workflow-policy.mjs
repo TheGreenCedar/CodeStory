@@ -104,7 +104,7 @@ export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate
 export function releaseEvidenceApprovalViolations(callerJobs, calledWorkflow) {
   const violations = [];
   const file = releaseEvidenceWorkflowRef.slice(releaseEvidenceWorkflowRef.lastIndexOf("/") + 1);
-  for (const [callerFile, callerJob] of callerJobs) {
+  for (const [callerFile, callerJob, passesApproval] of callerJobs) {
     const job = object(callerJob);
     add(
       violations,
@@ -121,36 +121,40 @@ export function releaseEvidenceApprovalViolations(callerJobs, calledWorkflow) {
       object(job.with).source_run_id === "${{ inputs.source_run_id }}",
       `${callerFile} release-evidence must forward source_run_id`,
     );
+    const secrets = object(job.secrets);
+    const secret = secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON;
     add(
       violations,
-      job.secrets === undefined,
-      `${callerFile} release-evidence must not receive caller secrets`,
+      passesApproval
+        ? secret === "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}"
+          && Object.keys(secrets).length === 1
+        : job.secrets === undefined,
+      passesApproval
+        ? `${callerFile} release-evidence must pass only the named approval secret`
+        : `${callerFile} release-evidence must not receive caller secrets`,
     );
   }
   add(
     violations,
-    at(
-      calledWorkflow,
-      "on",
-      "workflow_call",
-      "secrets",
+    object(at(
+      calledWorkflow, "on", "workflow_call", "secrets",
       "CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON",
-    ) === undefined,
-    `${file} approval must not be declared as a caller secret`,
+    )).required === false,
+    `${file} approval must be an optional caller secret`,
   );
 
   const job = object(at(calledWorkflow, "jobs", "measure"));
   add(
     violations,
     job.environment === "release-evidence",
-    `${file} approval must use the release-evidence environment`,
+    `${file} approval must remain gated by the release-evidence environment`,
   );
   const evaluation = namedStep(job, "Produce and evaluate same-SHA candidate");
   add(
     violations,
     object(evaluation?.env).APPROVAL_JSON
       === "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
-    `${file} approval must come from the protected environment secret`,
+    `${file} approval must use the explicitly passed release secret`,
   );
   requireStepRun(violations, file, job, "Produce and evaluate same-SHA candidate", [
     'if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then',
@@ -714,8 +718,8 @@ function validateRemainingWorkflows(workflows, violations) {
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Linux", "ARM64", "codestory-release-evidence"]), `${evidenceFile} must use the protected evidence runner`);
     violations.push(...releaseEvidenceApprovalViolations(
       [
-        ["release.yml", at(workflows.get("release.yml"), "jobs", "release-evidence")],
-        ["packaged-platform-pr.yml", at(workflows.get("packaged-platform-pr.yml"), "jobs", "release-evidence")],
+        ["release.yml", at(workflows.get("release.yml"), "jobs", "release-evidence"), true],
+        ["packaged-platform-pr.yml", at(workflows.get("packaged-platform-pr.yml"), "jobs", "release-evidence"), false],
       ],
       evidence,
     ));
