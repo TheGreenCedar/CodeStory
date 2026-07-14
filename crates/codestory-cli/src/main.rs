@@ -365,6 +365,31 @@ fn new_agent_surface_runtime(
     RuntimeContext::new_agent_sidecar_with_selection(project, profile, run_id)
 }
 
+struct OpenedAgentSurface {
+    runtime: RuntimeContext,
+    before: ProjectSummary,
+    opened: runtime::OpenedProject,
+}
+
+fn open_agent_surface(
+    project: &ProjectArgs,
+    profile: Option<args::CliSidecarProfile>,
+    run_id: Option<&str>,
+    refresh: args::RefreshMode,
+    surface: &'static str,
+) -> Result<OpenedAgentSurface> {
+    let runtime = new_agent_surface_runtime(project, profile, run_id)?;
+    let before = runtime.open_project_summary()?;
+    let opened = runtime.ensure_open_from_summary(refresh, before.clone())?;
+    ensure_index_ready(&opened, surface)?;
+    ensure_agent_surface_gpu_proof(&runtime, surface)?;
+    Ok(OpenedAgentSurface {
+        runtime,
+        before,
+        opened,
+    })
+}
+
 fn run_cache(cmd: CacheCommand) -> Result<()> {
     match cmd.action {
         CacheAction::Identity(cmd) => run_cache_identity(cmd),
@@ -1342,10 +1367,8 @@ struct ResolvedContextTarget {
 fn run_context(cmd: ContextCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "context")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "context")?;
-    ensure_agent_surface_gpu_proof(&runtime, "context")?;
+    let OpenedAgentSurface { runtime, .. } =
+        open_agent_surface(&cmd.project, None, None, cmd.refresh, "context")?;
 
     let resolved = resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
     let target_prompt = context_target_prompt(&resolved);
@@ -1390,10 +1413,13 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project, cmd.profile, cmd.run_id.as_deref())?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "packet")?;
-    ensure_agent_surface_gpu_proof(&runtime, "packet")?;
+    let OpenedAgentSurface { runtime, .. } = open_agent_surface(
+        &cmd.project,
+        cmd.profile,
+        cmd.run_id.as_deref(),
+        cmd.refresh,
+        "packet",
+    )?;
 
     let packet = runtime
         .browser
@@ -1423,10 +1449,8 @@ fn run_task(cmd: TaskCommand) -> Result<()> {
 fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "task brief")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "task brief")?;
-    ensure_agent_surface_gpu_proof(&runtime, "task brief")?;
+    let OpenedAgentSurface { runtime, .. } =
+        open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
     let packet = runtime
         .browser
@@ -2477,10 +2501,7 @@ fn ensure_agent_surface_gpu_proof(runtime: &RuntimeContext, surface: &str) -> Re
     );
     let live_degraded_reason = status.degraded_reason.clone();
     if live_degraded_reason.is_none()
-        && broker
-            .gpu_proof
-            .as_ref()
-            .is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, &sidecar))
+        && agent_surface_gpu_proof_is_valid(&status, &sidecar, broker.gpu_proof.as_ref())
     {
         return Ok(());
     }
@@ -2550,6 +2571,15 @@ fn gpu_proof_matches_selected_runtime(
             .project_identity
             .as_ref()
             .is_none_or(|expected| identity.workspace_id == expected.workspace_id)
+}
+
+fn agent_surface_gpu_proof_is_valid(
+    status: &DoctorSidecarStatusOutput,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    proof: Option<&readiness_broker::BrokerGpuProofSnapshot>,
+) -> bool {
+    !agent_surface_requires_identity_bound_gpu_proof(status)
+        || proof.is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, runtime))
 }
 
 fn agent_surface_requires_identity_bound_gpu_proof(status: &DoctorSidecarStatusOutput) -> bool {
@@ -3682,10 +3712,13 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project, cmd.profile, cmd.run_id.as_deref())?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "search")?;
-    ensure_agent_surface_gpu_proof(&runtime, "search")?;
+    let OpenedAgentSurface { runtime, .. } = open_agent_surface(
+        &cmd.project,
+        cmd.profile,
+        cmd.run_id.as_deref(),
+        cmd.refresh,
+        "search",
+    )?;
     let search_results = runtime
         .browser
         .search_results(search_request_from_command(&cmd))
@@ -3719,11 +3752,17 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
     let total_timer = Instant::now();
     let setup_timer = Instant::now();
     validate_drill_output_dir(&cmd.output_dir)?;
-    let runtime = new_agent_surface_runtime(&cmd.project, cmd.profile, cmd.run_id.as_deref())?;
-    let before = runtime.open_project_summary()?;
-    let opened = runtime.ensure_open_from_summary(cmd.refresh, before.clone())?;
-    ensure_index_ready(&opened, "drill")?;
-    ensure_agent_surface_gpu_proof(&runtime, "drill")?;
+    let OpenedAgentSurface {
+        runtime,
+        before,
+        opened,
+    } = open_agent_surface(
+        &cmd.project,
+        cmd.profile,
+        cmd.run_id.as_deref(),
+        cmd.refresh,
+        "drill",
+    )?;
     if cmd.refresh != args::RefreshMode::None {
         retrieval::finalize_retrieval_index_for_runtime(&runtime)
             .context("drill retrieval index finalize")?;
@@ -9655,6 +9694,20 @@ mod tests {
                 requested_device: Some("Vulkan0".into()),
             }),
         });
+        let surface_status = doctor_sidecar_status_from_report(
+            ready_repair_test_report("full", None),
+            Some(&sidecar),
+        );
+        assert!(!agent_surface_gpu_proof_is_valid(
+            &surface_status,
+            &sidecar,
+            None,
+        ));
+        assert!(agent_surface_gpu_proof_is_valid(
+            &surface_status,
+            &sidecar,
+            Some(&verified),
+        ));
         assert!(ready_repair_existing_sidecar_is_reusable(
             &full_accelerated,
             Some(&verified),
