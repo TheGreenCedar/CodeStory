@@ -24,9 +24,6 @@ on:
         required: false
         type: string
         default: ""
-    secrets:
-      CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
-        required: false
 
 permissions:
   actions: read
@@ -159,6 +156,10 @@ jobs:
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           set -euo pipefail
+          if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then
+            echo "::error::Protected release-evidence approval is required for source-run re-evaluation."
+            exit 1
+          fi
           if [ -z "$SOURCE_RUN_ID" ]; then
             node scripts/codestory-release-evidence-gate.mjs produce \
               --baseline benchmarks/release-evidence/approved-baselines.json \

@@ -6,6 +6,8 @@ import {
   notaryStepViolations,
   packagedPrSigningViolations,
   parseWorkflow,
+  releaseEvidenceApprovalViolations,
+  releaseEvidenceWorkflowRef,
 } from "./check-workflow-policy.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
@@ -23,6 +25,43 @@ function managedJob() {
         ].join("\n"),
       },
     ],
+  };
+}
+
+function releaseEvidenceApprovalBoundary() {
+  return {
+    callers: [
+      ["release.yml", {
+        uses: releaseEvidenceWorkflowRef,
+        with: { source_run_id: "${{ inputs.source_run_id }}" },
+      }],
+      ["packaged-platform-pr.yml", {
+        uses: releaseEvidenceWorkflowRef,
+        with: { source_run_id: "${{ inputs.source_run_id }}" },
+      }],
+    ],
+    called: {
+      on: { workflow_call: {} },
+      jobs: {
+        measure: {
+          environment: "release-evidence",
+          steps: [
+            {
+              name: "Produce and evaluate same-SHA candidate",
+              env: {
+                APPROVAL_JSON: "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
+              },
+              run: [
+                'if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then',
+                '  echo "::error::Protected release-evidence approval is required for source-run re-evaluation."',
+                "  exit 1",
+                "fi",
+              ].join("\n"),
+            },
+          ],
+        },
+      },
+    },
   };
 }
 
@@ -112,6 +151,34 @@ test("PR package proof cannot opt into signing credentials", () => {
     const candidate = structuredClone(workflow);
     mutate(candidate);
     assert.notDeepEqual(packagedPrSigningViolations(candidate), []);
+  }
+});
+
+test("release approval remains inside the protected evidence environment", () => {
+  const boundary = releaseEvidenceApprovalBoundary();
+  assert.deepEqual(releaseEvidenceApprovalViolations(boundary.callers, boundary.called), []);
+
+  for (const mutate of [
+    candidate => { candidate.callers[0][1] = undefined; },
+    candidate => { candidate.callers[1][1].uses = "./.github/workflows/release.yml"; },
+    candidate => { delete candidate.callers[1][1].with.source_run_id; },
+    candidate => { candidate.callers[0][1].secrets = "inherit"; },
+    candidate => { candidate.callers[1][1].secrets = "inherit"; },
+    candidate => {
+      candidate.called.on.workflow_call.secrets = {
+        CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: { required: false },
+      };
+    },
+    candidate => { candidate.called.jobs.measure.environment = "release"; },
+    candidate => {
+      candidate.called.jobs.measure.steps[0].env.APPROVAL_JSON
+        = "${{ inputs.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}";
+    },
+    candidate => { candidate.called.jobs.measure.steps[0].run = "exit 1"; },
+  ]) {
+    const candidate = structuredClone(boundary);
+    mutate(candidate);
+    assert.notDeepEqual(releaseEvidenceApprovalViolations(candidate.callers, candidate.called), []);
   }
 });
 

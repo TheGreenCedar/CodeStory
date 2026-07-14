@@ -160,6 +160,7 @@ artifact can become release-eligible.
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
 reported hashes and values in the
+protected `release-evidence` environment's
 `CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON` secret, then dispatch the Release
 workflow on the same SHA and version with
 `source_run_id=<rejected-run-id>`. That path downloads and re-evaluates the

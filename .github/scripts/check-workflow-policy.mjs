@@ -99,6 +99,67 @@ function requireJob(violations, file, workflow, name) {
   return object(found);
 }
 
+export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
+
+export function releaseEvidenceApprovalViolations(callerJobs, calledWorkflow) {
+  const violations = [];
+  const file = releaseEvidenceWorkflowRef.slice(releaseEvidenceWorkflowRef.lastIndexOf("/") + 1);
+  for (const [callerFile, callerJob] of callerJobs) {
+    const job = object(callerJob);
+    add(
+      violations,
+      callerJob !== undefined,
+      `${callerFile} must contain job release-evidence`,
+    );
+    add(
+      violations,
+      job.uses === releaseEvidenceWorkflowRef,
+      `${callerFile} release-evidence must call the evidence workflow`,
+    );
+    add(
+      violations,
+      object(job.with).source_run_id === "${{ inputs.source_run_id }}",
+      `${callerFile} release-evidence must forward source_run_id`,
+    );
+    add(
+      violations,
+      job.secrets === undefined,
+      `${callerFile} release-evidence must not receive caller secrets`,
+    );
+  }
+  add(
+    violations,
+    at(
+      calledWorkflow,
+      "on",
+      "workflow_call",
+      "secrets",
+      "CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON",
+    ) === undefined,
+    `${file} approval must not be declared as a caller secret`,
+  );
+
+  const job = object(at(calledWorkflow, "jobs", "measure"));
+  add(
+    violations,
+    job.environment === "release-evidence",
+    `${file} approval must use the release-evidence environment`,
+  );
+  const evaluation = namedStep(job, "Produce and evaluate same-SHA candidate");
+  add(
+    violations,
+    object(evaluation?.env).APPROVAL_JSON
+      === "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
+    `${file} approval must come from the protected environment secret`,
+  );
+  requireStepRun(violations, file, job, "Produce and evaluate same-SHA candidate", [
+    'if [ -n "$SOURCE_RUN_ID" ] && [ -z "$APPROVAL_JSON" ]; then',
+    "Protected release-evidence approval is required for source-run re-evaluation.",
+    "exit 1",
+  ]);
+  return violations;
+}
+
 export function parseWorkflow(source, file = "workflow") {
   const document = parseDocument(source, {
     lineCounter: new LineCounter(),
@@ -428,7 +489,6 @@ function validateReleaseCoordinator(workflows, violations) {
   ]);
 
   const evidence = requireJob(violations, releaseFile, release, "release-evidence");
-  add(violations, evidence.uses === "./.github/workflows/release-candidate-evidence.yml", `${releaseFile} release-evidence must call the evidence workflow`);
   add(violations, sameMembers(needs(evidence), ["preflight"]), `${releaseFile} release-evidence must need preflight`);
   for (const [key, value] of Object.entries({
     ref: "${{ github.sha }}",
@@ -436,7 +496,6 @@ function validateReleaseCoordinator(workflows, violations) {
     profile: "codestory-release-evidence-linux-arm64-v1",
     drill_manifest: "/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
     embedding_model_dir: "/srv/codestory-release-evidence/models",
-    source_run_id: "${{ inputs.source_run_id }}",
   })) {
     add(violations, object(evidence.with)[key] === value, `${releaseFile} release-evidence with.${key} must equal ${value}`);
   }
@@ -653,7 +712,13 @@ function validateRemainingWorkflows(workflows, violations) {
     add(violations, trigger(evidence, "workflow_dispatch") === undefined, `${evidenceFile} must be coordinator-only`);
     const job = requireJob(violations, evidenceFile, evidence, "measure");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Linux", "ARM64", "codestory-release-evidence"]), `${evidenceFile} must use the protected evidence runner`);
-    add(violations, job.environment === "release-evidence", `${evidenceFile} must use the release-evidence environment`);
+    violations.push(...releaseEvidenceApprovalViolations(
+      [
+        ["release.yml", at(workflows.get("release.yml"), "jobs", "release-evidence")],
+        ["packaged-platform-pr.yml", at(workflows.get("packaged-platform-pr.yml"), "jobs", "release-evidence")],
+      ],
+      evidence,
+    ));
     requireStepRun(violations, evidenceFile, job, "Produce full-sidecar repo evidence", ["--test-threads=1"]);
     requireStepRun(violations, evidenceFile, job, "Download prior rejected evidence for approval re-evaluation", ["actions/runs/$SOURCE_RUN_ID", "actions/runs/$SOURCE_RUN_ID/artifacts"]);
   }

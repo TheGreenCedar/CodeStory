@@ -153,6 +153,11 @@ artifact and evaluates it again without producing new measurements. Before the
 download, it requires a failed trusted evidence workflow from this repository
 whose head is the exact evidence SHA.
 
+The approval secret belongs only to the protected `release-evidence`
+environment used by the reusable workflow's measurement job. Release callers
+must not pass or inherit it. A re-evaluation with no nonempty protected approval
+fails before the evaluator runs.
+
 The workflow uploads `release-evidence-<full SHA>` from
 `target/release-evidence`, including provisioning, raw stats, packet summary,
 candidate, approval when supplied, and report files that exist. Runner
