@@ -84,7 +84,9 @@ mod semantic_doc_text;
 mod services;
 mod support;
 mod symbol_query;
+mod symbol_workflow;
 mod system_actions;
+mod target_resolution;
 mod trail_story;
 
 pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
@@ -112,6 +114,14 @@ use semantic_doc_text::{
 pub use services::{
     AgentService, BookmarkService, GroundingService, IndexService, ProjectService, SearchService,
     TrailService,
+};
+pub use symbol_workflow::{
+    SymbolWorkflowCaps, SymbolWorkflowMode, SymbolWorkflowNode, SymbolWorkflowOutcome,
+    SymbolWorkflowRequest, SymbolWorkflowResolution, SymbolWorkflowResponse, SymbolWorkflowRoute,
+    SymbolWorkflowTest,
+};
+pub use target_resolution::{
+    AmbiguousTarget, ResolvedTarget, TargetResolution, TargetSelection, TargetSelector,
 };
 
 #[cfg(feature = "test-support")]

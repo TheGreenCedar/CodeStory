@@ -25,7 +25,7 @@ use codestory_contracts::api::{
     ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
     RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
     SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
-    TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
+    TrailContextDto,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -55,7 +55,6 @@ mod file_state;
 mod http_transport;
 mod local_refresh_status;
 mod output;
-mod query_resolution;
 mod readiness;
 mod readiness_broker;
 mod ready_repair_status;
@@ -243,8 +242,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Drill(cmd) => run_drill(cmd),
         Command::DrillSuite(cmd) => run_drill_suite(cmd),
         Command::Symbol(cmd) => run_symbol(cmd),
-        Command::Impact(cmd) => run_symbol_workflow(SymbolWorkflowKind::Impact, cmd),
-        Command::TestMap(cmd) => run_symbol_workflow(SymbolWorkflowKind::TestMap, cmd),
+        Command::Impact(cmd) => {
+            run_symbol_workflow(codestory_runtime::SymbolWorkflowMode::Impact, cmd)
+        }
+        Command::TestMap(cmd) => {
+            run_symbol_workflow(codestory_runtime::SymbolWorkflowMode::TestMap, cmd)
+        }
         Command::Trail(cmd) => run_trail(cmd),
         Command::Callers(cmd) => run_callers(cmd),
         Command::Callees(cmd) => run_callees(cmd),
@@ -5681,472 +5684,102 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SymbolWorkflowKind {
-    Impact,
-    TestMap,
-}
-
-impl SymbolWorkflowKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Impact => "impact",
-            Self::TestMap => "test_map",
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Impact => "Symbol Impact",
-            Self::TestMap => "Symbol Test Map",
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowNodeOutput {
-    node_id: NodeId,
-    display_name: String,
-    kind: String,
-    file_path: Option<String>,
-    depth: u32,
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowRouteOutput {
-    display_name: String,
-    method: String,
-    path: String,
-    file_path: Option<String>,
-    line: Option<u32>,
-    confidence: String,
-    reason: String,
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowTestOutput {
-    path: String,
-    reason: String,
-    confidence: String,
-    graph_depth: u32,
-    impacted_symbol_count: u32,
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowCapsOutput {
-    caller_depth: u32,
-    caller_max_nodes: u32,
-    affected_depth: u32,
-    impacted_symbols_cap: u32,
-    impacted_routes_cap: u32,
-    affected_seed: String,
-}
-
 #[derive(serde::Serialize)]
 struct SymbolWorkflowOutput<'a> {
     workflow: &'static str,
-    project_root: String,
+    project_root: &'a str,
     resolution: QueryResolutionOutput,
     symbol: &'a codestory_contracts::api::SymbolContextDto,
-    direct_callers: Vec<SymbolWorkflowNodeOutput>,
-    transitive_callers: Vec<SymbolWorkflowNodeOutput>,
-    impacted_files: Vec<String>,
-    impacted_routes: Vec<SymbolWorkflowRouteOutput>,
-    likely_tests: Vec<SymbolWorkflowTestOutput>,
-    caps: SymbolWorkflowCapsOutput,
-    unknowns: Vec<String>,
-    next_commands: Vec<String>,
+    direct_callers: &'a [codestory_runtime::SymbolWorkflowNode],
+    transitive_callers: &'a [codestory_runtime::SymbolWorkflowNode],
+    impacted_files: &'a [String],
+    impacted_routes: &'a [codestory_runtime::SymbolWorkflowRoute],
+    likely_tests: &'a [codestory_runtime::SymbolWorkflowTest],
+    caps: &'a codestory_runtime::SymbolWorkflowCaps,
+    unknowns: &'a [String],
+    next_commands: &'a [String],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     affected: Option<&'a codestory_contracts::api::AffectedAnalysisDto>,
     trail: &'a TrailContextDto,
 }
 
-fn run_symbol_workflow(kind: SymbolWorkflowKind, cmd: SymbolWorkflowCommand) -> Result<()> {
-    ensure_dot_only_for_trail(cmd.format, kind.label())?;
+fn run_symbol_workflow(
+    mode: codestory_runtime::SymbolWorkflowMode,
+    cmd: SymbolWorkflowCommand,
+) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, mode.label())?;
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, kind.label())?;
+    ensure_index_ready(&opened, mode.label())?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let symbol = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-
-    let depth = cmd.depth.clamp(1, 8);
-    let max_nodes = cmd.max_nodes.clamp(1, 200);
-    let include_tests = cmd.include_tests || matches!(kind, SymbolWorkflowKind::TestMap);
-    let trail = runtime
-        .browser
-        .trail_context(TrailConfigDto {
-            root_id: target.selected.node_id.clone(),
-            mode: TrailMode::AllReferencing,
-            target_id: None,
-            depth,
-            direction: TrailDirection::Incoming,
-            caller_scope: if include_tests {
-                TrailCallerScope::IncludeTestsAndBenches
-            } else {
-                TrailCallerScope::ProductionOnly
-            },
-            edge_filter: Vec::new(),
-            show_utility_calls: false,
-            hide_speculative: true,
-            story: false,
-            node_filter: Vec::new(),
-            max_nodes,
-            layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
-        })
-        .map_err(map_api_error)?;
-
-    let affected_seed = target
-        .selected
-        .file_path
-        .clone()
-        .or_else(|| symbol.node.file_path.clone())
-        .map(|path| symbol_workflow_seed_path(&runtime.project_root, &path));
-    let affected = if let Some(path) = affected_seed.as_ref() {
-        Some(
-            runtime
-                .browser
-                .affected_analysis(AffectedAnalysisRequest {
-                    changed_paths: vec![path.clone()],
-                    change_records: vec![AffectedChangeRecordDto {
-                        path: path.clone(),
-                        kind: AffectedChangeKindDto::Unknown,
-                        status: "symbol_file".to_string(),
-                        previous_path: None,
-                    }],
-                    depth: Some(depth),
-                    filter: None,
-                })
-                .map_err(map_api_error)?,
-        )
-    } else {
-        None
+    let target = match cmd.target.selection()? {
+        args::TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
+        args::TargetSelection::Query { query, choose } => {
+            codestory_runtime::TargetSelection::Query { query, choose }
+        }
     };
-
-    let direct_callers = symbol_workflow_direct_callers(&trail);
-    let transitive_callers = symbol_workflow_transitive_callers(&trail, &direct_callers);
-    let impacted_files = symbol_workflow_impacted_files(affected.as_ref());
-    let impacted_routes = symbol_workflow_routes(affected.as_ref());
-    let likely_tests = symbol_workflow_tests(affected.as_ref());
-    let unknowns = symbol_workflow_unknowns(
-        affected.as_ref(),
-        &trail,
-        &direct_callers,
-        &transitive_callers,
-        &likely_tests,
-        affected_seed.as_deref(),
-        max_nodes,
-    );
-    let next_commands = symbol_workflow_next_commands(
+    let response = match runtime
+        .browser
+        .symbol_workflow(codestory_runtime::SymbolWorkflowRequest {
+            mode,
+            target,
+            file_filter,
+            depth: cmd.depth,
+            max_nodes: cmd.max_nodes,
+            include_tests: cmd.include_tests,
+        }) {
+        Ok(codestory_runtime::SymbolWorkflowOutcome::Complete(response)) => *response,
+        Ok(codestory_runtime::SymbolWorkflowOutcome::Ambiguous(ambiguous)) => {
+            return structured_ambiguous_target_failure(
+                &runtime,
+                AmbiguousTargetError {
+                    query: ambiguous.query,
+                    file_filter: ambiguous.file_filter,
+                    alternatives: ambiguous.alternatives,
+                    message: ambiguous.message,
+                },
+                cmd.format,
+                cmd.output_file.as_deref(),
+            );
+        }
+        Ok(codestory_runtime::SymbolWorkflowOutcome::Rejected(message)) => bail!(message),
+        Err(error) => return Err(map_api_error(error)),
+    };
+    let resolution_target =
+        runtime::ResolvedTarget::from_runtime(response.resolution.target.clone());
+    let resolution = build_query_resolution_output_from_occurrences(
         &runtime.project_root,
-        &target.selected.node_id,
-        affected_seed.as_deref(),
-        depth,
-        max_nodes,
-        kind,
-        include_tests,
+        &resolution_target,
+        &response.resolution.occurrences,
     );
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let caps = SymbolWorkflowCapsOutput {
-        caller_depth: depth,
-        caller_max_nodes: max_nodes,
-        affected_depth: depth,
-        impacted_symbols_cap: 200,
-        impacted_routes_cap: 100,
-        affected_seed: affected_seed
-            .clone()
-            .unwrap_or_else(|| "none: selected symbol has no indexed file path".to_string()),
-    };
     let output = SymbolWorkflowOutput {
-        workflow: kind.label(),
-        project_root: runtime.project_root.to_string_lossy().to_string(),
+        workflow: response.workflow,
+        project_root: &response.project_root,
         resolution,
-        symbol: &symbol,
-        direct_callers,
-        transitive_callers,
-        impacted_files,
-        impacted_routes,
-        likely_tests,
-        caps,
-        unknowns,
-        next_commands,
-        affected: affected.as_ref(),
-        trail: &trail,
+        symbol: &response.symbol,
+        direct_callers: &response.direct_callers,
+        transitive_callers: &response.transitive_callers,
+        impacted_files: &response.impacted_files,
+        impacted_routes: &response.impacted_routes,
+        likely_tests: &response.likely_tests,
+        caps: &response.caps,
+        unknowns: &response.unknowns,
+        next_commands: &response.next_commands,
+        affected: response.affected.as_ref(),
+        trail: &response.trail,
     };
-    let markdown = render_symbol_workflow_markdown(kind, &output);
+    let markdown = render_symbol_workflow_markdown(mode, &output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn symbol_workflow_direct_callers(trail: &TrailContextDto) -> Vec<SymbolWorkflowNodeOutput> {
-    let nodes = trail
-        .trail
-        .nodes
-        .iter()
-        .map(|node| (node.id.0.clone(), node))
-        .collect::<HashMap<_, _>>();
-    let mut seen = HashSet::new();
-    let mut callers = trail
-        .trail
-        .edges
-        .iter()
-        .filter(|edge| {
-            edge.kind == codestory_contracts::api::EdgeKind::CALL
-                && edge.target == trail.focus.id
-                && edge.source != trail.focus.id
-        })
-        .filter_map(|edge| {
-            if !seen.insert(edge.source.0.clone()) {
-                return None;
-            }
-            nodes
-                .get(&edge.source.0)
-                .map(|node| symbol_workflow_node_output(node))
-        })
-        .collect::<Vec<_>>();
-    callers.sort_by(|left, right| {
-        left.file_path
-            .cmp(&right.file_path)
-            .then(left.display_name.cmp(&right.display_name))
-    });
-    callers
-}
-
-fn symbol_workflow_transitive_callers(
-    trail: &TrailContextDto,
-    direct_callers: &[SymbolWorkflowNodeOutput],
-) -> Vec<SymbolWorkflowNodeOutput> {
-    let direct_ids = direct_callers
-        .iter()
-        .map(|caller| caller.node_id.0.clone())
-        .collect::<HashSet<_>>();
-    let mut callers = trail
-        .trail
-        .nodes
-        .iter()
-        .filter(|node| {
-            node.id != trail.focus.id
-                && node.depth > 1
-                && !direct_ids.contains(&node.id.0)
-                && symbol_workflow_has_call_path_to_focus(trail, &node.id)
-        })
-        .map(symbol_workflow_node_output)
-        .collect::<Vec<_>>();
-    callers.sort_by(|left, right| {
-        left.depth
-            .cmp(&right.depth)
-            .then(left.file_path.cmp(&right.file_path))
-            .then(left.display_name.cmp(&right.display_name))
-    });
-    callers.truncate(50);
-    callers
-}
-
-fn symbol_workflow_has_call_path_to_focus(trail: &TrailContextDto, start: &NodeId) -> bool {
-    let mut seen = HashSet::new();
-    let mut stack = vec![start.clone()];
-    while let Some(current) = stack.pop() {
-        if !seen.insert(current.0.clone()) {
-            continue;
-        }
-        for edge in trail.trail.edges.iter().filter(|edge| {
-            edge.kind == codestory_contracts::api::EdgeKind::CALL && edge.source == current
-        }) {
-            if edge.target == trail.focus.id {
-                return true;
-            }
-            stack.push(edge.target.clone());
-        }
-    }
-    false
-}
-
-fn symbol_workflow_node_output(
-    node: &codestory_contracts::api::GraphNodeDto,
-) -> SymbolWorkflowNodeOutput {
-    SymbolWorkflowNodeOutput {
-        node_id: node.id.clone(),
-        display_name: node
-            .qualified_name
-            .clone()
-            .unwrap_or_else(|| node.label.clone()),
-        kind: format!("{:?}", node.kind).to_ascii_lowercase(),
-        file_path: node.file_path.clone(),
-        depth: node.depth,
-    }
-}
-
-fn symbol_workflow_seed_path(project_root: &Path, path: &str) -> String {
-    let clean_path = path
-        .strip_prefix(r"\\?\")
-        .unwrap_or(path)
-        .replace('\\', "/");
-    codestory_workspace::workspace_relative_path(project_root, Path::new(&clean_path))
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .unwrap_or(clean_path)
-}
-
-fn symbol_workflow_impacted_files(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-) -> Vec<String> {
-    let mut files = BTreeSet::new();
-    if let Some(affected) = affected {
-        files.extend(affected.matched_files.iter().map(|file| file.path.clone()));
-        files.extend(
-            affected
-                .impacted_symbols
-                .iter()
-                .filter_map(|symbol| symbol.file_path.clone()),
-        );
-        files.extend(
-            affected
-                .impacted_routes
-                .iter()
-                .filter_map(|route| route.file_path.clone()),
-        );
-        files.extend(
-            affected
-                .impacted_routes
-                .iter()
-                .filter_map(|route| route.route.source_file.clone()),
-        );
-        files.extend(affected.impacted_tests.iter().map(|test| test.path.clone()));
-    }
-    files.into_iter().collect()
-}
-
-fn symbol_workflow_routes(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-) -> Vec<SymbolWorkflowRouteOutput> {
-    affected
-        .into_iter()
-        .flat_map(|affected| affected.impacted_routes.iter())
-        .map(|route| SymbolWorkflowRouteOutput {
-            display_name: route.display_name.clone(),
-            method: route.route.method.clone(),
-            path: route.route.path.clone(),
-            file_path: route
-                .file_path
-                .clone()
-                .or_else(|| route.route.source_file.clone()),
-            line: route.line.or(route.route.line),
-            confidence: route.confidence.clone(),
-            reason: route.reason.clone(),
-        })
-        .collect()
-}
-
-fn symbol_workflow_tests(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-) -> Vec<SymbolWorkflowTestOutput> {
-    affected
-        .into_iter()
-        .flat_map(|affected| affected.impacted_tests.iter())
-        .map(|test| SymbolWorkflowTestOutput {
-            path: test.path.clone(),
-            reason: test.reason.clone(),
-            confidence: test.confidence.clone(),
-            graph_depth: test.graph_depth,
-            impacted_symbol_count: test.impacted_symbol_count,
-        })
-        .collect()
-}
-
-fn symbol_workflow_unknowns(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-    trail: &TrailContextDto,
-    direct_callers: &[SymbolWorkflowNodeOutput],
-    transitive_callers: &[SymbolWorkflowNodeOutput],
-    likely_tests: &[SymbolWorkflowTestOutput],
-    affected_seed: Option<&str>,
-    max_nodes: u32,
-) -> Vec<String> {
-    let mut unknowns = Vec::new();
-    unknowns.push(
-        "affected files/routes/tests are seeded from the selected symbol's file, not a symbol-level change slice"
-            .to_string(),
-    );
-    if affected_seed.is_none() {
-        unknowns.push(
-            "selected symbol has no indexed file path; affected analysis was skipped".to_string(),
-        );
-    }
-    if direct_callers.is_empty() {
-        unknowns.push("no direct callers found in the incoming trail".to_string());
-    }
-    if transitive_callers.is_empty() {
-        unknowns.push("no transitive callers found inside the caller depth cap".to_string());
-    }
-    if likely_tests.is_empty() {
-        unknowns.push("no test-like file reached by the affected graph walk".to_string());
-    }
-    if trail.trail.truncated {
-        unknowns.push(format!(
-            "caller trail truncated at max_nodes={max_nodes}; rerun with a narrower symbol or higher cap"
-        ));
-    }
-    if let Some(affected) = affected {
-        unknowns.extend(affected.blind_spots.iter().cloned());
-    }
-    unknowns.sort();
-    unknowns.dedup();
-    unknowns
-}
-
-fn symbol_workflow_next_commands(
-    project_root: &Path,
-    node_id: &NodeId,
-    affected_seed: Option<&str>,
-    depth: u32,
-    max_nodes: u32,
-    kind: SymbolWorkflowKind,
-    include_tests: bool,
-) -> Vec<String> {
-    let project = quote_command_path(project_root);
-    let id = quote_command_value(&node_id.0);
-    let caller_scope_flag = if include_tests {
-        " --include-tests"
-    } else {
-        ""
-    };
-    let mut commands = vec![
-        format!("codestory-cli symbol --project {project} --id {id}"),
-        format!(
-            "codestory-cli callers --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}{caller_scope_flag}"
-        ),
-    ];
-    if let Some(path) = affected_seed {
-        commands.push(format!(
-            "codestory-cli affected --project {project} {} --depth {depth}",
-            quote_command_value(path)
-        ));
-    }
-    let paired = match kind {
-        SymbolWorkflowKind::Impact => "test-map",
-        SymbolWorkflowKind::TestMap => "impact",
-    };
-    commands.push(format!(
-        "codestory-cli {paired} --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}{caller_scope_flag}"
-    ));
-    commands
-}
-
 fn render_symbol_workflow_markdown(
-    kind: SymbolWorkflowKind,
+    mode: codestory_runtime::SymbolWorkflowMode,
     output: &SymbolWorkflowOutput<'_>,
 ) -> String {
     let mut markdown = String::new();
-    let _ = writeln!(markdown, "# {}", kind.title());
+    let _ = writeln!(markdown, "# {}", mode.title());
     let _ = writeln!(
         markdown,
         "symbol: {} [{}]",
@@ -6167,19 +5800,19 @@ fn render_symbol_workflow_markdown(
         output.caps.caller_depth, output.caps.caller_max_nodes, output.caps.affected_depth
     );
 
-    append_symbol_workflow_nodes(&mut markdown, "direct_callers", &output.direct_callers);
+    append_symbol_workflow_nodes(&mut markdown, "direct_callers", output.direct_callers);
     append_symbol_workflow_nodes(
         &mut markdown,
         "transitive_callers",
-        &output.transitive_callers,
+        output.transitive_callers,
     );
-    append_symbol_workflow_strings(&mut markdown, "impacted_files", &output.impacted_files);
+    append_symbol_workflow_strings(&mut markdown, "impacted_files", output.impacted_files);
 
     let _ = writeln!(markdown, "impacted_routes:");
     if output.impacted_routes.is_empty() {
         let _ = writeln!(markdown, "- none");
     } else {
-        for route in &output.impacted_routes {
+        for route in output.impacted_routes {
             let location = route
                 .file_path
                 .as_deref()
@@ -6203,7 +5836,7 @@ fn render_symbol_workflow_markdown(
     if output.likely_tests.is_empty() {
         let _ = writeln!(markdown, "- none");
     } else {
-        for test in &output.likely_tests {
+        for test in output.likely_tests {
             let _ = writeln!(
                 markdown,
                 "- {} confidence={} graph_depth={} impacted_symbols={}",
@@ -6213,15 +5846,15 @@ fn render_symbol_workflow_markdown(
         }
     }
 
-    append_symbol_workflow_strings(&mut markdown, "unknowns", &output.unknowns);
-    append_symbol_workflow_strings(&mut markdown, "next_commands", &output.next_commands);
+    append_symbol_workflow_strings(&mut markdown, "unknowns", output.unknowns);
+    append_symbol_workflow_strings(&mut markdown, "next_commands", output.next_commands);
     markdown
 }
 
 fn append_symbol_workflow_nodes(
     markdown: &mut String,
     label: &str,
-    nodes: &[SymbolWorkflowNodeOutput],
+    nodes: &[codestory_runtime::SymbolWorkflowNode],
 ) {
     let _ = writeln!(markdown, "{label}:");
     if nodes.is_empty() {
@@ -7270,19 +6903,32 @@ fn resolve_target_or_emit_ambiguity(
         Ok(target) => Ok(target),
         Err(error) => {
             if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
-                let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-                let markdown = (format != args::OutputFormat::Json)
-                    .then(|| render_cli_error_markdown(&output));
-                return Err(StructuredCommandFailure {
-                    envelope: ambiguous_command_failure(&output, &runtime.project_root),
-                    output_file: output_file.map(Path::to_path_buf),
-                    markdown,
-                }
-                .into());
+                return structured_ambiguous_target_failure(
+                    runtime,
+                    ambiguous.clone(),
+                    format,
+                    output_file,
+                );
             }
             Err(error)
         }
     }
+}
+
+fn structured_ambiguous_target_failure<T>(
+    runtime: &RuntimeContext,
+    ambiguous: AmbiguousTargetError,
+    format: args::OutputFormat,
+    output_file: Option<&Path>,
+) -> Result<T> {
+    let output = build_ambiguous_target_error_output(&runtime.project_root, &ambiguous);
+    let markdown = (format != args::OutputFormat::Json).then(|| render_cli_error_markdown(&output));
+    Err(StructuredCommandFailure {
+        envelope: ambiguous_command_failure(&output, &runtime.project_root),
+        output_file: output_file.map(Path::to_path_buf),
+        markdown,
+    }
+    .into())
 }
 
 fn ambiguous_command_failure(
@@ -8765,6 +8411,14 @@ fn build_query_resolution_output_with_runtime(
         runtime,
         std::iter::once(&target.selected).chain(target.alternatives.iter()),
     );
+    build_query_resolution_output_from_occurrences(&runtime.project_root, target, &occurrences)
+}
+
+fn build_query_resolution_output_from_occurrences(
+    project_root: &Path,
+    target: &runtime::ResolvedTarget,
+    occurrences: &HashMap<NodeId, Vec<SourceOccurrenceDto>>,
+) -> QueryResolutionOutput {
     QueryResolutionOutput {
         selector: target.selector,
         requested: target.requested.clone(),
@@ -8773,11 +8427,11 @@ fn build_query_resolution_output_with_runtime(
             .as_deref()
             .map(crate::display::clean_path_string),
         resolved: build_search_hit_output(
-            &runtime.project_root,
+            project_root,
             &target.selected,
             Some(&target.requested),
             false,
-            occurrences_for_hit(&occurrences, &target.selected),
+            occurrences_for_hit(occurrences, &target.selected),
         ),
         alternatives: target
             .alternatives
@@ -8785,11 +8439,11 @@ fn build_query_resolution_output_with_runtime(
             .skip(1)
             .map(|hit| {
                 build_search_hit_output(
-                    &runtime.project_root,
+                    project_root,
                     hit,
                     Some(&target.requested),
                     false,
-                    occurrences_for_hit(&occurrences, hit),
+                    occurrences_for_hit(occurrences, hit),
                 )
             })
             .collect(),
@@ -9497,7 +9151,6 @@ mod tests {
     use super::*;
     use crate::args::RefreshMode;
     use crate::display::{clean_path_string, relative_path};
-    use crate::query_resolution::compare_resolution_hits;
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
@@ -11124,134 +10777,24 @@ mod tests {
         }
     }
 
-    fn sample_search_hit_output(id: &str, name: &str) -> SearchHitOutput {
-        SearchHitOutput {
-            number: None,
-            node_id: id.to_string(),
-            node_ref: Some(format!("src/lib.rs:1:{name}")),
-            display_name: name.to_string(),
-            kind: NodeKind::FUNCTION,
-            file_path: Some("src/lib.rs".to_string()),
-            line: Some(1),
-            score: 1.0,
-            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-            match_quality: SearchMatchQualityDto::Exact,
-            resolvable: true,
-            score_breakdown: None,
-            duplicate_of: None,
-            excerpt: None,
-            primary_occurrence_kind: None,
-            symbol_role: None,
-            paired_refs: Vec::new(),
-            verification_targets: Vec::new(),
-            resolution_hints: Vec::new(),
-            why: Vec::new(),
-        }
-    }
-
     #[test]
-    fn symbol_workflow_transitive_callers_render_only_call_paths() {
-        let focus = sample_graph_node("focus", "Focus");
-        let mut direct = sample_graph_node("direct", "DirectCaller");
-        let mut transitive = sample_graph_node("transitive", "TransitiveCaller");
-        let mut reference = sample_graph_node("reference", "ReferenceOnly");
-        direct.depth = 1;
-        transitive.depth = 2;
-        reference.depth = 2;
-        let trail = TrailContextDto {
-            focus: sample_node_details("focus", "Focus"),
-            trail: GraphResponse {
-                center_id: NodeId("focus".to_string()),
-                nodes: vec![focus, direct, transitive, reference],
-                edges: vec![
-                    sample_graph_edge("direct-focus", "direct", "focus", Some("certain")),
-                    sample_graph_edge("transitive-direct", "transitive", "direct", Some("certain")),
-                    sample_graph_edge_with_kind(
-                        "reference-direct",
-                        "reference",
-                        "direct",
-                        EdgeKind::USAGE,
-                        Some("certain"),
-                    ),
-                ],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-            story: None,
-        };
-        let symbol = codestory_contracts::api::SymbolContextDto {
-            node: sample_node_details("focus", "Focus"),
-            summary: None,
-            children: Vec::new(),
-            related_hits: Vec::new(),
-            edge_digest: Vec::new(),
-        };
-        let direct_callers = symbol_workflow_direct_callers(&trail);
-        let transitive_callers = symbol_workflow_transitive_callers(&trail, &direct_callers);
-        let output = SymbolWorkflowOutput {
-            workflow: SymbolWorkflowKind::Impact.label(),
-            project_root: "C:/repo".to_string(),
-            resolution: QueryResolutionOutput {
-                selector: QuerySelectorOutput::Id,
-                requested: "focus".to_string(),
-                file_filter: None,
-                resolved: sample_search_hit_output("focus", "Focus"),
-                alternatives: Vec::new(),
-            },
-            symbol: &symbol,
-            direct_callers,
-            transitive_callers,
-            impacted_files: Vec::new(),
-            impacted_routes: Vec::new(),
-            likely_tests: Vec::new(),
-            caps: SymbolWorkflowCapsOutput {
-                caller_depth: 3,
-                caller_max_nodes: 20,
-                affected_depth: 3,
-                impacted_symbols_cap: 200,
-                impacted_routes_cap: 100,
-                affected_seed: "none".to_string(),
-            },
-            unknowns: Vec::new(),
-            next_commands: Vec::new(),
-            affected: None,
-            trail: &trail,
-        };
-
-        let markdown = render_symbol_workflow_markdown(SymbolWorkflowKind::Impact, &output);
-
-        assert!(markdown.contains("transitive_callers:"));
-        assert!(markdown.contains("TransitiveCaller"));
-        assert!(
-            !markdown.contains("ReferenceOnly"),
-            "non-CALL depth-2 nodes must not render as transitive callers:\n{markdown}"
-        );
-    }
-
-    #[test]
-    fn symbol_workflow_next_commands_preserve_include_tests_scope() {
-        let commands = symbol_workflow_next_commands(
-            Path::new("C:/repo"),
-            &NodeId("focus".to_string()),
-            None,
-            3,
-            20,
-            SymbolWorkflowKind::Impact,
-            true,
+    fn symbol_workflow_renderer_keeps_caller_shape() {
+        let mut markdown = String::new();
+        append_symbol_workflow_nodes(
+            &mut markdown,
+            "direct_callers",
+            &[codestory_runtime::SymbolWorkflowNode {
+                node_id: NodeId("caller".to_string()),
+                display_name: "Caller".to_string(),
+                kind: "function".to_string(),
+                file_path: Some("src/lib.rs".to_string()),
+                depth: 1,
+            }],
         );
 
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.contains("callers") && command.contains("--include-tests")),
-            "callers next command should preserve include-tests scope: {commands:#?}"
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.contains("test-map") && command.contains("--include-tests")),
-            "paired workflow next command should preserve include-tests scope: {commands:#?}"
+        assert_eq!(
+            markdown,
+            "direct_callers:\n- [caller] Caller (function) depth=1 src/lib.rs\n"
         );
     }
 
@@ -12572,265 +12115,6 @@ mod tests {
             cache_root.ends_with(&fnv1a_hex(b"C:/repo")),
             "default cache root should end with the project hash"
         );
-    }
-
-    #[test]
-    fn resolution_prefers_exact_type_name_over_member_hits() {
-        let query = "AppController";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("2".to_string()),
-                display_name: "AppController::open_project".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: None,
-                line: None,
-                score: 0.9,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("1".to_string()),
-                display_name: "AppController".to_string(),
-                kind: codestory_contracts::api::NodeKind::CLASS,
-                file_path: None,
-                line: None,
-                score: 0.9,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].display_name, "AppController");
-    }
-
-    #[test]
-    fn resolution_prefers_declaration_anchor_over_impl_anchor() {
-        let temp = tempdir().expect("create temp dir");
-        let file_path = temp.path().join("lib.rs");
-        fs::write(
-            &file_path,
-            "pub struct AppController;\nimpl AppController {\n    fn open_project(&self) {}\n}\n",
-        )
-        .expect("write file");
-
-        let query = "AppController";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("2".to_string()),
-                display_name: "AppController".to_string(),
-                kind: codestory_contracts::api::NodeKind::CLASS,
-                file_path: Some(file_path.to_string_lossy().to_string()),
-                line: Some(2),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("1".to_string()),
-                display_name: "AppController".to_string(),
-                kind: codestory_contracts::api::NodeKind::STRUCT,
-                file_path: Some(file_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].line, Some(1));
-        assert_eq!(hits[0].kind, codestory_contracts::api::NodeKind::STRUCT);
-    }
-
-    #[test]
-    fn resolution_prefers_callable_definitions_over_unknown_hits() {
-        let query = "check_winner";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("2".to_string()),
-                display_name: "check_winner".to_string(),
-                kind: codestory_contracts::api::NodeKind::UNKNOWN,
-                file_path: Some("src/callsite.rs".to_string()),
-                line: Some(20),
-                score: 0.9,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("1".to_string()),
-                display_name: "check_winner".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some("src/game.rs".to_string()),
-                line: Some(10),
-                score: 0.8,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].kind, codestory_contracts::api::NodeKind::FUNCTION);
-    }
-
-    #[test]
-    fn resolution_prefers_callable_implementation_over_declaration() {
-        let temp = tempdir().expect("create temp dir");
-        let declaration_path = temp.path().join("Project.h");
-        let implementation_path = temp.path().join("Project.cpp");
-        fs::write(&declaration_path, "void buildIndex() const;\n").expect("write declaration");
-        fs::write(
-            &implementation_path,
-            "void Project::buildIndex() const\n{\n    runIndexer();\n}\n",
-        )
-        .expect("write implementation");
-
-        let query = "Project::buildIndex";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("declaration".to_string()),
-                display_name: "Project::buildIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::METHOD,
-                file_path: Some(declaration_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("implementation".to_string()),
-                display_name: "Project::buildIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some(implementation_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].node_id.0, "implementation");
-    }
-
-    #[test]
-    fn resolution_prefers_multiline_callable_implementation_over_declaration() {
-        let temp = tempdir().expect("create temp dir");
-        let declaration_path = temp.path().join("IndexerJava.h");
-        let implementation_path = temp.path().join("IndexerJava.cpp");
-        fs::write(
-            &declaration_path,
-            "void doIndex(\n    Command command,\n    State state) override;\n",
-        )
-        .expect("write declaration");
-        fs::write(
-            &implementation_path,
-            "void IndexerJava::doIndex(\n    Command command,\n    State state)\n{\n    parse(command);\n}\n",
-        )
-        .expect("write implementation");
-
-        let query = "IndexerJava::doIndex";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("declaration".to_string()),
-                display_name: "IndexerJava::doIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::METHOD,
-                file_path: Some(declaration_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("implementation".to_string()),
-                display_name: "IndexerJava::doIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some(implementation_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].node_id.0, "implementation");
-    }
-
-    #[test]
-    fn resolution_keeps_callable_implementation_when_body_contains_assignment() {
-        let temp = tempdir().expect("create temp dir");
-        let declaration_path = temp.path().join("Foo.h");
-        let implementation_path = temp.path().join("Foo.cpp");
-        fs::write(&declaration_path, "void bar();\n").expect("write declaration");
-        fs::write(
-            &implementation_path,
-            "void Foo::bar()\n{\n    int status = 0;\n    use(status);\n}\n",
-        )
-        .expect("write implementation");
-
-        let query = "Foo::bar";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("declaration".to_string()),
-                display_name: "Foo::bar".to_string(),
-                kind: codestory_contracts::api::NodeKind::METHOD,
-                file_path: Some(declaration_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("implementation".to_string()),
-                display_name: "Foo::bar".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some(implementation_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].node_id.0, "implementation");
     }
 
     fn sample_runtime_hit(

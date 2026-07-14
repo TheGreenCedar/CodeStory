@@ -12,7 +12,10 @@ use codestory_contracts::query::{
     SymbolQuery, TrailQuery,
 };
 
-use crate::{AppController, compare_ranked_hits, symbol_name_match_rank};
+use crate::{
+    AppController, SymbolWorkflowOutcome, SymbolWorkflowRequest, TargetResolution, TargetSelection,
+    compare_ranked_hits, symbol_name_match_rank,
+};
 
 #[derive(Debug, Clone)]
 pub struct BrowserQueryItem {
@@ -116,6 +119,21 @@ impl ReadOnlyBrowserService {
     ) -> Result<Vec<SearchHit>, ApiError> {
         self.controller
             .resolve_indexed_symbol_candidates(query, max_results)
+    }
+
+    pub fn resolve_target(
+        &self,
+        target: TargetSelection,
+        file_filter: Option<&str>,
+    ) -> Result<TargetResolution, ApiError> {
+        self.controller.resolve_target(target, file_filter)
+    }
+
+    pub fn symbol_workflow(
+        &self,
+        request: SymbolWorkflowRequest,
+    ) -> Result<SymbolWorkflowOutcome, ApiError> {
+        self.controller.symbol_workflow(request)
     }
 
     pub fn indexed_files(&self, req: IndexedFilesRequest) -> Result<IndexedFilesDto, ApiError> {
