@@ -104,7 +104,24 @@ static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn process_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    PROCESS_ENV_TEST_LOCK.lock().expect("process env test lock")
+    PROCESS_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn test_sidecar_runtime_from_env() -> codestory_retrieval::SidecarRuntimeConfig {
+    let process_defaults = codestory_retrieval::SidecarProcessDefaults::new(
+        std::env::temp_dir().join(format!("codestory-runtime-tests-{}", std::process::id())),
+        codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+    );
+    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        None,
+        codestory_retrieval::SidecarProfile::Local,
+        None,
+        &process_defaults,
+        &codestory_retrieval::SidecarRuntimeOverrides::default(),
+    )
 }
 pub use search_runtime::*;
 use semantic_doc_text::{
@@ -3405,7 +3422,7 @@ fn build_search_state(
         llm_refresh_file_scope,
         semantic_projection_mode,
         hydrate_semantic_docs,
-        &codestory_retrieval::SidecarRuntimeConfig::local(),
+        &test_sidecar_runtime_from_env(),
     )
 }
 
@@ -4563,11 +4580,7 @@ fn load_persisted_search_state(
     storage: &mut Storage,
     storage_path: &Path,
 ) -> Result<LoadedSearchState, ApiError> {
-    load_persisted_search_state_for_runtime(
-        storage,
-        storage_path,
-        &codestory_retrieval::SidecarRuntimeConfig::local(),
-    )
+    load_persisted_search_state_for_runtime(storage, storage_path, &test_sidecar_runtime_from_env())
 }
 
 fn load_persisted_search_state_for_runtime(
@@ -4836,10 +4849,7 @@ fn retrieval_state_from_engine_with_storage_contract(
 
 #[cfg(test)]
 fn retrieval_state_from_storage(storage: &Storage) -> Result<RetrievalStateDto, ApiError> {
-    retrieval_state_from_storage_for_runtime(
-        storage,
-        &codestory_retrieval::SidecarRuntimeConfig::local(),
-    )
+    retrieval_state_from_storage_for_runtime(storage, &test_sidecar_runtime_from_env())
 }
 
 fn retrieval_state_from_storage_for_runtime(
@@ -6925,7 +6935,7 @@ fn finalize_staged_semantic_docs(
         llm_refresh_file_scope,
         component_report_refresh,
         cancel_token,
-        &codestory_retrieval::SidecarRuntimeConfig::local(),
+        &test_sidecar_runtime_from_env(),
     )
 }
 
@@ -12071,7 +12081,7 @@ fn index_incremental(
         storage_path,
         events_tx,
         cancel_token,
-        &codestory_retrieval::SidecarRuntimeConfig::local(),
+        &test_sidecar_runtime_from_env(),
     )
 }
 
@@ -12650,7 +12660,7 @@ fn rebuild_search_state_from_storage(
         storage_path,
         llm_refresh_scope,
         hydrate_semantic_docs,
-        &codestory_retrieval::SidecarRuntimeConfig::local(),
+        &test_sidecar_runtime_from_env(),
         None,
     )
 }
@@ -12821,10 +12831,8 @@ mod tests {
     use crossbeam_channel::unbounded;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+    use std::sync::MutexGuard as StdMutexGuard;
     use tempfile::tempdir;
-
-    static ENV_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -13021,9 +13029,7 @@ mod tests {
     }
 
     fn hybrid_test_env() -> HybridTestEnv {
-        let lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = process_env_test_lock();
         HybridTestEnv {
             guards: vec![
                 EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "true"),
@@ -13227,9 +13233,7 @@ mod tests {
 
     #[test]
     fn llm_doc_embed_batch_size_uses_throughput_default() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
 
         assert_eq!(llm_doc_embed_batch_size(), 128);
@@ -13341,9 +13345,7 @@ mod tests {
 
     #[test]
     fn llm_doc_embed_batch_size_allows_wider_managed_batches() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::set(LLM_DOC_EMBED_BATCH_SIZE_ENV, "1024");
 
         assert_eq!(llm_doc_embed_batch_size(), 1024);
@@ -13351,9 +13353,7 @@ mod tests {
 
     #[test]
     fn stream_pending_llm_symbol_docs_defaults_to_enabled() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::remove(SEMANTIC_STREAM_PENDING_DOCS_ENV);
         assert!(stream_pending_llm_symbol_docs_from_env());
 
@@ -13363,9 +13363,7 @@ mod tests {
 
     #[test]
     fn semantic_stream_sort_window_defaults_to_one_batch() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::remove(SEMANTIC_STREAM_SORT_WINDOW_BATCHES_ENV);
         assert_eq!(semantic_stream_sort_window_batches_from_env(), 1);
 
@@ -13378,9 +13376,7 @@ mod tests {
 
     #[test]
     fn semantic_doc_scope_defaults_to_durable_symbols_and_all_scope_is_opt_in() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV);
         assert_eq!(
             semantic_doc_scope_from_env(),
@@ -13431,9 +13427,7 @@ mod tests {
 
     #[test]
     fn semantic_doc_alias_mode_defaults_to_alias_variant() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV);
         assert_eq!(
             semantic_doc_alias_mode_from_env(),
@@ -13455,9 +13449,7 @@ mod tests {
 
     #[test]
     fn semantic_doc_token_budget_defaults_to_safe_window() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV);
 
         assert_eq!(
@@ -14009,9 +14001,7 @@ mod tests {
 
     #[test]
     fn semantic_doc_text_adds_symbol_aliases_for_supported_language_naming_styles() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
         let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
         let cases = [
@@ -14098,9 +14088,7 @@ mod tests {
 
     #[test]
     fn semantic_doc_text_adds_kind_role_owner_and_path_alias_context() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
         let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
         let doc = semantic_doc_text_for_test(
@@ -14132,9 +14120,7 @@ mod tests {
 
     #[test]
     fn semantic_doc_text_keeps_comments_before_long_file_path() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
         let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "128");
         let file_path = r"\\?\C:\Users\alber\AppData\Local\Temp\codestory-search-quality-fixture-with-a-long-path\src\architecture.ts";
@@ -14174,9 +14160,7 @@ export class SourceGroupCxxCdb {
 
     #[test]
     fn semantic_doc_text_alias_modes_are_switchable_for_research() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "512");
         let no_alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "no_alias");
         let no_alias_doc = semantic_doc_text_for_test(
@@ -14221,9 +14205,7 @@ export class SourceGroupCxxCdb {
 
     #[test]
     fn semantic_doc_text_token_budget_respects_configured_limit() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _alias = EnvGuard::set(SEMANTIC_DOC_ALIAS_MODE_ENV, "current_alias");
         let _budget = EnvGuard::set(SEMANTIC_DOC_MAX_TOKENS_ENV, "48");
         let doc = semantic_doc_text_for_test(
@@ -16607,12 +16589,10 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[test]
     fn search_prefers_full_sidecars_for_tictactoe_queries() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
         let workspace = copy_tictactoe_workspace();
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         controller
             .open_project(OpenProjectRequest {
                 path: workspace.path().to_string_lossy().to_string(),
@@ -16639,12 +16619,10 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[test]
     fn repo_explanation_search_requires_full_sidecar_retrieval() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = process_env_test_lock();
         let _env = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
         let workspace = copy_tictactoe_workspace();
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         controller
             .open_project(OpenProjectRequest {
                 path: workspace.path().to_string_lossy().to_string(),
@@ -16821,7 +16799,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -16854,7 +16832,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -16910,7 +16888,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -17010,7 +16988,7 @@ fn build_llm_symbol_doc_text() -> String {
         let mut env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -17049,7 +17027,7 @@ fn build_llm_symbol_doc_text() -> String {
             EMBEDDING_BACKEND_ENV,
             "unavailable-test-backend",
         ));
-        let reopened = AppController::new();
+        let reopened = AppController::new_with_config(test_sidecar_runtime_from_env());
         reopened
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -17096,7 +17074,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -17154,7 +17132,7 @@ fn build_llm_symbol_doc_text() -> String {
         env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -17178,8 +17156,7 @@ fn build_llm_symbol_doc_text() -> String {
         );
 
         env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "384"));
-        let repair_controller =
-            AppController::new_with_config(codestory_retrieval::SidecarRuntimeConfig::local());
+        let repair_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         repair_controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -17211,7 +17188,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -17296,7 +17273,7 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("write component source");
         }
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -17404,7 +17381,7 @@ fn build_llm_symbol_doc_text() -> String {
         )
         .expect("write alpha source");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -17448,7 +17425,7 @@ fn build_llm_symbol_doc_text() -> String {
         env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -17481,8 +17458,7 @@ fn build_llm_symbol_doc_text() -> String {
         source.push_str("\nfn codestory_contract_drift_added_hint() -> i32 { 7 }\n");
         fs::write(&rust_fixture, source).expect("write changed rust fixture");
 
-        let repair_controller =
-            AppController::new_with_config(codestory_retrieval::SidecarRuntimeConfig::local());
+        let repair_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         repair_controller
             .open_project_summary_with_storage_path(
                 workspace.path().to_path_buf(),
@@ -17525,7 +17501,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -17573,7 +17549,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(workspace.path().to_path_buf(), storage_path)
@@ -18086,7 +18062,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         controller
             .open_project_summary_with_storage_path(
@@ -19174,7 +19150,7 @@ fn build_llm_symbol_doc_text() -> String {
         let _env = hybrid_test_env();
         let workspace = tempdir().expect("workspace dir");
         let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
 
         write_reindex_semantic_fixture(workspace.path(), "initial compressed digest");
         controller

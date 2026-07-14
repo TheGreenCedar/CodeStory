@@ -119,7 +119,7 @@ impl EmbeddingBackendSelection {
                 "{EMBEDDING_RUNTIME_MODE_ENV}={runtime_mode} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
             );
         }
-        Self::from_config(&codestory_retrieval::SidecarRuntimeConfig::local().embedding)
+        Self::from_config(&crate::test_sidecar_runtime_from_env().embedding)
     }
 
     fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
@@ -190,7 +190,7 @@ struct EmbeddingProfile {
 impl EmbeddingProfile {
     #[cfg(test)]
     fn from_env() -> Result<Self> {
-        Self::from_config(&codestory_retrieval::SidecarRuntimeConfig::local().embedding)
+        Self::from_config(&crate::test_sidecar_runtime_from_env().embedding)
     }
 
     fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
@@ -2047,11 +2047,8 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Mutex as StdMutex;
     use std::thread;
     use tempfile::tempdir;
-
-    static ENV_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn test_axis_embedding(axis: usize) -> Vec<f32> {
         let mut embedding = vec![0.0; EMBEDDING_DIM];
@@ -2096,9 +2093,7 @@ mod tests {
 
     #[test]
     fn embedding_profile_defaults_to_bge_base() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::remove(EMBEDDING_PROFILE_ENV);
 
         let profile = EmbeddingProfile::from_env()?;
@@ -2111,9 +2106,7 @@ mod tests {
 
     #[test]
     fn mandatory_sidecar_defaults_to_llamacpp_backend_when_backend_is_unset() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
         let _backend = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
         let _url = EnvGuard::remove(LLAMACPP_EMBEDDINGS_URL_ENV);
@@ -2129,9 +2122,7 @@ mod tests {
 
     #[test]
     fn removed_onnx_configuration_fails_explicitly() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
 
@@ -2143,9 +2134,7 @@ mod tests {
 
     #[test]
     fn removed_onnx_runtime_mode_fails_even_with_llamacpp_backend() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
 
         for alias in ["onnx", "ort", "onnxruntime", "onnx-runtime"] {
@@ -2161,9 +2150,7 @@ mod tests {
 
     #[test]
     fn removed_onnx_environment_fails_even_with_llamacpp_selected() {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _legacy = EnvGuard::set("CODESTORY_EMBED_ONNX_MODEL", "legacy.onnx");
 
@@ -2254,7 +2241,7 @@ mod tests {
             truncate_dim: None,
             expected_dim: Some(3),
         };
-        let mut client_config = codestory_retrieval::SidecarRuntimeConfig::local().embedding;
+        let mut client_config = crate::test_sidecar_runtime_from_env().embedding;
         client_config.endpoint = url.clone();
         client_config.endpoint_origin =
             codestory_retrieval::EmbeddingEndpointOrigin::TrustedProjectConfig;
@@ -2288,9 +2275,7 @@ mod tests {
     #[test]
     #[ignore]
     fn embedding_identity_probe_from_env() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let query = std::env::var("CODESTORY_EMBED_IDENTITY_PROBE_QUERY").unwrap_or_else(|_| {
             "Where is the retrieval sidecar embedding contract enforced?".into()
         });
@@ -2449,9 +2434,7 @@ mod tests {
 
     #[test]
     fn symbol_full_text_index_can_be_disabled_for_projection_only_search() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(SYMBOL_FULL_TEXT_INDEX_ENV, "false");
         let mut engine = SearchEngine::new(None)?;
 
@@ -2759,9 +2742,7 @@ mod tests {
 
     #[test]
     fn test_hybrid_search_quantized_prefilter_rescores_full_precision() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
 
         let mut engine = SearchEngine::new(None)?;
@@ -2872,9 +2853,7 @@ mod tests {
 
     #[test]
     fn test_quantized_semantic_prefilter_prefers_primary_docs() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
 
         let mut engine = SearchEngine::new(None)?;
@@ -2903,9 +2882,7 @@ mod tests {
 
     #[test]
     fn test_float32_semantic_scores_return_bounded_top_candidates() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "float32");
 
         fn axis_embedding(axis: usize) -> Vec<f32> {
@@ -2935,9 +2912,7 @@ mod tests {
 
     #[test]
     fn test_quantized_semantic_scores_return_bounded_top_candidates() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
 
         fn axis_embedding(axis: usize) -> Vec<f32> {

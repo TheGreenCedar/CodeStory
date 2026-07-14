@@ -198,7 +198,7 @@ mod tests {
     fn packet_subquery_warmup_fails_closed_without_sidecar_primary() {
         let _lock = crate::process_env_test_lock();
         let _retrieval_env = EnvVarGuard::cleared("CODESTORY_RETRIEVAL");
-        let controller = AppController::new();
+        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
 
         let error = controller
             .warm_packet_subquery_embeddings(&["run_exec_session".to_string()])
