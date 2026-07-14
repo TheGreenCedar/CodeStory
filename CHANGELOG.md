@@ -60,6 +60,10 @@
 - Kept packet claim attribution tied to behavior-owning citation identities and
   require cited interceptor evidence before an interceptor-focused request flow
   can report sufficient coverage.
+- Treated real file-level lexical hits for known config, data, and documentation
+  formats as diagnostic when the same retrieval has resolved graph evidence,
+  while keeping unknown source files, unresolved symbols, and invalid paths
+  blocking and retaining the first blocker in capped diagnostics.
 - Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
   generation artifact scopes to project identity schema 3. Legacy schema-2
   state is discovered for inventory but never reused or destructively cleaned;

@@ -1075,34 +1075,34 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
     let trace = &result.trace;
     let stage_timings = retrieval_stage_timings(trace);
 
-    let candidates = result
-        .hits
-        .iter()
-        .take(MAX_SHADOW_CANDIDATES)
-        .enumerate()
-        .map(|(index, hit)| RetrievalCandidateSummaryDto {
-            rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
-            file_path: hit.file_path.clone(),
-            line: hit.start_line,
-            symbol_name: hit.symbol_name.clone(),
-            score: hit.score,
-            source: candidate_source_label(hit.source),
-            resolution: resolution_labels.get(index).cloned(),
-            admission_status: admission_labels
-                .get(index)
-                .map(|label| label.admission_status.clone()),
-            loss_reason: admission_labels
-                .get(index)
-                .and_then(|label| label.loss_reason.clone()),
-            resolved_node_id: admission_labels
-                .get(index)
-                .and_then(|label| label.resolved_node_id.clone()),
-            search_hit_rank: admission_labels
-                .get(index)
-                .and_then(|label| label.search_hit_rank),
-            final_rank: admission_labels
-                .get(index)
-                .and_then(|label| label.final_rank),
+    let candidates = shadow_candidate_indices(&result.hits, resolution_labels)
+        .into_iter()
+        .map(|index| {
+            let hit = &result.hits[index];
+            RetrievalCandidateSummaryDto {
+                rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                file_path: hit.file_path.clone(),
+                line: hit.start_line,
+                symbol_name: hit.symbol_name.clone(),
+                score: hit.score,
+                source: candidate_source_label(hit.source),
+                resolution: resolution_labels.get(index).cloned(),
+                admission_status: admission_labels
+                    .get(index)
+                    .map(|label| label.admission_status.clone()),
+                loss_reason: admission_labels
+                    .get(index)
+                    .and_then(|label| label.loss_reason.clone()),
+                resolved_node_id: admission_labels
+                    .get(index)
+                    .and_then(|label| label.resolved_node_id.clone()),
+                search_hit_rank: admission_labels
+                    .get(index)
+                    .and_then(|label| label.search_hit_rank),
+                final_rank: admission_labels
+                    .get(index)
+                    .and_then(|label| label.final_rank),
+            }
         })
         .collect();
 
@@ -1163,10 +1163,44 @@ fn unresolved_candidates_are_diagnostic_only(
             .zip(resolution_labels)
             .filter(|(_, label)| label.as_str() != "resolved")
             .all(|(candidate, label)| {
-                bare_dense_anchor_unresolved(candidate, label)
-                    || (has_resolved_hit
-                        && non_source_markdown_candidate_unresolved(candidate, label))
+                unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
             })
+}
+
+fn shadow_candidate_indices(
+    candidates: &[CandidateHit],
+    resolution_labels: &[String],
+) -> Vec<usize> {
+    let mut indices = (0..candidates.len().min(MAX_SHADOW_CANDIDATES)).collect::<Vec<_>>();
+    let has_resolved_hit = resolution_labels
+        .iter()
+        .any(|label| label.as_str() == "resolved");
+    let blocking_index = candidates
+        .iter()
+        .zip(resolution_labels)
+        .enumerate()
+        .skip(MAX_SHADOW_CANDIDATES)
+        .find_map(|(index, (candidate, label))| {
+            (label != "resolved"
+                && !unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit))
+            .then_some(index)
+        });
+    if let Some(blocking_index) = blocking_index
+        && let Some(last_index) = indices.last_mut()
+    {
+        *last_index = blocking_index;
+    }
+    indices
+}
+
+fn unresolved_candidate_is_diagnostic(
+    candidate: &CandidateHit,
+    resolution_label: &str,
+    has_resolved_hit: bool,
+) -> bool {
+    bare_dense_anchor_unresolved(candidate, resolution_label)
+        || (has_resolved_hit
+            && non_parser_backed_file_candidate_unresolved(candidate, resolution_label))
 }
 
 fn bare_dense_anchor_unresolved(candidate: &CandidateHit, resolution_label: &str) -> bool {
@@ -1185,14 +1219,23 @@ fn bare_dense_anchor_path(candidate: &CandidateHit) -> bool {
             .is_some_and(|symbol| symbol.trim().eq_ignore_ascii_case(file_path))
 }
 
-fn non_source_markdown_candidate_unresolved(
+fn non_parser_backed_file_candidate_unresolved(
     candidate: &CandidateHit,
     resolution_label: &str,
 ) -> bool {
+    // `node_unresolved` is assigned only after the candidate path resolves.
     resolution_label == "node_unresolved"
         && candidate.source == CandidateSource::Lexical
         && candidate.symbol_name.is_none()
-        && candidate.file_path.to_ascii_lowercase().ends_with(".md")
+        && known_non_symbol_file_path(&candidate.file_path)
+}
+
+fn known_non_symbol_file_path(file_path: &str) -> bool {
+    let lower = file_path.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some("cfg" | "conf" | "def" | "ini" | "json" | "md" | "markdown" | "toml" | "yaml" | "yml")
+    )
 }
 
 fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
@@ -2139,23 +2182,29 @@ mod tests {
     }
 
     #[test]
-    fn shadow_marks_non_source_markdown_candidates_diagnostic_only_with_source_hits() {
+    fn shadow_marks_non_parser_backed_file_candidates_diagnostic_only_with_source_hits() {
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
             QueryResult {
                 query: "form validation".into(),
                 features: classify_query("form validation"),
                 hits: vec![
                     CandidateHit::with_source(
-                        "docs/tasks/form-validation/marking.md",
+                        "config/form-validation.json",
                         None,
                         0.9,
                         CandidateSource::Lexical,
                     ),
                     CandidateHit::with_source(
-                        "src/forms/validation.html",
+                        "config/form-validation.conf",
+                        None,
+                        0.85,
+                        CandidateSource::Lexical,
+                    ),
+                    CandidateHit::with_source(
+                        "src/forms/validation.rs",
                         Some("email".into()),
                         0.8,
-                        CandidateSource::Qdrant,
+                        CandidateSource::Scip,
                     ),
                 ],
                 trace: QueryTrace {
@@ -2168,14 +2217,62 @@ mod tests {
                     stages: Vec::new(),
                 },
             },
-            2,
+            3,
             1,
-            &["node_unresolved".to_string(), "resolved".to_string()],
+            &[
+                "node_unresolved".to_string(),
+                "node_unresolved".to_string(),
+                "resolved".to_string(),
+            ],
             &[],
         );
         let value = serde_json::to_value(&shadow).expect("serialize shadow");
-        assert_eq!(shadow.unresolved_candidate_count, 1);
+        assert_eq!(shadow.unresolved_candidate_count, 2);
         assert_eq!(value["diagnostic_only"], true);
+    }
+
+    #[test]
+    fn shadow_keeps_blocking_unresolved_candidate_visible() {
+        let mut hits = vec![CandidateHit::with_source(
+            "config/application.json",
+            None,
+            0.9,
+            CandidateSource::Lexical,
+        )];
+        let mut resolution_labels = vec!["node_unresolved".to_string()];
+        for index in 1..MAX_SHADOW_CANDIDATES {
+            hits.push(CandidateHit::with_source(
+                format!("src/module_{index}.rs"),
+                Some(format!("module_{index}")),
+                0.8,
+                CandidateSource::Scip,
+            ));
+            resolution_labels.push("resolved".to_string());
+        }
+        hits.push(CandidateHit::with_source(
+            "missing/application.json",
+            None,
+            0.7,
+            CandidateSource::Lexical,
+        ));
+        resolution_labels.push("path_unresolvable".to_string());
+
+        let summary_indices = shadow_candidate_indices(&hits, &resolution_labels);
+        assert_eq!(summary_indices.len(), MAX_SHADOW_CANDIDATES);
+        assert_eq!(summary_indices.last(), Some(&MAX_SHADOW_CANDIDATES));
+        assert!(!unresolved_candidates_are_diagnostic_only(
+            &hits,
+            &resolution_labels,
+            2,
+        ));
+
+        let source_candidate =
+            CandidateHit::with_source("src/parser.zig", None, 0.9, CandidateSource::Lexical);
+        assert!(!unresolved_candidate_is_diagnostic(
+            &source_candidate,
+            "node_unresolved",
+            true,
+        ));
     }
 
     #[test]
