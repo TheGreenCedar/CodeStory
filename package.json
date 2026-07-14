@@ -1,4 +1,5 @@
 {
+  "name": "codestory-workflow-policy",
   "private": true,
   "devDependencies": {
     "yaml": "2.9.0"
