@@ -218,7 +218,6 @@ jobs:
       - run: cargo check --workspace --locked
       - run: node scripts/setup-retrieval-env.mjs --self-test
       - run: node --test scripts/tests/codex-worktree-setup.test.mjs
-      - run: node scripts/codex-worktree-setup.mjs --self-test
       - run: test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh
 
   repo-scale-stats:

@@ -13,8 +13,6 @@ const macosSurfaces = [
   /^\.github\/workflows\/macos-/u,
   /^backend\/.*(?:darwin|macos|metal)/iu,
   /^scripts\/setup-retrieval-env\./u,
-  /^scripts\/codex-worktree-setup\.(?:mjs|sh)$/u,
-  /^scripts\/tests\/codex-worktree-setup\.test\.mjs$/u,
   /^plugins\/codestory\/.*(?:darwin|macos|metal)/iu,
 ];
 
@@ -24,6 +22,8 @@ const crossPlatformRuntimeSurfaces = [
   /^crates\/codestory-cli\/src\/readiness_broker\//u,
   /^crates\/codestory-retrieval\/src\/(?:config|index|inventory|lib|query|sidecar)\.rs$/u,
   /^scripts\/install-codestory\.ps1$/u,
+  /^scripts\/codex-worktree-setup\.(?:mjs|ps1|sh)$/u,
+  /^scripts\/tests\/codex-worktree-setup\.test\.mjs$/u,
 ];
 
 const proofNeutralSurfaces = [
@@ -95,6 +95,14 @@ function selfTest() {
         "crates/codestory-cli/src/readiness_broker/native_lease.rs",
         "crates/codestory-retrieval/src/inventory.rs",
         "crates/codestory-retrieval/src/sidecar.rs",
+      ],
+    },
+    {
+      name: "shared worktree setup changes use every platform",
+      expected: "full",
+      paths: [
+        "scripts/codex-worktree-setup.mjs",
+        "scripts/tests/codex-worktree-setup.test.mjs",
       ],
     },
   ];

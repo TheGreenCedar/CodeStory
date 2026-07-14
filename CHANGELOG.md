@@ -79,8 +79,9 @@
   probes also reject completed processes using both exit time and exit code.
 - Managed installation and upgrade checks cover every shipped native platform,
   including upgrade from a verified older CLI with that version retained as the
-  rollback. The Codex worktree setup dispatcher now provides equivalent native
-  setup behavior on Windows, macOS, and Linux.
+  rollback. The Codex worktree setup dispatcher now owns one version-checked,
+  locked setup path for Windows, macOS, and Linux; the shell and PowerShell
+  entrypoints are thin compatibility adapters.
 - The packaged plugin now launches the CodeStory CLI directly without a shell
   and rejects Windows batch-file overrides. Managed CLI, model, and native
   backend downloads enforce declared byte limits while streaming and remove

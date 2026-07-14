@@ -200,9 +200,10 @@ sidecar proof, verify the Git target. The tracked Codex environment runs:
 node scripts/codex-worktree-setup.mjs
 ```
 
-The Node.js dispatcher selects `scripts/codex-worktree-setup.ps1` on Windows
-and `scripts/codex-worktree-setup.sh` on macOS/Linux. Both print this handoff
-surface first:
+The Node.js dispatcher owns the setup behavior on every platform.
+`scripts/codex-worktree-setup.ps1` and `scripts/codex-worktree-setup.sh` are
+thin compatibility adapters for callers that still invoke a platform script.
+The dispatcher prints this handoff surface first:
 
 ```text
 intended_base_ref
@@ -228,18 +229,20 @@ heads, unresolved refs, and the exact `git ls-remote origin ...` result before
 it runs index, retrieval, or doctor handoff work. It then resolves a
 version-matched CLI through `CODESTORY_CLI`, PATH, the CodeStory install
 directory, this worktree, and sibling worktrees; tries the matching release;
-and falls back to a release Cargo build with optional `sccache`. It best-effort
+and falls back to a locked release Cargo build with optional `sccache`. It best-effort
 rehydrates a compatible sibling cache, refreshes the local index, and reports
 agent sidecar readiness. Treat Git-target warnings as proof-target blockers,
 not packet/search readiness blockers.
 
-Exercise the dispatcher and platform implementation without changing your real
-workspace state:
+Exercise the shared dispatcher behavior and the current platform adapter without
+changing your real workspace state:
 
 ```sh
 node --test scripts/tests/codex-worktree-setup.test.mjs
-node scripts/codex-worktree-setup.mjs --self-test
 ```
+
+`node scripts/codex-worktree-setup.mjs --self-test` is a compatibility alias
+for that same suite, not a second implementation-specific test path.
 
 ## Recommended Reading Order
 

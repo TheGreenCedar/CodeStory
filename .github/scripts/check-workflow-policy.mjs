@@ -220,12 +220,8 @@ const lockedSetupSurfaces = [
     ],
   ],
   [
-    path.join("scripts", "codex-worktree-setup.sh"),
-    ["cargo build --release --locked -p codestory-cli"],
-  ],
-  [
-    path.join("scripts", "codex-worktree-setup.ps1"),
-    ['@("build", "--release", "--locked", "-p", "codestory-cli"'],
+    path.join("scripts", "codex-worktree-setup.mjs"),
+    ['["build", "--release", "--locked", "-p", "codestory-cli"]'],
   ],
   [
     path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.sh"),
