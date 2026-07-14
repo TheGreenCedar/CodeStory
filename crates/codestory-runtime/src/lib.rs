@@ -9869,21 +9869,21 @@ impl AppController {
                     format!("sidecar search failed: {error}"),
                 )
             })?;
-        let mut indexed_symbol_hits =
-            agent::retrieval_primary::resolve_sidecar_candidates_to_search_hits(
+        let resolution = agent::retrieval_primary::resolve_sidecar_candidates_with_stats(
+            self,
+            &query_result.hits,
+            limit_per_source,
+        )
+        .map_err(|error| {
+            agent::retrieval_primary::sidecar_retrieval_unavailable_error(
                 self,
-                &query_result.hits,
-                limit_per_source,
+                format!(
+                    "sidecar search rejected query: candidate resolution failed: {}",
+                    error.message
+                ),
             )
-            .map_err(|error| {
-                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
-                    self,
-                    format!(
-                        "sidecar search rejected query: candidate resolution failed: {}",
-                        error.message
-                    ),
-                )
-            })?;
+        })?;
+        let mut indexed_symbol_hits = resolution.resolved_hits.clone();
         if let Some(reason) = agent::retrieval_primary::sidecar_primary_result_rejection_reason(
             &query_result,
             &indexed_symbol_hits,
@@ -9901,8 +9901,6 @@ impl AppController {
                 ),
             );
         }
-        let candidate_count = query_result.hits.len();
-        let resolved_hit_count = indexed_symbol_hits.len();
         let initial_sidecar_hits = indexed_symbol_hits.clone();
 
         apply_search_intent_filters(&mut indexed_symbol_hits, &intent_query.filters);
@@ -10003,8 +10001,7 @@ impl AppController {
             agent::retrieval_primary::shadow_from_query_result_with_candidate_admission_diagnostics(
                 self,
                 query_result.clone(),
-                candidate_count,
-                resolved_hit_count,
+                &resolution,
                 &initial_sidecar_hits,
                 &hits,
             ),

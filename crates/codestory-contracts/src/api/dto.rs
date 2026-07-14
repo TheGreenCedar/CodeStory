@@ -1816,6 +1816,8 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub candidate_count: u32,
     pub resolved_hit_count: u32,
     pub unresolved_candidate_count: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub blocking_unresolved_candidate_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
 }
@@ -2152,6 +2154,7 @@ mod packet_tests {
             candidate_count: 5,
             resolved_hit_count: 4,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
             diagnostic: Some("sidecar candidates did not all resolve".to_string()),
         };
 

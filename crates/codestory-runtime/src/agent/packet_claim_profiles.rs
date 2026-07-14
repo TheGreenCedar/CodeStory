@@ -1,7 +1,10 @@
 #[cfg(test)]
 use crate::agent::eval_probes::eval_probes_enabled;
 use crate::agent::packet_citations::packet_citation_source_text;
-use crate::agent::packet_evidence_roles::PacketEvidenceRole;
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_citation_owns_interceptor_management,
+    packet_citation_owns_request_pipeline, packet_evidence_role,
+};
 use crate::agent::packet_flow_requirements::{CoverageMode, FlowRole};
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_source_patterns::{
@@ -322,6 +325,9 @@ struct SourceClaimContext<'a> {
     source: &'a str,
     symbol: &'a str,
     kind: NodeKind,
+    evidence_role: Option<PacketEvidenceRole>,
+    owns_request_pipeline: bool,
+    owns_interceptor_management: bool,
     path: String,
     file_name: String,
     normalized_prompt: String,
@@ -346,6 +352,9 @@ impl<'a> SourceClaimContext<'a> {
             source,
             symbol,
             kind: citation.kind,
+            evidence_role: packet_evidence_role(citation),
+            owns_request_pipeline: packet_citation_owns_request_pipeline(citation),
+            owns_interceptor_management: packet_citation_owns_interceptor_management(citation),
             path,
             file_name,
             normalized_prompt: normalize_identifier(prompt),
@@ -377,7 +386,7 @@ pub(crate) fn packet_source_derived_claims_for_citation(
 }
 
 pub(crate) fn packet_source_derived_claim_for_role(
-    role: PacketEvidenceRole,
+    _role: PacketEvidenceRole,
     citation: &AgentCitationDto,
     prompt: &str,
 ) -> Option<String> {
@@ -388,32 +397,11 @@ pub(crate) fn packet_source_derived_claim_for_role(
     let ctx = SourceClaimContext::new(prompt, citation, &source);
     let request_flow = packet_terms_indicate_request_dispatch_flow(&ctx.prompt_terms);
 
-    if request_flow && let Some(claim) = python_like_request_dispatch_claim_for_role(&ctx) {
-        return Some(claim);
-    }
-
-    if request_flow {
-        if role == PacketEvidenceRole::ClientFactory
-            && let Some(claim) = client_factory_claim(&ctx)
-        {
+    if request_flow && citation_can_own_behavior(&ctx) {
+        if let Some(claim) = python_like_request_dispatch_claim_for_role(&ctx) {
             return Some(claim);
         }
-        if let Some(claim) = client_request_pipeline_claim(&ctx) {
-            return Some(claim);
-        }
-        if role == PacketEvidenceRole::RequestDispatch
-            && let Some(claim) = request_dispatch_claim(&ctx)
-        {
-            return Some(claim);
-        }
-        if role == PacketEvidenceRole::InterceptorManagement
-            && let Some(claim) = interceptor_management_claim(&ctx)
-        {
-            return Some(claim);
-        }
-        if role == PacketEvidenceRole::TransportAdapter
-            && let Some(claim) = transport_adapter_claim(&ctx)
-        {
+        if let Some(claim) = client_request_claim_for_citation(&ctx) {
             return Some(claim);
         }
     }
@@ -435,13 +423,13 @@ pub(crate) fn packet_source_derived_claim_for_role(
 
         if eval_diagnostics
             && command_flow
-            && role == PacketEvidenceRole::NetworkCommandInput
+            && _role == PacketEvidenceRole::NetworkCommandInput
             && let Some(claim) = network_command_input_claim(&ctx)
         {
             return Some(claim);
         }
 
-        if eval_diagnostics && command_flow && role == PacketEvidenceRole::CommandDispatch {
+        if eval_diagnostics && command_flow && _role == PacketEvidenceRole::CommandDispatch {
             if let Some(claim) = command_dispatch_table_claim(&ctx) {
                 return Some(claim);
             }
@@ -452,7 +440,7 @@ pub(crate) fn packet_source_derived_claim_for_role(
 
         if eval_diagnostics
             && search_flow
-            && role == PacketEvidenceRole::SearchDriver
+            && _role == PacketEvidenceRole::SearchDriver
             && let Some(claim) = search_driver_claim(&ctx)
         {
             return Some(claim);
@@ -460,7 +448,7 @@ pub(crate) fn packet_source_derived_claim_for_role(
 
         if eval_diagnostics
             && search_flow
-            && role == PacketEvidenceRole::ArgumentPlanning
+            && _role == PacketEvidenceRole::ArgumentPlanning
             && let Some(claim) = argument_planning_claim(&ctx)
         {
             return Some(claim);
@@ -468,7 +456,7 @@ pub(crate) fn packet_source_derived_claim_for_role(
 
         if eval_diagnostics
             && search_flow
-            && role == PacketEvidenceRole::SearchExecutionUnit
+            && _role == PacketEvidenceRole::SearchExecutionUnit
             && let Some(claim) = search_execution_state_claim(&ctx)
         {
             return Some(claim);
@@ -509,13 +497,12 @@ fn collect_client_request_dispatch_claims(ctx: &SourceClaimContext<'_>, claims: 
     if !packet_terms_indicate_request_dispatch_flow(&ctx.prompt_terms) {
         return;
     }
+    if !citation_can_own_behavior(ctx) {
+        return;
+    }
 
-    push_optional_claim(claims, client_factory_claim(ctx));
     claims.extend(python_like_request_dispatch_claims(ctx));
-    push_optional_claim(claims, client_request_pipeline_claim(ctx));
-    push_optional_claim(claims, request_dispatch_claim(ctx));
-    push_optional_claim(claims, interceptor_management_claim(ctx));
-    push_optional_claim(claims, transport_adapter_claim(ctx));
+    push_optional_claim(claims, client_request_claim_for_citation(ctx));
 }
 
 fn collect_buffered_io_claims(ctx: &SourceClaimContext<'_>, claims: &mut Vec<String>) {
@@ -630,7 +617,8 @@ fn client_factory_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
 }
 
 fn client_request_pipeline_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
-    if packet_source_has_all(ctx.source, &["merge", "config", "interceptors", "request"])
+    if ctx.owns_request_pipeline
+        && packet_source_has_all(ctx.source, &["merge", "config", "interceptors", "request"])
         && packet_source_has_any(ctx.source, &["dispatch", "adapter"])
         && let Some(owner) = packet_display_owner(ctx.symbol)
     {
@@ -648,7 +636,7 @@ fn request_dispatch_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
         && packet_source_has_any(ctx.source, &["headers", "data", "body"])
     {
         return Some(format!(
-            "`{}` transforms the body/headers and invokes the configured adapter.",
+            "`{}` transforms the body/headers and invokes the configured adapter, sending the request through that transport.",
             ctx.symbol
         ));
     }
@@ -656,9 +644,11 @@ fn request_dispatch_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
 }
 
 fn interceptor_management_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
-    if packet_source_has_all(ctx.source, &["handlers", "fulfilled", "rejected"]) {
+    if ctx.owns_interceptor_management
+        && packet_source_has_any(ctx.source, &["handler", "handlers"])
+    {
         return Some(format!(
-            "`{}` stores interceptor pairs used by the promise chain in request.",
+            "`{}` stores request interceptor handler pairs for chained execution.",
             ctx.symbol
         ));
     }
@@ -666,16 +656,45 @@ fn interceptor_management_claim(ctx: &SourceClaimContext<'_>) -> Option<String> 
 }
 
 fn transport_adapter_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
-    if packet_source_has_all(ctx.source, &["adapter"])
-        && packet_source_has_all(ctx.source, &["xhr", "http"])
-        && packet_source_has_any(ctx.source, &["known", "environment", "platform"])
-    {
+    if packet_source_has_all(
+        ctx.source,
+        &[
+            "knownadapters",
+            "getadapter",
+            "return adapter",
+            "xhr",
+            "http",
+        ],
+    ) {
         return Some(format!(
             "`{}` selects xhr or http transport based on environment capabilities.",
             ctx.file_name
         ));
     }
     None
+}
+
+fn client_request_claim_for_citation(ctx: &SourceClaimContext<'_>) -> Option<String> {
+    if let Some(claim) = client_request_pipeline_claim(ctx) {
+        return Some(claim);
+    }
+    if ctx.kind == NodeKind::FILE {
+        return transport_adapter_claim(ctx);
+    }
+    match ctx.evidence_role {
+        Some(PacketEvidenceRole::ClientFactory) => client_factory_claim(ctx),
+        Some(PacketEvidenceRole::RequestDispatch) => request_dispatch_claim(ctx),
+        Some(PacketEvidenceRole::InterceptorManagement) => interceptor_management_claim(ctx),
+        Some(PacketEvidenceRole::TransportAdapter) => transport_adapter_claim(ctx),
+        _ => None,
+    }
+}
+
+fn citation_can_own_behavior(ctx: &SourceClaimContext<'_>) -> bool {
+    !matches!(
+        ctx.kind,
+        NodeKind::MODULE | NodeKind::NAMESPACE | NodeKind::PACKAGE
+    )
 }
 
 fn python_like_request_dispatch_claim_for_role(ctx: &SourceClaimContext<'_>) -> Option<String> {
@@ -2630,6 +2649,84 @@ mod tests {
                 contract.domain
             );
         }
+    }
+
+    #[test]
+    fn role_safe_request_claims_require_behavior_owning_citations() {
+        let _env = EnvVarGuard::cleared(EVAL_PROBES_ENV);
+        let prompt = "Explain how a client instance sends requests through interceptors, dispatch, and a transport adapter.";
+        let source = r#"
+            Client.prototype.request = function request(config) {
+              config = merge(defaults, config)
+              this.interceptors.request.forEach(run)
+              return dispatchTransport(config)
+            }
+        "#;
+
+        let mut import_label = test_packet_citation("../helpers.js", "src/adapters/client.js");
+        import_label.kind = NodeKind::MODULE;
+        let import_claims =
+            packet_source_derived_claims_for_citation(prompt, &import_label, source);
+        assert!(
+            import_claims.is_empty(),
+            "an import/module label must not inherit file-wide behavior: {import_claims:?}"
+        );
+
+        let mut retry_method =
+            test_packet_citation("Client.prototype.retryRequest", "src/client.js");
+        retry_method.kind = NodeKind::METHOD;
+        let retry_claims = packet_source_derived_claims_for_citation(prompt, &retry_method, source);
+        assert!(
+            retry_claims.is_empty(),
+            "a request-suffixed method must not inherit the request declaration: {retry_claims:?}"
+        );
+
+        let mut request_method = test_packet_citation("Client.prototype.request", "src/client.js");
+        request_method.kind = NodeKind::METHOD;
+        let request_claims =
+            packet_source_derived_claims_for_citation(prompt, &request_method, source);
+        assert!(
+            request_claims
+                .iter()
+                .any(|claim| claim.contains("runs request interceptors")),
+            "the behavior-owning request method should retain its pipeline claim: {request_claims:?}"
+        );
+
+        let mut interceptor_owner = test_packet_citation(
+            "RequestInterceptorRegistry.constructor",
+            "src/interceptors.ts",
+        );
+        interceptor_owner.kind = NodeKind::METHOD;
+        let interceptor_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &interceptor_owner,
+            "constructor() { this.handlers = [] }",
+        );
+        assert!(
+            interceptor_claims
+                .iter()
+                .any(|claim| claim.contains("interceptor handler pairs")),
+            "an interceptor-owner constructor should retain its management claim: {interceptor_claims:?}"
+        );
+
+        let adapter_source = "const knownAdapters = { http, xhr }; function getAdapter(name) { const adapter = knownAdapters[name]; return adapter; }";
+        let adapter_helper = test_packet_citation("isResolvedHandle", "src/adapters/adapters.js");
+        let adapter_helper_claims =
+            packet_source_derived_claims_for_citation(prompt, &adapter_helper, adapter_source);
+        assert!(
+            adapter_helper_claims.is_empty(),
+            "a helper in an adapter directory must not inherit file-wide selection behavior: {adapter_helper_claims:?}"
+        );
+
+        let adapter_owner = test_packet_citation("getAdapter", "src/adapters/adapters.js");
+        let adapter_owner_claims =
+            packet_source_derived_claims_for_citation(prompt, &adapter_owner, adapter_source);
+        assert!(
+            adapter_owner_claims
+                .iter()
+                .any(|claim| claim.contains("transport based on environment capabilities")),
+            "the adapter selector should retain its selection claim: {adapter_owner_claims:?}"
+        );
     }
 
     fn hook_cache_source() -> &'static str {

@@ -37,6 +37,50 @@ pub(crate) enum PacketEvidenceRole {
     SourceEvidence,
 }
 
+pub(crate) fn packet_citation_owns_request_pipeline(citation: &AgentCitationDto) -> bool {
+    matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && crate::terminal_symbol_segment(&citation.display_name) == "request"
+}
+
+pub(crate) fn packet_citation_owns_interceptor_management(citation: &AgentCitationDto) -> bool {
+    let owner_kind = matches!(citation.kind, NodeKind::STRUCT | NodeKind::CLASS)
+        || (citation.kind == NodeKind::METHOD
+            && matches!(
+                crate::terminal_symbol_segment(&citation.display_name).as_str(),
+                "constructor" | "init" | "new"
+            ));
+    if !owner_kind {
+        return false;
+    }
+    let display = normalize_identifier(&citation.display_name);
+    display.contains("interceptor")
+        && ["manager", "registry", "collection", "chain"]
+            .iter()
+            .any(|owner| display.contains(owner))
+}
+
+pub(crate) fn packet_citation_owns_transport_adapter(citation: &AgentCitationDto) -> bool {
+    if !matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
+    ) {
+        return false;
+    }
+    let display = normalize_identifier(&citation.display_name);
+    if !display.contains("adapter") {
+        return false;
+    }
+    let terminal = normalize_identifier(&crate::terminal_symbol_segment(&citation.display_name));
+    if matches!(citation.kind, NodeKind::CLASS | NodeKind::STRUCT) {
+        return terminal.ends_with("adapter");
+    }
+    [
+        "select", "get", "resolve", "choose", "create", "build", "send",
+    ]
+    .iter()
+    .any(|operation| terminal.starts_with(operation))
+}
+
 impl PacketEvidenceRole {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -120,7 +164,7 @@ pub(crate) fn packet_evidence_role(citation: &AgentCitationDto) -> Option<Packet
         && !normalized_display.contains("event")
     {
         Some(PacketEvidenceRole::RequestDispatch)
-    } else if path.contains("/adapters/") || normalized_display.contains("adapter") {
+    } else if packet_citation_owns_transport_adapter(citation) {
         Some(PacketEvidenceRole::TransportAdapter)
     } else if (normalized_display.contains("factory") || normalized_display.contains("create"))
         && (normalized_display.contains("client") || normalized_display.contains("instance"))
@@ -470,5 +514,33 @@ mod tests {
             packet_evidence_role(&citation("CHECK constraint", "db/schema.sql")),
             Some(PacketEvidenceRole::SqlSchemaFile)
         );
+    }
+
+    #[test]
+    fn transport_adapter_role_requires_a_behavior_owner() {
+        assert_eq!(
+            packet_evidence_role(&citation("selectAdapter", "src/client/adapters/select.ts")),
+            Some(PacketEvidenceRole::TransportAdapter)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation(
+                "isResolvedHandle",
+                "src/client/adapters/select.ts"
+            )),
+            Some(PacketEvidenceRole::SourceEvidence)
+        );
+        assert_eq!(
+            packet_evidence_role(&citation("TargetAdapter", "src/client/target.ts")),
+            Some(PacketEvidenceRole::SourceEvidence)
+        );
+        for display_name in ["AdapterOptions", "HttpAdapterConfig"] {
+            let mut citation = citation(display_name, "src/client/config.ts");
+            citation.kind = NodeKind::CLASS;
+            assert_eq!(
+                packet_evidence_role(&citation),
+                None,
+                "configuration type must not own transport behavior: {display_name}"
+            );
+        }
     }
 }

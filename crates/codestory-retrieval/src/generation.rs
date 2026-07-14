@@ -2,7 +2,7 @@ use codestory_contracts::graph::NodeKind;
 use codestory_store::{LlmSymbolDoc, RetrievalIndexManifest, Store};
 use std::collections::BTreeMap;
 
-pub const SIDECAR_SCHEMA_VERSION: i32 = 3;
+pub const SIDECAR_SCHEMA_VERSION: i32 = 4;
 pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";
@@ -424,7 +424,7 @@ mod tests {
         ));
 
         let mut legacy = current;
-        legacy.sidecar_schema_version = Some(1);
+        legacy.sidecar_schema_version = Some(SIDECAR_SCHEMA_VERSION - 1);
         assert!(!manifest_has_current_sidecar_contract(project_id, &legacy));
 
         let mut legacy = manifest(project_id, hash);
