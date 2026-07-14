@@ -9,7 +9,8 @@
   fails when that version section is missing, duplicated, or empty instead of
   substituting an automatically generated pull-request list.
 - Gated CPU-backed Linux ARM64 release evidence on protected exact-head approval
-  while retaining raw repo-scale and drill output without weakening evaluation.
+  while retaining raw repo-scale and drill output without weakening evaluation,
+  and pinned direct CLI benchmarks to their prepared local sidecar namespace.
 - Added reproducible provisioning for the repository-scoped Linux
   release-evidence runner. The runner uses a stable provisioned machine
   identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64

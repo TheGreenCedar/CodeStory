@@ -2228,6 +2228,8 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
     task?.prompt ?? repoConfig.prompt,
     "--budget",
     "compact",
+    "--profile",
+    "local",
     "--format",
     "json",
   ];

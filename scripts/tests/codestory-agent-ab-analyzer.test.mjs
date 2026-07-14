@@ -436,6 +436,10 @@ test("packet command keeps manifest-derived extra probes diagnostic-only", () =>
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
+  assert.deepEqual(args.slice(args.indexOf("--profile"), args.indexOf("--profile") + 2), [
+    "--profile",
+    "local",
+  ]);
 
   const diagnosticArgs = packetCommandArgs(
     { path: "C:\\repo" },
