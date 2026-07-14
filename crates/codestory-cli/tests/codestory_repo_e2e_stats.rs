@@ -862,6 +862,22 @@ fn codestory_repo_release_e2e_emits_stats() {
         ],
     );
 
+    let (_ready_repair_seconds, _ready_repair_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "ready".to_string(),
+            "--goal".to_string(),
+            "agent".to_string(),
+            "--repair".to_string(),
+            "--run-id".to_string(),
+            sidecar_run_id.to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
+    );
+
     let (retrieval_index_seconds, _retrieval_index_json) = run_cli_json(
         &binary,
         project_root.as_path(),
