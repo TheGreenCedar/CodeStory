@@ -7,9 +7,8 @@ use crate::config::{
 use crate::generation::{
     manifest_has_current_sidecar_contract, manifest_unavailable_reason_for_runtime,
 };
-use crate::qdrant_client::QdrantClient;
 use crate::retention::{
-    FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
+    FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
     GenerationRetentionLock, GenerationRetentionPlan, GenerationRetentionState,
     apply_generation_retention, global_generation_gc_state_file,
     plan_generation_retention_with_unrooted_state, scan_retention_protection,
@@ -437,7 +436,7 @@ fn apply_generation_retention_for_storage(
         &project_id,
         GenerationRetentionState::Reclaimable,
     );
-    let mut remover = FsQdrantGenerationRemover::new(&runtime.layout)?;
+    let mut remover = FsGenerationRemover::new(&runtime.layout)?;
     Ok(apply_generation_retention(&plan, &mut remover))
 }
 
@@ -508,22 +507,7 @@ fn build_generation_retention_plan(
             .errors
             .push("active retrieval manifest is unavailable; pruning suppressed".to_string()),
     }
-    let live_qdrant_collections = match QdrantClient::new(layout).list_collection_names() {
-        Ok(collections) => collections,
-        Err(error) => {
-            protection.errors.push(format!(
-                "list live Qdrant collections for retention: {error:#}"
-            ));
-            Vec::new()
-        }
-    };
-    plan_generation_retention_with_unrooted_state(
-        layout,
-        project_id,
-        &protection,
-        &live_qdrant_collections,
-        unrooted_state,
-    )
+    plan_generation_retention_with_unrooted_state(layout, project_id, &protection, unrooted_state)
 }
 
 fn record_manifest_retention_freshness(

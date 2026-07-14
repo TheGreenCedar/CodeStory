@@ -1,9 +1,9 @@
 use crate::candidate::{CandidateHit, CandidateSource};
 use crate::config::SidecarLayout;
 use crate::embeddings::LlamaCppEmbeddingClient;
-use crate::qdrant_client::QdrantUpsertPoint;
 use crate::sidecar_search::SearchExecutionContext;
 use anyhow::{Context, Result, bail};
+use codestory_store::FileRole;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,16 @@ pub(crate) struct EmbeddedVectorHealth {
     pub point_count: u64,
     pub latency_ms: u64,
     pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticPoint {
+    pub display_name: String,
+    pub node_id: String,
+    pub file_path: Option<String>,
+    pub file_role: Option<FileRole>,
+    pub dense_reason: Option<String>,
+    pub vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +69,7 @@ impl EmbeddedVectorIndex {
         input_hash: &str,
         embedding_backend: &str,
         embedding_dim: usize,
-        produce: impl FnOnce(&mut dyn FnMut(QdrantUpsertPoint) -> Result<()>) -> Result<()>,
+        produce: impl FnOnce(&mut dyn FnMut(SemanticPoint) -> Result<()>) -> Result<()>,
     ) -> Result<u64> {
         let path = index_path(layout, collection);
         let parent = path
@@ -173,7 +183,7 @@ fn write_database(
     input_hash: &str,
     embedding_backend: &str,
     embedding_dim: usize,
-    produce: impl FnOnce(&mut dyn FnMut(QdrantUpsertPoint) -> Result<()>) -> Result<()>,
+    produce: impl FnOnce(&mut dyn FnMut(SemanticPoint) -> Result<()>) -> Result<()>,
 ) -> Result<u64> {
     let mut connection = Connection::open(path)
         .with_context(|| format!("create embedded vector index {}", path.display()))?;
@@ -205,16 +215,12 @@ fn write_database(
                  node_id, display_name, file_path, file_role, dense_reason, vector
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
-        let mut visit = |point: QdrantUpsertPoint| -> Result<()> {
-            let vector = point
-                .vector
-                .as_deref()
-                .context("embedded vector point is missing")?;
-            if vector.len() != embedding_dim {
+        let mut visit = |point: SemanticPoint| -> Result<()> {
+            if point.vector.len() != embedding_dim {
                 bail!(
                     "embedded vector dimension mismatch for node {}: expected {embedding_dim}, found {}",
                     point.node_id,
-                    vector.len()
+                    point.vector.len()
                 );
             }
             insert.execute(params![
@@ -223,7 +229,7 @@ fn write_database(
                 point.file_path,
                 point.file_role.map(|role| role.as_str()),
                 point.dense_reason,
-                vector_bytes(vector),
+                vector_bytes(&point.vector),
             ])?;
             point_count = point_count.saturating_add(1);
             Ok(())
@@ -360,7 +366,7 @@ fn search_database(
                     file_path,
                     Some(display_name),
                     score,
-                    CandidateSource::Qdrant,
+                    CandidateSource::Semantic,
                 );
                 hit.node_id = Some(node_id);
                 hit.file_role = file_role
@@ -437,15 +443,14 @@ mod tests {
         }
     }
 
-    fn point(node_id: &str, vector: Vec<f32>) -> QdrantUpsertPoint {
-        QdrantUpsertPoint {
-            id: 1,
+    fn point(node_id: &str, vector: Vec<f32>) -> SemanticPoint {
+        SemanticPoint {
             display_name: format!("symbol_{node_id}"),
             node_id: node_id.into(),
             file_path: Some(format!("src/{node_id}.rs")),
             file_role: Some(FileRole::Source),
             dense_reason: Some("public_api".into()),
-            vector: Some(vector),
+            vector,
         }
     }
 

@@ -1,7 +1,6 @@
 //! Bounded, post-publication retention for one sidecar namespace.
 
 use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
-use crate::qdrant_client::{QdrantClient, QdrantDeleteOutcome};
 use anyhow::{Context, Result, bail};
 use codestory_store::{RetrievalIndexManifest, Store};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
@@ -322,7 +321,8 @@ pub struct GenerationBundle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scip: Option<GenerationArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub qdrant: Option<GenerationArtifact>,
+    #[serde(rename = "qdrant")]
+    pub semantic: Option<GenerationArtifact>,
     pub bytes: u64,
 }
 
@@ -347,28 +347,15 @@ pub struct GenerationRetentionPlan {
     pub errors: Vec<String>,
 }
 
-#[cfg(test)]
-fn plan_generation_retention(
+pub fn plan_generation_retention(
     layout: &SidecarLayout,
     project_id: &str,
     protection: &RetentionProtectionScan,
-) -> GenerationRetentionPlan {
-    plan_generation_retention_with_qdrant_collections(layout, project_id, protection, &[])
-}
-
-/// Build a dry-run plan, supplementing on-disk Qdrant discovery with names
-/// returned by the live Qdrant API.
-pub fn plan_generation_retention_with_qdrant_collections(
-    layout: &SidecarLayout,
-    project_id: &str,
-    protection: &RetentionProtectionScan,
-    live_qdrant_collections: &[String],
 ) -> GenerationRetentionPlan {
     plan_generation_retention_with_unrooted_state(
         layout,
         project_id,
         protection,
-        live_qdrant_collections,
         GenerationRetentionState::Reclaimable,
     )
 }
@@ -377,7 +364,6 @@ pub(crate) fn plan_generation_retention_with_unrooted_state(
     layout: &SidecarLayout,
     project_id: &str,
     protection: &RetentionProtectionScan,
-    live_qdrant_collections: &[String],
     unrooted_state: GenerationRetentionState,
 ) -> GenerationRetentionPlan {
     debug_assert!(matches!(
@@ -409,9 +395,12 @@ pub(crate) fn plan_generation_retention_with_unrooted_state(
         &mut blocked,
         &mut errors,
     );
-    if direct_directory_exists_or_missing(&layout.qdrant_data_dir, "Qdrant data root", &mut errors)
-    {
-        discover_qdrant_collections(
+    if direct_directory_exists_or_missing(
+        &layout.qdrant_data_dir,
+        "semantic vector root",
+        &mut errors,
+    ) {
+        discover_vector_generations(
             &layout.qdrant_data_dir.join("collections"),
             project_id,
             &mut builders,
@@ -419,14 +408,6 @@ pub(crate) fn plan_generation_retention_with_unrooted_state(
             &mut errors,
         );
     }
-    discover_live_qdrant_collections(
-        live_qdrant_collections,
-        project_id,
-        &mut builders,
-        &mut blocked,
-        &mut errors,
-    );
-
     let mut active = BTreeSet::new();
     let mut rollback = BTreeSet::new();
     collect_protected_generations(
@@ -517,31 +498,17 @@ pub(crate) fn plan_generation_retention_with_unrooted_state(
 
 pub trait GenerationRemover {
     fn remove_generation_dir(&mut self, path: &Path) -> Result<()>;
-    fn delete_qdrant_collection(&mut self, collection: &str) -> Result<bool>;
+    fn remove_vector_generation(&mut self, generation: &str) -> Result<bool>;
 }
 
-pub struct FsQdrantGenerationRemover {
-    qdrant: Option<QdrantClient>,
+pub struct FsGenerationRemover {
     root: PathBuf,
     deletion: OwnedDeletionRoot,
     collections_dir: PathBuf,
 }
 
-impl FsQdrantGenerationRemover {
+impl FsGenerationRemover {
     pub fn new(layout: &SidecarLayout) -> Result<Self> {
-        Self::new_with_qdrant(layout, Some(QdrantClient::new(layout)))
-    }
-
-    pub fn new_for_runtime(
-        layout: &SidecarLayout,
-        runtime: &crate::config::SidecarRuntimeConfig,
-    ) -> Result<Self> {
-        let qdrant = (runtime.vector_backend() == crate::config::VectorBackend::ExternalQdrant)
-            .then(|| QdrantClient::new(layout));
-        Self::new_with_qdrant(layout, qdrant)
-    }
-
-    fn new_with_qdrant(layout: &SidecarLayout, qdrant: Option<QdrantClient>) -> Result<Self> {
         let root = layout
             .lexical_data_dir
             .parent()
@@ -554,7 +521,6 @@ impl FsQdrantGenerationRemover {
         let deletion = OwnedDeletionRoot::open(root)
             .with_context(|| format!("open owned sidecar root {}", root.display()))?;
         Ok(Self {
-            qdrant,
             root: root.to_path_buf(),
             deletion,
             collections_dir: layout.qdrant_data_dir.join("collections"),
@@ -575,7 +541,7 @@ impl FsQdrantGenerationRemover {
     }
 }
 
-impl GenerationRemover for FsQdrantGenerationRemover {
+impl GenerationRemover for FsGenerationRemover {
     fn remove_generation_dir(&mut self, path: &Path) -> Result<()> {
         if self.remove_owned_path(path)? {
             Ok(())
@@ -587,18 +553,8 @@ impl GenerationRemover for FsQdrantGenerationRemover {
         }
     }
 
-    fn delete_qdrant_collection(&mut self, collection: &str) -> Result<bool> {
-        let path = self.collections_dir.join(collection);
-        let Some(qdrant) = self.qdrant.as_ref() else {
-            self.remove_owned_path(&path)?;
-            return Ok(true);
-        };
-        let outcome = qdrant.delete_collection_with_outcome(collection)?;
-        if outcome == QdrantDeleteOutcome::NotFound {
-            self.remove_owned_path(&path)?;
-            return Ok(true);
-        }
-        Ok(!path.exists())
+    fn remove_vector_generation(&mut self, generation: &str) -> Result<bool> {
+        self.remove_owned_path(&self.collections_dir.join(generation))
     }
 }
 
@@ -666,19 +622,19 @@ pub fn apply_generation_retention(
             remaining_reclaimable_bytes: bundle.bytes,
             errors: Vec::new(),
         };
-        match remover.delete_qdrant_collection(&bundle.qdrant_collection) {
+        match remover.remove_vector_generation(&bundle.qdrant_collection) {
             Ok(true) => {
                 result.qdrant_collection_removed = true;
                 result.removed_bytes = result
                     .removed_bytes
-                    .saturating_add(bundle.qdrant.as_ref().map_or(0, |item| item.bytes));
+                    .saturating_add(bundle.semantic.as_ref().map_or(0, |item| item.bytes));
             }
             Ok(false) => result.errors.push(format!(
-                "delete Qdrant collection {} was acknowledged but its local data remains",
+                "delete vector generation {} was acknowledged but its local data remains",
                 bundle.qdrant_collection
             )),
             Err(error) => result.errors.push(format!(
-                "delete Qdrant collection {}: {error:#}",
+                "delete vector generation {}: {error:#}",
                 bundle.qdrant_collection
             )),
         }
@@ -725,14 +681,14 @@ pub fn apply_generation_retention(
 enum ArtifactKind {
     Lexical,
     Scip,
-    Qdrant,
+    Semantic,
 }
 
 #[derive(Default)]
 struct BundleBuilder {
     lexical: Option<GenerationArtifact>,
     scip: Option<GenerationArtifact>,
-    qdrant: Option<GenerationArtifact>,
+    semantic: Option<GenerationArtifact>,
 }
 
 impl BundleBuilder {
@@ -740,7 +696,7 @@ impl BundleBuilder {
         match kind {
             ArtifactKind::Lexical => self.lexical = Some(artifact),
             ArtifactKind::Scip => self.scip = Some(artifact),
-            ArtifactKind::Qdrant => self.qdrant = Some(artifact),
+            ArtifactKind::Semantic => self.semantic = Some(artifact),
         }
     }
 
@@ -750,7 +706,7 @@ impl BundleBuilder {
         generation: String,
         state: GenerationRetentionState,
     ) -> GenerationBundle {
-        let bytes = [&self.lexical, &self.scip, &self.qdrant]
+        let bytes = [&self.lexical, &self.scip, &self.semantic]
             .into_iter()
             .flatten()
             .fold(0_u64, |total, artifact| {
@@ -766,7 +722,7 @@ impl BundleBuilder {
             state,
             lexical: self.lexical,
             scip: self.scip,
-            qdrant: self.qdrant,
+            semantic: self.semantic,
             bytes,
         }
     }
@@ -862,7 +818,7 @@ fn canonical_manifest_generation(manifest: &RetrievalIndexManifest) -> Result<St
         bail!("retrieval manifest has a noncanonical sidecar generation");
     };
     if manifest.qdrant_collection != format!("codestory_{}_{suffix}", manifest.project_id) {
-        bail!("retrieval manifest generation and Qdrant collection do not match");
+        bail!("retrieval manifest generation and semantic vector generation do not match");
     }
     Ok(generation.to_string())
 }
@@ -1063,14 +1019,15 @@ fn discover_generation_dirs(
     }
 }
 
-fn discover_qdrant_collections(
+fn discover_vector_generations(
     root: &Path,
     project_id: &str,
     builders: &mut BTreeMap<String, BundleBuilder>,
     blocked: &mut Vec<BlockedGenerationEntry>,
     errors: &mut Vec<String>,
 ) {
-    let Some(entries) = read_direct_directory(root, "Qdrant collection root", errors) else {
+    let Some(entries) = read_direct_directory(root, "semantic vector generation root", errors)
+    else {
         return;
     };
     let project_prefix = format!("codestory_{project_id}_");
@@ -1079,7 +1036,7 @@ fn discover_qdrant_collections(
             Ok(entry) => entry,
             Err(error) => {
                 errors.push(format!(
-                    "read Qdrant collection in {}: {error}",
+                    "read semantic vector generation in {}: {error}",
                     root.display()
                 ));
                 continue;
@@ -1091,14 +1048,19 @@ fn discover_qdrant_collections(
             continue;
         }
         let Some(suffix) = canonical_collection_suffix(project_id, &name) else {
-            block_scoped_entry(path, "malformed Qdrant collection name", blocked, errors);
+            block_scoped_entry(
+                path,
+                "malformed semantic vector generation name",
+                blocked,
+                errors,
+            );
             continue;
         };
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) => {
                 errors.push(format!(
-                    "read Qdrant collection type {}: {error}",
+                    "read semantic vector generation type {}: {error}",
                     path.display()
                 ));
                 continue;
@@ -1107,7 +1069,7 @@ fn discover_qdrant_collections(
         if file_type.is_symlink() || !file_type.is_dir() {
             block_scoped_entry(
                 path,
-                "Qdrant collection entry is not a direct directory",
+                "semantic vector generation entry is not a direct directory",
                 blocked,
                 errors,
             );
@@ -1117,39 +1079,12 @@ fn discover_qdrant_collections(
             Ok(bytes) => builders
                 .entry(format!("{project_id}-{suffix}"))
                 .or_default()
-                .set(ArtifactKind::Qdrant, GenerationArtifact { path, bytes }),
+                .set(ArtifactKind::Semantic, GenerationArtifact { path, bytes }),
             Err(error) => errors.push(format!(
-                "measure Qdrant collection {}: {error:#}",
+                "measure semantic vector generation {}: {error:#}",
                 path.display()
             )),
         }
-    }
-}
-
-fn discover_live_qdrant_collections(
-    collections: &[String],
-    project_id: &str,
-    builders: &mut BTreeMap<String, BundleBuilder>,
-    blocked: &mut Vec<BlockedGenerationEntry>,
-    errors: &mut Vec<String>,
-) {
-    let project_prefix = format!("codestory_{project_id}_");
-    for collection in collections {
-        if !collection.starts_with(&project_prefix) {
-            continue;
-        }
-        let Some(suffix) = canonical_collection_suffix(project_id, collection) else {
-            block_scoped_entry(
-                PathBuf::from(format!("qdrant:{collection}")),
-                "malformed live Qdrant collection name",
-                blocked,
-                errors,
-            );
-            continue;
-        };
-        builders
-            .entry(format!("{project_id}-{suffix}"))
-            .or_default();
     }
 }
 
@@ -1365,9 +1300,9 @@ mod tests {
             Ok(())
         }
 
-        fn delete_qdrant_collection(&mut self, collection: &str) -> Result<bool> {
+        fn remove_vector_generation(&mut self, collection: &str) -> Result<bool> {
             self.removed_collections.push(collection.to_string());
-            Ok(!self.qdrant_data_remains)
+            Ok(!self.semantic_data_remains)
         }
     }
 
@@ -1728,39 +1663,6 @@ mod tests {
         assert_eq!(report.remaining_reclaimable_bytes, 4);
         assert!(!report.removals[0].qdrant_collection_removed);
         assert!(report.errors[0].contains("local data remains"));
-    }
-
-    #[test]
-    fn live_qdrant_collection_is_planned_when_disk_directory_is_absent() {
-        let root = tempdir().expect("root");
-        let layout = layout(root.path());
-        let project = "repo-v1-project";
-        let active = "aaaaaaaaaaaaaaaa";
-        let collection = "codestory_repo-v1-project_ffffffffffffffff".to_string();
-        let protection = RetentionProtectionScan {
-            authoritative_active: vec![manifest(project, active, 1)],
-            ..RetentionProtectionScan::default()
-        };
-
-        let plan = plan_generation_retention_with_qdrant_collections(
-            &layout,
-            project,
-            &protection,
-            std::slice::from_ref(&collection),
-        );
-
-        assert!(!plan.pruning_suppressed);
-        let stale = plan
-            .bundles
-            .iter()
-            .find(|bundle| bundle.qdrant_collection == collection)
-            .expect("live-only stale collection");
-        assert_eq!(stale.state, GenerationRetentionState::Reclaimable);
-        assert!(stale.qdrant.is_none());
-        let mut remover = TestRemover::default();
-        let report = apply_generation_retention(&plan, &mut remover);
-        assert_eq!(remover.removed_collections, vec![collection]);
-        assert_eq!(report.removed_bytes, 0);
     }
 
     #[test]

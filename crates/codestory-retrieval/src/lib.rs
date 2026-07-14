@@ -29,8 +29,6 @@ pub mod outbound_http;
 mod planner;
 mod port_registry;
 mod process_identity;
-mod qdrant_client;
-mod qdrant_storage;
 mod query;
 mod query_features;
 mod ranker;
@@ -79,7 +77,7 @@ pub use embeddings::{
     embedding_runtime_id_for_runtime, ensure_embedding_accelerator_smoke_for_runtime,
     ensure_product_embedding_backend, ensure_product_embedding_backend_for_runtime,
     probe_product_embedding_runtime, probe_product_embedding_runtime_for_runtime,
-    qdrant_vector_dim,
+    semantic_vector_dim,
 };
 pub use executor::{
     QueryExecutor, QueryResult, QueryTrace, RetrievalPublicationIdentity, StageCompletionStatus,
@@ -92,10 +90,8 @@ pub use health::{
     RetrievalStatusReport, probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
-    FinalizeIndexOutcome, ProjectQdrantRepairOutcome, finalize_index, finalize_index_for_runtime,
-    finalize_index_for_runtime_with_progress, project_id_for_root,
-    repair_project_qdrant_collection, repair_project_qdrant_collection_for_runtime,
-    sidecar_project_id_for_root,
+    FinalizeIndexOutcome, finalize_index, finalize_index_for_runtime,
+    finalize_index_for_runtime_with_progress, project_id_for_root, sidecar_project_id_for_root,
 };
 pub use inventory::{
     SidecarDockerResource, SidecarDockerResourceKind, SidecarGcNamespaceResult, SidecarGcReport,
@@ -110,15 +106,6 @@ pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{
     ProcessOwnerState, ProcessStartProbe, native_embedding_process_start_identity,
     probe_process_start_identity, process_owner_state,
-};
-pub use qdrant_client::{
-    QDRANT_INDEX_UPSERT_BATCH_SIZE, QDRANT_VECTOR_DIM, QdrantClient, QdrantUpsertPoint,
-    diagnostic_query_vector,
-};
-pub use qdrant_storage::{
-    BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION,
-    PRUNE_SUPPRESSED_POST_PUBLICATION_RETENTION, PRUNE_SUPPRESSED_PROTECTION_SCAN_ERROR,
-    QdrantStorageRepairReport, repair_qdrant_storage,
 };
 pub use query::{
     QueryBatchItem, QueryBatchRequest, QueryRequest, execute_retrieval_query,

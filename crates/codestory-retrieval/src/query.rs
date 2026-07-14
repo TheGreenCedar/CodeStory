@@ -455,7 +455,6 @@ mod tests {
     use crate::index::finalize_index;
     use crate::sidecar_search::SidecarSearch;
     use crate::test_support::retrieval_manifest_fixture;
-    use crate::{QdrantClient, SidecarLayout};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -526,7 +525,7 @@ mod tests {
                 Ok(self.record(query))
             }
 
-            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(Vec::new())
             }
 
@@ -670,15 +669,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live Qdrant and embedding sidecars; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
+    #[ignore = "requires a live embedding runtime; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
     fn integration_query_against_fixture_manifest() {
-        let layout = SidecarLayout::from_env();
-        if !QdrantClient::new(&layout)
-            .list_collections_probe()
-            .reachable
-        {
-            return;
-        }
         if crate::embeddings::embed_query("function").is_err() {
             return;
         }

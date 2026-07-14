@@ -13,7 +13,7 @@ pub fn sidecar_generation_id(project_id: &str, sidecar_input_hash: &str) -> Stri
     format!("{project_id}-{suffix}")
 }
 
-pub fn sidecar_qdrant_collection(project_id: &str, sidecar_input_hash: &str) -> String {
+pub fn sidecar_vector_generation(project_id: &str, sidecar_input_hash: &str) -> String {
     let suffix = sidecar_input_hash.chars().take(16).collect::<String>();
     format!("codestory_{project_id}_{suffix}")
 }
@@ -26,7 +26,7 @@ pub fn manifest_has_current_sidecar_contract(
         return false;
     };
     let expected_generation = sidecar_generation_id(project_id, hash);
-    let expected_collection = sidecar_qdrant_collection(project_id, hash);
+    let expected_collection = sidecar_vector_generation(project_id, hash);
     !hash.trim().is_empty()
         && manifest.lexical_version == crate::lexical_index::LEXICAL_INDEX_VERSION
         && manifest.sidecar_schema_version == Some(SIDECAR_SCHEMA_VERSION)
@@ -71,7 +71,7 @@ pub fn manifest_staleness_reason_for_runtime(
         ));
     }
 
-    let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+    let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     if manifest.embedding_dim != Some(embedding_dim) {
         return Some(format!(
@@ -379,7 +379,7 @@ mod tests {
         RetrievalIndexManifest {
             project_id: project_id.into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-            qdrant_collection: sidecar_qdrant_collection(project_id, hash),
+            qdrant_collection: sidecar_vector_generation(project_id, hash),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 123,
             disk_bytes: None,
@@ -479,7 +479,7 @@ mod tests {
             .expect("docs");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
         manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
-        manifest.embedding_dim = Some(crate::embeddings::qdrant_vector_dim() as i32);
+        manifest.embedding_dim = Some(crate::embeddings::semantic_vector_dim() as i32);
         manifest.dense_reason_counts_json = Some("{\"public_api\":2}".into());
 
         let reason =
@@ -523,7 +523,7 @@ mod tests {
             .expect("docs");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
         manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
-        manifest.embedding_dim = Some(crate::embeddings::qdrant_vector_dim() as i32);
+        manifest.embedding_dim = Some(crate::embeddings::semantic_vector_dim() as i32);
         manifest.projection_count = Some(1);
         manifest.dense_projection_count = Some(1);
         manifest.dense_reason_counts_json = Some("{\"public_api\":1}".into());

@@ -19,7 +19,7 @@ pub fn retrieval_manifest_fixture(
     RetrievalIndexManifest {
         project_id: project_id.into(),
         lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-        qdrant_collection: crate::generation::sidecar_qdrant_collection(
+        qdrant_collection: crate::generation::sidecar_vector_generation(
             project_id,
             sidecar_input_hash,
         ),

@@ -1,5 +1,5 @@
-use crate::config::{SidecarLayout, SidecarRuntimeConfig, VectorBackend, dir_size_bytes};
-use crate::embedded_vector::EmbeddedVectorIndex;
+use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
+use crate::embedded_vector::{EmbeddedVectorIndex, SemanticPoint};
 #[cfg(test)]
 use crate::generation::manifest_unavailable_reason;
 use crate::generation::{
@@ -11,13 +11,12 @@ use crate::lexical_index::{
     LEXICAL_INDEX_VERSION, LexicalInputFingerprint, build_lexical_shard,
     finish_lexical_input_for_store, lexical_source_input,
 };
-use crate::qdrant_client::{QDRANT_INDEX_UPSERT_BATCH_SIZE, QdrantClient, QdrantUpsertPoint};
 use crate::retention::{
-    FsQdrantGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
+    FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
     GenerationRetentionLock, GenerationRetentionMarker, GenerationRetentionPlan,
     VerifiedRollbackManifest, apply_generation_retention, global_generation_gc_state_file,
-    plan_generation_retention_with_qdrant_collections, read_retention_marker,
-    scan_retention_protection, write_retention_marker,
+    plan_generation_retention, read_retention_marker, scan_retention_protection,
+    write_retention_marker,
 };
 use crate::scip_index::{
     SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
@@ -29,7 +28,6 @@ use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store, Sym
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -37,20 +35,9 @@ pub struct FinalizeIndexOutcome {
     pub project_id: String,
     pub manifest: RetrievalIndexManifest,
     pub degraded_modes: Vec<String>,
-    pub qdrant_stubbed: bool,
     pub scip_stubbed: bool,
     pub generation_retention_plan: GenerationRetentionPlan,
     pub generation_retention: GenerationRetentionApplyReport,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProjectQdrantRepairOutcome {
-    pub project_id: String,
-    pub qdrant_collection: String,
-    pub collection_existed: bool,
-    pub repaired: bool,
-    pub points_upserted: usize,
-    pub skipped_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +62,6 @@ struct SidecarEmbeddingContract<'a> {
 }
 
 struct SemanticGeneration<'a> {
-    runtime: &'a SidecarRuntimeConfig,
-    qdrant_client: &'a Option<QdrantClient>,
     layout: &'a SidecarLayout,
     collection: &'a str,
     generation: &'a str,
@@ -88,7 +73,6 @@ struct SemanticGeneration<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarStubFlags {
-    qdrant_stubbed: bool,
     scip_stubbed: bool,
 }
 
@@ -104,9 +88,7 @@ struct GenerationRetentionContext<'a> {
     embedding_device: &'a crate::embeddings::EmbeddingDeviceReadiness,
 }
 
-const SIDECAR_INPUT_BATCH_SIZE: usize = QDRANT_INDEX_UPSERT_BATCH_SIZE * 8;
-const QDRANT_SEMANTIC_SMOKE_RETRY_ATTEMPTS: usize = 2;
-const QDRANT_SEMANTIC_SMOKE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
 
 pub fn project_id_for_root(project_root: &Path) -> String {
     codestory_workspace::workspace_id_v3_for_root(project_root)
@@ -123,119 +105,6 @@ pub(crate) fn sidecar_project_id_for_runtime(
     Ok(runtime
         .validated_project_identity(project_root)?
         .artifact_scope_id)
-}
-
-pub fn repair_project_qdrant_collection(
-    project_root: &Path,
-    storage_path: &Path,
-) -> Result<Option<ProjectQdrantRepairOutcome>> {
-    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    repair_project_qdrant_collection_for_runtime(project_root, storage_path, &runtime)
-}
-
-pub fn repair_project_qdrant_collection_for_runtime(
-    project_root: &Path,
-    storage_path: &Path,
-    runtime: &SidecarRuntimeConfig,
-) -> Result<Option<ProjectQdrantRepairOutcome>> {
-    if !storage_path.is_file() {
-        return Ok(None);
-    }
-
-    let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
-    let storage = Store::open(storage_path).context("open storage for qdrant project repair")?;
-    let Some(manifest) = storage
-        .get_retrieval_index_manifest(&project_id)
-        .context("load retrieval manifest for qdrant project repair")?
-    else {
-        return Ok(None);
-    };
-    if let Some(reason) =
-        manifest_unavailable_reason_for_runtime(&project_id, &storage, &manifest, runtime)
-    {
-        return Ok(Some(ProjectQdrantRepairOutcome {
-            project_id,
-            qdrant_collection: manifest.qdrant_collection,
-            collection_existed: false,
-            repaired: false,
-            points_upserted: 0,
-            skipped_reason: Some(reason),
-        }));
-    }
-    drop(storage);
-
-    let layout = &runtime.layout;
-    layout.ensure_data_dirs()?;
-    let vector_backend = runtime.ensure_vector_backend_configured()?;
-    if vector_backend == VectorBackend::Embedded {
-        return Ok(Some(ProjectQdrantRepairOutcome {
-            project_id,
-            qdrant_collection: manifest.qdrant_collection,
-            collection_existed: false,
-            repaired: false,
-            points_upserted: 0,
-            skipped_reason: Some("embedded_vector_backend".into()),
-        }));
-    }
-    let qdrant_client = QdrantClient::for_runtime(runtime)?;
-    let probe = qdrant_client.health_probe(&manifest.qdrant_collection);
-    if !probe.reachable {
-        return Ok(Some(ProjectQdrantRepairOutcome {
-            project_id,
-            qdrant_collection: manifest.qdrant_collection,
-            collection_existed: false,
-            repaired: false,
-            points_upserted: 0,
-            skipped_reason: Some(format!("qdrant_unreachable: {}", probe.detail)),
-        }));
-    }
-
-    let collection_existed = probe.collection_exists;
-    if collection_existed
-        && qdrant_client.semantic_search_smoke(&manifest.qdrant_collection)
-        && qdrant_ready_point_count(
-            &qdrant_client,
-            &manifest.qdrant_collection,
-            manifest.projection_count.unwrap_or(0),
-        )
-        .is_some()
-    {
-        return Ok(Some(ProjectQdrantRepairOutcome {
-            project_id,
-            qdrant_collection: manifest.qdrant_collection,
-            collection_existed,
-            repaired: false,
-            points_upserted: 0,
-            skipped_reason: Some("collection_healthy".into()),
-        }));
-    }
-
-    let points_upserted = upsert_qdrant_points_from_store(
-        storage_path,
-        project_root,
-        &qdrant_client,
-        &manifest.qdrant_collection,
-    )
-    .context("repair qdrant project collection from indexed symbol projection")?;
-    if points_upserted == 0 {
-        return Ok(Some(ProjectQdrantRepairOutcome {
-            project_id,
-            qdrant_collection: manifest.qdrant_collection,
-            collection_existed,
-            repaired: false,
-            points_upserted: 0,
-            skipped_reason: Some("no_indexed_symbol_points".into()),
-        }));
-    }
-
-    Ok(Some(ProjectQdrantRepairOutcome {
-        project_id,
-        qdrant_collection: manifest.qdrant_collection,
-        collection_existed,
-        repaired: true,
-        points_upserted,
-        skipped_reason: None,
-    }))
 }
 
 pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<FinalizeIndexOutcome> {
@@ -271,15 +140,10 @@ pub fn finalize_index_for_runtime_with_progress(
         .context("lock sidecar generation publication and retention")?;
     layout.ensure_data_dirs()?;
     let degraded_modes = Vec::new();
-    let qdrant_stubbed = false;
     let scip_stubbed = false;
 
-    let vector_backend = runtime.ensure_vector_backend_configured()?;
-    let qdrant_client = (vector_backend == VectorBackend::ExternalQdrant)
-        .then(|| QdrantClient::for_runtime(runtime))
-        .transpose()?;
     let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
-    let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+    let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
@@ -295,7 +159,7 @@ pub fn finalize_index_for_runtime_with_progress(
         backend: &embedding_backend,
         dimension: embedding_dim,
         config: &runtime.embedding,
-        vector_backend: vector_backend.as_str(),
+        vector_backend: "embedded",
     };
     let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
         input_snapshot.storage(),
@@ -343,8 +207,6 @@ pub fn finalize_index_for_runtime_with_progress(
                 runtime,
             );
             let previous_semantic = SemanticGeneration {
-                runtime,
-                qdrant_client: &qdrant_client,
                 layout: &layout,
                 collection: &previous.qdrant_collection,
                 generation: previous.sidecar_generation.as_deref().unwrap_or_default(),
@@ -353,8 +215,8 @@ pub fn finalize_index_for_runtime_with_progress(
                 embedding_dim,
                 expected_points: sidecar_input.projection_count,
             };
-            let qdrant_point_count = semantic_ready_point_count(&previous_semantic);
-            if status.retrieval_mode == "full" && qdrant_point_count.is_some() {
+            let semantic_point_count = semantic_ready_point_count(&previous_semantic);
+            if status.retrieval_mode == "full" && semantic_point_count.is_some() {
                 let mut manifest = previous.clone();
                 if let Some(generation) = manifest.sidecar_generation.as_deref() {
                     let scip_dir = layout.scip_project_dir(generation);
@@ -367,10 +229,7 @@ pub fn finalize_index_for_runtime_with_progress(
                             project_id,
                             manifest,
                             degraded_modes,
-                            SidecarStubFlags {
-                                qdrant_stubbed,
-                                scip_stubbed,
-                            },
+                            SidecarStubFlags { scip_stubbed },
                         );
                     }
                 }
@@ -378,7 +237,7 @@ pub fn finalize_index_for_runtime_with_progress(
                     project_id = %project_id,
                     sidecar_generation = ?previous.sidecar_generation,
                     projection_count = sidecar_input.projection_count,
-                    qdrant_point_count = qdrant_point_count.unwrap_or_default(),
+                    semantic_point_count = semantic_point_count.unwrap_or_default(),
                     lexical_file_count = sidecar_input.lexical_file_count,
                     "retrieval sidecar generation unchanged; reused existing full sidecars"
                 );
@@ -390,28 +249,23 @@ pub fn finalize_index_for_runtime_with_progress(
                     project_id,
                     previous.clone(),
                     degraded_modes,
-                    SidecarStubFlags {
-                        qdrant_stubbed,
-                        scip_stubbed,
-                    },
+                    SidecarStubFlags { scip_stubbed },
                 );
             }
             warn!(
                 project_id = %project_id,
                 retrieval_mode = %status.retrieval_mode,
                 degraded_reason = ?status.degraded_reason,
-                qdrant_point_count = ?qdrant_point_count,
+                semantic_point_count = ?semantic_point_count,
                 "sidecar input unchanged but current generation is not healthy; rebuilding"
             );
         }
     }
 
     let generation = sidecar_generation_id(&project_id, &sidecar_input.hash);
-    let collection = QdrantClient::collection_name_for_generation(&project_id, &sidecar_input.hash);
+    let collection = crate::generation::sidecar_vector_generation(&project_id, &sidecar_input.hash);
     let scip_dir = layout.scip_project_dir(&generation);
     let semantic_generation = SemanticGeneration {
-        runtime,
-        qdrant_client: &qdrant_client,
         layout: &layout,
         collection: &collection,
         generation: &generation,
@@ -445,14 +299,14 @@ pub fn finalize_index_for_runtime_with_progress(
             &sidecar_input.lexical_hash,
             &sidecar_input.hash,
         );
-    let qdrant_ready_points = if existing_status.qdrant.capabilities.semantic {
+    let semantic_ready_points = if existing_status.qdrant.capabilities.semantic {
         semantic_ready_point_count(&semantic_generation)
     } else {
         None
     };
     let scip_ready = existing_status.scip.capabilities.graph;
 
-    if lexical_ready && qdrant_ready_points.is_some() && scip_ready {
+    if lexical_ready && semantic_ready_points.is_some() && scip_ready {
         update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
         manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
         let status = probe_sidecar_health_for_runtime(
@@ -466,7 +320,7 @@ pub fn finalize_index_for_runtime_with_progress(
             info!(
                 project_id = %project_id,
                 sidecar_generation = %generation,
-                qdrant_point_count = qdrant_ready_points.unwrap_or_default(),
+                semantic_point_count = semantic_ready_points.unwrap_or_default(),
                 "current generated sidecars already healthy; persisted manifest without rebuild"
             );
             return persist_finalized_manifest(
@@ -477,10 +331,7 @@ pub fn finalize_index_for_runtime_with_progress(
                 project_id,
                 manifest,
                 degraded_modes,
-                SidecarStubFlags {
-                    qdrant_stubbed,
-                    scip_stubbed,
-                },
+                SidecarStubFlags { scip_stubbed },
             );
         }
     }
@@ -501,12 +352,12 @@ pub fn finalize_index_for_runtime_with_progress(
         )
     })?;
 
-    let _qdrant_point_count = ensure_semantic_index(
+    let _semantic_point_count = ensure_semantic_index(
         storage_path,
         project_root,
         &project_id,
         &semantic_generation,
-        qdrant_ready_points,
+        semantic_ready_points,
         &mut progress,
     )?;
 
@@ -535,10 +386,7 @@ pub fn finalize_index_for_runtime_with_progress(
             project_id,
             manifest,
             degraded_modes,
-            SidecarStubFlags {
-                qdrant_stubbed,
-                scip_stubbed,
-            },
+            SidecarStubFlags { scip_stubbed },
         )
     })
 }
@@ -602,7 +450,7 @@ fn ensure_semantic_index(
     project_root: &Path,
     project_id: &str,
     semantic: &SemanticGeneration<'_>,
-    mut qdrant_ready_points: Option<u64>,
+    semantic_ready_points: Option<u64>,
     progress: &mut impl FnMut(&'static str),
 ) -> Result<u64> {
     if semantic.expected_points == 0 {
@@ -613,150 +461,39 @@ fn ensure_semantic_index(
         );
         return Ok(0);
     }
-    if semantic.runtime.vector_backend() == VectorBackend::Embedded {
-        if let Some(point_count) = qdrant_ready_points {
-            info!(
-                project_id = %project_id,
-                sidecar_generation = %semantic.generation,
-                point_count,
-                "embedded vector generation reused"
-            );
-            return Ok(point_count);
-        }
-        let point_count = with_finalize_progress(progress, "embedded vectors", || {
-            EmbeddedVectorIndex::build_with_points(
-                semantic.layout,
-                semantic.collection,
-                semantic.generation,
-                semantic.input_hash,
-                semantic.embedding_backend,
-                usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
-                |visit| visit_semantic_points_from_store(storage_path, project_root, visit),
-            )
-        })?;
-        if point_count != u64::try_from(semantic.expected_points).unwrap_or(u64::MAX) {
-            bail!(
-                "embedded vector generation incomplete for {project_id}: expected {} points, found {point_count}",
-                semantic.expected_points
-            );
-        }
+    if let Some(point_count) = semantic_ready_points {
         info!(
             project_id = %project_id,
             sidecar_generation = %semantic.generation,
             point_count,
-            "embedded SQLite vector generation published"
+            "embedded vector generation reused"
         );
         return Ok(point_count);
     }
-
-    let qdrant_client = semantic
-        .qdrant_client
-        .as_ref()
-        .context("external Qdrant backend selected without a client")?;
-    let qdrant_probe = qdrant_client.health_probe(semantic.collection);
-    if !qdrant_probe.reachable {
-        bail!(
-            "qdrant sidecar is mandatory but unreachable while finalizing retrieval index for {project_id}: {}",
-            qdrant_probe.detail
-        );
-    }
-    if let Some(point_count) = qdrant_ready_points {
-        info!(
-            project_id = %project_id,
-            collection = %semantic.collection,
-            qdrant_point_count = point_count,
-            "Qdrant generated collection reused"
-        );
-    } else {
-        let count = with_finalize_progress(progress, "embeddings", || {
-            upsert_qdrant_points_from_store(
-                storage_path,
-                project_root,
-                qdrant_client,
-                semantic.collection,
-            )
-        })?;
-        if count == 0 {
-            bail!(
-                "mandatory Qdrant semantic collection has no indexed symbol points for {project_id}"
-            );
-        }
-        qdrant_ready_points =
-            qdrant_ready_point_count(qdrant_client, semantic.collection, semantic.expected_points);
-        if qdrant_ready_points.is_none() {
-            let actual = qdrant_client
-                .count_points_exact(semantic.collection)
-                .unwrap_or_default();
-            bail!(
-                "mandatory Qdrant semantic collection incomplete for {project_id}: expected at least {} points, found {actual}",
-                semantic.expected_points
-            );
-        }
-        info!(
-            project_id = %project_id,
-            collection = %semantic.collection,
-            points = count,
-            qdrant_point_count = qdrant_ready_points.unwrap_or_default(),
-            real_embeddings = true,
-            "Qdrant collection ensured and populated"
-        );
-    }
-    with_finalize_progress(progress, "Qdrant finalize", || {
-        ensure_qdrant_semantic_smoke(project_id, semantic.collection, qdrant_client)
+    let point_count = with_finalize_progress(progress, "embedded vectors", || {
+        EmbeddedVectorIndex::build_with_points(
+            semantic.layout,
+            semantic.collection,
+            semantic.generation,
+            semantic.input_hash,
+            semantic.embedding_backend,
+            usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
+            |visit| visit_semantic_points_from_store(storage_path, project_root, visit),
+        )
     })?;
-    Ok(qdrant_ready_points.unwrap_or_default())
-}
-
-fn ensure_qdrant_semantic_smoke(
-    project_id: &str,
-    collection: &str,
-    qdrant_client: &QdrantClient,
-) -> Result<()> {
-    ensure_qdrant_semantic_smoke_with(
-        project_id,
-        collection,
-        || qdrant_client.semantic_search_smoke_result(collection),
-        QDRANT_SEMANTIC_SMOKE_RETRY_ATTEMPTS,
-        QDRANT_SEMANTIC_SMOKE_RETRY_DELAY,
-        std::thread::sleep,
-    )
-}
-
-fn ensure_qdrant_semantic_smoke_with<F, S>(
-    project_id: &str,
-    collection: &str,
-    mut smoke: F,
-    retry_attempts: usize,
-    retry_delay: Duration,
-    mut sleep: S,
-) -> Result<()>
-where
-    F: FnMut() -> Result<()>,
-    S: FnMut(Duration),
-{
-    let total_attempts = retry_attempts + 1;
-    for attempt in 1..=total_attempts {
-        match smoke() {
-            Ok(()) => return Ok(()),
-            Err(error) if attempt < total_attempts => {
-                warn!(
-                    project_id = %project_id,
-                    collection = %collection,
-                    attempt,
-                    total_attempts,
-                    error = %error,
-                    "Qdrant semantic smoke failed; retrying before finalize"
-                );
-                sleep(retry_delay);
-            }
-            Err(error) => {
-                bail!(
-                    "mandatory Qdrant semantic smoke failed for {project_id} collection {collection} after {attempt} attempt(s): {error:#}"
-                );
-            }
-        }
+    if point_count != u64::try_from(semantic.expected_points).unwrap_or(u64::MAX) {
+        bail!(
+            "embedded vector generation incomplete for {project_id}: expected {} points, found {point_count}",
+            semantic.expected_points
+        );
     }
-    Ok(())
+    info!(
+        project_id = %project_id,
+        sidecar_generation = %semantic.generation,
+        point_count,
+        "embedded SQLite vector generation published"
+    );
+    Ok(point_count)
 }
 
 fn ensure_scip_artifacts(
@@ -901,66 +638,21 @@ fn sidecar_disk_bytes(
     )
 }
 
-fn qdrant_ready_point_count(
-    qdrant_client: &QdrantClient,
-    collection: &str,
-    expected_points: i64,
-) -> Option<u64> {
-    qdrant_ready_point_count_with(collection, expected_points, || {
-        qdrant_client.count_points_exact(collection)
-    })
-}
-
 fn semantic_ready_point_count(semantic: &SemanticGeneration<'_>) -> Option<u64> {
     let expected = u64::try_from(semantic.expected_points).ok()?;
     if expected == 0 {
         return Some(0);
     }
-    match semantic.runtime.vector_backend() {
-        VectorBackend::Embedded => {
-            let health = EmbeddedVectorIndex::health(
-                semantic.layout,
-                semantic.collection,
-                semantic.generation,
-                semantic.input_hash,
-                expected,
-                semantic.embedding_backend,
-                usize::try_from(semantic.embedding_dim).ok()?,
-            );
-            health.ready.then_some(health.point_count)
-        }
-        VectorBackend::ExternalQdrant => semantic.qdrant_client.as_ref().and_then(|client| {
-            qdrant_ready_point_count(client, semantic.collection, semantic.expected_points)
-        }),
-    }
-}
-
-fn qdrant_ready_point_count_with(
-    collection: &str,
-    expected_points: i64,
-    count_points: impl FnOnce() -> Result<u64>,
-) -> Option<u64> {
-    let expected_points = u64::try_from(expected_points).ok()?;
-    match count_points() {
-        Ok(actual) if actual == expected_points => Some(actual),
-        Ok(actual) => {
-            warn!(
-                collection = %collection,
-                expected_points,
-                actual_points = actual,
-                "Qdrant generated collection point count does not match its candidate input"
-            );
-            None
-        }
-        Err(error) => {
-            warn!(
-                collection = %collection,
-                error = %error,
-                "Qdrant generated collection point count unavailable"
-            );
-            None
-        }
-    }
+    let health = EmbeddedVectorIndex::health(
+        semantic.layout,
+        semantic.collection,
+        semantic.generation,
+        semantic.input_hash,
+        expected,
+        semantic.embedding_backend,
+        usize::try_from(semantic.embedding_dim).ok()?,
+    );
+    health.ready.then_some(health.point_count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -980,7 +672,7 @@ fn persist_finalized_manifest(
     let mut storage = Store::open(storage_path).context("open storage for retrieval manifest")?;
     let embedding_backend =
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
-    let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+    let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     promote_retrieval_manifest(
         &mut storage,
@@ -993,7 +685,7 @@ fn persist_finalized_manifest(
                 backend: &embedding_backend,
                 dimension: embedding_dim,
                 config: &retention_context.runtime.embedding,
-                vector_backend: retention_context.runtime.vector_backend().as_str(),
+                vector_backend: "embedded",
             };
             let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
                 storage,
@@ -1041,7 +733,6 @@ fn persist_finalized_manifest(
         project_id,
         manifest,
         degraded_modes,
-        qdrant_stubbed: stub_flags.qdrant_stubbed,
         scip_stubbed: stub_flags.scip_stubbed,
         generation_retention_plan,
         generation_retention,
@@ -1085,9 +776,9 @@ struct CandidateGenerationEvidence {
     lexical_matches: bool,
     scip_revision: Option<String>,
     scip_graph: bool,
-    qdrant_points: Option<u64>,
-    qdrant_semantic: bool,
-    qdrant_zero_dense_policy: bool,
+    semantic_points: Option<u64>,
+    semantic_ready: bool,
+    semantic_zero_dense_policy: bool,
     embedding_device: crate::embeddings::EmbeddingDeviceReadiness,
     embedding_accelerator_smoke_elapsed_ms: Option<u64>,
     embedding_launch_before: Option<crate::health::EmbeddingLaunchMetadata>,
@@ -1108,7 +799,7 @@ fn validate_candidate_generation_evidence(
     evidence: &CandidateGenerationEvidence,
 ) -> Result<()> {
     let expected_embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
-    let expected_embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+    let expected_embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     if !manifest_matches_sidecar_input(
         manifest,
@@ -1131,17 +822,17 @@ fn validate_candidate_generation_evidence(
         && sidecar_input.dense_projection_count == 0
         && sidecar_input.semantic_policy_version.as_deref()
             == Some(crate::generation::SEMANTIC_POLICY_VERSION);
-    let qdrant_valid = if zero_dense_candidate {
-        evidence.qdrant_points.is_none()
-            && evidence.qdrant_semantic
-            && evidence.qdrant_zero_dense_policy
+    let semantic_valid = if zero_dense_candidate {
+        evidence.semantic_points.is_none()
+            && evidence.semantic_ready
+            && evidence.semantic_zero_dense_policy
     } else {
-        evidence.qdrant_points.is_some()
-            && evidence.qdrant_semantic
-            && !evidence.qdrant_zero_dense_policy
+        evidence.semantic_points.is_some()
+            && evidence.semantic_ready
+            && !evidence.semantic_zero_dense_policy
     };
-    if !qdrant_valid {
-        bail!("mandatory candidate generation component failed validation: qdrant");
+    if !semantic_valid {
+        bail!("mandatory candidate generation component failed validation: semantic");
     }
     let container_identity_valid = if evidence.embedding_container_identity_required {
         matches!(
@@ -1281,12 +972,7 @@ fn validate_candidate_generation(
         })
         .transpose()
         .context("validate candidate embedding container identity before final probes")?;
-    let qdrant_client = (context.runtime.vector_backend() == VectorBackend::ExternalQdrant)
-        .then(|| QdrantClient::for_runtime(context.runtime))
-        .transpose()?;
     let semantic_generation = SemanticGeneration {
-        runtime: context.runtime,
-        qdrant_client: &qdrant_client,
         layout: context.layout,
         collection: &manifest.qdrant_collection,
         generation,
@@ -1295,12 +981,7 @@ fn validate_candidate_generation(
         embedding_dim: manifest.embedding_dim.unwrap_or_default(),
         expected_points: sidecar_input.projection_count,
     };
-    let qdrant_points = semantic_ready_point_count(&semantic_generation);
-    if sidecar_input.projection_count > 0
-        && let Some(qdrant_client) = qdrant_client.as_ref()
-    {
-        ensure_qdrant_semantic_smoke(project_id, &manifest.qdrant_collection, qdrant_client)?;
-    }
+    let semantic_points = semantic_ready_point_count(&semantic_generation);
     let embedding_accelerator_smoke =
         crate::embeddings::ensure_embedding_accelerator_smoke_for_runtime(context.runtime)
             .context("validate candidate embedding accelerator with a fresh timed smoke")?;
@@ -1338,9 +1019,11 @@ fn validate_candidate_generation(
         ),
         scip_revision: read_scip_revision(&scip_dir),
         scip_graph: status.scip.capabilities.graph,
-        qdrant_points,
-        qdrant_semantic: status.qdrant.capabilities.semantic,
-        qdrant_zero_dense_policy: sidecar_input.projection_count == 0
+        semantic_points: (sidecar_input.projection_count > 0)
+            .then_some(semantic_points)
+            .flatten(),
+        semantic_ready: status.qdrant.capabilities.semantic,
+        semantic_zero_dense_policy: sidecar_input.projection_count == 0
             && sidecar_input.dense_projection_count == 0
             && status.qdrant.status == crate::health::ComponentStatus::Healthy
             && status.qdrant.degraded_reason.is_none()
@@ -1444,27 +1127,8 @@ fn retain_published_generations(
         protection.rollback.push(rollback.manifest);
     }
     protection.errors.extend(errors);
-    let live_qdrant_collections = match context.runtime.vector_backend() {
-        VectorBackend::Embedded => Vec::new(),
-        VectorBackend::ExternalQdrant => {
-            match QdrantClient::new(context.layout).list_collection_names() {
-                Ok(collections) => collections,
-                Err(error) => {
-                    protection.errors.push(format!(
-                        "list live Qdrant collections for retention: {error:#}"
-                    ));
-                    Vec::new()
-                }
-            }
-        }
-    };
-    let plan = plan_generation_retention_with_qdrant_collections(
-        context.layout,
-        project_id,
-        &protection,
-        &live_qdrant_collections,
-    );
-    let mut remover = FsQdrantGenerationRemover::new_for_runtime(context.layout, context.runtime)?;
+    let plan = plan_generation_retention(context.layout, project_id, &protection);
+    let mut remover = FsGenerationRemover::new(context.layout)?;
     let apply = apply_generation_retention(&plan, &mut remover);
     Ok((plan, apply))
 }
@@ -1503,7 +1167,7 @@ pub(crate) fn compute_sidecar_input_fingerprint_for_runtime(
         backend: embedding_backend,
         dimension: embedding_dim,
         config: &runtime.embedding,
-        vector_backend: runtime.vector_backend().as_str(),
+        vector_backend: "embedded",
     };
     compute_sidecar_input_fingerprint_with_lexical_source(
         storage,
@@ -1617,7 +1281,7 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         after = batch.last().map(|doc| doc.node_id);
         let batch = batch
             .into_iter()
-            .filter(qdrant_semantic_doc_row)
+            .filter(semantic_doc_row)
             .collect::<Vec<_>>();
         dense_projection_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
         for doc in batch {
@@ -1738,7 +1402,7 @@ fn hash_semantic_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &LlmS
 }
 
 #[cfg(test)]
-fn qdrant_semantic_projection_row(row: &codestory_store::SearchSymbolProjectionDetail) -> bool {
+fn semantic_projection_row(row: &codestory_store::SearchSymbolProjectionDetail) -> bool {
     let Some(kind) = row
         .node_kind
         .and_then(|kind| i32::try_from(kind).ok())
@@ -1749,7 +1413,7 @@ fn qdrant_semantic_projection_row(row: &codestory_store::SearchSymbolProjectionD
     crate::generation::sidecar_semantic_node_kind(kind)
 }
 
-fn qdrant_semantic_doc_row(doc: &LlmSymbolDoc) -> bool {
+fn semantic_doc_row(doc: &LlmSymbolDoc) -> bool {
     crate::generation::sidecar_semantic_doc_is_product_eligible(doc)
 }
 
@@ -1765,38 +1429,12 @@ fn hash_embedding_vector(hasher: &mut Sha256, embedding: &[f32]) {
     }
 }
 
-fn upsert_qdrant_points_from_store(
-    storage_path: &Path,
-    project_root: &Path,
-    qdrant_client: &QdrantClient,
-    collection: &str,
-) -> Result<usize> {
-    let mut total = 0usize;
-    let mut points = Vec::with_capacity(QDRANT_INDEX_UPSERT_BATCH_SIZE);
-    visit_semantic_points_from_store(storage_path, project_root, &mut |point| {
-        points.push(point);
-        if points.len() == QDRANT_INDEX_UPSERT_BATCH_SIZE {
-            total += qdrant_client
-                .upsert_points(collection, &points)
-                .context("qdrant collection upsert")?;
-            points.clear();
-        }
-        Ok(())
-    })?;
-    if !points.is_empty() {
-        total += qdrant_client
-            .upsert_points(collection, &points)
-            .context("qdrant collection upsert")?;
-    }
-    Ok(total)
-}
-
 fn visit_semantic_points_from_store(
     storage_path: &Path,
     project_root: &Path,
-    visit: &mut dyn FnMut(QdrantUpsertPoint) -> Result<()>,
+    visit: &mut dyn FnMut(SemanticPoint) -> Result<()>,
 ) -> Result<()> {
-    let mut storage = Store::open(storage_path).context("open storage for qdrant upsert")?;
+    let mut storage = Store::open(storage_path).context("open storage for semantic vectors")?;
     ensure_search_symbol_projection(&mut storage)?;
     let file_roles = storage
         .get_files()
@@ -1806,13 +1444,12 @@ fn visit_semantic_points_from_store(
     loop {
         let batch = storage
             .get_llm_symbol_docs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
-            .context("load stored semantic docs for qdrant")?;
+            .context("load stored semantic docs for vector indexing")?;
         if batch.is_empty() {
             break;
         }
         after = batch.last().map(|doc| doc.node_id);
-        for doc in batch.into_iter().filter(qdrant_semantic_doc_row) {
-            let id = qdrant_point_id_for_node_id(doc.node_id.0);
+        for doc in batch.into_iter().filter(semantic_doc_row) {
             let display_name = doc.qualified_name.clone().unwrap_or(doc.display_name);
             let file_path = doc
                 .file_path
@@ -1826,14 +1463,13 @@ fn visit_semantic_points_from_store(
                         .as_deref()
                         .map(|path| FileRole::classify_path(Path::new(path)))
                 });
-            visit(QdrantUpsertPoint {
-                id,
+            visit(SemanticPoint {
                 display_name,
                 node_id: doc.node_id.0.to_string(),
                 file_path,
                 file_role,
                 dense_reason: doc.dense_reason.clone(),
-                vector: Some(doc.embedding),
+                vector: doc.embedding,
             })?;
         }
     }
@@ -1855,10 +1491,6 @@ fn sidecar_file_role_map(
         .collect()
 }
 
-fn qdrant_point_id_for_node_id(node_id: i64) -> u64 {
-    u64::from_le_bytes(node_id.to_le_bytes())
-}
-
 fn normalize_sidecar_file_path(path: &str, project_root: &Path) -> Result<String> {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -1876,19 +1508,6 @@ mod tests {
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::SearchSymbolProjectionDetail;
     use tempfile::TempDir;
-
-    #[test]
-    fn qdrant_point_ids_preserve_negative_node_ids() {
-        assert_eq!(qdrant_point_id_for_node_id(42), 42);
-        assert_ne!(
-            qdrant_point_id_for_node_id(-1),
-            qdrant_point_id_for_node_id(0)
-        );
-        assert_ne!(
-            qdrant_point_id_for_node_id(-2),
-            qdrant_point_id_for_node_id(-1)
-        );
-    }
 
     #[test]
     fn finalize_index_fails_before_publication_without_runtime_or_artifacts() {
@@ -1929,168 +1548,6 @@ mod tests {
     }
 
     #[test]
-    fn qdrant_semantic_smoke_gate_succeeds_first_attempt() {
-        let mut calls = 0usize;
-        ensure_qdrant_semantic_smoke_with(
-            "proj",
-            "collection",
-            || {
-                calls += 1;
-                Ok(())
-            },
-            2,
-            Duration::from_millis(1),
-            |_| panic!("sleep should not run after first-pass success"),
-        )
-        .expect("smoke succeeds");
-
-        assert_eq!(calls, 1);
-    }
-
-    #[test]
-    fn qdrant_semantic_smoke_gate_retries_transient_failure() {
-        let mut calls = 0usize;
-        let mut sleeps = 0usize;
-        ensure_qdrant_semantic_smoke_with(
-            "proj",
-            "collection",
-            || {
-                calls += 1;
-                if calls == 1 {
-                    anyhow::bail!("qdrant semantic smoke search failed: qdrant query warming");
-                }
-                Ok(())
-            },
-            2,
-            Duration::from_millis(1),
-            |_| sleeps += 1,
-        )
-        .expect("retry succeeds");
-
-        assert_eq!(calls, 2);
-        assert_eq!(sleeps, 1);
-    }
-
-    #[test]
-    fn qdrant_semantic_smoke_gate_fails_closed_with_sublayer_detail() {
-        let mut calls = 0usize;
-        let error = ensure_qdrant_semantic_smoke_with(
-            "proj",
-            "collection",
-            || {
-                calls += 1;
-                anyhow::bail!("qdrant semantic smoke search failed: embedding endpoint refused")
-            },
-            2,
-            Duration::from_millis(1),
-            |_| {},
-        )
-        .expect_err("hard smoke failure must fail finalize");
-
-        let message = format!("{error:#}");
-        assert_eq!(calls, 3);
-        assert!(message.contains("mandatory Qdrant semantic smoke failed"));
-        assert!(message.contains("embedding endpoint refused"));
-    }
-
-    #[test]
-    fn project_qdrant_repair_noops_without_manifest() {
-        let project = TempDir::new().expect("project dir");
-        let storage_dir = TempDir::new().expect("storage dir");
-        let storage_path = storage_dir.path().join("codestory.db");
-        {
-            let storage = Store::open(&storage_path).expect("open empty db");
-            drop(storage);
-        }
-
-        let repair =
-            repair_project_qdrant_collection(project.path(), &storage_path).expect("repair");
-        assert!(repair.is_none());
-    }
-
-    #[test]
-    fn project_qdrant_repair_uses_selected_runtime_layout() {
-        let _env = crate::test_support::env_lock();
-        let project = TempDir::new().expect("project dir");
-        let storage_dir = TempDir::new().expect("storage dir");
-        let sidecar_dir = TempDir::new().expect("sidecar dir");
-        let storage_path = storage_dir.path().join("codestory.db");
-        let project_id = sidecar_project_id_for_root(project.path());
-        let input = SidecarInputFingerprint {
-            hash: "0123456789abcdef0123456789abcdef".into(),
-            symbol_doc_count: 0,
-            projection_count: 0,
-            dense_projection_count: 0,
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            graph_artifact_hash: "graph-hash".into(),
-            dense_reason_counts_json: "{}".into(),
-            lexical_file_count: 1,
-            lexical_hash: "lexical".into(),
-            lexical_coverage: Default::default(),
-        };
-        let collection = QdrantClient::collection_name_for_generation(&project_id, &input.hash);
-        let manifest = retrieval_manifest_for_sidecar(
-            &project_id,
-            &sidecar_generation_id(&project_id, &input.hash),
-            &collection,
-            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-            768,
-            &input,
-        );
-        {
-            let mut storage = Store::open(&storage_path).expect("open db");
-            storage
-                .upsert_retrieval_index_manifest(&manifest)
-                .expect("write manifest");
-            assert_eq!(
-                manifest_unavailable_reason(&project_id, &storage, &manifest),
-                None
-            );
-        }
-
-        let mut runtime = SidecarRuntimeConfig {
-            project_identity: None,
-            layout: SidecarLayout {
-                qdrant_http_port: 9,
-                qdrant_grpc_port: 10,
-                lexical_data_dir: sidecar_dir.path().join("selected-lexical"),
-                qdrant_data_dir: sidecar_dir.path().join("selected-qdrant"),
-                scip_artifacts_root: sidecar_dir.path().join("selected-scip"),
-                state_file: sidecar_dir.path().join("selected-state.json"),
-            },
-            profile: crate::config::SidecarProfile::Agent,
-            run_id: Some("selected-run".into()),
-            namespace: "selected-run".into(),
-            compose_project: "selected-run".into(),
-            embed_http_port: 11,
-            cleanup_command: "codestory-cli retrieval down".into(),
-            labels: BTreeMap::new(),
-            ..SidecarRuntimeConfig::local()
-        };
-        runtime.labels.insert(
-            "dev.codestory.vector_backend".into(),
-            "external_qdrant".into(),
-        );
-
-        let repair =
-            repair_project_qdrant_collection_for_runtime(project.path(), &storage_path, &runtime)
-                .expect("repair")
-                .expect("manifest-backed repair");
-
-        assert!(runtime.layout.lexical_data_dir.is_dir());
-        assert!(runtime.layout.qdrant_data_dir.is_dir());
-        assert!(runtime.layout.scip_artifacts_root.is_dir());
-        assert_eq!(repair.qdrant_collection, collection);
-        assert!(
-            repair
-                .skipped_reason
-                .as_deref()
-                .is_some_and(|reason| reason.starts_with("qdrant_unreachable:")),
-            "{repair:?}"
-        );
-    }
-
-    #[test]
     fn generated_manifest_helper_records_current_sidecar_contract() {
         let project_id = "proj";
         let input = SidecarInputFingerprint {
@@ -2106,7 +1563,7 @@ mod tests {
             lexical_coverage: Default::default(),
         };
         let generation = sidecar_generation_id(project_id, &input.hash);
-        let collection = QdrantClient::collection_name_for_generation(project_id, &input.hash);
+        let collection = crate::generation::sidecar_vector_generation(project_id, &input.hash);
 
         let manifest = retrieval_manifest_for_sidecar(
             project_id,
@@ -2133,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn qdrant_semantic_projection_excludes_low_value_local_symbols() {
+    fn semantic_projection_excludes_low_value_local_symbols() {
         let row = |kind: NodeKind| SearchSymbolProjectionDetail {
             node_id: codestory_contracts::graph::NodeId(1),
             display_name: "symbol".into(),
@@ -2143,17 +1600,15 @@ mod tests {
             end_line: Some(1),
         };
 
-        assert!(qdrant_semantic_projection_row(&row(NodeKind::FUNCTION)));
-        assert!(qdrant_semantic_projection_row(&row(
-            NodeKind::ENUM_CONSTANT
-        )));
-        assert!(!qdrant_semantic_projection_row(&row(NodeKind::VARIABLE)));
-        assert!(!qdrant_semantic_projection_row(&row(NodeKind::FIELD)));
-        assert!(!qdrant_semantic_projection_row(&row(NodeKind::UNKNOWN)));
+        assert!(semantic_projection_row(&row(NodeKind::FUNCTION)));
+        assert!(semantic_projection_row(&row(NodeKind::ENUM_CONSTANT)));
+        assert!(!semantic_projection_row(&row(NodeKind::VARIABLE)));
+        assert!(!semantic_projection_row(&row(NodeKind::FIELD)));
+        assert!(!semantic_projection_row(&row(NodeKind::UNKNOWN)));
     }
 
     #[test]
-    fn qdrant_semantic_doc_requires_product_stored_embedding() {
+    fn semantic_doc_requires_product_stored_embedding() {
         let doc = |kind: NodeKind, backend: Option<&str>, dim: u32| LlmSymbolDoc {
             node_id: codestory_contracts::graph::NodeId(1),
             file_node_id: None,
@@ -2176,27 +1631,27 @@ mod tests {
             updated_at_epoch_ms: 123,
         };
 
-        assert!(!qdrant_semantic_doc_row(&doc(
+        assert!(!semantic_doc_row(&doc(
             NodeKind::FUNCTION,
             Some("onnx"),
             768
         )));
-        assert!(qdrant_semantic_doc_row(&doc(
+        assert!(semantic_doc_row(&doc(
             NodeKind::METHOD,
             Some("llamacpp"),
             768
         )));
-        assert!(!qdrant_semantic_doc_row(&doc(
+        assert!(!semantic_doc_row(&doc(
             NodeKind::VARIABLE,
             Some("onnx"),
             768
         )));
-        assert!(!qdrant_semantic_doc_row(&doc(
+        assert!(!semantic_doc_row(&doc(
             NodeKind::FUNCTION,
             Some("hash"),
             768
         )));
-        assert!(!qdrant_semantic_doc_row(&doc(
+        assert!(!semantic_doc_row(&doc(
             NodeKind::FUNCTION,
             Some("onnx"),
             384
@@ -2283,7 +1738,7 @@ mod tests {
             backend: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             dimension: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             config: &runtime.embedding,
-            vector_backend: runtime.vector_backend().as_str(),
+            vector_backend: "embedded",
         };
         storage
             .insert_nodes_batch(&[Node {
@@ -2327,26 +1782,10 @@ mod tests {
             &runtime,
         )
         .expect("first fingerprint");
-        let mut external_runtime = runtime.clone();
-        external_runtime.labels.insert(
-            "dev.codestory.vector_backend".into(),
-            "external_qdrant".into(),
-        );
-        let external = compute_sidecar_input_fingerprint_for_runtime(
-            &storage,
-            &storage_path,
-            project.path(),
-            "proj",
-            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            &external_runtime,
-        )
-        .expect("external fingerprint");
-        assert_ne!(first.hash, external.hash);
         let old_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &first.hash),
-            &crate::generation::sidecar_qdrant_collection("proj", &first.hash),
+            &crate::generation::sidecar_vector_generation("proj", &first.hash),
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             &first,
@@ -2380,7 +1819,7 @@ mod tests {
         let mut rejected_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &first.hash),
-            &crate::generation::sidecar_qdrant_collection("proj", &first.hash),
+            &crate::generation::sidecar_vector_generation("proj", &first.hash),
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             &first,
@@ -2413,7 +1852,7 @@ mod tests {
         let mut new_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &second.hash),
-            &crate::generation::sidecar_qdrant_collection("proj", &second.hash),
+            &crate::generation::sidecar_vector_generation("proj", &second.hash),
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             &second,
@@ -2423,9 +1862,9 @@ mod tests {
             lexical_matches: true,
             scip_revision: new_manifest.scip_revision.clone(),
             scip_graph: true,
-            qdrant_points: Some(second.projection_count as u64),
-            qdrant_semantic: true,
-            qdrant_zero_dense_policy: false,
+            semantic_points: Some(second.projection_count as u64),
+            semantic_ready: true,
+            semantic_zero_dense_policy: false,
             embedding_device: crate::embeddings::EmbeddingDeviceReadiness {
                 requested_policy: "accelerator_required",
                 observed_state: "accelerated",
@@ -2457,7 +1896,7 @@ mod tests {
         let mut zero_dense_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &zero_dense_input.hash),
-            &crate::generation::sidecar_qdrant_collection("proj", &zero_dense_input.hash),
+            &crate::generation::sidecar_vector_generation("proj", &zero_dense_input.hash),
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             &zero_dense_input,
@@ -2465,8 +1904,8 @@ mod tests {
         zero_dense_manifest.scip_revision = Some("graph-test".into());
         let mut zero_dense_evidence = passing.clone();
         zero_dense_evidence.scip_revision = zero_dense_manifest.scip_revision.clone();
-        zero_dense_evidence.qdrant_points = None;
-        zero_dense_evidence.qdrant_zero_dense_policy = true;
+        zero_dense_evidence.semantic_points = None;
+        zero_dense_evidence.semantic_zero_dense_policy = true;
         validate_candidate_generation_evidence(
             "proj",
             &zero_dense_input,
@@ -2474,10 +1913,10 @@ mod tests {
             &runtime,
             &zero_dense_evidence,
         )
-        .expect("zero-dense policy accepts an intentionally absent Qdrant collection");
+        .expect("zero-dense policy accepts an intentionally absent vector generation");
 
         let mut missing_nonzero_collection = passing.clone();
-        missing_nonzero_collection.qdrant_points = None;
+        missing_nonzero_collection.semantic_points = None;
         validate_candidate_generation_evidence(
             "proj",
             &second,
@@ -2485,7 +1924,7 @@ mod tests {
             &runtime,
             &missing_nonzero_collection,
         )
-        .expect_err("a missing nonzero Qdrant collection must reject promotion");
+        .expect_err("a missing nonzero vector generation must reject promotion");
 
         let mut cpu_runtime = runtime.clone();
         cpu_runtime.embedding.device_policy = "allow_cpu".into();
@@ -2502,7 +1941,7 @@ mod tests {
         let mut cpu_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &cpu_input.hash),
-            &crate::generation::sidecar_qdrant_collection("proj", &cpu_input.hash),
+            &crate::generation::sidecar_vector_generation("proj", &cpu_input.hash),
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             &cpu_input,
@@ -2573,7 +2012,7 @@ mod tests {
         let mut native_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &native_input.hash),
-            &crate::generation::sidecar_qdrant_collection("proj", &native_input.hash),
+            &crate::generation::sidecar_vector_generation("proj", &native_input.hash),
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             &native_input,
@@ -2634,7 +2073,7 @@ mod tests {
         rollback_manifest.sidecar_input_hash = Some(rollback_hash.into());
         rollback_manifest.sidecar_generation = Some(sidecar_generation_id("proj", rollback_hash));
         rollback_manifest.qdrant_collection =
-            crate::generation::sidecar_qdrant_collection("proj", rollback_hash);
+            crate::generation::sidecar_vector_generation("proj", rollback_hash);
         rollback_manifest.built_at_epoch_ms -= 1;
         let state_file = storage_dir.path().join("state/retrieval-sidecars.json");
         let marker = GenerationRetentionMarker::next(
@@ -2655,7 +2094,7 @@ mod tests {
         for component in [
             "lexical",
             "scip",
-            "qdrant",
+            "semantic",
             "embedding_runtime",
             "accelerator_proof",
         ] {
@@ -2665,7 +2104,7 @@ mod tests {
             match component {
                 "lexical" => failing.lexical_matches = false,
                 "scip" => failing.scip_revision = Some("wrong-revision".into()),
-                "qdrant" => failing.qdrant_points = None,
+                "semantic" => failing.semantic_points = None,
                 "embedding_runtime" => {
                     candidate_runtime.embedding.model_id = Some("different-768d-model".into());
                     candidate_input = compute_sidecar_input_fingerprint_for_runtime(

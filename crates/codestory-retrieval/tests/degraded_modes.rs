@@ -33,7 +33,7 @@ fn degraded_mode_planner_matrix() {
         plan_query(&features, full)
             .stages
             .iter()
-            .any(|s| s.kind == RetrievalStageKind::Stage1bQdrantSemantic)
+            .any(|s| s.kind == RetrievalStageKind::Stage1bSemantic)
     );
 
     let qdrant_down = component(
@@ -48,7 +48,7 @@ fn degraded_mode_planner_matrix() {
         !plan_query(&features, no_semantic)
             .stages
             .iter()
-            .any(|s| s.kind == RetrievalStageKind::Stage1bQdrantSemantic)
+            .any(|s| s.kind == RetrievalStageKind::Stage1bSemantic)
     );
 
     let scip_down = component(

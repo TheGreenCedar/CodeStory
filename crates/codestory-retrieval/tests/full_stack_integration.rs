@@ -247,7 +247,7 @@ fn embedded_default_reaches_full_mode_and_returns_dense_hits() {
         result.hits.iter().any(|hit| {
             hit.node_id.as_deref() == Some("2001")
                 && hit.file_path == "lib.rs"
-                && (hit.source == CandidateSource::Qdrant
+                && (hit.source == CandidateSource::Semantic
                     || hit.provenance.iter().any(|source| source == "dense_anchor"))
         }),
         "expected embedded dense hit, got {:?}",

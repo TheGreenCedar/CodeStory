@@ -1,12 +1,11 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
-    QDRANT_HEALTH_BUDGET, SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarProfile,
-    SidecarRuntimeConfig, VectorBackend, default_sidecar_image_pins, retrieval_command,
+    SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarProfile, SidecarRuntimeConfig,
+    default_sidecar_image_pins, retrieval_command,
 };
 use crate::embedded_vector::EmbeddedVectorIndex;
 use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
-use crate::qdrant_client::QdrantClient;
 use crate::scip_client::{ScipAvailability, ScipClient};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -262,7 +261,7 @@ fn manifest_contract_report(
                 .embedding_backend
                 .clone()
                 .unwrap_or_else(|| "embedding_backend_missing".into()),
-            provenance: format!("qdrant_collection:{}", manifest.qdrant_collection),
+            provenance: format!("vector_generation:{}", manifest.qdrant_collection),
             count: manifest.dense_projection_count,
             status: component_status_label(&report.qdrant),
         },
@@ -437,15 +436,14 @@ pub fn unavailable_status_report_with_embedding_device(
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch: None,
         lexical: unavailable_component("lexical", &reason),
-        qdrant: unavailable_component("qdrant", &reason),
+        qdrant: unavailable_component("semantic", &reason),
         scip: unavailable_component("scip", &reason),
         manifest_contract: None,
         manifest,
     }
 }
 
-/// Runtime-scoped lexical storage plus Qdrant and embedding reachability before a project
-/// generation.
+/// Runtime-scoped lexical storage and embedding reachability before a project generation.
 pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> InfrastructureHealth {
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     probe_infrastructure_health_with_embedding_device(runtime, &embedding_device)
@@ -456,12 +454,10 @@ pub fn probe_infrastructure_health_with_embedding_device(
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> InfrastructureHealth {
     let layout = &runtime.layout;
-    let qdrant_probe = (runtime.vector_backend() == VectorBackend::ExternalQdrant)
-        .then(|| QdrantClient::new(layout).list_collections_probe());
     let embed_probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
     InfrastructureHealth {
         lexical_ready: layout.lexical_data_dir.is_dir(),
-        qdrant_reachable: qdrant_probe.as_ref().is_none_or(|probe| probe.reachable),
+        qdrant_reachable: true,
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
@@ -478,10 +474,7 @@ pub fn probe_infrastructure_health_with_embedding_device(
             "project-local SQLite FTS root {}",
             layout.lexical_data_dir.display()
         ),
-        qdrant_detail: qdrant_probe.map_or_else(
-            || "embedded SQLite vectors require no external service".into(),
-            |probe| probe.detail,
-        ),
+        qdrant_detail: "embedded SQLite vectors require no external service".into(),
         embed_detail: embed_probe.detail,
     }
 }
@@ -501,99 +494,6 @@ fn lexical_capabilities(
         semantic: false,
         graph: false,
     }
-}
-
-struct QdrantCapabilityProbe {
-    capabilities: SidecarCapabilities,
-    semantic_failure_reason: String,
-}
-
-#[cfg(test)]
-fn qdrant_capabilities(
-    layout: &SidecarLayout,
-    collection: &str,
-    probe: &crate::qdrant_client::QdrantHealthProbe,
-    expected_points: Option<u64>,
-    product_embedding_backend: bool,
-    current_product_embedding_backend: bool,
-) -> QdrantCapabilityProbe {
-    qdrant_capabilities_for_runtime(
-        layout,
-        collection,
-        probe,
-        expected_points,
-        product_embedding_backend,
-        current_product_embedding_backend,
-        &crate::config::SidecarRuntimeConfig::local(),
-    )
-}
-
-fn qdrant_capabilities_for_runtime(
-    layout: &SidecarLayout,
-    collection: &str,
-    probe: &crate::qdrant_client::QdrantHealthProbe,
-    expected_points: Option<u64>,
-    product_embedding_backend: bool,
-    current_product_embedding_backend: bool,
-    runtime: &crate::config::SidecarRuntimeConfig,
-) -> QdrantCapabilityProbe {
-    if !probe.reachable || !probe.collection_exists {
-        return qdrant_capability_failure("qdrant_unreachable");
-    }
-    if qdrant_point_count_incomplete(probe, expected_points) {
-        return qdrant_capability_failure("qdrant_point_count_incomplete");
-    }
-    if QdrantClient::is_collection_stubbed(&layout.qdrant_data_dir, collection) {
-        return qdrant_capability_failure("qdrant_hash_vectors_only");
-    }
-    if !product_embedding_backend {
-        return qdrant_capability_failure("qdrant_non_product_embedding_backend");
-    }
-    if !current_product_embedding_backend {
-        return qdrant_capability_failure("qdrant_current_embedding_backend_not_product");
-    }
-    let client = match QdrantClient::for_runtime(runtime) {
-        Ok(client) => client,
-        Err(error) => {
-            return qdrant_capability_failure(format!("embedding_runtime_unavailable: {error:#}"));
-        }
-    };
-    match client.semantic_search_smoke_result(collection) {
-        Ok(()) => QdrantCapabilityProbe {
-            capabilities: SidecarCapabilities {
-                lexical: false,
-                semantic: true,
-                graph: false,
-            },
-            semantic_failure_reason: "none".into(),
-        },
-        Err(error) => {
-            let detail = format!("{error:#}");
-            let reason = if detail.contains("llama.cpp embeddings") {
-                format!("embedding_runtime_unavailable: {detail}")
-            } else {
-                "qdrant_semantic_smoke_failed".into()
-            };
-            qdrant_capability_failure(reason)
-        }
-    }
-}
-
-fn qdrant_capability_failure(reason: impl Into<String>) -> QdrantCapabilityProbe {
-    QdrantCapabilityProbe {
-        capabilities: SidecarCapabilities::NONE,
-        semantic_failure_reason: reason.into(),
-    }
-}
-
-fn qdrant_point_count_incomplete(
-    probe: &crate::qdrant_client::QdrantHealthProbe,
-    expected_points: Option<u64>,
-) -> bool {
-    matches!(
-        (probe.point_count, expected_points),
-        (Some(actual), Some(expected)) if actual < expected
-    )
 }
 
 fn scip_capabilities(availability: &ScipAvailability, project_dir: &Path) -> SidecarCapabilities {
@@ -736,19 +636,9 @@ pub fn probe_sidecar_health_for_runtime(
         .dense_projection_count
         .or(manifest.projection_count)
         .unwrap_or(0);
-    let vector_backend = runtime.ensure_vector_backend_configured();
-    let qdrant = if let Err(error) = vector_backend {
-        ComponentHealth {
-            name: "semantic".into(),
-            status: ComponentStatus::Unavailable,
-            latency_ms: None,
-            detail: error.to_string(),
-            degraded_reason: Some("vector_backend_configuration_invalid".into()),
-            capabilities: SidecarCapabilities::NONE,
-        }
-    } else if dense_anchor_count == 0 {
-        zero_dense_qdrant_health(embedding_device)
-    } else if runtime.vector_backend() == VectorBackend::Embedded {
+    let semantic = if dense_anchor_count == 0 {
+        zero_dense_semantic_health(embedding_device)
+    } else {
         let collection = manifest.qdrant_collection.clone();
         let expected_points = u64::try_from(dense_anchor_count).unwrap_or(u64::MAX);
         let embedded = EmbeddedVectorIndex::health(
@@ -801,72 +691,6 @@ pub fn probe_sidecar_health_for_runtime(
                 SidecarCapabilities::NONE
             },
         }
-    } else {
-        let collection = manifest.qdrant_collection.clone();
-        let qdrant_probe = QdrantClient::new(layout).health_probe(&collection);
-        let expected_qdrant_points = Some(u64::try_from(dense_anchor_count).unwrap_or(u64::MAX));
-        let qdrant_point_count_incomplete =
-            qdrant_point_count_incomplete(&qdrant_probe, expected_qdrant_points);
-        let product_embedding_backend =
-            manifest_embedding_backend_is_product(manifest.embedding_backend.as_deref());
-        let current_product_embedding_backend =
-            manifest_embedding_backend_is_product(Some(current_embedding_backend.as_str()));
-        let qdrant_capability_probe = qdrant_capabilities_for_runtime(
-            layout,
-            &collection,
-            &qdrant_probe,
-            expected_qdrant_points,
-            product_embedding_backend,
-            current_product_embedding_backend,
-            runtime,
-        );
-        let qdrant_semantic_stub = qdrant_probe.reachable
-            && qdrant_probe.collection_exists
-            && !qdrant_capability_probe.capabilities.semantic;
-        let qdrant_device_unverified = qdrant_probe.reachable
-            && qdrant_probe.collection_exists
-            && product_embedding_backend
-            && current_product_embedding_backend
-            && !embedding_device.full_retrieval_allowed;
-        ComponentHealth {
-            name: "semantic".into(),
-            status: if !qdrant_probe.reachable {
-                ComponentStatus::Unavailable
-            } else if !qdrant_probe.collection_exists
-                || qdrant_device_unverified
-                || qdrant_semantic_stub
-            {
-                ComponentStatus::Degraded
-            } else if qdrant_probe.latency_ms <= QDRANT_HEALTH_BUDGET.as_millis() as u64 {
-                ComponentStatus::Healthy
-            } else {
-                ComponentStatus::Degraded
-            },
-            latency_ms: Some(qdrant_probe.latency_ms),
-            detail: qdrant_probe.detail,
-            degraded_reason: if !qdrant_probe.reachable {
-                Some("qdrant_unreachable".into())
-            } else if !qdrant_probe.collection_exists {
-                Some("qdrant_collection_missing".into())
-            } else if qdrant_point_count_incomplete {
-                Some("qdrant_point_count_incomplete".into())
-            } else if !product_embedding_backend {
-                Some("qdrant_non_product_embedding_backend".into())
-            } else if !current_product_embedding_backend {
-                Some("qdrant_current_embedding_backend_not_product".into())
-            } else if qdrant_device_unverified {
-                embedding_device.degraded_reason.clone()
-            } else if qdrant_semantic_stub {
-                Some(qdrant_capability_probe.semantic_failure_reason)
-            } else {
-                None
-            },
-            capabilities: if qdrant_device_unverified {
-                SidecarCapabilities::NONE
-            } else {
-                qdrant_capability_probe.capabilities
-            },
-        }
     };
 
     let scip_project_dir = layout.scip_project_dir(sidecar_generation);
@@ -892,7 +716,8 @@ pub fn probe_sidecar_health_for_runtime(
         capabilities: scip_capabilities,
     };
 
-    let (live_mode, degraded_reason) = crate::mode::derive_degraded_mode(&lexical, &qdrant, &scip);
+    let (live_mode, degraded_reason) =
+        crate::mode::derive_degraded_mode(&lexical, &semantic, &scip);
     let retrieval_mode = if manifest_classifies_full(&manifest) {
         "full"
     } else {
@@ -924,14 +749,14 @@ pub fn probe_sidecar_health_for_runtime(
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch: None,
         lexical,
-        qdrant,
+        qdrant: semantic,
         scip,
         manifest_contract: None,
         manifest: Some(manifest),
     }
 }
 
-fn zero_dense_qdrant_health(
+fn zero_dense_semantic_health(
     embedding_device: &crate::embeddings::EmbeddingDeviceReadiness,
 ) -> ComponentHealth {
     if !embedding_device.full_retrieval_allowed {
@@ -967,33 +792,6 @@ mod tests {
     use crate::lexical_index::{build_lexical_shard, lexical_input_fingerprint, shard_dir_for};
     use crate::test_support::retrieval_manifest_fixture;
     use tempfile::TempDir;
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard hold crate::test_support::env_lock() and restore the prior value on drop.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests using this guard hold crate::test_support::env_lock() and restore the prior value on drop.
-            unsafe {
-                if let Some(value) = self.previous.as_ref() {
-                    std::env::set_var(self.key, value);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
 
     #[test]
     fn repair_hint_names_reason_and_full_sidecar_rebuild_sequence() {
@@ -1053,7 +851,7 @@ mod tests {
         let manifest = codestory_store::RetrievalIndexManifest {
             project_id: "testproject".into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-            qdrant_collection: QdrantClient::collection_name("testproject"),
+            qdrant_collection: "codestory_testproject".into(),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,
             disk_bytes: None,
@@ -1187,23 +985,8 @@ mod tests {
     }
 
     #[test]
-    fn qdrant_point_count_gap_blocks_semantic_capability() {
-        let probe = crate::qdrant_client::QdrantHealthProbe {
-            reachable: true,
-            latency_ms: 1,
-            collection_exists: true,
-            point_count: Some(10),
-            detail: "http 200 points_count=10".into(),
-        };
-
-        assert!(qdrant_point_count_incomplete(&probe, Some(11)));
-        assert!(!qdrant_point_count_incomplete(&probe, Some(10)));
-        assert!(!qdrant_point_count_incomplete(&probe, None));
-    }
-
-    #[test]
     fn zero_dense_manifest_still_requires_verified_embedding_device() {
-        let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
+        let semantic = zero_dense_semantic_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
             observed_state: "unknown",
             observation_source: "sidecar_unobserved",
@@ -1217,12 +1000,12 @@ mod tests {
             degraded_reason: Some("embedding_device_unverified".into()),
         });
 
-        assert_eq!(qdrant.status, ComponentStatus::Degraded);
+        assert_eq!(semantic.status, ComponentStatus::Degraded);
         assert_eq!(
-            qdrant.degraded_reason.as_deref(),
+            semantic.degraded_reason.as_deref(),
             Some("embedding_device_unverified")
         );
-        assert!(!qdrant.capabilities.semantic);
+        assert!(!semantic.capabilities.semantic);
     }
 
     #[test]
@@ -1253,7 +1036,7 @@ mod tests {
 
     #[test]
     fn zero_dense_manifest_allows_explicit_cpu_opt_in() {
-        let qdrant = zero_dense_qdrant_health(&crate::embeddings::EmbeddingDeviceReadiness {
+        let semantic = zero_dense_semantic_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "cpu_allowed",
             observed_state: "cpu",
             observation_source: "cpu_policy",
@@ -1267,66 +1050,9 @@ mod tests {
             degraded_reason: None,
         });
 
-        assert_eq!(qdrant.status, ComponentStatus::Healthy);
-        assert_eq!(qdrant.degraded_reason, None);
-        assert!(qdrant.capabilities.semantic);
-    }
-
-    #[test]
-    fn qdrant_capability_requires_product_current_backend() {
-        let layout = SidecarLayout::from_env();
-        let probe = crate::qdrant_client::QdrantHealthProbe {
-            reachable: true,
-            latency_ms: 1,
-            collection_exists: true,
-            point_count: Some(10),
-            detail: "http 200 points_count=10".into(),
-        };
-
-        let result = qdrant_capabilities(&layout, "codestory_test", &probe, Some(10), true, false);
-
-        assert_eq!(result.capabilities, SidecarCapabilities::NONE);
-        assert_eq!(
-            result.semantic_failure_reason,
-            "qdrant_current_embedding_backend_not_product"
-        );
-    }
-
-    #[test]
-    fn qdrant_capability_names_dead_embedding_runtime_before_smoke() {
-        let _lock = crate::test_support::env_lock();
-        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
-        let _url = EnvGuard::set(
-            "CODESTORY_EMBED_LLAMACPP_URL",
-            "http://127.0.0.1:9/v1/embeddings",
-        );
-        let root = TempDir::new().expect("temp dir");
-        let layout = SidecarLayout {
-            qdrant_http_port: 16333,
-            qdrant_grpc_port: 16334,
-            lexical_data_dir: root.path().join("lexical"),
-            qdrant_data_dir: root.path().join("qdrant"),
-            scip_artifacts_root: root.path().join("scip"),
-            state_file: root.path().join("retrieval-sidecars.json"),
-        };
-        let probe = crate::qdrant_client::QdrantHealthProbe {
-            reachable: true,
-            latency_ms: 1,
-            collection_exists: true,
-            point_count: Some(10),
-            detail: "http 200 points_count=10".into(),
-        };
-
-        let result = qdrant_capabilities(&layout, "codestory_test", &probe, Some(10), true, true);
-
-        assert_eq!(result.capabilities, SidecarCapabilities::NONE);
-        assert!(
-            result
-                .semantic_failure_reason
-                .starts_with("embedding_runtime_unavailable:"),
-            "unexpected reason: {}",
-            result.semantic_failure_reason
-        );
+        assert_eq!(semantic.status, ComponentStatus::Healthy);
+        assert_eq!(semantic.degraded_reason, None);
+        assert!(semantic.capabilities.semantic);
     }
 
     #[test]
@@ -1338,7 +1064,7 @@ mod tests {
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,
             disk_bytes: Some(42),
-            degraded_modes_json: r#"["qdrant_hash_vectors_only"]"#.into(),
+            degraded_modes_json: r#"["embedded_vector_index_unavailable"]"#.into(),
             embedding_backend: Some("llamacpp:bge-base-en-v1.5".into()),
             embedding_dim: Some(768),
             sidecar_schema_version: Some(crate::generation::SIDECAR_SCHEMA_VERSION),
@@ -1389,7 +1115,7 @@ mod tests {
                 },
             },
             qdrant: ComponentHealth {
-                name: "qdrant".into(),
+                name: "semantic".into(),
                 status: ComponentStatus::Healthy,
                 latency_ms: Some(1),
                 detail: "ok".into(),
@@ -1434,7 +1160,10 @@ mod tests {
         assert_eq!(contract.graph_hash.as_deref(), Some("graph-hash"));
         assert_eq!(contract.symbol_doc_count, Some(9));
         assert_eq!(contract.dense_anchor_count, Some(3));
-        assert_eq!(contract.degraded_modes, vec!["qdrant_hash_vectors_only"]);
+        assert_eq!(
+            contract.degraded_modes,
+            vec!["embedded_vector_index_unavailable"]
+        );
         assert_eq!(contract.lanes.len(), 5);
         assert!(contract.lanes.iter().any(|lane| {
             lane.lane == "lexical"
@@ -1444,7 +1173,7 @@ mod tests {
         assert!(contract.lanes.iter().any(|lane| {
             lane.lane == "semantic_dense"
                 && lane.producer == "llamacpp:bge-base-en-v1.5"
-                && lane.provenance == "qdrant_collection:codestory_testproject_hash"
+                && lane.provenance == "vector_generation:codestory_testproject_hash"
                 && lane.count == Some(3)
         }));
         assert!(contract.lanes.iter().any(|lane| {

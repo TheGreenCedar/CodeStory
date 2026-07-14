@@ -1486,7 +1486,7 @@ fn strict_readiness_unavailable_reason_for_runtime(
             )));
         }
     }
-    let embedding_dim = i32::try_from(crate::embeddings::qdrant_vector_dim())
+    let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     let current_input = compute_sidecar_input_fingerprint_for_runtime(
         storage,
@@ -1623,7 +1623,7 @@ fn default_embedding_device_observation_source() -> String {
 mod tests {
     use super::*;
     use crate::generation::{
-        SIDECAR_SCHEMA_VERSION, sidecar_generation_id, sidecar_qdrant_collection,
+        SIDECAR_SCHEMA_VERSION, sidecar_generation_id, sidecar_vector_generation,
     };
     use crate::index::project_id_for_root;
     use crate::test_support::retrieval_manifest_fixture;
@@ -3034,7 +3034,7 @@ mod tests {
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: project_id.clone(),
                 lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-                qdrant_collection: sidecar_qdrant_collection(&project_id, &input.hash),
+                qdrant_collection: sidecar_vector_generation(&project_id, &input.hash),
                 scip_revision: Some("graph-test".into()),
                 built_at_epoch_ms: indexed_mtime,
                 disk_bytes: None,

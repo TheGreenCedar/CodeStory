@@ -1,6 +1,6 @@
-//! Query embeddings for Qdrant plus diagnostic document embedding helpers.
+//! Query embeddings plus diagnostic document embedding helpers.
 //!
-//! Product Qdrant indexing copies stored local semantic-document vectors. The live sidecar still
+//! Product semantic indexing copies stored local document vectors. The live sidecar
 //! uses **BAAI/bge-base-en-v1.5** (768-dim) via llama.cpp `/v1/embeddings` for query vectors and
 //! semantic smoke checks.
 
@@ -17,7 +17,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// bge-base-en-v1.5 vector width (must match Qdrant collection and llama.cpp model).
+/// bge-base-en-v1.5 vector width shared by stored vectors and the llama.cpp model.
 pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
 
 /// GGUF filename under `CODESTORY_EMBED_MODEL_DIR` (see docker/retrieval-compose.yml).
@@ -1607,7 +1607,7 @@ pub fn label_to_vector(label: &str) -> Vec<f32> {
     (0..8).map(|index| digest[index] as f32 / 255.0).collect()
 }
 
-pub fn qdrant_vector_dim() -> usize {
+pub fn semantic_vector_dim() -> usize {
     RETRIEVAL_EMBEDDING_DIM
 }
 
@@ -1940,7 +1940,7 @@ mod tests {
     }
 
     #[test]
-    fn default_qdrant_semantic_vectors_are_768() {
+    fn default_semantic_vectors_are_768() {
         let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::remove("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS");
         let _guard2 = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
@@ -1949,7 +1949,7 @@ mod tests {
             embedding_runtime_id_for_runtime(&runtime),
             PRODUCT_EMBEDDING_RUNTIME_ID
         );
-        assert_eq!(qdrant_vector_dim(), RETRIEVAL_EMBEDDING_DIM);
+        assert_eq!(semantic_vector_dim(), RETRIEVAL_EMBEDDING_DIM);
     }
 
     #[test]

@@ -3,7 +3,6 @@ use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embedded_vector::EmbeddedVectorIndex;
 use crate::embeddings::EmbeddingDeviceReadiness;
 use crate::lexical_client::LexicalClient;
-use crate::qdrant_client::QdrantClient;
 use crate::scip_client::ScipClient;
 use anyhow::Result;
 use codestory_store::RetrievalIndexManifest;
@@ -80,7 +79,7 @@ pub trait SidecarSearch: Send + Sync {
     }
 
     fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
-    fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
+    fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>>;
 
@@ -93,13 +92,13 @@ pub trait SidecarSearch: Send + Sync {
         context.run(|| self.lexical_search(query, limit))
     }
 
-    fn qdrant_search_with_context(
+    fn semantic_search_with_context(
         &self,
         query: &str,
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        context.run(|| self.qdrant_search(query, limit))
+        context.run(|| self.semantic_search(query, limit))
     }
 
     fn scip_anchor_with_context(
@@ -128,16 +127,9 @@ pub struct LiveSidecarSearch {
     project_id: String,
     sidecar_generation: String,
     sidecar_input_hash: String,
-    qdrant_collection: String,
     embedding_device: Option<EmbeddingDeviceReadiness>,
     lexical: LexicalClient,
-    semantic: SemanticSearch,
-}
-
-#[derive(Debug, Clone)]
-enum SemanticSearch {
-    Embedded(EmbeddedVectorIndex),
-    ExternalQdrant(QdrantClient),
+    semantic: EmbeddedVectorIndex,
 }
 
 impl LiveSidecarSearch {
@@ -183,30 +175,22 @@ impl LiveSidecarSearch {
         let sidecar_input_hash = manifest
             .and_then(|manifest| manifest.sidecar_input_hash.clone())
             .unwrap_or_else(|| "missing-manifest".to_string());
-        let qdrant_collection = manifest
+        let vector_generation = manifest
             .map(|manifest| manifest.qdrant_collection.clone())
             .unwrap_or_else(|| format!("codestory_{project_id}_missing_manifest"));
-        let semantic = match runtime.ensure_vector_backend_configured()? {
-            crate::config::VectorBackend::Embedded => {
-                SemanticSearch::Embedded(EmbeddedVectorIndex::open(
-                    &layout,
-                    &qdrant_collection,
-                    &sidecar_generation,
-                    &sidecar_input_hash,
-                    crate::embeddings::LlamaCppEmbeddingClient::new(&runtime.embedding)?,
-                ))
-            }
-            crate::config::VectorBackend::ExternalQdrant => {
-                SemanticSearch::ExternalQdrant(QdrantClient::for_runtime(runtime)?)
-            }
-        };
+        let semantic = EmbeddedVectorIndex::open(
+            &layout,
+            &vector_generation,
+            &sidecar_generation,
+            &sidecar_input_hash,
+            crate::embeddings::LlamaCppEmbeddingClient::new(&runtime.embedding)?,
+        );
         Ok(Self {
             runtime: runtime.clone(),
             layout,
             project_id,
             sidecar_generation,
             sidecar_input_hash,
-            qdrant_collection,
             embedding_device,
             lexical,
             semantic,
@@ -266,27 +250,17 @@ impl SidecarSearch for LiveSidecarSearch {
         )
     }
 
-    fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
-        match &self.semantic {
-            SemanticSearch::Embedded(index) => index.search(query, limit),
-            SemanticSearch::ExternalQdrant(client) => {
-                client.search(&self.qdrant_collection, query, limit)
-            }
-        }
+    fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+        self.semantic.search(query, limit)
     }
 
-    fn qdrant_search_with_context(
+    fn semantic_search_with_context(
         &self,
         query: &str,
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        match &self.semantic {
-            SemanticSearch::Embedded(index) => index.search_with_context(query, limit, context),
-            SemanticSearch::ExternalQdrant(client) => {
-                client.search_with_context(&self.qdrant_collection, query, limit, context)
-            }
-        }
+        self.semantic.search_with_context(query, limit, context)
     }
 
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
@@ -337,7 +311,7 @@ pub mod mock {
     #[derive(Debug, Default)]
     pub struct MockSidecarSearch {
         pub lexical: Mutex<HashMap<String, Vec<CandidateHit>>>,
-        pub qdrant: Mutex<HashMap<String, Vec<CandidateHit>>>,
+        pub semantic: Mutex<HashMap<String, Vec<CandidateHit>>>,
         pub scip_anchor: Mutex<HashMap<String, Vec<CandidateHit>>>,
         pub scip_expand: Mutex<Vec<CandidateHit>>,
     }
@@ -368,11 +342,11 @@ pub mod mock {
                 .collect())
         }
 
-        fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+        fn semantic_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
             Ok(self
-                .qdrant
+                .semantic
                 .lock()
-                .expect("qdrant lock")
+                .expect("semantic lock")
                 .get(query)
                 .cloned()
                 .unwrap_or_default()
