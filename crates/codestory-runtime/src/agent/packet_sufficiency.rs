@@ -403,10 +403,7 @@ fn unresolved_sidecar_queries(answer: &AgentAnswerDto) -> Vec<String> {
 }
 
 fn sidecar_diagnostic_blocks_sufficiency(diagnostic: &PacketSidecarQueryDiagnosticDto) -> bool {
-    if diagnostic.candidate_count > 0
-        && diagnostic.resolved_hit_count == 0
-        && diagnostic.unresolved_candidate_count > 0
-    {
+    if diagnostic.blocking_unresolved_candidate_count > 0 {
         return true;
     }
     diagnostic
@@ -2361,6 +2358,7 @@ mod tests {
             candidate_count: 1,
             resolved_hit_count: 0,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
             diagnostic: Some("unresolved test candidate".to_string()),
         }
     }
@@ -2378,6 +2376,7 @@ mod tests {
             candidate_count: 0,
             resolved_hit_count: 0,
             unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
             diagnostic: Some(
                 "sidecar query has blocking cancel reason `stage_deadline`".to_string(),
             ),
@@ -4106,11 +4105,13 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_sidecar_diagnostics_block_when_required_coverage_is_missing() {
+    fn mixed_sidecar_diagnostics_block_when_required_coverage_is_missing() {
         let question = "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.";
         let mut answer = answer_fixture(question);
-        answer.retrieval_trace.packet_sidecar_diagnostics =
-            vec![unresolved_sidecar_diagnostic("response finalization")];
+        let mut diagnostic = unresolved_sidecar_diagnostic("response finalization");
+        diagnostic.candidate_count = 2;
+        diagnostic.resolved_hit_count = 1;
+        answer.retrieval_trace.packet_sidecar_diagnostics = vec![diagnostic];
         let budget = budget_fixture();
         let claims = vec![
             claim(

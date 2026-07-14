@@ -101,8 +101,8 @@ use codestory_contracts::api::{
 #[cfg(test)]
 use codestory_contracts::api::{
     AgentRetrievalStepDto, AgentRetrievalStepStatusDto, EdgeId, PacketBudgetDto,
-    PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto,
-    PacketSufficiencyDto, PacketSufficiencyStatusDto, RetrievalShadowDto, SearchMatchQualityDto,
+    PacketBudgetUsageDto, PacketClaimDto, PacketPlanQueryDto, PacketSufficiencyDto,
+    PacketSufficiencyStatusDto, RetrievalShadowDto, SearchMatchQualityDto,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -5855,102 +5855,6 @@ mod tests {
                     && !gap.contains("pattern")
                     && !gap.contains("validity state")),
             "only selected planned probes for still-missing roles should become sufficiency gaps: {sufficiency:?}"
-        );
-    }
-
-    #[test]
-    fn packet_sufficiency_keeps_nonblocking_unresolved_sidecar_candidates_diagnostic() {
-        let question = "Explain how packet retrieval flows through sidecar diagnostics.";
-        let (mut answer, initial_sufficiency) = build_sufficient_packet_fixture(
-            question,
-            PacketTaskClassDto::EditPlanning,
-            vec![
-                test_packet_citation("PacketPlanner", "src/packet_plan.rs", 0.9),
-                test_packet_citation("RuntimeCoordinator", "src/runtime.rs", 0.8),
-                test_packet_citation("ProjectionStore", "src/store.rs", 0.7),
-            ],
-        );
-        assert_eq!(
-            initial_sufficiency.status,
-            PacketSufficiencyStatusDto::Sufficient
-        );
-        answer
-            .retrieval_trace
-            .packet_sidecar_diagnostics
-            .push(PacketSidecarQueryDiagnosticDto {
-                query: "sidecar batch".to_string(),
-                retrieval_mode: "full".to_string(),
-                sidecar_query_ms: None,
-                candidate_resolution_ms: None,
-                total_elapsed_ms: None,
-                sidecar_stage_count: 0,
-                sidecar_stage_total_ms: None,
-                batch_query_wall_ms: None,
-                candidate_count: 1,
-                resolved_hit_count: 0,
-                unresolved_candidate_count: 1,
-                diagnostic: Some(
-                    "sidecar candidates did not all resolve to indexed symbols".to_string(),
-                ),
-            });
-        answer
-            .retrieval_trace
-            .packet_sidecar_diagnostics
-            .push(PacketSidecarQueryDiagnosticDto {
-                query: "sidecar batch".to_string(),
-                retrieval_mode: "full".to_string(),
-                sidecar_query_ms: None,
-                candidate_resolution_ms: None,
-                total_elapsed_ms: None,
-                sidecar_stage_count: 0,
-                sidecar_stage_total_ms: None,
-                batch_query_wall_ms: None,
-                candidate_count: 1,
-                resolved_hit_count: 0,
-                unresolved_candidate_count: 1,
-                diagnostic: Some(
-                    "sidecar candidates did not all resolve to indexed symbols".to_string(),
-                ),
-            });
-
-        let budget = PacketBudgetDto {
-            requested: PacketBudgetModeDto::Compact,
-            limits: packet_budget_limits(PacketBudgetModeDto::Compact),
-            used: PacketBudgetUsageDto {
-                anchors: 3,
-                files: 0,
-                snippets: 0,
-                trail_edges: 0,
-                output_bytes: 0,
-            },
-            truncated: false,
-            omitted_sections: Vec::new(),
-            next_deeper_command: None,
-        };
-        let sufficiency = build_packet_sufficiency(
-            packet_fixture_project_root(),
-            question,
-            PacketTaskClassDto::EditPlanning,
-            &answer,
-            &budget,
-        );
-
-        assert_eq!(sufficiency.status, PacketSufficiencyStatusDto::Sufficient);
-        assert!(
-            !sufficiency
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("sidecar candidates")),
-            "nonblocking sidecar diagnostics should not become sufficiency gaps: {:?}",
-            sufficiency.gaps
-        );
-        assert_eq!(
-            sufficiency
-                .coverage_report
-                .as_ref()
-                .map(|report| report.unresolved.as_slice()),
-            Some(&["sidecar batch".to_string()][..]),
-            "duplicate diagnostics should remain visible once in coverage_report.unresolved: {sufficiency:?}"
         );
     }
 

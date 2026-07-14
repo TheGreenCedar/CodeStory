@@ -63,6 +63,9 @@
 - Treated real file-level lexical hits for known config, data, and documentation
   formats as diagnostic when the same retrieval has resolved graph evidence,
   and limited unresolved counts to candidates the resolver actually attempted.
+  Graph-projection semantic hits now preserve exact node identities and omit
+  unresolvable unknown nodes; existing sidecar generations rebuild once for the
+  updated artifact schema.
   Source misses, unresolved symbols, and invalid paths remain blocking, with
   the first blocker retained in capped diagnostics.
 - Kept compact search-flow packets focused on executable symbols and preserved

@@ -589,8 +589,8 @@ pub(crate) struct SidecarPacketBatchOutcome {
 
 pub(crate) struct SidecarCandidateResolutionOutcome {
     pub(crate) resolved_hits: Vec<SearchHit>,
-    attempted_candidate_count: usize,
     unresolved_candidate_count: usize,
+    blocking_unresolved_candidate_count: usize,
     attempted_candidate_indices: HashSet<usize>,
 }
 
@@ -616,10 +616,15 @@ fn packet_sidecar_query_diagnostic(
         sidecar_stage_count: u32::try_from(stage_timings.len()).unwrap_or(u32::MAX),
         sidecar_stage_total_ms: Some(sidecar_stage_total_ms),
         batch_query_wall_ms: Some(batch_query_wall_ms),
-        candidate_count: u32::try_from(resolution.attempted_candidate_count).unwrap_or(u32::MAX),
+        candidate_count: u32::try_from(resolution.attempted_candidate_indices.len())
+            .unwrap_or(u32::MAX),
         resolved_hit_count: u32::try_from(resolution.resolved_hits.len()).unwrap_or(u32::MAX),
         unresolved_candidate_count: u32::try_from(resolution.unresolved_candidate_count)
             .unwrap_or(u32::MAX),
+        blocking_unresolved_candidate_count: u32::try_from(
+            resolution.blocking_unresolved_candidate_count,
+        )
+        .unwrap_or(u32::MAX),
         diagnostic: sidecar_blocking_cancel_reason(query_result)
             .map(|reason| format!("sidecar query has blocking cancel reason `{reason}`"))
             .or_else(|| {
@@ -786,7 +791,7 @@ pub(crate) fn shadow_from_query_result_with_candidate_admission_diagnostics(
     );
     shadow_from_query_result_with_counts_and_resolution_labels(
         result,
-        resolution.attempted_candidate_count,
+        resolution.attempted_candidate_indices.len(),
         resolution.resolved_hits.len(),
         &resolution_labels,
         &admission_labels,
@@ -1524,10 +1529,9 @@ pub(crate) fn resolve_sidecar_candidates_with_stats(
     let project_root = controller.require_project_root()?;
     let node_names = controller.state.lock().node_names.clone();
     let mut hits = Vec::new();
-    let mut attempted_candidate_count = 0;
-    let mut unresolved_candidate_count = 0;
+    let mut unresolved_candidates = Vec::new();
     let mut attempted_candidate_indices = HashSet::new();
-    let mut seen = HashMap::<String, ()>::new();
+    let mut seen = HashSet::new();
     let mut ordered: Vec<(usize, &CandidateHit)> = candidates
         .iter()
         .enumerate()
@@ -1548,24 +1552,27 @@ pub(crate) fn resolve_sidecar_candidates_with_stats(
         if hits.len() >= max_results {
             break;
         }
-        attempted_candidate_count += 1;
         attempted_candidate_indices.insert(candidate_index);
         let rel_path = normalize_repo_relative_path(&project_root, &candidate.file_path);
         let Some(node_id) =
             resolve_candidate_node_id(&storage, &node_names, &project_root, &rel_path, candidate)
         else {
-            unresolved_candidate_count += 1;
+            let label = if candidate_path_resolvable(&project_root, &candidate.file_path) {
+                "node_unresolved"
+            } else {
+                "path_unresolvable"
+            };
+            unresolved_candidates.push((candidate, label));
             continue;
         };
         let dedupe_key = node_id.0.to_string();
-        if seen.contains_key(&dedupe_key) {
+        if !seen.insert(dedupe_key) {
             continue;
         }
-        seen.insert(dedupe_key, ());
         let Some(mut hit) =
             AppController::build_search_hit(&storage, &node_names, node_id, candidate.score)
         else {
-            unresolved_candidate_count += 1;
+            unresolved_candidates.push((candidate, "hit_build_failed"));
             continue;
         };
         hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
@@ -1573,10 +1580,19 @@ pub(crate) fn resolve_sidecar_candidates_with_stats(
         hits.push(hit);
     }
 
+    let has_resolved_hit = !hits.is_empty();
+    let unresolved_candidate_count = unresolved_candidates.len();
+    let blocking_unresolved_candidate_count = unresolved_candidates
+        .iter()
+        .filter(|(candidate, label)| {
+            !unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
+        })
+        .count();
+
     Ok(SidecarCandidateResolutionOutcome {
         resolved_hits: hits,
-        attempted_candidate_count,
         unresolved_candidate_count,
+        blocking_unresolved_candidate_count,
         attempted_candidate_indices,
     })
 }
@@ -1920,8 +1936,8 @@ mod tests {
         };
         let resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
-            attempted_candidate_count: 1,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
             attempted_candidate_indices: HashSet::from([0]),
         };
 
@@ -2775,8 +2791,8 @@ mod tests {
         };
         let empty_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
-            attempted_candidate_count: 0,
             unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::new(),
         };
         let empty_diagnostic =
@@ -2807,8 +2823,8 @@ mod tests {
         };
         let unresolved_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
-            attempted_candidate_count: 1,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
             attempted_candidate_indices: HashSet::from([0]),
         };
         let unresolved_diagnostic =
@@ -2844,8 +2860,8 @@ mod tests {
         };
         let cancelled_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: vec![search_hit_for_candidate(&cancelled.hits[0])],
-            attempted_candidate_count: 1,
             unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
             attempted_candidate_indices: HashSet::from([0]),
         };
         let cancelled_diagnostic =
@@ -2943,7 +2959,7 @@ mod tests {
 
         let resolution = resolve_sidecar_candidates_with_stats(&controller, &query_result.hits, 1)
             .expect("resolve sidecar candidates");
-        assert_eq!(resolution.attempted_candidate_count, 1);
+        assert_eq!(resolution.attempted_candidate_indices.len(), 1);
         assert_eq!(resolution.resolved_hits.len(), 1);
         assert_eq!(resolution.unresolved_candidate_count, 0);
 
@@ -2955,6 +2971,20 @@ mod tests {
             diagnostic.diagnostic.is_none(),
             "capped-away candidates should not create unresolved diagnostics: {diagnostic:?}"
         );
+
+        let mixed_resolution =
+            resolve_sidecar_candidates_with_stats(&controller, &query_result.hits, 2)
+                .expect("resolve mixed sidecar candidates");
+        assert_eq!(mixed_resolution.attempted_candidate_indices.len(), 2);
+        assert_eq!(mixed_resolution.resolved_hits.len(), 1);
+        assert_eq!(mixed_resolution.unresolved_candidate_count, 1);
+        assert_eq!(mixed_resolution.blocking_unresolved_candidate_count, 1);
+
+        let mixed_diagnostic =
+            packet_sidecar_query_diagnostic(&query_result, &mixed_resolution, 1, 0, 1);
+        assert_eq!(mixed_diagnostic.resolved_hit_count, 1);
+        assert_eq!(mixed_diagnostic.unresolved_candidate_count, 1);
+        assert_eq!(mixed_diagnostic.blocking_unresolved_candidate_count, 1);
     }
 
     #[test]

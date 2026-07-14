@@ -206,7 +206,11 @@ fn symbol_to_hit(
 ) -> super::CandidateHit {
     use super::candidate::{CandidateHit, CandidateSource};
     CandidateHit {
-        node_id: None,
+        node_id: if provenance == SCIP_GRAPH_PROJECTION_PROVENANCE {
+            symbol.node_id.clone()
+        } else {
+            None
+        },
         file_path: symbol.path.clone(),
         symbol_name: Some(symbol.symbol.clone()),
         start_line: Some(symbol.start_line),
@@ -504,6 +508,7 @@ mod tests {
 
     fn imported_symbol() -> ScipSymbolRecord {
         ScipSymbolRecord {
+            node_id: Some("forged-graph-node".into()),
             path: "src/lib.rs".into(),
             symbol: "fixture_package::run".into(),
             start_line: 3,
@@ -554,6 +559,7 @@ mod tests {
         let mut symbols = Vec::new();
         for index in 0..12 {
             symbols.push(ScipSymbolRecord {
+                node_id: None,
                 path: format!("src/needle/noise_{index}.ts"),
                 symbol: format!("noise_{index}"),
                 start_line: index + 1,
@@ -561,6 +567,7 @@ mod tests {
             });
         }
         symbols.push(ScipSymbolRecord {
+            node_id: None,
             path: "src/needle/target.ts".to_string(),
             symbol: "needle".to_string(),
             start_line: 99,
@@ -603,6 +610,7 @@ mod tests {
             ScipProofAdapterContract::graph_projection("graph-test"),
             (0..256)
                 .map(|index| ScipSymbolRecord {
+                    node_id: None,
                     path: format!("src/{index}.rs"),
                     symbol: format!("symbol_{index}"),
                     start_line: index + 1,
@@ -643,18 +651,21 @@ mod tests {
             ScipProofAdapterContract::graph_projection("graph-test"),
             vec![
                 ScipSymbolRecord {
+                    node_id: None,
                     path: "workspace/app/src/main.rs".to_string(),
                     symbol: "workspace_app::Cli".to_string(),
                     start_line: 15,
                     end_line: 15,
                 },
                 ScipSymbolRecord {
+                    node_id: None,
                     path: "workspace/tools/src/cli.rs".to_string(),
                     symbol: "Cli".to_string(),
                     start_line: 1,
                     end_line: 1,
                 },
                 ScipSymbolRecord {
+                    node_id: None,
                     path: "workspace/app/src/cli.rs".to_string(),
                     symbol: "Cli".to_string(),
                     start_line: 42,
@@ -746,6 +757,13 @@ mod tests {
         );
         assert_eq!(loaded.contract.freshness, "fresh");
         assert_eq!(loaded.proofs.len(), 2);
+        let hit = symbol_to_hit(
+            &loaded.symbols[0],
+            1.0,
+            0,
+            loaded.contract.provenance_label().expect("provenance"),
+        );
+        assert_eq!(hit.node_id, None);
 
         assert_eq!(
             loaded.contract.provenance_label(),

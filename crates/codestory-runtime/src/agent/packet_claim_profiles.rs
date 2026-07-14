@@ -636,7 +636,7 @@ fn request_dispatch_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
         && packet_source_has_any(ctx.source, &["headers", "data", "body"])
     {
         return Some(format!(
-            "`{}` transforms the body/headers and invokes the configured adapter.",
+            "`{}` transforms the body/headers and invokes the configured adapter, sending the request through that transport.",
             ctx.symbol
         ));
     }
@@ -656,10 +656,16 @@ fn interceptor_management_claim(ctx: &SourceClaimContext<'_>) -> Option<String> 
 }
 
 fn transport_adapter_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
-    if packet_source_has_all(ctx.source, &["adapter"])
-        && packet_source_has_all(ctx.source, &["xhr", "http"])
-        && packet_source_has_any(ctx.source, &["known", "environment", "platform"])
-    {
+    if packet_source_has_all(
+        ctx.source,
+        &[
+            "knownadapters",
+            "getadapter",
+            "return adapter",
+            "xhr",
+            "http",
+        ],
+    ) {
         return Some(format!(
             "`{}` selects xhr or http transport based on environment capabilities.",
             ctx.file_name
@@ -671,6 +677,9 @@ fn transport_adapter_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
 fn client_request_claim_for_citation(ctx: &SourceClaimContext<'_>) -> Option<String> {
     if let Some(claim) = client_request_pipeline_claim(ctx) {
         return Some(claim);
+    }
+    if ctx.kind == NodeKind::FILE {
+        return transport_adapter_claim(ctx);
     }
     match ctx.evidence_role {
         Some(PacketEvidenceRole::ClientFactory) => client_factory_claim(ctx),
@@ -2698,6 +2707,25 @@ mod tests {
                 .iter()
                 .any(|claim| claim.contains("interceptor handler pairs")),
             "an interceptor-owner constructor should retain its management claim: {interceptor_claims:?}"
+        );
+
+        let adapter_source = "const knownAdapters = { http, xhr }; function getAdapter(name) { const adapter = knownAdapters[name]; return adapter; }";
+        let adapter_helper = test_packet_citation("isResolvedHandle", "src/adapters/adapters.js");
+        let adapter_helper_claims =
+            packet_source_derived_claims_for_citation(prompt, &adapter_helper, adapter_source);
+        assert!(
+            adapter_helper_claims.is_empty(),
+            "a helper in an adapter directory must not inherit file-wide selection behavior: {adapter_helper_claims:?}"
+        );
+
+        let adapter_owner = test_packet_citation("getAdapter", "src/adapters/adapters.js");
+        let adapter_owner_claims =
+            packet_source_derived_claims_for_citation(prompt, &adapter_owner, adapter_source);
+        assert!(
+            adapter_owner_claims
+                .iter()
+                .any(|claim| claim.contains("transport based on environment capabilities")),
+            "the adapter selector should retain its selection claim: {adapter_owner_claims:?}"
         );
     }
 

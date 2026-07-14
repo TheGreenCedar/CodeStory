@@ -6,7 +6,8 @@ use crate::agent::eval_probes::{
 use crate::agent::packet_batch::packet_file_stem_matches_query;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management,
-    packet_citation_owns_request_pipeline, packet_evidence_role,
+    packet_citation_owns_request_pipeline, packet_citation_owns_transport_adapter,
+    packet_evidence_role,
 };
 use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
 use crate::agent::packet_scoring::{
@@ -925,9 +926,6 @@ pub(crate) fn packet_citation_satisfies_required_probe(
     if packet_citation_matches_required_coverage_role(query, citation) {
         return true;
     }
-    if packet_citation_matches_behavior_owning_required_probe(query, citation) {
-        return true;
-    }
     if let Some(matches_file_scoped_symbol) =
         packet_file_scoped_symbol_probe_matches(query, citation)
     {
@@ -1096,9 +1094,7 @@ fn packet_citation_matches_behavior_owning_required_probe(
         "requestinterceptor" | "interceptorhandlers" => {
             packet_citation_owns_interceptor_management(citation)
         }
-        "adapters" | "transportadapter" => {
-            packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::TransportAdapter])
-        }
+        "adapters" | "transportadapter" => packet_citation_owns_transport_adapter(citation),
         "searchentrypoint" => packet_citation_has_behavior_role(
             citation,
             &[
