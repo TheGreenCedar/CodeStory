@@ -59,6 +59,8 @@
 - SQLite lexical searches now validate immutable generation metadata on the hot
   path and reuse stored normalized FTS text. Full corpus row-equivalence checks
   remain at build, publication, readiness, and explicit health boundaries.
+- MCP resource reads now reject malformed or unknown URIs before selecting,
+  refreshing, or repairing a project, leaving runtime and status state untouched.
 - Express, Fastify, and FastAPI route extraction now builds one ordered
   binding timeline per module. Route queries reuse that timeline instead of
   rescanning prior statements, and FastAPI imports are resolved from parsed

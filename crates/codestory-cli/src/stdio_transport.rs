@@ -382,6 +382,67 @@ struct StdioServerState {
     recent_sidecar_repair: Option<StdioRecentSidecarRepair>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StdioResource {
+    Status,
+    AgentGuide,
+    Project,
+    Grounding,
+    RootSymbols,
+    Symbol(NodeId),
+    References(NodeId),
+    Snippet(NodeId),
+    Trail(NodeId),
+}
+
+impl StdioResource {
+    fn parse(uri: &str) -> Result<Self> {
+        let resource = match uri {
+            "codestory://status" => Self::Status,
+            "codestory://agent-guide" => Self::AgentGuide,
+            "codestory://project" => Self::Project,
+            "codestory://grounding" => Self::Grounding,
+            "codestory://symbols/root" => Self::RootSymbols,
+            _ => {
+                let (kind, node_id) = uri
+                    .strip_prefix("codestory://")
+                    .and_then(|tail| tail.split_once('/'))
+                    .context("unknown resource")?;
+                if node_id.trim().is_empty() || node_id != node_id.trim() {
+                    bail!("unknown resource");
+                }
+                let node_id = NodeId(node_id.to_string());
+                match kind {
+                    "symbol" => Self::Symbol(node_id),
+                    "references" => Self::References(node_id),
+                    "snippet" => Self::Snippet(node_id),
+                    "trail" => Self::Trail(node_id),
+                    _ => bail!("unknown resource"),
+                }
+            }
+        };
+        Ok(resource)
+    }
+
+    fn activates_project(&self) -> bool {
+        !matches!(self, Self::Status | Self::AgentGuide)
+    }
+
+    fn uri(&self) -> String {
+        match self {
+            Self::Status => "codestory://status".into(),
+            Self::AgentGuide => "codestory://agent-guide".into(),
+            Self::Project => "codestory://project".into(),
+            Self::Grounding => "codestory://grounding".into(),
+            Self::RootSymbols => "codestory://symbols/root".into(),
+            Self::Symbol(node_id) => format!("codestory://symbol/{}", node_id.0),
+            Self::References(node_id) => format!("codestory://references/{}", node_id.0),
+            Self::Snippet(node_id) => format!("codestory://snippet/{}", node_id.0),
+            Self::Trail(node_id) => format!("codestory://trail/{}", node_id.0),
+        }
+    }
+}
+
 struct StdioServerSession {
     runtime: Option<RuntimeContext>,
     state: StdioServerState,
@@ -571,16 +632,22 @@ fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<
                     "Invalid params: missing resource uri",
                 ));
             };
+            let resource = match StdioResource::parse(uri) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    return Some(stdio_jsonrpc_error(id, -32602, error.to_string()));
+                }
+            };
             if let Err(error) = session.select_resource_project(&request) {
                 return Some(stdio_jsonrpc_error(id, -32602, error.to_string()));
             }
             let runtime = session.runtime.as_ref().expect("stdio project selected");
-            if stdio_resource_activates_project(uri)
+            if resource.activates_project()
                 && let Err(error) = activate_stdio_project(runtime, &mut session.state)
             {
                 serde_json::json!({"error": format!("Unable to activate CodeStory before reading `{uri}`: {error}")})
             } else {
-                read_stdio_resource(runtime, &mut session.state, uri)
+                read_stdio_resource(runtime, &mut session.state, &resource)
             }
         }
         "tools/call" => {
@@ -1012,10 +1079,6 @@ fn stdio_jsonrpc_tool_call_from_legacy(
 
 fn stdio_tool_reads_publication(name: &str) -> bool {
     !matches!(name, "status" | "repair_all" | "sidecar_setup")
-}
-
-fn stdio_resource_activates_project(uri: &str) -> bool {
-    !matches!(uri, "codestory://status" | "codestory://agent-guide")
 }
 
 fn stdio_served_publication_meta(
@@ -2770,37 +2833,36 @@ fn stdio_legacy_error_value(runtime: &RuntimeContext, error: &anyhow::Error) -> 
 fn read_stdio_resource(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
-    uri: &str,
+    resource: &StdioResource,
 ) -> serde_json::Value {
-    let result = if uri == "codestory://status" {
-        read_stdio_status_resource_cached(runtime, state)
-    } else if uri == "codestory://agent-guide" {
-        Ok(read_stdio_agent_guide_resource(&runtime.project_root))
-    } else {
-        let publication_before = runtime
+    let uri = resource.uri();
+    let result = match resource {
+        StdioResource::Status => read_stdio_status_resource_cached(runtime, state),
+        StdioResource::AgentGuide => Ok(read_stdio_agent_guide_resource(&runtime.project_root)),
+        _ => runtime
             .project
             .complete_index_publication_at(&runtime.storage_path)
-            .map_err(map_api_error);
-        publication_before.and_then(|publication_before| {
-            let mut value = read_stdio_publication_resource(runtime, uri)?;
-            let publication_after = runtime
-                .project
-                .complete_index_publication_at(&runtime.storage_path)
-                .map_err(map_api_error)?;
-            if publication_before != publication_after {
-                value = read_stdio_publication_resource(runtime, uri)?;
-                let publication_after_retry = runtime
+            .map_err(map_api_error)
+            .and_then(|publication_before| {
+                let mut value = read_stdio_publication_resource(runtime, resource)?;
+                let publication_after = runtime
                     .project
                     .complete_index_publication_at(&runtime.storage_path)
                     .map_err(map_api_error)?;
-                if publication_after != publication_after_retry {
-                    bail!(
-                        "cache_busy: the index publication changed twice while reading {uri}; retry against the stable publication"
-                    );
+                if publication_before != publication_after {
+                    value = read_stdio_publication_resource(runtime, resource)?;
+                    let publication_after_retry = runtime
+                        .project
+                        .complete_index_publication_at(&runtime.storage_path)
+                        .map_err(map_api_error)?;
+                    if publication_after != publication_after_retry {
+                        bail!(
+                            "cache_busy: the index publication changed twice while reading {uri}; retry against the stable publication"
+                        );
+                    }
                 }
-            }
-            Ok(value)
-        })
+                Ok(value)
+            }),
     };
     result
         .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
@@ -2809,25 +2871,25 @@ fn read_stdio_resource(
 
 fn read_stdio_publication_resource(
     runtime: &RuntimeContext,
-    uri: &str,
+    resource: &StdioResource,
 ) -> Result<serde_json::Value> {
-    match uri {
-        "codestory://project" => runtime
+    match resource {
+        StdioResource::Project => runtime
             .open_project_summary()
             .map(|summary| serde_json::json!(summary)),
-        "codestory://grounding" => runtime
+        StdioResource::Grounding => runtime
             .grounding
             .grounding_snapshot(GroundingBudgetDto::Balanced)
             .map(|snapshot| serde_json::json!(snapshot))
             .map_err(map_api_error),
-        "codestory://symbols/root" => runtime
+        StdioResource::RootSymbols => runtime
             .browser
             .list_root_symbols(ListRootSymbolsRequest {
                 limit: Some(BROWSER_SYMBOLS_DEFAULT_LIMIT),
             })
             .map(|symbols| serde_json::json!(symbols))
             .map_err(map_api_error),
-        _ => read_stdio_template_resource(runtime, uri),
+        _ => read_stdio_template_resource(runtime, resource),
     }
 }
 
@@ -6294,41 +6356,37 @@ fn stdio_node_links(node_id: &str) -> serde_json::Value {
     ])
 }
 
-fn read_stdio_template_resource(runtime: &RuntimeContext, uri: &str) -> Result<serde_json::Value> {
-    let Some((kind, node_id)) = uri
-        .strip_prefix("codestory://")
-        .and_then(|tail| tail.split_once('/'))
-    else {
-        bail!("unknown resource");
-    };
-    let node_id = NodeId(node_id.to_string());
-    match kind {
-        "symbol" => runtime
+fn read_stdio_template_resource(
+    runtime: &RuntimeContext,
+    resource: &StdioResource,
+) -> Result<serde_json::Value> {
+    match resource {
+        StdioResource::Symbol(node_id) => runtime
             .browser
-            .symbol_context(node_id)
+            .symbol_context(node_id.clone())
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
-        "references" => runtime
+        StdioResource::References(node_id) => runtime
             .browser
-            .references_context(browser_references_config(node_id))
+            .references_context(browser_references_config(node_id.clone()))
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
-        "snippet" => runtime
+        StdioResource::Snippet(node_id) => runtime
             .browser
-            .snippet_context(node_id, 4)
+            .snippet_context(node_id.clone(), 4)
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
-        "trail" => runtime
+        StdioResource::Trail(node_id) => runtime
             .browser
             .trail_context(browser_trail_config(
-                node_id,
+                node_id.clone(),
                 BROWSER_TRAIL_DEFAULT_DEPTH,
                 TrailDirection::Both,
                 false,
             ))
             .map(|value| serde_json::json!(value))
             .map_err(map_api_error),
-        _ => bail!("unknown resource"),
+        _ => bail!("resource is not publication-backed"),
     }
 }
 
@@ -8097,8 +8155,16 @@ starting sidecar setup
 
         assert!(!stdio_tool_reads_publication("status"));
         assert!(stdio_tool_reads_publication("ground"));
-        assert!(!stdio_resource_activates_project("codestory://status"));
-        assert!(stdio_resource_activates_project("codestory://grounding"));
+        assert!(
+            !StdioResource::parse("codestory://status")
+                .expect("status resource")
+                .activates_project()
+        );
+        assert!(
+            StdioResource::parse("codestory://grounding")
+                .expect("grounding resource")
+                .activates_project()
+        );
         assert!(stdio_agent_activation_needs_repair(&status(
             "enabled", "blocked"
         )));
@@ -8148,5 +8214,31 @@ starting sidecar setup
             300,
             Duration::from_millis(100)
         ));
+    }
+
+    #[test]
+    fn invalid_resource_uri_is_rejected_before_project_selection() {
+        let project = tempfile::tempdir().expect("project");
+        let mut session = StdioServerSession::new(None);
+        let response = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "resources/read",
+                "params": {
+                    "uri": "codestory://unknown/resource",
+                    "project": project.path()
+                }
+            })
+            .to_string(),
+        )
+        .expect("invalid resource response");
+
+        assert_eq!(response.pointer("/error/code"), Some(&json!(-32602)));
+        assert!(session.runtime.is_none(), "invalid URI selected a runtime");
+        assert!(session.state.status_cache.is_none());
+        assert!(session.state.recent_local_refresh.is_none());
+        assert!(session.state.recent_sidecar_repair.is_none());
     }
 }
