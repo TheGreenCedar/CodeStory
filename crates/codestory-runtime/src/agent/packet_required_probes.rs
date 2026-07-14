@@ -1089,14 +1089,14 @@ fn packet_citation_matches_behavior_owning_required_probe(
             packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ClientFactory])
                 || packet_citation_owns_request_pipeline(citation)
         }
-        "createinstance" => {
+        "defaultinstance" => {
             packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ClientFactory])
         }
         "requestdispatch" | "requestmethod" => packet_citation_owns_request_pipeline(citation),
-        "requestinterceptor" | "interceptormanager" => {
+        "requestinterceptor" | "interceptorhandlers" => {
             packet_citation_owns_interceptor_management(citation)
         }
-        "transportadapter" => {
+        "adapters" | "transportadapter" => {
             packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::TransportAdapter])
         }
         "searchentrypoint" => packet_citation_has_behavior_role(
@@ -2291,7 +2291,7 @@ mod tests {
             NodeKind::METHOD,
         );
         assert_role_match(
-            "create instance",
+            "default instance",
             "createClientInstance",
             "src/client/factory.ts",
             NodeKind::FUNCTION,
@@ -2304,14 +2304,26 @@ mod tests {
                 NodeKind::METHOD,
             );
         }
-        for query in ["request interceptor", "interceptor manager"] {
+        for query in ["request interceptor", "interceptor handlers"] {
             assert_role_match(
                 query,
                 "RequestInterceptorRegistry",
                 "src/client/interceptors.ts",
                 NodeKind::CLASS,
             );
+            assert_role_match(
+                query,
+                "RequestInterceptorRegistry.constructor",
+                "src/client/interceptors.ts",
+                NodeKind::METHOD,
+            );
         }
+        assert_role_match(
+            "adapters",
+            "selectAdapter",
+            "src/client/adapters/select.ts",
+            NodeKind::FUNCTION,
+        );
         assert_role_match(
             "transport adapter",
             "selectAdapter",

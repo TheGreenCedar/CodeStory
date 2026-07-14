@@ -62,10 +62,9 @@
   can report sufficient coverage.
 - Treated real file-level lexical hits for known config, data, and documentation
   formats as diagnostic when the same retrieval has resolved graph evidence,
-  and ignored unresolved tail rows only after every served graph hit had
-  resolved. Source misses that could enter the served result, unresolved
-  symbols, and invalid paths remain blocking, with the first blocker retained
-  in capped diagnostics.
+  and limited unresolved counts to candidates the resolver actually attempted.
+  Source misses, unresolved symbols, and invalid paths remain blocking, with
+  the first blocker retained in capped diagnostics.
 - Kept compact search-flow packets focused on executable symbols and preserved
   planned execution-role probes ahead of generated variants without increasing
   the packet budget.

@@ -1235,7 +1235,8 @@ impl StructuralLanguagePolicy {
         let normalized = normalize_identifier(&claim.claim);
         match requirement.id {
             "request_interceptor_management" => {
-                Self::claim_text_names_interceptor_management(&normalized)
+                normalize_identifier(claim.coverage_role.as_deref().unwrap_or_default())
+                    == "interceptormanagement"
                     && claim
                         .citations
                         .iter()
@@ -1308,10 +1309,6 @@ impl StructuralLanguagePolicy {
             }
             _ => false,
         }
-    }
-
-    fn claim_text_names_interceptor_management(normalized: &str) -> bool {
-        normalized.contains("storesinterceptorpairs") && normalized.contains("promisechain")
     }
 
     fn admits_diagnostic_evidence(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
@@ -3904,7 +3901,7 @@ mod tests {
         let mut unrelated_helper = cited_anchor("requestInterceptorHandler");
         unrelated_helper.kind = NodeKind::FIELD;
         claims.push(cited_claim(
-            "requestInterceptorHandler stores interceptor pairs used by the promise chain in request.",
+            "requestInterceptorHandler stores request interceptor handler pairs for chained execution.",
             Some("interceptor management"),
             unrelated_helper,
             Some(true),
@@ -3915,7 +3912,7 @@ mod tests {
         let mut unrelated_type = cited_anchor("InterceptorOptions");
         unrelated_type.kind = NodeKind::CLASS;
         claims.push(cited_claim(
-            "InterceptorOptions stores interceptor pairs used by the promise chain in request.",
+            "InterceptorOptions stores request interceptor handler pairs for chained execution.",
             Some("interceptor management"),
             unrelated_type,
             Some(true),
@@ -3926,7 +3923,7 @@ mod tests {
         let mut interceptor_registry = cited_anchor("InterceptorRegistry");
         interceptor_registry.kind = NodeKind::CLASS;
         claims.push(cited_claim(
-            "InterceptorRegistry stores interceptor pairs used by the promise chain in request.",
+            "InterceptorRegistry stores request interceptor handler pairs for chained execution.",
             Some("interceptor management"),
             interceptor_registry,
             Some(true),

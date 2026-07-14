@@ -43,7 +43,13 @@ pub(crate) fn packet_citation_owns_request_pipeline(citation: &AgentCitationDto)
 }
 
 pub(crate) fn packet_citation_owns_interceptor_management(citation: &AgentCitationDto) -> bool {
-    if !matches!(citation.kind, NodeKind::STRUCT | NodeKind::CLASS) {
+    let owner_kind = matches!(citation.kind, NodeKind::STRUCT | NodeKind::CLASS)
+        || (citation.kind == NodeKind::METHOD
+            && matches!(
+                crate::terminal_symbol_segment(&citation.display_name).as_str(),
+                "constructor" | "init" | "new"
+            ));
+    if !owner_kind {
         return false;
     }
     let display = normalize_identifier(&citation.display_name);

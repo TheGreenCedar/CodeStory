@@ -645,10 +645,10 @@ fn request_dispatch_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
 
 fn interceptor_management_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
     if ctx.owns_interceptor_management
-        && packet_source_has_all(ctx.source, &["handlers", "fulfilled", "rejected"])
+        && packet_source_has_any(ctx.source, &["handler", "handlers"])
     {
         return Some(format!(
-            "`{}` stores interceptor pairs used by the promise chain in request.",
+            "`{}` stores request interceptor handler pairs for chained execution.",
             ctx.symbol
         ));
     }
@@ -2650,7 +2650,7 @@ mod tests {
             Client.prototype.request = function request(config) {
               config = merge(defaults, config)
               this.interceptors.request.forEach(run)
-              return dispatchRequest(config)
+              return dispatchTransport(config)
             }
         "#;
 
@@ -2681,6 +2681,23 @@ mod tests {
                 .iter()
                 .any(|claim| claim.contains("runs request interceptors")),
             "the behavior-owning request method should retain its pipeline claim: {request_claims:?}"
+        );
+
+        let mut interceptor_owner = test_packet_citation(
+            "RequestInterceptorRegistry.constructor",
+            "src/interceptors.ts",
+        );
+        interceptor_owner.kind = NodeKind::METHOD;
+        let interceptor_claims = packet_source_derived_claims_for_citation(
+            prompt,
+            &interceptor_owner,
+            "constructor() { this.handlers = [] }",
+        );
+        assert!(
+            interceptor_claims
+                .iter()
+                .any(|claim| claim.contains("interceptor handler pairs")),
+            "an interceptor-owner constructor should retain its management claim: {interceptor_claims:?}"
         );
     }
 

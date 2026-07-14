@@ -19,7 +19,7 @@ use codestory_retrieval::{
     sidecar_project_id_for_root, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -514,27 +514,23 @@ fn sidecar_primary_search_outcome_from_query_result(
     query_result: QueryResult,
     max_results: usize,
 ) -> SidecarPrimarySearchOutcome {
-    let candidate_count = query_result.hits.len();
-    let resolved_hits = match resolve_sidecar_candidates_to_search_hits(
-        controller,
-        &query_result.hits,
-        max_results,
-    ) {
-        Ok(hits) => hits,
-        Err(error) => {
-            return SidecarPrimarySearchOutcome::Unavailable {
-                reason: format!(
-                    "sidecar retrieval primary unavailable: candidate resolution failed: {}",
-                    error.message
-                ),
-            };
-        }
-    };
+    let resolution =
+        match resolve_sidecar_candidates_with_stats(controller, &query_result.hits, max_results) {
+            Ok(hits) => hits,
+            Err(error) => {
+                return SidecarPrimarySearchOutcome::Unavailable {
+                    reason: format!(
+                        "sidecar retrieval primary unavailable: candidate resolution failed: {}",
+                        error.message
+                    ),
+                };
+            }
+        };
+    let resolved_hits = resolution.resolved_hits.clone();
     let shadow = shadow_from_query_result_with_candidate_admission_diagnostics(
         controller,
         query_result.clone(),
-        candidate_count,
-        resolved_hits.len(),
+        &resolution,
         &resolved_hits,
         &resolved_hits,
     );
@@ -591,10 +587,11 @@ pub(crate) struct SidecarPacketBatchOutcome {
     pub diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
-struct SidecarCandidateResolutionOutcome {
-    resolved_hits: Vec<SearchHit>,
+pub(crate) struct SidecarCandidateResolutionOutcome {
+    pub(crate) resolved_hits: Vec<SearchHit>,
     attempted_candidate_count: usize,
     unresolved_candidate_count: usize,
+    attempted_candidate_indices: HashSet<usize>,
 }
 
 fn packet_sidecar_query_diagnostic(
@@ -771,12 +768,15 @@ pub(crate) fn shadow_from_query_result(result: QueryResult) -> RetrievalShadowDt
 pub(crate) fn shadow_from_query_result_with_candidate_admission_diagnostics(
     controller: &AppController,
     result: QueryResult,
-    candidate_count: usize,
-    resolved_hit_count: usize,
+    resolution: &SidecarCandidateResolutionOutcome,
     search_hits: &[SearchHit],
     final_hits: &[SearchHit],
 ) -> RetrievalShadowDto {
-    let resolution_labels = sidecar_candidate_resolution_labels(controller, &result.hits);
+    let resolution_labels = sidecar_candidate_resolution_labels(
+        controller,
+        &result.hits,
+        &resolution.attempted_candidate_indices,
+    );
     let admission_labels = sidecar_candidate_admission_labels(
         controller,
         &result.hits,
@@ -786,8 +786,8 @@ pub(crate) fn shadow_from_query_result_with_candidate_admission_diagnostics(
     );
     shadow_from_query_result_with_counts_and_resolution_labels(
         result,
-        candidate_count,
-        resolved_hit_count,
+        resolution.attempted_candidate_count,
+        resolution.resolved_hits.len(),
         &resolution_labels,
         &admission_labels,
     )
@@ -865,13 +865,18 @@ pub(crate) fn sidecar_rejection_diagnostic(
 fn sidecar_candidate_resolution_labels(
     controller: &AppController,
     candidates: &[CandidateHit],
+    attempted_candidate_indices: &HashSet<usize>,
 ) -> Vec<String> {
     let project_root = controller.require_project_root().ok();
     let storage = controller.open_storage().ok();
     let node_names = controller.state.lock().node_names.clone();
     candidates
         .iter()
-        .map(|candidate| {
+        .enumerate()
+        .map(|(index, candidate)| {
+            if !attempted_candidate_indices.contains(&index) {
+                return "not_attempted".to_string();
+            }
             candidate_resolution_label(
                 project_root.as_deref(),
                 storage.as_ref(),
@@ -922,6 +927,15 @@ fn sidecar_candidate_admission_labels(
                 .map(String::as_str)
                 .unwrap_or("unlabeled");
             if resolution != "resolved" {
+                if resolution == "not_attempted" {
+                    return SidecarCandidateAdmissionLabel {
+                        admission_status: "rejected".to_string(),
+                        loss_reason: Some("not_in_resolution_window".to_string()),
+                        resolved_node_id: None,
+                        search_hit_rank: None,
+                        final_rank: None,
+                    };
+                }
                 return SidecarCandidateAdmissionLabel {
                     admission_status: "unresolved".to_string(),
                     loss_reason: Some(resolution.to_string()),
@@ -1120,14 +1134,13 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
     } else {
         resolution_labels
             .iter()
-            .filter(|label| label.as_str() != "resolved")
+            .filter(|label| !matches!(label.as_str(), "resolved" | "not_attempted"))
             .count()
     };
     let diagnostic_only = unresolved_candidates_are_diagnostic_only(
         &result.hits,
         resolution_labels,
         unresolved_candidate_count,
-        resolved_hit_count,
     );
 
     RetrievalShadowDto {
@@ -1153,26 +1166,18 @@ fn unresolved_candidates_are_diagnostic_only(
     candidates: &[CandidateHit],
     resolution_labels: &[String],
     unresolved_candidate_count: usize,
-    resolved_hit_count: usize,
 ) -> bool {
     let has_resolved_hit = resolution_labels
         .iter()
         .any(|label| label.as_str() == "resolved");
-    let mut resolved_seen = 0;
     unresolved_candidate_count > 0
         && !resolution_labels.is_empty()
         && candidates
             .iter()
             .zip(resolution_labels)
+            .filter(|(_, label)| !matches!(label.as_str(), "resolved" | "not_attempted"))
             .all(|(candidate, label)| {
-                if label == "resolved" {
-                    resolved_seen += 1;
-                    return true;
-                }
                 unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
-                    || (label == "node_unresolved"
-                        && resolved_hit_count > 0
-                        && resolved_seen >= resolved_hit_count)
             })
 }
 
@@ -1191,6 +1196,7 @@ fn shadow_candidate_indices(
         .skip(MAX_SHADOW_CANDIDATES)
         .find_map(|(index, (candidate, label))| {
             (label != "resolved"
+                && label != "not_attempted"
                 && !unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit))
             .then_some(index)
         });
@@ -1247,6 +1253,10 @@ fn known_non_symbol_file_path(file_path: &str) -> bool {
         Some("cfg" | "conf" | "def" | "ini" | "json" | "md" | "markdown" | "toml" | "yaml" | "yml")
     ) || extension
         .is_some_and(|value| value.len() == 1 && matches!(value.as_bytes()[0], b'1'..=b'9'))
+        || (extension == Some("zsh")
+            && lower
+                .split('/')
+                .any(|segment| matches!(segment, "complete" | "completion" | "completions")))
 }
 
 fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
@@ -1504,16 +1514,7 @@ fn resolve_candidate_node_id(
         .or(Some(file_node_id))
 }
 
-pub(crate) fn resolve_sidecar_candidates_to_search_hits(
-    controller: &AppController,
-    candidates: &[CandidateHit],
-    max_results: usize,
-) -> Result<Vec<SearchHit>, ApiError> {
-    resolve_sidecar_candidates_with_stats(controller, candidates, max_results)
-        .map(|outcome| outcome.resolved_hits)
-}
-
-fn resolve_sidecar_candidates_with_stats(
+pub(crate) fn resolve_sidecar_candidates_with_stats(
     controller: &AppController,
     candidates: &[CandidateHit],
     max_results: usize,
@@ -1525,12 +1526,14 @@ fn resolve_sidecar_candidates_with_stats(
     let mut hits = Vec::new();
     let mut attempted_candidate_count = 0;
     let mut unresolved_candidate_count = 0;
+    let mut attempted_candidate_indices = HashSet::new();
     let mut seen = HashMap::<String, ()>::new();
-    let mut ordered: Vec<&CandidateHit> = candidates
+    let mut ordered: Vec<(usize, &CandidateHit)> = candidates
         .iter()
-        .filter(|candidate| !is_phantom_sidecar_hit(candidate))
+        .enumerate()
+        .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
         .collect();
-    ordered.sort_by(|left, right| {
+    ordered.sort_by(|(_, left), (_, right)| {
         let left_resolvable = candidate_path_resolvable(&project_root, &left.file_path);
         let right_resolvable = candidate_path_resolvable(&project_root, &right.file_path);
         right_resolvable.cmp(&left_resolvable).then(
@@ -1541,11 +1544,12 @@ fn resolve_sidecar_candidates_with_stats(
         )
     });
 
-    for candidate in ordered {
+    for (candidate_index, candidate) in ordered {
         if hits.len() >= max_results {
             break;
         }
         attempted_candidate_count += 1;
+        attempted_candidate_indices.insert(candidate_index);
         let rel_path = normalize_repo_relative_path(&project_root, &candidate.file_path);
         let Some(node_id) =
             resolve_candidate_node_id(&storage, &node_names, &project_root, &rel_path, candidate)
@@ -1573,6 +1577,7 @@ fn resolve_sidecar_candidates_with_stats(
         resolved_hits: hits,
         attempted_candidate_count,
         unresolved_candidate_count,
+        attempted_candidate_indices,
     })
 }
 
@@ -1917,6 +1922,7 @@ mod tests {
             resolved_hits: Vec::new(),
             attempted_candidate_count: 1,
             unresolved_candidate_count: 1,
+            attempted_candidate_indices: HashSet::from([0]),
         };
 
         let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 2, 1, 3);
@@ -2212,10 +2218,22 @@ mod tests {
                         CandidateSource::Lexical,
                     ),
                     CandidateHit::with_source(
+                        "scripts/completions/tool.zsh",
+                        None,
+                        0.825,
+                        CandidateSource::Lexical,
+                    ),
+                    CandidateHit::with_source(
                         "src/forms/validation.rs",
                         Some("email".into()),
                         0.8,
                         CandidateSource::Scip,
+                    ),
+                    CandidateHit::with_source(
+                        "tests/support/harness.tcl",
+                        None,
+                        0.7,
+                        CandidateSource::Lexical,
                     ),
                 ],
                 trace: QueryTrace {
@@ -2228,17 +2246,19 @@ mod tests {
                     stages: Vec::new(),
                 },
             },
-            3,
+            4,
             1,
             &[
                 "node_unresolved".to_string(),
                 "node_unresolved".to_string(),
+                "node_unresolved".to_string(),
                 "resolved".to_string(),
+                "not_attempted".to_string(),
             ],
             &[],
         );
         let value = serde_json::to_value(&shadow).expect("serialize shadow");
-        assert_eq!(shadow.unresolved_candidate_count, 2);
+        assert_eq!(shadow.unresolved_candidate_count, 3);
         assert_eq!(value["diagnostic_only"], true);
     }
 
@@ -2275,30 +2295,14 @@ mod tests {
             &hits,
             &resolution_labels,
             2,
-            MAX_SHADOW_CANDIDATES - 1,
         ));
 
         let source_candidate =
-            CandidateHit::with_source("src/parser.zig", None, 0.9, CandidateSource::Lexical);
+            CandidateHit::with_source("src/tool.zsh", None, 0.9, CandidateSource::Lexical);
         assert!(!unresolved_candidate_is_diagnostic(
             &source_candidate,
             "node_unresolved",
             true,
-        ));
-
-        assert!(unresolved_candidates_are_diagnostic_only(
-            &[
-                CandidateHit::with_source(
-                    "src/server.rs",
-                    Some("serve".into()),
-                    0.9,
-                    CandidateSource::Scip,
-                ),
-                source_candidate,
-            ],
-            &["resolved".to_string(), "node_unresolved".to_string()],
-            1,
-            1,
         ));
     }
 
@@ -2773,6 +2777,7 @@ mod tests {
             resolved_hits: Vec::new(),
             attempted_candidate_count: 0,
             unresolved_candidate_count: 0,
+            attempted_candidate_indices: HashSet::new(),
         };
         let empty_diagnostic =
             packet_sidecar_query_diagnostic(&empty_full, &empty_resolution, 1, 0, 1);
@@ -2804,6 +2809,7 @@ mod tests {
             resolved_hits: Vec::new(),
             attempted_candidate_count: 1,
             unresolved_candidate_count: 1,
+            attempted_candidate_indices: HashSet::from([0]),
         };
         let unresolved_diagnostic =
             packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution, 1, 0, 1);
@@ -2840,6 +2846,7 @@ mod tests {
             resolved_hits: vec![search_hit_for_candidate(&cancelled.hits[0])],
             attempted_candidate_count: 1,
             unresolved_candidate_count: 0,
+            attempted_candidate_indices: HashSet::from([0]),
         };
         let cancelled_diagnostic =
             packet_sidecar_query_diagnostic(&cancelled, &cancelled_resolution, 100, 1, 101);

@@ -327,7 +327,7 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_entrypoint",
         role: FlowRole::Entrypoint,
-        query_seeds: &["create instance", "request method", "request entrypoint"],
+        query_seeds: &["default instance", "request method", "request entrypoint"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     },
     FlowRequirement {
@@ -347,7 +347,7 @@ const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
 const REQUEST_INTERCEPTOR_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "request_interceptor_management",
     role: FlowRole::Dispatch,
-    query_seeds: &["interceptor manager", "request interceptor"],
+    query_seeds: &["interceptor handlers", "request interceptor"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
 };
 
@@ -731,9 +731,9 @@ mod tests {
 
         assert_eq!(entrypoint.role, FlowRole::Entrypoint);
         for expected in [
-            "create instance",
+            "default instance",
             "request method",
-            "interceptor manager",
+            "interceptor handlers",
             "adapters",
         ] {
             assert!(
@@ -774,9 +774,9 @@ mod tests {
             );
         }
         for client_only in [
-            "create instance",
+            "default instance",
             "request method",
-            "interceptor manager",
+            "interceptor handlers",
             "adapters",
         ] {
             assert!(
