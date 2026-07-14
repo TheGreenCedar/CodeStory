@@ -34,9 +34,9 @@
   trusted external embedding endpoint; Intel status and evidence never claim
   Metal acceleration.
 - Managed macOS readiness follows the selected dynamic Agent endpoint instead
-  of assuming port 8080, reuses only a matching live native process, and blocks
-  packet and search with repair guidance if that endpoint or its verified
-  accelerator identity disappears.
+  of assuming port 8080, reuses one matching live native process across project
+  workspaces, and blocks packet and search with repair guidance if that endpoint
+  or its verified accelerator identity disappears.
 - Direct-download Mac artifacts are release-ready only after the exact arm64 and
   x64 binaries pass Developer ID signing, notarization, quarantined extraction,
   Gatekeeper, and native execution checks. Source or unsigned package checks do

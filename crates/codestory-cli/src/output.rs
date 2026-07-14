@@ -239,7 +239,7 @@ fn append_readiness_broker(
     {
         let next = match resource.status.as_str() {
             "stale" => "retry repair to reclaim stale native embedding lock",
-            "busy" => "wait for owner or retry after current repair completes",
+            "busy" => "wait for active owner repair, or stop an incompatible full owner runtime",
             _ => "inspect broker snapshot",
         };
         let _ = writeln!(

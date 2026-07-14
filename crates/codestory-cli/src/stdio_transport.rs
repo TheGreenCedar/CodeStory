@@ -4722,13 +4722,23 @@ fn stdio_status_native_embedding_busy_next_calls(
 ) -> serde_json::Value {
     let owner_workspace = busy.owner_workspace_root.as_deref().unwrap_or("unknown");
     let owner_project = busy.owner_project_id.as_deref().unwrap_or("unknown");
+    let instruction = crate::readiness_broker::native_embedding_owner_down_command(busy)
+        .map(|command| {
+            format!(
+                "CodeStory could not reuse the full native embedding runtime owned by another operation. Stop the incompatible owner with `{command}`, then retry MCP repair. owner_project={owner_project} owner_workspace={owner_workspace} owner_pid={:?}",
+                busy.owner_pid
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "CodeStory could not yet reuse the native embedding runtime owned by another operation. Wait for its active repair to finish, then retry MCP repair. owner_project={owner_project} owner_workspace={owner_workspace} owner_pid={:?}",
+                busy.owner_pid
+            )
+        });
     serde_json::json!([
         {
             "method": "host/instruction",
-            "instruction": format!(
-                "CodeStory native embedding runtime is already owned by another operation; wait for it to finish before starting MCP repair. owner_project={owner_project} owner_workspace={owner_workspace} owner_pid={:?}",
-                busy.owner_pid
-            )
+            "instruction": instruction
         },
         {
             "method": "tools/call",
@@ -7132,8 +7142,9 @@ mod tests {
     }
 
     #[test]
-    fn stdio_native_embedding_same_project_reusable_lock_does_not_block_repair() {
-        let project = tempfile::tempdir().expect("project");
+    fn stdio_native_embedding_cross_project_reusable_lock_does_not_block_repair() {
+        let project = tempfile::tempdir().expect("requested project");
+        let owner_project = tempfile::tempdir().expect("owner project");
         let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             codestory_retrieval::SidecarProfile::Agent,
@@ -7144,7 +7155,12 @@ mod tests {
             sidecar.run_id.as_deref(),
             env!("CARGO_PKG_VERSION"),
         );
-        let resource = native_resource_snapshot_for_scope(&scope, "busy", 44);
+        let owner_scope = crate::readiness_broker::agent_repair_scope(
+            owner_project.path(),
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
+            env!("CARGO_PKG_VERSION"),
+        );
+        let resource = native_resource_snapshot_for_scope(&owner_scope, "busy", 44);
         let snapshot = broker_snapshot_with_native_resource(project.path(), resource);
         let mut classifier_called = false;
 
@@ -7155,6 +7171,10 @@ mod tests {
             |classifier_scope, classifier_sidecar, classifier_resource| {
                 classifier_called = true;
                 assert_eq!(classifier_scope.project_id, scope.project_id);
+                assert_ne!(
+                    classifier_scope.project_id,
+                    classifier_resource.owner_project_id.as_deref().unwrap()
+                );
                 assert_eq!(classifier_sidecar.run_id, sidecar.run_id);
                 assert_eq!(classifier_resource.owner_pid, Some(44));
                 Ok(Some(44))

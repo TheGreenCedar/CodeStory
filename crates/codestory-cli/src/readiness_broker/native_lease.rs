@@ -631,17 +631,37 @@ pub(crate) fn reusable_native_embedding_resource_pid_for_snapshot(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn reusable_native_embedding_resource_pid(
-    scope: &BrokerScope,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-    busy: &BrokerMachineResourceBusy,
-    validate_launch: &mut impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<u32>,
-) -> Result<Option<u32>> {
-    Ok(
-        reusable_native_embedding_resource_launch(scope, sidecar, busy, validate_launch)?
-            .and_then(|launch| launch.pid),
-    )
+pub(crate) fn native_embedding_owner_down_command(
+    snapshot: &BrokerResourceSnapshot,
+) -> Option<String> {
+    let lock_path = machine_resource_lock_path(&snapshot.resource);
+    if super::paths::clean_path(&lock_path) != snapshot.lock_path {
+        return None;
+    }
+    let lock = read_machine_resource_lock_file(&lock_path)?;
+    if lock.resource != snapshot.resource
+        || Some(lock.pid) != snapshot.owner_pid
+        || Some(lock.scope.project_id.as_str()) != snapshot.owner_project_id.as_deref()
+        || Some(lock.scope.workspace_root.as_str()) != snapshot.owner_workspace_root.as_deref()
+        || lock.native_embedding_launch.is_none()
+        || lock.native_embedding_quarantine_reason.is_some()
+    {
+        return None;
+    }
+    let project = crate::display::quote_command_argument_value(&lock.scope.workspace_root);
+    match lock.scope.profile.as_str() {
+        "local" => Some(format!(
+            "codestory-cli retrieval down --project {project} --profile local"
+        )),
+        "agent" => {
+            let run_id = lock.scope.run_id.as_deref()?;
+            Some(format!(
+                "codestory-cli retrieval down --project {project} --profile agent --run-id {}",
+                crate::display::quote_command_argument_value(run_id)
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn reusable_native_embedding_resource_launch(
@@ -655,7 +675,14 @@ fn reusable_native_embedding_resource_launch(
         sidecar,
         busy,
         validate_launch,
-        reused_launch_matches_owner_and_requested_runtime,
+        |owner_scope, requested_runtime, launch| {
+            reused_launch_matches_owner_and_requested_runtime(
+                owner_scope,
+                scope,
+                requested_runtime,
+                launch,
+            )
+        },
     )?
     else {
         return Ok(None);
@@ -710,6 +737,9 @@ pub(crate) fn reusable_native_embedding_resource_launch_with_matcher(
     let Some(scope_identity) = super::scope::effective_scope_identity(scope) else {
         return Ok(None);
     };
+    if sidecar.project_identity.as_ref() != Some(&scope_identity) {
+        return Ok(None);
+    }
     let Some(owner_workspace_root) = busy.snapshot.owner_workspace_root.as_deref() else {
         return Ok(None);
     };
@@ -717,14 +747,6 @@ pub(crate) fn reusable_native_embedding_resource_launch_with_matcher(
     else {
         return Ok(None);
     };
-    if owner_identity.workspace_id != scope_identity.workspace_id
-        || !codestory_workspace::same_workspace_path(
-            Path::new(owner_workspace_root),
-            Path::new(&scope.workspace_root),
-        )
-    {
-        return Ok(None);
-    }
     let lock_path = machine_resource_lock_path(&busy.snapshot.resource);
     if super::paths::clean_path(&lock_path) != busy.snapshot.lock_path {
         return Ok(None);
@@ -741,7 +763,6 @@ pub(crate) fn reusable_native_embedding_resource_launch_with_matcher(
     if lock.resource != busy.snapshot.resource
         || lock.pid != owner_pid
         || busy.snapshot.owner_project_id.as_deref() != Some(lock.scope.project_id.as_str())
-        || lock_identity.workspace_id != scope_identity.workspace_id
         || lock_identity.workspace_id != owner_identity.workspace_id
         || !codestory_workspace::same_workspace_path(
             Path::new(&lock.scope.workspace_root),
@@ -813,6 +834,7 @@ fn adopt_reused_native_launch_endpoint(
 
 fn reused_launch_matches_owner_and_requested_runtime(
     owner_scope: &BrokerScope,
+    requested_scope: &BrokerScope,
     requested_runtime: &codestory_retrieval::SidecarRuntimeConfig,
     launch: &codestory_retrieval::EmbeddingLaunchMetadata,
 ) -> Result<bool> {
@@ -836,7 +858,7 @@ fn reused_launch_matches_owner_and_requested_runtime(
         return Ok(false);
     }
     let Some(expected_requested) = codestory_retrieval::expected_native_embedding_launch_metadata(
-        std::path::Path::new(&owner_scope.workspace_root),
+        std::path::Path::new(&requested_scope.workspace_root),
         requested_runtime,
     )?
     else {
@@ -849,7 +871,7 @@ fn reused_launch_matches_owner_and_requested_runtime(
     ))
 }
 
-fn same_native_launch_configuration(
+pub(super) fn same_native_launch_configuration(
     expected: &codestory_retrieval::EmbeddingLaunchMetadata,
     actual: &codestory_retrieval::EmbeddingLaunchMetadata,
     require_log_path: bool,
@@ -862,7 +884,13 @@ fn same_native_launch_configuration(
         && expected.executable_path == actual.executable_path
         && expected.model_path == actual.model_path
         && expected.requested_device == actual.requested_device
-        && (!require_log_path || actual.log_path.is_none() || expected.log_path == actual.log_path)
+        && (!require_log_path
+            || actual.log_path.is_none()
+            || expected.log_path.as_deref().is_some_and(|expected| {
+                actual.log_path.as_deref().is_some_and(|actual| {
+                    codestory_workspace::same_workspace_path(Path::new(expected), Path::new(actual))
+                })
+            }))
 }
 
 pub(super) fn enrich_legacy_native_launch_log_path(
@@ -884,14 +912,20 @@ fn bail_native_embedding_busy<T>(busy: &BrokerMachineResourceBusy) -> Result<T> 
         .owner_workspace_root
         .as_deref()
         .unwrap_or("unknown");
+    let next = native_embedding_owner_down_command(&busy.snapshot)
+        .map(|command| format!("the full owner runtime has an incompatible native launch contract; stop it with `{command}`, then retry"))
+        .unwrap_or_else(|| {
+            "the owner is still active after the bounded wait; retry after its current repair completes"
+                .to_string()
+        });
     bail!(
-        "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}; retry after the current repair reaches full retrieval",
+        "native embedding runtime is busy for another CodeStory operation: resource={} owner_project={} owner_workspace={} owner_pid={:?}; {next}",
         busy.snapshot.resource,
         busy.snapshot
             .owner_project_id
             .as_deref()
             .unwrap_or("unknown"),
         owner,
-        busy.snapshot.owner_pid
+        busy.snapshot.owner_pid,
     );
 }

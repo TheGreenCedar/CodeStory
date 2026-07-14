@@ -25,7 +25,7 @@ pub(crate) use machine_lock::{
 pub(crate) use native_lease::{
     BrokerNativeEmbeddingResourceLease, NativeEmbeddingLeaseLifecycleParams,
     cleanup_native_embedding_resource_lease_after_transfer_error,
-    native_embedding_launch_from_sidecar_state_file,
+    native_embedding_launch_from_sidecar_state_file, native_embedding_owner_down_command,
     reusable_native_embedding_resource_pid_for_snapshot, run_with_native_embedding_lease_lifecycle,
     transfer_native_embedding_resource_lease,
 };
