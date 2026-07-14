@@ -99,10 +99,12 @@ pub(crate) fn packet_flow_requirements_for_terms(
     if packet_terms_indicate_indexing_flow(terms) {
         requirements.extend_from_slice(INDEXING_FLOW);
     }
-    if packet_terms_indicate_request_dispatch_flow(terms)
-        || packet_terms_indicate_server_request_dispatch_flow(terms)
-    {
-        requirements.extend_from_slice(REQUEST_DISPATCH_FLOW);
+    let server_request_dispatch = packet_terms_indicate_server_request_dispatch_flow(terms);
+    let client_request_dispatch = packet_terms_indicate_request_dispatch_flow(terms);
+    if server_request_dispatch {
+        requirements.extend_from_slice(SERVER_REQUEST_DISPATCH_FLOW);
+    } else if client_request_dispatch {
+        requirements.extend_from_slice(CLIENT_REQUEST_DISPATCH_FLOW);
         if packet_terms_have_any(terms, &["interceptor", "interceptors"]) {
             requirements.push(REQUEST_INTERCEPTOR_REQUIREMENT);
         }
@@ -300,7 +302,7 @@ const INDEXING_FLOW: &[FlowRequirement] = &[
     },
 ];
 
-const REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
+const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_entrypoint",
         role: FlowRole::Registration,
@@ -321,10 +323,31 @@ const REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     },
 ];
 
+const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "request_entrypoint",
+        role: FlowRole::Entrypoint,
+        query_seeds: &["create instance", "request method", "request entrypoint"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    },
+    FlowRequirement {
+        id: "request_dispatch",
+        role: FlowRole::Dispatch,
+        query_seeds: &["request dispatch", "adapters", "transport adapter"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    },
+    FlowRequirement {
+        id: "request_terminal",
+        role: FlowRole::TerminalBoundary,
+        query_seeds: &["response finalization", "transport send"],
+        coverage_mode: CoverageMode::AllowsSourceRange,
+    },
+];
+
 const REQUEST_INTERCEPTOR_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "request_interceptor_management",
     role: FlowRole::Dispatch,
-    query_seeds: &["request interceptor"],
+    query_seeds: &["interceptor manager", "request interceptor"],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
 };
 
@@ -687,5 +710,79 @@ mod tests {
             client_requirement_ids("Explain how an HTTP client performs transport send."),
             vec!["client_transport_send"]
         );
+    }
+
+    #[test]
+    fn client_request_flow_uses_behavior_owner_probes_without_server_registration() {
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Explain how a default HTTP client instance is created, then a request passes through request and response interceptors before dispatch to the adapter and transport.",
+            ),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        let entrypoint = requirements
+            .iter()
+            .find(|requirement| requirement.id == "request_entrypoint")
+            .expect("client request flow should require an entrypoint");
+        let queries = requirements
+            .iter()
+            .flat_map(|requirement| requirement.query_seeds.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(entrypoint.role, FlowRole::Entrypoint);
+        for expected in [
+            "create instance",
+            "request method",
+            "interceptor manager",
+            "adapters",
+        ] {
+            assert!(
+                queries.contains(&expected),
+                "client request flow should probe {expected}"
+            );
+        }
+        for server_only in ["route registration", "handler dispatch"] {
+            assert!(
+                !queries.contains(&server_only),
+                "client request flow should not probe {server_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_request_flow_retains_route_registration_and_handler_dispatch() {
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(
+                "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
+            ),
+            PacketTaskClassDto::RouteTracing,
+        );
+        let entrypoint = requirements
+            .iter()
+            .find(|requirement| requirement.id == "request_entrypoint")
+            .expect("server request flow should require an entrypoint");
+        let queries = requirements
+            .iter()
+            .flat_map(|requirement| requirement.query_seeds.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(entrypoint.role, FlowRole::Registration);
+        for expected in ["route registration", "handler dispatch"] {
+            assert!(
+                queries.contains(&expected),
+                "server request flow should probe {expected}"
+            );
+        }
+        for client_only in [
+            "create instance",
+            "request method",
+            "interceptor manager",
+            "adapters",
+        ] {
+            assert!(
+                !queries.contains(&client_only),
+                "server request flow should not probe {client_only}"
+            );
+        }
     }
 }

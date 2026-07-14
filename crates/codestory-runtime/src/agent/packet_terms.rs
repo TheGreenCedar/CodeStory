@@ -264,7 +264,10 @@ pub(crate) fn packet_terms_indicate_server_request_dispatch_flow(terms: &[String
     ]);
 
     (server_or_protocol && has_any(&["request", "requests"]) && handler_or_view)
-        || (request_flow && has_any(&["server", "view", "views", "context", "response"]))
+        || (request_flow && has_any(&["server", "view", "views", "context"]))
+        || (request_flow
+            && has_any(&["handler", "handlers", "handling"])
+            && !packet_terms_indicate_server_route_dispatch_flow(terms))
 }
 
 pub(crate) fn packet_terms_indicate_server_route_dispatch_flow(terms: &[String]) -> bool {
@@ -841,7 +844,7 @@ mod tests {
     #[test]
     fn server_request_dispatch_prompts_do_not_activate_client_transport() {
         let terms = packet_probe_terms(
-            "Trace how a WSGI app receives a request, opens request handling, dispatches to a view, finalizes the response, and returns control to the server.",
+            "Trace how a request handler dispatches work and finalizes the response.",
         );
 
         assert!(packet_terms_indicate_server_request_dispatch_flow(&terms));

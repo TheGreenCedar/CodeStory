@@ -1091,7 +1091,7 @@ fn packet_source_set_path_score(citation: &AgentCitationDto) -> u8 {
 }
 
 fn packet_required_probe_prefers_implementation(query: &str) -> bool {
-    query.contains("::") || query.contains('.')
+    query.contains("::") || query.contains('.') || normalize_identifier(query) == "requestmethod"
 }
 
 fn packet_prefer_implementation_file(
@@ -1113,6 +1113,13 @@ fn packet_prefer_implementation_file(
 
 fn packet_path_is_implementation(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".d.ts")
+        || lower.ends_with(".d.tsx")
+        || lower.ends_with(".d.cts")
+        || lower.ends_with(".d.mts")
+    {
+        return false;
+    }
     matches!(
         lower.rsplit('.').next(),
         Some(
@@ -1410,6 +1417,22 @@ mod tests {
                 .take(2)
                 .all(|path| path.contains("commonMain")),
             "generic source probes should protect shared source-set evidence before platform variants: {protected_paths:?}"
+        );
+    }
+
+    #[test]
+    fn request_method_probe_prefers_implementation_over_declaration() {
+        let mut declaration = citation("request", "index.d.ts", 100.0);
+        declaration.kind = NodeKind::METHOD;
+        let mut implementation = citation("Client.request", "src/client/Client.js", 1.0);
+        implementation.kind = NodeKind::METHOD;
+        let mut answer = answer_fixture(vec![declaration, implementation]);
+
+        promote_required_probe_citations(&mut answer, &["request method".to_string()]);
+
+        assert_eq!(
+            answer.citations[0].file_path.as_deref(),
+            Some("src/client/Client.js")
         );
     }
 

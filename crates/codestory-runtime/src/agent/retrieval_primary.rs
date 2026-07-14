@@ -1127,6 +1127,7 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
         &result.hits,
         resolution_labels,
         unresolved_candidate_count,
+        resolved_hit_count,
     );
 
     RetrievalShadowDto {
@@ -1152,18 +1153,26 @@ fn unresolved_candidates_are_diagnostic_only(
     candidates: &[CandidateHit],
     resolution_labels: &[String],
     unresolved_candidate_count: usize,
+    resolved_hit_count: usize,
 ) -> bool {
     let has_resolved_hit = resolution_labels
         .iter()
         .any(|label| label.as_str() == "resolved");
+    let mut resolved_seen = 0;
     unresolved_candidate_count > 0
         && !resolution_labels.is_empty()
         && candidates
             .iter()
             .zip(resolution_labels)
-            .filter(|(_, label)| label.as_str() != "resolved")
             .all(|(candidate, label)| {
+                if label == "resolved" {
+                    resolved_seen += 1;
+                    return true;
+                }
                 unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
+                    || (label == "node_unresolved"
+                        && resolved_hit_count > 0
+                        && resolved_seen >= resolved_hit_count)
             })
 }
 
@@ -1232,10 +1241,12 @@ fn non_parser_backed_file_candidate_unresolved(
 
 fn known_non_symbol_file_path(file_path: &str) -> bool {
     let lower = file_path.to_ascii_lowercase();
+    let extension = lower.rsplit('.').next();
     matches!(
-        lower.rsplit('.').next(),
+        extension,
         Some("cfg" | "conf" | "def" | "ini" | "json" | "md" | "markdown" | "toml" | "yaml" | "yml")
-    )
+    ) || extension
+        .is_some_and(|value| value.len() == 1 && matches!(value.as_bytes()[0], b'1'..=b'9'))
 }
 
 fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
@@ -2195,7 +2206,7 @@ mod tests {
                         CandidateSource::Lexical,
                     ),
                     CandidateHit::with_source(
-                        "config/form-validation.conf",
+                        "docs/man/tool.1",
                         None,
                         0.85,
                         CandidateSource::Lexical,
@@ -2264,6 +2275,7 @@ mod tests {
             &hits,
             &resolution_labels,
             2,
+            MAX_SHADOW_CANDIDATES - 1,
         ));
 
         let source_candidate =
@@ -2272,6 +2284,21 @@ mod tests {
             &source_candidate,
             "node_unresolved",
             true,
+        ));
+
+        assert!(unresolved_candidates_are_diagnostic_only(
+            &[
+                CandidateHit::with_source(
+                    "src/server.rs",
+                    Some("serve".into()),
+                    0.9,
+                    CandidateSource::Scip,
+                ),
+                source_candidate,
+            ],
+            &["resolved".to_string(), "node_unresolved".to_string()],
+            1,
+            1,
         ));
     }
 

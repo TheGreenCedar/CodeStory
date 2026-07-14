@@ -19,8 +19,8 @@ use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal
 use codestory_contracts::api::{
     AgentAnswerDto, AgentHybridWeightsDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto,
-    PacketPlanDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit, SearchHitOrigin,
-    SearchMatchQualityDto, SemanticFallbackRecordDto,
+    PacketPlanDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto,
+    SearchHit, SearchHitOrigin, SearchMatchQualityDto, SemanticFallbackRecordDto,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -657,7 +657,7 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
         )
     });
     let mut seen = HashSet::<String>::new();
-    ranked
+    let mut queries = ranked
         .into_iter()
         .filter_map(|(_, query)| {
             if is_packet_path_like_query(&query.query) {
@@ -670,7 +670,27 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
                 None
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    reserve_architecture_main_anchor_probe(plan, &required_probes, &mut queries);
+    queries
+}
+
+fn reserve_architecture_main_anchor_probe(
+    plan: &PacketPlanDto,
+    required_probes: &HashSet<String>,
+    queries: &mut Vec<String>,
+) {
+    if plan.task_class != PacketTaskClassDto::ArchitectureExplanation
+        || !required_probes.contains("searchentrypoint")
+    {
+        return;
+    }
+    queries.retain(|query| normalize_identifier(query) != "main");
+    let insert_at = queries
+        .iter()
+        .take_while(|query| required_probes.contains(&normalize_identifier(query)))
+        .count();
+    queries.insert(insert_at, "main".to_string());
 }
 
 fn packet_anchor_required_probe_keys(plan: &PacketPlanDto) -> HashSet<String> {
@@ -811,6 +831,7 @@ fn packet_lexical_subquery_needs_hybrid_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::packet_plan::build_packet_plan;
     use codestory_contracts::api::{PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto};
 
     #[test]
@@ -1112,6 +1133,27 @@ mod tests {
         assert!(queries.contains(&"run".to_string()));
         assert!(queries.contains(&"entrypoint".to_string()));
         assert!(!queries.contains(&"architecture entrypoint".to_string()));
+    }
+
+    #[test]
+    fn compact_search_flow_reserves_main_anchor_query() {
+        let plan = build_packet_plan(
+            "Explain how a search command parses CLI flags, walks candidate inputs, and executes sequential or parallel searches through matcher, searcher, and printer components.",
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+
+        assert_eq!(
+            plan.queries.len(),
+            32,
+            "fixture should exercise the plan cap"
+        );
+        let selected = packet_anchor_probe_queries(&plan)
+            .into_iter()
+            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
+            .collect::<Vec<_>>();
+
+        assert!(selected.iter().any(|query| query == "main"));
     }
 
     #[test]
