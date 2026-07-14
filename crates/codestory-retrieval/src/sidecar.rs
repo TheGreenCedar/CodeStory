@@ -16,6 +16,8 @@ use crate::process_identity::{
     native_embedding_process_start_identity, probe_process_start_identity, process_owner_state,
     process_started_at_epoch_ms,
 };
+#[cfg(all(not(windows), not(target_os = "linux")))]
+use crate::process_identity::{PsProbeOutputStatus, classify_ps_probe_output};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
@@ -592,7 +594,7 @@ pub fn native_embedding_launch_identity_status(
     let final_start_probe = probe_process_start_identity(pid);
     match &final_start_probe {
         ProcessStartProbe::Running {
-            start_identity: Some(actual),
+            start_identity: actual,
         } if start_identity_before != *actual => {
             return NativeEmbeddingLaunchIdentityStatus::Unverified {
                 pid: Some(pid),
@@ -601,12 +603,11 @@ pub fn native_embedding_launch_identity_status(
                 ),
             };
         }
+        ProcessStartProbe::Running { .. }
+            if process_owner_state(&final_start_probe, Some(expected_start_identity))
+                == ProcessOwnerState::Matching => {}
         ProcessStartProbe::Running {
-            start_identity: Some(_),
-        } if process_owner_state(&final_start_probe, Some(expected_start_identity))
-            == ProcessOwnerState::Matching => {}
-        ProcessStartProbe::Running {
-            start_identity: Some(actual),
+            start_identity: actual,
         } => {
             return NativeEmbeddingLaunchIdentityStatus::Mismatched {
                 pid,
@@ -615,10 +616,7 @@ pub fn native_embedding_launch_identity_status(
                 ),
             };
         }
-        ProcessStartProbe::Running {
-            start_identity: None,
-        }
-        | ProcessStartProbe::NotRunning => {
+        ProcessStartProbe::NotRunning => {
             return NativeEmbeddingLaunchIdentityStatus::Unverified {
                 pid: Some(pid),
                 reason: "live native embedding process start identity is unavailable".to_string(),
@@ -957,8 +955,9 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
     command.args(["-p", &pid.to_string(), "-o", "state=", "-o", "command="]);
     let output = bounded_process_command_output(&mut command)
         .with_context(|| format!("query native embedding pid {pid}"))?;
-    if !output.status.success() {
-        return Ok(None);
+    match classify_ps_probe_output(&output)? {
+        PsProbeOutputStatus::Success => {}
+        PsProbeOutputStatus::ProcessMissing => return Ok(None),
     }
     let mut snapshot =
         native_embedding_non_linux_unix_process_snapshot_from_ps_output(&output.stdout);

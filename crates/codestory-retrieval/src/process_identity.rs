@@ -28,7 +28,7 @@ const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 /// Live-process evidence from the platform start-identity probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessStartProbe {
-    Running { start_identity: Option<String> },
+    Running { start_identity: String },
     NotRunning,
     Unknown { reason: String },
 }
@@ -51,11 +51,8 @@ pub fn process_owner_state(
         ProcessStartProbe::Unknown { .. } => ProcessOwnerState::Unknown,
         ProcessStartProbe::Running { start_identity } => match expected_start_identity {
             None => ProcessOwnerState::Matching,
-            Some(expected) => match start_identity {
-                Some(actual) if actual == expected => ProcessOwnerState::Matching,
-                Some(_) => ProcessOwnerState::GoneOrReused,
-                None => ProcessOwnerState::Unknown,
-            },
+            Some(expected) if start_identity == expected => ProcessOwnerState::Matching,
+            Some(_) => ProcessOwnerState::GoneOrReused,
         },
     }
 }
@@ -68,17 +65,15 @@ pub fn probe_process_start_identity(pid: u32) -> ProcessStartProbe {
         && let Some(identity) = CURRENT_PROCESS_START_IDENTITY.get()
     {
         return ProcessStartProbe::Running {
-            start_identity: Some(identity.clone()),
+            start_identity: identity.clone(),
         };
     }
 
     let probe = probe_process_start_identity_platform(pid);
     if pid == std::process::id()
-        && let ProcessStartProbe::Running {
-            start_identity: Some(identity),
-        } = &probe
+        && let ProcessStartProbe::Running { start_identity } = &probe
     {
-        let _ = CURRENT_PROCESS_START_IDENTITY.set(identity.clone());
+        let _ = CURRENT_PROCESS_START_IDENTITY.set(start_identity.clone());
     }
     probe
 }
@@ -89,12 +84,7 @@ pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String
         bail!("native embedding process pid must be greater than zero");
     }
     match probe_process_start_identity(pid) {
-        ProcessStartProbe::Running {
-            start_identity: Some(identity),
-        } => Ok(Some(identity)),
-        ProcessStartProbe::Running {
-            start_identity: None,
-        } => bail!("native embedding process start identity is unavailable for pid {pid}"),
+        ProcessStartProbe::Running { start_identity } => Ok(Some(start_identity)),
         ProcessStartProbe::NotRunning => Ok(None),
         ProcessStartProbe::Unknown { reason } => {
             bail!("query native embedding start identity for pid {pid}: {reason}")
@@ -104,6 +94,28 @@ pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String
 
 pub(crate) fn bounded_process_command_output(command: &mut Command) -> Result<Output> {
     bounded_process_command_output_with_timeout(command, PROCESS_PROBE_TIMEOUT)
+}
+
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PsProbeOutputStatus {
+    Success,
+    ProcessMissing,
+}
+
+#[cfg(not(windows))]
+pub(crate) fn classify_ps_probe_output(output: &Output) -> Result<PsProbeOutputStatus> {
+    if output.status.success() {
+        return Ok(PsProbeOutputStatus::Success);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(PsProbeOutputStatus::ProcessMissing);
+    }
+    bail!(
+        "ps exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
 }
 
 fn bounded_process_command_output_with_timeout(
@@ -247,10 +259,10 @@ pub(crate) fn process_started_at_epoch_ms(pid: u32) -> Result<Option<i64>> {
         .env("TZ", "UTC")
         .args(["-p", &pid.to_string(), "-o", "lstart="]);
     let output = bounded_process_command_output(&mut command)?;
-    if !output.status.success() {
-        return Ok(None);
+    match classify_ps_probe_output(&output)? {
+        PsProbeOutputStatus::Success => Ok(process_started_at_epoch_ms_from_lstart(&output.stdout)),
+        PsProbeOutputStatus::ProcessMissing => Ok(None),
     }
-    Ok(process_started_at_epoch_ms_from_lstart(&output.stdout))
 }
 
 #[cfg(not(windows))]
@@ -270,7 +282,7 @@ fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
     match windows_process_creation_time(pid) {
         Ok(Some(creation_time)) => match windows_datetime_ticks_from_filetime(&creation_time) {
             Ok(ticks) => ProcessStartProbe::Running {
-                start_identity: Some(format!("windows:{ticks}")),
+                start_identity: format!("windows:{ticks}"),
             },
             Err(error) => ProcessStartProbe::Unknown {
                 reason: error.to_string(),
@@ -306,7 +318,7 @@ fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
         };
     };
     ProcessStartProbe::Running {
-        start_identity: Some(format!("linux:{start_ticks}")),
+        start_identity: format!("linux:{start_ticks}"),
     }
 }
 
@@ -325,18 +337,14 @@ fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
             };
         }
     };
-    if !output.status.success() {
-        return if output.status.code() == Some(1) {
-            ProcessStartProbe::NotRunning
-        } else {
-            ProcessStartProbe::Unknown {
-                reason: format!(
-                    "ps exited with {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            }
-        };
+    match classify_ps_probe_output(&output) {
+        Ok(PsProbeOutputStatus::Success) => {}
+        Ok(PsProbeOutputStatus::ProcessMissing) => return ProcessStartProbe::NotRunning,
+        Err(error) => {
+            return ProcessStartProbe::Unknown {
+                reason: error.to_string(),
+            };
+        }
     }
     let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if identity.is_empty() {
@@ -345,7 +353,7 @@ fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
         };
     }
     ProcessStartProbe::Running {
-        start_identity: Some(format!("unix:{identity}")),
+        start_identity: format!("unix:{identity}"),
     }
 }
 
@@ -363,7 +371,7 @@ mod tests {
     #[test]
     fn process_owner_state_preserves_identity_and_probe_uncertainty() {
         let running = ProcessStartProbe::Running {
-            start_identity: Some("start-a".to_string()),
+            start_identity: "start-a".to_string(),
         };
         assert_eq!(
             process_owner_state(&running, Some("start-a")),
@@ -387,18 +395,33 @@ mod tests {
             ProcessOwnerState::Unknown
         );
         assert_eq!(
-            process_owner_state(
-                &ProcessStartProbe::Running {
-                    start_identity: None,
-                },
-                Some("start-a")
-            ),
-            ProcessOwnerState::Unknown
-        );
-        assert_eq!(
             process_owner_state(&running, None),
             ProcessOwnerState::Matching
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ps_status_distinguishes_missing_process_from_probe_failure() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = |code, stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        assert_eq!(
+            classify_ps_probe_output(&output(0, "")).expect("successful ps"),
+            PsProbeOutputStatus::Success
+        );
+        assert_eq!(
+            classify_ps_probe_output(&output(1, "")).expect("missing pid"),
+            PsProbeOutputStatus::ProcessMissing
+        );
+        let error = classify_ps_probe_output(&output(2, "invalid ps invocation"))
+            .expect_err("probe failure must not look like a dead process");
+        assert!(error.to_string().contains("invalid ps invocation"));
     }
 
     #[cfg(unix)]
@@ -419,13 +442,13 @@ mod tests {
         let second = probe_process_start_identity(pid);
         let result = (|| -> Result<()> {
             let ProcessStartProbe::Running {
-                start_identity: Some(first),
+                start_identity: first,
             } = first
             else {
                 bail!("live child did not expose a process start identity")
             };
             let ProcessStartProbe::Running {
-                start_identity: Some(second),
+                start_identity: second,
             } = second
             else {
                 bail!("repeat live-child probe did not expose a process start identity")

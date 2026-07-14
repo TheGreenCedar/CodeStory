@@ -424,7 +424,7 @@ pub(crate) fn wait_for_ready_repair_reservation_adoption(
                 match probe_process_start_identity(reservation.pid) {
                     ProcessStartProbe::NotRunning => return Ok(()),
                     ProcessStartProbe::Running {
-                        start_identity: Some(actual),
+                        start_identity: actual,
                     } if actual == expected_start_identity => return Ok(()),
                     ProcessStartProbe::Running { .. } | ProcessStartProbe::Unknown { .. } => {
                         anyhow::bail!(
@@ -1163,7 +1163,7 @@ pub(crate) fn process_owner_state(
 
 pub(crate) fn recorded_process_start_identity(pid: u32) -> Option<String> {
     match probe_process_start_identity(pid) {
-        ProcessStartProbe::Running { start_identity } => start_identity,
+        ProcessStartProbe::Running { start_identity } => Some(start_identity),
         ProcessStartProbe::NotRunning | ProcessStartProbe::Unknown { .. } => None,
     }
 }
