@@ -216,9 +216,26 @@ fn promotion_path_error(action: &str, path: &Path, error: impl std::fmt::Display
     promotion_error(format!("Failed to {action} {}: {error}", path.display()))
 }
 
-fn read_promotion_database_identity(
-    path: &Path,
-) -> Result<Option<IndexPublicationRecord>, StorageError> {
+fn has_incomplete_incremental_marker(conn: &Connection) -> Result<bool, StorageError> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'incomplete_index_run'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM incomplete_index_run WHERE id = 1)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn inspect_promotion_database(path: &Path) -> Result<Option<(Connection, u32)>, StorageError> {
     if !path.exists() {
         return Ok(None);
     }
@@ -233,6 +250,15 @@ fn read_promotion_database_identity(
     }
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let schema_version = version.max(0) as u32;
+    Ok(Some((conn, schema_version)))
+}
+
+fn read_complete_promotion_database_identity(
+    path: &Path,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
+        return Ok(None);
+    };
     if schema_version == 0 {
         return Ok(None);
     }
@@ -245,11 +271,46 @@ fn read_promotion_database_identity(
     read_complete_index_publication(&conn)
 }
 
-fn require_promotion_database_identity(
+fn read_recovery_database_identity(
+    path: &Path,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
+        return Ok(None);
+    };
+    match schema_version {
+        0 => Ok(None),
+        SCHEMA_VERSION => read_complete_index_publication(&conn),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
+            read_index_publication(&conn)
+        }
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION => Err(promotion_error(format!(
+            "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
+            path.display()
+        ))),
+        _ => Err(promotion_error(format!(
+            "SQLite recovery artifact {} has unsupported schema version {schema_version}",
+            path.display()
+        ))),
+    }
+}
+
+fn require_complete_promotion_database_identity(
     path: &Path,
     role: &str,
 ) -> Result<IndexPublicationRecord, StorageError> {
-    read_promotion_database_identity(path)?.ok_or_else(|| {
+    read_complete_promotion_database_identity(path)?.ok_or_else(|| {
+        promotion_error(format!(
+            "{role} {} has no complete publication identity",
+            path.display()
+        ))
+    })
+}
+
+fn require_recovery_database_identity(
+    path: &Path,
+    role: &str,
+) -> Result<IndexPublicationRecord, StorageError> {
+    read_recovery_database_identity(path)?.ok_or_else(|| {
         promotion_error(format!(
             "{role} {} has no complete publication identity",
             path.display()
@@ -410,7 +471,8 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
 
     if committed_path.exists() {
         let committed = read_promotion_journal(&committed_path)?;
-        let live_identity = require_promotion_database_identity(path, "Committed live database")?;
+        let live_identity =
+            require_complete_promotion_database_identity(path, "Committed live database")?;
         if live_identity != committed.candidate {
             return Err(promotion_error(format!(
                 "Committed promotion identity does not match live database {}",
@@ -451,7 +513,7 @@ fn rollback_prepared_promotion(
 ) -> Result<(), StorageError> {
     let backup_path = live_path.with_extension("sqlite.backup");
     let prepared_path = promotion_prepared_journal_path(live_path);
-    let live_identity = read_promotion_database_identity(live_path)?;
+    let live_identity = read_recovery_database_identity(live_path)?;
     if live_identity
         .as_ref()
         .is_some_and(|live| live != &prepared.candidate && Some(live) != prepared.previous.as_ref())
@@ -465,7 +527,7 @@ fn rollback_prepared_promotion(
     match prepared.previous.as_ref() {
         Some(expected_previous) => {
             let backup_identity =
-                require_promotion_database_identity(&backup_path, "Prepared recovery backup")?;
+                require_recovery_database_identity(&backup_path, "Prepared recovery backup")?;
             if &backup_identity != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion backup identity does not match {}",
@@ -475,8 +537,7 @@ fn rollback_prepared_promotion(
             if live_identity.as_ref() != Some(expected_previous) {
                 restore_promotion_database(&backup_path, live_path)?;
             }
-            let restored =
-                require_promotion_database_identity(live_path, "Restored live database")?;
+            let restored = require_recovery_database_identity(live_path, "Restored live database")?;
             if &restored != expected_previous {
                 return Err(promotion_error(format!(
                     "Prepared promotion rollback did not restore the recorded identity for {}",
@@ -506,8 +567,8 @@ fn recover_legacy_promotion_backup(
     backup_path: &Path,
 ) -> Result<(), StorageError> {
     let backup_identity =
-        require_promotion_database_identity(backup_path, "Legacy promotion backup")?;
-    let live_identity = read_promotion_database_identity(live_path);
+        require_recovery_database_identity(backup_path, "Legacy promotion backup")?;
+    let live_identity = read_recovery_database_identity(live_path);
     let restore_backup = match live_identity {
         Ok(None) => true,
         Err(error) => {
@@ -527,7 +588,7 @@ fn recover_legacy_promotion_backup(
     };
     if restore_backup {
         restore_promotion_database(backup_path, live_path)?;
-        let restored = require_promotion_database_identity(live_path, "Recovered live database")?;
+        let restored = require_recovery_database_identity(live_path, "Recovered live database")?;
         if restored != backup_identity {
             return Err(promotion_error(format!(
                 "Legacy promotion recovery produced an unexpected identity for {}",
@@ -1557,20 +1618,7 @@ impl Storage {
                 "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
             )));
         }
-        let table_exists: i64 = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'incomplete_index_run'
-            )",
-            [],
-            |row| row.get(0),
-        )?;
-        let marked = table_exists != 0
-            && conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM incomplete_index_run WHERE id = 1)",
-                [],
-                |row| row.get::<_, i64>(0),
-            )? != 0;
+        let marked = has_incomplete_incremental_marker(&conn)?;
         if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && !marked {
             return Err(StorageError::Other(format!(
                 "Database schema version {version} is only valid while an incremental index run is marked incomplete"
@@ -2668,9 +2716,11 @@ impl Storage {
         let backup_path = live_path.with_extension("sqlite.backup");
         let prepared_path = promotion_prepared_journal_path(live_path);
         let committed_path = promotion_committed_journal_path(live_path);
-        let candidate =
-            require_promotion_database_identity(staged_path, "Staged promotion candidate")?;
-        let previous = read_promotion_database_identity(live_path)?;
+        let candidate = require_complete_promotion_database_identity(
+            staged_path,
+            "Staged promotion candidate",
+        )?;
+        let previous = read_recovery_database_identity(live_path)?;
         cleanup_sqlite_sidecars(&backup_path)?;
 
         if previous.is_some() {
@@ -2683,7 +2733,7 @@ impl Storage {
             )?;
             drop(live_conn);
             let backup_identity =
-                require_promotion_database_identity(&backup_path, "Promotion backup")?;
+                require_recovery_database_identity(&backup_path, "Promotion backup")?;
             if Some(&backup_identity) != previous.as_ref() {
                 return Err(promotion_error(format!(
                     "Promotion backup identity does not match live database {}",
@@ -2742,7 +2792,8 @@ impl Storage {
         }
         drop(live_conn);
 
-        let published = require_promotion_database_identity(live_path, "Promoted live database")?;
+        let published =
+            require_complete_promotion_database_identity(live_path, "Promoted live database")?;
         if published != candidate {
             let _ = rollback_prepared_promotion(live_path, &prepared);
             return Err(promotion_error(format!(

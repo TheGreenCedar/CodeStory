@@ -2197,8 +2197,8 @@ fn promotion_journal(
 ) -> Result<PromotionJournal, StorageError> {
     Ok(PromotionJournal {
         version: PROMOTION_JOURNAL_VERSION,
-        previous: read_promotion_database_identity(previous_path)?,
-        candidate: require_promotion_database_identity(candidate_path, "Test candidate")?,
+        previous: read_recovery_database_identity(previous_path)?,
+        candidate: require_complete_promotion_database_identity(candidate_path, "Test candidate")?,
     })
 }
 
