@@ -16,6 +16,11 @@
   handoff is serialized with owner shutdown, attached projects cannot stop the
   shared process, and temporary contention is reported as background search
   preparation without process or workspace details.
+- Managed search is now automatic and invisible in normal plugin use. Public
+  setup, repair, enable, disable, and consent controls are gone; broad tools
+  prepare their dependencies and return one same-tool retry while work is in
+  progress. Diagnostics remain available when automatic recovery cannot
+  converge.
 
 ## 0.15.0
 

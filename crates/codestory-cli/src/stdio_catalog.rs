@@ -8,67 +8,47 @@
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Side-effect class advertised for a stdio tool.
-///
-/// Adding a new effect requires updating both safety metadata and tool annotations.
-pub(crate) enum ToolEffect {
-    Read,
-    LocalConfigWrite,
-}
-
 #[derive(Debug, Clone, Copy)]
 /// Safety metadata emitted in both legacy and annotation-style catalog fields.
 pub(crate) struct SafetyMetadata {
-    effect: ToolEffect,
+    activates_managed_state: bool,
 }
 
 impl SafetyMetadata {
-    pub(crate) const fn read_only() -> Self {
+    pub(crate) const fn observational() -> Self {
         Self {
-            effect: ToolEffect::Read,
+            activates_managed_state: false,
         }
     }
 
-    pub(crate) const fn local_config_write() -> Self {
+    pub(crate) const fn managed_activation() -> Self {
         Self {
-            effect: ToolEffect::LocalConfigWrite,
+            activates_managed_state: true,
         }
     }
 
     fn to_json(self) -> Value {
-        match self.effect {
-            ToolEffect::Read => json!({
-                "readOnly": true,
-                "sideEffects": false,
-                "localOnly": true,
-                "openWorld": false
-            }),
-            ToolEffect::LocalConfigWrite => json!({
-                "readOnly": false,
-                "sideEffects": true,
-                "localOnly": true,
-                "openWorld": false,
-                "mutation": "local_plugin_configuration"
-            }),
-        }
+        json!({
+            "effect": if self.activates_managed_state { "managed_activation" } else { "read_only" },
+            "readOnly": !self.activates_managed_state,
+            "sideEffects": self.activates_managed_state,
+            "activatesProject": self.activates_managed_state,
+            "writesRepository": false,
+            "destructive": false,
+            "idempotent": true,
+            "requiresConfirmation": false,
+            "localOnly": true,
+            "openWorld": false
+        })
     }
 
     fn annotations_json(self) -> Value {
-        match self.effect {
-            ToolEffect::Read => json!({
-                "readOnlyHint": true,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false
-            }),
-            ToolEffect::LocalConfigWrite => json!({
-                "readOnlyHint": false,
-                "destructiveHint": false,
-                "idempotentHint": true,
-                "openWorldHint": false
-            }),
-        }
+        json!({
+            "readOnlyHint": !self.activates_managed_state,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        })
     }
 }
 
@@ -1307,174 +1287,149 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &["question"],
 );
 
-static SIDECAR_SETUP_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Configure the plugin-local sidecar setup policy.",
-    &[SchemaProperty::string("action", "Policy action.")
-        .with_enum(&["status", "enable", "disable", "ask", "repair"])
-        .with_default(ValueLiteral::String("status"))],
-    &[],
-);
-
-static REPAIR_ALL_INPUT_SCHEMA: SchemaObject =
-    SchemaObject::object("Compatibility alias for sidecar_setup repair.", &[], &[]);
-
 static STATUS_INPUT_SCHEMA: SchemaObject =
     SchemaObject::object("Read readiness for one explicit repository.", &[], &[]);
 
 static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "status",
-        description: "Read CodeStory readiness for the requested repository before using other tools.",
+        description: "Inspect CodeStory readiness for the requested repository when diagnostics are needed.",
         input_schema: STATUS_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
-    },
-    ToolSpec {
-        name: "repair_all",
-        description: "Deprecated compatibility alias for sidecar_setup action=repair; agents should follow codestory://status recommended_next_calls.",
-        input_schema: REPAIR_ALL_INPUT_SCHEMA,
-        output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
-        safety: SafetyMetadata::local_config_write(),
-    },
-    ToolSpec {
-        name: "sidecar_setup",
-        description: "Read or change the plugin-local sidecar setup policy through MCP; use this instead of asking the user to run shell commands.",
-        input_schema: SIDECAR_SETUP_INPUT_SCHEMA,
-        output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
-        safety: SafetyMetadata::local_config_write(),
+        safety: SafetyMetadata::observational(),
     },
     ToolSpec {
         name: "packet",
-        description: "Answer broad structural questions with graph/sidecar evidence, sufficiency, truncation, and follow-up commands before source snippets.",
+        description: "Answer broad structural questions with repository evidence, sufficiency, truncation, and follow-up commands before source snippets. CodeStory prepares managed retrieval automatically.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "search",
-        description: "Discover candidate symbols and sidecar hits; for broad structural questions call packet before snippet/source reads.",
+        description: "Discover candidate symbols and retrieval hits; for broad structural questions call packet before snippet/source reads. CodeStory prepares managed retrieval automatically.",
         input_schema: SEARCH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SEARCH_RESULTS_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "ground",
-        description: "Return a compact repository map for orientation before packet/search, activating one bounded local refresh first when the repository is cold or stale; equivalent to codestory://grounding.",
+        description: "Return a compact repository map for orientation before packet/search; equivalent to codestory://grounding. The first call may refresh the local map and begin managed retrieval preparation.",
         input_schema: GROUND_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GROUNDING_SNAPSHOT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "files",
-        description: "List indexed files and coverage from a locally fresh index; refreshes local graph before dispatch and never bootstraps sidecars.",
+        description: "List indexed files and coverage from a locally fresh index; refreshes the repository map before dispatch and does not wait for broad search.",
         input_schema: FILES_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(INDEXED_FILES_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "affected",
-        description: "Analyze explicit changed paths against a locally fresh index; uses provided paths only, refreshes local graph before dispatch, never discovers git changes, and never bootstraps sidecars.",
+        description: "Analyze explicit changed paths against a locally fresh index; uses provided paths only, refreshes the repository map before dispatch, never discovers git changes, and does not wait for broad search.",
         input_schema: AFFECTED_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AFFECTED_ANALYSIS_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "symbol",
         description: "Resolve a symbol id or query and return details.",
         input_schema: TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SYMBOL_CONTEXT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "trail",
         description: "Return a graph trail around a symbol.",
         input_schema: TRAIL_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(TRAIL_CONTEXT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "callers",
         description: "Return a bounded incoming caller graph around a symbol.",
         input_schema: LOCAL_GRAPH_ALIAS_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "callees",
         description: "Return a bounded outgoing callee graph around a symbol.",
         input_schema: LOCAL_GRAPH_ALIAS_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "trace",
         description: "Return a readable trace around a symbol.",
         input_schema: TRACE_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(TRAIL_CONTEXT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "get_node",
         description: "Return one stable graph node with file refs before requesting a packet.",
         input_schema: GRAPH_TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "neighbors",
         description: "Return a bounded graph neighborhood around one node.",
         input_schema: GRAPH_NEIGHBORS_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "shortest_path",
         description: "Return a bounded forward path graph between two node ids.",
         input_schema: SHORTEST_PATH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "query_subgraph",
         description: "Return a bounded subgraph around one resolved node; packet remains the broad task tool.",
         input_schema: QUERY_SUBGRAPH_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GRAPH_TOOL_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "definition",
         description: "Return definition metadata for a symbol id or query.",
         input_schema: TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(DEFINITION_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "references",
         description: "Return incoming references for a symbol id or query.",
         input_schema: TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(TRAIL_CONTEXT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "symbols",
         description: "Browse root symbols or children for a parent id.",
         input_schema: SYMBOLS_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SYMBOLS_OUTPUT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "snippet",
         description: "Return a focused source snippet after packet, search, or graph evidence selects a concrete target.",
         input_schema: TARGET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(SNIPPET_CONTEXT_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
     ToolSpec {
         name: "context",
         description: "Build proof-bearing source/graph evidence for one concrete target; not broad question answering.",
         input_schema: CONTEXT_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(CONTEXT_PACKET_SCHEMA)),
-        safety: SafetyMetadata::read_only(),
+        safety: SafetyMetadata::managed_activation(),
     },
 ];
 

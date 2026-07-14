@@ -134,10 +134,6 @@ function pluginDataDir() {
     || inferredCodexPluginDataDir();
 }
 
-function sidecarPolicyPath(dataDir = pluginDataDir()) {
-  return dataDir ? path.join(dataDir, 'sidecar-setup-policy.json') : null;
-}
-
 function activeStatePath(dataDir = pluginDataDir()) {
   return dataDir ? path.join(dataDir, activeStateFile) : null;
 }
@@ -236,102 +232,6 @@ function resolveProjectRoot(options = {}) {
   };
 }
 
-function sidecarPolicyCommand(action, policyFile = sidecarPolicyPath()) {
-  const policyArg = policyFile ? ` --policy-file ${JSON.stringify(policyFile)}` : '';
-  return `node ${JSON.stringify(__filename)} sidecar-policy ${action}${policyArg}`;
-}
-
-function normalizeSidecarPolicyState(value) {
-  const state = String(value || '').trim().toLowerCase();
-  if (state === 'enabled' || state === 'disabled' || state === 'ask' || state === 'unknown') {
-    return state === 'unknown' ? 'ask' : state;
-  }
-  return 'ask';
-}
-
-function sidecarPolicyStateForAction(action) {
-  if (action === 'enable' || action === 'repair') return 'enabled';
-  if (action === 'disable') return 'disabled';
-  return 'ask';
-}
-
-function readSidecarPolicy(file = sidecarPolicyPath()) {
-  const policy = file ? readJson(file) : null;
-  const state = normalizeSidecarPolicyState(process.env.CODESTORY_PLUGIN_SIDECAR_POLICY || policy?.state);
-  return {
-    state,
-    path: file,
-    updatedAt: policy?.updated_at || null,
-    lastRepair: policy?.last_repair || null,
-  };
-}
-
-function firstSemverToken(value) {
-  const match = String(value || '').match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/u);
-  return match ? match[0] : null;
-}
-
-function sidecarLastRepairStaleReason(lastRepair, activeVersion = pluginVersion(), activePath = null) {
-  const command = lastRepair?.command;
-  if (!command) return null;
-  const version = firstSemverToken(command);
-  if (version && activeVersion && version !== activeVersion) {
-    return `last_repair_cli_version_mismatch:${version}!=${activeVersion}`;
-  }
-  if (activePath && command.includes('codestory-cli') && !command.includes(activePath)) {
-    return 'last_repair_cli_path_mismatch';
-  }
-  return null;
-}
-
-function normalizedSidecarLastRepair(lastRepair, activeVersion = pluginVersion(), activePath = null) {
-  if (!lastRepair) return null;
-  const staleReason = sidecarLastRepairStaleReason(lastRepair, activeVersion, activePath);
-  return {
-    ...lastRepair,
-    current: Boolean(lastRepair.command) && !staleReason,
-    stale_reason: staleReason,
-  };
-}
-
-function writeSidecarPolicy(state, patch = {}, file = sidecarPolicyPath()) {
-  if (!file) return null;
-  const current = readJson(file) || {};
-  const next = {
-    ...current,
-    ...patch,
-    state: normalizeSidecarPolicyState(state),
-    updated_at: new Date().toISOString(),
-  };
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(next, null, 2));
-  return next;
-}
-
-function handleSidecarPolicyCommand(argv) {
-  if (argv[2] !== 'sidecar-policy') return;
-  const action = argv[3] || 'status';
-  const policyFileFlag = argv.indexOf('--policy-file');
-  const policyFile = policyFileFlag >= 0 ? argv[policyFileFlag + 1] : sidecarPolicyPath();
-  if (!['enable', 'disable', 'ask', 'repair', 'status'].includes(action)) {
-    process.stderr.write('usage: codestory-mcp.cjs sidecar-policy [enable|disable|ask|repair|status] [--policy-file PATH]\n');
-    process.exit(2);
-  }
-  if (policyFileFlag >= 0 && !policyFile) {
-    process.stderr.write('sidecar-policy --policy-file requires a path\n');
-    process.exit(2);
-  }
-  if (action !== 'status') {
-    if (!policyFile) {
-      process.stderr.write('sidecar-policy needs PLUGIN_DATA, COPILOT_PLUGIN_DATA, CODESTORY_PLUGIN_DATA, or --policy-file to remember the setting\n');
-      process.exit(2);
-    }
-    writeSidecarPolicy(sidecarPolicyStateForAction(action), {}, policyFile);
-  }
-  process.stdout.write(`${JSON.stringify(readSidecarPolicy(policyFile), null, 2)}\n`);
-  process.exit(0);
-}
-
 function repairCommandForProject(projectRoot = launchCwd) {
   return `codestory-cli ready --goal agent --repair --project ${JSON.stringify(projectRoot)} --format json --run-id ${sharedAgentRunId}`;
 }
@@ -380,7 +280,7 @@ function runtimeTruthStatus(plugin, options = {}) {
   if (readinessLanes?.agent_packet_search) {
     readinessRefs.agent_packet_search = 'readiness_lanes.agent_packet_search';
   }
-  const sidecarStatusRef = readinessLanes?.agent_packet_search
+  const retrievalStatusRef = readinessLanes?.agent_packet_search
     ? 'readiness_lanes.agent_packet_search'
     : readinessGoals.has('agent_packet_search')
       ? 'readiness[goal=agent_packet_search]'
@@ -390,8 +290,8 @@ function runtimeTruthStatus(plugin, options = {}) {
     plugin_root: plugin.plugin_root || null,
     managed_cli_path: plugin.managed_binary_path || null,
     launcher_source: plugin.cli_source || 'unavailable',
-    sidecar_policy: options.sidecarPolicy || 'unavailable',
-    sidecar_status_ref: sidecarStatusRef,
+    managed_retrieval: 'automatic',
+    retrieval_status_ref: retrievalStatusRef,
     readiness_refs: readinessRefs,
     readiness_broker_ref: options.hasReadinessBroker ? 'readiness_broker' : null,
   };
@@ -2432,8 +2332,6 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   ]);
   const fullRepair = options.fullRepair || minimumNext;
   const recommendedNext = options.recommendedNext || fullRepair;
-  const sidecarPolicy = readSidecarPolicy();
-  const lastRepair = normalizedSidecarLastRepair(sidecarPolicy.lastRepair, resolved.version, resolved.path);
   const plugin = pluginRuntimeForResolved({ ...resolved, warnings: [...resolved.warnings, reason] });
   const repair = {
     goal: options.goal || 'local_navigation',
@@ -2472,7 +2370,7 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     'shortest_path',
     'query_subgraph',
   ];
-  const sidecarSurfaces = ['packet', 'search', 'context'];
+  const retrievalSurfaces = ['packet', 'search', 'context'];
   const blockedSurface = () => ({
     allowed: false,
     readiness_goal: repair.goal,
@@ -2481,38 +2379,8 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
   });
   const allowedSurfaces = Object.fromEntries([
     ...localSurfaces.map((surface) => [surface, blockedSurface()]),
-    ...sidecarSurfaces.map((surface) => [surface, blockedSurface()]),
+    ...retrievalSurfaces.map((surface) => [surface, blockedSurface()]),
   ]);
-  allowedSurfaces.repair_all = {
-    ...blockedSurface('repair_all', 'agent_packet_search'),
-    blocked_reason: 'diagnostic_fail_open',
-  };
-  const sidecarSetup = {
-    state: sidecarPolicy.state || 'unavailable',
-    auto_repair: false,
-    status_triggered_repair: false,
-    explicit_repair_enabled: sidecarPolicy.state === 'enabled',
-    repair_mode: 'diagnostic_fail_open',
-    prompt_required: sidecarPolicy.state === 'ask',
-    prompt: sidecarPolicy.state === 'ask'
-      ? 'CodeStory packet/search needs retrieval sidecars. MCP repair may start or download retrieval sidecars for this project. Enable MCP sidecar repair for this plugin install?'
-      : null,
-    last_repair: lastRepair,
-    active_repair: null,
-    abandoned_repair: null,
-  };
-  allowedSurfaces.sidecar_setup = {
-    allowed: true,
-    readiness_goal: repair.goal,
-    status: repair.status,
-    repair_reason: reason,
-    blocked_reason: 'diagnostic_fail_open_repair_unavailable',
-    summary: 'sidecar_setup status and policy actions are available in diagnostic fail-open mode; repair requires the real stdio runtime.',
-    allowed_actions: ['status', 'enable', 'disable', 'ask'],
-    canonical_arguments: { action: 'status' },
-    minimum_next: minimumNext,
-    full_repair: fullRepair,
-  };
   const readinessBroker = {
     schema_version: 2,
     identity: null,
@@ -2560,10 +2428,9 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     server_executable: null,
     server_executable_sha256: null,
     source_checkout_version: sourceCheckoutVersion(projectRoot),
-    sidecar_contract_version: null,
+    retrieval_contract_version: null,
     plugin_runtime: plugin,
     runtime_truth: runtimeTruthStatus(plugin, {
-      sidecarPolicy: sidecarPolicy.state || 'unavailable',
       localRefresh: options.localRefresh || null,
       readinessGoals: [repair.goal],
       hasReadinessBroker: true,
@@ -2581,7 +2448,10 @@ function fallbackDiagnostic(resolved, probe, reason, options = {}) {
     degraded_reason: reason,
     local_refresh: options.localRefresh || null,
     readiness: [repair],
-    sidecar_setup: sidecarSetup,
+    managed_retrieval: {
+      state: managedProvisioning ? 'preparing' : 'unavailable',
+      automatic: true,
+    },
     readiness_broker: readinessBroker,
     allowed_surfaces: allowedSurfaces,
     recommended_next_calls: singleRepairNextCalls(recommendedNext),
@@ -2659,7 +2529,6 @@ async function bootstrapStatus(projectRoot = launchCwd) {
     };
   }
 
-  const sidecarPolicy = readSidecarPolicy();
   const plugin = pluginRuntimeForResolved(resolved);
   const agentReadiness = probeAgentReadiness(resolved, projectRoot);
   const identityMismatch = projectIdentityMismatch(projectIdentity.identity, agentReadiness);
@@ -2712,7 +2581,6 @@ async function bootstrapStatus(projectRoot = launchCwd) {
     plugin_runtime: plugin,
     project_root_source: 'argument',
     runtime_truth: runtimeTruthStatus(plugin, {
-      sidecarPolicy: sidecarPolicy.state || 'unavailable',
       localRefresh,
       readinessGoals: readiness.map((verdict) => verdict.goal),
       readinessLanes: agentReadiness.parsed?.readiness_lanes || null,
@@ -2889,51 +2757,6 @@ function resourceContents(uri, value) {
   };
 }
 
-function failOpenSidecarSetupResult(request, status = null) {
-  const action = request.params?.arguments?.action || 'status';
-  if (action === 'repair') {
-    return {
-      isError: true,
-      content: [{ type: 'text', text: 'sidecar_setup repair is unavailable while CodeStory is in diagnostic fail-open mode; reload the host or restore the stdio runtime first.' }],
-      structuredContent: {
-        code: 'repair_unavailable_diagnostic_fail_open',
-        action,
-        recommended_next_calls: [{
-          method: 'resources/read',
-          uri: 'codestory://status',
-          instruction: 'Read status again after restoring the compatible stdio runtime.',
-        }],
-      },
-    };
-  }
-  if (!['status', 'enable', 'disable', 'ask'].includes(action)) {
-    return {
-      isError: true,
-      content: [{ type: 'text', text: 'sidecar_setup.action must be status, enable, disable, or ask while the runtime is in diagnostic mode.' }],
-      structuredContent: { code: 'invalid_sidecar_setup_action', action },
-    };
-  }
-  if (action !== 'status') {
-    writeSidecarPolicy(sidecarPolicyStateForAction(action));
-  }
-  const policy = readSidecarPolicy();
-  const lastRepair = normalizedSidecarLastRepair(
-    policy.lastRepair,
-    status?.plugin_runtime?.plugin_version,
-    status?.plugin_runtime?.cli_path,
-  );
-  const statusPolicy = { ...policy, lastRepair };
-  return {
-    content: [{ type: 'text', text: JSON.stringify(statusPolicy) }],
-    structuredContent: {
-      state: policy.state,
-      path: policy.path,
-      updated_at: policy.updatedAt,
-      last_repair: lastRepair,
-    },
-  };
-}
-
 function runFailOpenMcp(status, options = {}) {
   const currentStatus = () => (typeof status === 'function' ? status() : status);
   let handoff = null;
@@ -3027,31 +2850,7 @@ function runFailOpenMcp(status, options = {}) {
     if (stdinEnded) handoff.stdin.end();
     return handoff;
   };
-  const tools = [{
-    name: 'sidecar_setup',
-    description: 'Read or change plugin-local sidecar setup policy while CodeStory is in diagnostic fail-open mode. Repair requires the real stdio runtime.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['status', 'enable', 'disable', 'ask'], default: 'status' },
-      },
-      additionalProperties: false,
-    },
-    outputSchema: { type: 'object', additionalProperties: true },
-    safety: {
-      readOnly: false,
-      sideEffects: true,
-      localOnly: true,
-      openWorld: false,
-      mutation: 'local_plugin_configuration',
-    },
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-  }];
+  const tools = [];
   const resources = [
     { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
     { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
@@ -3126,11 +2925,7 @@ function runFailOpenMcp(status, options = {}) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        if (request.params?.name === 'sidecar_setup') {
-          response = jsonrpcResult(request.id, failOpenSidecarSetupResult(request, currentStatus()));
-        } else {
-          response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are unavailable in diagnostic fail-open mode; read codestory://status and restore a compatible stdio runtime.');
-        }
+        response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are temporarily unavailable while the managed runtime starts. Retry after the host reports that CodeStory is ready.');
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }
@@ -3178,7 +2973,6 @@ function rememberLaunch(resolved, runtimeCwd = process.cwd()) {
 }
 
 function stdioRuntimeEnv(resolved, runtimeCwd) {
-  const sidecarStatus = readSidecarPolicy();
   return {
     ...process.env,
     CODESTORY_PLUGIN_VERSION: resolved.version || '',
@@ -3200,15 +2994,6 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
     CODESTORY_PLUGIN_CLI_WARNINGS: resolved.warnings.join(';'),
     CODESTORY_PLUGIN_MULTI_PROJECT: '1',
     CODESTORY_PLUGIN_DATA: pluginDataDir() || '',
-    CODESTORY_PLUGIN_SIDECAR_POLICY_STATE: sidecarStatus.state,
-    CODESTORY_PLUGIN_SIDECAR_POLICY_PATH: sidecarStatus.path || '',
-    CODESTORY_PLUGIN_SIDECAR_POLICY_UPDATED_AT: sidecarStatus.updatedAt || '',
-    CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND: sidecarPolicyCommand('enable'),
-    CODESTORY_PLUGIN_SIDECAR_DISABLE_COMMAND: sidecarPolicyCommand('disable'),
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_STATE: sidecarStatus.lastRepair?.state || '',
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_AT: sidecarStatus.lastRepair?.updated_at || '',
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_PROJECT: sidecarStatus.lastRepair?.project_root || '',
-    CODESTORY_PLUGIN_SIDECAR_LAST_REPAIR_COMMAND: sidecarStatus.lastRepair?.command || '',
   };
 }
 
@@ -3223,7 +3008,6 @@ function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
 
 async function main() {
   if (await handleBootstrapStatusCommand(process.argv)) return;
-  handleSidecarPolicyCommand(process.argv);
   const runtimeCwd = releasePluginCacheCwd();
   const installed = await resolveCli({ provision: false });
   if (

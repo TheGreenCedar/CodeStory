@@ -1,67 +1,71 @@
-# Status Contract
+# CodeStory Tool State
 
-When plugin MCP is live, the `status` tool with an explicit absolute `project`
-is the first and canonical runtime truth. Call it before `ground`, `files`,
-`packet`, or `search`, and pass the same project to every tool. The server has no
-global workspace binding.
+Call the tool that matches the repository question and pass the same absolute
+`project` path to every call. Do not read status first. CodeStory owns local
+map refresh, managed search preparation, retry cooldowns, and runtime reuse
+across repositories.
 
-Status is observational: it reports freshness, active ownership, policy, and
-proof without starting work. Calling a project tool such as `ground` activates
-the selected project, starts or attaches its local refresh, and may enqueue the
-existing broker-backed agent repair when sidecar policy is already enabled.
-Failed automatic repairs are cooldown-gated until the relevant project or
-sidecar state changes. A stale heartbeat from a still-live owner remains
-fail-closed because suspension or starvation is not proof of abandonment;
-CodeStory never terminates a repair process based only on heartbeat age.
+## Normal tool loop
 
-Reuse a status result until repository, runtime, or index state changes, or a
-tool reports stale evidence or a freshness failure. A blocked sidecar-backed
-surface does not invalidate an allowed local graph route.
-
-## Status Fields
-
-| Status field | Meaning | Agent action |
+| State | Meaning | Agent action |
 | --- | --- | --- |
-| `server_version` | Version of the active MCP server binary. | Use as active runtime evidence once MCP is live. |
-| `cli_version` | Version reported by the active CLI runtime. | Use as the active CLI version, not the source checkout version. |
-| `server_executable` | Executable path serving this MCP session. | Use as active runtime evidence; do not guess from source paths. |
-| `server_executable_sha256` | Checksum of the active MCP server binary when available. | Use to confirm the exact runtime binary after install, repair, or reload. |
-| `runtime_update` | Non-blocking release and managed-install advisory. `state=available` reports an optional update; `restart_recommended=true` means a newer checksum-valid managed CLI is already installed. Release metadata is cached and refreshed outside the status request path. | Do not treat update availability as a readiness failure. Continue using each compatible surface according to `allowed_surfaces`; reload the host when convenient if restart is recommended. |
-| `sidecar_contract_version` | Sidecar schema contract compiled into the active CLI. | Use to diagnose sidecar/runtime contract drift. |
-| `plugin_runtime` | Plugin launch source and managed CLI metadata, including `plugin_runtime.plugin_root`, `plugin_cache_version`, `build_source`, and `repo_ref` when provisioned. | Treat `managed` as installed plugin runtime, `local_dev_override` as source/dev override, and `managed_unavailable` as blocked managed setup. |
-| `runtime_truth` | Grouped runtime source, plugin root, managed CLI path, launcher source, and references to canonical readiness fields. | Use as the concise bounded runtime identity summary. Follow its `*_ref` fields into top-level status instead of expecting cloned readiness payloads. |
-| `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Diagnostic sidecar policy detail. For agent repair, follow `recommended_next_calls` and prefer MCP `sidecar_setup` with `action=repair`. |
-| `sidecar_setup.stale_live_repair` | Read-only evidence for a repair whose heartbeat is stale while its recorded process is still live. | Treat it as unresolved ownership. Do not infer abandonment from age, start another repair, or terminate the owner. |
-| `readiness_broker` | Durable repair, local refresh, native embedding resource ownership, stale-lock reconciliation, persistence status, and GPU proof (`proof_status`, `embed_smoke_ok`, `embed_smoke_ms`). | Inspect before retrying repair. A foreign or unverifiable `native_embedding_runtime` busy state blocks repair; a same-project reusable native owner should be followed through `recommended_next_calls`. `gpu_proof.proof_status == "verified"` and `gpu_proof.meaningful_accelerator_work_proven == true` require observed acceleration plus a live timed embed smoke when accelerator is required. |
-| `index_publication` | Durable identity of the complete core database generation currently served at the live path. It is null when the live database is fenced by an incomplete legacy run. | Use its generation, generation ID, run ID, mode, and publication time to distinguish old-or-new complete reads during refresh. |
-| `local_refresh` | Single-flight local refresh state and owner metadata. While `state=refreshing`, `serving_publication` identifies the last complete generation that remains readable. | Continue using local surfaces whose allowed bit is true. Do not treat staged work as live. Read tool-call `_meta.codestory_publication` identifies the exact complete response generation; `served_from=last_complete_publication` means a writer was refreshing concurrently. |
-| `embedding_launch_metadata.launch_mode` | Embedding sidecar launch mode when available, such as `native_spawned` or Docker Compose embed. | On macOS arm64, expect `native_spawned` for accelerated Metal; Docker/Vulkan on Apple Silicon is stale or unrepaired. |
-| `embedding_accelerator_request_provider` / `embedding_accelerator_request_device` | Requested accelerator provider/device. These fields are intent, not proof. | Use them to diagnose mismatched requests, for example `metal` with no device on Apple Silicon versus `vulkan`/`Vulkan0` on Windows or Linux Vulkan paths. |
-| `embedding_device_state` / `embedding_device_observation_source` | Observed embedding device state and where the observation came from. | Treat these as proof inputs. `manual_env` and device-inventory observations remain diagnostic; complete accelerator proof requires the verified broker GPU proof above. Treat `accelerator_request_unobserved` as blocked unless CPU mode is explicitly allowed. |
-| `allowed_surfaces.<surface>.allowed` | A concrete MCP surface is callable. Ordinary surface entries stay compact and name their canonical verdict with `readiness_goal`; failure summaries are not cloned into every entry. On a cold or stale repository, `ground`, `files`, and `affected` remain callable while local readiness stays `repair_index`. | Use local graph entries only when their surface is allowed. Follow `readiness_goal` into top-level `readiness` for publication state and full diagnostics. |
-| `allowed_surfaces.<surface>.activation_required` | The callable surface must first build or refresh the bounded local graph. This marker appears on `ground`, `files`, and `affected` while local readiness is `repair_index`. | Call the intended tool once with the same project. Do not poll status first or repair packet/search infrastructure for local activation. Other graph evidence surfaces remain blocked until a complete publication exists. |
-| `allowed_surfaces.packet.allowed` / `allowed_surfaces.search.allowed` / `allowed_surfaces.context.allowed` | Sidecar-backed agent surfaces are allowed. | Use `packet`, `search`, and `context` confidently when their own allowed bit is true and `retrieval_mode=full`. |
+| `ready` | The requested capability is available. | Use the result. |
+| `preparing` | CodeStory is starting or updating managed search. | Wait `retry_after_ms`, then retry the same tool with the same arguments. |
+| `updating` | The repository map is moving to a new complete publication. | Retry the same tool after the reported delay; do not start another refresh. |
+| `working_locally` | Local graph navigation is available while broad search prepares. | Continue with local tools and retry the original broad tool later. |
+| `needs_environment` | Automatic preparation found one host requirement it cannot satisfy. | Report that single requirement in plain language. |
+| `unavailable` | CodeStory could not converge within the managed path. | Use focused source inspection and state the evidence gap. |
 
-New background repair failures record one shared `terminal_envelope`. Treat
-that structured envelope as the primary failure contract. A persisted result
-created by an older runtime can omit it; in that compatibility case, use
-`wait_error`, then the bounded stderr/stdout tails. Do not mistake either form
-of terminal evidence for an active repair lock.
+`packet`, `search`, and `context` return `codestory_preparing` with
+`retry_tool` and `retry_after_ms` while their managed dependencies are coming
+up. Retry that same tool. Do not ask the user to enable, repair, approve, or
+configure an internal service.
 
-## Runtime Repair
+`ground`, `files`, and `affected` can build or refresh the bounded local map as
+part of the call. Other local graph tools use the last complete publication and
+never read a half-published generation.
 
-Use managed project-scoped `status`, release install records, or source-build
-checks only for maintainer/debug transcripts when MCP is missing or suspect.
-They are not the supported agent repair path. `CODESTORY_CLI` is an explicit
-local-dev override; installed `.mcp.json` launches the managed adapter first,
-provisions from `github_release` when needed, and records the launch source in
-`plugin_runtime`. If the managed runtime cannot spawn or be provisioned, the
-adapter stays up with `repair_setup` diagnostics instead of closing transport.
+## Diagnostic status
 
-If project-scoped `status` reports a repairable state and the task requires the
-blocked surface, run the MCP `recommended_next_calls` loop: call
-`sidecar_setup` with the same `project` and `action=repair` when recommended,
-then call `status` again before using that surface. When an allowed local graph
-surface satisfies the task, use it without repairing packet/search/context and
-do not represent local navigation as full retrieval proof. Do not ask the human to install the binary unless network,
-permissions, host reload, or release assets block the repair.
+`codestory://status` is an observational diagnostic surface. Read it only when
+the direct tool loop stops converging, the tool reports stale evidence, or the
+task explicitly asks for runtime diagnostics. A status read never starts work.
+
+The most useful fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `server_version`, `server_executable`, `server_executable_sha256` | Exact live MCP runtime identity. |
+| `plugin_runtime` | Installed plugin and managed CLI source. |
+| `runtime_truth` | Compact references to the canonical readiness and runtime fields. |
+| `index_publication` | Complete core database generation currently being served. |
+| `local_refresh` | Local map state and the complete publication retained during refresh. |
+| `managed_retrieval` | Automatic broad-search lifecycle state. This is diagnostic, not a user control. |
+| `retrieval_mode` | Persisted broad-search classification; `full` is required for trustworthy broad results. |
+| `readiness_lanes.agent_packet_search` | Current broad-search capability state. |
+| `readiness_broker` | Maintainer evidence for ownership, liveness, and accelerator proof. |
+| `retrieval_diagnostics` | Detailed managed-runtime evidence for debugging. |
+| `runtime_update` | Non-blocking installed-runtime update advisory. |
+
+Reuse a status result until repository, runtime, or index state changes. Follow
+its references instead of treating duplicated nested payloads as separate
+truths.
+
+## Evidence boundary
+
+Local navigation is useful while broad search prepares, but it is not full
+retrieval proof. Trust a broad result only when the requested tool succeeds
+against a current complete publication. Under accelerator-required policy,
+maintainer proof additionally requires a live selected endpoint, matching
+process identity, and verified accelerator work.
+
+Stale ownership remains fail-closed. Heartbeat age alone does not prove that a
+process is abandoned, and CodeStory does not terminate an owner on that basis.
+
+## Maintainer recovery
+
+CLI status, doctor, install records, process IDs, ports, model paths, and backend
+logs are maintainer diagnostics. They are not the normal agent or user repair
+path. Use them only after automatic retries stop converging or when collecting
+an explicit proof transcript. `CODESTORY_CLI` remains a local-development
+override; installed plugin sessions use the managed launcher.

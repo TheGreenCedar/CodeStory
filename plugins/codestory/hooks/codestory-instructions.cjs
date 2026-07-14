@@ -1,4 +1,4 @@
-const MCP_RESOURCE_TEXT = 'If CodeStory MCP tools are hidden and tool_search is available, query "codestory mcp ground status packet search", then use the loaded tools.';
+const MCP_RESOURCE_TEXT = 'If CodeStory MCP tools are hidden and tool_search is available, query "codestory mcp ground packet search symbol", then use the loaded tools.';
 
 function normalizePrompt(prompt) {
   return String(prompt || '').replace(/\s+/g, ' ').trim();
@@ -37,7 +37,7 @@ function routeForPrompt(prompt) {
     return 'Symbol ownership: use symbol, then definition; add callers/callees only when the question asks for flow.';
   }
   if (/\b(?:whole|entire|broad|architecture|subsystem|data flow|how does|how do|explain|codebase review)\b/u.test(text)) {
-    return 'Broad question: use packet only when status allows it and retrieval_mode=full; otherwise use ground, then focused symbol/trace evidence before source.';
+    return 'Broad question: call packet directly; if it is still preparing, use ground plus focused symbol/trace evidence and retry packet after its reported delay.';
   }
   return 'Repository orientation: use ground; use files only for language, role, path, or coverage questions.';
 }
@@ -76,8 +76,8 @@ function eventHeader(event, input = {}) {
   return [
     'CODESTORY SESSION ROUTING ACTIVE',
     '',
-    'For repository work, use the codestory-grounding skill and call status once for the explicit project.',
-    'Task router: orientation -> ground/files; symbol -> symbol/definition; flow -> callers/callees/trace; review/change -> affected with explicit paths plus focused graph evidence; broad -> packet only when allowed/full.',
+    'For repository work, use the codestory-grounding skill and call the intended tool with the explicit project.',
+    'Task router: orientation -> ground/files; symbol -> symbol/definition; flow -> callers/callees/trace; review/change -> affected with explicit paths plus focused graph evidence; broad -> packet.',
     '',
   ].join('\n');
 }

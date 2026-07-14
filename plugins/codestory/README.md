@@ -72,11 +72,13 @@ refreshes the catalog snapshot. Refresh the installed package from `/plugins` or
 the matching terminal plugin add command, then start a fresh Codex host session
 before trusting the active MCP runtime.
 
-## Repair and CLI
+## Diagnostics and CLI
 
-Normal users repair through the agent and MCP (`status` and `sidecar_setup`,
-both with an explicit `project`). Power-user CLI transcripts:
-[CLI reference](../../docs/users/cli-reference.md).
+CodeStory prepares its local repository map and broad-search runtime
+automatically. Agents call the intended tool with an explicit `project`; users
+do not need to configure or repair a background service. `status` and the
+[CLI reference](../../docs/users/cli-reference.md) are diagnostics for
+maintainers when automatic preparation cannot converge.
 
 Blocked session steps: [Troubleshooting](../../docs/users/troubleshooting.md).
 

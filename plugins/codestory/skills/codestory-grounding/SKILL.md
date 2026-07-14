@@ -1,134 +1,87 @@
 ---
 name: codestory-grounding
-description: Use when an agent should ground a local repository with CodeStory before making source claims, planning edits, choosing tests, reviewing changes, or using packet/search evidence through the CodeStory plugin MCP.
+description: Use when an agent should ground a local repository with CodeStory before making source claims, planning edits, choosing tests, reviewing changes, or using broad retrieval evidence through the CodeStory plugin MCP.
 ---
 
 # CodeStory Grounding
 
-CodeStory indexes a repository once and serves read-only local evidence so an
-agent can stop rediscovering the same files, symbols, and call paths every turn.
+CodeStory keeps a local repository map and broad-search index so agents can
+reach useful evidence without rediscovering the same code every turn.
 
-The target is always the repository workspace being grounded. The CodeStory
-checkout is only tool source unless the user is editing CodeStory itself.
+The target is always the repository being grounded. Pass its exact absolute
+root as `project` on every CodeStory call. Never rely on a global active
+workspace.
 
-## When To Use
+## Direct Tool Loop
 
-Use CodeStory before making source claims, planning edits, choosing tests, or
-reviewing changes in a repository. Do not wait for the user to mention it by name.
+Call the tool that matches the task. Do not call `status` first.
 
-Before opening source files, call the CodeStory `status` tool with
-`project=<target-workspace>` when MCP is live. The MCP server is multi-project;
-every tool call must carry the caller's absolute repository root and must not
-rely on a mutable global or thread workspace binding. In
-Codex hosts where the server-specific `mcp__codestory__*` tool namespace is not
-initially visible, use host deferred discovery/tool_search with
-`codestory mcp ground status packet search`, then use the loaded CodeStory MCP
-tools. Treat this as MCP activation, not source fallback.
+1. Resolve the target repository root.
+2. Call the intended tool with `project=<absolute-root>`.
+3. If the result says `state=preparing`, wait for `retry_after_ms` and retry the
+   same tool with the same arguments. Do not poll status or ask the user to set
+   up CodeStory.
+4. Preserve cited anchors in source claims. Read focused source only for the
+   remaining evidence gaps.
 
-If `status`, `ready`, or `ground` reports no repo, no supported files, or zero
-indexed files, stop the CodeStory path. Do not paste empty ground output as
-context. Fall back to ordinary source inspection or ask for the intended repo
-path when ambiguous.
+CodeStory prepares its managed local runtime automatically. `status` and
+`codestory://status` are optional diagnostics for a failed or unexpectedly slow
+request, not prerequisites for normal grounding.
 
-## Quick Loop (MCP)
-
-When the plugin MCP server is available:
-
-1. Resolve `<target-workspace>` explicitly.
-2. Call `status` with `project=<target-workspace>` — field meanings in [status-contract](references/status-contract.md). If `mcp__codestory__*` tools are not initially visible and tool_search is available, query `codestory mcp ground status packet search`, then use the loaded CodeStory MCP tools.
-3. Reuse that status result until repository, runtime, or index state changes, or
-   a tool reports stale/freshness failure.
-4. Obey `allowed_surfaces` and `retrieval_mode`.
-5. Call the allowed surface that fits the task; preserve cited anchors in answers.
-6. Follow project-scoped `recommended_next_calls` only when the task requires a
-   blocked surface or setup is otherwise necessary.
-
-If the skill is visible but no `mcp__codestory` tools are exposed, call it a
-plugin MCP visibility failure. Unscoped resources cannot identify the caller's
-repository in multi-project mode. Do not use CLI as CodeStory grounding unless
-the user explicitly asks; use ordinary source inspection and report that live
-MCP tools were not visible.
+If the server-specific tools are hidden and deferred discovery is available,
+query `codestory mcp ground packet search symbol`, then call the discovered tool
+directly. If the plugin MCP is unavailable, use ordinary source inspection and
+report the visibility gap. Do not substitute CLI diagnostics for a live plugin
+result unless the user explicitly asks.
 
 ## Task Router
 
 | Situation | Route |
 | --- | --- |
-| Orientation: "What is in this checkout?" | `ground` / `codestory://grounding`; use `files` for language mix or gaps. |
-| Find symbol: "Where is X defined?" | `symbol`, then `definition` or `snippet`. |
-| Trace: "Who calls this?" | `callers`, `callees`, `trace`, or `trail --story --hide-speculative`. |
-| Impact: "What might this change touch?" | `affected` with changed files from git; planning hints only, not proof. |
-| Broad question | `packet`, `search`, or `context` only when allowed and `retrieval_mode=full`. |
-| Blocked packet/search/context, local route available | Do not repair. Route by task through allowed `ground`, `files`, `symbol`, `definition`, `callers`, `callees`, `trace`, `trail`, `references`, `snippet`, `affected`, `symbols`, `get_node`, `neighbors`, `shortest_path`, or `query_subgraph`, then use focused source only for remaining evidence gaps. |
-| Blocked surface required by the task | Follow `recommended_next_calls`; normally call MCP `sidecar_setup` with the same `project` and `action=repair`, then call project-scoped `status` again. |
+| Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
+| Find a symbol | `symbol`, then `definition` or `snippet`. |
+| Follow a call path | `callers`, `callees`, `trace`, or `trail`. |
+| Review change impact | `affected` with explicit Git-changed paths, then focused symbol or trace evidence. |
+| Broad structural question | `packet`; use `search` or `context` for bounded follow-up. |
 
 ## Evidence Rules
 
 - Treat CodeStory output as evidence, not omniscience.
-- Preserve cited file, symbol, trail, and snippet anchors in user-facing claims.
-- Local graph output is navigation evidence. It does not prove full
-  packet/search readiness or substitute for sidecar-backed evidence claims.
-- When `packet` reports `sufficient` with no `follow_up_commands`, answer from the packet.
-- When `packet` reports `partial`, run named follow-up commands before proof claims.
-- `retrieval_mode=full` is infrastructure eligibility, not answer-quality proof;
-  anything weaker is navigation hints only.
-- On macOS arm64, expected accelerated sidecar intent is
-  `launch_mode=native_spawned` with request provider `metal`. Requested provider
-  and device are intent; observed device state and source are proof inputs, not
-  sufficient proof. When acceleration is required, require
-  `gpu_proof.proof_status=verified`, `meaningful_accelerator_work_proven=true`,
-  and `embed_smoke_ok=true`; manual assertions and device inventory remain
-  diagnostic. If status still reports `vulkan`/`Vulkan0` or
-  `accelerator_request_unobserved` on Apple Silicon, report a stale/pre-release
-  runtime or failed repair and follow the MCP repair loop.
-- CPU-backed retrieval is an explicit degraded policy. It does not make
-  packet/search evidence full unless refreshed status also allows those
-  surfaces and reports `retrieval_mode=full`.
+- Local repository-map output is navigation evidence. Broad packet/search
+  output is stronger only when the response reports full retrieval readiness.
+- When `packet` reports `sufficient`, answer from the packet and cited anchors.
+  When it reports `partial`, run the named follow-up before making proof claims.
+- `affected` is planning evidence, not a guarantee that every runtime effect was
+  found.
+- Do not paste empty grounding output as context. If a repository truly has no
+  supported files, fall back to ordinary inspection or resolve the intended
+  root when it is ambiguous.
 
-## Repair Loop
+## Failure Handling
 
-Supported agent repair is MCP-only:
+- `preparing`: retry the same tool after its delay.
+- `updating`: the last complete repository map remains usable; retry the same
+  tool when current publication evidence is required.
+- `working_locally`: use local navigation while broad search prepares.
+- `needs_environment`: report the single plain-language host requirement from
+  the result. Do not expose internal process, port, model, or service details.
+- `unavailable`: use ordinary source inspection and report that CodeStory was
+  unavailable for this task.
 
-1. Call `status` with `project=<target-workspace>`.
-2. Inspect `readiness_broker` and `sidecar_setup`; status reads report state
-   but do not start repairs.
-3. If the task requires the blocked surface, `recommended_next_calls` says so,
-   and the `mcp__codestory__sidecar_setup` tool is visible, call MCP `sidecar_setup` with
-   `project=<target-workspace>, action=repair`.
-4. Call `status` again with the same project.
-5. Use only the surfaces allowed by the refreshed status.
-
-If Codex exposes CodeStory resources but hides server-specific tools, report the
-host tool-visibility blocker; unscoped resources are not a safe multi-project
-fallback. Do not synthesize repair context or run CLI repair in the agent path.
-
-CLI commands such as `fix`, `doctor`, `ready`, and `retrieval status` are
-maintainer/debug transcript tools. They do not prove plugin MCP is live in the
-agent host and are not the supported repair path for agent grounding.
-
-Repair details: [serve](references/serve.md), [doctor](references/doctor.md).
+Maintainer commands such as `doctor`, `ready`, and retrieval status are debug
+transcript tools. They do not prove that the installed plugin is live in the
+agent host.
 
 `setup.ps1` and `setup.sh` under this skill are build-from-source paths for
-contributors only, not the normal user install path.
+contributors, not normal installation steps.
 
-## References (load on demand)
+## References
 
-- [status-contract](references/status-contract.md)
-- [index](references/index.md)
-- [cache](references/cache.md)
-- [ground](references/ground.md)
-- [doctor](references/doctor.md)
+- [status contract](references/status-contract.md)
+- [repository map](references/ground.md)
 - [packet](references/packet.md)
 - [search](references/search.md)
 - [context](references/context.md)
-- [symbol](references/symbol.md)
-- [trail](references/trail.md)
-- [snippet](references/snippet.md)
-- [drill](references/drill.md)
-- [drill-suite](references/drill-suite.md)
-- [query](references/query.md)
-- [explore](references/explore.md)
-- [files](references/files.md)
-- [affected](references/affected.md)
-- [bookmark](references/bookmark.md)
-- [retrieval-rollout](references/retrieval-rollout.md)
-- [serve](references/serve.md)
+- [symbols](references/symbol.md)
+- [trails](references/trail.md)
+- [snippets](references/snippet.md)
