@@ -19,13 +19,13 @@ Use this template for host-specific guides and journey pages under `docs/users/`
 
 ### 3. Install verification
 
-- Three checks before first real task (adapter present, hooks/MCP live, first status read)
+- Three checks before first real task (adapter present, hooks/MCP live, direct grounding call)
 - Link to first-session prompt in the guide
 
 ### 4. First session
 
 - What you do: open repo, start fresh session
-- What the agent does: status check, grounding, surface gating
+- What the agent does: calls the intended tool and lets CodeStory prepare its prerequisites
 - One concrete first prompt (portable template allowed)
 
 ### 5. Example prompts
@@ -54,10 +54,10 @@ Use this template for host-specific guides and journey pages under `docs/users/`
 
 | Stage | You | Agent | Check |
 | --- | --- | --- | --- |
-| Install | Install plugin or configure MCP | Starts or connects MCP adapter | Fresh session sees `codestory://status` |
-| First grounding | Open repo, ask readiness prompt | Reads status, grounds if allowed | `allowed_surfaces` matches task |
+| Install | Install plugin or configure MCP | Starts or connects MCP adapter | Fresh session sees CodeStory tools |
+| First grounding | Open repo, ask a repository question | Calls `ground` directly | Current files and symbols return |
 | Source work | Ask for plan or code path | Uses allowed local graph tools | Claims cite files and symbols |
 | Broad discovery | Ask repo-wide question | Uses packet/search when allowed | `retrieval_mode=full` |
-| Repair | Ask what is blocked | Uses status, agent-guide, sidecar_setup | Repeat status after repair |
+| Recovery | Retry the intended tool | Reuses the active preparation operation | The same tool returns evidence or one terminal fallback |
 
 Degraded packet/search is navigation help only, not proof. See [glossary](../glossary.md#retrieval-mode).

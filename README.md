@@ -27,10 +27,10 @@ Capability comparison, day-1 checklist, and shared prompts: [User guides](docs/u
 2. Install the plugin or adapter once.
 3. Approve hooks when your host prompts for them.
 4. Open the repository you want grounded and start a **fresh** agent session there.
-5. Ask the first-session readiness prompt from your host guide.
+5. Ask a repository question from your host guide.
 
-The agent checks CodeStory status, grounds the checkout when allowed, and tells
-you which surfaces are ready before you edit. You do not need to run CLI
+The agent calls the matching CodeStory tool directly. CodeStory grounds the
+checkout and prepares managed search automatically; you do not need CLI setup
 commands for normal use.
 
 **Something blocked?** [Troubleshooting](docs/users/troubleshooting.md).

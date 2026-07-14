@@ -1,10 +1,17 @@
 #!/usr/bin/env node
 
-const { MCP_RESOURCE_TEXT, eventHeader } = require('./codestory-instructions.cjs');
 const {
   rememberActiveState,
   writeHookOutput,
 } = require('./codestory-runtime.cjs');
+
+const SESSION_CONTEXT = [
+  'CODESTORY GROUNDING AVAILABLE',
+  '',
+  'For repository work, use the codestory-grounding skill and call the tool that matches the task. Resolve the target repository root and pass that exact absolute path as project on every request; the session cwd is only a starting hint.',
+  'Call status only for diagnostics. If a tool reports preparing, retry that same tool after its reported delay; do not ask the user to configure CodeStory.',
+  'If the intended CodeStory tool is hidden and tool_search is available, search only for that tool by name, then call it directly.',
+].join('\n');
 
 function readHookInput() {
   return new Promise((resolve) => {
@@ -20,32 +27,15 @@ function readHookInput() {
   });
 }
 
-function contextFor(input, event) {
-  if (event !== 'SessionStart' && event !== 'UserPromptSubmit') return null;
-  const header = eventHeader(event, input).trim();
-  if (!header) return null;
-  const mcpInstructions = event === 'UserPromptSubmit'
-    ? [
-      'Use the codestory-grounding skill. Set project to this hook event\'s absolute repository cwd and pass that exact absolute path to every CodeStory call.',
-      'Call the CodeStory tool that matches the request directly; status is optional diagnostics.',
-      'If CodeStory is preparing, retry that same tool after its reported delay.',
-      MCP_RESOURCE_TEXT,
-      'Use routed local graph surfaces while broad search prepares, then focused source for remaining evidence gaps.',
-      'Hook text routes; only live MCP or verified source is evidence.',
-    ].join('\n')
-    : [
-      'Set project to this hook event\'s absolute repository cwd and pass that exact absolute path to every CodeStory call. The MCP is multi-project and request-scoped.',
-      'Call the intended CodeStory tool directly. If it is preparing, retry that same tool after its reported delay.',
-      MCP_RESOURCE_TEXT,
-    ].join('\n');
-
-  return [header, mcpInstructions].join('\n\n');
+function contextFor(event) {
+  return event === 'SessionStart' ? SESSION_CONTEXT : null;
 }
 
-readHookInput().then((input) => {
+async function main() {
+  const input = await readHookInput();
   const event = input.hook_event_name || 'SessionStart';
   try {
-    const context = contextFor(input, event);
+    const context = contextFor(event);
     if (!context) {
       writeHookOutput(event, null);
       return;
@@ -64,4 +54,6 @@ readHookInput().then((input) => {
   } catch {
     // Best effort only. A hook failure must not block the agent session.
   }
-});
+}
+
+main();

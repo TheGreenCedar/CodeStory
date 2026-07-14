@@ -2757,6 +2757,127 @@ function resourceContents(uri, value) {
   };
 }
 
+const FAIL_OPEN_TOOL_ARGUMENTS = {
+  project: { type: 'string', description: 'Absolute repository root for this request.' },
+  question: { type: 'string', description: 'Broad repository question.' },
+  query: { type: 'string', description: 'Symbol or search query.' },
+  id: { type: 'string', description: 'Stable CodeStory node id.' },
+  bookmark: { type: 'string', description: 'Stable bookmark id.' },
+  parent_id: { type: 'string', description: 'Parent node id.' },
+  from_id: { type: 'string', description: 'Path start node id.' },
+  to_id: { type: 'string', description: 'Path end node id.' },
+  changed_paths: { type: 'array', items: { type: 'string' }, description: 'Changed repository-relative paths.' },
+  change_records: { type: 'array', items: { type: 'object' }, description: 'Structured changed-file records.' },
+};
+
+const FAIL_OPEN_TOOL_SPECS = [
+  ['status', 'Inspect compact CodeStory capability state when diagnostics are needed.', [], []],
+  ['ground', 'Orient in a repository with a compact local map.', [], []],
+  ['packet', 'Answer a broad structural question with repository evidence.', ['question'], ['question']],
+  ['search', 'Find bounded symbol and repository candidates.', ['query'], ['query']],
+  ['files', 'List bounded indexed files and coverage.', [], []],
+  ['affected', 'Analyze explicit changed paths against the local graph.', ['changed_paths', 'change_records'], []],
+  ['symbol', 'Resolve one symbol by query or id.', ['query', 'id'], []],
+  ['definition', 'Return definition evidence for one symbol.', ['query', 'id'], []],
+  ['snippet', 'Return a focused source snippet for one symbol.', ['query', 'id'], []],
+  ['callers', 'Return bounded incoming callers for one symbol.', ['query', 'id'], []],
+  ['callees', 'Return bounded outgoing callees for one symbol.', ['query', 'id'], []],
+  ['trace', 'Return a readable bounded trace for one symbol.', ['query', 'id'], []],
+  ['trail', 'Return a bounded graph trail for one symbol.', ['query', 'id'], []],
+  ['get_node', 'Return one stable graph node.', ['query', 'id'], []],
+  ['neighbors', 'Return a bounded graph neighborhood.', ['query', 'id'], []],
+  ['shortest_path', 'Return a bounded path between two node ids.', ['from_id', 'to_id'], ['from_id', 'to_id']],
+  ['query_subgraph', 'Return a bounded subgraph around one node.', ['query', 'id'], []],
+  ['references', 'Return incoming references for one symbol.', ['query', 'id'], []],
+  ['symbols', 'Browse root symbols or children.', ['parent_id'], []],
+  ['context', 'Build focused evidence for one target.', ['query', 'id', 'bookmark'], []],
+];
+
+function failOpenToolSafety(name) {
+  const activatesManagedState = name !== 'status';
+  return {
+    safety: {
+      effect: activatesManagedState ? 'managed_activation' : 'read_only',
+      readOnly: !activatesManagedState,
+      sideEffects: activatesManagedState,
+      activatesProject: activatesManagedState,
+      writesRepository: false,
+      destructive: false,
+      idempotent: true,
+      requiresConfirmation: false,
+      localOnly: !activatesManagedState,
+      openWorld: activatesManagedState,
+    },
+    annotations: {
+      readOnlyHint: !activatesManagedState,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: activatesManagedState,
+    },
+  };
+}
+
+function failOpenToolCatalog() {
+  return FAIL_OPEN_TOOL_SPECS.map(([name, description, argumentNames, required]) => ({
+    name,
+    description,
+    inputSchema: {
+      type: 'object',
+      properties: Object.fromEntries([
+        ['project', FAIL_OPEN_TOOL_ARGUMENTS.project],
+        ...argumentNames.map((argument) => [argument, FAIL_OPEN_TOOL_ARGUMENTS[argument]]),
+      ]),
+      required: ['project', ...required],
+      additionalProperties: true,
+    },
+    outputSchema: { type: 'object', additionalProperties: true },
+    ...failOpenToolSafety(name),
+  }));
+}
+
+function failOpenToolResult(tool, status, argumentsValue = {}) {
+  const preparing = status.managed_retrieval?.state === 'preparing';
+  const project = typeof argumentsValue.project === 'string' ? argumentsValue.project : null;
+  if (tool === 'status') {
+    const structuredContent = {
+      project,
+      state: preparing ? 'preparing' : 'unavailable',
+      capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
+      current_operation: preparing ? { id: 'managed-runtime-provisioning', state: 'preparing' } : null,
+      next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
+      retry_after_ms: preparing ? 1500 : null,
+      diagnostics_uri: 'codestory://status',
+    };
+    return {
+      content: [{ type: 'text', text: `state: ${structuredContent.state}\nresult: structured\n` }],
+      structuredContent,
+    };
+  }
+  const structuredContent = preparing ? {
+    code: 'codestory_preparing',
+    message: 'CodeStory is preparing. Retry the same tool shortly.',
+    tool,
+    project,
+    state: 'preparing',
+    retry_tool: tool,
+    retry_after_ms: 1500,
+    operation: { id: 'managed-runtime-provisioning', state: 'preparing' },
+    diagnostics_uri: 'codestory://status',
+  } : {
+    code: 'codestory_unavailable',
+    message: 'CodeStory is unavailable. Continue with focused source inspection.',
+    tool,
+    project,
+    state: 'unavailable',
+    diagnostics_uri: 'codestory://status',
+  };
+  return {
+    content: [{ type: 'text', text: structuredContent.message }],
+    structuredContent,
+    isError: true,
+  };
+}
+
 function runFailOpenMcp(status, options = {}) {
   const currentStatus = () => (typeof status === 'function' ? status() : status);
   let handoff = null;
@@ -2850,17 +2971,15 @@ function runFailOpenMcp(status, options = {}) {
     if (stdinEnded) handoff.stdin.end();
     return handoff;
   };
-  const tools = [];
+  const tools = failOpenToolCatalog();
   const resources = [
     { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
     { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
   ];
   const guide = () => {
-    const liveStatus = currentStatus();
     return {
-      status: 'repair_setup',
-      message: 'Read codestory://status, follow recommended_next_calls, restore a compatible stdio runtime, then retry grounding.',
-      recommended_next_calls: liveStatus.recommended_next_calls,
+      message: 'Call the tool that matches the task. If it reports preparing, retry that same tool after its delay.',
+      diagnostics_uri: 'codestory://status',
     };
   };
   let buffer = '';
@@ -2925,7 +3044,10 @@ function runFailOpenMcp(status, options = {}) {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
       } else if (request.method === 'tools/call') {
-        response = jsonrpcError(request.id, -32602, 'CodeStory grounding tools are temporarily unavailable while the managed runtime starts. Retry after the host reports that CodeStory is ready.');
+        const tool = request.params?.name;
+        response = tools.some((candidate) => candidate.name === tool)
+          ? jsonrpcResult(request.id, failOpenToolResult(tool, currentStatus(), request.params?.arguments))
+          : jsonrpcError(request.id, -32602, `unknown tool: ${tool || '<missing>'}`);
       } else {
         response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
       }
@@ -3020,8 +3142,8 @@ async function main() {
       projectRoot: null,
       projectRootSource: 'request_argument',
       summary: 'CodeStory managed CLI provisioning is running in the background.',
-      minimumNext: ['Read codestory://status again while managed CLI provisioning continues.'],
-      fullRepair: ['Read codestory://status again while managed CLI provisioning continues.'],
+      minimumNext: ['Retry the intended CodeStory tool after 1500ms.'],
+      fullRepair: ['Retry the intended CodeStory tool after 1500ms.'],
     });
     setImmediate(() => {
       resolveCli().then((resolved) => {

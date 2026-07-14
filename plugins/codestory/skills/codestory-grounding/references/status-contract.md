@@ -13,7 +13,6 @@ across repositories.
 | `preparing` | CodeStory is starting or updating managed search. | Wait `retry_after_ms`, then retry the same tool with the same arguments. |
 | `updating` | The repository map is moving to a new complete publication. | Retry the same tool after the reported delay; do not start another refresh. |
 | `working_locally` | Local graph navigation is available while broad search prepares. | Continue with local tools and retry the original broad tool later. |
-| `needs_environment` | Automatic preparation found one host requirement it cannot satisfy. | Report that single requirement in plain language. |
 | `unavailable` | CodeStory could not converge within the managed path. | Use focused source inspection and state the evidence gap. |
 
 `packet`, `search`, and `context` return `codestory_preparing` with

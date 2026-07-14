@@ -25,11 +25,11 @@ source-worktree setup. Docker Desktop or another compatible Docker engine is
 currently required for broad search.
 
 Apple Silicon uses managed Metal acceleration automatically. Intel Macs keep
-local navigation available and report one plain environment requirement when
-broad search needs an explicit CPU or trusted external configuration. Backend,
-process, and model details live in the
-[maintainer operations guide](../ops/retrieval-sidecars.md), not the normal user
-flow.
+local navigation available. If broad search cannot use a supported local or
+trusted external backend, the requested tool returns `unavailable` and the
+agent continues with focused source inspection. Backend, process, and model
+details live in the [maintainer operations guide](../ops/retrieval-sidecars.md),
+not the normal user flow.
 
 The plugin downloads the matching signed and notarized CLI. Contributors who
 build the CLI locally also need the Rust toolchain; normal plugin users do not.
@@ -106,8 +106,8 @@ Use CodeStory to map this repository and show me the files and symbols that own 
 **Expected wait:** On a large repository, the first index build can take several
 minutes. Let the agent finish grounding before you ask it to edit files.
 
-**Success looks like:** The agent confirms your repo map is ready, says whether
-broad search is available, and does not report a missing CLI or broken plugin.
+**Success looks like:** The agent answers with repository-specific files and
+symbols without asking you to configure, approve, or repair CodeStory.
 
 The agent uses [local navigation](../glossary.md#local-navigation-readiness) while
 [packet/search](../glossary.md#agent-packetsearch-readiness) prepares. You do

@@ -13,8 +13,9 @@ the native executable, arguments, and process-start identity to match, and
 answer quality still needs the matching packet-runtime, drill, or benchmark
 evidence tier.
 
-**Runtime truth and surface gating:** When plugin MCP is live, read
-`codestory://status` first and obey `allowed_surfaces` plus `retrieval_mode`.
+**Runtime truth and surface gating:** Normal agents call the intended CodeStory
+tool directly. Maintainers can read `codestory://status` after automatic
+preparation stops converging and inspect `allowed_surfaces` plus `retrieval_mode`.
 Field semantics and operator repair prompts live in
 [users/troubleshooting.md](../users/troubleshooting.md) and
 [glossary.md](../glossary.md#retrieval-mode). This runbook owns bootstrap,
@@ -45,10 +46,9 @@ navigation and agent retrieval separate: a ready SQLite graph can support
 `ground`, `files`, and symbol navigation while sidecar packet/search remains
 blocked.
 
-Start with the active runtime surface. When plugin MCP is live, read
-`codestory://status`, follow `recommended_next_calls`, call MCP `sidecar_setup repair`
-when recommended, and reread `codestory://status`. The CLI commands below are
-maintainer/debug transcripts, not the supported agent repair path:
+Start with the active runtime surface. Retry the intended agent tool while it
+reports a live preparation operation. If that loop terminates without becoming
+ready, use the CLI commands below as maintainer/debug transcripts:
 
 ```sh
 codestory-cli agent preflight --project <repo> --format json
@@ -56,9 +56,9 @@ codestory-cli doctor --project <repo> --format markdown
 codestory-cli retrieval status --project <repo> --format json
 ```
 
-When plugin MCP is live, read `codestory://status` first and use its
+When diagnosing a live plugin, use `codestory://status` and its
 `allowed_surfaces` values as the tool boundary. For field semantics and
-first-response repair prompts, use
+direct-tool retry behavior, use
 [users/troubleshooting.md](../users/troubleshooting.md). Treat status as the
 active runtime source when it is available.
 
@@ -66,10 +66,10 @@ active runtime source when it is available.
 |-------|---------|-----------------|
 | `local_navigation=ready`, `agent_packet_search=ready`, `sidecar_mode=full` | Local graph, persisted sidecar state, and any required live endpoint/accelerator identity are ready | Use packet/search/context as infrastructure-eligible, then prove answer quality with source, packet-runtime, drill, or benchmark evidence |
 | `local_navigation=ready`, `agent_packet_search=repairing` | Agent sidecar repair is active and status should include the current `phase`, `profile`, `run_id`, and `namespace` | Wait or reread `codestory://status`; do not start a second agent repair for the same run |
-| `sidecar_setup.last_worker_result.outcome=failed` or `abandoned` | The background repair worker reached a durable terminal state without completing | Match `attempt_id` and, when present, branch on `terminal_envelope.error.code` and its failed layer. For a legacy persisted result without an envelope, use `wait_error` and bounded tails as compatibility diagnostics |
-| `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but sidecar retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; call MCP `sidecar_setup repair` from status before packet/search claims |
+| `managed_retrieval.last_worker_result.outcome=failed` or `abandoned` | The background repair worker reached a durable terminal state without completing | Match `attempt_id` and, when present, branch on `terminal_envelope.error.code` and its failed layer. For a legacy persisted result without an envelope, use `wait_error` and bounded tails as compatibility diagnostics |
+| `local_navigation=ready`, `agent_packet_search=repair_retrieval` | SQLite graph is usable, but managed retrieval is missing, stale, or unhealthy | Use local graph surfaces for source navigation; inspect the terminal operation and CLI diagnostics before packet/search claims |
 | `local_navigation=repair_local` | Core index or cache is missing or stale | Follow `recommended_next_calls`, then reread status; use CLI local repair commands only for maintainer transcripts |
-| `sidecar_mode` not `full` | Packet/search sidecars are diagnostic only | Call MCP `sidecar_setup repair`, then reread status; maintainers can inspect `retrieval status` and rerun explicit sidecar commands if needed |
+| `sidecar_mode` not `full` | Packet/search retrieval is diagnostic only | Inspect `retrieval status` and rerun explicit maintainer retrieval commands if automatic preparation has already terminated |
 | `doctor` ready but a packet/search command returns `retrieval_unavailable` | Runtime/status disagreement or sidecar process drift | Capture the failing command output, `doctor`, and `retrieval status`; repair the named layer before retrying |
 
 Layer repair should follow the first failing layer, not a broad rebuild:
@@ -94,7 +94,7 @@ Attach these artifacts to issues or PRs that claim readiness repair:
 
 - `codestory://status` transcript when MCP is live, or the full
   `agent preflight` JSON when it is not.
-- The matching `sidecar_setup.last_worker_result` when background repair fails,
+- The matching `managed_retrieval.last_worker_result` when background repair fails,
   including its `attempt_id`, exit code, truncated-output flags, and shared
   `terminal_envelope` when the result was written by a current runtime.
 - `doctor --format markdown` or JSON output, including readiness verdicts and
