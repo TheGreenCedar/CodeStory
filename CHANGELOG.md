@@ -69,6 +69,14 @@
   including upgrade from a verified older CLI with that version retained as the
   rollback. The Codex worktree setup dispatcher now provides equivalent native
   setup behavior on Windows, macOS, and Linux.
+- The packaged plugin now launches the CodeStory CLI directly without a shell
+  and rejects Windows batch-file overrides. Managed CLI, model, and native
+  backend downloads enforce declared byte limits while streaming and remove
+  partial files after failure.
+- Dependency-resolving setup and proof commands use the committed Cargo lock,
+  and workflow policy rejects unlocked Cargo commands. Project-controlled
+  network endpoints remain disabled unless a trusted operator enables the
+  process-wide project-network opt-in.
 - Release proof is staged by maturity and changed surface. Draft changes use
   focused source checks; exact-head, platform, protected hardware, signing, and
   installation proof run only at their explicit promotion boundaries. The

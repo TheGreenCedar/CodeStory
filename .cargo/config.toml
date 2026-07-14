@@ -1,4 +1,4 @@
 [alias]
 # Cross-platform retrieval dev setup (run from repository root).
-retrieval-setup = "run -p codestory-cli -- retrieval bootstrap --project ."
-retrieval-status = "run -p codestory-cli -- retrieval status --project ."
+retrieval-setup = "run --locked -p codestory-cli -- retrieval bootstrap --project ."
+retrieval-status = "run --locked -p codestory-cli -- retrieval status --project ."

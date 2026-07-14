@@ -96,28 +96,28 @@ jobs:
             ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-
 
       - name: Generalization lint regression contracts
-        run: cargo test -p codestory-runtime --test retrieval_generalization_guard
+        run: cargo test --locked -p codestory-runtime --test retrieval_generalization_guard
 
       - name: Runtime sidecar and packet contract tests
         run: |
-          cargo test -p codestory-runtime --lib agent::retrieval_primary::tests
-          cargo test -p codestory-runtime --lib agent::packet_search::tests
-          cargo test -p codestory-runtime --lib agent::packet_claim_profiles::tests
-          cargo test -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_sidecars
-          cargo test -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_sidecars
-          cargo test -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_sidecars
+          cargo test --locked -p codestory-runtime --lib agent::retrieval_primary::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_search::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_claim_profiles::tests
+          cargo test --locked -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_sidecars
+          cargo test --locked -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_sidecars
+          cargo test --locked -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_sidecars
 
       - name: Stdio protocol contract tests
-        run: cargo test -p codestory-cli --test stdio_protocol_contracts
+        run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts
 
       - name: CLI search JSON fail-closed contract tests
-        run: cargo test -p codestory-cli --test search_json_output
+        run: cargo test --locked -p codestory-cli --test search_json_output
 
       - name: Packet/search fixture and baseline contract tests
-        run: cargo test -p codestory-cli --test packet_search_eval
+        run: cargo test --locked -p codestory-cli --test packet_search_eval
 
       - name: Retrieval crate unit tests
-        run: cargo test -p codestory-retrieval
+        run: cargo test --locked -p codestory-retrieval
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
@@ -164,7 +164,7 @@ jobs:
             ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-
 
       - name: Retrieval bootstrap manifest-missing contract
-        run: cargo test -p codestory-cli --test retrieval_bootstrap_contracts
+        run: cargo test --locked -p codestory-cli --test retrieval_bootstrap_contracts
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

@@ -9,11 +9,11 @@ trustworthy; running retrieval alone is not enough.
 
 | Rollout layer | Trustworthy proof | Run when | Does not prove |
 | --- | --- | --- | --- |
-| Indexer coverage | `cargo test -p codestory-indexer --test fidelity_regression`; `cargo test -p codestory-indexer --test tictactoe_language_coverage`; targeted `files` or `affected` checks for changed paths | Parser, tree-sitter, semantic-resolution, symbol, edge, file-role, or coverage changes | Sidecar readiness, runtime packet behavior, or CLI search contract |
-| Retrieval sidecar crate | `cargo test -p codestory-retrieval`; then live `retrieval bootstrap`, `retrieval index --project <repo> --refresh full`, and `retrieval status --project <repo> --format json` reporting `retrieval_mode="full"` plus current `symbol_doc_count`, `dense_projection_count`, `semantic_policy_version`, `graph_artifact_hash`, and dense reason counts | SQLite lexical, Qdrant, SCIP, manifest generation, sidecar status, symbol-doc virtual docs, dense-anchor policy, embedding backend/dim, or Qdrant client changes | Runtime admission, stdio cache invalidation, or full CLI output shape |
-| Runtime integration | `cargo test -p codestory-runtime --lib`; `cargo test -p codestory-runtime --test retrieval_generalization_guard`; `cargo test -p codestory-runtime --test retrieval_eval`; set `CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1` only after real sidecars are prepared | Packet/search orchestration, fail-closed modes, retrieval shadow traces, rollback-warning logic, or runtime use of sidecar results | CLI argument/output behavior or GitHub smoke workflow behavior |
-| CLI surface | `cargo test -p codestory-cli --test retrieval_bootstrap_contracts`; `cargo test -p codestory-cli --test stdio_protocol_contracts`; `cargo test -p codestory-cli --test search_json_output`; with real sidecars, run the ignored full-mode search JSON test explicitly | `retrieval bootstrap/status/index` contracts, stdio protocol/cache fingerprints, fail-closed search JSON, or user-facing command shape | Full product readiness unless `retrieval status` is `full` after live sidecar indexing |
-| Benchmark harness | `cargo check -p codestory-bench --benches`; the relevant Criterion bench only when it isolates the hot path; release e2e stats for real-repo timing; for AST-first retrieval, include same-run baseline/candidate rows for cold total index time, `semantic_embedding_ms`, dense doc count reduction, repeat refresh embedded-doc count, holdout MRR@10/Hit@10/exact-symbol Hit@1, packet lazy-search source reads, and peak descendant working set | New benchmark code, latency/timing claims, rollback baseline updates, dense-policy changes, or performance-sensitive retrieval/index changes | Promotion by itself; synthetic or narrow benches are scouts until real-repo evidence exists |
+| Indexer coverage | `cargo test --locked -p codestory-indexer --test fidelity_regression`; `cargo test --locked -p codestory-indexer --test tictactoe_language_coverage`; targeted `files` or `affected` checks for changed paths | Parser, tree-sitter, semantic-resolution, symbol, edge, file-role, or coverage changes | Sidecar readiness, runtime packet behavior, or CLI search contract |
+| Retrieval sidecar crate | `cargo test --locked -p codestory-retrieval`; then live `retrieval bootstrap`, `retrieval index --project <repo> --refresh full`, and `retrieval status --project <repo> --format json` reporting `retrieval_mode="full"` plus current `symbol_doc_count`, `dense_projection_count`, `semantic_policy_version`, `graph_artifact_hash`, and dense reason counts | SQLite lexical, Qdrant, SCIP, manifest generation, sidecar status, symbol-doc virtual docs, dense-anchor policy, embedding backend/dim, or Qdrant client changes | Runtime admission, stdio cache invalidation, or full CLI output shape |
+| Runtime integration | `cargo test --locked -p codestory-runtime --lib`; `cargo test --locked -p codestory-runtime --test retrieval_generalization_guard`; `cargo test --locked -p codestory-runtime --test retrieval_eval`; set `CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1` only after real sidecars are prepared | Packet/search orchestration, fail-closed modes, retrieval shadow traces, rollback-warning logic, or runtime use of sidecar results | CLI argument/output behavior or GitHub smoke workflow behavior |
+| CLI surface | `cargo test --locked -p codestory-cli --test retrieval_bootstrap_contracts`; `cargo test --locked -p codestory-cli --test stdio_protocol_contracts`; `cargo test --locked -p codestory-cli --test search_json_output`; with real sidecars, run the ignored full-mode search JSON test explicitly | `retrieval bootstrap/status/index` contracts, stdio protocol/cache fingerprints, fail-closed search JSON, or user-facing command shape | Full product readiness unless `retrieval status` is `full` after live sidecar indexing |
+| Benchmark harness | `cargo check --locked -p codestory-bench --benches`; the relevant Criterion bench only when it isolates the hot path; release e2e stats for real-repo timing; for AST-first retrieval, include same-run baseline/candidate rows for cold total index time, `semantic_embedding_ms`, dense doc count reduction, repeat refresh embedded-doc count, holdout MRR@10/Hit@10/exact-symbol Hit@1, packet lazy-search source reads, and peak descendant working set | New benchmark code, latency/timing claims, rollback baseline updates, dense-policy changes, or performance-sensitive retrieval/index changes | Promotion by itself; synthetic or narrow benches are scouts until real-repo evidence exists |
 | Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/ops/retrieval-sidecars.md#preflight-smoke-contract` pass criteria | PRs touching retrieval crate, runtime/stdio/search wiring, indexer retrieval hooks, retrieval docs, scripts, Docker sidecar config, or the workflow | Full sidecar readiness. CI smoke uses `--skip-compose --wait-secs 0` and proves manifest-missing fail-closed shape only |
 
 ## Agent-Grounding Release Gates
@@ -65,15 +65,16 @@ evidence is trustworthy only after live sidecars are indexed and status is full.
 
 ## Repo-Scale E2E Stats Log
 
-Before committing in this repo, run the release CLI e2e stats lane and append
-the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`:
+On the promoted final merge-ready head, run the release CLI e2e stats lane and
+append the emitted headline metrics to `docs/testing/codestory-e2e-stats-log.md`
+only when the changed behavior requires that lane:
 
 ```powershell
-cargo build --release -p codestory-cli
-cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
+cargo build --release --locked -p codestory-cli
+cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 ```
 
-This log is especially mandatory for retrieval rollout changes that affect
+This log is required on that promoted head for retrieval rollout changes that affect
 default indexing, symbol-doc persistence, dense-anchor persistence or reuse,
 sidecar indexing/status, packet/search behavior, runtime grounding surfaces, CLI
 command shape, or any performance/timing claim. A stats-only row with

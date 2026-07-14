@@ -8,15 +8,14 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 const path = require('path');
+const { Transform, pipeline } = require('stream');
 const zlib = require('zlib');
 const { dirtyMarkerPathForProject } = require('../hooks/codestory-runtime.cjs');
 
 const pluginRoot = path.dirname(__dirname);
 const launchCwd = process.cwd();
 const binaryName = process.platform === 'win32' ? 'codestory-cli.exe' : 'codestory-cli';
-const fallbackBinaryNames = process.platform === 'win32'
-  ? ['codestory-cli.exe', 'codestory-cli.cmd', 'codestory-cli']
-  : ['codestory-cli'];
+const fallbackBinaryNames = [binaryName];
 const activeStateFile = '.codestory-active';
 const activeThreadStatePrefix = '.codestory-active-thread-';
 const sharedAgentRunId = 'shared-agent';
@@ -33,6 +32,7 @@ const managedCliLockWaitMs = 2 * releaseAssetRetryBudgetMs + managedCliStagingBu
 const managedCliPendingOwnerCleanupLimit = 64;
 const managedCliQuarantineRetention = 2;
 const managedCliArchiveMaxBytes = 256 * 1024 * 1024;
+const managedCliChecksumMaxBytes = 1024 * 1024;
 const managedCliArchiveMaxEntries = 20_000;
 const managedCliArchiveMaxEntryBytes = 256 * 1024 * 1024;
 const managedCliArchiveMaxOutputBytes = 512 * 1024 * 1024;
@@ -41,6 +41,26 @@ const managedCliProbeStderrMaxBytes = 4 * 1024;
 const managedCliProbeTerminationGraceMs = 500;
 const managedCliProbeForceKillGraceMs = 1000;
 const managedCliMcpProtocolVersion = '2024-11-05';
+
+function isWindowsBatchCli(cliPath, platform = process.platform) {
+  return platform === 'win32' && /\.(?:cmd|bat)$/iu.test(String(cliPath || ''));
+}
+
+function requireDirectCli(cliPath, platform = process.platform) {
+  if (isWindowsBatchCli(cliPath, platform)) {
+    throw new Error('codestory_cli_batch_override_rejected:use_codestory_cli_exe');
+  }
+}
+
+function spawnCodeStoryCli(cliPath, args, options = {}, spawnChild = spawn) {
+  requireDirectCli(cliPath);
+  return spawnChild(cliPath, args, { ...options, shell: false });
+}
+
+function spawnCodeStoryCliSync(cliPath, args, options = {}) {
+  requireDirectCli(cliPath);
+  return spawnSync(cliPath, args, { ...options, shell: false });
+}
 
 function readJson(file) {
   try {
@@ -428,8 +448,24 @@ function expectedArchiveHash(sumsText, name) {
   throw new Error(`SHA256SUMS.txt did not contain ${name}`);
 }
 
-function copyLocalReleaseFile(releaseDir, name, destination) {
-  fs.copyFileSync(path.join(releaseDir, name), destination);
+function releaseFileMaxBytes(name) {
+  return name === 'SHA256SUMS.txt' ? managedCliChecksumMaxBytes : managedCliArchiveMaxBytes;
+}
+
+function copyLocalReleaseFile(releaseDir, name, destination, maxBytes) {
+  const source = path.join(releaseDir, name);
+  try {
+    if (fs.statSync(source).size > maxBytes) {
+      throw new Error(`download_size_limit_exceeded:${name}`);
+    }
+    fs.copyFileSync(source, destination);
+    if (fs.statSync(destination).size > maxBytes) {
+      throw new Error(`download_size_limit_exceeded:${name}`);
+    }
+  } catch (error) {
+    fs.rmSync(destination, { force: true });
+    throw error;
+  }
 }
 
 function sleep(ms) {
@@ -438,6 +474,10 @@ function sleep(ms) {
 
 function downloadFileOnce(url, destination, options = {}) {
   const timeoutMs = options.timeoutMs || releaseDownloadTimeoutMs;
+  const maxBytes = options.maxBytes ?? managedCliArchiveMaxBytes;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    return Promise.reject(new Error(`download_size_limit_invalid:${maxBytes}`));
+  }
   const deadlineMs = options.deadlineMs ?? Date.now() + timeoutMs;
   const redirectsRemaining = options.redirectsRemaining ?? 5;
   const parsedUrl = new URL(url);
@@ -452,11 +492,13 @@ function downloadFileOnce(url, destination, options = {}) {
     let output = null;
     let activeRequest = null;
     let activeResponse = null;
+    let limiter = null;
     const finish = (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadlineTimer);
       if (error) {
+        if (limiter) limiter.destroy();
         if (output) output.destroy();
         if (activeResponse) activeResponse.destroy();
         if (activeRequest) activeRequest.destroy();
@@ -491,12 +533,33 @@ function downloadFileOnce(url, destination, options = {}) {
         finish(new Error(`download failed ${response.statusCode}: ${url}`));
         return;
       }
+      const announced = response.headers['content-length'];
+      if (announced !== undefined) {
+        const contentLength = Number(announced);
+        if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+          response.resume();
+          finish(new Error(`download_content_length_invalid:${url}`));
+          return;
+        }
+        if (contentLength > maxBytes) {
+          response.resume();
+          finish(new Error(`download_size_limit_exceeded:${url}`));
+          return;
+        }
+      }
+      let receivedBytes = 0;
+      limiter = new Transform({
+        transform(chunk, _encoding, callback) {
+          receivedBytes += chunk.length;
+          if (receivedBytes > maxBytes) {
+            callback(new Error(`download_size_limit_exceeded:${url}`));
+            return;
+          }
+          callback(null, chunk);
+        },
+      });
       output = fs.createWriteStream(destination);
-      response.pipe(output);
-      output.on('finish', () => output.close((error) => finish(error || null)));
-      output.on('error', finish);
-      response.on('aborted', () => finish(new Error(`download body aborted: ${url}`)));
-      response.on('error', finish);
+      pipeline(response, limiter, output, (error) => finish(error || null));
     });
     activeRequest = request;
     request.on('error', finish);
@@ -552,9 +615,10 @@ function redactedReleaseFileUrl(version, name) {
 
 async function fetchReleaseFile(version, name, destination) {
   const startedAt = Date.now();
+  const maxBytes = releaseFileMaxBytes(name);
   if (process.env.CODESTORY_PLUGIN_RELEASE_DIR) {
     try {
-      copyLocalReleaseFile(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name, destination);
+      copyLocalReleaseFile(process.env.CODESTORY_PLUGIN_RELEASE_DIR, name, destination, maxBytes);
     } catch (error) {
       throw new Error(releaseAssetFetchFailure(name, startedAt, 1, error));
     }
@@ -562,7 +626,7 @@ async function fetchReleaseFile(version, name, destination) {
   }
   const url = releaseFileUrl(version, name);
   try {
-    await downloadFile(url, destination);
+    await downloadFile(url, destination, { maxBytes });
   } catch (error) {
     throw new Error(releaseAssetFetchFailure(name, startedAt, releaseDownloadAttempts, error));
   }
@@ -1235,12 +1299,11 @@ function isPlainObject(value) {
 function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
   return new Promise((resolve, reject) => {
     const spawnChild = options.spawn || spawn;
-    const child = spawnChild(cliPath, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
+    const child = spawnCodeStoryCli(cliPath, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32' && /\.(cmd|bat)$/iu.test(cliPath),
       windowsHide: true,
       env: { ...process.env, CODESTORY_PLUGIN_PROVISIONING_PROBE: '1' },
-    });
+    }, spawnChild);
     let completed = false;
     let requestedOutcome = null;
     let stdout = '';
@@ -1525,10 +1588,14 @@ async function resolveCli(options = {}) {
     const cliPath = path.isAbsolute(process.env.CODESTORY_CLI)
       ? process.env.CODESTORY_CLI
       : path.resolve(launchCwd, process.env.CODESTORY_CLI);
+    const batchOverride = isWindowsBatchCli(cliPath);
+    if (batchOverride) {
+      warnings.push('codestory_cli_batch_override_rejected:use_codestory_cli_exe');
+    }
     return {
       source: 'local_dev_override',
-      path: cliPath,
-      sha256: fs.existsSync(cliPath) ? fileSha256(cliPath) : null,
+      path: batchOverride ? null : cliPath,
+      sha256: !batchOverride && fs.existsSync(cliPath) ? fileSha256(cliPath) : null,
       version,
       cliVersion: null,
       repoRef: null,
@@ -1579,12 +1646,11 @@ function probeResolvedCli(resolved) {
       stderr: '',
     };
   }
-  const result = spawnSync(resolved.path, ['--version'], {
+  const result = spawnCodeStoryCliSync(resolved.path, ['--version'], {
     encoding: 'utf8',
     env: resolved.provisioningProbe
       ? { ...process.env, CODESTORY_PLUGIN_PROVISIONING_PROBE: '1' }
       : process.env,
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     timeout: 3000,
     windowsHide: true,
   });
@@ -1599,6 +1665,9 @@ function probeResolvedCli(resolved) {
 }
 
 function failOpenReasonForProbe(resolved, probe) {
+  const batchRejection = (resolved.warnings || []).find((warning) =>
+    warning.startsWith('codestory_cli_batch_override_rejected:'));
+  if (batchRejection) return batchRejection;
   if (resolved.source === 'managed_unavailable') {
     return resolved.managedProvisionFailure || 'managed_cli_unavailable';
   }
@@ -1761,6 +1830,9 @@ function verifyManagedCliVersion(entry, probeVersion = probeResolvedCli) {
   }
   if (!pathInside(realExecutable, realVersionDir)) {
     return { verified: false, reason: 'manifest_path_escape' };
+  }
+  if (isWindowsBatchCli(realExecutable)) {
+    return { verified: false, reason: 'manifest_batch_executable_rejected' };
   }
   let actualSha256;
   try {
@@ -2061,10 +2133,9 @@ function localWaitFreshTimeoutMs() {
 function runLocalNavigationWaitFresh(resolved, projectRoot) {
   const args = ['ready', '--goal', 'local', '--wait-fresh'];
   args.push('--project', projectRoot, '--format', 'json');
-  const result = spawnSync(resolved.path, args, {
+  const result = spawnCodeStoryCliSync(resolved.path, args, {
     cwd: projectRoot,
     encoding: 'utf8',
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     timeout: localWaitFreshTimeoutMs(),
     windowsHide: true,
   });
@@ -2074,10 +2145,9 @@ function runLocalNavigationWaitFresh(resolved, projectRoot) {
 function runAgentReadiness(resolved, projectRoot) {
   const args = ['ready', '--goal', 'agent'];
   args.push('--project', projectRoot, '--format', 'json');
-  const result = spawnSync(resolved.path, args, {
+  const result = spawnCodeStoryCliSync(resolved.path, args, {
     cwd: projectRoot,
     encoding: 'utf8',
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     timeout: localWaitFreshTimeoutMs(),
     windowsHide: true,
   });
@@ -2086,10 +2156,9 @@ function runAgentReadiness(resolved, projectRoot) {
 
 function runProjectIdentity(resolved, projectRoot) {
   const args = ['cache', 'identity', '--project', projectRoot, '--format', 'json'];
-  const result = spawnSync(resolved.path, args, {
+  const result = spawnCodeStoryCliSync(resolved.path, args, {
     cwd: projectRoot,
     encoding: 'utf8',
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     timeout: localWaitFreshTimeoutMs(),
     windowsHide: true,
   });
@@ -3144,10 +3213,9 @@ function stdioRuntimeEnv(resolved, runtimeCwd) {
 }
 
 function spawnStdioRuntime(resolved, runtimeCwd, stdio) {
-  return spawn(resolved.path, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
+  return spawnCodeStoryCli(resolved.path, ['serve', '--stdio', '--multi-project', '--refresh', 'none'], {
     cwd: runtimeCwd,
     stdio,
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolved.path),
     windowsHide: true,
     env: stdioRuntimeEnv(resolved, runtimeCwd),
   });
@@ -3302,6 +3370,8 @@ if (require.main === module) {
       acquireManagedCliLock,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,
+      isWindowsBatchCli,
+      requireDirectCli,
       reclaimStaleManagedCliPendingOwners,
       removeManagedCliInitializationIf,
       processStartIdentity,

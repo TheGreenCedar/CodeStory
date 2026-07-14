@@ -630,7 +630,7 @@ try {
             Write-Host ""
             Write-Host "==> Build release CLI"
             Write-Warning "$resolveError Current-release install failed: $installError. Building release CLI with cargo."
-            Invoke-Checked "cargo" @("build", "--release", "-p", "codestory-cli")
+            Invoke-Checked "cargo" @("build", "--release", "--locked", "-p", "codestory-cli")
             $cli = Find-CodeStoryCli $projectPath
         }
     }

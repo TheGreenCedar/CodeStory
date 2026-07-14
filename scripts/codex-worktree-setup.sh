@@ -461,7 +461,7 @@ run_setup() {
       echo
       echo "==> Build release CLI"
       warn "$resolve_error Current-release install failed: ${install_error:-installed CLI was not discoverable}. Building release CLI with cargo."
-      cargo build --release -p codestory-cli
+      cargo build --release --locked -p codestory-cli
       find_cli "$project_path" || { popd >/dev/null; echo "$RESOLVE_ERROR" >&2; return 1; }
     fi
   fi

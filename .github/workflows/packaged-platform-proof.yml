@@ -101,7 +101,7 @@ jobs:
 
       - name: Build codestory-cli
         if: matrix.asset_target != 'linux-x64'
-        run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
+        run: cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
 
       - name: Build Linux x64 at the glibc 2.31 baseline
         if: matrix.asset_target == 'linux-x64'
@@ -114,7 +114,7 @@ jobs:
             --volume "$PWD:/workspace" \
             --workdir /workspace \
             "${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
-            cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
+            cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
             "target/${{ matrix.rust_target }}/release/codestory-cli"

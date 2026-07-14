@@ -201,9 +201,12 @@ configure/verify accelerated llama.cpp execution and rerun repair. A
 runtime log observation plus a successful live timed embed smoke verifies GPU
 proof.
 
-Keep endpoint and cache-root settings out of project `.codestory.toml` files.
-Use trusted user config, explicit CLI flags, or environment variables for those
-trust boundaries.
+Keep cache-root settings out of project `.codestory.toml` files. Project files
+also cannot set network endpoints by default. For repositories you fully trust,
+`CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` opts the whole process into accepting
+project summary and embedding endpoints; those endpoints can receive source or
+query text, and the opt-in applies to every project that long-lived process
+opens. Prefer trusted user config, explicit CLI flags, or environment variables.
 
 ### Bootstrap sidecars
 
@@ -213,7 +216,7 @@ From the CodeStory repository root:
 node scripts/setup-retrieval-env.mjs --fetch-embed-model
 # macOS arm64 Metal native sidecar only:
 node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only
-cargo run -p codestory-cli -- retrieval bootstrap --project <repo> --format json
+cargo run --locked -p codestory-cli -- retrieval bootstrap --project <repo> --format json
 ```
 
 Use the environment variables from the minimum table only when the defaults do
@@ -255,9 +258,9 @@ to the request; use a CodeStory-managed runtime for verified accelerator proof.
 Run the full sidecar path for the target workspace:
 
 ```sh
-cargo run -p codestory-cli -- index --project <repo> --refresh full
-cargo run -p codestory-cli -- retrieval index --project <repo> --refresh full
-cargo run -p codestory-cli -- retrieval status --project <repo> --format json
+cargo run --locked -p codestory-cli -- index --project <repo> --refresh full
+cargo run --locked -p codestory-cli -- retrieval index --project <repo> --refresh full
+cargo run --locked -p codestory-cli -- retrieval status --project <repo> --format json
 ```
 
 The proof is the final status JSON:
