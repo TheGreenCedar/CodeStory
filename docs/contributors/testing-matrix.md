@@ -89,14 +89,14 @@ compiled or run through the bench lane below.
 
 An explicitly promoted Mac-scoped head runs source checks independently on
 Apple Silicon (`macos-15`) and Intel (`macos-15-intel`) before packaging. Mac
-setup changes also pass the retrieval setup self-test, the Node dispatcher
-test, and the POSIX worktree setup self-test. Draft pushes stay on Ubuntu. Run
-locally from an isolated cache when changing these surfaces:
+setup changes also pass the retrieval setup self-test and the shared Node
+worktree setup suite, which includes the current platform adapter smoke. Draft
+pushes stay on Ubuntu. Run locally from an isolated cache when changing these
+surfaces:
 
 ```sh
 node scripts/setup-retrieval-env.mjs --self-test
 node --test scripts/tests/codex-worktree-setup.test.mjs
-node scripts/codex-worktree-setup.mjs --self-test
 ```
 
 ## Release And Version Bumps

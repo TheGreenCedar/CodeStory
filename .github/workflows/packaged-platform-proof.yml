@@ -74,6 +74,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Check shared worktree setup and host adapter
+        if: matrix.asset_target == 'linux-x64' || matrix.asset_target == 'windows-x64'
+        run: node --test scripts/tests/codex-worktree-setup.test.mjs
+
       - name: Install pinned Rust
         run: |
           rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
