@@ -1,20 +1,19 @@
 # Claude Code
 
-Use CodeStory in Claude Code with lifecycle hooks for session and prompt
-grounding. MCP setup is manual unless your Claude Code plugin flow wires it.
+Use CodeStory in Claude Code with one session hook and the CodeStory MCP server.
+MCP setup is manual unless your Claude Code plugin flow wires it.
 
 ## What you get
 
 | You | Agent |
 | --- | --- |
-| Install the CodeStory Claude plugin | Hooks run `codestory-activate.cjs` on session start and prompts |
-| Open your repo | Receives a compact task router; the hook does not run MCP or inject source claims |
-| Ask concrete questions | Uses the routed MCP surface when configured and obeys `allowed_surfaces` from status |
+| Install the CodeStory Claude plugin | A bounded session hook makes the grounding contract available |
+| Open your repo | The hook records the project without running tools or injecting source claims |
+| Ask concrete questions | Calls the matching CodeStory tool; managed preparation happens automatically |
 
-Hooks fail open: missing Node, MCP, or degraded sidecars do not block the host.
-The agent reads project-scoped status once, reuses it while repository/runtime
-state is unchanged, and follows the routed local graph when deep retrieval is
-blocked. Sidecar repair is reserved for tasks that actually need packet/search.
+The hook fails open: missing Node or MCP does not block the host. Normal use does
+not begin with a status check and never asks you to configure CodeStory. If a
+first call is still preparing, the agent retries that same call after its delay.
 
 ## Install
 
@@ -84,46 +83,35 @@ the adapter provisions the runtime when the MCP server starts successfully.
 
 ## Install verification
 
-Run these three checks before your first real task:
+Run these two checks before your first real task:
 
 1. **Adapter present** — `claude plugin list` shows **codestory**, or you
    started Claude with `--plugin-dir plugins/codestory`. Confirm the manifest
    at `plugins/codestory/.claude-plugin/plugin.json` and hooks at
    `plugins/codestory/hooks/claude-codex-hooks.json`.
-2. **Hooks live** — Start a new session; you should see CodeStory hook status
-   messages on session start or prompt submit (hooks fail open if Node is
-   missing).
-3. **First status read succeeds** — Use the readiness prompt in [First
-   session](#first-session). The agent should answer in plain English whether
-   your repo map is ready and whether broad search is available.
+2. **Hooks live** — Start a new session. The session hook should make the
+   CodeStory grounding contract available (and fails open if Node is missing).
 
 ## First session
 
-1. Start a new Claude Code session in the repository (startup, resume, clear, or
-   compact triggers session hooks).
-2. Ask:
+Start a new Claude Code session in the repository and ask a real repository
+question:
 
 ```text
-Read codestory://status, ground this checkout if allowed, and tell me which CodeStory surfaces are ready before I edit.
+Where is [Feature] implemented, who calls it, and which tests cover it?
 ```
 
 **Expected wait:** On a large repository, the first index build can take several
-minutes. Let the agent finish grounding before you ask it to edit files.
+minutes. The agent should retry the same tool while CodeStory prepares.
 
-**Success looks like:** The agent confirms your repo map is ready, says whether
-broad search is available, and does not report a missing CLI or broken MCP
-connection.
+**Success looks like:** The agent answers with repository-specific files and
+symbols without asking you to run setup, approve a background service, or poll
+readiness.
 
 Hooks inject routing, not grounding evidence. Follow the selected live MCP
 surface and its evidence gaps before making source claims.
 
 ## Example prompts
-
-**Readiness**
-
-```text
-Check CodeStory status and allowed_surfaces before I edit [path/to/file].
-```
 
 **Find ownership**
 
@@ -137,10 +125,10 @@ Where is [Feature] defined and who calls it?
 I am changing [path/to/file]. What symbols are affected and what tests should I run first?
 ```
 
-**Broad question (when packet/search ready)**
+**Broad question**
 
 ```text
-How does [subsystem] interact with [other area]? Use packet or search only if retrieval_mode is full.
+How does [subsystem] interact with [other area]? Cite the owning files and symbols.
 ```
 
 More pairs and anti-patterns: [Prompt patterns](prompt-patterns.md).
@@ -151,8 +139,8 @@ More pairs and anti-patterns: [Prompt patterns](prompt-patterns.md).
 | --- | --- |
 | Hooks silent | Confirm `node` on PATH; check `CLAUDE_PLUGIN_ROOT` resolves to plugin dir |
 | No MCP tools | Add MCP server config; see [Cursor MCP section](cursor.md#2-mcp-server-copy-shipped-config) |
-| Packet/search blocked | [Troubleshooting - packet/search](troubleshooting.md#packetsearch-degraded-or-blocked) |
-| Hook timeout | Session continues; use explicit status prompt |
+| Broad search unavailable | [Troubleshooting - packet/search](troubleshooting.md#packetsearch-degraded-or-blocked) |
+| Hook timeout | Session continues; ask the repository question directly |
 
 Shared repair: [Troubleshooting](troubleshooting.md).
 
@@ -161,7 +149,7 @@ Shared repair: [Troubleshooting](troubleshooting.md).
 | Feature | Claude Code | Codex |
 | --- | --- | --- |
 | MCP auto-start | Manual | Yes |
-| Hooks | Session + prompt | Session + prompt |
+| Hooks | Session | Session |
 | Skill | Partial (host-dependent) | Full `@CodeStory` skill |
 | Managed CLI | Yes when MCP sets `CODESTORY_PLUGIN_DATA` | Yes via plugin |
 

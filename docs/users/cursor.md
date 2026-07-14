@@ -7,7 +7,7 @@ MCP server pointing at the plugin adapter.
 
 | You | Agent |
 | --- | --- |
-| Copy the project rule and add MCP config | Rule tells the agent to read `codestory://status` first |
+| Copy the project rule and add MCP config | Rule tells the agent to call the tool matching the task |
 | Open your repo in Cursor | Uses MCP tools when the server is connected |
 | Ask repo questions | Local graph and packet/search when [allowed](../glossary.md#allowed-surfaces) |
 
@@ -60,8 +60,8 @@ checkout lives inside your workspace root. If the plugin is elsewhere, change
 On Windows, ensure `node` is on PATH.
 
 Set `CODESTORY_PLUGIN_DATA` to a persistent per-user directory outside the
-repository; the adapter stores the managed CLI, runtime state, and sidecar
-policy there. Set `CODESTORY_CLI` only for local development overrides.
+repository; the adapter stores its managed runtime there. Set `CODESTORY_CLI`
+only for local development overrides.
 
 Alternatively, add the same server block in Cursor user settings instead of a
 project `.cursor/mcp.json`.
@@ -73,44 +73,34 @@ repository root as the workspace folder.
 
 ## Install verification
 
-Run these three checks before your first real task:
+Run these two checks before your first real task:
 
 1. **Adapter present** — Confirm `.cursor/rules/codestory.mdc` (or the plugin
    copy at `plugins/codestory/.cursor/rules/codestory.mdc`) exists and
    `.cursor/mcp.json` points at `codestory-mcp.cjs`.
 2. **MCP live** — In Cursor, the CodeStory MCP server shows as connected after
    reload.
-3. **First status read succeeds** — Use the readiness prompt in [First
-   session](#first-session). The agent should answer in plain English whether
-   your repo map is ready and whether broad search is available.
 
 ## First session
 
 1. Confirm the CodeStory MCP server shows connected in Cursor.
 2. Start a new agent chat in the repository.
-3. Ask:
+3. Ask a real repository question:
 
 ```text
-Read codestory://status, ground this checkout if allowed, and tell me which CodeStory surfaces are ready before I edit.
+Where is [Feature] implemented, who calls it, and which tests cover it?
 ```
 
 **Expected wait:** On a large repository, the first index build can take several
-minutes. Let the agent finish grounding before you ask it to edit files.
+minutes. The agent should retry the same tool while CodeStory prepares.
 
-**Success looks like:** The agent confirms your repo map is ready, says whether
-broad search is available, and does not report a missing CLI or broken MCP
-connection.
+**Success looks like:** The agent returns repository-specific files and symbols
+without asking you to run setup or poll readiness.
 
 Without MCP, the rule points the agent to repair fallbacks -- see
 [Troubleshooting](troubleshooting.md).
 
 ## Example prompts
-
-**Readiness**
-
-```text
-Check CodeStory status and allowed_surfaces before I change [path/to/file].
-```
 
 **Find ownership**
 
@@ -148,11 +138,11 @@ Shared steps: [Troubleshooting](troubleshooting.md).
 | Feature | Cursor | Codex |
 | --- | --- | --- |
 | MCP auto-start | Manual config | Yes |
-| Lifecycle hooks | No (rule only) | Session start + prompt hooks |
+| Lifecycle hooks | No (rule only) | Session start |
 | Grounding skill | Via rule text | Full `@CodeStory` skill |
 | Managed CLI bootstrap | When MCP adapter runs | Always via plugin |
 
-Request-aware packet injection on every prompt requires hook-capable hosts
-(Codex, Claude Code). Cursor relies on the rule and your prompts.
+Cursor relies on the rule and your prompts. CodeStory tools remain intent-first
+on every host; session hooks teach the contract but do not route each prompt.
 
 Compare hosts: [capability matrix](README.md#capability-matrix).

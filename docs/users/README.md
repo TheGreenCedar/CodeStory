@@ -9,7 +9,7 @@ your repository, and start a fresh session there.
 1. **Pick a host** — if unsure, start with [Codex](codex.md) (recommended first install).
 2. **Install once** — follow your host guide; approve hooks when prompted.
 3. **Open the repo** you want grounded and start a **fresh** agent session there.
-4. **First prompt** — use the readiness prompt from your host guide, or ask a concrete repo question (see [prompt patterns](prompt-patterns.md)).
+4. **First prompt** — ask a concrete repo question; setup and preparation happen automatically when the host supports them (see [prompt patterns](prompt-patterns.md)).
 5. **Success looks like** — the agent cites indexed files, names blocked surfaces if any, and does not guess from partial tree reads. Large repos may take several minutes to index on first open.
 6. **Something wrong?** — [Trust and readiness](trust-and-readiness.md), then [Troubleshooting](troubleshooting.md).
 
@@ -52,9 +52,9 @@ through thin adapters; see each guide for honest gaps.
 | You | Agent (with CodeStory) |
 | --- | --- |
 | Install the plugin or adapter for your host | Grounds the checkout, traces symbols, and cites sources |
-| Open the repository you want grounded | Uses local graph tools for navigation; uses packet/search only when broad search is ready |
-| Ask concrete questions with repo terms | Reports blocked surfaces and next repair steps |
-| Start a fresh session after install or repair | Reads runtime status and obeys allowed surfaces (agent detail — see trust page) |
+| Open the repository you want grounded | Uses local graph tools for navigation and broad search when available |
+| Ask concrete questions with repo terms | Retries managed preparation and reports plain-language gaps if it cannot proceed |
+| Start a fresh session after install or repair | Selects the repository explicitly on every request |
 
 Readiness boundaries in plain language: [Trust and readiness](trust-and-readiness.md).
 

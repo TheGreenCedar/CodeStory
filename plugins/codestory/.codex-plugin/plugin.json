@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "CodeStory",
     "shortDescription": "Use local CodeStory grounding from Codex",
-    "longDescription": "CodeStory gives Codex a local, read-only grounding surface backed by codestory-cli. It exposes the existing CodeStory skill plus the local stdio protocol without duplicating indexing, retrieval, packet, or sidecar logic in the plugin.",
+    "longDescription": "CodeStory gives Codex a fast local map and evidence-backed search for the repository in each request. It prepares its managed runtime automatically and keeps setup details out of normal sessions.",
     "developerName": "The Green Cedar",
     "category": "Developer Tools",
     "capabilities": ["Interactive", "Read", "Lifecycle hooks"],
@@ -26,7 +26,7 @@
     "defaultPrompt": [
       "Where is [SYMBOL] defined and what is the call path into [OWNING_MODULE]?",
       "I am editing a file in this repo. What symbols are affected and what tests should I run first?",
-      "Call CodeStory status with this repository's absolute path, ground the same project if allowed, and report which surfaces are ready."
+      "Explain how [SUBSYSTEM] works in this repository and cite the files and symbols that own the behavior."
     ],
     "brandColor": "#2563EB",
     "screenshots": []

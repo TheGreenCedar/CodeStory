@@ -95,7 +95,7 @@ See [glossary.md](glossary.md) for canonical definitions. Summary:
 Portable shapes (any repository):
 
 ```text
-@CodeStory check local_navigation and agent_packet_search on this checkout, ground the repo, and tell me whether sidecars need repair before I use packet.
+@CodeStory How does [SUBSYSTEM] work across this checkout? Cite the concrete files and symbols.
 ```
 
 ```text

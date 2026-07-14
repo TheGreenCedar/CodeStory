@@ -29,10 +29,10 @@ CodeStory prepares its managed local runtime automatically. `status` and
 request, not prerequisites for normal grounding.
 
 If the server-specific tools are hidden and deferred discovery is available,
-query `codestory mcp ground packet search symbol`, then call the discovered tool
-directly. If the plugin MCP is unavailable, use ordinary source inspection and
-report the visibility gap. Do not substitute CLI diagnostics for a live plugin
-result unless the user explicitly asks.
+search only for the intended tool, for example `codestory mcp packet`, then call
+it directly. If the plugin MCP is unavailable, use ordinary source inspection
+and report the visibility gap. Do not substitute CLI diagnostics for a live
+plugin result unless the user explicitly asks.
 
 ## Task Router
 
@@ -63,8 +63,6 @@ result unless the user explicitly asks.
 - `updating`: the last complete repository map remains usable; retry the same
   tool when current publication evidence is required.
 - `working_locally`: use local navigation while broad search prepares.
-- `needs_environment`: report the single plain-language host requirement from
-  the result. Do not expose internal process, port, model, or service details.
 - `unavailable`: use ordinary source inspection and report that CodeStory was
   unavailable for this task.
 

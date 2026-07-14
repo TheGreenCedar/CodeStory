@@ -80,11 +80,11 @@ Where is `dispatch` defined in this workspace, who calls it across crates, and c
 | `[OWNING_MODULE]` | Package, crate, or directory that owns the behavior |
 | `[route]` | HTTP route, CLI command, or entry surface |
 
-## Readiness prompts
+## Normal use
 
-Check readiness **once** at the start of a session or after repair — not before
-every question. Your host guide shows the first-session shape; keep one readiness
-prompt in the plugin defaults and use repo questions for day-to-day work.
+Ask the repository question directly. CodeStory prepares what it needs on the
+first relevant call. If preparation is still running, the agent retries that
+same call; you do not need a readiness prompt or setup command.
 
 More host examples: [Codex](codex.md#example-prompts), [Cursor](cursor.md#example-prompts),
 [Claude Code](claude-code.md#example-prompts), [Copilot](copilot.md#example-prompts).

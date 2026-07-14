@@ -24,8 +24,6 @@ const {
   uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
-const genericBaselineHook = join(pluginRoot, "tests", "fixtures", "hook-generic-baseline.cjs");
-
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
   return join(dataDir, `.codestory-active-thread-${key}.json`);
@@ -374,7 +372,7 @@ test("plugin metadata maps skill and direct stdio server", async () => {
 
 test("agent-facing guidance does not send agents to CLI fallback repair", async () => {
   const guidanceFiles = [
-    join(pluginRoot, "hooks", "codestory-instructions.cjs"),
+    join(pluginRoot, "hooks", "codestory-activate.cjs"),
     join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
     join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
     join(pluginRoot, "skills", "codestory-grounding", "references", "status-contract.md"),
@@ -390,6 +388,17 @@ test("agent-facing guidance does not send agents to CLI fallback repair", async 
     assert.doesNotMatch(text, /CLI fallback/u, file);
     assert.doesNotMatch(text, /managed CLI or local-dev CODESTORY_CLI preflight/u, file);
     assert.doesNotMatch(text, /Call `sidecar_setup`/u, file);
+  }
+
+  for (const file of [
+    join(repoRoot, ".github", "copilot-instructions.md"),
+    join(repoRoot, ".cursor", "rules", "codestory.mdc"),
+    join(pluginRoot, ".cursor", "rules", "codestory.mdc"),
+  ]) {
+    const text = await readFile(file, "utf8");
+    assert.match(text, /Call the CodeStory tool that matches the task/u, file);
+    assert.doesNotMatch(text, /read `codestory:\/\/status` first/u, file);
+    assert.doesNotMatch(text, /codestory-cli ready/u, file);
   }
 });
 
@@ -2591,10 +2600,27 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(status.allowed_surfaces.ground.allowed, false);
     assert.equal(status.managed_retrieval.automatic, true);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
-    assert.deepEqual(responses[2].result.tools, []);
-    assert.equal(responses[3].error.code, -32602);
-    assert.match(responses[3].error.message, /grounding tools are temporarily unavailable/u);
-    assert.match(responses[3].error.message, /Retry after the host reports that CodeStory is ready/u);
+    const toolNames = responses[2].result.tools.map((tool) => tool.name);
+    const catalogSource = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_catalog.rs"), "utf8");
+    const canonicalTools = catalogSource.slice(
+      catalogSource.indexOf("static TOOLS: &[ToolSpec]"),
+      catalogSource.indexOf("static RESOURCES: &[ResourceSpec]"),
+    );
+    const canonicalToolNames = [...canonicalTools.matchAll(/\bname:\s*"([^"]+)"/gu)]
+      .map((match) => match[1]);
+    assert.deepEqual([...toolNames].sort(), [...canonicalToolNames].sort());
+    const coldGroundTool = responses[2].result.tools.find((tool) => tool.name === "ground");
+    assert.equal(coldGroundTool.safety.effect, "managed_activation");
+    assert.equal(coldGroundTool.safety.requiresConfirmation, false);
+    assert.equal(coldGroundTool.safety.localOnly, false);
+    assert.equal(coldGroundTool.safety.openWorld, true);
+    assert.equal(coldGroundTool.annotations.readOnlyHint, false);
+    assert.equal(coldGroundTool.annotations.openWorldHint, true);
+    assert.equal(responses[3].result.isError, true);
+    assert.equal(responses[3].result.structuredContent.code, "codestory_unavailable");
+    assert.equal(responses[3].result.structuredContent.tool, "ground");
+    assert.equal(responses[3].result.structuredContent.retry_tool, undefined);
+    assert.match(responses[3].result.structuredContent.message, /focused source inspection/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2982,6 +3008,25 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     const status = JSON.parse(statusResponse.result.contents[0].text);
     assert.equal(status.degraded_reason, "managed_cli_provisioning");
     assert.equal(status.runtime_boundary.restart_required_for_runtime_change, false);
+    const coldTools = await request({
+      jsonrpc: "2.0",
+      id: "cold-tools",
+      method: "tools/list",
+    });
+    assert.equal(coldTools.result.tools.length, 20);
+    assert.ok(coldTools.result.tools.some((tool) => tool.name === "ground"));
+    const coldGround = await request({
+      jsonrpc: "2.0",
+      id: "cold-ground",
+      method: "tools/call",
+      params: { name: "ground", arguments: { project: repoRoot } },
+    });
+    assert.equal(coldGround.result.isError, true);
+    assert.equal(coldGround.result.structuredContent.code, "codestory_preparing");
+    assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
+    assert.equal(coldGround.result.structuredContent.project, repoRoot);
+    assert.equal(coldGround.result.structuredContent.operation.id, "managed-runtime-provisioning");
+    assert.doesNotMatch(coldGround.result.structuredContent.message, /status/u);
 
     releaseAssets();
     const runtimeMetadata = join(dataDir, ".codestory-mcp-runtime.json");
@@ -3464,8 +3509,9 @@ test("startup hook records active project without runtime bootstrap", async () =
     const output = JSON.parse(result.stdout);
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY SESSION ROUTING ACTIVE/u);
-    assert.match(context, /Task router: orientation/u);
+    assert.match(context, /CODESTORY GROUNDING AVAILABLE/u);
+    assert.match(context, /Call status only for diagnostics/u);
+    assert.match(context, /retry that same tool/u);
     assert.match(context, /tool_search/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
@@ -3677,7 +3723,7 @@ test("session-start hooks are thin and host manifests point at them", async () =
   const hookScript = /hooks[\\/]([\w.-]+\.(?:js|mjs|cjs|ps1|sh))/u;
 
   assert.equal(copilotHookConfig.hooks.sessionStart.length, 1);
-  assert.equal(hookConfig.hooks.UserPromptSubmit.length, 1);
+  assert.equal(Object.hasOwn(hookConfig.hooks, "UserPromptSubmit"), false);
 
   for (const hook of hookCommands) {
     assert.match(hook.command, /codestory-activate\.cjs/u);
@@ -3784,258 +3830,7 @@ function runCodexHook(input, env) {
   return runHookProcess(join(pluginRoot, "hooks", "codestory-activate.cjs"), input, env);
 }
 
-async function runCodexHookAsync(input, env) {
-  const child = spawn(process.execPath, [join(pluginRoot, "hooks", "codestory-activate.cjs")], {
-    env: {
-      ...process.env,
-      COPILOT_PLUGIN_DATA: "",
-      ...env,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
-  child.stderr.on("data", (chunk) => { stderr += chunk; });
-  child.stdin.end(JSON.stringify(input));
-  const [status] = await once(child, "close");
-  assert.equal(status, 0, stderr);
-  return JSON.parse(stdout);
-}
-
-test("hook emits MCP activation guidance without running CLI", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-mcp-guidance-"));
-  const binDir = await mkdtemp(join(tmpdir(), "codestory-hook-unused-cli-"));
-  const marker = join(dataDir, "cli-called.txt");
-
-  try {
-    const cliPath = await writeNodeCli(binDir, "require(\"fs\").writeFileSync(process.env.TEST_MARKER, process.argv.slice(2).join(\" \"));");
-    const output = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is RefreshMode defined?",
-      cwd: repoRoot,
-    }, {
-      CODESTORY_CLI: cliPath,
-      PLUGIN_DATA: dataDir,
-      TEST_MARKER: marker,
-      PATH: "",
-    });
-
-    const context = output.hookSpecificOutput.additionalContext;
-    assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY REQUEST ROUTING ACTIVE/u);
-    assert.match(context, /Route: Symbol ownership/u);
-    assert.match(context, /codestory mcp ground packet search symbol/u);
-    assert.match(context, /absolute repository cwd/u);
-    assert.match(context, /Call the CodeStory tool that matches the request directly/u);
-    assert.match(context, /If CodeStory is preparing, retry that same tool/u);
-    assert.match(context, /Hook text routes; only live MCP or verified source is evidence/u);
-    assert.doesNotMatch(context, /CodeStory hook output truncated/u);
-    assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
-    assert.doesNotMatch(context, /managed_bootstrap/u);
-    assert.doesNotMatch(context, /packet ok/u);
-    await assert.rejects(readFile(marker, "utf8"), /ENOENT/u);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-    await rm(binDir, { recursive: true, force: true });
-  }
-});
-
-test("hook routing is stateless across repeated and parallel processes", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-stateless-"));
-  const input = {
-    hook_event_name: "UserPromptSubmit",
-    prompt: "Where is RefreshMode defined?",
-    cwd: repoRoot,
-  };
-
-  try {
-    const serial = [runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" }), runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" })];
-    const parallel = await Promise.all(Array.from({ length: 6 }, () => runCodexHookAsync(input, {
-      CODEX_THREAD_ID: "shared-task",
-      PLUGIN_DATA: dataDir,
-      PATH: "",
-    })));
-    for (const output of [...serial, ...parallel]) {
-      assert.match(output.hookSpecificOutput.additionalContext, /Route: Symbol ownership/u);
-      assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /Where is RefreshMode defined/u);
-    }
-    await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("hook qualification compares executable policies with sourced MCP observations", async (t) => {
-  const fixture = JSON.parse(await readFile(
-    join(pluginRoot, "tests", "fixtures", "hook-route-qualification.json"),
-    "utf8",
-  ));
-  const observedDrills = JSON.parse(await readFile(
-    join(pluginRoot, "tests", "fixtures", "hook-observed-mcp-drills.json"),
-    "utf8",
-  ));
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-qualification-"));
-  const toolVocabulary = new Set([
-    "affected", "callees", "callers", "definition", "files", "ground", "packet",
-    "search", "snippet", "status", "symbol", "trace", "trail",
-  ]);
-  const record = (output) => {
-    const context = output.hookSpecificOutput?.additionalContext || "";
-    const plan = context.match(/^Plan: category=([a-z_]+); tools=([a-z_,]+)$/mu);
-    const instructedTools = plan
-      ? [...new Set(plan[2].split(","))].sort()
-      : [];
-    assert.ok(instructedTools.every((tool) => toolVocabulary.has(tool)));
-    return {
-      suppressed: !context,
-      category: plan?.[1] || null,
-      instructed_tools: instructedTools,
-    };
-  };
-  const failures = (actual, expected) => {
-    const result = [];
-    if (actual.suppressed !== Boolean(expected.suppressed)) result.push("suppression");
-    if (!expected.suppressed && actual.category !== expected.category) result.push("category");
-    const expectedTools = [...(expected.instructed_tools || [])].sort();
-    if (!expected.suppressed && actual.instructed_tools.join("\0") !== expectedTools.join("\0")) {
-      result.push(`tools:${actual.instructed_tools.join(",")}`);
-    }
-    for (const tool of expected.forbidden_tools || []) {
-      if (actual.instructed_tools.includes(tool)) result.push(`forbidden:${tool}`);
-    }
-    return result;
-  };
-
-  try {
-    const cases = fixture.cases.map((entry) => {
-      const currentOutput = runCodexHook({
-        hook_event_name: "UserPromptSubmit",
-        prompt: entry.prompt,
-        cwd: repoRoot,
-      }, { PLUGIN_DATA: dataDir, PATH: "" });
-      const context = currentOutput.hookSpecificOutput?.additionalContext || "";
-      assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
-      assert.equal(context.includes(entry.prompt), false);
-      assert.doesNotMatch(context, /hook output truncated/u);
-      const current = record(currentOutput);
-      const baseline = record(runHookProcess(genericBaselineHook, {
-        hook_event_name: "UserPromptSubmit",
-        prompt: entry.prompt,
-        cwd: repoRoot,
-      }, { PLUGIN_DATA: dataDir, PATH: "" }));
-      return {
-        slug: entry.slug,
-        current,
-        baseline,
-        current_failures: failures(current, entry),
-        baseline_failures: failures(baseline, entry),
-      };
-    });
-
-    const requiredObservedTools = {
-      orientation: ["ground", "files"],
-      symbol_ownership: ["symbol", "definition"],
-      call_flow: ["symbol", "callers", "callees"],
-      change_impact: ["affected"],
-      broad_question: ["ground", "symbol", "trace"],
-    };
-    assert.equal(observedDrills.artifact_kind, "sourced_observed_mcp_drill_traces");
-    assert.equal(observedDrills.test_execution.executes_mcp, false);
-    for (const drill of observedDrills.observations) {
-      const emitted = record(runCodexHook({
-        hook_event_name: "UserPromptSubmit",
-        prompt: drill.prompt,
-        cwd: repoRoot,
-      }, { PLUGIN_DATA: dataDir, PATH: "" }));
-      const observedTools = drill.steps.map(({ tool }) => tool);
-      const sourceIndex = observedTools.indexOf("source");
-      const graphIndex = observedTools.findIndex((tool) =>
-        ["ground", "symbol", "callers", "callees", "trace", "trail", "affected"].includes(tool));
-      assert.ok(
-        observedTools.every((tool) => tool === "source" || toolVocabulary.has(tool)),
-        drill.source.location,
-      );
-      assert.equal(drill.source_fallback.used, sourceIndex >= 0, drill.source.location);
-      assert.equal(emitted.category, drill.category);
-      assert.equal(observedTools[0], "status");
-      assert.equal(drill.source.kind, "agent_observation");
-      assert.equal(drill.source.url, "https://github.com/TheGreenCedar/CodeStory/pull/982");
-      assert.match(drill.source.commit, /^[0-9a-f]{40}$/u);
-      assert.ok(requiredObservedTools[drill.category].every((tool) =>
-        observedTools.includes(tool)), drill.source.location);
-      if (sourceIndex >= 0) {
-        assert.equal(drill.source_fallback.used, true);
-        assert.equal(drill.source_fallback.after_graph, true);
-        assert.ok(graphIndex > 0 && sourceIndex > graphIndex, drill.source.location);
-      }
-      if (drill.blocked_tools) {
-        assert.deepEqual([...drill.blocked_tools].sort(), ["packet", "search"]);
-      }
-      const affected = drill.steps.find(({ tool }) => tool === "affected");
-      if (affected) {
-        assert.deepEqual(affected.arguments.paths, [
-          "plugins/codestory/hooks/codestory-activate.cjs",
-          "plugins/codestory/tests/plugin-static.test.mjs",
-        ]);
-        assert.equal(affected.result_kind, "explicit_path_match");
-      }
-      assert.equal(observedTools.includes("sidecar_setup"), false);
-      assert.equal(drill.repair_attempted, false);
-    }
-
-    t.diagnostic(JSON.stringify({
-      cases,
-      observed_drills: observedDrills.observations.map(({ slug, source, steps }) => ({
-        slug,
-        source,
-        observed_tools: steps.map(({ tool }) => tool),
-      })),
-    }));
-    assert.deepEqual(cases.flatMap(({ slug, current_failures }) =>
-      current_failures.map((failure) => `${slug}:${failure}`)), []);
-    assert.deepEqual(cases.filter(({ baseline_failures }) => baseline_failures.length === 0), []);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("suppressed hook events write no active or thread state", async () => {
-  for (const input of [
-    { hook_event_name: "UserPromptSubmit", prompt: "Can you review this restaurant?", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Explain the egg method.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "I registered for semester classes.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Tell me about compiler design.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "What is the movie runtime?", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "I bought an iPhone.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Search for eBay.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Please update my social_security_number.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Help me build a birdhouse.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Explain liver function tests.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Organize my grocery list.", cwd: repoRoot },
-    { hook_event_name: "UserPromptSubmit", prompt: "Update issue #897.", cwd: repoRoot },
-    { hook_event_name: "GoalLoopHeartbeat", cwd: repoRoot },
-  ]) {
-    const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-no-state-"));
-    try {
-      const output = runCodexHook(input, {
-        CODEX_THREAD_ID: "suppressed-task",
-        PLUGIN_DATA: dataDir,
-        PATH: "",
-      });
-      assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
-      await assert.rejects(access(join(dataDir, ".codestory-active")), /ENOENT/u);
-      await assert.rejects(access(threadActiveStatePath(dataDir, "suppressed-task")), /ENOENT/u);
-      await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
-    } finally {
-      await rm(dataDir, { recursive: true, force: true });
-    }
-  }
-});
-
-test("compact and resume session starts re-inject complete bounded routing", async () => {
+test("session hooks inject one bounded contract and prompt hooks stay silent", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-reinject-"));
   const longCwd = `C:\\${"very-long-directory\\".repeat(200)}repo`;
   try {
@@ -4047,20 +3842,19 @@ test("compact and resume session starts re-inject complete bounded routing", asy
       }, { PLUGIN_DATA: dataDir, PATH: "" });
       const context = output.hookSpecificOutput.additionalContext;
       assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
-      assert.match(context, /absolute repository cwd/u);
-      assert.match(context, /codestory mcp ground packet search symbol/u);
+      assert.match(context, /target repository root/u);
+      assert.match(context, /starting hint/u);
+      assert.match(context, /search only for that tool by name/u);
+      assert.doesNotMatch(context, /status first|poll status/u);
       assert.doesNotMatch(context, /truncated/u);
-      assert.equal(context.endsWith("tools."), true);
+      assert.equal(context.endsWith("directly."), true);
     }
-    const promptContext = runCodexHook({
+    const promptOutput = runCodexHook({
       hook_event_name: "UserPromptSubmit",
       prompt: "Where is RuntimeContext defined?",
       cwd: longCwd,
-    }, { PLUGIN_DATA: dataDir, PATH: "" }).hookSpecificOutput.additionalContext;
-    assert.ok(promptContext.length <= 900, `hook output was ${promptContext.length} characters`);
-    assert.match(promptContext, /absolute repository cwd/u);
-    assert.doesNotMatch(promptContext, /truncated/u);
-    assert.equal(promptContext.endsWith("evidence."), true);
+    }, { PLUGIN_DATA: dataDir, PATH: "" });
+    assert.equal(Object.hasOwn(promptOutput, "hookSpecificOutput"), false);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -4127,8 +3921,8 @@ test("hook script executes under Codex home module scope", async () => {
           PATH: "",
         },
         input: JSON.stringify({
-          hook_event_name: "UserPromptSubmit",
-          prompt: "Explain CodeStory hook loading.",
+          hook_event_name: "SessionStart",
+          source: "startup",
           cwd: repoRoot,
         }),
         encoding: "utf8",
@@ -4139,7 +3933,7 @@ test("hook script executes under Codex home module scope", async () => {
     assert.doesNotMatch(result.stderr, /require is not defined/u);
     assert.match(
       JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-      /CODESTORY REQUEST ROUTING ACTIVE/u,
+      /CODESTORY GROUNDING AVAILABLE/u,
     );
   } finally {
     await rm(codexHome, { recursive: true, force: true });

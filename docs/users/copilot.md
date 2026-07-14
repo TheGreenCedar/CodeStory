@@ -58,17 +58,13 @@ to Codex.
 
 ### Install verification
 
-Run these three checks before your first real task:
+Run these two checks before your first real task:
 
 1. **Adapter present** — `copilot plugin list` shows **codestory**. Confirm the
    manifest at `plugins/codestory/.github/plugin/plugin.json` and hooks at
    `plugins/codestory/hooks/copilot-hooks.json`.
 2. **Hooks live** — Start a new Copilot CLI session in the repo; session-start
    hook should inject CodeStory grounding rules (`node` must be on PATH).
-3. **First status read succeeds** — Use the readiness prompt in [First
-   session](#first-session). With MCP configured, the agent should answer in
-   plain English whether your repo map is ready; without MCP, follow [CLI
-   reference](cli-reference.md) repair steps.
 
 ### First session
 
@@ -76,14 +72,14 @@ Start a new Copilot CLI session in the repo. Session-start hook injects
 grounding rules. Ask:
 
 ```text
-Read codestory://status if MCP is available, ground this checkout if allowed, and tell me which surfaces are ready.
+Where is [Feature] implemented, who calls it, and which tests cover it?
 ```
 
 **Expected wait:** On a large repository, the first index build can take several
-minutes. Let the agent finish grounding before you ask it to edit files.
+minutes. The agent should retry the same tool while CodeStory prepares.
 
-**Success looks like:** The agent confirms your repo map is ready (or gives clear
-repair steps), and hooks ran without blocking the session.
+**Success looks like:** The agent returns repository-specific files and symbols
+without asking you to run setup or poll readiness.
 
 Without MCP, see [CLI reference](cli-reference.md) for repair transcripts.
 
@@ -128,7 +124,7 @@ available. No hooks, no skill package, no managed bootstrap.
 | You | Agent |
 | --- | --- |
 | Keep `.github/copilot-instructions.md` in the repo | Reads instructions before source claims |
-| Optionally connect MCP yourself | Uses `codestory://status` when MCP is live |
+| Optionally connect MCP yourself | Calls the matching CodeStory tool when MCP is live |
 | Ask repo questions | Grounding only when MCP + instructions align |
 
 Canonical instruction file in this repo: `.github/copilot-instructions.md`
@@ -143,30 +139,27 @@ Canonical instruction file in this repo: `.github/copilot-instructions.md`
 
 ### Install verification
 
-Run these three checks before your first real task:
+Run these two checks before your first real task:
 
 1. **Adapter present** — `.github/copilot-instructions.md` exists at the repo
    root (copy from this repo or from
    `plugins/codestory/.cursor/rules/codestory.mdc` content).
 2. **MCP live (optional)** — If your editor build supports MCP, the CodeStory
    server is connected.
-3. **First session succeeds** — Use the readiness prompt in [First
-   session](#first-session-1). The agent should acknowledge CodeStory guidance
-   and, when MCP is connected, confirm whether your repo map is ready.
 
 ### First session
 
 Open Copilot chat in the repo and ask:
 
 ```text
-Check CodeStory status if available, then tell me what is indexed in this checkout before I edit [path/to/file].
+What owns [path/to/file], which symbols depend on it, and which tests should I run first?
 ```
 
 **Expected wait:** On a large repository, the first index build can take several
 minutes when MCP triggers a fresh index.
 
-**Success looks like:** The agent follows the repo instructions and tells you
-what is indexed before suggesting edits.
+**Success looks like:** The agent follows the repo instructions and returns
+repository-specific files and symbols without asking you to poll readiness.
 
 ### Example prompts
 

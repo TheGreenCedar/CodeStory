@@ -37,8 +37,8 @@ impl SafetyMetadata {
             "destructive": false,
             "idempotent": true,
             "requiresConfirmation": false,
-            "localOnly": true,
-            "openWorld": false
+            "localOnly": !self.activates_managed_state,
+            "openWorld": self.activates_managed_state
         })
     }
 
@@ -47,7 +47,7 @@ impl SafetyMetadata {
             "readOnlyHint": !self.activates_managed_state,
             "destructiveHint": false,
             "idempotentHint": true,
-            "openWorldHint": false
+            "openWorldHint": self.activates_managed_state
         })
     }
 }
@@ -527,6 +527,36 @@ const PACKET_TASK_CLASSES: &[&str] = &[
 static GENERIC_OBJECT_SCHEMA: SchemaObject =
     SchemaObject::passthrough_object("Generic JSON object.");
 
+static STATUS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
+    "Compact capability state. Read codestory://status only when full diagnostics are needed.",
+    &[
+        SchemaProperty::string("project", "Requested repository root."),
+        SchemaProperty::string("state", "Overall capability state.").with_enum(&[
+            "ready",
+            "preparing",
+            "updating",
+            "working_locally",
+            "unavailable",
+        ]),
+        SchemaProperty::object("capabilities", "Local navigation and broad-search states."),
+        SchemaProperty::object(
+            "current_operation",
+            "Current managed preparation operation.",
+        )
+        .nullable(),
+        SchemaProperty::string("next_action", "Direct next action for the caller."),
+        SchemaProperty::integer("retry_after_ms", "Retry delay while preparing.").nullable(),
+        SchemaProperty::string("diagnostics_uri", "Optional full diagnostic resource URI."),
+    ],
+    &[
+        "project",
+        "state",
+        "capabilities",
+        "next_action",
+        "diagnostics_uri",
+    ],
+);
+
 static RESOURCE_LINK_SCHEMA: SchemaObject = SchemaObject::object(
     "Continuation resource link.",
     &[
@@ -588,11 +618,6 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::string("query", "Search query."),
         SchemaProperty::object("retrieval", "Retrieval state DTO."),
-        SchemaProperty::object(
-            "retrieval_shadow",
-            "Optional sidecar shadow retrieval trace DTO.",
-        )
-        .nullable(),
         SchemaProperty::integer("limit_per_source", "Per-source result limit."),
         SchemaProperty::string("repo_text_mode", "Repo text search mode.")
             .with_enum(SEARCH_REPO_TEXT_MODES),
@@ -603,26 +628,11 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
         )
         .nullable(),
         SchemaProperty::object(
-            "search_plan",
-            "Optional broad natural-language Search Plan with subqueries, anchor groups, bridge evidence, next commands, and source-truth checks.",
-        )
-        .nullable(),
-        SchemaProperty::object(
             "repo_text_stats",
             "Repo text scan cap, byte, and truncation telemetry.",
         )
         .nullable(),
-        SchemaProperty::array(
-            "suggestions",
-            "Alternative matching symbols.",
-            &SEARCH_HIT_SCHEMA,
-        ),
-        SchemaProperty::array(
-            "indexed_symbol_hits",
-            "Indexed symbol hits.",
-            &SEARCH_HIT_SCHEMA,
-        ),
-        SchemaProperty::array("repo_text_hits", "Repo text hits.", &SEARCH_HIT_SCHEMA),
+        SchemaProperty::object("counts", "Source counts before merged-result deduplication."),
         SchemaProperty::array("hits", "Merged hit list.", &SEARCH_HIT_SCHEMA),
         SchemaProperty::string("code", "Typed API error code."),
         SchemaProperty::string("message", "Human-readable API error message."),
@@ -660,12 +670,17 @@ static SYMBOL_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
 
 static SYMBOLS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory symbol list output.",
-    &[SchemaProperty::array(
-        "symbols",
-        "Root or child symbol summaries.",
-        &SYMBOL_SUMMARY_SCHEMA,
-    )],
-    &["symbols"],
+    &[
+        SchemaProperty::array(
+            "symbols",
+            "Root or child symbol summaries.",
+            &SYMBOL_SUMMARY_SCHEMA,
+        ),
+        SchemaProperty::integer("returned_count", "Symbol rows included in this response."),
+        SchemaProperty::integer("limit", "Applied result limit."),
+        SchemaProperty::boolean("truncated", "Whether matching symbols exceeded the limit."),
+    ],
+    &["symbols", "returned_count", "limit", "truncated"],
 );
 
 static INDEXED_FILE_SCHEMA: SchemaObject = SchemaObject::object(
@@ -777,6 +792,9 @@ static AFFECTED_ANALYSIS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string_array("blind_spots", "Known impact-analysis blind spots."),
         SchemaProperty::string_array("next_commands", "Suggested follow-up commands."),
         SchemaProperty::string_array("notes", "Additional analysis notes."),
+        SchemaProperty::object("counts", "Original result counts before response caps."),
+        SchemaProperty::object("limits", "Applied response caps."),
+        SchemaProperty::boolean("truncated", "Whether any result collection was capped."),
         SchemaProperty::string("code", "Typed API error code."),
         SchemaProperty::string("message", "Human-readable API error message."),
         SchemaProperty::object("details", "Structured API error repair guidance.").nullable(),
@@ -1192,8 +1210,8 @@ static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::string("parent_id", "Parent node id.").with_min_length(1),
         SchemaProperty::integer("limit", "Maximum root symbols returned.")
-            .with_default(ValueLiteral::Integer(300))
-            .with_bounds(1, 2000),
+            .with_default(ValueLiteral::Integer(50))
+            .with_bounds(1, 200),
     ],
     &[],
 );
@@ -1206,8 +1224,8 @@ static FILES_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("role", "Only include files with this inferred role.")
             .with_enum(INDEXED_FILE_ROLES),
         SchemaProperty::integer("limit", "Maximum files returned.")
-            .with_default(ValueLiteral::Integer(500))
-            .with_bounds(1, 5000),
+            .with_default(ValueLiteral::Integer(100))
+            .with_bounds(1, 500),
     ],
     &[],
 );
@@ -1295,7 +1313,7 @@ static TOOLS: &[ToolSpec] = &[
         name: "status",
         description: "Inspect CodeStory readiness for the requested repository when diagnostics are needed.",
         input_schema: STATUS_INPUT_SCHEMA,
-        output_schema: Some(SchemaSpec::Object(GENERIC_OBJECT_SCHEMA)),
+        output_schema: Some(SchemaSpec::Object(STATUS_OUTPUT_SCHEMA)),
         safety: SafetyMetadata::observational(),
     },
     ToolSpec {

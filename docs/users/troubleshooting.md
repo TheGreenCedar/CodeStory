@@ -18,7 +18,7 @@ CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#
 | Repo map stale | Retry `ground`; CodeStory refreshes the map automatically | `ground` returns current files and symbols |
 | Broad search preparing | Retry the same `packet`, `search`, or `context` call after `retry_after_ms` | The requested tool returns cited evidence |
 | MCP down, need handoff | Reload/fix host MCP; CLI can collect a debug transcript only | `codestory://status` becomes visible in the agent host |
-| Managed runtime failed | Use `codestory://status` or CLI diagnostics only after automatic retries stop converging | The requested tool returns `ready` instead of `needs_environment` or `unavailable` |
+| Managed runtime failed | Use `codestory://status` or CLI diagnostics only after automatic retries stop converging | The requested tool returns `ready` instead of `unavailable` |
 
 ## Decision tree
 
@@ -29,7 +29,6 @@ flowchart TD
   result -->|preparing or updating| retry[Wait for retry_after_ms]
   retry --> start
   result -->|working_locally| local[Use local navigation and retry broad search later]
-  result -->|needs_environment| host[Follow the one plain-language host requirement]
   result -->|unavailable| fallback[Use source inspection and report the gap]
   start -->|tool missing| mcp[Reload the plugin host]
 ```
@@ -137,7 +136,7 @@ Symptoms: `packet`, `search`, or `context` not allowed; retrieval mode not
 
 **Agent:** Retry the same `packet`, `search`, or `context` request after the
 returned delay. Use local graph tools while the state is `working_locally`.
-If the result becomes `needs_environment`, report its single host requirement
+If the result becomes `unavailable`, continue with focused source inspection
 without exposing internal processes or services. Do not treat an unavailable
 or partial result as proof. See [Trust and readiness](trust-and-readiness.md#proof-vs-hint).
 
@@ -160,10 +159,9 @@ Apple Silicon uses managed Metal acceleration automatically. Retry the original
 broad-search tool while CodeStory reports `preparing`; local navigation remains
 available in the meantime.
 
-Intel Macs support local navigation by default. If broad search needs an
-explicit CPU or trusted external configuration, CodeStory reports that as one
-plain `needs_environment` requirement. The agent should relay that requirement
-without process, service, model, or port details.
+Intel Macs support local navigation by default. When broad search cannot use a
+supported local or trusted external backend, the tool returns `unavailable` and
+the agent continues with focused source inspection.
 
 Maintainer-only acceleration evidence and recovery commands are in
 [retrieval operations](../ops/retrieval-sidecars.md).

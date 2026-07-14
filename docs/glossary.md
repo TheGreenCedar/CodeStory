@@ -9,7 +9,7 @@ concept has one canonical owner page; other docs link here instead of redefining
 - **[agent packet/search readiness](#agent-packetsearch-readiness)** -- Sidecars are healthy and [retrieval mode](#retrieval-mode) is `full`; required for trustworthy `packet`, `search`, and query-based `context`. See [Troubleshooting](users/troubleshooting.md#packetsearch-degraded-or-blocked).
 - **[retrieval mode](#retrieval-mode)** -- Sidecar status contract reported in `codestory://status`. Only `full` serves agent packet/search.
 - **[grounding](#grounding)** -- Indexed context returned for a question or command, with source ties. The agent's starting map for the checkout.
-- **[allowed surfaces](#allowed-surfaces)** -- Per-tool permission bits in `codestory://status`. The agent must check each surface before calling it.
+- **[allowed surfaces](#allowed-surfaces)** -- Diagnostic per-tool permission bits in `codestory://status`. Normal tool calls enforce them internally.
 
 ## Index and graph
 
@@ -55,14 +55,14 @@ broad `context` output as evidence.
 
 **Good:** A task packet cites multiple existing files; retrieval mode is `full`.
 
-**Degraded:** Packet returns text but retrieval mode is not `full` -- a hint only.
+**Partial:** A returned packet reports partial sufficiency or unresolved citations -- a hint only.
 
 **Blocked:** `packet`, `search`, or `context` are not allowed; use local navigation instead.
 
 ### retrieval mode
 
-Reported by sidecar status and echoed in `codestory://status`. Values other than
-`full` mean packet/search output is navigation help only.
+Reported by managed retrieval status and echoed in `codestory://status`. Values
+other than `full` block packet/search evidence; local navigation remains usable.
 
 ### semantic ready
 

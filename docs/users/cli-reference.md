@@ -24,7 +24,7 @@ Windows: `.\target\release\codestory-cli.exe`.
 | Repair local graph | `codestory-cli ready --goal local --repair --project <repo> --format json` |
 | Repair packet/search | `codestory-cli ready --goal agent --repair --project <repo> --format json` |
 | Health summary | `codestory-cli doctor --project <repo>` |
-| Sidecar status | `codestory-cli retrieval status --project <repo> --format json` |
+| Managed search status | `codestory-cli retrieval status --project <repo> --format json` |
 | Direct stdio MCP (debug) | `codestory-cli serve --project <repo> --stdio --refresh none` |
 
 Preflight exposes `safe_surfaces`, `blocked_surfaces`, and `repair_command`.
@@ -126,9 +126,9 @@ untrusted repositories. Put `cache_dir` in user home `.codestory.toml` or pass
 | Readiness | `agent preflight --format json` | `codestory://status` when MCP is live |
 | Broad evidence | `retrieval status --format json` | `packet` or `search` only after `full` mode |
 
-## Sidecar setup
+## Managed search internals
 
-Product sidecar setup: [Retrieval sidecars ops](../ops/retrieval-sidecars.md).
+Maintainer-only lifecycle details: [retrieval operations](../ops/retrieval-sidecars.md).
 
 ## Environment overrides
 

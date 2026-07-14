@@ -21,6 +21,11 @@
   prepare their dependencies and return one same-tool retry while work is in
   progress. Diagnostics remain available when automatic recovery cannot
   converge.
+- Plugin sessions now expose the stable CodeStory tool catalog before managed
+  installation finishes, route directly from task intent, and inject only one
+  bounded session contract. Status is observational and compact; tool text
+  remains useful on hosts that do not render structured results, while large
+  file, symbol, search, and impact payloads are capped with explicit counts.
 
 ## 0.15.0
 

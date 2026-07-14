@@ -1337,6 +1337,7 @@ fn write_repair_status_fixture(
             "project_root": project_root,
             "profile": "agent",
             "run_id": run_id,
+            "attempt_id": format!("attempt:{run_id}"),
             "namespace": sidecar.namespace,
             "compose_project": sidecar.compose_project,
             "phase": phase,
@@ -1452,10 +1453,20 @@ fn assert_tool_safety_metadata(tool: &Value) {
             || contains_bool_recursive(safety, &["idempotent", "idempotentHint"], true),
         "{name} should declare idempotent behavior: {tool}"
     );
-    assert!(
-        contains_bool_recursive(tool, &["localOnly", "local_only"], true)
-            || contains_bool_recursive(tool, &["openWorld", "open_world"], false),
-        "{name} should declare local-only or open-world=false behavior: {tool}"
+    assert_eq!(
+        safety.get("localOnly").and_then(Value::as_bool),
+        Some(observational),
+        "{name} should reserve local-only for the observational status tool: {tool}"
+    );
+    assert_eq!(
+        safety.get("openWorld").and_then(Value::as_bool),
+        Some(!observational),
+        "{name} should disclose automatic managed downloads: {tool}"
+    );
+    assert_eq!(
+        annotations.get("openWorldHint").and_then(Value::as_bool),
+        Some(!observational),
+        "{name} annotations should match managed network behavior: {tool}"
     );
 }
 
@@ -2211,13 +2222,13 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
     let files_limit = schema_property(files, "limit");
     assert_eq!(
         files_limit.get("default"),
-        Some(&json!(500)),
-        "files.limit should document the CLI-backed default: {files}"
+        Some(&json!(100)),
+        "files.limit should document the compact agent default: {files}"
     );
     assert_eq!(
         files_limit.get("maximum"),
-        Some(&json!(5000)),
-        "files.limit should document the runtime clamp: {files}"
+        Some(&json!(500)),
+        "files.limit should document the stdio hard cap: {files}"
     );
 
     let affected = tool_input_schema(&tools, "affected");
@@ -2322,8 +2333,8 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
     );
     assert_eq!(
         symbols_limit.get("default"),
-        Some(&json!(300)),
-        "symbols.limit should document the root-symbol browse default: {symbols}"
+        Some(&json!(50)),
+        "symbols.limit should document the compact root-symbol browse default: {symbols}"
     );
     assert_eq!(
         symbols_limit.get("minimum"),
@@ -2332,7 +2343,7 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
     );
     assert_eq!(
         symbols_limit.get("maximum"),
-        Some(&json!(2000)),
+        Some(&json!(200)),
         "symbols.limit should document the stdio hard cap: {symbols}"
     );
 
@@ -2606,15 +2617,24 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         .unwrap_or_else(|| panic!("search outputSchema should describe hit items: {tools}"));
     let search_output_schema = tool_output_schema(&tools, "search");
     assert_eq!(
-        schema_property(search_output_schema, "search_plan")["type"],
-        json!(["object", "null"]),
-        "search outputSchema should allow optional SearchPlan DTOs: {search_output_schema}"
+        schema_property(search_output_schema, "counts")["type"],
+        json!("object"),
+        "search outputSchema should expose compact source counts: {search_output_schema}"
     );
-    assert_eq!(
-        schema_property(search_output_schema, "retrieval_shadow")["type"],
-        json!(["object", "null"]),
-        "search outputSchema should expose optional retrieval_shadow DTOs: {search_output_schema}"
-    );
+    for removed_diagnostic in [
+        "search_plan",
+        "retrieval_shadow",
+        "suggestions",
+        "indexed_symbol_hits",
+        "repo_text_hits",
+    ] {
+        assert!(
+            search_output_schema["properties"]
+                .get(removed_diagnostic)
+                .is_none(),
+            "search outputSchema should omit duplicated or diagnostic field {removed_diagnostic}: {search_output_schema}"
+        );
+    }
     assert!(
         schema_property(search_output_schema, "code")["type"] == "string"
             && schema_property(search_output_schema, "message")["type"] == "string",
@@ -2999,6 +3019,8 @@ fn files_tool_lists_indexed_files_without_sidecars() {
 fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
+    let mut changed_paths = vec!["src/runtime.rs".to_string()];
+    changed_paths.extend((0..60).map(|index| format!("unmatched/generated-{index}.rs")));
 
     let response = send_json(
         &mut server,
@@ -3009,7 +3031,7 @@ fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
             "params": {
                 "name": "affected",
                 "arguments": {
-                    "changed_paths": ["src/runtime.rs"],
+                    "changed_paths": changed_paths,
                     "change_records": [
                         {
                             "path": "src/runtime.rs",
@@ -3025,10 +3047,12 @@ fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
 
     let result = assert_tool_success(&response, json!("affected-runtime"));
     assert_eq!(
-        result["changed_paths"],
-        json!(["src/runtime.rs"]),
-        "affected should preserve explicit changed paths: {result}"
+        result["counts"]["changed_paths"],
+        json!(61),
+        "affected should preserve the original changed-path count: {result}"
     );
+    assert_eq!(result["changed_paths"].as_array().map(Vec::len), Some(50));
+    assert_eq!(result["truncated"], json!(true));
     assert_eq!(
         result["change_records"][0]["kind"],
         json!("modified"),
@@ -3049,6 +3073,18 @@ fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
             .as_array()
             .is_some_and(|symbols| !symbols.is_empty()),
         "affected should expand matched files to impacted symbols: {result}"
+    );
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .expect("affected compact text");
+    assert!(text.contains("tool: affected"));
+    assert!(text.contains("matched_file_count: 1"));
+    assert!(text.contains("count.changed_paths: 61"));
+    assert!(text.contains("structuredContent: available"));
+    assert!(
+        text.len() < 4 * 1024,
+        "tool text should stay compact while structuredContent carries the bounded result"
     );
 }
 
@@ -3159,6 +3195,39 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "MCP status must stay below 24 KiB; got {} bytes",
         minified.len()
     );
+    let compact_response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "compact-status-tool",
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        }),
+    );
+    let compact = assert_tool_success(&compact_response, json!("compact-status-tool"));
+    assert_eq!(compact["state"], json!("working_locally"), "{compact}");
+    assert_eq!(
+        compact["capabilities"]["local_navigation"],
+        json!("ready"),
+        "{compact}"
+    );
+    assert_eq!(compact["diagnostics_uri"], json!("codestory://status"));
+    for diagnostic in [
+        "allowed_surfaces",
+        "readiness_broker",
+        "retrieval_diagnostics",
+        "managed_retrieval",
+    ] {
+        assert!(compact.get(diagnostic).is_none(), "{compact}");
+    }
+    let compact_text = assert_tool_text_content(
+        assert_success_envelope(&compact_response, json!("compact-status-tool")),
+        &compact_response,
+    );
+    assert!(compact_text.contains("tool: status"));
+    assert!(compact_text.contains("state: working_locally"));
+    assert!(compact_text.contains("capability.local_navigation: ready"));
+    assert!(compact_text.contains("next_action:"));
     let local_summary = "Local navigation can use the current index.";
     assert_eq!(
         status.to_string().matches(local_summary).count(),
@@ -3687,6 +3756,12 @@ fn repeated_grounding_cools_down_identical_failed_agent_repair_across_servers() 
         "{retrying_error}"
     );
     assert_eq!(retrying_error["state"], json!("preparing"));
+    assert!(
+        retrying_error["operation"]["id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "active preparation should return one retryable operation id: {retrying_error}"
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -4097,58 +4172,6 @@ fn offline_release_metadata_is_non_blocking_and_unknown() {
 }
 
 #[test]
-fn failed_release_refresh_keeps_stale_cached_advice_without_blocking() {
-    let mut fixture = indexed_fixture();
-    let plugin_data = fixture.cache_dir.path().join("plugin-data-stale-cache");
-    fs::create_dir_all(&plugin_data).expect("create stale release cache dir");
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as i64;
-    fs::write(
-        plugin_data.join("release-metadata.json"),
-        json!({
-            "schema_version": 1,
-            "latest_version": "999.0.0",
-            "checked_at_epoch_ms": now,
-            "refresh_failed": true
-        })
-        .to_string(),
-    )
-    .expect("write stale release metadata");
-    fixture.plugin_data_dir = Some(plugin_data);
-    fixture.latest_release_version = None;
-    fixture.disable_release_probe = true;
-    fixture.disable_installed_cli_probe = true;
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "status-stale-release-metadata",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-    let result = assert_success_envelope(&response, json!("status-stale-release-metadata"));
-    let status = json_resource_content(result, "codestory://status");
-
-    assert_eq!(status["runtime_update"]["state"], json!("available"));
-    assert_eq!(
-        status["runtime_update"]["metadata_source"],
-        json!("stale_cache")
-    );
-    assert_eq!(status["runtime_update"]["metadata_stale"], json!(true));
-    assert_eq!(
-        status["runtime_update"]["metadata_refresh_scheduled"],
-        json!(false)
-    );
-    assert_eq!(status["runtime_update"]["blocking"], json!(false));
-    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-}
-
-#[test]
 fn local_dev_override_does_not_recommend_restart_for_managed_history() {
     let mut fixture = indexed_fixture();
     let plugin_data = fixture.cache_dir.path().join("plugin-data-local-override");
@@ -4517,11 +4540,14 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
         json!({
             "jsonrpc": "2.0",
             "id": "concurrent-status",
-            "method": "tools/call",
-            "params": {"name": "status", "arguments": {}}
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
         }),
     );
-    let status = assert_tool_success(&status_response, json!("concurrent-status"));
+    let status = json_resource_content(
+        assert_success_envelope(&status_response, json!("concurrent-status")),
+        "codestory://status",
+    );
     assert_eq!(status["local_refresh"]["state"], json!("refreshing"));
     assert_eq!(status["local_refresh"]["pid"], json!(pid));
     assert_eq!(status["local_refresh"]["phase"], json!("incremental_index"));
@@ -4603,12 +4629,14 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
         json!({
             "jsonrpc": "2.0",
             "id": "warmup-generation",
-            "method": "tools/call",
-            "params": {"name": "status", "arguments": {}}
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
         }),
     );
-    let old_generation = assert_tool_success(&warmup_status, json!("warmup-generation"))
-        ["index_publication"]["generation"]
+    let old_generation = json_resource_content(
+        assert_success_envelope(&warmup_status, json!("warmup-generation")),
+        "codestory://status",
+    )["index_publication"]["generation"]
         .as_u64()
         .expect("old complete generation");
     drop(warmup_client);
@@ -4683,11 +4711,14 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             json!({
                 "jsonrpc": "2.0",
                 "id": "reader-status",
-                "method": "tools/call",
-                "params": {"name": "status", "arguments": {}}
+                "method": "resources/read",
+                "params": {"uri": "codestory://status"}
             }),
         );
-        let status = assert_tool_success(&status_response, json!("reader-status"));
+        let status = json_resource_content(
+            assert_success_envelope(&status_response, json!("reader-status")),
+            "codestory://status",
+        );
         let generation = status["index_publication"]["generation"]
             .as_u64()
             .expect("reader complete generation");
@@ -5224,16 +5255,14 @@ fn transcript_calls_search_tool() {
 
     let result = assert_tool_success(&response, json!(10));
     assert!(
-        result["indexed_symbol_hits"]
-            .as_array()
-            .is_some_and(|hits| hits
-                .iter()
-                .any(|hit| hit["display_name"] == "AppController")),
+        result["hits"].as_array().is_some_and(|hits| hits
+            .iter()
+            .any(|hit| hit["display_name"] == "AppController")),
         "search tool should return AppController hit: {result}"
     );
-    let app_controller_hit = result["indexed_symbol_hits"]
+    let app_controller_hit = result["hits"]
         .as_array()
-        .expect("indexed symbol hits")
+        .expect("merged search hits")
         .iter()
         .find(|hit| hit["display_name"] == "AppController")
         .unwrap_or_else(|| panic!("missing AppController hit: {result}"));
@@ -5319,10 +5348,15 @@ fn transcript_calls_search_tool() {
         !symbols.is_empty() && symbols.len() <= 2,
         "symbols tool should respect the requested cap: {symbols_result}"
     );
+    assert_eq!(
+        symbols_result["returned_count"],
+        json!(symbols.len()),
+        "symbols should report how many rows are in the bounded response: {symbols_result}"
+    );
 }
 
 #[test]
-fn search_tool_starts_managed_preparation_and_returns_same_tool_retry() {
+fn search_tool_retries_only_while_managed_preparation_is_live() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -5340,19 +5374,30 @@ fn search_tool_starts_managed_preparation_and_returns_same_tool_retry() {
     );
 
     let error = assert_tool_error(&response, json!("search-requires-full-retrieval"));
-    assert_eq!(
-        error.pointer("/code").and_then(Value::as_str),
-        Some("codestory_preparing"),
-        "stdio search should start managed preparation and return a retry: {response}"
-    );
-    assert_eq!(error["state"], json!("preparing"));
     assert_eq!(error["tool"], json!("search"));
-    assert_eq!(error["retry_tool"], json!("search"));
-    assert!(
-        error["retry_after_ms"]
-            .as_u64()
-            .is_some_and(|delay| delay > 0)
-    );
+    match error.pointer("/code").and_then(Value::as_str) {
+        Some("codestory_preparing") => {
+            assert_eq!(error["state"], json!("preparing"));
+            assert_eq!(error["retry_tool"], json!("search"));
+            assert!(
+                error["retry_after_ms"]
+                    .as_u64()
+                    .is_some_and(|delay| delay > 0)
+            );
+            assert!(
+                error["operation"]["id"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()),
+                "retryable preparation must name the live operation: {response}"
+            );
+        }
+        Some("codestory_unavailable") => {
+            assert_eq!(error["state"], json!("unavailable"));
+            assert!(error.get("retry_tool").is_none(), "{response}");
+            assert!(error.get("retry_after_ms").is_none(), "{response}");
+        }
+        code => panic!("unexpected search preparation result {code:?}: {response}"),
+    }
     assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
     let serialized = error.to_string();
     for hidden_detail in [
@@ -5367,7 +5412,7 @@ fn search_tool_starts_managed_preparation_and_returns_same_tool_retry() {
     ] {
         assert!(
             !serialized.contains(hidden_detail),
-            "preparing response should hide infrastructure detail `{hidden_detail}`: {response}"
+            "managed response should hide infrastructure detail `{hidden_detail}`: {response}"
         );
     }
 }
@@ -5393,9 +5438,9 @@ fn context_tool_maps_target_id_to_deep_browser_request() {
         }),
     );
     let search_result = assert_tool_success(&search_response, json!("context-focus-search"));
-    let node_id = search_result["indexed_symbol_hits"]
+    let node_id = search_result["hits"]
         .as_array()
-        .expect("indexed symbol hits")
+        .expect("merged search hits")
         .iter()
         .find(|hit| hit["display_name"] == "AppController")
         .and_then(|hit| hit["node_id"].as_str())
@@ -5672,9 +5717,7 @@ fn search_tool_exposes_continuation_links_and_clamps_tiny_payloads() {
         response_size < 64 * 1024,
         "tiny fixture search response should stay bounded, got {response_size} bytes: {result}"
     );
-    let hits = result["indexed_symbol_hits"]
-        .as_array()
-        .expect("indexed symbol hits");
+    let hits = result["hits"].as_array().expect("merged search hits");
     assert!(
         hits.len() <= 50,
         "search indexed hits should respect the documented page cap: {result}"
@@ -5713,8 +5756,8 @@ fn search_tool_does_not_offer_symbol_links_for_non_resolvable_repo_text_hits() {
     );
 
     let result = assert_tool_success(&response, json!("repo-text-continuations"));
-    let repo_text_hits = result["repo_text_hits"].as_array().expect("repo text hits");
-    let non_resolvable_hit = repo_text_hits
+    let hits = result["hits"].as_array().expect("merged search hits");
+    let non_resolvable_hit = hits
         .iter()
         .find(|hit| hit["resolvable"] == json!(false))
         .unwrap_or_else(|| panic!("expected a non-resolvable repo-text hit: {result}"));

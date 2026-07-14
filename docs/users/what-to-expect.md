@@ -1,7 +1,7 @@
 # What to expect in your repo
 
 CodeStory builds a **local map** of your checkout — files, symbols, imports,
-call paths, and bounded answer packets when sidecars are ready. Quality depends
+call paths, and bounded answer packets when broad search is ready. Quality depends
 on your **language mix**, **repo size**, and **readiness lane**, not on a single
 global score.
 
@@ -28,8 +28,8 @@ what each claim does *not* mean:
 
 ## Repo size and freshness
 
-- **First index** on a large checkout can take minutes; hooks and status report
-  progress and blocked surfaces.
+- **First index** on a large checkout can take minutes; the agent retries the
+  intended CodeStory call while preparation runs.
 - **Incremental refresh** after small edits is usually fast; stale local
   navigation is a repair problem, not a prompt problem.
 - **Very large or unusual layouts** (generated trees, vendored giants) may index
@@ -37,9 +37,9 @@ what each claim does *not* mean:
 
 ## When output looks weak
 
-Degraded or partial packet/search output is a **lead to inspect**, not proof
-that the answer is complete. Local graph tools may still be reliable while broad
-search is blocked.
+Blocked or degraded broad-search infrastructure returns no packet evidence. A
+returned packet with partial sufficiency is a **lead to inspect**, not proof
+that the answer is complete. Local graph tools may still be reliable meanwhile.
 
 Plain-language trust boundaries and good vs blocked sessions:
 [Trust and readiness](trust-and-readiness.md).
