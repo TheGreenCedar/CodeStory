@@ -4,39 +4,39 @@
 
 ### Highlights
 
-- CodeStory now gives agents one managed grounding path from project selection
-  through indexing, retrieval, packet construction, and search. Fresh plugin
-  sessions can open diagnostics immediately while the version-matched CLI is
-  provisioned in the background, then activate stale projects through normal
-  grounding without a separate repair workflow.
-- Retrieval publication is atomic and fail-closed. Readers stay on one complete
-  generation, source changes during indexing cannot publish stale graph data,
-  and packet or search remains closed when publications, sidecars, endpoints,
-  process identity, or required accelerator proof are stale or ambiguous.
-- Project, workspace, artifact, runtime, lease, and process identities are now
-  kept separate throughout managed state. Plugin requests select their project
-  explicitly, case-distinct Unix repositories no longer collide, and switching
-  repositories cannot inherit another project's cache, endpoint, or readiness
-  evidence.
-- Grounding quality is more precise for request flows, configuration files, and
-  compact executable paths. Resolved graph evidence no longer remains blocked
-  by diagnostic file hits, while genuine source misses, unresolved symbols, and
-  invalid paths still prevent a packet from claiming sufficient coverage.
+- Agents now have one managed path from opening a project through indexing,
+  packet construction, and search. Fresh plugin sessions can show diagnostics
+  while the matching CLI is installed, then bring stale projects current
+  through normal grounding instead of a separate repair command.
+- Index and retrieval publication is atomic. Readers stay on one complete
+  generation, failed or interrupted refreshes leave the previous generation
+  usable, and source changes during a refresh cannot publish stale results.
+- Packet, search, and context now fail closed when their publication, sidecars,
+  embedding endpoint, process identity, or required accelerator proof is stale
+  or ambiguous. Local graph navigation remains available when only deep search
+  is warming or degraded.
+- Every plugin request selects its project explicitly. Switching repositories
+  cannot inherit another project's cache, endpoint, operation, or readiness
+  evidence, including on case-sensitive Unix filesystems.
+- Grounding is more precise for request flows, configuration files, framework
+  routes, and compact executable paths. Diagnostic file hits no longer hide
+  resolved graph evidence, while real source gaps still prevent an unsupported
+  sufficiency claim.
 
 ### macOS
 
 - macOS 15 and newer is a supported native target. Apple Silicon uses the
-  checksum-pinned managed native embedding server with Metal; CodeStory verifies
-  the selected endpoint, launch identity, runtime initialization, positive
-  layer offload, and a timed embedding request before opening agent retrieval.
+  checksum-pinned managed embedding server with Metal. CodeStory verifies the
+  selected endpoint, process identity, GPU offload, and a timed embedding
+  request before opening agent retrieval.
 - Intel Macs support the native CLI, managed plugin, local graph, and grounding.
-  Semantic retrieval requires either explicitly allowed CPU operation or a
-  trusted external embedding endpoint; Intel status and evidence never claim
-  Metal acceleration.
-- Managed macOS readiness follows the selected dynamic Agent endpoint instead
-  of assuming port 8080, reuses one matching live native process across project
-  workspaces, and blocks packet and search with repair guidance if that endpoint
-  or its verified accelerator identity disappears.
+  Semantic retrieval requires explicit CPU/external policy; that policy may
+  select a trusted external embedding endpoint. Intel status and evidence never
+  claim Metal acceleration.
+- Managed readiness follows the selected dynamic endpoint, reuses one matching
+  live embedding process when projects switch, and blocks packet and search
+  with repair guidance if the endpoint or verified accelerator identity
+  disappears or changes.
 - Direct-download Mac artifacts are release-ready only after the exact arm64 and
   x64 binaries pass Developer ID signing, notarization, quarantined extraction,
   Gatekeeper, and native execution checks. Source or unsigned package checks do
@@ -44,87 +44,42 @@
 
 ### Reliability and operations
 
-- Managed state moves to project-identity schema 3 and retrieval manifests to
-  schema 21. Existing schema-19 and schema-20 retrieval rows migrate in place;
-  legacy schema-2 sidecar and broker state remains available for bounded
-  inventory and cleanup but is not trusted for runtime reuse.
 - The legacy ONNX backend and its runtime, installer, setup, configuration, and
-  environment selections have been removed. Upgrade automation must remove
-  those selections and use managed llama.cpp or a trusted external embedding
-  endpoint; stale ONNX settings now fail explicitly instead of being ignored.
-- Incremental indexing verifies source hashes even when modification times are
-  unchanged, and parser-backed output is published only when the indexed bytes
-  still match the file. Failed, cancelled, or concurrent refreshes preserve the
-  previous usable generation.
-- SQLite lexical searches now validate immutable generation metadata on the hot
-  path and reuse stored normalized FTS text. Full corpus row-equivalence checks
-  remain at build, publication, readiness, and explicit health boundaries.
-- MCP resource reads now reject malformed or unknown URIs before selecting,
-  refreshing, or repairing a project, leaving runtime and status state untouched.
-- Retrieval queries, numeric candidate resolution, file-role reads, and final
-  packet/search output now stay pinned to one core and sidecar publication.
-  Concurrent publication drift returns `cache_busy` and retries once instead of
-  resolving an older candidate ID against a newer graph.
-- Express, Fastify, and FastAPI route extraction now builds one ordered
-  binding timeline per module. Route queries reuse that timeline instead of
-  rescanning prior statements, and FastAPI imports are resolved from parsed
-  nodes so multiline aliases, comments, and later shadowing remain accurate.
-- Core snapshot promotion now records durable prepared and committed identities.
-  A committed generation cannot be rolled back by a retained cleanup backup,
-  while interrupted and legacy recovery validates database identities before
-  replacing the live store. Recovery accepts the incomplete-run schema sentinel
-  only for a previous live database or backup carrying its matching marker;
-  staged candidates and committed generations must remain complete.
-- Native process reuse and cleanup now bind executable filesystem identity,
-  arguments, endpoint, and one shared cross-platform process start identity.
-  macOS and Windows process inspection is bounded, dead, reused, or unverified
-  PIDs remain fail-closed, and cleanup stays limited to resources carrying
-  CodeStory ownership proof.
-- Sidecar cache roots and runtime environment defaults are captured once per
-  process and passed explicitly through test construction. Windows process
-  probes also reject completed processes using both exit time and exit code.
-- `affected` now reads Git name-status and untracked paths through NUL-delimited
-  byte protocols, preserves valid UTF-8 pathname whitespace, and returns
-  `unsupported_non_utf8_path` instead of lossy DTO text. Workspace-relative
-  path stripping now follows native filesystem identity and case rules.
-- `impact` and `test-map` now use one typed runtime workflow for symbol
-  resolution, caller traversal, affected projections, caps, unknowns, and next
-  actions. The CLI keeps the existing syntax and output while limiting itself
-  to request parsing and rendering.
-- Generation and packaged-proof deletion now stays relative to one pinned,
-  trusted directory handle. Unix cleanup uses no-follow descriptor traversal;
-  Windows rejects reparse traversal and deletes through the opened handle, so
-  an ancestor rename cannot redirect cleanup outside CodeStory-owned storage.
-- Agent port allocation now uses one normalized SQLite registry with unique
-  port rows and immediate transactions for allocation, renewal, pruning, and
-  ownership checks. The v0.15 compatibility bridge preserves and projects
-  locked v0.14 JSON state; malformed or conflicting evidence fails closed.
-- Managed installation and upgrade checks cover every shipped native platform,
-  including upgrade from a verified older CLI with that version retained as the
-  rollback. The Codex worktree setup dispatcher now owns one version-checked,
-  locked setup path for Windows, macOS, and Linux; the shell and PowerShell
-  entrypoints are thin compatibility adapters.
-- Windows packaged upgrade proof now seeds rollback with a native executable
-  fixture, preserving direct-process verification after batch CLI overrides
-  became unsupported.
-- The packaged plugin now launches the CodeStory CLI directly without a shell
-  and rejects Windows batch-file overrides. Managed CLI, model, and native
-  backend downloads enforce declared byte limits while streaming and remove
-  partial files after failure.
-- Dependency-resolving setup and proof commands use the committed Cargo lock,
-  and workflow policy rejects unlocked Cargo commands. Project-controlled
-  network endpoints remain disabled unless a trusted operator enables the
-  process-wide project-network opt-in.
-- Workflow policy now parses YAML structure with one exact-pinned dependency.
-  Trigger, permission, job, matrix, secret, dependency, condition, and named
-  step checks no longer accept comments or unrelated command text as evidence.
-- Release proof is staged by maturity and changed surface. Draft changes use
-  focused source checks; exact-head, platform, protected hardware, signing, and
-  installation proof run only at their explicit promotion boundaries. The
-  evidence gate reconciles packet selectors with their recorded transport modes
-  before enforcing exact raw-row coverage, and coordinator re-evaluation binds
-  retained evidence to the selected candidate artifact even when the dispatch
-  workflow itself runs from a different branch.
+  environment selections have been removed. Use managed llama.cpp under the
+  host's configured accelerator/CPU policy, or a trusted external endpoint
+  under explicit CPU/external policy. Stale ONNX settings now fail with
+  migration guidance instead of being silently ignored.
+- Existing retrieval rows migrate in place. Ambiguous legacy sidecar or broker
+  state is retained for bounded inventory and cleanup but is not reused; deep
+  search may require a managed repair or rebuild after upgrade.
+- Incremental indexing verifies file content rather than trusting modification
+  times alone. Retrieval reads remain pinned to one graph and sidecar
+  publication, and a concurrent publication change returns a bounded retry
+  instead of mixing evidence from different generations.
+- Lexical search avoids full-corpus validation on every query, and framework
+  route discovery handles multiline imports, aliases, comments, and shadowing
+  without repeatedly rescanning a module.
+- Status, doctor, and malformed MCP resource reads remain observational: they
+  do not refresh projects, start repair, or mutate sidecar state. Normal repair
+  guidance stays in the managed MCP flow, with CLI commands retained for
+  operator diagnostics.
+- Native processes, ports, generations, downloads, and cleanup are tied to
+  verified CodeStory ownership. Dead or reused processes, conflicting legacy
+  state, unsafe paths, oversized downloads, and ambiguous cleanup all fail
+  closed instead of being guessed through.
+- The packaged plugin launches the native CodeStory CLI without a shell. On
+  Windows, `CODESTORY_CLI` must name a native `.exe`; the supported `codex.cmd`
+  host shim is unchanged. Cross-platform worktree setup uses one
+  version-checked path on Windows, macOS, and Linux.
+- Linux x64 requires glibc 2.31 or newer. Both Linux architectures receive
+  packaged execution checks; accelerator and full-retrieval claims still
+  require live sidecar evidence for the selected host.
+- Repository-controlled network endpoints remain disabled by default. Setting
+  `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` is an explicit trust decision that
+  permits the repository to choose summary and embedding egress endpoints.
+- Release proof is staged by maturity: focused checks run during development,
+  while exact-head platform, protected hardware, signing, installation, and
+  live-runtime evidence run at their promotion or publication boundaries.
 
 ### Release boundary
 
