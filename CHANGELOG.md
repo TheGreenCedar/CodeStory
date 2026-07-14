@@ -8,6 +8,22 @@
   changelog before the existing platform proof-boundary appendix. Publication
   fails when that version section is missing, duplicated, or empty instead of
   substituting an automatically generated pull-request list.
+- Added reproducible provisioning for the repository-scoped Linux
+  release-evidence runner. The runner uses a stable provisioned machine
+  identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64
+  sidecars, an exact real-repository drill, isolated proof state, and explicit
+  verification, recovery, unregister, and destruction paths. One checked-in
+  machine contract pins the Colima base image, Ubuntu package snapshot and
+  versions, runtime tools, model, images, and drill. Colima host mounts are
+  disabled, validation source is copied into the guest, lifecycle cleanup is
+  ownership-scoped, and release evidence rejects stale identity attestations,
+  host-home visibility, or any unexpected host-backed mount. Checksum-verified
+  model bytes can stream over SSH from the normal CodeStory cache when the
+  pinned upstream download is unavailable. Lifecycle mutations now require the
+  exact runner to be offline and idle, treat GitHub API failures as failures,
+  and retain credentials and VM state until remote deletion is confirmed. The
+  evidence profile no longer becomes the host's active Docker context, and
+  lifecycle and workflow preflights reject competing containers in its VM.
 - Added a Windows-x64-only promoted proof scope so coordinator runs can produce
   the Vulkan package without starting Mac source, signing, notarization, or
   Metal jobs.
