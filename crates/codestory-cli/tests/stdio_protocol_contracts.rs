@@ -1366,15 +1366,32 @@ fn test_sidecar_runtime(
     project: &Path,
     run_id: &str,
 ) -> codestory_retrieval::SidecarRuntimeConfig {
-    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
-        Some(project),
-        codestory_retrieval::SidecarProfile::Agent,
-        Some(run_id),
+    test_sidecar_runtime_in_cache(
+        project,
+        run_id,
         &fixture
             .cache_dir
             .path()
             .join("test-state")
             .join("stdio-cache"),
+    )
+}
+
+fn test_sidecar_runtime_in_cache(
+    project: &Path,
+    run_id: &str,
+    cache_root: &Path,
+) -> codestory_retrieval::SidecarRuntimeConfig {
+    let defaults = codestory_retrieval::SidecarProcessDefaults::new(
+        cache_root.to_path_buf(),
+        codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+    );
+    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        Some(project),
+        codestory_retrieval::SidecarProfile::Agent,
+        Some(run_id),
+        &defaults,
+        &codestory_retrieval::SidecarRuntimeOverrides::default(),
     )
 }
 
@@ -4284,13 +4301,11 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
         &canonical_root,
         codestory_retrieval::DEFAULT_AGENT_RUN_ID,
     );
-    let mutable_cache_sidecar =
-        codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
-            Some(&canonical_root),
-            codestory_retrieval::SidecarProfile::Agent,
-            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-            &fixture.cache_dir.path().join("test-state").join("cache"),
-        );
+    let mutable_cache_sidecar = test_sidecar_runtime_in_cache(
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+        &fixture.cache_dir.path().join("test-state").join("cache"),
+    );
     assert_ne!(
         repair_sidecar.layout.state_file, mutable_cache_sidecar.layout.state_file,
         "the regression contract requires distinct retained and mutable cache roots"

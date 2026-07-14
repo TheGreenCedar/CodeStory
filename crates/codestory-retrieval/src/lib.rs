@@ -57,11 +57,10 @@ pub use config::{
     DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
     DEFAULT_QDRANT_HTTP_PORT, EmbeddingEndpointOrigin, EmbeddingRuntimeConfig,
     EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN, RetrievalRuntimeConfig, SidecarImagePins,
-    SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProfile, SidecarRuntimeConfig,
-    SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
+    SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProcessDefaults, SidecarProfile,
+    SidecarRuntimeConfig, SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
     default_sidecar_image_pins, embedding_server_launch_mode,
-    embedding_server_launch_mode_for_runtime, sidecar_runtime_auto, sidecar_runtime_for_project,
-    sidecar_runtime_for_project_with_run_id, user_cache_root,
+    embedding_server_launch_mode_for_runtime, sidecar_process_defaults, user_cache_root,
 };
 #[cfg(feature = "test-support")]
 pub use config::{

@@ -1,6 +1,6 @@
 use crate::config::{
     SidecarImagePins, SidecarLayout, SidecarProfile, SidecarRuntimeConfig,
-    default_sidecar_image_pins, sidecar_runtime_auto, sidecar_runtime_for_project,
+    default_sidecar_image_pins,
 };
 use crate::generation::{
     SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, manifest_has_current_sidecar_contract,
@@ -442,7 +442,10 @@ pub fn sidecar_down() -> Result<()> {
 }
 
 pub fn sidecar_down_for_project(project_root: &Path, profile: SidecarProfile) -> Result<()> {
-    sidecar_down_for_runtime(&sidecar_runtime_for_project(project_root, profile))
+    sidecar_down_for_runtime(&SidecarRuntimeConfig::for_project_profile(
+        Some(project_root),
+        profile,
+    ))
 }
 
 pub fn sidecar_down_for_runtime(runtime: &SidecarRuntimeConfig) -> Result<()> {
@@ -1129,7 +1132,7 @@ pub fn strict_sidecar_status_for_profile(
     strict_sidecar_status_for_runtime(
         project_root,
         storage_path,
-        sidecar_runtime_for_project(project_root, profile),
+        SidecarRuntimeConfig::for_project_profile(Some(project_root), profile),
     )
 }
 
@@ -1146,7 +1149,7 @@ fn sidecar_status_inner(
     storage_path: Option<&Path>,
     strict: bool,
 ) -> Result<RetrievalStatusReport> {
-    let runtime = sidecar_runtime_auto(project_root);
+    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
     sidecar_status_inner_with_runtime(project_root, storage_path, strict, runtime)
 }
 
@@ -1601,7 +1604,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: BTreeMap::new(),
-            ..SidecarRuntimeConfig::local()
+            ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         };
         runtime.embedding.endpoint = SidecarLayout::embed_base_url(runtime.embed_http_port);
         runtime.embedding.endpoint_origin = crate::config::EmbeddingEndpointOrigin::ManagedSidecar;
@@ -1857,7 +1860,7 @@ mod tests {
     fn sidecar_down_preserves_recorded_compose_state_when_docker_is_unavailable() {
         let _lock = crate::test_support::env_lock();
         let root = TempDir::new().expect("root");
-        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let runtime = crate::config::test_sidecar_runtime_in_cache(
             Some(root.path()),
             SidecarProfile::Agent,
             Some("docker-retry"),
@@ -1887,7 +1890,7 @@ mod tests {
     fn failed_bootstrap_cleanup_preserves_preexisting_compose_after_state_publication() {
         let _lock = crate::test_support::env_lock();
         let root = TempDir::new().expect("root");
-        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let runtime = crate::config::test_sidecar_runtime_in_cache(
             Some(root.path()),
             SidecarProfile::Agent,
             Some("preexisting-compose"),

@@ -21,6 +21,8 @@ const WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 #[cfg(windows)]
 const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
 #[cfg(windows)]
+const WINDOWS_STILL_ACTIVE: u32 = 259;
+#[cfg(windows)]
 const WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH: u64 = 504_911_232_000_000_000;
 #[cfg(windows)]
 const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
@@ -182,10 +184,11 @@ unsafe extern "system" {
         kernel_time: *mut WindowsFileTime,
         user_time: *mut WindowsFileTime,
     ) -> i32;
+    fn GetExitCodeProcess(process: RawHandle, exit_code: *mut u32) -> i32;
 }
 
 #[cfg(windows)]
-fn windows_process_creation_time(pid: u32) -> Result<Option<WindowsFileTime>> {
+fn windows_running_process_creation_time(pid: u32) -> Result<Option<WindowsFileTime>> {
     if pid == 0 {
         bail!("native embedding process pid must be greater than zero");
     }
@@ -215,12 +218,25 @@ fn windows_process_creation_time(pid: u32) -> Result<Option<WindowsFileTime>> {
         return Err(io::Error::last_os_error())
             .with_context(|| format!("query native embedding start identity for pid {pid}"));
     }
+    let mut exit_code = 0_u32;
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit_code) } == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("query native embedding exit code for pid {pid}"));
+    }
+    if !windows_process_is_running(&exit_time, exit_code) {
+        return Ok(None);
+    }
     Ok(Some(creation_time))
 }
 
 #[cfg(windows)]
 fn windows_filetime_ticks(filetime: &WindowsFileTime) -> u64 {
     (u64::from(filetime.high_date_time) << 32) | u64::from(filetime.low_date_time)
+}
+
+#[cfg(windows)]
+fn windows_process_is_running(exit_time: &WindowsFileTime, exit_code: u32) -> bool {
+    windows_filetime_ticks(exit_time) == 0 && exit_code == WINDOWS_STILL_ACTIVE
 }
 
 #[cfg(windows)]
@@ -245,7 +261,7 @@ fn windows_epoch_ms_from_filetime(filetime: &WindowsFileTime) -> Result<i64> {
 
 #[cfg(windows)]
 pub(crate) fn process_started_at_epoch_ms(pid: u32) -> Result<Option<i64>> {
-    windows_process_creation_time(pid)?
+    windows_running_process_creation_time(pid)?
         .as_ref()
         .map(windows_epoch_ms_from_filetime)
         .transpose()
@@ -279,7 +295,7 @@ fn process_started_at_epoch_ms_from_lstart(output: &[u8]) -> Option<i64> {
 
 #[cfg(windows)]
 fn probe_process_start_identity_platform(pid: u32) -> ProcessStartProbe {
-    match windows_process_creation_time(pid) {
+    match windows_running_process_creation_time(pid) {
         Ok(Some(creation_time)) => match windows_datetime_ticks_from_filetime(&creation_time) {
             Ok(ticks) => ProcessStartProbe::Running {
                 start_identity: format!("windows:{ticks}"),
@@ -483,6 +499,48 @@ mod tests {
             DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH
         );
         assert_eq!(windows_epoch_ms_from_filetime(&unix_epoch)?, 0);
+        assert!(windows_process_is_running(
+            &WindowsFileTime::default(),
+            WINDOWS_STILL_ACTIVE
+        ));
+        assert!(!windows_process_is_running(
+            &WindowsFileTime {
+                low_date_time: 1,
+                high_date_time: 0,
+            },
+            WINDOWS_STILL_ACTIVE
+        ));
+        assert!(!windows_process_is_running(&WindowsFileTime::default(), 0));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_start_probe_rejects_exited_child() -> Result<()> {
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .context("spawn Windows process identity fixture")?;
+        let pid = child.id();
+        let result = match probe_process_start_identity(pid) {
+            ProcessStartProbe::Running { start_identity }
+                if start_identity.starts_with("windows:") =>
+            {
+                Ok(())
+            }
+            probe => Err(anyhow::anyhow!(
+                "live Windows child did not expose a process start identity: {probe:?}"
+            )),
+        };
+
+        let _ = child.kill();
+        let _ = child.wait();
+        result?;
+        assert_eq!(
+            probe_process_start_identity(pid),
+            ProcessStartProbe::NotRunning
+        );
         Ok(())
     }
 }

@@ -2719,7 +2719,7 @@ offloaded 13/13 layers to GPU\n";
             "starting native llama.cpp embedding server: current\noffloaded 13/13 layers to GPU\n",
         )
         .expect("owner log");
-        let mut runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let mut runtime = crate::config::test_sidecar_runtime_in_cache(
             Some(project.path()),
             SidecarProfile::Agent,
             Some("shared-agent"),
@@ -2770,7 +2770,7 @@ offloaded 13/13 layers to GPU\n";
         );
         assert_eq!(runtime.ownership().ports.embed_http, reused_embed_port);
 
-        let warm = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let warm = crate::config::test_sidecar_runtime_in_cache(
             Some(project.path()),
             SidecarProfile::Agent,
             Some("shared-agent"),
@@ -2781,7 +2781,7 @@ offloaded 13/13 layers to GPU\n";
         assert!(crate::sidecar::sidecar_state_matches_runtime(&state, &warm));
         warm.ensure_ports_allocated()
             .expect("warm runtime renews the original isolated lease tuple");
-        let local = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let local = crate::config::test_sidecar_runtime_in_cache(
             Some(project.path()),
             SidecarProfile::Local,
             None,
@@ -2917,7 +2917,7 @@ offloaded 13/13 layers to GPU\n";
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
-            ..SidecarRuntimeConfig::local()
+            ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
             .expect("create state dir");
@@ -2967,7 +2967,7 @@ offloaded 13/13 layers to GPU\n";
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
-            ..SidecarRuntimeConfig::local()
+            ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
             .expect("create state dir");

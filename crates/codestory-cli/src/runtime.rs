@@ -168,17 +168,19 @@ impl RuntimeContext {
         let process_cache_root = startup
             .stdio_cache_root
             .as_deref()
-            .unwrap_or(&startup.user_cache_root);
+            .unwrap_or_else(|| startup.sidecar_defaults.cache_root());
         let cache_root = cache_root_for_project_in(
             &project_root,
             cache_override.as_deref(),
             process_cache_root,
         )?;
         let storage_path = cache_root.join("codestory.db");
-        let sidecar = crate::sidecar_runtime::for_project_auto_with_defaults_in_cache(
+        let sidecar_defaults = startup
+            .sidecar_defaults
+            .with_cache_root(process_cache_root.to_path_buf());
+        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults(
             &project_root,
-            process_cache_root,
-            &startup.runtime_defaults,
+            &sidecar_defaults,
             &config.runtime_overrides(),
         );
         let runtime = Runtime::new_with_config(sidecar.clone());
@@ -1003,9 +1005,11 @@ mod tests {
         let startup = |cache_root: &Path| crate::config::CliStartupConfig {
             user_home: None,
             project_network_config_allowed: true,
-            user_cache_root: cache_root.to_path_buf(),
             stdio_cache_root: Some(cache_root.to_path_buf()),
-            runtime_defaults: codestory_retrieval::SidecarRuntimeDefaults::default(),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache_root.to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
         };
         let first_startup = startup(&first_cache);
         let second_startup = startup(&second_cache);
