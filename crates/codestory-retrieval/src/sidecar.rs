@@ -11,10 +11,11 @@ use crate::health::{
     probe_sidecar_health_for_runtime, unavailable_status_report_with_embedding_device,
 };
 use crate::index::{compute_sidecar_input_fingerprint_for_runtime, sidecar_project_id_for_runtime};
+#[cfg(not(target_os = "linux"))]
+use crate::process_identity::bounded_process_command_output;
 use crate::process_identity::{
-    ProcessOwnerState, ProcessStartProbe, bounded_process_command_output,
-    native_embedding_process_start_identity, probe_process_start_identity, process_owner_state,
-    process_started_at_epoch_ms,
+    ProcessOwnerState, ProcessStartProbe, native_embedding_process_start_identity,
+    probe_process_start_identity, process_owner_state, process_started_at_epoch_ms,
 };
 #[cfg(all(not(windows), not(target_os = "linux")))]
 use crate::process_identity::{PsProbeOutputStatus, classify_ps_probe_output};
