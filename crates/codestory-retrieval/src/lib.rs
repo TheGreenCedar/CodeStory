@@ -22,6 +22,7 @@ mod index;
 mod inventory;
 mod lexical_client;
 mod lexical_index;
+mod managed_assets;
 mod mode;
 pub mod outbound_http;
 mod planner;

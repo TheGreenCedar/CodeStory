@@ -26,6 +26,11 @@
   bounded session contract. Status is observational and compact; tool text
   remains useful on hosts that do not render structured results, while large
   file, symbol, search, and impact payloads are capped with explicit counts.
+- The pinned search model and native backend are now verified and published in
+  one machine-wide cache. Repositories and worktrees reuse the same immutable
+  assets; concurrent first use is serialized, interrupted or corrupt payloads
+  are quarantined, and normal search preparation downloads missing assets
+  without a setup prompt.
 
 ## 0.15.0
 

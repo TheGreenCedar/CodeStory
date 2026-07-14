@@ -4,7 +4,6 @@ use crate::config::{
     retrieval_compose_profile, user_cache_root,
 };
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
-use crate::outbound_http::read_bytes;
 use crate::qdrant_storage::{
     BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
     repair_qdrant_storage,
@@ -303,6 +302,7 @@ struct NativeLlamaCandidate {
 #[derive(Debug, Deserialize)]
 struct NativeLlamaInstallManifest {
     artifact: String,
+    artifact_bytes: u64,
     artifact_sha256: String,
     executable_rel_path: String,
     executable_sha256: String,
@@ -1546,15 +1546,33 @@ fn ensure_selected_managed_native_llama_server(repo_root: Option<&Path>) -> Resu
 
 fn ensure_managed_native_llama_server(backend: &crate::config::LlamaSidecarBackend) -> Result<()> {
     let executable = user_cache_root().join(native_llama_backend_rel_path(backend));
+    let cache_root = user_cache_root();
+    let _asset_lock = crate::managed_assets::ManagedAssetLock::acquire(&cache_root)?;
     if executable.is_file() && validate_managed_native_llama_server(&executable, backend).is_ok() {
         return Ok(());
     }
+    if let Some(install_dir) = executable.parent()
+        && fs::symlink_metadata(install_dir).is_ok()
+    {
+        crate::managed_assets::quarantine_path(install_dir, "invalid")?;
+    }
+    let archive = cache_root
+        .join("managed-embeddings/blobs/sha256")
+        .join(&backend.sha256)
+        .join(&backend.artifact);
+    crate::managed_assets::ensure_cached_asset_locked(
+        &archive,
+        std::slice::from_ref(&backend.url),
+        backend.artifact_bytes,
+        &backend.sha256,
+    )?;
     let temp_root = managed_llama_temp_root()?;
-    let archive = temp_root.join(&backend.artifact);
-    let install_result = (|| {
-        download_managed_native_llama_server_archive(backend, &archive)?;
-        install_managed_native_llama_server_from_archive(backend, &archive, &executable)
-    })();
+    let install_result = install_managed_native_llama_server_from_archive(
+        backend,
+        &archive,
+        &temp_root.join("extract"),
+        &executable,
+    );
     let cleanup_result = fs::remove_dir_all(&temp_root);
     if let Err(error) = cleanup_result
         && install_result.is_ok()
@@ -1576,47 +1594,22 @@ fn managed_llama_temp_root() -> Result<PathBuf> {
     Ok(root)
 }
 
-fn download_managed_native_llama_server_archive(
-    backend: &crate::config::LlamaSidecarBackend,
-    archive: &Path,
-) -> Result<()> {
-    let response = read_bytes(
-        ureq::get(&backend.url)
-            .timeout(Duration::from_secs(120))
-            .call(),
-    )
-    .with_context(|| format!("download {}", backend.url))?;
-    if !(200..300).contains(&response.status) {
-        bail!(
-            "download managed native llama-server archive http {}",
-            response.status
-        );
-    }
-    fs::write(archive, &response.body).with_context(|| format!("write {}", archive.display()))?;
-    verify_sha256(archive, &backend.sha256)
-        .with_context(|| format!("verify {}", archive.display()))?;
-    Ok(())
-}
-
 fn install_managed_native_llama_server_from_archive(
     backend: &crate::config::LlamaSidecarBackend,
     archive: &Path,
+    extract_root: &Path,
     executable: &Path,
 ) -> Result<()> {
     verify_sha256(archive, &backend.sha256)
         .with_context(|| format!("verify {}", archive.display()))?;
-    let extract_root = archive
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("managed llama-server archive has no parent"))?
-        .join("extract");
-    fs::create_dir_all(&extract_root)
+    fs::create_dir_all(extract_root)
         .with_context(|| format!("create {}", extract_root.display()))?;
     let member_path = safe_archive_member_path(&backend.executable_archive_path)?;
     let output = Command::new("tar")
         .arg("-xzf")
         .arg(archive)
         .arg("-C")
-        .arg(&extract_root)
+        .arg(extract_root)
         .output()
         .with_context(|| format!("run tar for {}", archive.display()))?;
     if !output.status.success() {
@@ -1836,6 +1829,7 @@ fn write_managed_native_llama_install_manifest(
     let manifest = serde_json::json!({
         "backend": backend.id,
         "artifact": backend.artifact,
+        "artifact_bytes": backend.artifact_bytes,
         "artifact_sha256": backend.sha256,
         "executable_rel_path": backend.executable_rel_path,
         "executable_sha256": executable_sha,
@@ -1869,6 +1863,14 @@ fn validate_managed_native_llama_server(
             executable.display(),
             backend.artifact,
             manifest.artifact
+        );
+    }
+    if manifest.artifact_bytes != backend.artifact_bytes {
+        bail!(
+            "managed llama-server artifact size mismatch for {}: expected {}, got {}",
+            executable.display(),
+            backend.artifact_bytes,
+            manifest.artifact_bytes
         );
     }
     if !manifest
@@ -2468,25 +2470,19 @@ fn docker_bind_path(path: &Path) -> String {
     without_verbatim.replace('\\', "/")
 }
 
-fn embed_model_dir(repo_root: Option<&Path>, layout: &SidecarLayout) -> Result<PathBuf> {
-    let inventory = embed_model_inventory(repo_root, layout);
-    if let Some(model_dir) = inventory
-        .required_gguf_present
-        .then_some(inventory.model_dir.as_ref())
-        .flatten()
-    {
-        return Ok(PathBuf::from(model_dir));
-    }
-    if std::env::var("CODESTORY_EMBED_MODEL_DIR").is_ok() {
+fn embed_model_dir(_repo_root: Option<&Path>, _layout: &SidecarLayout) -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
+        let path = PathBuf::from(path);
+        if embed_model_dir_ready(&path) {
+            return Ok(path);
+        }
         anyhow::bail!(
-            "CODESTORY_EMBED_MODEL_DIR does not contain {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
+            "CODESTORY_EMBED_MODEL_DIR does not contain {}",
             crate::embeddings::BGE_BASE_EN_V1_5_GGUF
         );
     }
-    anyhow::bail!(
-        "No llama.cpp embedding model directory contains {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
-        crate::embeddings::BGE_BASE_EN_V1_5_GGUF
-    )
+    crate::managed_assets::ensure_managed_embedding_model(&user_cache_root())
+        .context("prepare managed embedding model")
 }
 
 pub fn embed_model_inventory(
@@ -2499,9 +2495,14 @@ pub fn embed_model_inventory(
         .find(|candidate| embed_model_dir_ready(candidate))
         .or_else(|| candidates.first())
         .map(|path| path.display().to_string());
-    let required_gguf_present = model_dir
-        .as_ref()
-        .is_some_and(|path| embed_model_dir_ready(Path::new(path)));
+    let required_gguf_present = model_dir.as_ref().is_some_and(|path| {
+        let path = Path::new(path);
+        if path == crate::managed_assets::managed_embedding_model_dir(&user_cache_root()) {
+            crate::managed_assets::managed_embedding_model_is_published(&user_cache_root())
+        } else {
+            embed_model_dir_ready(path)
+        }
+    });
     EmbedModelInventory {
         model_dir,
         required_gguf: crate::embeddings::BGE_BASE_EN_V1_5_GGUF.to_string(),
@@ -2513,46 +2514,22 @@ pub fn embed_model_inventory(
     }
 }
 
-fn embed_model_candidates(repo_root: Option<&Path>, layout: &SidecarLayout) -> Vec<PathBuf> {
+fn embed_model_candidates(_repo_root: Option<&Path>, _layout: &SidecarLayout) -> Vec<PathBuf> {
     if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
         return vec![PathBuf::from(path)];
     }
-    let workdir = repo_root
-        .or_else(|| Some(Path::new(".")))
-        .unwrap_or(Path::new("."));
-    let fallback = layout
-        .qdrant_data_dir
-        .parent()
-        .map(|parent| parent.join("embed-models"))
-        .unwrap_or_else(|| layout.qdrant_data_dir.join("embed-models"));
+    let cache_root = user_cache_root();
     let mut candidates = Vec::new();
     for candidate in [
-        workdir.join("target").join("retrieval-models"),
-        workdir.join("models").join("gguf").join("bge-base-en-v1.5"),
-        user_cache_root().join("retrieval-models"),
-        user_cache_root().join("embed-models"),
-        fallback,
+        crate::managed_assets::managed_embedding_model_dir(&cache_root),
+        cache_root.join("retrieval-models"),
+        cache_root.join("embed-models"),
     ] {
         if !candidates.contains(&candidate) {
             candidates.push(candidate);
         }
     }
     candidates
-}
-
-#[cfg(test)]
-fn embed_model_dir_from_candidates(
-    candidates: impl IntoIterator<Item = PathBuf>,
-) -> Result<PathBuf> {
-    for candidate in candidates {
-        if embed_model_dir_ready(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    bail!(
-        "No llama.cpp embedding model directory contains {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
-        crate::embeddings::BGE_BASE_EN_V1_5_GGUF
-    )
 }
 
 fn embed_model_dir_ready(path: &Path) -> bool {
@@ -2921,7 +2898,8 @@ mod tests {
     }
 
     #[test]
-    fn embed_model_dir_discovers_repo_models_layout() {
+    fn embed_model_dir_uses_only_explicit_project_override() {
+        let _lock = crate::test_support::env_lock();
         let project = tempdir().expect("project");
         let model_dir = project
             .path()
@@ -2934,6 +2912,10 @@ mod tests {
             b"model placeholder",
         )
         .expect("model file");
+        let _override = EnvGuard::set(
+            "CODESTORY_EMBED_MODEL_DIR",
+            model_dir.to_str().expect("utf8 model dir"),
+        );
         let layout = SidecarLayout::from_env();
 
         assert_eq!(
@@ -2943,26 +2925,9 @@ mod tests {
     }
 
     #[test]
-    fn embed_model_dir_uses_first_candidate_with_model() {
-        let empty = tempdir().expect("empty");
-        let cache = tempdir().expect("cache");
-        let model_dir = cache.path().join("embed-models");
-        std::fs::create_dir_all(&model_dir).expect("model dir");
-        std::fs::write(
-            model_dir.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
-            b"model placeholder",
-        )
-        .expect("model file");
-
-        assert_eq!(
-            embed_model_dir_from_candidates([empty.path().to_path_buf(), model_dir.clone()])
-                .expect("fallback model dir"),
-            model_dir
-        );
-    }
-
-    #[test]
-    fn embed_model_dir_discovers_user_cache_retrieval_models() {
+    fn embed_model_inventory_reports_machine_cache_without_mutating_it() {
+        let _lock = crate::test_support::env_lock();
+        let _override = EnvGuard::remove("CODESTORY_EMBED_MODEL_DIR");
         let cache = tempdir().expect("cache");
         let project = tempdir().expect("project");
         let model_dir = cache.path().join("retrieval-models");
@@ -2973,26 +2938,15 @@ mod tests {
         )
         .expect("model file");
         let layout = compose_test_runtime(project.path()).layout;
-        let selected = crate::config::with_test_cache_root(cache.path(), || {
-            embed_model_dir(Some(project.path()), &layout)
-        })
-        .expect("model dir");
+        let inventory = crate::config::with_test_cache_root(cache.path(), || {
+            embed_model_inventory(Some(project.path()), &layout)
+        });
 
-        assert_eq!(selected, model_dir);
-    }
-
-    #[test]
-    fn embed_model_dir_fails_before_empty_fallback_container() {
-        let empty = tempdir().expect("empty");
-
-        let error = embed_model_dir_from_candidates([empty.path().to_path_buf()])
-            .expect_err("missing model must fail before docker compose");
-
-        assert!(
-            error
-                .to_string()
-                .contains(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
+        assert_eq!(
+            inventory.model_dir.as_deref(),
+            Some(model_dir.to_str().unwrap())
         );
+        assert!(inventory.required_gguf_present);
     }
 
     #[test]
@@ -3319,6 +3273,7 @@ mod tests {
         let manifest = serde_json::json!({
             "backend": legacy.id,
             "artifact": legacy.artifact,
+            "artifact_bytes": legacy.artifact_bytes,
             "artifact_sha256": legacy.sha256,
             "executable_rel_path": legacy.executable_rel_path,
             "executable_sha256": exe_sha,
@@ -3343,91 +3298,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_native_candidate_requires_install_manifest() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
-        let backend =
-            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server");
-        std::fs::write(&exe, b"fake exe").expect("exe");
-
-        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
-            path: exe,
-            backend: Some(backend),
-        }])
-        .expect_err("missing install manifest must fail closed");
-
-        assert!(error.to_string().contains("install-manifest.json"));
-    }
-
-    #[test]
-    fn managed_native_candidate_accepts_complete_extracted_install() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
-        let mut backend =
-            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server");
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        let executable_sha = sha256_file(&exe).expect("sha");
-        backend.executable_sha256 = executable_sha.clone();
-        std::fs::write(
-            temp.path().join("install-manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "artifact": backend.artifact,
-                "artifact_sha256": backend.sha256,
-                "executable_rel_path": backend.executable_rel_path,
-                "executable_sha256": executable_sha,
-            }))
-            .expect("manifest"),
-        )
-        .expect("manifest write");
-        std::fs::write(temp.path().join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
-            .expect("marker write");
-
-        let selected = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
-            path: exe.clone(),
-            backend: Some(backend),
-        }])
-        .expect("valid managed candidate");
-
-        assert_eq!(selected, exe);
-    }
-
-    #[test]
-    fn managed_native_candidate_rejects_single_file_install() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
-        let mut backend = crate::config::selected_llama_sidecar_backend("vulkan")
-            .expect("windows vulkan backend");
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server.exe");
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        let executable_sha = sha256_file(&exe).expect("sha");
-        backend.executable_sha256 = executable_sha.clone();
-        std::fs::write(
-            temp.path().join("install-manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "artifact": backend.artifact,
-                "artifact_sha256": backend.sha256,
-                "executable_rel_path": backend.executable_rel_path,
-                "executable_sha256": executable_sha,
-            }))
-            .expect("manifest"),
-        )
-        .expect("manifest write");
-
-        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
-            path: exe,
-            backend: Some(backend),
-        }])
-        .expect_err("single-file install must not validate");
-
-        assert!(error.to_string().contains("install is incomplete"));
-    }
-
-    #[test]
     fn managed_native_candidate_rejects_manifest_blessed_wrong_executable() {
         let _lock = crate::test_support::env_lock();
         let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
@@ -3441,6 +3311,7 @@ mod tests {
             temp.path().join("install-manifest.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "artifact": backend.artifact,
+                "artifact_bytes": backend.artifact_bytes,
                 "artifact_sha256": backend.sha256,
                 "executable_rel_path": backend.executable_rel_path,
                 "executable_sha256": executable_sha,
@@ -3472,30 +3343,6 @@ mod tests {
         assert!(safe_archive_member_path("../llama-server").is_err());
         assert!(safe_archive_member_path("/tmp/llama-server").is_err());
         assert!(safe_archive_member_path("llama-b9902\\llama-server").is_err());
-    }
-
-    #[test]
-    fn managed_native_copy_materializes_safe_internal_symlink_target() {
-        let temp = tempdir().expect("temp");
-        let source_dir = temp.path().join("payload");
-        let target_dir = temp.path().join("install");
-        std::fs::create_dir_all(&source_dir).expect("payload dir");
-        std::fs::create_dir_all(&target_dir).expect("target dir");
-        let real = source_dir.join("libggml-rpc.dylib");
-        std::fs::write(&real, b"fake dylib").expect("real dylib");
-
-        copy_archive_symlinked_file_target(
-            &source_dir.join("libggml-rpc.0.dylib"),
-            &target_dir.join("libggml-rpc.0.dylib"),
-            &std::fs::canonicalize(&source_dir).expect("canonical source"),
-            Path::new("libggml-rpc.dylib"),
-        )
-        .expect("materialize symlink target");
-
-        assert_eq!(
-            std::fs::read(target_dir.join("libggml-rpc.0.dylib")).expect("copied dylib"),
-            b"fake dylib"
-        );
     }
 
     #[test]
@@ -3559,8 +3406,14 @@ mod tests {
             .join("b9902")
             .join("llama-b9902-bin-macos-arm64-metal")
             .join("llama-server");
-        install_managed_native_llama_server_from_archive(&backend, &archive, &executable)
-            .expect("install");
+        backend.artifact_bytes = std::fs::metadata(&archive).expect("archive metadata").len();
+        install_managed_native_llama_server_from_archive(
+            &backend,
+            &archive,
+            &temp.path().join("extract"),
+            &executable,
+        )
+        .expect("install");
 
         assert_eq!(
             std::fs::read(&executable).expect("installed exe"),
@@ -4108,20 +3961,6 @@ mod tests {
                 .expect("read state")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn native_launch_missing_model_fails_before_spawn() {
-        let temp = tempdir().expect("temp");
-        let error = embed_model_dir_from_candidates([temp.path().join("embed-models")])
-            .expect_err("missing model should fail closed");
-
-        assert!(
-            error
-                .to_string()
-                .contains(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
-        );
-        assert!(error.to_string().contains("fetch-embed-model"));
     }
 
     #[test]

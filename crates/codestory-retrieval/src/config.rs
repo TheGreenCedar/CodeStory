@@ -125,6 +125,8 @@ pub(crate) struct LlamaSidecarBackend {
     pub provider: String,
     pub launch_mode: String,
     pub artifact: String,
+    #[serde(default)]
+    pub artifact_bytes: u64,
     pub url: String,
     pub sha256: String,
     pub executable_archive_path: String,

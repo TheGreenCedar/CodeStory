@@ -30,7 +30,7 @@ Options:
   --skip-compose            Pass --skip-compose to "retrieval bootstrap"
   --skip-status             Skip final "retrieval status"
   --with-holdout-clone      Clone holdout-retrieval OSS repos (network; large)
-  --fetch-embed-model       Download bge-base-en-v1.5.Q8_0.gguf into target/retrieval-models
+  --fetch-embed-model       Prewarm the machine-wide pinned embedding model cache
   --fetch-llama-server      Download the managed native llama-server for this host
   --llama-backend <id>      Select a llama-server backend from llama-sidecar-backends.json
   --fetch-only              With --fetch-embed-model/--fetch-llama-server, fetch/verify and exit
@@ -262,20 +262,29 @@ function printPrereqReport(opts) {
   return failed;
 }
 
-const BGE_GGUF = "bge-base-en-v1.5.Q8_0.gguf";
-const BGE_GGUF_SHA256 = "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c";
-const BGE_GGUF_BYTES = 117_974_304;
+const EMBED_MODELS_MANIFEST = path.join(
+  repoRoot,
+  "crates",
+  "codestory-retrieval",
+  "assets",
+  "embedding-models.json",
+);
 const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
-const BGE_URLS = [
-  "https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf",
-  "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf",
-];
+
+function pinnedEmbedModel() {
+  const models = JSON.parse(fs.readFileSync(EMBED_MODELS_MANIFEST, "utf8")).models ?? [];
+  if (models.length !== 1) {
+    throw new Error(`${EMBED_MODELS_MANIFEST} must contain exactly one product model`);
+  }
+  return models[0];
+}
 
 function embedModelDir() {
   if (process.env.CODESTORY_EMBED_MODEL_DIR) {
     return path.resolve(process.env.CODESTORY_EMBED_MODEL_DIR);
   }
-  return path.join(repoRoot, "target", "retrieval-models");
+  const model = pinnedEmbedModel();
+  return path.join(codestoryCacheRoot(), "managed-embeddings", "models", "sha256", model.sha256);
 }
 
 function sha256File(file) {
@@ -289,19 +298,20 @@ function sha256File(file) {
 }
 
 async function verifyEmbedModel(file) {
+  const model = pinnedEmbedModel();
   const stat = fs.statSync(file);
   if (!stat.isFile()) {
     throw new Error(`Embed model path is not a file: ${file}`);
   }
-  if (stat.size !== BGE_GGUF_BYTES) {
+  if (stat.size !== model.artifact_bytes) {
     throw new Error(
-      `Embed model size mismatch for ${file}: got ${stat.size} bytes, expected ${BGE_GGUF_BYTES}`,
+      `Embed model size mismatch for ${file}: got ${stat.size} bytes, expected ${model.artifact_bytes}`,
     );
   }
   const actual = await sha256File(file);
-  if (actual !== BGE_GGUF_SHA256) {
+  if (actual !== model.sha256) {
     throw new Error(
-      `Embed model SHA-256 mismatch for ${file}: got ${actual}, expected ${BGE_GGUF_SHA256}`,
+      `Embed model SHA-256 mismatch for ${file}: got ${actual}, expected ${model.sha256}`,
     );
   }
   return actual;
@@ -376,32 +386,56 @@ async function downloadFile(
 }
 
 async function fetchEmbedModel() {
+  const model = pinnedEmbedModel();
   const dir = embedModelDir();
   fs.mkdirSync(dir, { recursive: true });
-  const dest = path.join(dir, BGE_GGUF);
+  const dest = path.join(dir, model.filename);
   if (fs.existsSync(dest) && fs.statSync(dest).size > 1_000_000) {
     let checksum;
     try {
       checksum = await verifyEmbedModel(dest);
     } catch (error) {
-      throw new Error(
-        `${error instanceof Error ? error.message : error}. Remove ${dest} and rerun --fetch-embed-model.`,
+      const quarantine = path.join(
+        dir,
+        `.quarantine-${model.filename}-invalid-${process.pid}-${Date.now()}`,
       );
+      fs.renameSync(dest, quarantine);
+      console.log(`Quarantined invalid managed model at ${quarantine}: ${error}`);
     }
-    console.log(`Embed model already present and verified: ${dest} sha256=${checksum}`);
-    return dest;
+    if (checksum) {
+      console.log(`Embed model already present and verified: ${dest} sha256=${checksum}`);
+      return dest;
+    }
   }
   let lastError = null;
-  for (const url of BGE_URLS) {
-    console.log(`Downloading ${BGE_GGUF} from ${url} to ${dest} ...`);
-    const tempDest = `${dest}.tmp-${process.pid}`;
+  for (const url of model.urls) {
+    console.log(`Downloading ${model.filename} from ${url} to ${dest} ...`);
+    const tempDest = path.join(dir, `.${model.filename}.partial-${process.pid}-${Date.now()}`);
     try {
       const downloadedBytes = await downloadFile(url, tempDest, {
-        expectedBytes: BGE_GGUF_BYTES,
-        maxBytes: BGE_GGUF_BYTES,
+        expectedBytes: model.artifact_bytes,
+        maxBytes: model.artifact_bytes,
       });
       const checksum = await verifyEmbedModel(tempDest);
-      fs.renameSync(tempDest, dest);
+      try {
+        fs.renameSync(tempDest, dest);
+      } catch (error) {
+        if (!fs.existsSync(dest)) throw error;
+        await verifyEmbedModel(dest);
+        fs.rmSync(tempDest, { force: true });
+        console.log(`Embed model was published concurrently and verified: ${dest}`);
+        return dest;
+      }
+      const manifestTemp = path.join(
+        dir,
+        `.install-manifest.json.partial-${process.pid}-${Date.now()}`,
+      );
+      fs.writeFileSync(
+        manifestTemp,
+        `${JSON.stringify({ ...model, source_url: url, urls: undefined }, null, 2)}\n`,
+        { flag: "wx" },
+      );
+      fs.renameSync(manifestTemp, path.join(dir, "install-manifest.json"));
       console.log(`Wrote ${dest} (${downloadedBytes} bytes, sha256=${checksum})`);
       return dest;
     } catch (error) {
@@ -667,6 +701,16 @@ async function fetchLlamaServer(opts) {
 }
 
 async function runSelfTest() {
+  const model = pinnedEmbedModel();
+  if (
+    model.filename !== "bge-base-en-v1.5.Q8_0.gguf" ||
+    !Number.isSafeInteger(model.artifact_bytes) ||
+    !/^[0-9a-f]{64}$/.test(model.sha256) ||
+    !Array.isArray(model.urls) ||
+    model.urls.length === 0
+  ) {
+    throw new Error("managed embedding model metadata is incomplete");
+  }
   const backends = readLlamaBackends();
   const macMetal = backends.find((backend) => backend.id === "macos-aarch64-metal");
   const winVulkan = backends.find((backend) => backend.id === "windows-x86_64-vulkan");
