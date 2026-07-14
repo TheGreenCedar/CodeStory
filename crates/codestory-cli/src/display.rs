@@ -1,4 +1,4 @@
-use codestory_contracts::api::{GroundingBudgetDto, SearchHit, TrailDirection};
+use codestory_contracts::api::{GroundingBudgetDto, TrailDirection};
 use std::path::Path;
 
 use crate::args::CliTrailMode;
@@ -49,19 +49,6 @@ pub(crate) fn relative_path(project_root: &Path, raw: &str) -> String {
     codestory_workspace::workspace_relative_path(project_root, Path::new(&normalized_raw))
         .map(|relative| clean_path_string(&relative.to_string_lossy()))
         .unwrap_or(normalized_raw)
-}
-
-pub(crate) fn format_search_hit_target(project_root: &Path, hit: &SearchHit) -> String {
-    let mut out = format!("{} [{}]", hit.display_name, format_kind(hit.kind));
-    if let Some(path) = hit.file_path.as_deref() {
-        out.push(' ');
-        out.push_str(&relative_path(project_root, path));
-    }
-    if let Some(line) = hit.line {
-        out.push(':');
-        out.push_str(&line.to_string());
-    }
-    out
 }
 
 pub(crate) fn format_kind(kind: codestory_contracts::api::NodeKind) -> String {

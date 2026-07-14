@@ -7,25 +7,17 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
-    ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
-    ProjectSummary, SearchHit,
+    ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, ProjectSummary, SearchHit,
 };
 use codestory_runtime::{
     BookmarkService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService,
-    Runtime,
+    Runtime, TargetResolution,
 };
 use std::path::{Path, PathBuf};
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
-use crate::display::{
-    clean_path_string, format_search_hit_target, quote_command_path, relative_path,
-};
-use crate::query_resolution::{
-    ResolutionRank, compare_resolution_hits, file_filter_match_bucket, is_resolvable_graph_target,
-    resolution_rank_with_project_root, search_hit_matches_file_filter,
-};
+use crate::display::{clean_path_string, quote_command_path};
 
-const HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT: usize = 10;
 const INCOMPLETE_INDEX_RECOVERY_REASON: &str =
     "previous_incremental_run_incomplete_full_refresh_required";
 
@@ -58,23 +50,28 @@ pub(crate) struct RuntimeContext {
     pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ResolutionCandidateRank {
-    file_filter_match: u8,
-    resolution: ResolutionRank,
-}
-
 #[derive(Debug, Clone)]
-/// A query or id after CLI target resolution has selected one graph-backed hit.
-///
-/// `alternatives` is ordered for reviewer/operator display and may be truncated
-/// by the search layer; it is not a complete search result set.
 pub(crate) struct ResolvedTarget {
     pub(crate) selector: QuerySelectorOutput,
     pub(crate) requested: String,
     pub(crate) file_filter: Option<String>,
     pub(crate) selected: SearchHit,
     pub(crate) alternatives: Vec<SearchHit>,
+}
+
+impl ResolvedTarget {
+    pub(crate) fn from_runtime(target: codestory_runtime::ResolvedTarget) -> Self {
+        Self {
+            selector: match target.selector {
+                codestory_runtime::TargetSelector::Id => QuerySelectorOutput::Id,
+                codestory_runtime::TargetSelector::Query => QuerySelectorOutput::Query,
+            },
+            requested: target.requested,
+            file_filter: target.file_filter,
+            selected: target.selected,
+            alternatives: target.alternatives,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -260,216 +257,24 @@ pub(crate) fn resolve_target(
     target: TargetSelection,
     file_filter: Option<&str>,
 ) -> Result<ResolvedTarget> {
-    match target {
-        TargetSelection::Id(id) => {
-            let details = runtime
-                .browser
-                .node_details(NodeDetailsRequest { id: id.clone() })
-                .map_err(map_api_error)?;
-            Ok(ResolvedTarget {
-                selector: QuerySelectorOutput::Id,
-                requested: id.0,
-                file_filter: None,
-                selected: search_hit_from_node(&details),
-                alternatives: Vec::new(),
-            })
-        }
+    let target = match target {
+        TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
         TargetSelection::Query { query, choose } => {
-            resolve_query_target(runtime, query, choose, file_filter)
+            codestory_runtime::TargetSelection::Query { query, choose }
         }
-    }
-}
-
-fn resolve_query_target(
-    runtime: &RuntimeContext,
-    query: String,
-    choose: Option<usize>,
-    file_filter: Option<&str>,
-) -> Result<ResolvedTarget> {
-    let alternatives = query_resolution_alternatives(runtime, &query, file_filter)?;
-    let tied_alternatives =
-        tied_top_alternatives(&runtime.project_root, &query, file_filter, &alternatives);
-
-    if let Some(choice) = choose {
-        return resolve_chosen_query_target(
-            query,
-            file_filter,
-            alternatives,
-            tied_alternatives,
-            choice,
-        );
-    }
-
-    reject_ambiguous_query_target(
-        &runtime.project_root,
-        &query,
-        file_filter,
-        tied_alternatives,
-    )?;
-    debug_assert_unique_top_candidate(&runtime.project_root, &query, file_filter, &alternatives);
-
-    let selected = alternatives
-        .first()
-        .cloned()
-        .ok_or_else(|| no_query_match_error(&runtime.project_root, &query, file_filter))?;
-    Ok(query_resolved_target(
-        query,
-        file_filter,
-        selected,
-        alternatives,
-    ))
-}
-
-fn query_resolution_alternatives(
-    runtime: &RuntimeContext,
-    query: &str,
-    file_filter: Option<&str>,
-) -> Result<Vec<SearchHit>> {
-    let mut alternatives = query_resolution_search_hits(runtime, query)?;
-    alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
-    if alternatives.is_empty()
-        && let Some(stem) = command_query_resolution_stem(query)
-    {
-        alternatives = query_resolution_search_hits(runtime, &stem)?;
-        alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
-    }
-    if let Some(file_filter) = file_filter {
-        alternatives
-            .retain(|hit| search_hit_matches_file_filter(&runtime.project_root, hit, file_filter));
-    }
-    if alternatives.is_empty() {
-        return Err(no_query_match_error(
-            &runtime.project_root,
-            query,
-            file_filter,
-        ));
-    }
-
-    alternatives.sort_by(|left, right| {
-        compare_resolution_candidates(&runtime.project_root, query, file_filter, left, right)
-    });
-    Ok(alternatives)
-}
-
-fn query_resolution_search_hits(runtime: &RuntimeContext, query: &str) -> Result<Vec<SearchHit>> {
-    runtime
-        .browser
-        .resolve_indexed_symbol_candidates(query, 50)
-        .map_err(map_api_error)
-}
-
-fn command_query_resolution_stem(query: &str) -> Option<String> {
-    for suffix in ["_command", "_cmd", "_handler"] {
-        if let Some(stem) = query.strip_suffix(suffix)
-            && stem.len() >= 4
-        {
-            return Some(stem.to_string());
-        }
-    }
-    None
-}
-
-fn resolve_chosen_query_target(
-    query: String,
-    file_filter: Option<&str>,
-    mut alternatives: Vec<SearchHit>,
-    tied_alternatives: Vec<SearchHit>,
-    choice: usize,
-) -> Result<ResolvedTarget> {
-    if choice == 0 || choice > tied_alternatives.len() {
-        bail!(
-            "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
-            tied_alternatives.len()
-        );
-    }
-
-    let selected = tied_alternatives[choice - 1].clone();
-    promote_selected_alternative(&mut alternatives, &selected);
-    Ok(query_resolved_target(
-        query,
-        file_filter,
-        selected,
-        alternatives,
-    ))
-}
-
-fn promote_selected_alternative(alternatives: &mut Vec<SearchHit>, selected: &SearchHit) {
-    if let Some(position) = alternatives
-        .iter()
-        .position(|hit| hit.node_id == selected.node_id)
-    {
-        let chosen = alternatives.remove(position);
-        alternatives.insert(0, chosen);
-    }
-}
-
-fn reject_ambiguous_query_target(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    tied_alternatives: Vec<SearchHit>,
-) -> Result<()> {
-    if tied_alternatives.len() <= 1 {
-        return Ok(());
-    }
-
-    let message = ambiguous_query_error(project_root, query, file_filter, &tied_alternatives);
-    Err(AmbiguousTargetError {
-        query: query.to_owned(),
-        file_filter: file_filter.map(ToOwned::to_owned),
-        alternatives: tied_alternatives,
-        message,
-    }
-    .into())
-}
-
-fn debug_assert_unique_top_candidate(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    alternatives: &[SearchHit],
-) {
-    if alternatives.len() > 1 {
-        let rank1 = resolution_candidate_rank(project_root, query, file_filter, &alternatives[1]);
-        debug_assert_ne!(
-            resolution_candidate_rank(project_root, query, file_filter, &alternatives[0]),
-            rank1
-        );
-    }
-}
-
-fn query_resolved_target(
-    query: String,
-    file_filter: Option<&str>,
-    selected: SearchHit,
-    alternatives: Vec<SearchHit>,
-) -> ResolvedTarget {
-    ResolvedTarget {
-        selector: QuerySelectorOutput::Query,
-        requested: query,
-        file_filter: file_filter.map(ToOwned::to_owned),
-        selected,
-        alternatives,
-    }
-}
-
-fn tied_top_alternatives(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    alternatives: &[SearchHit],
-) -> Vec<SearchHit> {
-    let Some(first) = alternatives.first() else {
-        return Vec::new();
     };
-    let top_rank = resolution_candidate_rank(project_root, query, file_filter, first);
-    alternatives
-        .iter()
-        .take_while(|hit| {
-            resolution_candidate_rank(project_root, query, file_filter, hit) == top_rank
-        })
-        .cloned()
-        .collect()
+    match runtime.browser.resolve_target(target, file_filter) {
+        Ok(TargetResolution::Resolved(target)) => Ok(ResolvedTarget::from_runtime(*target)),
+        Ok(TargetResolution::Ambiguous(ambiguous)) => Err(AmbiguousTargetError {
+            query: ambiguous.query,
+            file_filter: ambiguous.file_filter,
+            alternatives: ambiguous.alternatives,
+            message: ambiguous.message,
+        }
+        .into()),
+        Ok(TargetResolution::Rejected(message)) => Err(anyhow!(message)),
+        Err(error) => Err(map_api_error(error)),
+    }
 }
 
 /// Canonicalize a project argument before deriving cache identity.
@@ -662,185 +467,6 @@ fn cache_busy_message(project: Option<&Path>) -> String {
     format!(
         "cache_busy: CodeStory cache is busy or locked. Wait for the active indexing/search process to release the SQLite cache, then retry.\n\nMinimum next:\n  codestory-cli ready --project {project} --goal agent\n\nFull repair:\n  codestory-cli ready --project {project} --goal agent\n  codestory-cli doctor --project {project}"
     )
-}
-
-pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
-    SearchHit {
-        node_id: node.id.clone(),
-        display_name: node.display_name.clone(),
-        kind: node.kind,
-        file_path: node.file_path.clone(),
-        line: node.start_line,
-        score: 0.0,
-        origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-        match_quality: None,
-        resolvable: true,
-        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        evidence_producer: Some("node_details".to_string()),
-        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
-        loss_reason: None,
-        coverage_role: None,
-        eligible_for_sufficiency: Some(true),
-        score_breakdown: None,
-    }
-}
-
-fn resolution_candidate_rank(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    hit: &SearchHit,
-) -> ResolutionCandidateRank {
-    let rank = resolution_rank_with_project_root(Some(project_root), query, hit);
-    ResolutionCandidateRank {
-        file_filter_match: file_filter
-            .map(|filter| file_filter_match_bucket(project_root, hit, filter))
-            .unwrap_or(0),
-        resolution: rank,
-    }
-}
-
-fn compare_resolution_candidates(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    left: &SearchHit,
-    right: &SearchHit,
-) -> std::cmp::Ordering {
-    resolution_candidate_rank(project_root, query, file_filter, right)
-        .cmp(&resolution_candidate_rank(
-            project_root,
-            query,
-            file_filter,
-            left,
-        ))
-        .then_with(|| compare_resolution_hits(query, left, right))
-        .then_with(|| left.node_id.0.cmp(&right.node_id.0))
-}
-
-fn no_query_match_error(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-) -> anyhow::Error {
-    let search_command = format!(
-        "codestory-cli search --project {} --query {} --limit 10",
-        quote_cli_path(project_root),
-        quote_cli_value(query)
-    );
-    match file_filter {
-        Some(file_filter) => anyhow!(
-            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `{search_command}` to inspect candidates, or relax `--file`.",
-            clean_path_string(file_filter)
-        ),
-        None => anyhow!(
-            "query_resolution: No symbol matched query `{query}`. Run `{search_command}` to inspect candidates."
-        ),
-    }
-}
-
-fn ambiguous_query_error(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    alternatives: &[SearchHit],
-) -> String {
-    let mut message = String::new();
-    let scope = file_filter
-        .map(|value| format!(" even after applying `--file {}`", clean_path_string(value)))
-        .unwrap_or_default();
-    message.push_str(&format!(
-        "Query `{query}` is ambiguous{scope}; choose a match or pass a stable id.\n"
-    ));
-    message.push_str("\nNext commands:\n");
-    message.push_str(&format!(
-        "  codestory-cli symbol --project {} --query {}{} --choose 1\n",
-        quote_cli_path(project_root),
-        quote_cli_value(query),
-        file_filter
-            .map(|value| format!(" --file {}", quote_cli_value(&clean_path_string(value))))
-            .unwrap_or_default()
-    ));
-    if let Some(first) = alternatives.first() {
-        message.push_str(&format!(
-            "  codestory-cli symbol --project {} --id {}\n",
-            quote_cli_path(project_root),
-            first.node_id.0
-        ));
-        if let Some(path) = first.file_path.as_deref() {
-            message.push_str(&format!(
-                "  codestory-cli symbol --project {} --query {} --file {}\n",
-                quote_cli_path(project_root),
-                quote_cli_value(query),
-                quote_cli_value(&relative_path(project_root, path))
-            ));
-        }
-    }
-    if file_filter.is_some() {
-        message.push_str(
-            "\nPass a more qualified symbol name, a stable `--id`, or a narrower `--file` fragment.",
-        );
-    } else {
-        message.push_str(
-            "\nPass a more qualified symbol name, add `--file <path-fragment>`, or resolve the exact `--id` from `search` output.",
-        );
-    }
-    let displayed = alternatives.len().min(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT);
-    message.push_str(&format!(
-        "\n\nTop equally ranked matches (showing {displayed} of {}):\n",
-        alternatives.len()
-    ));
-    for (index, hit) in alternatives
-        .iter()
-        .take(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT)
-        .enumerate()
-    {
-        let number = index + 1;
-        message.push_str("  ");
-        message.push_str(&number.to_string());
-        message.push_str(". ");
-        message.push_str(&format_search_hit_target(project_root, hit));
-        message.push_str(" id=`");
-        message.push_str(&hit.node_id.0);
-        message.push('`');
-        if let Some(node_ref) = node_ref(project_root, hit) {
-            message.push_str(" ref=`");
-            message.push_str(&node_ref);
-            message.push('`');
-        }
-        message.push('\n');
-    }
-    message
-}
-
-fn node_ref(project_root: &Path, hit: &SearchHit) -> Option<String> {
-    let file_path = hit.file_path.as_deref()?;
-    let line = hit.line?;
-    Some(format!(
-        "{}:{line}:{}",
-        relative_path(project_root, file_path),
-        hit.display_name
-    ))
-}
-
-fn quote_cli_path(path: &Path) -> String {
-    quote_cli_value(&clean_path_string(&path.to_string_lossy()))
-}
-
-fn quote_cli_value(value: &str) -> String {
-    if cli_value_needs_single_quotes(value) {
-        quote_cli_single_quoted_value(value)
-    } else {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
-}
-
-fn cli_value_needs_single_quotes(value: &str) -> bool {
-    value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
-}
-
-fn quote_cli_single_quoted_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]

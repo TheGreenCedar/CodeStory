@@ -85,6 +85,10 @@
   byte protocols, preserves valid UTF-8 pathname whitespace, and returns
   `unsupported_non_utf8_path` instead of lossy DTO text. Workspace-relative
   path stripping now follows native filesystem identity and case rules.
+- `impact` and `test-map` now use one typed runtime workflow for symbol
+  resolution, caller traversal, affected projections, caps, unknowns, and next
+  actions. The CLI keeps the existing syntax and output while limiting itself
+  to request parsing and rendering.
 - Generation and packaged-proof deletion now stays relative to one pinned,
   trusted directory handle. Unix cleanup uses no-follow descriptor traversal;
   Windows rejects reparse traversal and deletes through the opened handle, so
