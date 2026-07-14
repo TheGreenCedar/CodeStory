@@ -99,7 +99,7 @@ if [[ "$use_local_checkout" != "1" ]]; then
   fi
 fi
 
-cargo build --release -p codestory-cli --manifest-path "$source_dir/Cargo.toml"
+cargo build --release --locked -p codestory-cli --manifest-path "$source_dir/Cargo.toml"
 
 built="$source_dir/target/release/$binary_name"
 if [[ ! -f "$built" ]]; then

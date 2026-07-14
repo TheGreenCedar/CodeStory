@@ -66,7 +66,7 @@ jobs:
       - name: Deny rustdoc warnings
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

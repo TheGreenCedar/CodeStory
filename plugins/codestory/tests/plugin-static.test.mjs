@@ -1007,7 +1007,14 @@ test("managed cli staging rejects a version-only binary without MCP initialize",
   }
 });
 
-test("managed cli staging requires the exact MCP initialize contract", async () => {
+test("managed cli staging uses direct executables and requires the exact MCP contract", async () => {
+  assert.equal(launcherTest.isWindowsBatchCli("C:\\tools\\codestory-cli.cmd", "win32"), true);
+  assert.equal(launcherTest.isWindowsBatchCli("C:\\tools\\codestory-cli.bat", "win32"), true);
+  assert.equal(launcherTest.isWindowsBatchCli("C:\\tools\\codestory-cli.exe", "win32"), false);
+  assert.throws(
+    () => launcherTest.requireDirectCli("C:\\tools\\codestory-cli.cmd", "win32"),
+    /codestory_cli_batch_override_rejected/u,
+  );
   const incompatible = {
     jsonrpc: "2.0",
     id: "managed-cli-staging",
@@ -1017,14 +1024,19 @@ test("managed cli staging requires the exact MCP initialize contract", async () 
       serverInfo: { name: "", version: 1 },
     },
   };
+  let spawnOptions;
   await assert.rejects(
     launcherTest.probeManagedCliStdio("fixture", 100, {
-      spawn: () => fakeProbeChild(incompatible),
+      spawn: (_file, _args, options) => {
+        spawnOptions = options;
+        return fakeProbeChild(incompatible);
+      },
       terminationGraceMs: 5,
       forceKillGraceMs: 20,
     }),
     /stdio_initialize_incompatible/u,
   );
+  assert.equal(spawnOptions.shell, false);
 });
 
 test("managed cli staging escalates and awaits a stubborn child", async () => {
@@ -3729,6 +3741,42 @@ test("release asset downloader enforces a total body deadline", async () => {
     assert.ok(Date.now() - started < 1000);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader bounds announced and streamed bytes without partial files", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-bounds-"));
+  const fakeGet = (headers, body) => (_url, onResponse) => {
+    const request = new EventEmitter();
+    request.destroy = () => request;
+    process.nextTick(() => {
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = headers;
+      onResponse(response);
+      response.end(body);
+    });
+    return request;
+  };
+  try {
+    for (const [name, headers] of [
+      ["announced.bin", { "content-length": "5" }],
+      ["streamed.bin", {}],
+    ]) {
+      const destination = join(dataDir, name);
+      await assert.rejects(
+        launcherTest.downloadFile("https://example.invalid/bounded", destination, {
+          attempts: 1,
+          get: fakeGet(headers, "12345"),
+          maxBytes: 4,
+          timeoutMs: 100,
+        }),
+        /download_size_limit_exceeded/u,
+      );
+      assert.equal(fs.existsSync(destination), false);
+    }
+  } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });

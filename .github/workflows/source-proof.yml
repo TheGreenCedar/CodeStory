@@ -121,7 +121,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Lint every workspace target and feature once
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Save Cargo inputs and output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

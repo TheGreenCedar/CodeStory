@@ -35,12 +35,12 @@ Run Cargo commands serially in this repo.
 | --- | --- |
 | Docs only | `git diff --check`, `node .github/scripts/check-doc-links.mjs` |
 | Draft code | On Ubuntu: `cargo fmt --check`, `cargo check --workspace --locked`, library clippy, and focused publication contracts |
-| Exact-head source proof | After independent review accepts the current head: `cargo test --workspace --locked`, then `cargo clippy --workspace --all-targets --all-features -- -D warnings`, once |
+| Exact-head source proof | After independent review accepts the current head: `cargo test --workspace --locked`, then `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, once |
 | Scoped macOS source proof | On both `macos-15` and `macos-15-intel`: `cargo check --workspace --locked` plus setup self-tests, only for an explicitly promoted Mac-scoped head |
 | Concurrent publication | `cargo test -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture`; draft CI runs this focused contract on Ubuntu |
 | Publication fault recovery | `cargo test -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture`; `cargo test -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture`; draft CI runs both focused proofs on Ubuntu |
 | Release-blocking fidelity | `cargo test -p codestory-indexer --test fidelity_regression`, `cargo test -p codestory-indexer --test tictactoe_language_coverage`, `cargo test -p codestory-runtime --test retrieval_eval` |
-| Heavy repo-scale timing | Once on a promoted final merge-ready head: `cargo build --release -p codestory-cli`, then `cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture`; upload the output and append its metrics before the final commit |
+| Heavy repo-scale timing | Once on a promoted final merge-ready head: `cargo build --release --locked -p codestory-cli`, then `cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture`; upload the output and append its metrics before the final commit |
 
 Append fresh headline rows to
 [`codestory-e2e-stats-log.md`](../testing/codestory-e2e-stats-log.md) when
@@ -346,7 +346,7 @@ That corpus is not the strict agent A/B comparison. For language-level
 packet-runtime promotion evidence, run the manifest-backed holdout suite:
 
 ```sh
-cargo build --release -p codestory-cli
+cargo build --release --locked -p codestory-cli
 node scripts/codestory-agent-ab-benchmark.mjs \
   --packet-runtime \
   --packet-runtime-mode both \

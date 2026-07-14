@@ -85,6 +85,24 @@ function requireContent(content, requirements, violationFor) {
   }
 }
 
+function unlockedCargoCommandLines(content) {
+  return content
+    .split(/\r?\n/u)
+    .map((line, index) => ({ line, number: index + 1 }))
+    .filter(({ line }) => /\bcargo\s+(?:build|check|test|clippy|doc|run)\b/u.test(line))
+    .filter(({ line }) => !/\s--locked(?:\s|$)/u.test(line));
+}
+
+const cargoLockPolicyFixture = [
+  "run: cargo test --workspace",
+  "run: cargo test --workspace --locked",
+].join("\n");
+if (
+  unlockedCargoCommandLines(cargoLockPolicyFixture).map(({ number }) => number).join(",") !== "1"
+) {
+  violations.push("Cargo lock policy self-test must reject only the unlocked fixture");
+}
+
 function managedPluginMatrixIsRequired(content, jobName, archiveLine) {
   const job = yamlJob(content, jobName);
   const step = namedStep(job, "Prove managed plugin handoff");
@@ -188,6 +206,47 @@ for (const file of fs
       );
     }
   });
+  for (const { number } of unlockedCargoCommandLines(content)) {
+    violations.push(`${file}:${number} dependency-resolving Cargo commands must use --locked`);
+  }
+}
+
+const lockedSetupSurfaces = [
+  [
+    path.join(".cargo", "config.toml"),
+    [
+      'retrieval-setup = "run --locked -p codestory-cli',
+      'retrieval-status = "run --locked -p codestory-cli',
+    ],
+  ],
+  [
+    path.join("scripts", "codex-worktree-setup.sh"),
+    ["cargo build --release --locked -p codestory-cli"],
+  ],
+  [
+    path.join("scripts", "codex-worktree-setup.ps1"),
+    ['@("build", "--release", "--locked", "-p", "codestory-cli"'],
+  ],
+  [
+    path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.sh"),
+    ["cargo build --release --locked -p codestory-cli"],
+  ],
+  [
+    path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.ps1"),
+    ['@("build", "--release", "--locked", "-p", "codestory-cli"'],
+  ],
+  [
+    path.join("scripts", "setup-retrieval-env.mjs"),
+    ['return ["run", "--locked", ...args]'],
+  ],
+];
+for (const [surface, requirements] of lockedSetupSurfaces) {
+  const content = fs.readFileSync(surface, "utf8");
+  requireContent(
+    content,
+    requirements,
+    requirement => `${surface} must preserve locked Cargo setup contract ${requirement}`,
+  );
 }
 
 if (fs.existsSync(sagaIssueLinkGuard)) {
@@ -307,7 +366,7 @@ if (!fs.existsSync(sourceProof)) {
     'test "$current_head" = "$EVENT_HEAD_SHA"',
     "name: full-source-gate",
     "cargo test --workspace --locked",
-    "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
     "cancel-in-progress: true",
   ], snippet => `source-proof.yml must include ${snippet}`);
   if (content.includes("pull_request_target:")) {
@@ -426,6 +485,7 @@ if (!fs.existsSync(packagedPlatformProof)) {
     'LINUX_GLIBC_BASELINE_IMAGE: "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"',
     'APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"',
     "Build Linux x64 at the glibc 2.31 baseline",
+    'cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"',
     "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
     'cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli"',
     "bash .github/scripts/check-linux-glibc-baseline.sh",

@@ -369,7 +369,7 @@ if (!existsSync(cliPath)) {
     "all",
     "cli_missing",
     0,
-    "release codestory-cli is missing; run cargo build --release -p codestory-cli first",
+    "release codestory-cli is missing; run cargo build --release --locked -p codestory-cli first",
     { cli_path: cliPath },
   );
 } else {
