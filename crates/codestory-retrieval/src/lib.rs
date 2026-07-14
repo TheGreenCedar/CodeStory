@@ -25,6 +25,7 @@ mod lexical_index;
 mod mode;
 pub mod outbound_http;
 mod planner;
+mod port_registry;
 mod process_identity;
 mod qdrant_client;
 mod qdrant_storage;

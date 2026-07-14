@@ -89,6 +89,10 @@
   trusted directory handle. Unix cleanup uses no-follow descriptor traversal;
   Windows rejects reparse traversal and deletes through the opened handle, so
   an ancestor rename cannot redirect cleanup outside CodeStory-owned storage.
+- Agent port allocation now uses one normalized SQLite registry with unique
+  port rows and immediate transactions for allocation, renewal, pruning, and
+  ownership checks. The v0.15 compatibility bridge preserves and projects
+  locked v0.14 JSON state; malformed or conflicting evidence fails closed.
 - Managed installation and upgrade checks cover every shipped native platform,
   including upgrade from a verified older CLI with that version retained as the
   rollback. The Codex worktree setup dispatcher now owns one version-checked,

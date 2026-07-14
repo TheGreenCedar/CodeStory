@@ -355,20 +355,26 @@ run Docker prune, broad Docker cleanup, or host/global network deletion.
 `retrieval down` clears the sidecar state file only. Stop Docker/Compose
 separately if containers must be removed.
 
-Agent namespaces hold renewable ten-minute port leases in
-`<cache>/sidecars/port-allocations.json`. Each lease records its namespace,
-non-PID owner token, process ID for diagnostics, acquisition/renewal/expiry
-timestamps, and selected ports. Runtime construction and sidecar startup renew
-the same owner token; every renewal must present the token retained by that
-immutable runtime, and bootstrap renews periodically across storage repair,
-model preparation, and container startup. Under the registry lock, missing
-owners and expired leases are reclaimed only while their ports are free; bound
-ports remain fail-closed.
-The registry, owner records, and per-namespace recovery leases use atomic
-replacement. If the compact registry is malformed, CodeStory reconstructs it
-from valid recovery leases and refuses allocation when those records are also
-malformed. Normal allocation prunes inactive records, so registry size tracks
-active namespaces instead of permanent history. Reclamation removes a namespace
+Agent namespaces hold renewable ten-minute port leases in the authoritative
+SQLite registry at `<cache>/sidecars/port-allocations.sqlite3`. Normalized lease
+and port rows enforce one owner per namespace and one lease per port. Allocation,
+renewal, pruning, and ownership checks run together under `BEGIN IMMEDIATE` and
+the existing registry lock. Each lease records its namespace, non-PID owner
+token, process ID for diagnostics, acquisition/renewal/expiry timestamps, and
+selected ports. Runtime construction and sidecar startup renew the same owner
+token; every renewal must present the token retained by that immutable runtime,
+and bootstrap renews periodically across storage repair, model preparation, and
+container startup. Missing owners and expired leases are reclaimed only while
+their ports are free; bound ports remain fail-closed.
+
+For the v0.15 compatibility release, CodeStory imports and projects the v0.14
+`port-allocations.json`, `port-leases/<namespace>.json`, and `port-owner.json`
+records while holding that same lock. SQLite remains authoritative after import.
+Malformed or conflicting legacy evidence is preserved and blocks allocation
+when ownership is ambiguous; it is never rewritten as a repair side effect.
+The JSON bridge is scheduled for removal after the v0.15 compatibility window.
+Normal allocation prunes inactive records, so registry size tracks active
+namespaces instead of permanent history. Reclamation removes a namespace
 directory only when it is empty; state and sidecar data are never recursively
 deleted by lease cleanup.
 Test harnesses and their ephemeral namespaces must use an explicit isolated
@@ -393,7 +399,7 @@ Cache-root and profile layout:
 | Linux default | `$XDG_CACHE_HOME/codestory`, normally `~/.cache/codestory` |
 | Local profile | `<cache>/{lexical,qdrant,scip,retrieval-sidecars-v3.json}` in namespace `codestory-v3`, with configurable Qdrant/embed ports |
 | Managed Agent profile | `<cache>/sidecars/codestory-agent-v3-<workspace>-<run>/{lexical,qdrant,scip,retrieval-sidecars-v3.json}` with dynamic or persisted Qdrant/embed ports |
-| Agent port registry | `<cache>/sidecars/port-allocations.json`, with atomic `port-leases/<namespace>.json` recovery records |
+| Agent port registry | Authoritative `<cache>/sidecars/port-allocations.sqlite3`; v0.15 also imports/projects locked legacy JSON records for compatibility |
 
 Unversioned `retrieval-sidecars.json` files and pre-v3 Agent namespaces remain
 visible to inventory, but current runtimes never select, overwrite, or clean

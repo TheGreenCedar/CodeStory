@@ -71,7 +71,7 @@ fn cli_state_stays_out_of_controlled_user_cache_fallback() {
         test_support::test_state_root()
             .join("cache")
             .join("sidecars")
-            .join("port-allocations.json")
+            .join("port-allocations.sqlite3")
             .is_file(),
         "agent port registry must stay under the injected state root"
     );
