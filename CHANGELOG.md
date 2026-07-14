@@ -56,6 +56,9 @@
   unchanged, and parser-backed output is published only when the indexed bytes
   still match the file. Failed, cancelled, or concurrent refreshes preserve the
   previous usable generation.
+- SQLite lexical searches now validate immutable generation metadata on the hot
+  path and reuse stored normalized FTS text. Full corpus row-equivalence checks
+  remain at build, publication, readiness, and explicit health boundaries.
 - Express, Fastify, and FastAPI route extraction now builds one ordered
   binding timeline per module. Route queries reuse that timeline instead of
   rescanning prior statements, and FastAPI imports are resolved from parsed

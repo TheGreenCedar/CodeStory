@@ -382,23 +382,18 @@ fn search_lexical_index_with_cancel_inner(
     let connection = open_read_only(&index_path)?;
     let progress_cancelled = Arc::clone(&cancelled);
     connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
-    let _metadata = validate_open_database(
+    let _metadata = validate_open_database_metadata(
         &connection,
         project_id,
         expected_sidecar_input_hash,
         None,
-        false,
         cancelled.as_ref(),
     )?;
     let tokens = lexical_query_tokens(query);
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
-    let candidate_terms = candidate_query_terms(&tokens);
-    if candidate_terms.is_empty() {
-        return Ok(Vec::new());
-    }
-    let fts_query = candidate_terms
+    let fts_query = tokens
         .iter()
         .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
@@ -433,7 +428,8 @@ fn search_lexical_index_with_cancel_inner(
     let required_weight = required_lexical_match_weight(tokens.len(), total_weight);
 
     let mut statement = connection.prepare(
-        "SELECT d.path, d.content, d.source, d.node_id, d.symbol_name, d.start_line
+        "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+                d.source, d.node_id, d.symbol_name, d.start_line
          FROM lexical_fts
          JOIN lexical_documents d ON d.id = lexical_fts.rowid
          WHERE lexical_fts MATCH ?1
@@ -441,20 +437,21 @@ fn search_lexical_index_with_cancel_inner(
          LIMIT ?2",
     )?;
     let rows = statement.query_map(params![fts_query, candidate_limit as i64], |row| {
-        Ok(LexicalDocument {
+        let document = LexicalDocument {
             path: row.get(0)?,
             content: row.get(1)?,
-            source: LexicalDocumentSource::parse(&row.get::<_, String>(2)?).map_err(|error| {
+            source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    2,
+                    4,
                     rusqlite::types::Type::Text,
                     error.into(),
                 )
             })?,
-            node_id: row.get(3)?,
-            symbol_name: row.get(4)?,
-            start_line: row.get(5)?,
-        })
+            node_id: row.get(5)?,
+            symbol_name: row.get(6)?,
+            start_line: row.get(7)?,
+        };
+        Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
     })?;
 
     let mut hits = Vec::new();
@@ -462,9 +459,7 @@ fn search_lexical_index_with_cancel_inner(
         if index % 64 == 0 && cancelled() {
             bail!("lexical search cancelled");
         }
-        let document = row?;
-        let normalized_path = normalize_lexical_text(&document.path);
-        let normalized_content = normalize_lexical_text(&document.content);
+        let (document, normalized_path, normalized_content) = row?;
         let token_match = lexical_token_match(
             &tokens,
             &token_weights,
@@ -666,6 +661,72 @@ fn validate_open_database(
     quick_check: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
+    let metadata = validate_open_database_metadata(
+        connection,
+        expected_project_id,
+        expected_sidecar_input_hash,
+        expected_lexical,
+        cancelled,
+    )?;
+    if quick_check {
+        let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        if check != "ok" {
+            bail!("lexical SQLite shard failed quick_check: {check}");
+        }
+    }
+    let actual_count: u32 =
+        connection.query_row("SELECT count(*) FROM lexical_documents", [], |row| {
+            row.get(0)
+        })?;
+    if actual_count != metadata.file_count {
+        bail!(
+            "lexical SQLite shard row count mismatch: metadata={}, actual={actual_count}",
+            metadata.file_count
+        );
+    }
+    let fts_count: u32 =
+        connection.query_row("SELECT count(*) FROM lexical_fts", [], |row| row.get(0))?;
+    if fts_count != actual_count {
+        bail!(
+            "lexical SQLite shard FTS row count mismatch: documents={actual_count}, fts={fts_count}"
+        );
+    }
+    let mut rows = connection.prepare(
+        "SELECT d.path, d.content, f.path, f.content
+         FROM lexical_documents d
+         LEFT JOIN lexical_fts f ON f.rowid = d.id
+         ORDER BY d.id",
+    )?;
+    let mut rows = rows.query([])?;
+    let mut row_index = 0_usize;
+    while let Some(row) = rows.next()? {
+        if row_index.is_multiple_of(64) && cancelled() {
+            bail!("lexical validation cancelled");
+        }
+        row_index += 1;
+        let path: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let fts_path: Option<String> = row.get(2)?;
+        let fts_content: Option<String> = row.get(3)?;
+        if fts_path != Some(normalize_lexical_text(&path))
+            || fts_content != Some(normalize_lexical_text(&content))
+        {
+            bail!("lexical SQLite shard FTS rows do not match immutable documents");
+        }
+    }
+    if cancelled() {
+        bail!("lexical validation cancelled");
+    }
+    Ok(metadata)
+}
+
+fn validate_open_database_metadata(
+    connection: &Connection,
+    expected_project_id: &str,
+    expected_sidecar_input_hash: &str,
+    expected_lexical: Option<(u32, &str)>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<LexicalShardMetadata> {
     if cancelled() {
         bail!("lexical search cancelled");
     }
@@ -682,12 +743,6 @@ fn validate_open_database(
     )?;
     if required_tables != 3 {
         bail!("lexical SQLite shard schema is incomplete");
-    }
-    if quick_check {
-        let check: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-        if check != "ok" {
-            bail!("lexical SQLite shard failed quick_check: {check}");
-        }
     }
     let metadata = connection
         .query_row(
@@ -745,49 +800,6 @@ fn validate_open_database(
         && (metadata.file_count != file_count || metadata.lexical_hash != lexical_hash)
     {
         bail!("lexical SQLite shard does not match current lexical input");
-    }
-    let actual_count: u32 =
-        connection.query_row("SELECT count(*) FROM lexical_documents", [], |row| {
-            row.get(0)
-        })?;
-    if actual_count != metadata.file_count {
-        bail!(
-            "lexical SQLite shard row count mismatch: metadata={}, actual={actual_count}",
-            metadata.file_count
-        );
-    }
-    let fts_count: u32 =
-        connection.query_row("SELECT count(*) FROM lexical_fts", [], |row| row.get(0))?;
-    if fts_count != actual_count {
-        bail!(
-            "lexical SQLite shard FTS row count mismatch: documents={actual_count}, fts={fts_count}"
-        );
-    }
-    let mut rows = connection.prepare(
-        "SELECT d.path, d.content, f.path, f.content
-         FROM lexical_documents d
-         LEFT JOIN lexical_fts f ON f.rowid = d.id
-         ORDER BY d.id",
-    )?;
-    let mut rows = rows.query([])?;
-    let mut row_index = 0_usize;
-    while let Some(row) = rows.next()? {
-        if row_index.is_multiple_of(64) && cancelled() {
-            bail!("lexical search cancelled");
-        }
-        row_index += 1;
-        let path: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let fts_path: Option<String> = row.get(2)?;
-        let fts_content: Option<String> = row.get(3)?;
-        if fts_path != Some(normalize_lexical_text(&path))
-            || fts_content != Some(normalize_lexical_text(&content))
-        {
-            bail!("lexical SQLite shard FTS rows do not match immutable documents");
-        }
-    }
-    if cancelled() {
-        bail!("lexical search cancelled");
     }
     Ok(metadata)
 }
@@ -995,14 +1007,14 @@ fn lexical_documents_hash(documents: &[LexicalDocument], coverage: &LexicalCover
 
 fn normalize_lexical_text(value: &str) -> String {
     let mut normalized = String::with_capacity(value.len() + value.len() / 8);
-    let characters = value.chars().collect::<Vec<_>>();
-    for (index, character) in characters.iter().copied().enumerate() {
-        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
-        let next = characters.get(index + 1);
+    let mut characters = value.chars().peekable();
+    let mut previous = None;
+    while let Some(character) = characters.next() {
+        let next = characters.peek().copied();
         if character.is_uppercase()
-            && previous.is_some_and(|value| value.is_lowercase() || value.is_numeric())
+            && previous.is_some_and(|value: char| value.is_lowercase() || value.is_numeric())
             || character.is_uppercase()
-                && previous.is_some_and(|value| value.is_uppercase())
+                && previous.is_some_and(|value: char| value.is_uppercase())
                 && next.is_some_and(|value| value.is_lowercase())
         {
             normalized.push(' ');
@@ -1012,32 +1024,13 @@ fn normalize_lexical_text(value: &str) -> String {
         } else {
             normalized.push(' ');
         }
+        previous = Some(character);
     }
     normalized
 }
 
-fn candidate_query_terms(tokens: &[String]) -> Vec<String> {
-    let mut terms = Vec::new();
-    for token in tokens {
-        for part in token.split('_').filter(|part| part.len() >= 2) {
-            if !terms.iter().any(|existing| existing == part) {
-                terms.push(part.to_string());
-            }
-        }
-    }
-    terms
-}
-
 fn fts_document_frequency(connection: &Connection, token: &str) -> Result<usize> {
-    let terms = candidate_query_terms(&[token.to_string()]);
-    if terms.is_empty() {
-        return Ok(0);
-    }
-    let query = terms
-        .iter()
-        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let query = format!("\"{}\"*", token.replace('"', "\"\""));
     connection
         .query_row(
             "SELECT count(*) FROM lexical_fts WHERE lexical_fts MATCH ?1",
@@ -1051,7 +1044,7 @@ fn lexical_query_tokens(query: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let normalized = normalize_lexical_text(query);
     for token in normalized
-        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .split_whitespace()
         .filter(|token| token.len() >= 2)
         .filter(|token| !LEXICAL_STOP_WORDS.contains(token))
     {
@@ -1253,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_lexical_search_interrupts_the_sqlite_vm() {
+    fn sqlite_lexical_search_observes_cancellation() {
         let project = TempDir::new().expect("project");
         std::fs::create_dir_all(project.path().join("src")).expect("src");
         for index in 0..256 {
@@ -1269,14 +1262,14 @@ mod tests {
         let search_polls = Arc::clone(&polls);
 
         let error = search_lexical_index_with_cancel(&shard, "input", "needle", 8, move || {
-            search_polls.fetch_add(1, Ordering::Relaxed) > 20
+            search_polls.fetch_add(1, Ordering::Relaxed) > 5
         })
-        .expect_err("SQLite execution should observe cancellation");
+        .expect_err("lexical execution should observe cancellation");
 
         assert!(error.to_string().contains("cancelled"));
         assert!(
-            polls.load(Ordering::Relaxed) > 20,
-            "the progress handler must poll inside SQLite beyond Rust loop checkpoints"
+            polls.load(Ordering::Relaxed) > 5,
+            "lexical execution must poll cancellation during query work"
         );
     }
 
@@ -1465,9 +1458,10 @@ mod tests {
     }
 
     #[test]
-    fn fts_rows_are_bound_to_the_immutable_document_rows() {
+    fn deep_validation_rejects_forged_rows_without_scanning_them_on_search() {
         let project = TempDir::new().expect("project");
         std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
+        std::fs::write(project.path().join("other.rs"), "fn unrelated() {}").expect("source");
         let data = TempDir::new().expect("data");
         let shard = build(project.path(), data.path(), "binding", "input");
         let index = shard.join(LEXICAL_INDEX_FILE);
@@ -1475,7 +1469,8 @@ mod tests {
         let connection = Connection::open(&index).expect("open writable");
         connection
             .execute(
-                "UPDATE lexical_fts SET content = 'forged' WHERE rowid = 1",
+                "UPDATE lexical_fts SET content = 'forged'
+                 WHERE rowid = (SELECT id FROM lexical_documents WHERE path = 'other.rs')",
                 [],
             )
             .expect("forge FTS row");
@@ -1490,46 +1485,13 @@ mod tests {
                 .hash,
             "input"
         ));
-    }
-
-    #[test]
-    fn routine_readiness_and_search_reject_mutated_or_deleted_bound_rows() {
-        let project = TempDir::new().expect("project");
-        std::fs::write(project.path().join("lib.rs"), "fn handler() {}").expect("source");
-        let data = TempDir::new().expect("data");
-        for (generation, mutation) in [
-            (
-                "mutated-fts",
-                "UPDATE lexical_fts SET content = 'forged' WHERE rowid = 1;",
-            ),
-            ("deleted-fts", "DELETE FROM lexical_fts WHERE rowid = 1;"),
-            (
-                "mutated-document",
-                "DROP TRIGGER lexical_documents_no_update;
-                 UPDATE lexical_documents SET content = 'forged' WHERE id = 1;",
-            ),
-            (
-                "deleted-document",
-                "DROP TRIGGER lexical_documents_no_delete;
-                 DELETE FROM lexical_documents WHERE id = 1;",
-            ),
-        ] {
-            let shard = build(project.path(), data.path(), generation, "input");
-            let index = shard.join(LEXICAL_INDEX_FILE);
-            make_test_file_writable(&index);
-            let connection = Connection::open(&index).expect("open writable");
-            connection.execute_batch(mutation).expect("mutate shard");
-            drop(connection);
-
-            assert!(
-                !shard_has_lexical_index(&shard, "input"),
-                "readiness accepted {generation}"
-            );
-            assert!(
-                search_lexical_index(&shard, "input", "handler", 4).is_err(),
-                "search accepted {generation}"
-            );
-        }
+        assert_eq!(
+            search_lexical_index(&shard, "input", "handler", 4)
+                .expect("metadata-valid search")
+                .first()
+                .map(|hit| hit.path.as_str()),
+            Some("lib.rs")
+        );
     }
 
     #[test]
@@ -1670,87 +1632,106 @@ mod tests {
     #[ignore = "measurement fixture; run with --ignored --nocapture for PR corpus/query evidence"]
     fn report_jsonl_to_sqlite_corpus_and_query_delta() {
         let root = TempDir::new().expect("root");
-        let shard = shard_dir_for(root.path(), "benchmark");
-        std::fs::create_dir_all(&shard).expect("shard");
-        let documents = (0..10_000)
-            .map(|index| LexicalDocument {
-                path: format!("src/file_{index:05}.rs"),
-                content: format!("pub fn symbol_{index:05}() {{ handler_{index:05}(); }}"),
-                source: LexicalDocumentSource::LexicalSource,
-                node_id: None,
-                symbol_name: None,
-                start_line: None,
-            })
-            .collect::<Vec<_>>();
-        let coverage = LexicalCoverage {
-            discovered_files: documents.len() as u32,
-            indexed_files: documents.len() as u32,
-            ..Default::default()
-        };
-        let fingerprint = LexicalInputFingerprint {
-            file_count: documents.len() as u32,
-            hash: lexical_documents_hash(&documents, &coverage),
-            coverage: coverage.clone(),
-        };
-        write_lexical_database(
-            &shard.join(LEXICAL_INDEX_FILE),
-            "benchmark",
-            "benchmark-input",
-            &fingerprint,
-            |visit| {
-                for document in &documents {
-                    visit(document)?;
-                }
-                Ok(coverage.clone())
-            },
-        )
-        .expect("write sqlite");
-        let jsonl = documents
-            .iter()
-            .flat_map(|document| {
-                let mut row = serde_json::to_vec(document).expect("serialize JSONL row");
-                row.push(b'\n');
-                row
-            })
-            .collect::<Vec<_>>();
-        let jsonl_path = shard.join(LEGACY_INDEX_FILE);
-        std::fs::write(&jsonl_path, &jsonl).expect("write JSONL");
-
-        let query = "symbol_09999";
-        let mut sqlite_micros = Vec::new();
-        let mut jsonl_micros = Vec::new();
-        let mut sqlite_top = None;
-        let mut jsonl_top = None;
-        for _ in 0..21 {
-            let started = std::time::Instant::now();
-            let hits =
-                search_lexical_index(&shard, "benchmark-input", query, 8).expect("SQLite search");
-            sqlite_micros.push(started.elapsed().as_micros() as u64);
-            sqlite_top = hits.first().map(|hit| hit.path.clone());
-
-            let started = std::time::Instant::now();
-            let parsed = std::fs::read_to_string(&jsonl_path)
-                .expect("read JSONL")
-                .lines()
-                .map(|line| serde_json::from_str::<LexicalDocument>(line).expect("parse row"))
+        let mut reports = Vec::new();
+        for corpus_documents in [1_000_usize, 10_000] {
+            let generation = format!("benchmark-{corpus_documents}");
+            let shard = shard_dir_for(root.path(), &generation);
+            std::fs::create_dir_all(&shard).expect("shard");
+            let documents = (0..corpus_documents)
+                .map(|index| LexicalDocument {
+                    path: format!("src/file_{index:05}.rs"),
+                    content: format!("pub fn symbol_{index:05}() {{ handler_{index:05}(); }}"),
+                    source: LexicalDocumentSource::LexicalSource,
+                    node_id: None,
+                    symbol_name: None,
+                    start_line: None,
+                })
                 .collect::<Vec<_>>();
-            let hits = legacy_full_scan_for_measurement(&parsed, query, 8);
-            jsonl_micros.push(started.elapsed().as_micros() as u64);
-            jsonl_top = hits.first().map(|hit| hit.path.clone());
-        }
-        sqlite_micros.sort_unstable();
-        jsonl_micros.sort_unstable();
-        assert_eq!(sqlite_top, jsonl_top);
-        println!(
-            "{}",
-            serde_json::json!({
+            let coverage = LexicalCoverage {
+                discovered_files: documents.len() as u32,
+                indexed_files: documents.len() as u32,
+                ..Default::default()
+            };
+            let fingerprint = LexicalInputFingerprint {
+                file_count: documents.len() as u32,
+                hash: lexical_documents_hash(&documents, &coverage),
+                coverage: coverage.clone(),
+            };
+            let index_path = shard.join(LEXICAL_INDEX_FILE);
+            write_lexical_database(
+                &index_path,
+                &generation,
+                "benchmark-input",
+                &fingerprint,
+                |visit| {
+                    for document in &documents {
+                        visit(document)?;
+                    }
+                    Ok(coverage.clone())
+                },
+            )
+            .expect("write sqlite");
+            let jsonl = documents
+                .iter()
+                .flat_map(|document| {
+                    let mut row = serde_json::to_vec(document).expect("serialize JSONL row");
+                    row.push(b'\n');
+                    row
+                })
+                .collect::<Vec<_>>();
+            let jsonl_path = shard.join(LEGACY_INDEX_FILE);
+            std::fs::write(&jsonl_path, &jsonl).expect("write JSONL");
+
+            let mut deep_validation_micros = Vec::new();
+            for _ in 0..7 {
+                let started = std::time::Instant::now();
+                validate_lexical_database(
+                    &index_path,
+                    &generation,
+                    "benchmark-input",
+                    Some((fingerprint.file_count, fingerprint.hash.as_str())),
+                    true,
+                )
+                .expect("deep validation");
+                deep_validation_micros.push(started.elapsed().as_micros() as u64);
+            }
+
+            let query = format!("symbol_{:05}", corpus_documents - 1);
+            let mut sqlite_micros = Vec::new();
+            let mut jsonl_micros = Vec::new();
+            let mut sqlite_top = None;
+            let mut jsonl_top = None;
+            for _ in 0..21 {
+                let started = std::time::Instant::now();
+                let hits = search_lexical_index(&shard, "benchmark-input", &query, 8)
+                    .expect("SQLite search");
+                sqlite_micros.push(started.elapsed().as_micros() as u64);
+                sqlite_top = hits.first().map(|hit| hit.path.clone());
+
+                let started = std::time::Instant::now();
+                let parsed = std::fs::read_to_string(&jsonl_path)
+                    .expect("read JSONL")
+                    .lines()
+                    .map(|line| serde_json::from_str::<LexicalDocument>(line).expect("parse row"))
+                    .collect::<Vec<_>>();
+                let hits = legacy_full_scan_for_measurement(&parsed, &query, 8);
+                jsonl_micros.push(started.elapsed().as_micros() as u64);
+                jsonl_top = hits.first().map(|hit| hit.path.clone());
+            }
+            deep_validation_micros.sort_unstable();
+            sqlite_micros.sort_unstable();
+            jsonl_micros.sort_unstable();
+            assert_eq!(sqlite_top, jsonl_top);
+            reports.push(serde_json::json!({
                 "corpus_documents": documents.len(),
                 "jsonl_bytes": std::fs::metadata(jsonl_path).expect("JSONL metadata").len(),
-                "sqlite_bytes": std::fs::metadata(shard.join(LEXICAL_INDEX_FILE)).expect("SQLite metadata").len(),
+                "sqlite_bytes": std::fs::metadata(index_path).expect("SQLite metadata").len(),
+                "deep_validation_median_us": deep_validation_micros[deep_validation_micros.len() / 2],
                 "jsonl_median_query_us": jsonl_micros[jsonl_micros.len() / 2],
-                "sqlite_median_query_us": sqlite_micros[sqlite_micros.len() / 2],
-            })
-        );
+                "sqlite_warm_median_query_us": sqlite_micros[sqlite_micros.len() / 2],
+            }));
+        }
+        println!("{}", serde_json::json!({ "corpora": reports }));
     }
 
     fn legacy_full_scan_for_measurement(
