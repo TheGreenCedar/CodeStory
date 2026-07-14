@@ -1115,17 +1115,9 @@ pub fn expected_native_embedding_launch_metadata(
     repo_root: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<crate::health::EmbeddingLaunchMetadata>> {
-    let native = runtime
-        .embedding
-        .server_launch
-        .as_deref()
-        .is_some_and(|mode| {
-            matches!(
-                mode.trim().to_ascii_lowercase().as_str(),
-                "native" | "native_spawned"
-            )
-        });
-    if !native {
+    if crate::config::embedding_server_launch_mode_for_runtime(runtime)?
+        != EmbeddingServerLaunchMode::NativeSpawned
+    {
         return Ok(None);
     }
     let launch = native_embedding_server_launch(Some(repo_root), runtime)?;

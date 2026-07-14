@@ -548,60 +548,26 @@ fn broker_scope_treats_windows_case_alias_as_one_workspace() {
 }
 
 #[test]
-fn native_embedding_reuse_does_not_cross_workspace_roots() {
-    let project = tempdir().expect("project");
-    let other_worktree = tempdir().expect("other worktree");
-    let scope = test_scope(project.path(), "shared-agent");
-    let sidecar = test_sidecar_runtime(
-        project.path(),
-        codestory_retrieval::SidecarProfile::Agent,
-        Some("shared-agent"),
-    );
-    let busy = BrokerMachineResourceBusy {
-        snapshot: BrokerResourceSnapshot {
-            resource: NATIVE_EMBEDDING_RESOURCE.to_string(),
-            scope: "machine".to_string(),
-            status: "busy".to_string(),
-            owner_pid: Some(std::process::id()),
-            owner_operation_id: Some("other-worktree".to_string()),
-            owner_project_id: Some(scope.project_id.clone()),
-            owner_workspace_root: Some(clean_path(other_worktree.path())),
-            started_at_epoch_ms: Some(now_epoch_ms()),
-            lock_path: "other-worktree.lock".to_string(),
-            queued_reason: Some("machine_resource_busy".to_string()),
-        },
-    };
-    let mut validate = |_launch: &codestory_retrieval::EmbeddingLaunchMetadata| {
-        panic!("different workspace must not reach launch validation")
-    };
-
-    assert_eq!(
-        reusable_native_embedding_resource_pid(&scope, &sidecar, &busy, &mut validate)
-            .expect("workspace comparison"),
-        None
-    );
-}
-
-#[test]
-fn native_embedding_busy_lock_reuses_matching_sidecar_owner() {
-    let project = tempdir().expect("temp project");
+fn native_embedding_busy_lock_reuses_matching_cross_project_owner() {
+    let owner_project = tempdir().expect("owner project");
+    let requested_project = tempdir().expect("requested project");
     let resource = unique_resource("native-reuse");
     cleanup_machine_resource(&resource);
     let owner_scope = operation_scope(
-        project.path(),
+        owner_project.path(),
         "local",
         None,
         "retrieval_bootstrap",
         "9.9.9",
     );
-    let requested_scope = test_scope(project.path(), "shared-agent");
+    let requested_scope = test_scope(requested_project.path(), "shared-agent");
     let owner_sidecar = test_sidecar_runtime(
-        project.path(),
+        owner_project.path(),
         codestory_retrieval::SidecarProfile::Local,
         None,
     );
     let requested_sidecar = test_sidecar_runtime(
-        project.path(),
+        requested_project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
     );
@@ -613,6 +579,14 @@ fn native_embedding_busy_lock_reuses_matching_sidecar_owner() {
     snapshot.status = "busy".to_string();
     let busy = BrokerMachineResourceBusy { snapshot };
     let validator_called = std::cell::Cell::new(false);
+
+    let owner_down = native_embedding_owner_down_command(&busy.snapshot)
+        .expect("full owner exposes exact cleanup command");
+    assert!(owner_down.contains("--profile local"), "{owner_down}");
+    assert!(
+        owner_down.contains(&clean_path(owner_project.path())),
+        "{owner_down}"
+    );
 
     let reused = reusable_native_embedding_resource_launch_with_matcher(
         &requested_scope,
@@ -628,11 +602,37 @@ fn native_embedding_busy_lock_reuses_matching_sidecar_owner() {
                 validator_called.get(),
                 "process identity must be exact before runtime configuration matching"
             );
+            let lexical_log = owner_project.path().join("llama-server-native.log");
+            fs::write(&lexical_log, "native launch proof\n").expect("write native log fixture");
+            let mut lexical_log_launch = launch.clone();
+            lexical_log_launch.log_path = Some(lexical_log.display().to_string());
+            let mut canonical_log_launch = lexical_log_launch.clone();
+            canonical_log_launch.log_path = Some(
+                lexical_log
+                    .canonicalize()
+                    .expect("canonical native log fixture")
+                    .display()
+                    .to_string(),
+            );
+            assert!(same_native_launch_configuration(
+                &canonical_log_launch,
+                &lexical_log_launch,
+                true
+            ));
             assert_eq!(scope.operation_kind, "retrieval_bootstrap");
             assert_eq!(scope.profile, "local");
+            assert_ne!(scope.project_id, requested_scope.project_id);
+            assert_ne!(
+                scope.canonical_root_hash,
+                requested_scope.canonical_root_hash
+            );
             assert_ne!(
                 broker_operation_id(scope),
                 broker_operation_id(&requested_scope)
+            );
+            assert_eq!(
+                retargeted.project_identity,
+                requested_sidecar.project_identity
             );
             assert_eq!(
                 retargeted.profile,
