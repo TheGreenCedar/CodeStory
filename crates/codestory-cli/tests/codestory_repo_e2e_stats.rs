@@ -490,11 +490,12 @@ struct ReleaseE2eSidecarCleanup {
     project_root: PathBuf,
     cache_dir: PathBuf,
     run_id: String,
+    armed: bool,
 }
 
-impl Drop for ReleaseE2eSidecarCleanup {
-    fn drop(&mut self) {
-        let _ = test_support::command(&self.binary)
+impl ReleaseE2eSidecarCleanup {
+    fn down(&self) -> std::io::Result<std::process::Output> {
+        test_support::command(&self.binary)
             .current_dir(&self.project_root)
             .args(["retrieval", "down", "--profile", "agent", "--run-id"])
             .arg(&self.run_id)
@@ -505,7 +506,64 @@ impl Drop for ReleaseE2eSidecarCleanup {
             .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
             .env("CODESTORY_EMBED_BACKEND", "llamacpp")
             .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
-            .output();
+            .output()
+    }
+
+    fn teardown(&mut self) {
+        let (_, status_json) = run_cli_json(
+            &self.binary,
+            &self.project_root,
+            &self.cache_dir,
+            &[
+                "retrieval".to_string(),
+                "status".to_string(),
+                "--profile".to_string(),
+                "agent".to_string(),
+                "--run-id".to_string(),
+                self.run_id.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+        let namespace = string_field(&status_json, &["ownership", "namespace"]).to_string();
+
+        let down = self.down().expect("tear down release evidence sidecar");
+        assert!(
+            down.status.success(),
+            "release evidence sidecar teardown failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&down.stdout),
+            String::from_utf8_lossy(&down.stderr)
+        );
+
+        let (_, inventory_json) = run_cli_json(
+            &self.binary,
+            &self.project_root,
+            &self.cache_dir,
+            &[
+                "retrieval".to_string(),
+                "inventory".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+        let namespaces = json_path(&inventory_json, &["namespaces"])
+            .as_array()
+            .expect("release evidence sidecar inventory namespaces");
+        assert!(
+            !namespaces
+                .iter()
+                .any(|entry| entry["namespace"].as_str() == Some(namespace.as_str())),
+            "release evidence teardown left owned namespace {namespace}: {inventory_json:#}"
+        );
+        self.armed = false;
+    }
+}
+
+impl Drop for ReleaseE2eSidecarCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.down();
+        }
     }
 }
 
@@ -715,11 +773,12 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
 
     let cache_dir = tempdir().expect("cache dir");
-    let _sidecar_cleanup = ReleaseE2eSidecarCleanup {
+    let mut sidecar_cleanup = ReleaseE2eSidecarCleanup {
         binary: binary.clone(),
         project_root: project_root.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
         run_id: sidecar_run_id.to_string(),
+        armed: true,
     };
 
     let (index_seconds, index_json) = run_cli_json(
@@ -1300,6 +1359,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.search_dir_unchanged,
         "plain read commands should not recreate the persisted search dir"
     );
+    sidecar_cleanup.teardown();
 }
 
 #[test]
@@ -1354,13 +1414,14 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             missing.join(", ")
         );
     }
-    let _sidecar_cleanup = cases
+    let mut sidecar_cleanup = cases
         .iter()
         .map(|case| ReleaseE2eSidecarCleanup {
             binary: binary.clone(),
             project_root: case.project_root.clone(),
             cache_dir: cache_dir.path().join(&case.name),
             run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
+            armed: true,
         })
         .collect::<Vec<_>>();
 
@@ -1566,6 +1627,9 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         }
 
         assert_manifest_anchor_expectations(case, repo_json);
+    }
+    for cleanup in &mut sidecar_cleanup {
+        cleanup.teardown();
     }
 }
 

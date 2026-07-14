@@ -3,6 +3,12 @@ name: Release candidate evidence
 on:
   workflow_call:
     inputs:
+      ref:
+        required: true
+        type: string
+      proof_key:
+        required: true
+        type: string
       profile:
         required: true
         type: string
@@ -21,37 +27,25 @@ on:
     secrets:
       CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
         required: false
-  workflow_dispatch:
-    inputs:
-      profile:
-        description: Approved release-eligible profile id.
-        required: true
-        type: string
-      drill_manifest:
-        description: Absolute path to the prepared real-repo drill manifest on the evidence runner.
-        required: false
-        type: string
-      embedding_model_dir:
-        description: Absolute path containing bge-base-en-v1.5.Q8_0.gguf on the evidence runner.
-        required: false
-        type: string
-      source_run_id:
-        description: Optional prior rejected evidence run id to re-evaluate without re-measuring.
-        required: false
-        type: string
 
 permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: release-candidate-evidence-${{ inputs.proof_key }}
+  cancel-in-progress: true
+
 jobs:
   measure:
     name: Measure release candidate
+    environment: release-evidence
     runs-on: [self-hosted, Linux, ARM64, codestory-release-evidence]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
 
       - name: Record and validate runner provisioning
@@ -95,7 +89,7 @@ jobs:
         env:
           CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR: ${{ github.workspace }}/target/release-evidence/drill
           CODESTORY_RELEASE_EVIDENCE_STATS_PATH: ${{ github.workspace }}/target/release-evidence/stats.json
-          CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ github.sha }}
+          CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
           CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
           CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
@@ -104,14 +98,14 @@ jobs:
           CODESTORY_EMBED_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
           set -euo pipefail
-          cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture \
+          cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture --test-threads=1 \
             2>&1 | tee target/release-evidence/repo-e2e-output.txt
 
       - name: Produce publishable packet evidence
         if: inputs.source_run_id == ''
         shell: bash
         env:
-          CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ github.sha }}
+          CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
           CODESTORY_RELEASE_EVIDENCE_PROFILE: ${{ inputs.profile }}
           CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
           CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
@@ -137,12 +131,13 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          EVIDENCE_SHA: ${{ inputs.ref }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           mkdir -p target/release-evidence
           gh run download "$SOURCE_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --name "release-evidence-$GITHUB_SHA" \
+            --name "release-evidence-$EVIDENCE_SHA" \
             --dir target/release-evidence
 
       - name: Produce and evaluate same-SHA candidate
@@ -150,6 +145,7 @@ jobs:
         env:
           PROFILE: ${{ inputs.profile }}
           APPROVAL_JSON: ${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}
+          EVIDENCE_SHA: ${{ inputs.ref }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           set -euo pipefail
@@ -160,7 +156,7 @@ jobs:
               --stats target/release-evidence/stats.json \
               --packet target/release-evidence/packet/packet-runtime-summary.json \
               --out target/release-evidence/candidate.json \
-              --expected-sha "$GITHUB_SHA" \
+              --expected-sha "$EVIDENCE_SHA" \
               --mode release \
               --repo "$GITHUB_WORKSPACE"
           fi
@@ -173,7 +169,7 @@ jobs:
             --baseline benchmarks/release-evidence/approved-baselines.json \
             --candidate target/release-evidence/candidate.json \
             --out target/release-evidence/report.json \
-            --expected-sha "$GITHUB_SHA" \
+            --expected-sha "$EVIDENCE_SHA" \
             --mode release \
             --repo "$GITHUB_WORKSPACE" \
             "${approval_args[@]}"
@@ -182,6 +178,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: release-evidence-${{ github.sha }}
+          name: release-evidence-${{ inputs.ref }}
           path: target/release-evidence
           if-no-files-found: warn

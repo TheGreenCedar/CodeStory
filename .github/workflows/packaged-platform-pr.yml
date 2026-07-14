@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Prove an accepted PR head or the current dev integration head.
+        description: Prove an accepted PR head, run release evidence, or prove current dev.
         required: true
         default: platform
         type: choice
-        options: [platform, integration]
+        options: [platform, release-evidence, integration]
       pr_number:
         description: Same-repository pull request for platform mode.
         required: false
@@ -25,6 +25,10 @@ on:
         default: auto
         type: choice
         options: [auto, windows, macos, full]
+      source_run_id:
+        description: Optional prior rejected release-evidence run to re-evaluate.
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -76,7 +80,7 @@ jobs:
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          test "$mode" = "platform"
+          test "$mode" = "platform" || test "$mode" = "release-evidence"
           pr_number="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
           expected_head="${EVENT_HEAD_SHA:-$INPUT_HEAD_SHA}"
           test -n "$pr_number" && test -n "$expected_head"
@@ -84,6 +88,7 @@ jobs:
           head_repo="$(jq -r '.head.repo.full_name' <<<"$pr")"
           current_head="$(jq -r '.head.sha' <<<"$pr")"
           base_sha="$(jq -r '.base.sha' <<<"$pr")"
+          base_ref="$(jq -r '.base.ref' <<<"$pr")"
           test "$head_repo" = "$GITHUB_REPOSITORY" || {
             echo "::error::Platform proof does not execute fork pull requests."
             exit 1
@@ -95,15 +100,26 @@ jobs:
             echo "::error::PR #$pr_number moved from promoted head $expected_head to $current_head."
             exit 1
           }
+          if [ "$mode" = "release-evidence" ]; then
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            test "$base_ref" = "dev/codestory-next" || {
+              echo "::error::Release evidence requires a PR into dev/codestory-next, not $base_ref."
+              exit 1
+            }
+            jq -e 'any(.labels[]; .name == "review-accepted")' <<<"$pr" >/dev/null || {
+              echo "::error::PR #$pr_number does not carry the review-accepted label."
+              exit 1
+            }
+          fi
           {
             echo "head_sha=$current_head"
             echo "base_sha=$base_sha"
-            echo "mode=platform"
-            echo "proof_key=pr-$pr_number-$current_head"
+            echo "mode=$mode"
+            echo "proof_key=$mode-pr-$pr_number-$current_head"
           } >> "$GITHUB_OUTPUT"
 
       - name: Require successful exact-head source proof
-        if: steps.resolve.outputs.mode == 'platform'
+        if: steps.resolve.outputs.mode != 'integration'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -147,6 +163,8 @@ jobs:
           set -euo pipefail
           if [ "${{ steps.resolve.outputs.mode }}" = "integration" ]; then
             scope=full
+          elif [ "${{ steps.resolve.outputs.mode }}" = "release-evidence" ]; then
+            scope=none
           else
             scope="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" | node .github/scripts/route-ci-proof.mjs --stdin --requested "$REQUESTED_SCOPE")"
           fi
@@ -154,6 +172,7 @@ jobs:
           echo "Selected $scope platform proof."
 
       - name: Verify package version surfaces
+        if: steps.resolve.outputs.mode != 'release-evidence'
         id: version
         shell: bash
         run: |
@@ -203,11 +222,24 @@ jobs:
       - run: test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh
 
   repo-scale-stats:
+    if: needs.route.outputs.mode != 'release-evidence'
     needs: route
     uses: ./.github/workflows/repo-scale-stats.yml
     with:
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
+
+  release-evidence:
+    if: needs.route.outputs.mode == 'release-evidence'
+    needs: route
+    uses: ./.github/workflows/release-candidate-evidence.yml
+    with:
+      ref: ${{ needs.route.outputs.head_sha }}
+      proof_key: ${{ needs.route.outputs.proof_key }}
+      profile: codestory-release-evidence-linux-arm64-v1
+      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
+      embedding_model_dir: /srv/codestory-release-evidence/models
+      source_run_id: ${{ inputs.source_run_id }}
 
   source-proof:
     if: needs.route.outputs.mode == 'integration'
@@ -253,7 +285,7 @@ jobs:
       use_packaged_cli_artifact: true
 
   closeout:
-    if: always() && needs.route.result != 'skipped'
+    if: always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'release-evidence'
     needs:
       - route
       - macos-source

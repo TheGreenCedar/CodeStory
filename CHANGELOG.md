@@ -8,8 +8,8 @@
   changelog before the existing platform proof-boundary appendix. Publication
   fails when that version section is missing, duplicated, or empty instead of
   substituting an automatically generated pull-request list.
-- Retained raw repo-scale and real-repository drill evidence from the explicit
-  CPU-backed Linux ARM64 release profile without weakening baseline evaluation.
+- Gated CPU-backed Linux ARM64 release evidence on protected exact-head approval
+  while retaining raw repo-scale and drill output without weakening evaluation.
 - Added reproducible provisioning for the repository-scoped Linux
   release-evidence runner. The runner uses a stable provisioned machine
   identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64

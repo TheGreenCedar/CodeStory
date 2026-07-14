@@ -11,6 +11,7 @@ const closeDevIssues = path.join(workflowRoot, "close-dev-issues.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
 const releaseWorkflow = path.join(workflowRoot, "release.yml");
+const releaseCandidateEvidence = path.join(workflowRoot, "release-candidate-evidence.yml");
 const releaseNotesExtractor = path.join(".github", "scripts", "extract-codestory-release-notes.mjs");
 const postPublishReleaseSmoke = path.join(workflowRoot, "post-publish-release-smoke.yml");
 const packagedPlatformPr = path.join(workflowRoot, "packaged-platform-pr.yml");
@@ -563,12 +564,14 @@ if (!fs.existsSync(packagedPlatformPr)) {
     "types: [labeled, synchronize]",
     "platform-proof",
     "workflow_dispatch:",
-    "options: [platform, integration]",
+    "options: [platform, release-evidence, integration]",
     "options: [auto, windows, macos, full]",
     "expected_head_sha:",
     "actions: read",
     'test "$head_repo" = "$GITHUB_REPOSITORY"',
     'test "$current_head" = "$expected_head"',
+    'test "$base_ref" = "dev/codestory-next"',
+    'any(.labels[]; .name == "review-accepted")',
     "actions/runs?head_sha=$HEAD_SHA",
     '.path == ".github/workflows/source-proof.yml"',
     ".head_repository.full_name == $repo",
@@ -578,7 +581,10 @@ if (!fs.existsSync(packagedPlatformPr)) {
     "scope=full",
     "uses: ./.github/workflows/source-proof.yml",
     "uses: ./.github/workflows/repo-scale-stats.yml",
+    "uses: ./.github/workflows/release-candidate-evidence.yml",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
+    "profile: codestory-release-evidence-linux-arm64-v1",
+    "source_run_id: ${{ inputs.source_run_id }}",
     "scope: ${{ needs.route.outputs.scope }}",
     "always() &&\n      needs.route.result == 'success' &&\n      needs.packaged-proof.result == 'success' &&",
     "uses: ./.github/workflows/macos-metal-proof.yml",
@@ -632,6 +638,24 @@ if (!fs.existsSync(packagedPlatformPr)) {
     content.includes("pull_request_target:")
   ) {
     violations.push("packaged-platform-pr.yml must not request release permissions or call the publishing workflow");
+  }
+}
+
+if (!fs.existsSync(releaseCandidateEvidence)) {
+  violations.push("release-candidate-evidence.yml must own protected live evidence");
+} else {
+  const content = fs.readFileSync(releaseCandidateEvidence, "utf8");
+  requireContent(content, [
+    "workflow_call:",
+    "proof_key:",
+    "environment: release-evidence",
+    "runs-on: [self-hosted, Linux, ARM64, codestory-release-evidence]",
+    "ref: ${{ inputs.ref }}",
+    "--test-threads=1",
+    "release-evidence-${{ inputs.ref }}",
+  ], snippet => `release-candidate-evidence.yml must include ${snippet}`);
+  if (content.includes("workflow_dispatch:")) {
+    violations.push("release-candidate-evidence.yml must be callable only through the coordinator workflow");
   }
 }
 
