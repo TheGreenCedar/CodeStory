@@ -5,7 +5,8 @@
  * Primary documented path: `cargo retrieval-setup` from repo root.
  * This script adds prerequisite reporting and optional holdout repo clones.
  *
- * Prerequisites: Node 18+, cargo, Docker Desktop (unless --skip-compose).
+ * Prerequisites: Node 18+ and cargo. Docker is needed only for the managed
+ * Linux embedding service or an explicitly selected external-Qdrant compose path.
  * SCIP language indexers are documented only — not installed by this script.
  */
 import { spawnSync } from "node:child_process";
@@ -191,6 +192,10 @@ function cargoRunArgs(...args) {
 function printPrereqReport(opts) {
   const composeFile = path.join(repoRoot, "docker", "retrieval-compose.yml");
   const cacheRoot = codestoryCacheRoot();
+  const externalQdrant =
+    process.env.CODESTORY_VECTOR_BACKEND?.trim().toLowerCase() === "external_qdrant";
+  const composeRequired =
+    !opts.skipCompose && !opts.fetchOnly && (process.platform === "linux" || externalQdrant);
   const checks = [
     ["node", commandExists("node"), "required"],
     [
@@ -201,7 +206,9 @@ function printPrereqReport(opts) {
     [
       "docker",
       commandExists("docker"),
-      opts.skipCompose || opts.fetchOnly ? "optional" : "required for live Qdrant",
+      composeRequired
+        ? "required for the selected container-backed service"
+        : "optional; unused by the default managed path on this host",
     ],
     [
       "tar",
@@ -213,9 +220,9 @@ function printPrereqReport(opts) {
     [
       `compose file (${composeFile})`,
       fs.existsSync(composeFile),
-      opts.fetchOnly
-        ? "optional"
-        : "required unless CODESTORY_RETRIEVAL_COMPOSE_FILE points elsewhere",
+      composeRequired
+        ? "required unless CODESTORY_RETRIEVAL_COMPOSE_FILE points elsewhere"
+        : "optional for the selected managed path",
     ],
   ];
 
@@ -234,7 +241,16 @@ function printPrereqReport(opts) {
   }
 
   console.log("\nAutomated:");
-  console.log("  - Docker Compose: Qdrant + llama.cpp embed service");
+  if (externalQdrant) {
+    console.log("  - External-Qdrant compatibility path selected explicitly");
+  } else {
+    console.log("  - Embedded SQLite vector generation (no Qdrant service)");
+  }
+  console.log(
+    process.platform === "linux"
+      ? "  - Managed llama.cpp embedding service through Docker Compose"
+      : "  - Managed native llama.cpp embedding service",
+  );
   console.log("  - codestory retrieval bootstrap (cache dirs, sidecar state, health wait)");
   console.log("  - codestory retrieval status --project <path>");
   if (opts.withHoldoutClone) {
@@ -245,9 +261,9 @@ function printPrereqReport(opts) {
   console.log("  - SCIP indexers per language (rust-analyzer scip, scip-typescript, etc.)");
   console.log("  - retrieval index --project <repo> after sidecars are healthy");
 
-  if (!opts.skipCompose && !commandExists("docker")) {
-    console.log("\nDocker install (Windows):");
-    console.log("  https://docs.docker.com/desktop/setup/install/windows-install/");
+  if (composeRequired && !commandExists("docker")) {
+    console.log("\nDocker install:");
+    console.log("  https://docs.docker.com/desktop/");
     console.log("\nManual Qdrant without compose:");
     console.log(
       `  docker run -d --name codestory-qdrant -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 ` +
@@ -325,6 +341,8 @@ function selectedLlamaBackend(opts) {
     process.env.CODESTORY_EMBED_DEVICE_PROVIDER?.trim().toLowerCase() ||
     (osName === "macos" && arch === "aarch64"
       ? "metal"
+      : osName === "macos" && arch === "x86_64"
+        ? "cpu"
       : osName === "windows" && arch === "x86_64"
         ? "vulkan"
         : "");
@@ -394,12 +412,21 @@ function runSelfTest() {
   }
   const backends = readLlamaBackends();
   const macMetal = backends.find((backend) => backend.id === "macos-aarch64-metal");
+  const macCpu = backends.find((backend) => backend.id === "macos-x86_64-cpu");
   const winVulkan = backends.find((backend) => backend.id === "windows-x86_64-vulkan");
   const winLegacy = backends.find(
     (backend) => backend.id === "windows-x86_64-vulkan-b9058-legacy",
   );
   if (!macMetal) {
     throw new Error("missing macos-aarch64-metal backend");
+  }
+  if (
+    !macCpu ||
+    macCpu.launch_mode !== "native_spawned" ||
+    !macCpu.sha256 ||
+    !macCpu.executable_sha256
+  ) {
+    throw new Error("missing checksum-backed macOS Intel native CPU backend");
   }
   if (!winVulkan) {
     throw new Error("missing windows-x86_64-vulkan backend");
@@ -414,9 +441,6 @@ function runSelfTest() {
     )
   ) {
     throw new Error("downloadable llama-server backends must declare artifact_bytes");
-  }
-  if (backends.some((backend) => backend.os === "macos" && backend.arch !== "aarch64")) {
-    throw new Error("macOS Intel llama-server backend must not be present");
   }
   if (!macMetal.managed_cache_rel_dir.includes("/llama/b9902/")) {
     throw new Error(`unexpected managed cache version path: ${macMetal.managed_cache_rel_dir}`);

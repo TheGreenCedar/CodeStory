@@ -65,7 +65,7 @@ flowchart LR
 - `codestory-workspace` discovers files, loads `codestory_project.json`, and computes full or incremental refresh plans.
 - `codestory-store` owns SQLite schema, graph persistence, snapshot lifecycle, trail queries, bookmark rows, and stored search documents.
 - `codestory-indexer` parses files, extracts symbols and edges, flushes batches to the store, and runs semantic resolution.
-- `codestory-retrieval` owns the project-local SQLite lexical shard, Qdrant/SCIP health, sidecar manifests, product embedding backend checks, and fail-closed query execution.
+- `codestory-retrieval` owns the project-local SQLite lexical and embedded-vector generations, optional external Qdrant, SCIP health, retrieval manifests, product embedding checks, and fail-closed query execution.
 - `codestory-runtime` orchestrates indexing, search, grounding, trail building, project summaries, and agent flows.
 - `codestory-cli` is the thin command adapter that parses args, calls runtime or retrieval services, and renders text or JSON.
 - `codestory-bench` measures indexing, grounding, resolution, and cleanup-sensitive paths without owning product behavior.

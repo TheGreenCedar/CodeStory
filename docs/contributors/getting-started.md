@@ -30,19 +30,17 @@ Replace `[TARGET_FEATURE]` and `[OWNING_CRATE]` with the specific feature and cr
 ## Host prerequisites
 
 Supported Mac development starts at macOS 15 on Apple Silicon or Intel. Install
-the Xcode Command Line Tools, Node.js 18+, and the Rust toolchain. Start Docker
-Desktop or another compatible Docker engine before running packet/search lanes;
-Qdrant uses Docker on both Mac architectures even though Apple Silicon runs the
-managed embedding server natively with Metal.
+the Xcode Command Line Tools, Node.js 18+, and the Rust toolchain. Docker is not
+part of the default Mac packet/search path: vectors are embedded in SQLite,
+Apple Silicon runs managed Metal, and Intel runs the managed native CPU backend.
 
 The protected packaged-hardware proof also requires `python3`; use that
 versioned command in Mac automation because Command Line Tools does not promise
 an unversioned `python` shim.
 
-Apple Silicon is the managed accelerated Mac cell. Intel supports the native
-CLI/plugin and local graph; retrieval must use explicit degraded CPU allowance
-or a trusted external embedding endpoint under explicit operator policy, and
-must never be described as Metal.
+Apple Silicon is the managed accelerated Mac cell. Intel is a managed CPU cell
+and must never be described as Metal. Both paths prepare automatically; trusted
+external endpoints remain explicit advanced overrides.
 
 ## Choose The Verification Lane First
 
@@ -171,7 +169,7 @@ commands as product-quality proof.
 Use this lane only for packet/search, retrieval, ranking-quality, or sidecar
 work. Prepare the managed full-sidecar path before debugging ranking quality:
 
-- product sidecar setup: `codestory-cli retrieval bootstrap --project .` (the setup wrapper's fetch flags are optional offline prewarming)
+- product retrieval setup: normal plugin tools prepare it automatically; for a maintainer transcript use `codestory-cli retrieval bootstrap --project .` (the setup wrapper's fetch flags are optional offline prewarming)
 - default symbol-doc scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol diagnostic symbol-doc set
 - default dense policy: `graph_first_v1` embeds only selected dense anchors; private trivial code remains searchable through symbol docs, lexical source, and graph expansion
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows

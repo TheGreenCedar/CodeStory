@@ -738,7 +738,7 @@ pub(crate) struct RetrievalCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RetrievalAction {
-    /// Start Docker Compose sidecars (when available), prepare cache dirs, and wait for health.
+    /// Prepare managed retrieval services and wait for health.
     Bootstrap(RetrievalBootstrapCommand),
     #[command(name = "prewarm-assets", hide = true)]
     PrewarmAssets(RetrievalPrewarmAssetsCommand),
@@ -746,7 +746,7 @@ pub(crate) enum RetrievalAction {
     Up(RetrievalSidecarStateCommand),
     /// Remove local sidecar state file (does not stop external processes).
     Down(RetrievalSidecarStateCommand),
-    /// Validate the lexical shard plus Qdrant and SCIP availability for the project.
+    /// Validate lexical, semantic, and graph retrieval for the project.
     Status(RetrievalStatusCommand),
     /// List owned sidecar namespaces and dry-run cleanup eligibility.
     Inventory(RetrievalInventoryCommand),
@@ -838,7 +838,7 @@ pub(crate) struct RetrievalBootstrapCommand {
         long,
         value_name = "SECS",
         default_value_t = 90,
-        help = "Seconds to wait for Qdrant and embedding HTTP probes (0 = no wait)."
+        help = "Seconds to wait for managed retrieval health (0 = no wait)."
     )]
     pub(crate) wait_secs: u64,
     #[arg(

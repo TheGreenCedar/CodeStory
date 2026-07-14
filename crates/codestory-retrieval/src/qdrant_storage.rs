@@ -50,7 +50,7 @@ struct ProtectionScanResult {
     sources_scanned: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct QdrantStorageRepairReport {
     pub qdrant_reachable: bool,
     pub removed_invalid_dirs: usize,

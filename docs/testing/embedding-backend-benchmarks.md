@@ -40,6 +40,7 @@ promoted on quality and cross-repo evidence.
 
 | Candidate or lane | Best relevant evidence | Quality signal | Speed and footprint signal | Decision |
 | --- | --- | --- | --- | --- |
+| Generation-bound embedded SQLite exact scan | Apple M5 release-mode synthetic scan at 768 dimensions over 1k, 10k, and 25k dense anchors | Exact cosine ranking preserves the existing BGE vectors and provenance; the end-to-end full-mode boundary returns the expected dense hit | Warm p95 was 2.928 ms, 14.442 ms, and 37.300 ms; database sizes were 4.68 MB, 46.64 MB, and 116.60 MB | Select as the default local vector engine. It stays inside the accepted historical 84.7 ms cross-repo search p95 without a service, port, or container. Keep external Qdrant only as an explicit compatibility lane. |
 | Managed BGE-base ONNX Runtime, CLS-pooled graph, DirectML, doc batch 2048, token budget 32768, stored int8 | Large C++ workspace fresh-cache timing on 26,010 semantic docs after batch-fast tokenizer switch and pooled-output graph derivation | Quality gate not run yet; direct CPU ORT check showed pooled graph output exactly matched source `last_hidden_state[:, 0, :]` on sampled inputs; semantic contract and search smoke passed | `semantic_embedding_ms=128.438s`; previous 32k unpooled row was `135.762s`; pooled 65k was slower at `131.807s`; prior managed ONNX 65k first pass was `152.500s`, batch-fast 65k was `138.118s`, 16k was `137.776s`; unpooled 131k was aborted as slower and memory-heavy after sampled peak working set around `3.37 GB` | Historical diagnostic lane after mandatory-sidecar reset. Do not treat as promoted product evidence without a fresh sidecar contract and quality gate. |
 | BGE-base llama.cpp, b512/Q8/r6, server batch 1024, microbatch 1024, stored int8, full-text enabled | Segment 2 baseline `909369.110274`; repeat `909844.215726`; earlier fixed-wrapper holdout `910504.353332`; cross-repo `851670.370370` | Local MRR@10 `0.982432`, Hit@10 `1.0`, Hit@1 `0.972973`; cross-repo Hit@10 `1.0`, adversarial Hit@10 `1.0`, MRR@10 `0.826831` across 225 queries | Segment 2 baseline `368.01` docs/sec, cache `74.40 MB`, sampled peak descendant working set `828.73 MB`; repeat `371.89` docs/sec, sampled peak `1019.79 MB`; cross-repo search p95 `84.7 ms` | Historical externally validated baseline and closest prior evidence to the current mandatory sidecar backend. Re-run the same gates under the generation-bound sidecar contract before promotion. |
 | BGE-base llama.cpp, b512/r5, microbatch 1024, stored int8 | Earlier local `pipeline_score=918957.022351`; confirmation `918697.617312`; corrected segment-2 scout `901789.644032` | Earlier perfect local scores triggered the overfit review; corrected segment-2 quality matched q8/r6, but did not improve it | Corrected segment-2 r5 slowed to `327.58` docs/sec and sampled peak rose to `1074.43 MB` | Historical/discarded. Do not treat r5 as the current promoted answer after the corrected broad-holdout pass. |
@@ -63,6 +64,11 @@ promoted on quality and cross-repo evidence.
 
 The measured work covered these families:
 
+- Embedded SQLite exact cosine scans with bounded top-k selection. The measured
+  25k-vector row is deliberately larger than CodeStory's recent roughly 1k
+  dense-anchor repo-scale publication, while 10k covers a substantially denser
+  policy. Measurements exclude query embedding time so vector-engine cost stays
+  visible; no wall-clock threshold is asserted in unit tests.
 - ONNX Runtime provider and batch geometry, plus external llama.cpp request geometry for historical comparison.
 - Stored-vector footprint: compact scaled int8 persisted vectors.
 - Quality metric repair: explicit gates, continuous penalties, denominator metrics, and query-rank reporting.

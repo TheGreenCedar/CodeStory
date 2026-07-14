@@ -161,9 +161,10 @@ available in the meantime. The first broad search can take longer while
 CodeStory prepares its local search support once for the Mac; later repositories
 reuse it automatically.
 
-Intel Macs support local navigation by default. When broad search cannot use a
-supported local or trusted external backend, the tool returns `unavailable` and
-the agent continues with focused source inspection.
+Intel Macs use the managed native CPU path automatically. Broad search should
+move through `preparing` to ready without Docker, Qdrant, or user configuration,
+and must report CPU operation rather than Metal. A `needs_environment` result
+means automatic preparation failed; relay only the plain host requirement.
 
 Maintainer-only acceleration evidence and recovery commands are in
 [retrieval operations](../ops/retrieval-sidecars.md).

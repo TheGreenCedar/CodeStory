@@ -3275,13 +3275,17 @@ fn run_ready_repair_with_native_embedding_lease(
                     gpu_proof: Some(gpu_proof.clone()),
                     reconciliation: None,
                 });
-            progress.set_phase("Qdrant finalize");
-            codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-                &runtime.project_root,
-                &runtime.storage_path,
-                selected_sidecar,
-            )
-            .context("ready repair project qdrant repair")?;
+            progress.set_phase("semantic finalize");
+            if selected_sidecar.vector_backend()
+                == codestory_retrieval::VectorBackend::ExternalQdrant
+            {
+                codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                    &runtime.project_root,
+                    &runtime.storage_path,
+                    selected_sidecar,
+                )
+                .context("ready repair external vector collection")?;
+            }
             progress.set_phase("graph artifact");
             runtime
                 .index
@@ -3353,7 +3357,7 @@ fn ensure_ready_repair_embed_liveness_with_probe(
     let smoke = probe();
     if !smoke.reachable {
         bail!(
-            "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; lexical_ready={} ({}); qdrant_reachable={} ({})",
+            "ready repair embedding liveness failed before semantic readiness validation: {}; lexical_ready={} ({}); semantic_ready={} ({})",
             smoke.detail,
             infrastructure.lexical_ready,
             infrastructure.lexical_detail,

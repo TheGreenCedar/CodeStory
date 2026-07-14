@@ -188,7 +188,7 @@ SHA.
 | Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
-| macOS x64 | `macos-15-intel` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, cleanup, actionable failure without a backend, and explicitly labelled CPU/external operation when configured; never Metal |
+| macOS x64 | `macos-15-intel` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, checksum-pinned native CPU retrieval without Docker/Qdrant or configuration, terminal shared-agent evidence, and cleanup; never Metal |
 | macOS arm64 | `macos-15` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 
 The managed convergence proof on every native runner uses an isolated project

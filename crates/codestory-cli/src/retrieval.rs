@@ -94,13 +94,18 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
             },
             |report| &report.state,
             |report, selected_sidecar| {
-                let project_qdrant_repair =
-                    codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-                        &runtime.project_root,
-                        &runtime.storage_path,
-                        selected_sidecar,
-                    )
-                    .context("retrieval project qdrant repair")?;
+                let project_qdrant_repair = (selected_sidecar.vector_backend()
+                    == codestory_retrieval::VectorBackend::ExternalQdrant)
+                    .then(|| {
+                        codestory_retrieval::repair_project_qdrant_collection_for_runtime(
+                            &runtime.project_root,
+                            &runtime.storage_path,
+                            selected_sidecar,
+                        )
+                    })
+                    .transpose()
+                    .context("retrieval external vector repair")?
+                    .flatten();
                 let status = strict_sidecar_status_for_runtime(
                     &runtime.project_root,
                     Some(&runtime.storage_path),
@@ -439,7 +444,7 @@ fn emit_retrieval_index(
         generation_retention: &outcome.generation_retention,
     };
     let markdown = format!(
-        "# Retrieval index\n\n- project_id: `{}`\n- lexical_version: `{}`\n- qdrant_collection: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n- retention_retained_bytes: {}\n- retention_reclaimable_bytes: {}\n- retention_removed_bytes: {}\n- retention_remaining_reclaimable_bytes: {}\n- retention_pruning_suppressed: {}\n",
+        "# Retrieval index\n\n- project_id: `{}`\n- lexical_version: `{}`\n- semantic_generation: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n- retention_retained_bytes: {}\n- retention_reclaimable_bytes: {}\n- retention_removed_bytes: {}\n- retention_remaining_reclaimable_bytes: {}\n- retention_pruning_suppressed: {}\n",
         payload.manifest.project_id,
         payload.manifest.lexical_version,
         payload.manifest.qdrant_collection,
@@ -478,6 +483,7 @@ fn emit_retrieval_query(
 
 #[derive(serde::Serialize)]
 struct RetrievalBootstrapOutput<'a> {
+    semantic_backend: &'static str,
     compose_started: bool,
     compose_file: Option<&'a str>,
     lexical_ready: bool,
@@ -507,6 +513,11 @@ fn emit_retrieval_bootstrap(
         .as_ref()
         .map(|path| path.display().to_string());
     let payload = RetrievalBootstrapOutput {
+        semantic_backend: if report.state.qdrant_http_port == 0 {
+            "embedded"
+        } else {
+            "external_qdrant"
+        },
         compose_started: report.compose_started,
         compose_file: compose_path.as_deref(),
         lexical_ready: report.infrastructure.lexical_ready,
@@ -562,15 +573,23 @@ fn emit_retrieval_bootstrap(
             )
         })
         .unwrap_or_default();
-    let sidecar_images_note = format!(
-        "\n- sidecar_images: qdrant=`{}` embed=`{}`",
-        payload.sidecar_state.sidecar_images.qdrant, payload.sidecar_state.sidecar_images.embed
-    );
+    let sidecar_images_note = if payload.semantic_backend == "external_qdrant" {
+        format!(
+            "\n- sidecar_images: qdrant=`{}` embed=`{}`",
+            payload.sidecar_state.sidecar_images.qdrant, payload.sidecar_state.sidecar_images.embed
+        )
+    } else {
+        format!(
+            "\n- embedding_image: `{}`",
+            payload.sidecar_state.sidecar_images.embed
+        )
+    };
     let markdown = format!(
-        "# Retrieval bootstrap\n\n- compose_started: {}\n- lexical_ready: {} ({})\n- qdrant_reachable: {} ({})\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
+        "# Retrieval bootstrap\n\n- compose_started: {}\n- lexical_ready: {} ({})\n- semantic_backend: `{}`\n- semantic_ready: {} ({})\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
         payload.compose_started,
         payload.lexical_ready,
         payload.lexical_detail,
+        payload.semantic_backend,
         payload.qdrant_reachable,
         payload.qdrant_detail,
         payload.embed_reachable,
@@ -657,22 +676,37 @@ fn emit_retrieval_status(
         .ownership
         .as_ref()
         .map(|ownership| {
+            let ports = if ownership.ports.qdrant_http == 0 {
+                format!("embed:{}", ownership.ports.embed_http)
+            } else {
+                format!(
+                    "qdrant:{} grpc:{} embed:{}",
+                    ownership.ports.qdrant_http,
+                    ownership.ports.qdrant_grpc,
+                    ownership.ports.embed_http,
+                )
+            };
             format!(
-                "- ownership: owner=`{}` profile=`{}` namespace=`{}` cleanup=`{}` ports=qdrant:{} grpc:{} embed:{}\n",
+                "- ownership: owner=`{}` profile=`{}` namespace=`{}` cleanup=`{}` ports={}\n",
                 ownership.owner,
                 ownership.profile,
                 ownership.namespace,
                 ownership.cleanup_command,
-                ownership.ports.qdrant_http,
-                ownership.ports.qdrant_grpc,
-                ownership.ports.embed_http,
+                ports,
             )
         })
         .unwrap_or_default();
-    let sidecar_images_note = format!(
-        "- sidecar_images: qdrant=`{}` embed=`{}`\n",
-        report.sidecar_images.qdrant, report.sidecar_images.embed
-    );
+    let sidecar_images_note = report
+        .ownership
+        .as_ref()
+        .filter(|ownership| ownership.ports.qdrant_http != 0)
+        .map(|_| {
+            format!(
+                "- sidecar_images: qdrant=`{}` embed=`{}`\n",
+                report.sidecar_images.qdrant, report.sidecar_images.embed
+            )
+        })
+        .unwrap_or_else(|| format!("- embedding_image: `{}`\n", report.sidecar_images.embed));
     let broker_note = format!(
         "- readiness_broker: project_id={} persistence={} operations={} gpu_proof={}\n",
         readiness_broker.project_id,
@@ -685,7 +719,7 @@ fn emit_retrieval_status(
             .unwrap_or("unknown")
     );
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- qdrant: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
