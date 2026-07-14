@@ -39,8 +39,9 @@
   disappears or changes.
 - Direct-download Mac artifacts are release-ready only after the exact arm64 and
   x64 binaries pass Developer ID signing, notarization, quarantined extraction,
-  Gatekeeper, and native execution checks. Source or unsigned package checks do
-  not make that claim.
+  and native execution checks. Release proof retains `spctl` diagnostics but no
+  longer mistakes its bare-CLI "not an app" result for notarization failure.
+  Source or unsigned package checks do not make that claim.
 
 ### Reliability and operations
 
@@ -90,7 +91,7 @@
 - The repository version and release notes describe the candidate source.
   Publication is complete only when the matching archives and checksums are
   available and the required platform checks pass.
-- Marketplace availability, Gatekeeper acceptance, installed runtime/version
+- Marketplace availability, quarantined native execution, installed runtime/version
   readback, and live full-retrieval behavior are separate post-publication
   claims and require their own evidence.
 
