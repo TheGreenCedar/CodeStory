@@ -34,14 +34,24 @@ function releaseEvidenceApprovalBoundary() {
       ["release.yml", {
         uses: releaseEvidenceWorkflowRef,
         with: { source_run_id: "${{ inputs.source_run_id }}" },
-      }],
+        secrets: {
+          CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON:
+            "${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}",
+        },
+      }, true],
       ["packaged-platform-pr.yml", {
         uses: releaseEvidenceWorkflowRef,
         with: { source_run_id: "${{ inputs.source_run_id }}" },
-      }],
+      }, false],
     ],
     called: {
-      on: { workflow_call: {} },
+      on: {
+        workflow_call: {
+          secrets: {
+            CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: { required: false },
+          },
+        },
+      },
       jobs: {
         measure: {
           environment: "release-evidence",
@@ -154,7 +164,7 @@ test("PR package proof cannot opt into signing credentials", () => {
   }
 });
 
-test("release approval remains inside the protected evidence environment", () => {
+test("release approval crosses only the protected release boundary", () => {
   const boundary = releaseEvidenceApprovalBoundary();
   assert.deepEqual(releaseEvidenceApprovalViolations(boundary.callers, boundary.called), []);
 
@@ -162,12 +172,18 @@ test("release approval remains inside the protected evidence environment", () =>
     candidate => { candidate.callers[0][1] = undefined; },
     candidate => { candidate.callers[1][1].uses = "./.github/workflows/release.yml"; },
     candidate => { delete candidate.callers[1][1].with.source_run_id; },
+    candidate => { delete candidate.callers[0][1].secrets; },
+    candidate => {
+      candidate.callers[0][1].secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON
+        = "${{ secrets.WRONG_SECRET }}";
+    },
+    candidate => { candidate.callers[0][1].secrets.EXTRA_SECRET = "${{ secrets.EXTRA }}"; },
     candidate => { candidate.callers[0][1].secrets = "inherit"; },
     candidate => { candidate.callers[1][1].secrets = "inherit"; },
+    candidate => { delete candidate.called.on.workflow_call.secrets; },
     candidate => {
-      candidate.called.on.workflow_call.secrets = {
-        CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: { required: false },
-      };
+      candidate.called.on.workflow_call.secrets
+        .CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON.required = true;
     },
     candidate => { candidate.called.jobs.measure.environment = "release"; },
     candidate => {

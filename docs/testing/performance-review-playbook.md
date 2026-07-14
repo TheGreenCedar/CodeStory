@@ -159,10 +159,11 @@ artifact can become release-eligible.
 
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
-reported hashes and values in the
-protected `release-evidence` environment's
-`CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON` secret, then dispatch the Release
-workflow on the same SHA and version with
+reported hashes and values in the short-lived repository Actions secret
+`CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON`. The release coordinator passes only
+that named secret into the reusable job behind the protected
+`release-evidence` environment gate; PR packaging receives none. Dispatch the
+Release workflow on the same SHA and version with
 `source_run_id=<rejected-run-id>`. That path downloads and re-evaluates the
 exact candidate without re-running measurements; any SHA, hash, value, profile,
 baseline, threshold, date, or expiry drift still fails.

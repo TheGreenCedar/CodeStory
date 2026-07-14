@@ -153,9 +153,12 @@ artifact and evaluates it again without producing new measurements. Before the
 download, it requires a failed trusted evidence workflow from this repository
 whose head is the exact evidence SHA.
 
-The approval secret belongs only to the protected `release-evidence`
-environment used by the reusable workflow's measurement job. Release callers
-must not pass or inherit it. A re-evaluation with no nonempty protected approval
+GitHub does not expose environment-only secrets across a reusable-workflow
+call. Store the short-lived approval as the repository Actions secret
+`CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON`; `release.yml` passes only that named
+secret into the called job, which remains behind the protected
+`release-evidence` environment gate. PR packaging passes no secrets. Delete the
+repository secret after publication. A re-evaluation with no nonempty approval
 fails before the evaluator runs.
 
 The workflow uploads `release-evidence-<full SHA>` from
