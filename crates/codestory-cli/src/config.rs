@@ -10,9 +10,8 @@ const PROJECT_NETWORK_CONFIG_OPT_IN_ENV: &str = "CODESTORY_ALLOW_PROJECT_NETWORK
 pub(crate) struct CliStartupConfig {
     pub(crate) user_home: Option<PathBuf>,
     pub(crate) project_network_config_allowed: bool,
-    pub(crate) user_cache_root: PathBuf,
     pub(crate) stdio_cache_root: Option<PathBuf>,
-    pub(crate) runtime_defaults: codestory_retrieval::SidecarRuntimeDefaults,
+    pub(crate) sidecar_defaults: codestory_retrieval::SidecarProcessDefaults,
 }
 
 impl CliStartupConfig {
@@ -26,8 +25,7 @@ impl CliStartupConfig {
                 .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(false),
             stdio_cache_root: std::env::var_os("CODESTORY_STDIO_CACHE_ROOT").map(PathBuf::from),
-            user_cache_root: crate::sidecar_runtime::user_cache_root(),
-            runtime_defaults: codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+            sidecar_defaults: crate::sidecar_runtime::process_defaults(),
         }
     }
 }

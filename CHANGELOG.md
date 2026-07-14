@@ -69,6 +69,9 @@
   macOS and Windows process inspection is bounded, dead, reused, or unverified
   PIDs remain fail-closed, and cleanup stays limited to resources carrying
   CodeStory ownership proof.
+- Sidecar cache roots and runtime environment defaults are captured once per
+  process and passed explicitly through test construction. Windows process
+  probes also reject completed processes using both exit time and exit code.
 - Managed installation and upgrade checks cover every shipped native platform,
   including upgrade from a verified older CLI with that version retained as the
   rollback. The Codex worktree setup dispatcher now provides equivalent native

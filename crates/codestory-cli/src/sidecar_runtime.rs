@@ -5,10 +5,14 @@
 //! isolation before the constructor (or startup configuration) can fall back
 //! to the platform `ProjectDirs` cache.
 
+#[cfg(test)]
+use codestory_retrieval::SidecarRuntimeDefaults;
 use codestory_retrieval::{
-    SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeDefaults, SidecarRuntimeOverrides,
+    SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeOverrides,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -41,20 +45,33 @@ fn with_default_test_cache_root<T>(task: impl FnOnce() -> T) -> T {
     codestory_retrieval::with_test_cache_root(&root, task)
 }
 
-pub(crate) fn user_cache_root() -> PathBuf {
+pub(crate) fn process_defaults() -> SidecarProcessDefaults {
     prepare_cache_access();
     #[cfg(test)]
-    return with_default_test_cache_root(codestory_retrieval::user_cache_root);
+    return with_default_test_cache_root(|| {
+        SidecarProcessDefaults::new(
+            codestory_retrieval::user_cache_root(),
+            SidecarRuntimeDefaults::from_process_env(),
+        )
+    });
     #[cfg(not(test))]
-    codestory_retrieval::user_cache_root()
+    codestory_retrieval::sidecar_process_defaults()
+}
+
+#[cfg(test)]
+pub(crate) fn user_cache_root() -> PathBuf {
+    process_defaults().cache_root().to_path_buf()
 }
 
 pub(crate) fn local() -> SidecarRuntimeConfig {
-    prepare_cache_access();
-    #[cfg(test)]
-    return with_default_test_cache_root(SidecarRuntimeConfig::local);
-    #[cfg(not(test))]
-    SidecarRuntimeConfig::local()
+    let defaults = process_defaults();
+    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        None,
+        SidecarProfile::Local,
+        None,
+        &defaults,
+        &SidecarRuntimeOverrides::default(),
+    )
 }
 
 #[cfg(test)]
@@ -63,13 +80,14 @@ pub(crate) fn embedding_runtime_id() -> String {
 }
 
 pub(crate) fn for_project(project_root: &Path, profile: SidecarProfile) -> SidecarRuntimeConfig {
-    prepare_cache_access();
-    #[cfg(test)]
-    return with_default_test_cache_root(|| {
-        codestory_retrieval::sidecar_runtime_for_project(project_root, profile)
-    });
-    #[cfg(not(test))]
-    codestory_retrieval::sidecar_runtime_for_project(project_root, profile)
+    let defaults = process_defaults();
+    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        Some(project_root),
+        profile,
+        None,
+        &defaults,
+        &SidecarRuntimeOverrides::default(),
+    )
 }
 
 pub(crate) fn for_project_with_run_id(
@@ -77,28 +95,23 @@ pub(crate) fn for_project_with_run_id(
     profile: SidecarProfile,
     run_id: Option<&str>,
 ) -> SidecarRuntimeConfig {
-    prepare_cache_access();
-    #[cfg(test)]
-    return with_default_test_cache_root(|| {
-        codestory_retrieval::sidecar_runtime_for_project_with_run_id(project_root, profile, run_id)
-    });
-    #[cfg(not(test))]
-    codestory_retrieval::sidecar_runtime_for_project_with_run_id(project_root, profile, run_id)
+    let defaults = process_defaults();
+    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        Some(project_root),
+        profile,
+        run_id,
+        &defaults,
+        &SidecarRuntimeOverrides::default(),
+    )
 }
 
-pub(crate) fn for_project_auto_with_defaults_in_cache(
+pub(crate) fn for_project_auto_with_process_defaults(
     project_root: &Path,
-    cache_root: &Path,
-    defaults: &SidecarRuntimeDefaults,
+    defaults: &SidecarProcessDefaults,
     overrides: &SidecarRuntimeOverrides,
 ) -> SidecarRuntimeConfig {
     prepare_cache_access();
-    SidecarRuntimeConfig::for_project_auto_with_defaults_in_cache(
-        project_root,
-        cache_root,
-        defaults,
-        overrides,
-    )
+    SidecarRuntimeConfig::for_project_auto_with_process_defaults(project_root, defaults, overrides)
 }
 
 #[cfg(test)]
@@ -117,11 +130,16 @@ pub(crate) fn for_project_with_run_id_in_cache(
     cache_root: &Path,
 ) -> SidecarRuntimeConfig {
     prepare_cache_access();
-    SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+    let defaults = SidecarProcessDefaults::new(
+        cache_root.to_path_buf(),
+        SidecarRuntimeDefaults::from_process_env(),
+    );
+    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
         project_root,
         profile,
         run_id,
-        cache_root,
+        &defaults,
+        &SidecarRuntimeOverrides::default(),
     )
 }
 
@@ -135,10 +153,7 @@ mod tests {
         let active_root = codestory_retrieval::active_test_cache_root()
             .expect("gateway should activate a process-unique test cache root");
 
-        let explicit_root = std::env::var_os("CODESTORY_CACHE_ROOT")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        assert_eq!(cache_root, explicit_root.unwrap_or(active_root));
+        assert_eq!(cache_root, active_root);
         assert!(local().layout.state_file.starts_with(&cache_root));
     }
 

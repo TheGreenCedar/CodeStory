@@ -208,7 +208,7 @@ pub fn repair_project_qdrant_collection_for_runtime(
 }
 
 pub fn finalize_index(project_root: &Path, storage_path: &Path) -> Result<FinalizeIndexOutcome> {
-    let runtime = crate::config::sidecar_runtime_auto(project_root);
+    let runtime = crate::config::SidecarRuntimeConfig::for_project_auto(project_root);
     finalize_index_for_runtime(project_root, storage_path, &runtime)
 }
 

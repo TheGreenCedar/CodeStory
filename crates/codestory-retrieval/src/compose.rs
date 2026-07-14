@@ -2586,7 +2586,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: std::collections::BTreeMap::new(),
-            ..SidecarRuntimeConfig::local()
+            ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         }
     }
 
@@ -2863,12 +2863,7 @@ mod tests {
 
     #[test]
     fn embed_model_dir_discovers_user_cache_retrieval_models() {
-        let _lock = crate::test_support::env_lock();
         let cache = tempdir().expect("cache");
-        let _cache_root = EnvGuard::set(
-            "CODESTORY_CACHE_ROOT",
-            cache.path().to_str().expect("cache path"),
-        );
         let project = tempdir().expect("project");
         let model_dir = cache.path().join("retrieval-models");
         std::fs::create_dir_all(&model_dir).expect("model dir");
@@ -2878,11 +2873,12 @@ mod tests {
         )
         .expect("model file");
         let layout = compose_test_runtime(project.path()).layout;
+        let selected = crate::config::with_test_cache_root(cache.path(), || {
+            embed_model_dir(Some(project.path()), &layout)
+        })
+        .expect("model dir");
 
-        assert_eq!(
-            embed_model_dir(Some(project.path()), &layout).expect("model dir"),
-            model_dir
-        );
+        assert_eq!(selected, model_dir);
     }
 
     #[test]
@@ -3181,7 +3177,8 @@ mod tests {
         let _provider = EnvGuard::set("CODESTORY_EMBED_DEVICE_PROVIDER", "vulkan");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
-        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Local);
+        let runtime =
+            crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
 
         let error = native_embedding_server_launch(None, &runtime)
             .expect_err("linux compose-only backend must not satisfy native_spawned");
@@ -3499,7 +3496,8 @@ mod tests {
         let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
         std::fs::write(&exe, b"fake exe").expect("exe");
         std::fs::write(&model, b"fake model").expect("model");
-        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Local);
+        let runtime =
+            crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
 
         let launch =
             native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
@@ -3577,7 +3575,8 @@ mod tests {
         let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
         std::fs::write(&exe, b"fake exe").expect("exe");
         std::fs::write(&model, b"fake model").expect("model");
-        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Local);
+        let runtime =
+            crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
 
         let launch =
             native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);

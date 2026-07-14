@@ -11,7 +11,7 @@ use codestory_contracts::api::{
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 #[cfg(test)]
-use codestory_retrieval::sidecar_runtime_auto;
+use codestory_retrieval::SidecarRuntimeConfig;
 use codestory_retrieval::{
     CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
     QueryTrace, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
@@ -2552,7 +2552,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve dead port");
         let dead_port = listener.local_addr().expect("dead port address").port();
         drop(listener);
-        let mut runtime = sidecar_runtime_auto(project.path());
+        let mut runtime = SidecarRuntimeConfig::for_project_auto(project.path());
         runtime.embed_http_port = dead_port;
         runtime.embedding.endpoint = format!("http://127.0.0.1:{dead_port}/v1/embeddings");
         runtime.embedding.endpoint_origin =

@@ -12,6 +12,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Qdrant container image pin for local dev and CI smoke.
@@ -270,6 +271,37 @@ impl SidecarRuntimeDefaults {
     }
 }
 
+/// Immutable process-scoped inputs used to construct sidecar runtimes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarProcessDefaults {
+    cache_root: PathBuf,
+    runtime: SidecarRuntimeDefaults,
+}
+
+impl SidecarProcessDefaults {
+    pub fn new(cache_root: PathBuf, runtime: SidecarRuntimeDefaults) -> Self {
+        Self {
+            cache_root,
+            runtime,
+        }
+    }
+
+    pub fn cache_root(&self) -> &Path {
+        &self.cache_root
+    }
+
+    pub fn runtime(&self) -> &SidecarRuntimeDefaults {
+        &self.runtime
+    }
+
+    pub fn with_cache_root(&self, cache_root: PathBuf) -> Self {
+        Self {
+            cache_root,
+            runtime: self.runtime.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetrievalRuntimeConfig {
     pub hybrid_enabled: bool,
@@ -437,40 +469,21 @@ impl SidecarRuntimeConfig {
     }
 
     pub fn for_project_auto(project_root: &Path) -> Self {
-        Self::for_project_auto_with_overrides(project_root, &SidecarRuntimeOverrides::default())
-    }
-
-    pub fn for_project_auto_with_overrides(
-        project_root: &Path,
-        overrides: &SidecarRuntimeOverrides,
-    ) -> Self {
-        Self::for_project_auto_with_defaults(
+        Self::for_project_auto_with_process_defaults(
             project_root,
-            &SidecarRuntimeDefaults::from_process_env(),
-            overrides,
-        )
-    }
-
-    pub fn for_project_auto_with_defaults(
-        project_root: &Path,
-        defaults: &SidecarRuntimeDefaults,
-        overrides: &SidecarRuntimeOverrides,
-    ) -> Self {
-        Self::for_project_auto_with_defaults_in_cache(
-            project_root,
-            &user_cache_root(),
-            defaults,
-            overrides,
+            &sidecar_process_defaults(),
+            &SidecarRuntimeOverrides::default(),
         )
     }
 
     #[doc(hidden)]
-    pub fn for_project_auto_with_defaults_in_cache(
+    pub fn for_project_auto_with_process_defaults(
         project_root: &Path,
-        cache_root: &Path,
-        defaults: &SidecarRuntimeDefaults,
+        process_defaults: &SidecarProcessDefaults,
         overrides: &SidecarRuntimeOverrides,
     ) -> Self {
+        let cache_root = process_defaults.cache_root();
+        let defaults = process_defaults.runtime();
         let explicit_profile = env_profile(defaults);
         let env_run_id = env_agent_run_id(defaults);
         let latest_run_id = if explicit_profile.is_none() && env_run_id.is_none() {
@@ -484,12 +497,11 @@ impl SidecarRuntimeConfig {
             latest_run_id,
             running_in_ci_agent(defaults),
         );
-        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
+        Self::for_project_profile_with_process_defaults(
             Some(project_root),
             profile,
             run_id.as_deref(),
-            cache_root,
-            defaults,
+            process_defaults,
             overrides,
         )
     }
@@ -503,89 +515,25 @@ impl SidecarRuntimeConfig {
         profile: SidecarProfile,
         run_id: Option<&str>,
     ) -> Self {
-        Self::for_project_profile_with_run_id_and_overrides(
+        Self::for_project_profile_with_process_defaults(
             project_root,
             profile,
             run_id,
-            &SidecarRuntimeOverrides::default(),
-        )
-    }
-
-    pub fn for_project_profile_with_run_id_and_overrides(
-        project_root: Option<&Path>,
-        profile: SidecarProfile,
-        run_id: Option<&str>,
-        overrides: &SidecarRuntimeOverrides,
-    ) -> Self {
-        Self::for_project_profile_with_run_id_defaults_and_overrides(
-            project_root,
-            profile,
-            run_id,
-            &SidecarRuntimeDefaults::from_process_env(),
-            overrides,
-        )
-    }
-
-    fn for_project_profile_with_run_id_defaults_and_overrides(
-        project_root: Option<&Path>,
-        profile: SidecarProfile,
-        run_id: Option<&str>,
-        defaults: &SidecarRuntimeDefaults,
-        overrides: &SidecarRuntimeOverrides,
-    ) -> Self {
-        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
-            project_root,
-            profile,
-            run_id,
-            &user_cache_root(),
-            defaults,
-            overrides,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn for_project_profile_with_run_id_in_cache(
-        project_root: Option<&Path>,
-        profile: SidecarProfile,
-        run_id: Option<&str>,
-        cache_root: &Path,
-    ) -> Self {
-        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
-            project_root,
-            profile,
-            run_id,
-            cache_root,
-            &SidecarRuntimeDefaults::from_process_env(),
+            &sidecar_process_defaults(),
             &SidecarRuntimeOverrides::default(),
         )
     }
 
     #[doc(hidden)]
-    pub fn for_project_profile_with_run_id_in_cache_and_overrides(
+    pub fn for_project_profile_with_process_defaults(
         project_root: Option<&Path>,
         profile: SidecarProfile,
         run_id: Option<&str>,
-        cache_root: &Path,
+        process_defaults: &SidecarProcessDefaults,
         overrides: &SidecarRuntimeOverrides,
     ) -> Self {
-        Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
-            project_root,
-            profile,
-            run_id,
-            cache_root,
-            &SidecarRuntimeDefaults::from_process_env(),
-            overrides,
-        )
-    }
-
-    fn for_project_profile_with_run_id_in_cache_defaults_and_overrides(
-        project_root: Option<&Path>,
-        profile: SidecarProfile,
-        run_id: Option<&str>,
-        cache_root: &Path,
-        defaults: &SidecarRuntimeDefaults,
-        overrides: &SidecarRuntimeOverrides,
-    ) -> Self {
+        let cache_root = process_defaults.cache_root();
+        let defaults = process_defaults.runtime();
         let base = cache_root.to_path_buf();
         let run_id = (profile == SidecarProfile::Agent).then(|| agent_run_id(run_id, defaults));
         let project_identity = project_root.map(codestory_workspace::project_identity_v3);
@@ -942,12 +890,15 @@ impl SidecarRuntimeConfig {
                 .and_then(Path::parent),
         }
         .unwrap_or_else(|| Path::new("."));
-        let mut selected = Self::for_project_profile_with_run_id_in_cache_defaults_and_overrides(
+        let process_defaults = SidecarProcessDefaults::new(
+            cache_root.to_path_buf(),
+            SidecarRuntimeDefaults::default(),
+        );
+        let mut selected = Self::for_project_profile_with_process_defaults(
             project_root,
             profile,
             run_id,
-            cache_root,
-            &SidecarRuntimeDefaults::default(),
+            &process_defaults,
             &SidecarRuntimeOverrides::default(),
         );
         let selected_managed_endpoint = selected.embedding.endpoint.clone();
@@ -1080,25 +1031,6 @@ impl SidecarLayout {
         }
         Ok(())
     }
-}
-
-pub fn sidecar_runtime_for_project(
-    project_root: &Path,
-    profile: SidecarProfile,
-) -> SidecarRuntimeConfig {
-    SidecarRuntimeConfig::for_project_profile(Some(project_root), profile)
-}
-
-pub fn sidecar_runtime_for_project_with_run_id(
-    project_root: &Path,
-    profile: SidecarProfile,
-    run_id: Option<&str>,
-) -> SidecarRuntimeConfig {
-    SidecarRuntimeConfig::for_project_profile_with_run_id(Some(project_root), profile, run_id)
-}
-
-pub fn sidecar_runtime_auto(project_root: &Path) -> SidecarRuntimeConfig {
-    SidecarRuntimeConfig::for_project_auto(project_root)
 }
 
 fn embedding_runtime_config(
@@ -2686,24 +2618,87 @@ pub fn retrieval_command(
     command
 }
 
-pub fn user_cache_root() -> PathBuf {
+fn uncached_user_cache_root() -> PathBuf {
     if let Ok(path) = std::env::var("CODESTORY_CACHE_ROOT") {
         let path = path.trim();
         if !path.is_empty() {
             return PathBuf::from(path);
         }
     }
-    #[cfg(feature = "test-support")]
-    if let Some(path) = active_test_cache_root() {
-        return path;
-    }
-    #[cfg(test)]
-    if let Some(path) = automatic_unit_test_cache_root() {
-        return path;
-    }
     ProjectDirs::from("dev", "codestory", "codestory")
         .map(|dirs| dirs.cache_dir().to_path_buf())
         .unwrap_or_else(|| std::env::temp_dir().join("codestory").join("cache"))
+}
+
+fn frozen_process_defaults(cell: &OnceLock<SidecarProcessDefaults>) -> &SidecarProcessDefaults {
+    cell.get_or_init(|| {
+        SidecarProcessDefaults::new(
+            uncached_user_cache_root(),
+            SidecarRuntimeDefaults::from_process_env(),
+        )
+    })
+}
+
+pub fn sidecar_process_defaults() -> SidecarProcessDefaults {
+    #[cfg(test)]
+    let defaults = SidecarProcessDefaults::new(
+        uncached_user_cache_root(),
+        SidecarRuntimeDefaults::default(),
+    );
+    #[cfg(not(test))]
+    let defaults = {
+        static PROCESS_DEFAULTS: OnceLock<SidecarProcessDefaults> = OnceLock::new();
+        frozen_process_defaults(&PROCESS_DEFAULTS).clone()
+    };
+
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(cache_root) = test_cache_root_override() {
+        return defaults.with_cache_root(cache_root);
+    }
+    defaults
+}
+
+pub fn user_cache_root() -> PathBuf {
+    sidecar_process_defaults().cache_root
+}
+
+#[cfg(test)]
+pub(crate) fn test_sidecar_runtime_from_env(
+    project_root: Option<&Path>,
+    profile: SidecarProfile,
+    run_id: Option<&str>,
+) -> SidecarRuntimeConfig {
+    let defaults = SidecarProcessDefaults::new(
+        uncached_user_cache_root(),
+        SidecarRuntimeDefaults::from_process_env(),
+    );
+    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        project_root,
+        profile,
+        run_id,
+        &defaults,
+        &SidecarRuntimeOverrides::default(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_sidecar_runtime_in_cache(
+    project_root: Option<&Path>,
+    profile: SidecarProfile,
+    run_id: Option<&str>,
+    cache_root: &Path,
+) -> SidecarRuntimeConfig {
+    let defaults = SidecarProcessDefaults::new(
+        cache_root.to_path_buf(),
+        SidecarRuntimeDefaults::from_process_env(),
+    );
+    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+        project_root,
+        profile,
+        run_id,
+        &defaults,
+        &SidecarRuntimeOverrides::default(),
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2714,14 +2709,20 @@ thread_local! {
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn active_test_cache_root() -> Option<PathBuf> {
-    TEST_CACHE_ROOT_OVERRIDE
-        .with(|root| root.borrow().clone())
-        .or_else(|| {
-            AUTOMATIC_TEST_CACHE_ROOT_ENABLED
-                .load(std::sync::atomic::Ordering::Acquire)
-                .then(automatic_unit_test_cache_root)
-                .flatten()
-        })
+    test_cache_root_override()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn test_cache_root_override() -> Option<PathBuf> {
+    let explicit = TEST_CACHE_ROOT_OVERRIDE.with(|root| root.borrow().clone());
+    if explicit.is_some() {
+        return explicit;
+    }
+    #[cfg(feature = "test-support")]
+    if !AUTOMATIC_TEST_CACHE_ROOT_ENABLED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    automatic_unit_test_cache_root()
 }
 
 #[cfg(feature = "test-support")]
@@ -2760,7 +2761,7 @@ fn automatic_unit_test_cache_root() -> Option<PathBuf> {
     Some(root)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn with_test_cache_root<T>(root: &Path, task: impl FnOnce() -> T) -> T {
     struct Reset(Option<PathBuf>);
@@ -2860,6 +2861,11 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
+    fn embedding_server_launch_mode_from_env() -> Result<EmbeddingServerLaunchMode> {
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
+        embedding_server_launch_mode_for_runtime(&runtime)
+    }
+
     #[test]
     fn test_support_isolates_named_threads_after_explicit_activation() {
         #[cfg(feature = "test-support")]
@@ -2868,6 +2874,34 @@ mod tests {
         assert!(root.starts_with(std::env::temp_dir().join("codestory-unit-tests")));
         #[cfg(feature = "test-support")]
         assert_eq!(active_test_cache_root(), Some(root));
+    }
+
+    #[test]
+    fn process_defaults_are_frozen_after_first_capture() {
+        let _lock = crate::test_support::env_lock();
+        let cache = tempdir().expect("cache");
+        let poison = tempdir().expect("poison cache");
+        let _cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            cache.path().to_str().expect("cache path"),
+        );
+        let _port = EnvGuard::set("CODESTORY_QDRANT_HTTP_PORT", "32101");
+        let cell = OnceLock::new();
+        let first = frozen_process_defaults(&cell).clone();
+
+        let _poison_cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            poison.path().to_str().expect("poison cache path"),
+        );
+        let _poison_port = EnvGuard::set("CODESTORY_QDRANT_HTTP_PORT", "32102");
+        let second = frozen_process_defaults(&cell);
+
+        assert_eq!(first.cache_root(), cache.path());
+        assert_eq!(second, &first);
+        assert_eq!(
+            second.runtime().get("CODESTORY_QDRANT_HTTP_PORT"),
+            Some("32101")
+        );
     }
 
     #[test]
@@ -2880,9 +2914,9 @@ mod tests {
         );
 
         let first =
-            SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
+            test_sidecar_runtime_from_env(Some(project.path()), SidecarProfile::Agent, None);
         let second =
-            SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
+            test_sidecar_runtime_from_env(Some(project.path()), SidecarProfile::Agent, None);
 
         assert_eq!(first.run_id.as_deref(), Some(DEFAULT_AGENT_RUN_ID));
         assert_eq!(first.run_id, second.run_id);
@@ -2909,7 +2943,7 @@ mod tests {
             project.path().join("cache").to_str().expect("utf8 cache"),
         );
         let runtime =
-            SidecarRuntimeConfig::for_project_profile(Some(project.path()), SidecarProfile::Agent);
+            test_sidecar_runtime_from_env(Some(project.path()), SidecarProfile::Agent, None);
         let identity = runtime.project_identity.as_ref().expect("project identity");
 
         assert_eq!(
@@ -2950,12 +2984,12 @@ mod tests {
             project.path().join("cache").to_str().expect("utf8 cache"),
         );
 
-        let first = SidecarRuntimeConfig::for_project_profile_with_run_id(
+        let first = test_sidecar_runtime_from_env(
             Some(project.path()),
             SidecarProfile::Agent,
             Some("review-fix"),
         );
-        let second = SidecarRuntimeConfig::for_project_profile_with_run_id(
+        let second = test_sidecar_runtime_from_env(
             Some(project.path()),
             SidecarProfile::Agent,
             Some("review-fix"),
@@ -2980,7 +3014,7 @@ mod tests {
             "CODESTORY_CACHE_ROOT",
             project.path().join("cache").to_str().expect("utf8 cache"),
         );
-        let first = SidecarRuntimeConfig::for_project_profile_with_run_id(
+        let first = test_sidecar_runtime_from_env(
             Some(project.path()),
             SidecarProfile::Agent,
             Some("persisted"),
@@ -3008,7 +3042,7 @@ mod tests {
         )
         .expect("state file");
 
-        let second = SidecarRuntimeConfig::for_project_profile_with_run_id(
+        let second = test_sidecar_runtime_from_env(
             Some(project.path()),
             SidecarProfile::Agent,
             Some("persisted"),
@@ -3048,7 +3082,7 @@ mod tests {
     #[test]
     fn retained_runtime_identity_fails_closed_after_reobservation_drift() {
         let project = tempdir().expect("project");
-        let mut runtime = SidecarRuntimeConfig::for_project_profile_with_run_id(
+        let mut runtime = test_sidecar_runtime_from_env(
             Some(project.path()),
             SidecarProfile::Agent,
             Some("identity-drift"),
@@ -3093,7 +3127,7 @@ mod tests {
             .expect("legacy state directory");
         std::fs::write(&legacy_state_file, b"{}\n").expect("legacy state file");
 
-        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let runtime = test_sidecar_runtime_in_cache(
             Some(&noncanonical_project),
             SidecarProfile::Agent,
             Some(run_id),
@@ -3127,7 +3161,7 @@ mod tests {
         );
 
         let v3_run_id = "current-run";
-        let v3_runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let v3_runtime = test_sidecar_runtime_in_cache(
             Some(&noncanonical_project),
             SidecarProfile::Agent,
             Some(v3_run_id),
@@ -3239,7 +3273,7 @@ mod tests {
     #[test]
     fn stale_runtime_cannot_renew_successor_owner_lease() {
         let cache = tempdir().expect("cache");
-        let first = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let first = test_sidecar_runtime_in_cache(
             None,
             SidecarProfile::Agent,
             Some("successor"),
@@ -3248,7 +3282,7 @@ mod tests {
         let root = cache.path().join("sidecars");
         std::fs::remove_file(agent_port_owner_path(&root, &first.namespace))
             .expect("remove first owner");
-        let successor = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let successor = test_sidecar_runtime_in_cache(
             None,
             SidecarProfile::Agent,
             Some("successor"),
@@ -3267,7 +3301,7 @@ mod tests {
     #[test]
     fn heartbeat_keeps_unbound_ports_past_original_ttl_under_contention() {
         let cache = tempdir().expect("cache");
-        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+        let runtime = test_sidecar_runtime_in_cache(
             None,
             SidecarProfile::Agent,
             Some("heartbeat"),
@@ -3808,11 +3842,7 @@ mod tests {
         let _qdrant_grpc = EnvGuard::set("CODESTORY_QDRANT_GRPC_PORT", "invalid");
         let _embed = EnvGuard::set("CODESTORY_EMBED_PORT", "invalid");
 
-        let runtime = SidecarRuntimeConfig::for_project_profile_with_run_id(
-            None,
-            SidecarProfile::Agent,
-            Some("current"),
-        );
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Agent, Some("current"));
 
         assert_eq!(runtime.layout.qdrant_http_port, 0);
         assert_eq!(runtime.layout.qdrant_grpc_port, 0);
@@ -3855,7 +3885,7 @@ mod tests {
         let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
 
         assert_eq!(
-            embedding_server_launch_mode().expect("launch mode"),
+            embedding_server_launch_mode_from_env().expect("launch mode"),
             EmbeddingServerLaunchMode::NativeSpawned
         );
     }
@@ -3870,7 +3900,7 @@ mod tests {
         );
 
         assert_eq!(
-            embedding_server_launch_mode().expect("launch mode"),
+            embedding_server_launch_mode_from_env().expect("launch mode"),
             EmbeddingServerLaunchMode::ExternalEndpoint
         );
     }
@@ -3885,7 +3915,7 @@ mod tests {
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
 
         assert_eq!(
-            embedding_server_launch_mode().expect("launch mode"),
+            embedding_server_launch_mode_from_env().expect("launch mode"),
             EmbeddingServerLaunchMode::DockerComposeEmbed
         );
     }
@@ -3896,7 +3926,7 @@ mod tests {
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "external_endpoint");
         let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", " ");
 
-        let error = embedding_server_launch_mode().expect_err("blank external url");
+        let error = embedding_server_launch_mode_from_env().expect_err("blank external url");
 
         assert!(
             error
@@ -3914,7 +3944,7 @@ mod tests {
         let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "windows/x86_64");
         let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
-        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Agent, None);
 
         assert_eq!(
             embedding_server_launch_mode_for_runtime(&runtime).expect("launch mode"),
@@ -3931,7 +3961,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
         let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
-        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Agent, None);
 
         assert_eq!(
             runtime.embedding.endpoint,
@@ -3948,12 +3978,8 @@ mod tests {
         let _cache = EnvGuard::remove("CODESTORY_CACHE_ROOT");
         let _qdrant = EnvGuard::remove("CODESTORY_QDRANT_HTTP_PORT");
         let _endpoint = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
-        let retained = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
-            None,
-            SidecarProfile::Local,
-            None,
-            cache.path(),
-        );
+        let retained =
+            test_sidecar_runtime_in_cache(None, SidecarProfile::Local, None, cache.path());
         let _cache = EnvGuard::set(
             "CODESTORY_CACHE_ROOT",
             poison_cache.path().to_str().expect("utf8 poison cache"),
@@ -3984,7 +4010,7 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _legacy = EnvGuard::set("CODESTORY_EMBED_ONNX_MODEL", "legacy.onnx");
 
-        let runtime = SidecarRuntimeConfig::local();
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
 
         let error = runtime
             .embedding
@@ -3998,12 +4024,8 @@ mod tests {
     #[test]
     fn ownership_redacts_external_embedding_endpoint_secrets() {
         let cache = tempdir().expect("cache");
-        let mut runtime = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
-            None,
-            SidecarProfile::Local,
-            None,
-            cache.path(),
-        );
+        let mut runtime =
+            test_sidecar_runtime_in_cache(None, SidecarProfile::Local, None, cache.path());
         runtime.embedding.endpoint =
             "http://username-secret:password-secret@127.0.0.1:8080/v1/embeddings?token=query-secret#fragment-secret"
                 .into();
@@ -4041,12 +4063,8 @@ mod tests {
                 Sha256::digest(runtime.embedding.endpoint.as_bytes())
             )
         );
-        let mut restarted = SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
-            None,
-            SidecarProfile::Local,
-            None,
-            cache.path(),
-        );
+        let mut restarted =
+            test_sidecar_runtime_in_cache(None, SidecarProfile::Local, None, cache.path());
         restarted.embedding.endpoint = runtime.embedding.endpoint.clone();
         restarted.embedding.endpoint_origin = runtime.embedding.endpoint_origin;
         let retained = restarted.ownership();
@@ -4128,7 +4146,7 @@ mod tests {
             "CODESTORY_EMBED_LLAMACPP_URL",
             "http://127.0.0.1:37040/v1/embeddings",
         );
-        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Agent, None);
 
         assert_eq!(
             runtime.embedding.endpoint_origin,
@@ -4150,7 +4168,7 @@ mod tests {
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "docker_compose_embed");
         let endpoint = "http://127.0.0.1:37040/v1/embeddings";
         let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", endpoint);
-        let runtime = SidecarRuntimeConfig::for_project_profile(None, SidecarProfile::Agent);
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Agent, None);
 
         assert_eq!(runtime.embedding.endpoint, endpoint);
         assert_eq!(
@@ -4173,7 +4191,7 @@ mod tests {
         let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "llama-server.exe");
         let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
 
-        let error = embedding_server_launch_mode().expect_err("invalid mode");
+        let error = embedding_server_launch_mode_from_env().expect_err("invalid mode");
 
         assert!(
             error
@@ -4192,7 +4210,7 @@ mod tests {
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
 
         assert_eq!(
-            embedding_server_launch_mode().expect("launch mode"),
+            embedding_server_launch_mode_from_env().expect("launch mode"),
             EmbeddingServerLaunchMode::NativeSpawned
         );
     }
@@ -4207,7 +4225,7 @@ mod tests {
         let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
 
         assert_eq!(
-            embedding_server_launch_mode().expect("launch mode"),
+            embedding_server_launch_mode_from_env().expect("launch mode"),
             EmbeddingServerLaunchMode::DockerComposeEmbed
         );
     }
