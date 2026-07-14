@@ -66,6 +66,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
+      - name: Validate versioned changelog notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          node .github/scripts/extract-codestory-release-notes.mjs
+          --version "$VERSION"
+          --output "$RUNNER_TEMP/codestory-release-notes.md"
+
       - name: Refuse existing tag or release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -142,6 +150,28 @@ jobs:
           test -s target/release-assets/SHA256SUMS.txt
           (cd target/release-assets && sha256sum -c SHA256SUMS.txt)
 
+      - name: Compose versioned GitHub release notes
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/extract-codestory-release-notes.mjs \
+            --version "$VERSION" \
+            --output target/release-assets/release-notes.md
+          cat >> target/release-assets/release-notes.md <<'EOF'
+
+          ## Platform proof boundaries
+
+          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS x64/arm64.
+
+          - Windows x64 managed install, local ground, and repair handoff are acceptance-smoked; this is not full sidecar or GPU proof.
+          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof.
+          - Intel macOS packaging is acceptance-smoked; it does not make Apple Silicon Metal claims.
+          - Windows arm64 ships a CLI asset but has no managed native accelerated embedding cell.
+          - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
+          - Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.
+          EOF
+
       - name: Refuse existing tag or release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -177,24 +207,11 @@ jobs:
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
-          cat > target/release-assets/proof-boundaries.md <<'EOF'
-          ## Platform proof boundaries
-
-          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS x64/arm64.
-
-          - Windows x64 managed install, local ground, and repair handoff are acceptance-smoked; this is not full sidecar or GPU proof.
-          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof.
-          - Intel macOS packaging is acceptance-smoked; it does not make Apple Silicon Metal claims.
-          - Windows arm64 ships a CLI asset but has no managed native accelerated embedding cell.
-          - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
-          - Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.
-          EOF
           gh release create "$TAG" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "CodeStory $TAG" \
-            --notes-file target/release-assets/proof-boundaries.md \
-            --generate-notes
+            --notes-file target/release-assets/release-notes.md
 
   post-publish-smoke:
     name: Post-publish release asset smoke

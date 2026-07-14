@@ -4,6 +4,10 @@
 
 ### Changed
 
+- GitHub releases now use the exact matching version section from this
+  changelog before the existing platform proof-boundary appendix. Publication
+  fails when that version section is missing, duplicated, or empty instead of
+  substituting an automatically generated pull-request list.
 - Added reproducible provisioning for the repository-scoped Linux
   release-evidence runner. The runner uses a stable provisioned machine
   identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64
