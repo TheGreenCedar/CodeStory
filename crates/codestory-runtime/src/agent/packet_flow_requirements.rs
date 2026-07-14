@@ -103,6 +103,9 @@ pub(crate) fn packet_flow_requirements_for_terms(
         || packet_terms_indicate_server_request_dispatch_flow(terms)
     {
         requirements.extend_from_slice(REQUEST_DISPATCH_FLOW);
+        if packet_terms_have_any(terms, &["interceptor", "interceptors"]) {
+            requirements.push(REQUEST_INTERCEPTOR_REQUIREMENT);
+        }
     }
     if packet_terms_indicate_client_send_flow(terms) {
         push_client_send_requirements_for_terms(terms, &mut requirements);
@@ -317,6 +320,13 @@ const REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
         coverage_mode: CoverageMode::AllowsSourceRange,
     },
 ];
+
+const REQUEST_INTERCEPTOR_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "request_interceptor_management",
+    role: FlowRole::Dispatch,
+    query_seeds: &["request interceptor"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+};
 
 const URL_SESSION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {

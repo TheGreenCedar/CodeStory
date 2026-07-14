@@ -1134,8 +1134,10 @@ impl PacketFlowContext {
         {
             return false;
         }
-        if StructuralLanguagePolicy::claim_satisfies_requirement(requirement, claim) {
-            return true;
+        let structural_match =
+            StructuralLanguagePolicy::claim_satisfies_requirement(requirement, claim);
+        if structural_match || StructuralLanguagePolicy::requires_cited_role(requirement) {
+            return structural_match;
         }
         if StructuralLanguagePolicy::requires_specific_proof(requirement) {
             return self.claim_declares_exact_requirement_id(claim, requirement);
@@ -1195,6 +1197,10 @@ impl PacketFlowContext {
 struct StructuralLanguagePolicy;
 
 impl StructuralLanguagePolicy {
+    fn requires_cited_role(requirement: &FlowRequirement) -> bool {
+        requirement.id == "request_interceptor_management"
+    }
+
     fn requires_specific_proof(requirement: &FlowRequirement) -> bool {
         matches!(
             requirement.id,
@@ -1226,6 +1232,14 @@ impl StructuralLanguagePolicy {
     fn claim_satisfies_requirement(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
         let normalized = normalize_identifier(&claim.claim);
         match requirement.id {
+            "request_interceptor_management" => claim.citations.iter().any(|citation| {
+                !matches!(
+                    citation.kind,
+                    codestory_contracts::api::NodeKind::MODULE
+                        | codestory_contracts::api::NodeKind::NAMESPACE
+                        | codestory_contracts::api::NodeKind::PACKAGE
+                ) && normalize_identifier(&citation.display_name).contains("interceptor")
+            }),
             "sql_tables" => claim.citations.iter().any(Self::citation_is_sql_table),
             "sql_relationships" => claim
                 .citations
@@ -3843,6 +3857,71 @@ mod tests {
                 "expected generic coverage report to include {expected}: {report:?}"
             );
         }
+    }
+
+    #[test]
+    fn role_safe_sufficiency_requires_cited_requested_interceptor_evidence() {
+        let question = "Trace how a client creates a request, runs interceptors, dispatches it, and sends it through a transport.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let mut claims = vec![
+            claim("The public client entrypoint creates a request before dispatch."),
+            claim("Request dispatch transforms config and invokes the selected handler."),
+            claim("The transport boundary sends the request and returns a response."),
+        ];
+
+        let assemble = |supported_claims| {
+            assemble_packet_sufficiency(PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/generic-client"),
+                question,
+                task_class: PacketTaskClassDto::RouteTracing,
+                answer: &answer,
+                budget: &budget,
+                supported_claims,
+                missing_required_probe_queries: Vec::new(),
+                targeted_follow_up_queries: Vec::new(),
+            })
+        };
+
+        let missing_role = assemble(claims.clone());
+        assert_eq!(missing_role.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            missing_role
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report
+                    .missing
+                    .iter()
+                    .any(|gap| gap == "request_interceptor_management")),
+            "an explicitly requested role must remain missing without compatible cited evidence: {missing_role:?}"
+        );
+
+        let mut unrelated_helper = cited_anchor("normalizeConfig");
+        unrelated_helper.file_path = Some("src/interceptors/helpers.js".to_string());
+        claims.push(cited_claim(
+            "normalizeConfig prepares request options before dispatch.",
+            Some("interceptor management"),
+            unrelated_helper,
+            Some(true),
+        ));
+        let unrelated_path = assemble(claims.clone());
+        assert_eq!(unrelated_path.status, PacketSufficiencyStatusDto::Partial);
+
+        claims.push(cited_claim(
+            "InterceptorRegistry stores fulfilled and rejected handlers for request execution.",
+            Some("interceptor management"),
+            cited_anchor("InterceptorRegistry"),
+            Some(true),
+        ));
+        let complete = assemble(claims);
+        assert_eq!(complete.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(
+            complete
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report.missing.is_empty()),
+            "role-compatible cited evidence should complete the requested flow: {complete:?}"
+        );
     }
 
     #[test]

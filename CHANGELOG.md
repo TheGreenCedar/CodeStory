@@ -57,6 +57,9 @@
 
 ### Fixed
 
+- Kept packet claim attribution tied to behavior-owning citation identities and
+  require cited interceptor evidence before an interceptor-focused request flow
+  can report sufficient coverage.
 - Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
   generation artifact scopes to project identity schema 3. Legacy schema-2
   state is discovered for inventory but never reused or destructively cleaned;
