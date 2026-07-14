@@ -116,7 +116,7 @@ jq -e --arg profile_id "$profile_id" --arg repository "$repository" \
 printf '%s  %s\n' "$model_sha" "$runner_root/models/$model_name" | sha256sum -c -
 test "$(git -C "$runner_root/drills/serde-json" rev-parse HEAD)" = "$drill_commit"
 test -z "$(git -C "$runner_root/drills/serde-json" status --porcelain)"
-jq -e '.cases[0].anchors == ["from_reader", "Deserializer", "Value"]' \
+jq -e '.cases[0].anchors == ["from_reader", "Deserializer::from_reader", "Value"]' \
   "$runner_root/drills/real-repo-drill-cases.json" >/dev/null
 test -f "$runner_root/validation/source-sha"
 test ! -e "$runner_root/validation/codestory/.git"

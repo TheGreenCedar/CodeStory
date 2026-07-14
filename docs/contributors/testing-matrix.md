@@ -408,8 +408,8 @@ symbol-doc persistence, dense-anchor persistence/reuse, embedding reuse, or
 cold-start performance changes. Intermediate checkpoints do not append rows:
 
 ```sh
-cargo build --release -p codestory-cli
-cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
+cargo build --release --locked -p codestory-cli
+cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture --test-threads=1
 ```
 
 The real-repo drill portion fails closed unless `CODESTORY_REAL_REPO_DRILL_CASES`
@@ -493,6 +493,23 @@ blocks the release unless a non-expired exception binds the exact candidate
 hash, baseline id/hash, profile, metric, measured value, threshold, owner, ISO
 date, and rationale. Preserve the emitted decision JSON; it carries status,
 metric, decision, commit, and artifact paths/hashes.
+
+The dedicated Linux ARM64 evidence profile explicitly allows CPU embeddings
+from its checksum-verified preseeded model. Fresh measurements retain the raw
+repo-scale log, stats JSON, and complete real-repo drill tree. Before a distinct
+release-eligible baseline exists, artifact production succeeds but evaluation
+must reject the first run; retained output alone is not acceptance.
+
+Only the manual `release-evidence` mode of the registered platform-proof
+coordinator can reach that self-hosted runner. Its hosted resolver first requires
+a same-repository PR into `dev/codestory-next`, its exact expected head, the
+`review-accepted` label, and a successful exact-head source proof. It then calls
+the reusable evidence workflow with fixed profile and runner paths. The resolved
+SHA is checked out behind the protected `release-evidence` environment; the
+ambient dispatch ref is never measured. Runner groups are unavailable for this
+personal-account repository, so environment approval is the allocation guard.
+The two live tests run serially and must prove their owned sidecars are gone
+before the packet benchmark starts.
 
 ## CLI Boundary And Output Changes
 

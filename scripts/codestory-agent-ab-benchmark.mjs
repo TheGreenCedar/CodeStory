@@ -413,6 +413,19 @@ function retrievalEnv() {
   return benchmarkRetrievalEnv(benchmarkChildEnv(process.env));
 }
 
+function selectedBenchmarkChildEnv(opts = {}) {
+  return { ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)) };
+}
+
+function selectedSidecarArgs(opts = {}) {
+  const profile = opts.packetSidecarProfile ?? "local";
+  const args = ["--profile", profile];
+  if (profile === "agent" && opts.packetSidecarRunId) {
+    args.push("--run-id", opts.packetSidecarRunId);
+  }
+  return args;
+}
+
 function runnerCommand(opts, repoPath, prompt) {
   if (opts.runner !== "codex") {
     return {
@@ -2228,6 +2241,7 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
     task?.prompt ?? repoConfig.prompt,
     "--budget",
     "compact",
+    ...selectedSidecarArgs(opts),
     "--format",
     "json",
   ];
@@ -3008,6 +3022,7 @@ function doctorSnapshotFromOutput(result, output, parseError, wallMs) {
 }
 
 function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
+  const locality = semanticRuntimeLocalityFromRetrievalStatus(output);
   return {
     status: result.status === "pass" && !parseError ? "pass" : result.status,
     exit_code: result.exitCode,
@@ -3020,6 +3035,11 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
     manifest_embedding_dim: output?.manifest?.embedding_dim ?? null,
     sidecar_generation: output?.manifest?.sidecar_generation ?? null,
     qdrant_collection: output?.manifest?.qdrant_collection ?? null,
+    embedding_endpoint_origin: output?.ownership?.embedding_endpoint_origin ?? null,
+    embedding_endpoint: output?.ownership?.ports?.embed_url ?? null,
+    local_only: locality.local_only,
+    locality_kind: locality.locality_kind,
+    locality_evidence: locality.locality_evidence,
     lexical_capabilities: output?.lexical?.capabilities ?? null,
     qdrant_capabilities: output?.qdrant?.capabilities ?? null,
     scip_capabilities: output?.scip?.capabilities ?? null,
@@ -3028,12 +3048,12 @@ function retrievalStatusSnapshotFromOutput(result, output, parseError, wallMs) {
   };
 }
 
-async function codestoryDoctorSnapshot(codestoryCli, project, timeoutMs) {
+async function codestoryDoctorSnapshot(codestoryCli, project, timeoutMs, env = benchmarkChildEnv(process.env)) {
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
     ["doctor", "--project", project, "--format", "json"],
-    { timeoutMs, env: benchmarkChildEnv(process.env) },
+    { timeoutMs, env },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   let output = null;
@@ -3048,12 +3068,18 @@ async function codestoryDoctorSnapshot(codestoryCli, project, timeoutMs) {
   return doctorSnapshotFromOutput(result, output, parseError, wallMs);
 }
 
-async function codestoryRetrievalStatusSnapshot(codestoryCli, project, timeoutMs) {
+async function codestoryRetrievalStatusSnapshot(
+  codestoryCli,
+  project,
+  timeoutMs,
+  env = benchmarkChildEnv(process.env),
+  sidecarArgs = [],
+) {
   const started = performance.now();
   const result = await runProcess(
     codestoryCli,
-    ["retrieval", "status", "--project", project, "--format", "json"],
-    { timeoutMs, env: benchmarkChildEnv(process.env) },
+    ["retrieval", "status", "--project", project, ...sidecarArgs, "--format", "json"],
+    { timeoutMs, env },
   );
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
   let output = null;
@@ -3136,7 +3162,9 @@ async function prepareCodeStoryCaches(opts, tasks) {
 
     console.log(`preparing CodeStory cache for ${repo}`);
     const preparationStarted = performance.now();
-    const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000);
+    const childEnv = selectedBenchmarkChildEnv(opts);
+    const sidecarArgs = selectedSidecarArgs(opts);
+    const before = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000, childEnv);
     const preparation = {
       repo,
       project: config.path,
@@ -3155,14 +3183,22 @@ async function prepareCodeStoryCaches(opts, tasks) {
       after: before,
     };
 
-    preparation.retrieval_contract = retrievalContractSummary(benchmarkChildEnv(process.env));
-    if (shouldPrepareRetrievalIndex(process.env)) {
+    preparation.retrieval_contract = retrievalContractSummary(childEnv);
+    if (shouldPrepareRetrievalIndex(childEnv)) {
       const retrievalStarted = performance.now();
       const retrievalIndex = await runProcess(
         codestoryCli,
-        ["retrieval", "index", "--project", config.path, "--refresh", "auto"],
+        [
+          "retrieval",
+          "index",
+          "--project",
+          config.path,
+          ...sidecarArgs,
+          "--refresh",
+          "auto",
+        ],
         {
-          env: benchmarkChildEnv(process.env),
+          env: childEnv,
           timeoutMs: opts.prepareCodestoryTimeoutMs,
           timeoutMessage: `retrieval index timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
         },
@@ -3178,11 +3214,13 @@ async function prepareCodeStoryCaches(opts, tasks) {
           `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
         );
       }
-      preparation.after = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000);
+      preparation.after = await codestoryDoctorSnapshot(codestoryCli, config.path, 60_000, childEnv);
       preparation.retrieval_status = await codestoryRetrievalStatusSnapshot(
         codestoryCli,
         config.path,
         60_000,
+        childEnv,
+        sidecarArgs,
       );
       if (preparation.retrieval_status.retrieval_mode !== "full") {
         throw new Error(
@@ -3272,6 +3310,29 @@ function semanticRuntimeLocality(output) {
   };
 }
 
+function semanticRuntimeLocalityFromRetrievalStatus(output) {
+  const origin = output?.ownership?.embedding_endpoint_origin ?? null;
+  const endpoint = output?.ownership?.ports?.embed_url ?? null;
+  if (!origin || !endpoint) {
+    return {
+      local_only: null,
+      locality_kind: "unknown_sidecar_endpoint",
+      locality_evidence: "retrieval status did not expose sidecar endpoint ownership",
+    };
+  }
+  const loopback = isLoopbackUrl(endpoint);
+  return {
+    local_only: loopback,
+    locality_kind:
+      origin === "managed_sidecar" && loopback
+        ? "managed_sidecar_loopback"
+        : loopback
+          ? "loopback_endpoint"
+          : "remote_endpoint",
+    locality_evidence: `retrieval status reports ${origin} embedding ownership`,
+  };
+}
+
 function cachePolicyForRun(observations = {}) {
   if (observations.indexing_in_timed_run) {
     return "timed-run-indexed-cache";
@@ -3321,12 +3382,15 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     codestoryCli,
     config.path,
     Math.min(opts.timeoutMs ?? 600_000, 60_000),
+    selectedBenchmarkChildEnv(opts),
   );
   const retrievalStatus = observations.cache_preparation?.retrieval_status ??
     await codestoryRetrievalStatusSnapshot(
       codestoryCli,
       config.path,
       Math.min(opts.timeoutMs ?? 600_000, 60_000),
+      selectedBenchmarkChildEnv(opts),
+      selectedSidecarArgs(opts),
     );
   return {
     codestory_cli: path.resolve(codestoryCli),
@@ -3338,9 +3402,9 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     semantic_backend: doctor.semantic_backend ?? null,
     semantic_doc_count: doctor.semantic_doc_count ?? null,
     embedding_model: doctor.embedding_model ?? null,
-    local_only: doctor.local_only ?? null,
-    locality_kind: doctor.locality_kind ?? null,
-    locality_evidence: doctor.locality_evidence ?? null,
+    local_only: retrievalStatus.local_only ?? doctor.local_only ?? null,
+    locality_kind: retrievalStatus.locality_kind ?? doctor.locality_kind ?? null,
+    locality_evidence: retrievalStatus.locality_evidence ?? doctor.locality_evidence ?? null,
     cache_policy: cachePolicyForRun(observations),
     indexing_in_timed_run: observations.indexing_in_timed_run ?? null,
     codestory_index_commands_observed: observations.codestory_index_commands_observed ?? null,
@@ -4164,7 +4228,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
   const args = packetCommandArgs(repoConfig, task, opts);
   const started = performance.now();
   const result = await runProcess(codestoryCli, args, {
-    env: benchmarkChildEnv(process.env),
+    env: selectedBenchmarkChildEnv(opts),
     timeoutMs: opts.timeoutMs,
   });
   const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
@@ -4215,7 +4279,7 @@ async function runColdPacketRuntime(opts, task, repeat, outDir) {
 
 function createStdioClient(command, args, opts) {
   const child = spawn(command, args, {
-    env: benchmarkChildEnv(process.env),
+    env: selectedBenchmarkChildEnv(opts),
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -5063,10 +5127,101 @@ function packetCompositionMarkdown(payload) {
   return `${lines.join("\n")}\n`;
 }
 
+function configurePacketRuntimeSidecar(opts) {
+  const commit = String(process.env.CODESTORY_RELEASE_EVIDENCE_COMMIT ?? "adhoc")
+    .replace(/[^0-9a-f]/gi, "")
+    .slice(0, 12) || "adhoc";
+  const runId = `packet-runtime-${commit}-${process.pid}-${Date.now().toString(36)}`;
+  opts.packetSidecarProfile = "agent";
+  opts.packetSidecarRunId = runId;
+  const childEnv = benchmarkChildEnv(process.env, {
+    CODESTORY_RETRIEVAL_PROFILE: "agent",
+    CODESTORY_SIDECAR_RUN_ID: runId,
+    CODESTORY_EMBED_SERVER_LAUNCH: "",
+  });
+  childEnv.CODESTORY_EMBED_LLAMACPP_URL = "";
+  opts.packetRuntimeChildEnv = childEnv;
+}
+
+async function bootstrapPacketRuntimeSidecars(opts, tasks, attemptedRepos) {
+  const codestoryCli = resolveCodeStoryCli(opts);
+  const repoNames = [...new Set(tasks.map((task) => task.repo))];
+  for (const repo of repoNames) {
+    const config = ALL_REPOS[repo];
+    if (!config || !existsSync(config.path)) {
+      throw new Error(`cannot bootstrap packet sidecar for missing repo ${repo}`);
+    }
+    attemptedRepos.push({ repo, project: config.path });
+    const result = await runProcess(
+      codestoryCli,
+      [
+        "retrieval",
+        "bootstrap",
+        "--project",
+        config.path,
+        ...selectedSidecarArgs(opts),
+        "--format",
+        "json",
+      ],
+      {
+        env: selectedBenchmarkChildEnv(opts),
+        timeoutMs: Math.min(opts.prepareCodestoryTimeoutMs, 180_000),
+      },
+    );
+    if (result.status !== "pass") {
+      throw new Error(
+        `packet sidecar bootstrap failed for ${repo}: ${trimTail(result.stderr || result.stdout)}`,
+      );
+    }
+  }
+}
+
+async function cleanupPacketRuntimeSidecars(opts, attemptedRepos) {
+  const codestoryCli = resolveCodeStoryCli(opts);
+  const failures = [];
+  for (const { repo, project } of [...attemptedRepos].reverse()) {
+    const result = await runProcess(
+      codestoryCli,
+      ["retrieval", "down", "--project", project, ...selectedSidecarArgs(opts)],
+      {
+        env: selectedBenchmarkChildEnv(opts),
+        timeoutMs: 120_000,
+      },
+    );
+    if (result.status !== "pass") {
+      failures.push(`${repo}: ${trimTail(result.stderr || result.stdout)}`);
+    }
+  }
+  return failures;
+}
+
 async function runPacketRuntimeBenchmark(opts, tasks) {
   if (!tasks.length) {
     throw new Error("--packet-runtime requires --task-suite or --task-manifest");
   }
+  configurePacketRuntimeSidecar(opts);
+  const attemptedRepos = [];
+  let primaryError = null;
+  try {
+    await bootstrapPacketRuntimeSidecars(opts, tasks, attemptedRepos);
+    return await runPacketRuntimeBenchmarkBody(opts, tasks);
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    const cleanupFailures = await cleanupPacketRuntimeSidecars(opts, attemptedRepos);
+    if (cleanupFailures.length) {
+      const message = `packet sidecar cleanup failed: ${cleanupFailures.join("; ")}`;
+      if (primaryError) {
+        console.error(message);
+      } else {
+        throw new Error(message);
+      }
+    }
+  }
+}
+
+async function runPacketRuntimeBenchmarkBody(opts, tasks) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", `packet-runtime-${timestamp}`));
   const benchmarkId = opts.benchmarkRunId ?? path.basename(outDir);
@@ -5120,12 +5275,17 @@ async function runPacketRuntimeBenchmark(opts, tasks) {
     modes,
     repeats: opts.repeats,
     output_dir: outDir,
-    retrieval_env: retrievalEnv(),
-    retrieval_contract: retrievalContractSummary(benchmarkChildEnv(process.env)),
+    retrieval_env: benchmarkRetrievalEnv(selectedBenchmarkChildEnv(opts)),
+    retrieval_contract: retrievalContractSummary(selectedBenchmarkChildEnv(opts)),
+    sidecar_lifecycle: {
+      profile: opts.packetSidecarProfile,
+      run_id: opts.packetSidecarRunId,
+      cleanup: "retrieval down",
+    },
     benchmark_contract: benchmarkRunContract({
       opts,
       task: null,
-      env: process.env,
+      env: selectedBenchmarkChildEnv(opts),
       harnessPath: benchmarkHarnessPath,
       scorerPath: benchmarkScorerPath,
       cliIdentity: opts.codestoryCli ?? process.env.CODESTORY_CLI ?? null,
@@ -6285,6 +6445,19 @@ function runSelfTest() {
       semantic_ready: true,
     }),
     "already-ready",
+  );
+  assert.deepEqual(
+    semanticRuntimeLocalityFromRetrievalStatus({
+      ownership: {
+        embedding_endpoint_origin: "managed_sidecar",
+        ports: { embed_url: "http://127.0.0.1:8080/v1/embeddings" },
+      },
+    }),
+    {
+      local_only: true,
+      locality_kind: "managed_sidecar_loopback",
+      locality_evidence: "retrieval status reports managed_sidecar embedding ownership",
+    },
   );
   const packetRuntimePreparation = [
     {

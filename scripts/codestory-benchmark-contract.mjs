@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 
 const RETRIEVAL_ENV_KEYS = [
   "CODESTORY_RETRIEVAL",
+  "CODESTORY_RETRIEVAL_PROFILE",
   "CODESTORY_RETRIEVAL_SHADOW",
   "CODESTORY_QDRANT_ENABLED",
   "CODESTORY_RETRIEVAL_REAL_EMBEDDINGS",
@@ -80,6 +81,8 @@ function retrievalContractSummary(env = process.env) {
     sidecar_primary: true,
     unsupported_sidecar_disabled_request: false,
     code_story_retrieval: raw,
+    runtime_profile:
+      env.CODESTORY_RETRIEVAL_PROFILE ?? env.CODESTORY_SIDECAR_PROFILE ?? null,
     embedding_backend: env.CODESTORY_EMBED_BACKEND ?? null,
     compose_profile: env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE ?? null,
   };
@@ -89,6 +92,9 @@ function benchmarkChildEnv(baseEnv = process.env, additions = {}) {
   const env = { ...baseEnv, ...additions };
   if (env.CODESTORY_RETRIEVAL == null || env.CODESTORY_RETRIEVAL === "") {
     env.CODESTORY_RETRIEVAL = "1";
+  }
+  if (env.CODESTORY_RETRIEVAL_PROFILE == null || env.CODESTORY_RETRIEVAL_PROFILE === "") {
+    env.CODESTORY_RETRIEVAL_PROFILE = "local";
   }
   if (
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS == null ||

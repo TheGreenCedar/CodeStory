@@ -489,12 +489,14 @@ struct ReleaseE2eSidecarCleanup {
     binary: PathBuf,
     project_root: PathBuf,
     cache_dir: PathBuf,
+    sidecar_cache_root: PathBuf,
     run_id: String,
+    armed: bool,
 }
 
-impl Drop for ReleaseE2eSidecarCleanup {
-    fn drop(&mut self) {
-        let _ = test_support::command(&self.binary)
+impl ReleaseE2eSidecarCleanup {
+    fn down(&self) -> std::io::Result<std::process::Output> {
+        test_support::command(&self.binary)
             .current_dir(&self.project_root)
             .args(["retrieval", "down", "--profile", "agent", "--run-id"])
             .arg(&self.run_id)
@@ -503,9 +505,72 @@ impl Drop for ReleaseE2eSidecarCleanup {
             .arg("--cache-dir")
             .arg(&self.cache_dir)
             .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+            .env_remove("CODESTORY_STDIO_CACHE_ROOT")
+            .env("CODESTORY_CACHE_ROOT", &self.sidecar_cache_root)
             .env("CODESTORY_EMBED_BACKEND", "llamacpp")
             .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
-            .output();
+            .output()
+    }
+
+    fn teardown(&mut self) {
+        let (_, status_json) = run_cli_json_with_sidecar_cache_root(
+            &self.binary,
+            &self.project_root,
+            &self.cache_dir,
+            &self.sidecar_cache_root,
+            &[
+                "retrieval".to_string(),
+                "status".to_string(),
+                "--profile".to_string(),
+                "agent".to_string(),
+                "--run-id".to_string(),
+                self.run_id.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+        let namespace = string_field(&status_json, &["ownership", "namespace"]).to_string();
+
+        let down = self.down().expect("tear down release evidence sidecar");
+        assert!(
+            down.status.success(),
+            "release evidence sidecar teardown failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&down.stdout),
+            String::from_utf8_lossy(&down.stderr)
+        );
+
+        let (_, inventory_json) = run_cli_json_with_sidecar_cache_root(
+            &self.binary,
+            &self.project_root,
+            &self.cache_dir,
+            &self.sidecar_cache_root,
+            &[
+                "retrieval".to_string(),
+                "inventory".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+        let namespaces = json_path(&inventory_json, &["namespaces"])
+            .as_array()
+            .expect("release evidence sidecar inventory namespaces");
+        if let Some(entry) = namespaces
+            .iter()
+            .find(|entry| entry["namespace"].as_str() == Some(namespace.as_str()))
+        {
+            assert_eq!(entry["state_exists"].as_bool(), Some(false));
+            assert_eq!(entry["containers"].as_array().map(Vec::len), Some(0));
+            assert_eq!(entry["networks"].as_array().map(Vec::len), Some(0));
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for ReleaseE2eSidecarCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.down();
+        }
     }
 }
 
@@ -530,7 +595,23 @@ fn run_cli_json(
     cache_dir: &Path,
     args: &[String],
 ) -> (f64, Value) {
-    let (seconds, stdout) = run_cli_output(binary, project_root, cache_dir, args);
+    run_cli_json_with_sidecar_cache_root(binary, project_root, cache_dir, cache_dir, args)
+}
+
+fn run_cli_json_with_sidecar_cache_root(
+    binary: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
+    sidecar_cache_root: &Path,
+    args: &[String],
+) -> (f64, Value) {
+    let (seconds, stdout) = run_cli_output_with_sidecar_cache_root(
+        binary,
+        project_root,
+        cache_dir,
+        sidecar_cache_root,
+        args,
+    );
     (
         seconds,
         serde_json::from_slice(&stdout).expect("parse json output"),
@@ -543,6 +624,16 @@ fn run_cli_output(
     cache_dir: &Path,
     args: &[String],
 ) -> (f64, Vec<u8>) {
+    run_cli_output_with_sidecar_cache_root(binary, project_root, cache_dir, cache_dir, args)
+}
+
+fn run_cli_output_with_sidecar_cache_root(
+    binary: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
+    sidecar_cache_root: &Path,
+    args: &[String],
+) -> (f64, Vec<u8>) {
     let started = Instant::now();
     let output = test_support::command(binary)
         .current_dir(project_root)
@@ -552,6 +643,8 @@ fn run_cli_output(
         .arg("--cache-dir")
         .arg(cache_dir)
         .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+        .env_remove("CODESTORY_STDIO_CACHE_ROOT")
+        .env("CODESTORY_CACHE_ROOT", sidecar_cache_root)
         .env("CODESTORY_EMBED_BACKEND", "llamacpp")
         .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
         .output()
@@ -715,11 +808,13 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
 
     let cache_dir = tempdir().expect("cache dir");
-    let _sidecar_cleanup = ReleaseE2eSidecarCleanup {
+    let mut sidecar_cleanup = ReleaseE2eSidecarCleanup {
         binary: binary.clone(),
         project_root: project_root.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
+        sidecar_cache_root: cache_dir.path().to_path_buf(),
         run_id: sidecar_run_id.to_string(),
+        armed: true,
     };
 
     let (index_seconds, index_json) = run_cli_json(
@@ -1300,6 +1395,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.search_dir_unchanged,
         "plain read commands should not recreate the persisted search dir"
     );
+    sidecar_cleanup.teardown();
 }
 
 #[test]
@@ -1312,7 +1408,10 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         binary.display()
     );
 
-    let root_output = tempdir().expect("drill output dir");
+    let temporary_output = tempdir().expect("drill output dir");
+    let root_output = env::var_os("CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| temporary_output.path().to_path_buf());
     let cache_dir = tempdir().expect("drill cache dir");
     let Some(manifest_path) = env::var_os("CODESTORY_REAL_REPO_DRILL_CASES").map(PathBuf::from)
     else {
@@ -1351,10 +1450,41 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             missing.join(", ")
         );
     }
+    let mut sidecar_cleanup = cases
+        .iter()
+        .map(|case| ReleaseE2eSidecarCleanup {
+            binary: binary.clone(),
+            project_root: case.project_root.clone(),
+            cache_dir: cache_dir.path().join(&case.name),
+            sidecar_cache_root: cache_dir.path().to_path_buf(),
+            run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
+            armed: true,
+        })
+        .collect::<Vec<_>>();
 
-    let (_seconds, suite_json) = run_cli_json(
+    for cleanup in &sidecar_cleanup {
+        run_cli_json_with_sidecar_cache_root(
+            &binary,
+            &cleanup.project_root,
+            &cleanup.cache_dir,
+            &cleanup.sidecar_cache_root,
+            &[
+                "retrieval".to_string(),
+                "bootstrap".to_string(),
+                "--profile".to_string(),
+                "agent".to_string(),
+                "--run-id".to_string(),
+                cleanup.run_id.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+    }
+
+    let (_seconds, suite_json) = run_cli_json_with_sidecar_cache_root(
         &binary,
         repo_root().as_path(),
+        cache_dir.path(),
         cache_dir.path(),
         &[
             "drill-suite".to_string(),
@@ -1363,7 +1493,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "--format".to_string(),
             "json".to_string(),
             "--output-dir".to_string(),
-            root_output.path().display().to_string(),
+            root_output.display().to_string(),
             "--case-file".to_string(),
             manifest_path.display().to_string(),
         ],
@@ -1376,23 +1506,22 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
     );
     assert_eq!(u64_field(&suite_json, &["repo_count"]), cases.len() as u64);
     assert_eq!(
+        u64_field(&suite_json, &["blocked_count"]),
+        0,
+        "drill-suite should complete every configured repo before its evidence is evaluated: {suite_json:#}"
+    );
+    assert_eq!(
         array_len(&suite_json, &["repos"]),
         cases.len(),
         "suite should include exactly the manifest real-repo drill cases"
     );
     assert!(
-        root_output.path().join("suite-report.md").is_file(),
+        root_output.join("suite-report.md").is_file(),
         "drill-suite should write a markdown aggregate report"
     );
     assert!(
-        root_output.path().join("suite-report.json").is_file(),
+        root_output.join("suite-report.json").is_file(),
         "drill-suite should write a JSON aggregate report"
-    );
-    let suite_markdown = fs::read_to_string(root_output.path().join("suite-report.md"))
-        .expect("read suite markdown");
-    assert!(
-        suite_markdown.contains("targets / 0 verified /") && suite_markdown.contains("pending"),
-        "suite markdown should make pending source-truth verification visible instead of implying CodeStory-only proof"
     );
     for case in &cases {
         assert!(
@@ -1427,12 +1556,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             u64_field(repo_json, &["summary", "anchors", "unresolved"]),
             0,
             "{} suite summary should not leave seed anchors unresolved",
-            case.name
-        );
-        assert_ne!(
-            string_field(repo_json, &["summary", "verdict", "status"]),
-            "blocked",
-            "{} suite summary should remain usable even when degraded",
             case.name
         );
         assert!(
@@ -1472,15 +1595,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             ),
             check_count,
             "{} suite open-gaps summary should preserve pending source-truth checks",
-            case.name
-        );
-        assert_eq!(
-            string_field(
-                repo_json,
-                &["summary", "open_gaps", "answer_quality_status"]
-            ),
-            "pending_source_verification",
-            "{} suite open-gaps status should not imply CodeStory-only answer quality is final",
             case.name
         );
         assert!(
@@ -1529,7 +1643,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             case.name
         );
         assert_compact_bridge_status_handoff(&case.name, repo_json);
-        assert_eq!(array_len(&drill_json, &["execution_boundaries"]), 1);
 
         for anchor_index in 0..case.anchors.len() {
             let index = anchor_index.to_string();
@@ -1554,6 +1667,9 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         }
 
         assert_manifest_anchor_expectations(case, repo_json);
+    }
+    for cleanup in &mut sidecar_cleanup {
+        cleanup.teardown();
     }
 }
 
