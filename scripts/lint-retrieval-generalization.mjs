@@ -116,6 +116,21 @@ const allowedHarnessReferences = [
     "violations.push(\"retrieval-sidecar-smoke.yml Windows proof must be workflow_dispatch-only\");",
   ],
   [
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    ".github/workflows/release-candidate-evidence.yml",
+    "const releaseCandidateEvidence = path.join(workflowRoot, \"release-candidate-evidence.yml\");",
+  ],
+  [
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    ".github/workflows/release-candidate-evidence.yml",
+    "\"uses: ./.github/workflows/release-candidate-evidence.yml\",",
+  ],
+  [
+    path.join(".github", "workflows", "packaged-platform-pr.yml"),
+    ".github/workflows/release-candidate-evidence.yml",
+    "uses: ./.github/workflows/release-candidate-evidence.yml",
+  ],
+  [
     path.join(".github", "scripts", "route-ci-proof.mjs"),
     ".github/workflows/retrieval-sidecar-smoke.yml",
     "\".github/workflows/retrieval-sidecar-smoke.yml\",",

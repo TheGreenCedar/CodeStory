@@ -642,7 +642,7 @@ if (!fs.existsSync(packagedPlatformPr)) {
 }
 
 if (!fs.existsSync(releaseCandidateEvidence)) {
-  violations.push("release-candidate-evidence.yml must own protected live evidence");
+  violations.push("release evidence workflow must own protected live evidence");
 } else {
   const content = fs.readFileSync(releaseCandidateEvidence, "utf8");
   requireContent(content, [
@@ -653,9 +653,9 @@ if (!fs.existsSync(releaseCandidateEvidence)) {
     "ref: ${{ inputs.ref }}",
     "--test-threads=1",
     "release-evidence-${{ inputs.ref }}",
-  ], snippet => `release-candidate-evidence.yml must include ${snippet}`);
+  ], snippet => `release evidence workflow must include ${snippet}`);
   if (content.includes("workflow_dispatch:")) {
-    violations.push("release-candidate-evidence.yml must be callable only through the coordinator workflow");
+    violations.push("release evidence workflow must be callable only through the coordinator workflow");
   }
 }
 
