@@ -3592,6 +3592,7 @@ fn execute_retrieval(
             ));
             return Err(sidecar_retrieval_unavailable_error(controller, reason));
         }
+        Some(SidecarPrimarySearchOutcome::Retryable { error }) => return Err(error),
         None => {
             return Err(sidecar_retrieval_unavailable_error(
                 controller,

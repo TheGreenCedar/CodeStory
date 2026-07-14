@@ -873,7 +873,6 @@ fn persist_finalized_manifest(
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
     manifest.degraded_modes_json =
         serde_json::to_string(&degraded_modes).unwrap_or_else(|_| "[]".into());
-    let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
     let mut storage = Store::open(storage_path).context("open storage for retrieval manifest")?;
     let embedding_backend =
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
@@ -884,6 +883,8 @@ fn persist_finalized_manifest(
         sidecar_input,
         &manifest,
         |storage| {
+            let lexical_source = lexical_source_input(project_root)
+                .context("rescan lexical source at publication fence")?;
             let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
                 storage,
                 project_root,
@@ -2599,12 +2600,54 @@ mod tests {
                 .expect("marker exists"),
             marker_before
         );
-        let lexical_source = lexical_source_input(project.path()).expect("lexical source");
+
+        let source_path = project.path().join("lib.rs");
+        let drifted = promote_retrieval_manifest(
+            &mut storage,
+            &second,
+            &new_manifest,
+            |snapshot| {
+                let lexical_source =
+                    lexical_source_input(project.path()).expect("fresh lexical source");
+                compute_sidecar_input_fingerprint_with_lexical_source(
+                    snapshot,
+                    project.path(),
+                    "proj",
+                    crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                    crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                    &runtime.embedding,
+                    lexical_source,
+                )
+            },
+            || {
+                validate_candidate_generation_evidence(
+                    "proj",
+                    &second,
+                    &new_manifest,
+                    &runtime,
+                    &passing,
+                )?;
+                std::fs::write(&source_path, "pub fn changed_during_validation() {}\n")?;
+                Ok(())
+            },
+        )
+        .expect_err("source drift during validation must reject publication");
+        assert!(drifted.to_string().contains("input changed"));
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")
+                .expect("current manifest after source drift"),
+            Some(old_manifest.clone())
+        );
+        std::fs::write(&source_path, "pub fn do_work() {}\n").expect("restore source");
+
         promote_retrieval_manifest(
             &mut storage,
             &second,
             &new_manifest,
             |snapshot| {
+                let lexical_source =
+                    lexical_source_input(project.path()).expect("fresh lexical source");
                 compute_sidecar_input_fingerprint_with_lexical_source(
                     snapshot,
                     project.path(),

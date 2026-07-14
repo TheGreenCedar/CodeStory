@@ -13,9 +13,11 @@ use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 #[cfg(test)]
 use codestory_retrieval::SidecarRuntimeConfig;
 use codestory_retrieval::{
-    CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
-    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
-    execute_strict_retrieval_query_batch_with_cache_for_runtime, is_phantom_sidecar_hit,
+    CandidateHit, CandidateSource, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionLock,
+    QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult, QueryTrace,
+    RetrievalPublicationIdentity, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
+    execute_strict_retrieval_query_batch_with_cache_for_runtime, global_generation_gc_state_file,
+    is_phantom_sidecar_hit, retrieval_publication_identity_from_storage,
     sidecar_project_id_for_root, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
@@ -28,10 +30,169 @@ const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
 const MAX_PACKET_BATCH_BUDGET_MS: u64 = 120_000;
 const MAX_SHADOW_CANDIDATES: usize = 20;
 const MAX_SHADOW_WOULD_RANK: usize = 10;
+const RETRIEVAL_PUBLICATION_ATTEMPTS: usize = 2;
 pub(crate) const RETRIEVAL_VERSION_SIDECAR: &str = "sidecar";
 
 const RETRIEVAL_ENV: &str = "CODESTORY_RETRIEVAL";
 const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
+
+struct PinnedRetrievalRead {
+    storage: Store,
+    project_root: PathBuf,
+    storage_path: PathBuf,
+    project_id: String,
+    identity: RetrievalPublicationIdentity,
+    node_names: HashMap<CoreNodeId, String>,
+    _global_generation_lease: GenerationRetentionLock,
+    _project_generation_lease: GenerationRetentionLock,
+}
+
+impl PinnedRetrievalRead {
+    fn begin(controller: &AppController) -> Result<Self, ApiError> {
+        let project_root = controller.require_project_root()?;
+        let storage_path = controller.require_storage_path()?;
+        let project_id = sidecar_project_id_for_root(&project_root);
+        let global_generation_lease = GenerationRetentionLock::acquire_shared(
+            &global_generation_gc_state_file(&controller.runtime_config),
+            GLOBAL_GENERATION_GC_LOCK_SCOPE,
+        )
+        .map_err(|error| ApiError::new("cache_busy", format!("pin sidecar generation: {error}")))?;
+        let project_generation_lease = GenerationRetentionLock::acquire_shared(
+            &controller.runtime_config.layout.state_file,
+            &project_id,
+        )
+        .map_err(|error| {
+            ApiError::new(
+                "cache_busy",
+                format!("pin project sidecar generation: {error}"),
+            )
+        })?;
+        let storage = Store::open_read_only(&storage_path).map_err(|error| {
+            ApiError::internal(format!("open pinned retrieval storage: {error}"))
+        })?;
+        storage
+            .get_connection()
+            .execute_batch("BEGIN DEFERRED TRANSACTION")
+            .map_err(|error| {
+                ApiError::new(
+                    "cache_busy",
+                    format!("pin core retrieval snapshot: {error}"),
+                )
+            })?;
+        let identity = retrieval_publication_identity_from_storage(&storage, &project_id).map_err(
+            |error| ApiError::new("cache_busy", format!("pin retrieval publication: {error}")),
+        )?;
+        let node_names = crate::load_search_symbol_projection(&storage, 10_000)?.0;
+        Ok(Self {
+            storage,
+            project_root,
+            storage_path,
+            project_id,
+            identity,
+            node_names,
+            _global_generation_lease: global_generation_lease,
+            _project_generation_lease: project_generation_lease,
+        })
+    }
+
+    fn matches_query(&self, query: &QueryResult) -> bool {
+        query.publication_identity.as_ref() == Some(&self.identity)
+    }
+
+    fn revalidate(&self) -> Result<(), ApiError> {
+        let identity = read_retrieval_publication_identity(&self.storage_path, &self.project_id)?;
+        if identity != self.identity {
+            return Err(ApiError::new(
+                "cache_busy",
+                "retrieval publication changed while resolving candidates; retry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PinnedRetrievalRead {
+    fn drop(&mut self) {
+        let _ = self.storage.get_connection().execute_batch("ROLLBACK");
+    }
+}
+
+fn with_pinned_retrieval_read<T>(
+    controller: &AppController,
+    read: impl FnOnce(&PinnedRetrievalRead) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let pinned = PinnedRetrievalRead::begin(controller)?;
+    let value = read(&pinned)?;
+    pinned.revalidate()?;
+    Ok(value)
+}
+
+fn read_retrieval_publication_identity(
+    storage_path: &Path,
+    project_id: &str,
+) -> Result<RetrievalPublicationIdentity, ApiError> {
+    let storage = Store::open_read_only(storage_path).map_err(|error| {
+        ApiError::new("cache_busy", format!("open retrieval publication: {error}"))
+    })?;
+    let snapshot = storage.read_snapshot().map_err(|error| {
+        ApiError::new(
+            "cache_busy",
+            format!("pin retrieval publication identity: {error}"),
+        )
+    })?;
+    let identity = retrieval_publication_identity_from_storage(snapshot.storage(), project_id)
+        .map_err(|error| {
+            ApiError::new(
+                "cache_busy",
+                format!("read retrieval publication identity: {error}"),
+            )
+        })?;
+    snapshot.finish().map_err(|error| {
+        ApiError::new(
+            "cache_busy",
+            format!("finish retrieval publication identity: {error}"),
+        )
+    })?;
+    Ok(identity)
+}
+
+pub(crate) fn current_retrieval_publication_identity(
+    controller: &AppController,
+) -> Result<RetrievalPublicationIdentity, ApiError> {
+    let project_root = controller.require_project_root()?;
+    let storage_path = controller.require_storage_path()?;
+    let project_id = sidecar_project_id_for_root(&project_root);
+    read_retrieval_publication_identity(&storage_path, &project_id)
+}
+
+pub(crate) fn with_stable_retrieval_publication<T>(
+    controller: &AppController,
+    operation: &str,
+    mut build: impl FnMut() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    if !sidecar_retrieval_primary_enabled(controller) {
+        return build();
+    }
+    for attempt in 0..RETRIEVAL_PUBLICATION_ATTEMPTS {
+        let result = (|| {
+            let before = current_retrieval_publication_identity(controller)?;
+            let output = build()?;
+            if before != current_retrieval_publication_identity(controller)? {
+                return Err(ApiError::new(
+                    "cache_busy",
+                    format!("retrieval publication changed while building {operation}; retry"),
+                ));
+            }
+            Ok(output)
+        })();
+        match result {
+            Err(error)
+                if error.code == "cache_busy" && attempt + 1 < RETRIEVAL_PUBLICATION_ATTEMPTS => {}
+            result => return result,
+        }
+    }
+    unreachable!("bounded retrieval attempts always return")
+}
 
 fn env_flag_enabled(value: &str) -> bool {
     matches!(
@@ -386,6 +547,32 @@ pub(crate) fn run_sidecar_query(
     })
 }
 
+pub(crate) fn run_and_resolve_sidecar_query(
+    controller: &AppController,
+    query: &str,
+    max_results: usize,
+    latency_budget_ms: Option<u32>,
+) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
+    with_pinned_retrieval_read(controller, |pinned| {
+        let query_result =
+            run_sidecar_query(controller, query, latency_budget_ms).map_err(|error| {
+                sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!("sidecar retrieval query failed: {error}"),
+                )
+            })?;
+        if !pinned.matches_query(&query_result) {
+            return Err(ApiError::new(
+                "cache_busy",
+                "sidecar query and core publications differ",
+            ));
+        }
+        let resolution =
+            resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)?;
+        Ok((query_result, resolution))
+    })
+}
+
 pub(crate) fn run_sidecar_query_batch(
     controller: &AppController,
     queries: &[(String, u64)],
@@ -459,6 +646,9 @@ pub(crate) enum SidecarPrimarySearchOutcome {
     Unavailable {
         reason: String,
     },
+    Retryable {
+        error: ApiError,
+    },
     Served {
         hits: Vec<SearchHit>,
         scored_hits: Vec<HybridSearchScoredHit>,
@@ -472,50 +662,33 @@ pub(crate) fn try_sidecar_primary_search(
     max_results: usize,
     latency_budget_ms: Option<u32>,
 ) -> Option<SidecarPrimarySearchOutcome> {
-    try_sidecar_primary_search_inner_with_query(
-        controller,
-        prompt,
-        max_results,
-        latency_budget_ms,
-        run_sidecar_query,
-    )
-}
-
-fn try_sidecar_primary_search_inner_with_query(
-    controller: &AppController,
-    prompt: &str,
-    max_results: usize,
-    latency_budget_ms: Option<u32>,
-    mut run_query: impl FnMut(&AppController, &str, Option<u32>) -> Result<QueryResult, AnyhowError>,
-) -> Option<SidecarPrimarySearchOutcome> {
     if !sidecar_retrieval_primary_enabled(controller) {
         return sidecar_retrieval_unavailable_reason(controller)
             .map(|reason| SidecarPrimarySearchOutcome::Unavailable { reason });
     }
-
-    let query_result = match run_query(controller, prompt, latency_budget_ms) {
-        Ok(result) => result,
-        Err(error) => {
-            return Some(SidecarPrimarySearchOutcome::Unavailable {
-                reason: format!("sidecar retrieval primary unavailable: {error}"),
-            });
+    match run_and_resolve_sidecar_query(controller, prompt, max_results, latency_budget_ms) {
+        Ok((query_result, resolution)) => Some(sidecar_primary_search_outcome_from_resolution(
+            controller,
+            query_result,
+            resolution,
+        )),
+        Err(error) if error.code == "cache_busy" => {
+            Some(SidecarPrimarySearchOutcome::Retryable { error })
         }
-    };
-
-    Some(sidecar_primary_search_outcome_from_query_result(
-        controller,
-        query_result,
-        max_results,
-    ))
+        Err(error) => Some(SidecarPrimarySearchOutcome::Unavailable {
+            reason: format!("sidecar retrieval primary unavailable: {}", error.message),
+        }),
+    }
 }
 
+#[cfg(test)]
 fn sidecar_primary_search_outcome_from_query_result(
     controller: &AppController,
     query_result: QueryResult,
     max_results: usize,
 ) -> SidecarPrimarySearchOutcome {
     let resolution =
-        match resolve_sidecar_candidates_with_stats(controller, &query_result.hits, max_results) {
+        match resolve_sidecar_candidates_for_test(controller, &query_result.hits, max_results) {
             Ok(hits) => hits,
             Err(error) => {
                 return SidecarPrimarySearchOutcome::Unavailable {
@@ -526,6 +699,14 @@ fn sidecar_primary_search_outcome_from_query_result(
                 };
             }
         };
+    sidecar_primary_search_outcome_from_resolution(controller, query_result, resolution)
+}
+
+fn sidecar_primary_search_outcome_from_resolution(
+    controller: &AppController,
+    query_result: QueryResult,
+    resolution: SidecarCandidateResolutionOutcome,
+) -> SidecarPrimarySearchOutcome {
     let resolved_hits = resolution.resolved_hits.clone();
     let shadow = shadow_from_query_result_with_candidate_admission_diagnostics(
         controller,
@@ -640,14 +821,45 @@ fn search_sidecar_packet_batch_inner(
     queries: &[(String, usize)],
     latency_budget_ms: Option<u32>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
-    search_sidecar_packet_batch_inner_with_query_batch(
-        controller,
-        queries,
-        latency_budget_ms,
-        run_sidecar_query_batch,
-    )
+    let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
+        .checked_div(queries.len().max(1) as u64)
+        .unwrap_or(100)
+        .max(100);
+    let batch_queries = queries
+        .iter()
+        .map(|(query, _)| (query.clone(), per_query_budget))
+        .collect::<Vec<_>>();
+    with_pinned_retrieval_read(controller, |pinned| {
+        let batch_started_at = Instant::now();
+        let query_results =
+            run_sidecar_query_batch(controller, &batch_queries).map_err(|error| {
+                sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!("sidecar retrieval batch query failed: {error}"),
+                )
+            })?;
+        if query_results
+            .iter()
+            .any(|result| !pinned.matches_query(result))
+        {
+            return Err(ApiError::new(
+                "cache_busy",
+                "sidecar retrieval batch and core publications differ",
+            ));
+        }
+        build_sidecar_packet_batch_outcome(
+            controller,
+            queries,
+            query_results,
+            clamp_elapsed_ms(batch_started_at),
+            |query_result, max_results| {
+                resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)
+            },
+        )
+    })
 }
 
+#[cfg(test)]
 fn search_sidecar_packet_batch_inner_with_query_batch(
     controller: &AppController,
     queries: &[(String, usize)],
@@ -673,6 +885,24 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         )
     })?;
     let batch_query_wall_ms = clamp_elapsed_ms(batch_started_at);
+    build_sidecar_packet_batch_outcome(
+        controller,
+        queries,
+        query_results,
+        batch_query_wall_ms,
+        |query_result, max_results| {
+            resolve_sidecar_candidates_for_test(controller, &query_result.hits, max_results)
+        },
+    )
+}
+
+fn build_sidecar_packet_batch_outcome(
+    controller: &AppController,
+    queries: &[(String, usize)],
+    query_results: Vec<QueryResult>,
+    batch_query_wall_ms: u32,
+    mut resolve: impl FnMut(&QueryResult, usize) -> Result<SidecarCandidateResolutionOutcome, ApiError>,
+) -> Result<SidecarPacketBatchOutcome, ApiError> {
     if query_results.len() != queries.len() {
         return Err(sidecar_retrieval_unavailable_error(
             controller,
@@ -698,17 +928,15 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         let sidecar_query_ms = u32::try_from(query_result.trace.elapsed_ms).unwrap_or(u32::MAX);
         let max_results = (*max_results).clamp(1, 50);
         let resolution_started_at = Instant::now();
-        let resolution =
-            resolve_sidecar_candidates_with_stats(controller, &query_result.hits, max_results)
-                .map_err(|error| {
-                    sidecar_retrieval_unavailable_error(
-                        controller,
-                        format!(
-                            "sidecar retrieval rejected packet batch query `{query}`: candidate resolution failed: {}",
-                            error.message
-                        ),
-                    )
-                })?;
+        let resolution = resolve(&query_result, max_results).map_err(|error| {
+            sidecar_retrieval_unavailable_error(
+                controller,
+                format!(
+                    "sidecar retrieval rejected packet batch query `{query}`: candidate resolution failed: {}",
+                    error.message
+                ),
+            )
+        })?;
         let candidate_resolution_ms = clamp_elapsed_ms(resolution_started_at);
         diagnostics.push(packet_sidecar_query_diagnostic(
             &query_result,
@@ -1479,15 +1707,27 @@ fn resolve_candidate_node_id(
         .or(Some(file_node_id))
 }
 
-pub(crate) fn resolve_sidecar_candidates_with_stats(
-    controller: &AppController,
+fn resolve_sidecar_candidates_in_read(
+    pinned: &PinnedRetrievalRead,
     candidates: &[CandidateHit],
     max_results: usize,
 ) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
-    controller.ensure_search_state()?;
-    let storage = controller.open_storage()?;
-    let project_root = controller.require_project_root()?;
-    let node_names = controller.state.lock().node_names.clone();
+    resolve_sidecar_candidates_in_storage(
+        &pinned.storage,
+        &pinned.node_names,
+        &pinned.project_root,
+        candidates,
+        max_results,
+    )
+}
+
+fn resolve_sidecar_candidates_in_storage(
+    storage: &Store,
+    node_names: &HashMap<CoreNodeId, String>,
+    project_root: &Path,
+    candidates: &[CandidateHit],
+    max_results: usize,
+) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
     let mut hits = Vec::new();
     let mut unresolved_candidates = Vec::new();
     let mut attempted_candidate_indices = HashSet::new();
@@ -1498,8 +1738,8 @@ pub(crate) fn resolve_sidecar_candidates_with_stats(
         .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
         .collect();
     ordered.sort_by(|(_, left), (_, right)| {
-        let left_resolvable = candidate_path_resolvable(&project_root, &left.file_path);
-        let right_resolvable = candidate_path_resolvable(&project_root, &right.file_path);
+        let left_resolvable = candidate_path_resolvable(project_root, &left.file_path);
+        let right_resolvable = candidate_path_resolvable(project_root, &right.file_path);
         right_resolvable.cmp(&left_resolvable).then(
             right
                 .score
@@ -1513,11 +1753,11 @@ pub(crate) fn resolve_sidecar_candidates_with_stats(
             break;
         }
         attempted_candidate_indices.insert(candidate_index);
-        let rel_path = normalize_repo_relative_path(&project_root, &candidate.file_path);
+        let rel_path = normalize_repo_relative_path(project_root, &candidate.file_path);
         let Some(node_id) =
-            resolve_candidate_node_id(&storage, &node_names, &project_root, &rel_path, candidate)
+            resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
         else {
-            let label = if candidate_path_resolvable(&project_root, &candidate.file_path) {
+            let label = if candidate_path_resolvable(project_root, &candidate.file_path) {
                 "node_unresolved"
             } else {
                 "path_unresolvable"
@@ -1530,7 +1770,7 @@ pub(crate) fn resolve_sidecar_candidates_with_stats(
             continue;
         }
         let Some(mut hit) =
-            AppController::build_search_hit(&storage, &node_names, node_id, candidate.score)
+            AppController::build_search_hit(storage, node_names, node_id, candidate.score)
         else {
             unresolved_candidates.push((candidate, "hit_build_failed"));
             continue;
@@ -1555,6 +1795,29 @@ pub(crate) fn resolve_sidecar_candidates_with_stats(
         blocking_unresolved_candidate_count,
         attempted_candidate_indices,
     })
+}
+
+#[cfg(test)]
+fn resolve_sidecar_candidates_for_test(
+    controller: &AppController,
+    candidates: &[CandidateHit],
+    max_results: usize,
+) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
+    let storage = controller.open_storage()?;
+    let project_root = controller.require_project_root()?;
+    let node_names = storage
+        .get_nodes()
+        .map_err(|error| ApiError::internal(format!("load test nodes: {error}")))?
+        .into_iter()
+        .map(|node| (node.id, crate::node_display_name(&node)))
+        .collect();
+    resolve_sidecar_candidates_in_storage(
+        &storage,
+        &node_names,
+        &project_root,
+        candidates,
+        max_results,
+    )
 }
 
 fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
@@ -1636,6 +1899,8 @@ mod tests {
 
     fn retrieval_cache_key_for_test(query_fingerprint: &str) -> RetrievalCacheKey {
         RetrievalCacheKey {
+            core_generation_id: None,
+            core_run_id: None,
             project_id: "abc".into(),
             lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
@@ -1877,6 +2142,7 @@ mod tests {
     #[test]
     fn unresolved_sidecar_candidates_are_diagnostic_only() {
         let result = QueryResult {
+            publication_identity: None,
             query: "application use".into(),
             features: classify_query("application use"),
             hits: vec![CandidateHit::with_source(
@@ -1914,6 +2180,7 @@ mod tests {
     #[test]
     fn shadow_maps_unavailable_trace() {
         let shadow = shadow_from_query_result(QueryResult {
+            publication_identity: None,
             query: "extension".into(),
             features: classify_query("extension"),
             hits: Vec::new(),
@@ -1938,6 +2205,7 @@ mod tests {
     #[test]
     fn shadow_maps_stage_timings_and_would_rank() {
         let shadow = shadow_from_query_result(QueryResult {
+            publication_identity: None,
             query: "extension".into(),
             features: classify_query("ExtensionService"),
             hits: vec![
@@ -2063,6 +2331,7 @@ mod tests {
         candidate.start_line = Some(42);
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
             QueryResult {
+                publication_identity: None,
                 query: "handler".into(),
                 features: classify_query("handler"),
                 hits: vec![candidate],
@@ -2115,6 +2384,7 @@ mod tests {
     #[test]
     fn shadow_marks_only_bare_dense_anchors_as_diagnostic_only() {
         let dense_anchor = QueryResult {
+            publication_identity: None,
             query: "apii".into(),
             features: classify_query("apii"),
             hits: vec![CandidateHit::with_source(
@@ -2145,6 +2415,7 @@ mod tests {
         assert_eq!(value["diagnostic_only"], true);
 
         let missing_path = QueryResult {
+            publication_identity: None,
             query: "StringUtils".into(),
             features: classify_query("StringUtils"),
             hits: vec![CandidateHit::with_source(
@@ -2179,6 +2450,7 @@ mod tests {
     fn shadow_marks_non_parser_backed_file_candidates_diagnostic_only_with_source_hits() {
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
             QueryResult {
+                publication_identity: None,
                 query: "form validation".into(),
                 features: classify_query("form validation"),
                 hits: vec![
@@ -2287,6 +2559,7 @@ mod tests {
     fn shadow_candidate_summaries_include_admission_diagnostics() {
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
             QueryResult {
+                publication_identity: None,
                 query: "exec json flow".into(),
                 features: classify_query("exec json flow"),
                 hits: vec![
@@ -2574,6 +2847,122 @@ mod tests {
             .expect("manifest");
     }
 
+    #[test]
+    fn pinned_read_resolves_the_original_generation_and_rejects_publication_drift() {
+        use codestory_retrieval::CandidateSource;
+        use codestory_store::{FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord};
+
+        let project = tempfile::tempdir().expect("project");
+        let source_path = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "fn original() {}\n").expect("write source");
+        let storage_path = project.path().join("cache/codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let project_id = sidecar_project_id_for_root(project.path());
+
+        let mut storage = Store::open(&storage_path).expect("open storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        let original_node = codestory_contracts::graph::Node {
+            id: CoreNodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "original".into(),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(1),
+            ..Default::default()
+        };
+        storage
+            .insert_nodes_batch(&[
+                codestory_contracts::graph::Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: source_path.to_string_lossy().into_owned(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                original_node,
+            ])
+            .expect("insert nodes");
+        storage
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "run-one".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("publish first identity");
+        let first_manifest = retrieval_manifest_fixture(&project_id, "first");
+        storage
+            .upsert_retrieval_index_manifest(&first_manifest)
+            .expect("publish first manifest");
+        drop(storage);
+
+        let controller = AppController::new();
+        {
+            let mut state = controller.state.lock();
+            state.project_root = Some(project.path().to_path_buf());
+            state.storage_path = Some(storage_path.clone());
+        }
+        let pinned = PinnedRetrievalRead::begin(&controller).expect("pin first publication");
+
+        let mut writer = Store::open(&storage_path).expect("open publication writer");
+        writer
+            .insert_nodes_batch(&[codestory_contracts::graph::Node {
+                id: CoreNodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "replacement".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(1),
+                ..Default::default()
+            }])
+            .expect("reuse numeric id in replacement generation");
+        writer
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 2,
+                generation_id: "22222222-2222-4222-8222-222222222222".into(),
+                run_id: "run-two".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            })
+            .expect("publish replacement identity");
+        let replacement_manifest = retrieval_manifest_fixture(&project_id, "second");
+        writer
+            .upsert_retrieval_index_manifest(&replacement_manifest)
+            .expect("publish replacement manifest");
+        drop(writer);
+
+        let mut candidate = CandidateHit::with_source(
+            "src/lib.rs",
+            Some("original".into()),
+            1.0,
+            CandidateSource::Scip,
+        );
+        candidate.node_id = Some("2".into());
+        let resolution = resolve_sidecar_candidates_in_read(&pinned, &[candidate], 1)
+            .expect("resolve against pinned snapshot");
+        assert_eq!(resolution.resolved_hits.len(), 1);
+        assert_eq!(resolution.resolved_hits[0].display_name, "original");
+
+        let error = pinned
+            .revalidate()
+            .expect_err("publication drift must reject the result");
+        assert_eq!(error.code, "cache_busy");
+    }
+
     fn git_project() -> Option<tempfile::TempDir> {
         if std::process::Command::new("git")
             .arg("--version")
@@ -2624,6 +3013,7 @@ mod tests {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let empty_full = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: Vec::new(),
@@ -2643,6 +3033,7 @@ mod tests {
         );
 
         let unresolved = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -2680,6 +3071,7 @@ mod tests {
             );
             let resolved_hit = search_hit_for_candidate(&candidate);
             let result = QueryResult {
+                publication_identity: None,
                 query: "handler".into(),
                 features: classify_query("handler"),
                 hits: vec![candidate],
@@ -2709,6 +3101,7 @@ mod tests {
 
         for mode in ["no_semantic", "no_scip", "lexical_only", "unavailable"] {
             let result = QueryResult {
+                publication_identity: None,
                 query: "handler".into(),
                 features: classify_query("handler"),
                 hits: Vec::new(),
@@ -2737,6 +3130,7 @@ mod tests {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let empty_full = QueryResult {
+            publication_identity: None,
             query: "unlikely symbol".into(),
             features: classify_query("unlikely symbol"),
             hits: Vec::new(),
@@ -2764,6 +3158,7 @@ mod tests {
         assert!(empty_diagnostic.diagnostic.is_none());
 
         let unresolved = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -2801,6 +3196,7 @@ mod tests {
         );
 
         let cancelled = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -2896,6 +3292,7 @@ mod tests {
         );
         resolved_candidate.node_id = Some("2".to_string());
         let query_result = QueryResult {
+            publication_identity: None,
             query: "alpha".into(),
             features: classify_query("alpha"),
             hits: vec![
@@ -2918,7 +3315,7 @@ mod tests {
             },
         };
 
-        let resolution = resolve_sidecar_candidates_with_stats(&controller, &query_result.hits, 1)
+        let resolution = resolve_sidecar_candidates_for_test(&controller, &query_result.hits, 1)
             .expect("resolve sidecar candidates");
         assert_eq!(resolution.attempted_candidate_indices.len(), 1);
         assert_eq!(resolution.resolved_hits.len(), 1);
@@ -2934,7 +3331,7 @@ mod tests {
         );
 
         let mixed_resolution =
-            resolve_sidecar_candidates_with_stats(&controller, &query_result.hits, 2)
+            resolve_sidecar_candidates_for_test(&controller, &query_result.hits, 2)
                 .expect("resolve mixed sidecar candidates");
         assert_eq!(mixed_resolution.attempted_candidate_indices.len(), 2);
         assert_eq!(mixed_resolution.resolved_hits.len(), 1);
@@ -2953,6 +3350,7 @@ mod tests {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let unavailable = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: Vec::new(),
@@ -2972,6 +3370,7 @@ mod tests {
         );
 
         let unresolved = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -3018,6 +3417,7 @@ mod tests {
             |_, batch| {
                 assert_eq!(batch, &[("helpers".to_string(), 500)]);
                 Ok(vec![QueryResult {
+                    publication_identity: None,
                     query: "helpers".into(),
                     features: classify_query("helpers"),
                     hits: vec![CandidateHit::with_source(
@@ -3093,6 +3493,7 @@ mod tests {
                 Ok(batch
                     .iter()
                     .map(|(query, budget)| QueryResult {
+                        publication_identity: None,
                         query: query.to_string(),
                         features: classify_query(query),
                         hits: Vec::new(),
@@ -3137,6 +3538,7 @@ mod tests {
             |_, batch| {
                 assert_eq!(batch, &[("handler".to_string(), 500)]);
                 Ok(vec![QueryResult {
+                    publication_identity: None,
                     query: "handler".into(),
                     features: classify_query("handler"),
                     hits: vec![CandidateHit::with_source(
@@ -3185,6 +3587,7 @@ mod tests {
             .expect("remove storage parent");
 
         let query_result = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -3278,6 +3681,7 @@ mod tests {
         );
         candidate.node_id = Some("2".to_string());
         let query_result = QueryResult {
+            publication_identity: None,
             query: "Explain how CodeStory validates packaged agent readiness.".into(),
             features: classify_query("Explain how CodeStory validates packaged agent readiness."),
             hits: vec![candidate],
@@ -3306,6 +3710,9 @@ mod tests {
             }
             SidecarPrimarySearchOutcome::Unavailable { reason } => {
                 panic!("resolved cancelled packet primary trace should stay available: {reason}")
+            }
+            SidecarPrimarySearchOutcome::Retryable { error } => {
+                panic!("resolved cancelled packet primary trace should not retry: {error:?}")
             }
         }
     }
