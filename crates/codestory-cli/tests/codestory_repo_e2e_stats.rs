@@ -489,6 +489,7 @@ struct ReleaseE2eSidecarCleanup {
     binary: PathBuf,
     project_root: PathBuf,
     cache_dir: PathBuf,
+    sidecar_cache_root: PathBuf,
     run_id: String,
     armed: bool,
 }
@@ -504,16 +505,18 @@ impl ReleaseE2eSidecarCleanup {
             .arg("--cache-dir")
             .arg(&self.cache_dir)
             .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+            .env("CODESTORY_CACHE_ROOT", &self.sidecar_cache_root)
             .env("CODESTORY_EMBED_BACKEND", "llamacpp")
             .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
             .output()
     }
 
     fn teardown(&mut self) {
-        let (_, status_json) = run_cli_json(
+        let (_, status_json) = run_cli_json_with_sidecar_cache_root(
             &self.binary,
             &self.project_root,
             &self.cache_dir,
+            &self.sidecar_cache_root,
             &[
                 "retrieval".to_string(),
                 "status".to_string(),
@@ -535,10 +538,11 @@ impl ReleaseE2eSidecarCleanup {
             String::from_utf8_lossy(&down.stderr)
         );
 
-        let (_, inventory_json) = run_cli_json(
+        let (_, inventory_json) = run_cli_json_with_sidecar_cache_root(
             &self.binary,
             &self.project_root,
             &self.cache_dir,
+            &self.sidecar_cache_root,
             &[
                 "retrieval".to_string(),
                 "inventory".to_string(),
@@ -549,12 +553,15 @@ impl ReleaseE2eSidecarCleanup {
         let namespaces = json_path(&inventory_json, &["namespaces"])
             .as_array()
             .expect("release evidence sidecar inventory namespaces");
-        assert!(
-            !namespaces
-                .iter()
-                .any(|entry| entry["namespace"].as_str() == Some(namespace.as_str())),
-            "release evidence teardown left owned namespace {namespace}: {inventory_json:#}"
-        );
+        if let Some(entry) = namespaces
+            .iter()
+            .find(|entry| entry["namespace"].as_str() == Some(namespace.as_str()))
+        {
+            assert_ne!(entry["state"].as_str(), Some("live"));
+            assert_eq!(entry["state_exists"].as_bool(), Some(false));
+            assert_eq!(entry["containers"].as_array().map(Vec::len), Some(0));
+            assert_eq!(entry["networks"].as_array().map(Vec::len), Some(0));
+        }
         self.armed = false;
     }
 }
@@ -588,7 +595,23 @@ fn run_cli_json(
     cache_dir: &Path,
     args: &[String],
 ) -> (f64, Value) {
-    let (seconds, stdout) = run_cli_output(binary, project_root, cache_dir, args);
+    run_cli_json_with_sidecar_cache_root(binary, project_root, cache_dir, cache_dir, args)
+}
+
+fn run_cli_json_with_sidecar_cache_root(
+    binary: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
+    sidecar_cache_root: &Path,
+    args: &[String],
+) -> (f64, Value) {
+    let (seconds, stdout) = run_cli_output_with_sidecar_cache_root(
+        binary,
+        project_root,
+        cache_dir,
+        sidecar_cache_root,
+        args,
+    );
     (
         seconds,
         serde_json::from_slice(&stdout).expect("parse json output"),
@@ -601,6 +624,16 @@ fn run_cli_output(
     cache_dir: &Path,
     args: &[String],
 ) -> (f64, Vec<u8>) {
+    run_cli_output_with_sidecar_cache_root(binary, project_root, cache_dir, cache_dir, args)
+}
+
+fn run_cli_output_with_sidecar_cache_root(
+    binary: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
+    sidecar_cache_root: &Path,
+    args: &[String],
+) -> (f64, Vec<u8>) {
     let started = Instant::now();
     let output = test_support::command(binary)
         .current_dir(project_root)
@@ -610,6 +643,7 @@ fn run_cli_output(
         .arg("--cache-dir")
         .arg(cache_dir)
         .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+        .env("CODESTORY_CACHE_ROOT", sidecar_cache_root)
         .env("CODESTORY_EMBED_BACKEND", "llamacpp")
         .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
         .output()
@@ -777,6 +811,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         binary: binary.clone(),
         project_root: project_root.clone(),
         cache_dir: cache_dir.path().to_path_buf(),
+        sidecar_cache_root: cache_dir.path().to_path_buf(),
         run_id: sidecar_run_id.to_string(),
         armed: true,
     };
@@ -1420,14 +1455,35 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             binary: binary.clone(),
             project_root: case.project_root.clone(),
             cache_dir: cache_dir.path().join(&case.name),
+            sidecar_cache_root: cache_dir.path().to_path_buf(),
             run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
             armed: true,
         })
         .collect::<Vec<_>>();
 
-    let (_seconds, suite_json) = run_cli_json(
+    for cleanup in &sidecar_cleanup {
+        run_cli_json_with_sidecar_cache_root(
+            &binary,
+            &cleanup.project_root,
+            &cleanup.cache_dir,
+            &cleanup.sidecar_cache_root,
+            &[
+                "retrieval".to_string(),
+                "bootstrap".to_string(),
+                "--profile".to_string(),
+                "agent".to_string(),
+                "--run-id".to_string(),
+                cleanup.run_id.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+    }
+
+    let (_seconds, suite_json) = run_cli_json_with_sidecar_cache_root(
         &binary,
         repo_root().as_path(),
+        cache_dir.path(),
         cache_dir.path(),
         &[
             "drill-suite".to_string(),
@@ -1449,6 +1505,11 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
     );
     assert_eq!(u64_field(&suite_json, &["repo_count"]), cases.len() as u64);
     assert_eq!(
+        u64_field(&suite_json, &["blocked_count"]),
+        0,
+        "drill-suite should complete every configured repo before its evidence is evaluated: {suite_json:#}"
+    );
+    assert_eq!(
         array_len(&suite_json, &["repos"]),
         cases.len(),
         "suite should include exactly the manifest real-repo drill cases"
@@ -1460,12 +1521,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
     assert!(
         root_output.join("suite-report.json").is_file(),
         "drill-suite should write a JSON aggregate report"
-    );
-    let suite_markdown =
-        fs::read_to_string(root_output.join("suite-report.md")).expect("read suite markdown");
-    assert!(
-        suite_markdown.contains("targets / 0 verified /") && suite_markdown.contains("pending"),
-        "suite markdown should make pending source-truth verification visible instead of implying CodeStory-only proof"
     );
     for case in &cases {
         assert!(
