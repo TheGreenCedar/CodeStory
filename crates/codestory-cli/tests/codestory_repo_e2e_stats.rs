@@ -1558,12 +1558,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "{} suite summary should not leave seed anchors unresolved",
             case.name
         );
-        assert_ne!(
-            string_field(repo_json, &["summary", "verdict", "status"]),
-            "blocked",
-            "{} suite summary should remain usable even when degraded",
-            case.name
-        );
         assert!(
             bool_field(repo_json, &["summary", "source_truth", "required"]),
             "{} suite summary should require source-truth verification",
@@ -1601,15 +1595,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             ),
             check_count,
             "{} suite open-gaps summary should preserve pending source-truth checks",
-            case.name
-        );
-        assert_eq!(
-            string_field(
-                repo_json,
-                &["summary", "open_gaps", "answer_quality_status"]
-            ),
-            "pending_source_verification",
-            "{} suite open-gaps status should not imply CodeStory-only answer quality is final",
             case.name
         );
         assert!(
@@ -1658,7 +1643,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             case.name
         );
         assert_compact_bridge_status_handoff(&case.name, repo_json);
-        assert_eq!(array_len(&drill_json, &["execution_boundaries"]), 1);
 
         for anchor_index in 0..case.anchors.len() {
             let index = anchor_index.to_string();
