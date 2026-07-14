@@ -47,7 +47,7 @@ permissions:
 jobs:
   measure:
     name: Measure release candidate
-    runs-on: [self-hosted, linux, codestory-release-evidence]
+    runs-on: [self-hosted, Linux, ARM64, codestory-release-evidence]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -62,7 +62,7 @@ jobs:
           DRILL_MANIFEST: ${{ inputs.drill_manifest }}
           EMBEDDING_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
-          test -n "$PROFILE"
+          set -euo pipefail
           test "$DRILL_MANIFEST" = /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
           test "$EMBEDDING_MODEL_DIR" = /srv/codestory-release-evidence/models
           bash scripts/release-evidence/guest-verify.sh \
@@ -70,10 +70,16 @@ jobs:
           mkdir -p target/release-evidence
           cp /srv/codestory-release-evidence/artifacts/provisioning.json \
             target/release-evidence/provisioning.json
+          provisioned_profile="$(jq -er 'select(.schema_version == 2) | .profile_id' \
+            target/release-evidence/provisioning.json)"
+          test "$PROFILE" = "$provisioned_profile" || {
+            echo "::error::Requested profile $PROFILE does not match provisioned profile $provisioned_profile."
+            exit 1
+          }
 
       - name: Build release CLI
         if: inputs.source_run_id == ''
-        run: cargo build --release -p codestory-cli
+        run: cargo build --release --locked -p codestory-cli
 
       - name: Capture machine fingerprint
         if: inputs.source_run_id == ''
@@ -87,14 +93,19 @@ jobs:
         if: inputs.source_run_id == ''
         shell: bash
         env:
+          CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR: ${{ github.workspace }}/target/release-evidence/drill
           CODESTORY_RELEASE_EVIDENCE_STATS_PATH: ${{ github.workspace }}/target/release-evidence/stats.json
           CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ github.sha }}
           CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
           CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
           CODESTORY_REAL_REPO_DRILL_CASES: ${{ inputs.drill_manifest }}
+          CODESTORY_EMBED_ALLOW_CPU: "1"
           CODESTORY_EMBED_MODEL_DIR: ${{ inputs.embedding_model_dir }}
-        run: cargo test -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
+        run: |
+          set -euo pipefail
+          cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture \
+            2>&1 | tee target/release-evidence/repo-e2e-output.txt
 
       - name: Produce publishable packet evidence
         if: inputs.source_run_id == ''
@@ -105,8 +116,10 @@ jobs:
           CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
           CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
+          CODESTORY_EMBED_ALLOW_CPU: "1"
           CODESTORY_EMBED_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
+          set -euo pipefail
           node scripts/codestory-agent-ab-benchmark.mjs \
             --packet-runtime \
             --packet-runtime-mode cold-cli \

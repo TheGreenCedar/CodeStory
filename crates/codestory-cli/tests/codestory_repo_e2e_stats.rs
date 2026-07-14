@@ -1312,7 +1312,10 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         binary.display()
     );
 
-    let root_output = tempdir().expect("drill output dir");
+    let temporary_output = tempdir().expect("drill output dir");
+    let root_output = env::var_os("CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| temporary_output.path().to_path_buf());
     let cache_dir = tempdir().expect("drill cache dir");
     let Some(manifest_path) = env::var_os("CODESTORY_REAL_REPO_DRILL_CASES").map(PathBuf::from)
     else {
@@ -1351,6 +1354,15 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             missing.join(", ")
         );
     }
+    let _sidecar_cleanup = cases
+        .iter()
+        .map(|case| ReleaseE2eSidecarCleanup {
+            binary: binary.clone(),
+            project_root: case.project_root.clone(),
+            cache_dir: cache_dir.path().join(&case.name),
+            run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
+        })
+        .collect::<Vec<_>>();
 
     let (_seconds, suite_json) = run_cli_json(
         &binary,
@@ -1363,7 +1375,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "--format".to_string(),
             "json".to_string(),
             "--output-dir".to_string(),
-            root_output.path().display().to_string(),
+            root_output.display().to_string(),
             "--case-file".to_string(),
             manifest_path.display().to_string(),
         ],
@@ -1381,15 +1393,15 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         "suite should include exactly the manifest real-repo drill cases"
     );
     assert!(
-        root_output.path().join("suite-report.md").is_file(),
+        root_output.join("suite-report.md").is_file(),
         "drill-suite should write a markdown aggregate report"
     );
     assert!(
-        root_output.path().join("suite-report.json").is_file(),
+        root_output.join("suite-report.json").is_file(),
         "drill-suite should write a JSON aggregate report"
     );
-    let suite_markdown = fs::read_to_string(root_output.path().join("suite-report.md"))
-        .expect("read suite markdown");
+    let suite_markdown =
+        fs::read_to_string(root_output.join("suite-report.md")).expect("read suite markdown");
     assert!(
         suite_markdown.contains("targets / 0 verified /") && suite_markdown.contains("pending"),
         "suite markdown should make pending source-truth verification visible instead of implying CodeStory-only proof"

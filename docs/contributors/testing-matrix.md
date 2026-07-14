@@ -494,6 +494,12 @@ hash, baseline id/hash, profile, metric, measured value, threshold, owner, ISO
 date, and rationale. Preserve the emitted decision JSON; it carries status,
 metric, decision, commit, and artifact paths/hashes.
 
+The dedicated Linux ARM64 evidence profile explicitly allows CPU embeddings
+from its checksum-verified preseeded model. Fresh measurements retain the raw
+repo-scale log, stats JSON, and complete real-repo drill tree. Before a distinct
+release-eligible baseline exists, artifact production succeeds but evaluation
+must reject the first run; retained output alone is not acceptance.
+
 ## CLI Boundary And Output Changes
 
 ```sh

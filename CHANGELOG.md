@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Retained raw repo-scale and real-repository drill evidence from the explicit
+  CPU-backed Linux ARM64 release profile without weakening baseline evaluation.
 - Added reproducible provisioning for the repository-scoped Linux
   release-evidence runner. The runner uses a stable provisioned machine
   identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64
