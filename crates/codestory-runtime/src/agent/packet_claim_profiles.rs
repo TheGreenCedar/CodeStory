@@ -1,7 +1,10 @@
 #[cfg(test)]
 use crate::agent::eval_probes::eval_probes_enabled;
 use crate::agent::packet_citations::packet_citation_source_text;
-use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_citation_owns_interceptor_management,
+    packet_citation_owns_request_pipeline, packet_evidence_role,
+};
 use crate::agent::packet_flow_requirements::{CoverageMode, FlowRole};
 use crate::agent::packet_scoring::{normalize_identifier, packet_display_path};
 use crate::agent::packet_source_patterns::{
@@ -323,6 +326,8 @@ struct SourceClaimContext<'a> {
     symbol: &'a str,
     kind: NodeKind,
     evidence_role: Option<PacketEvidenceRole>,
+    owns_request_pipeline: bool,
+    owns_interceptor_management: bool,
     path: String,
     file_name: String,
     normalized_prompt: String,
@@ -348,6 +353,8 @@ impl<'a> SourceClaimContext<'a> {
             symbol,
             kind: citation.kind,
             evidence_role: packet_evidence_role(citation),
+            owns_request_pipeline: packet_citation_owns_request_pipeline(citation),
+            owns_interceptor_management: packet_citation_owns_interceptor_management(citation),
             path,
             file_name,
             normalized_prompt: normalize_identifier(prompt),
@@ -610,9 +617,7 @@ fn client_factory_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
 }
 
 fn client_request_pipeline_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
-    let normalized_symbol = normalize_identifier(ctx.symbol);
-    if matches!(ctx.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-        && normalized_symbol.ends_with("request")
+    if ctx.owns_request_pipeline
         && packet_source_has_all(ctx.source, &["merge", "config", "interceptors", "request"])
         && packet_source_has_any(ctx.source, &["dispatch", "adapter"])
         && let Some(owner) = packet_display_owner(ctx.symbol)
@@ -639,7 +644,9 @@ fn request_dispatch_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
 }
 
 fn interceptor_management_claim(ctx: &SourceClaimContext<'_>) -> Option<String> {
-    if packet_source_has_all(ctx.source, &["handlers", "fulfilled", "rejected"]) {
+    if ctx.owns_interceptor_management
+        && packet_source_has_all(ctx.source, &["handlers", "fulfilled", "rejected"])
+    {
         return Some(format!(
             "`{}` stores interceptor pairs used by the promise chain in request.",
             ctx.symbol
@@ -2654,6 +2661,15 @@ mod tests {
         assert!(
             import_claims.is_empty(),
             "an import/module label must not inherit file-wide behavior: {import_claims:?}"
+        );
+
+        let mut retry_method =
+            test_packet_citation("Client.prototype.retryRequest", "src/client.js");
+        retry_method.kind = NodeKind::METHOD;
+        let retry_claims = packet_source_derived_claims_for_citation(prompt, &retry_method, source);
+        assert!(
+            retry_claims.is_empty(),
+            "a request-suffixed method must not inherit the request declaration: {retry_claims:?}"
         );
 
         let mut request_method = test_packet_citation("Client.prototype.request", "src/client.js");

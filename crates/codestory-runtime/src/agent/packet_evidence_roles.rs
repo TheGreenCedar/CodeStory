@@ -37,6 +37,22 @@ pub(crate) enum PacketEvidenceRole {
     SourceEvidence,
 }
 
+pub(crate) fn packet_citation_owns_request_pipeline(citation: &AgentCitationDto) -> bool {
+    matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && crate::terminal_symbol_segment(&citation.display_name) == "request"
+}
+
+pub(crate) fn packet_citation_owns_interceptor_management(citation: &AgentCitationDto) -> bool {
+    if !matches!(citation.kind, NodeKind::STRUCT | NodeKind::CLASS) {
+        return false;
+    }
+    let display = normalize_identifier(&citation.display_name);
+    display.contains("interceptor")
+        && ["manager", "registry", "collection", "chain"]
+            .iter()
+            .any(|owner| display.contains(owner))
+}
+
 impl PacketEvidenceRole {
     pub(crate) fn as_str(self) -> &'static str {
         match self {

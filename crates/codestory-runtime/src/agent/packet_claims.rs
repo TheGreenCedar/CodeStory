@@ -666,7 +666,7 @@ pub(crate) fn packet_claim_for_role(
             format!("`{symbol}` creates client instances or binds request methods for this flow.")
         }
         PacketEvidenceRole::InterceptorManagement => {
-            format!("`{symbol}` manages fulfilled/rejected interceptor registration and iteration.")
+            format!("`{symbol}` is interceptor-related evidence for this request flow.")
         }
         PacketEvidenceRole::RequestDispatch => format!(
             "`{symbol}` dispatches requests by transforming config and handing off to an adapter or handler."

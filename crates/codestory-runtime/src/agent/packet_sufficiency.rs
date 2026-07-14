@@ -1,6 +1,8 @@
 use crate::agent::packet_claims::{decorate_packet_claims_proof_metadata, packet_supported_claims};
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
-use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
+};
 use crate::agent::packet_flow_requirements::{
     CoverageMode, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
 };
@@ -1232,14 +1234,13 @@ impl StructuralLanguagePolicy {
     fn claim_satisfies_requirement(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
         let normalized = normalize_identifier(&claim.claim);
         match requirement.id {
-            "request_interceptor_management" => claim.citations.iter().any(|citation| {
-                !matches!(
-                    citation.kind,
-                    codestory_contracts::api::NodeKind::MODULE
-                        | codestory_contracts::api::NodeKind::NAMESPACE
-                        | codestory_contracts::api::NodeKind::PACKAGE
-                ) && normalize_identifier(&citation.display_name).contains("interceptor")
-            }),
+            "request_interceptor_management" => {
+                Self::claim_text_names_interceptor_management(&normalized)
+                    && claim
+                        .citations
+                        .iter()
+                        .any(packet_citation_owns_interceptor_management)
+            }
             "sql_tables" => claim.citations.iter().any(Self::citation_is_sql_table),
             "sql_relationships" => claim
                 .citations
@@ -1307,6 +1308,10 @@ impl StructuralLanguagePolicy {
             }
             _ => false,
         }
+    }
+
+    fn claim_text_names_interceptor_management(normalized: &str) -> bool {
+        normalized.contains("storesinterceptorpairs") && normalized.contains("promisechain")
     }
 
     fn admits_diagnostic_evidence(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
@@ -3896,10 +3901,10 @@ mod tests {
             "an explicitly requested role must remain missing without compatible cited evidence: {missing_role:?}"
         );
 
-        let mut unrelated_helper = cited_anchor("normalizeConfig");
-        unrelated_helper.file_path = Some("src/interceptors/helpers.js".to_string());
+        let mut unrelated_helper = cited_anchor("requestInterceptorHandler");
+        unrelated_helper.kind = NodeKind::FIELD;
         claims.push(cited_claim(
-            "normalizeConfig prepares request options before dispatch.",
+            "requestInterceptorHandler stores interceptor pairs used by the promise chain in request.",
             Some("interceptor management"),
             unrelated_helper,
             Some(true),
@@ -3907,10 +3912,23 @@ mod tests {
         let unrelated_path = assemble(claims.clone());
         assert_eq!(unrelated_path.status, PacketSufficiencyStatusDto::Partial);
 
+        let mut unrelated_type = cited_anchor("InterceptorOptions");
+        unrelated_type.kind = NodeKind::CLASS;
         claims.push(cited_claim(
-            "InterceptorRegistry stores fulfilled and rejected handlers for request execution.",
+            "InterceptorOptions stores interceptor pairs used by the promise chain in request.",
             Some("interceptor management"),
-            cited_anchor("InterceptorRegistry"),
+            unrelated_type,
+            Some(true),
+        ));
+        let unrelated_type = assemble(claims.clone());
+        assert_eq!(unrelated_type.status, PacketSufficiencyStatusDto::Partial);
+
+        let mut interceptor_registry = cited_anchor("InterceptorRegistry");
+        interceptor_registry.kind = NodeKind::CLASS;
+        claims.push(cited_claim(
+            "InterceptorRegistry stores interceptor pairs used by the promise chain in request.",
+            Some("interceptor management"),
+            interceptor_registry,
             Some(true),
         ));
         let complete = assemble(claims);
