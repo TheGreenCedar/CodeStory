@@ -1,15 +1,16 @@
 use anyhow::Result;
 use codestory_contracts::api::{ApiError, ApiErrorDetails, CommandFailureEnvelope};
-use codestory_retrieval::{DEFAULT_AGENT_RUN_ID, SidecarProfile, SidecarRuntimeConfig};
+pub(crate) use codestory_retrieval::ProcessOwnerState;
+use codestory_retrieval::{
+    DEFAULT_AGENT_RUN_ID, ProcessStartProbe, SidecarProfile, SidecarRuntimeConfig,
+    probe_process_start_identity, process_owner_state as classify_process_owner_state,
+};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,10 +25,6 @@ const READY_REPAIR_STATUS_TTL: Duration = Duration::from_secs(30);
 const READY_REPAIR_LOCK_STALE_TTL: Duration = Duration::from_secs(120);
 const READY_REPAIR_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_REPAIR_COORDINATION_POLL: Duration = Duration::from_millis(10);
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-const READY_REPAIR_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-const READY_REPAIR_PROCESS_PROBE_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) const READY_REPAIR_ATTEMPT_ENV: &str = "CODESTORY_READY_REPAIR_ATTEMPT_ID";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,20 +182,6 @@ pub(crate) struct ReadyRepairCleanup {
 pub(crate) enum ReadyRepairLockAttempt {
     Acquired(ReadyRepairLock),
     Busy(Box<ReadyRepairBusy>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProcessOwnerState {
-    Matching,
-    GoneOrReused,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProcessProbe {
-    Running { start_identity: Option<String> },
-    NotRunning,
-    Unknown,
 }
 
 #[derive(Debug)]
@@ -438,12 +421,12 @@ pub(crate) fn wait_for_ready_repair_reservation_adoption(
                             "ready repair reservation adopted without a worker start identity"
                         )
                     })?;
-                match probe_process(reservation.pid) {
-                    ProcessProbe::NotRunning => return Ok(()),
-                    ProcessProbe::Running {
-                        start_identity: Some(actual),
+                match probe_process_start_identity(reservation.pid) {
+                    ProcessStartProbe::NotRunning => return Ok(()),
+                    ProcessStartProbe::Running {
+                        start_identity: actual,
                     } if actual == expected_start_identity => return Ok(()),
-                    ProcessProbe::Running { .. } | ProcessProbe::Unknown => {
+                    ProcessStartProbe::Running { .. } | ProcessStartProbe::Unknown { .. } => {
                         anyhow::bail!(
                             "ready repair reservation adopted an invalid worker identity"
                         );
@@ -1175,161 +1158,14 @@ pub(crate) fn process_owner_state(
     pid: u32,
     expected_start_identity: Option<&str>,
 ) -> ProcessOwnerState {
-    process_owner_state_with(pid, expected_start_identity, probe_process)
-}
-
-fn process_owner_state_with(
-    pid: u32,
-    expected_start_identity: Option<&str>,
-    probe: impl FnOnce(u32) -> ProcessProbe,
-) -> ProcessOwnerState {
-    match probe(pid) {
-        ProcessProbe::NotRunning => ProcessOwnerState::GoneOrReused,
-        ProcessProbe::Unknown => ProcessOwnerState::Unknown,
-        ProcessProbe::Running { start_identity } => match expected_start_identity {
-            None => ProcessOwnerState::Matching,
-            Some(expected) => match start_identity {
-                Some(actual) if actual == expected => ProcessOwnerState::Matching,
-                Some(_) => ProcessOwnerState::GoneOrReused,
-                None => ProcessOwnerState::Unknown,
-            },
-        },
-    }
+    classify_process_owner_state(&probe_process_start_identity(pid), expected_start_identity)
 }
 
 pub(crate) fn recorded_process_start_identity(pid: u32) -> Option<String> {
-    match probe_process(pid) {
-        ProcessProbe::Running { start_identity } => start_identity,
-        ProcessProbe::NotRunning | ProcessProbe::Unknown => None,
+    match probe_process_start_identity(pid) {
+        ProcessStartProbe::Running { start_identity } => Some(start_identity),
+        ProcessStartProbe::NotRunning | ProcessStartProbe::Unknown { .. } => None,
     }
-}
-
-fn probe_process(pid: u32) -> ProcessProbe {
-    static CURRENT_PROCESS_START_IDENTITY: OnceLock<String> = OnceLock::new();
-
-    if pid == std::process::id()
-        && let Some(identity) = CURRENT_PROCESS_START_IDENTITY.get()
-    {
-        return ProcessProbe::Running {
-            start_identity: Some(identity.clone()),
-        };
-    }
-
-    let probe = probe_process_platform(pid);
-    if pid == std::process::id()
-        && let ProcessProbe::Running {
-            start_identity: Some(identity),
-        } = &probe
-    {
-        let _ = CURRENT_PROCESS_START_IDENTITY.set(identity.clone());
-    }
-    probe
-}
-
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-fn bounded_process_probe_output(command: &mut Command) -> Option<std::process::Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + READY_REPAIR_PROCESS_PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(READY_REPAIR_COORDINATION_POLL);
-            }
-            Ok(None) | Err(_) => {
-                if child.kill().is_ok() {
-                    let reap_deadline = Instant::now() + READY_REPAIR_PROCESS_PROBE_REAP_TIMEOUT;
-                    while Instant::now() < reap_deadline {
-                        if child.try_wait().ok().flatten().is_some() {
-                            break;
-                        }
-                        thread::sleep(READY_REPAIR_COORDINATION_POLL);
-                    }
-                }
-                return None;
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn probe_process_platform(pid: u32) -> ProcessProbe {
-    let script = format!(
-        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\" -ErrorAction Stop; if ($null -eq $p) {{ exit 2 }}; $p.CreationDate.ToUniversalTime().Ticks"
-    );
-    let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    let Some(output) = bounded_process_probe_output(&mut command) else {
-        return ProcessProbe::Unknown;
-    };
-    if output.status.code() == Some(2) {
-        return ProcessProbe::NotRunning;
-    }
-    if !output.status.success() {
-        return ProcessProbe::Unknown;
-    }
-    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if identity.is_empty() {
-        return ProcessProbe::Unknown;
-    }
-    ProcessProbe::Running {
-        start_identity: Some(format!("windows:{identity}")),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn probe_process_platform(pid: u32) -> ProcessProbe {
-    let path = Path::new("/proc").join(pid.to_string()).join("stat");
-    let stat = match fs::read_to_string(path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == ErrorKind::NotFound => return ProcessProbe::NotRunning,
-        Err(_) => return ProcessProbe::Unknown,
-    };
-    let Some((_, fields)) = stat.rsplit_once(") ") else {
-        return ProcessProbe::Unknown;
-    };
-    let Some(start_ticks) = fields.split_whitespace().nth(19) else {
-        return ProcessProbe::Unknown;
-    };
-    ProcessProbe::Running {
-        start_identity: Some(format!("linux:{start_ticks}")),
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn probe_process_platform(pid: u32) -> ProcessProbe {
-    let mut command = Command::new("ps");
-    command
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .args(["-o", "lstart=", "-p", &pid.to_string()]);
-    let Some(output) = bounded_process_probe_output(&mut command) else {
-        return ProcessProbe::Unknown;
-    };
-    if !output.status.success() {
-        return if output.status.code() == Some(1) {
-            ProcessProbe::NotRunning
-        } else {
-            ProcessProbe::Unknown
-        };
-    }
-    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if identity.is_empty() {
-        return ProcessProbe::Unknown;
-    }
-    ProcessProbe::Running {
-        start_identity: Some(format!("unix:{identity}")),
-    }
-}
-
-#[cfg(not(any(windows, unix)))]
-fn probe_process_platform(_pid: u32) -> ProcessProbe {
-    ProcessProbe::Unknown
 }
 
 fn ready_repair_lock_paths_for_sidecar(sidecar: &SidecarRuntimeConfig) -> Vec<PathBuf> {
@@ -1469,47 +1305,6 @@ mod tests {
             labels: Default::default(),
             ..crate::sidecar_runtime::local()
         }
-    }
-
-    #[test]
-    fn process_owner_probe_matches_live_process_identity() {
-        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
-            start_identity: Some("start-a".to_string()),
-        });
-
-        assert_eq!(state, ProcessOwnerState::Matching);
-    }
-
-    #[test]
-    fn process_owner_probe_detects_dead_process() {
-        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::NotRunning);
-
-        assert_eq!(state, ProcessOwnerState::GoneOrReused);
-    }
-
-    #[test]
-    fn process_owner_probe_detects_pid_reuse() {
-        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
-            start_identity: Some("start-b".to_string()),
-        });
-
-        assert_eq!(state, ProcessOwnerState::GoneOrReused);
-    }
-
-    #[test]
-    fn process_owner_probe_uncertainty_preserves_ownership() {
-        let failed_probe = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Unknown);
-        let missing_identity =
-            process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
-                start_identity: None,
-            });
-        let legacy_live = process_owner_state_with(42, None, |_| ProcessProbe::Running {
-            start_identity: Some("start-b".to_string()),
-        });
-
-        assert_eq!(failed_probe, ProcessOwnerState::Unknown);
-        assert_eq!(missing_identity, ProcessOwnerState::Unknown);
-        assert_eq!(legacy_live, ProcessOwnerState::Matching);
     }
 
     #[test]

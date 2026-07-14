@@ -11,6 +11,14 @@ use crate::health::{
     probe_sidecar_health_for_runtime, unavailable_status_report_with_embedding_device,
 };
 use crate::index::{compute_sidecar_input_fingerprint_for_runtime, sidecar_project_id_for_runtime};
+#[cfg(not(target_os = "linux"))]
+use crate::process_identity::bounded_process_command_output;
+use crate::process_identity::{
+    ProcessOwnerState, ProcessStartProbe, native_embedding_process_start_identity,
+    probe_process_start_identity, process_owner_state, process_started_at_epoch_ms,
+};
+#[cfg(all(not(windows), not(target_os = "linux")))]
+use crate::process_identity::{PsProbeOutputStatus, classify_ps_probe_output};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::language_support::{
     LanguageSupportMode, language_support_profile_for_ext,
@@ -20,10 +28,6 @@ use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(windows)]
-use std::io;
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::process::Command;
 #[cfg(not(windows))]
@@ -51,36 +55,7 @@ unsafe extern "C" {
     ) -> std::ffi::c_int;
 }
 
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Default)]
-struct WindowsFileTime {
-    low_date_time: u32,
-    high_date_time: u32,
-}
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> RawHandle;
-    fn GetProcessTimes(
-        process: RawHandle,
-        creation_time: *mut WindowsFileTime,
-        exit_time: *mut WindowsFileTime,
-        kernel_time: *mut WindowsFileTime,
-        user_time: *mut WindowsFileTime,
-    ) -> i32;
-}
-
 const NATIVE_EMBEDDING_PROCESS_START_TOLERANCE_MS: i64 = 5 * 1000;
-#[cfg(windows)]
-const WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-#[cfg(windows)]
-const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
-#[cfg(windows)]
-const WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH: u64 = 504_911_232_000_000_000;
-#[cfg(windows)]
-const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 #[cfg(target_os = "macos")]
 const MACOS_CTL_KERN: std::ffi::c_int = 1;
 #[cfg(target_os = "macos")]
@@ -617,8 +592,11 @@ pub fn native_embedding_launch_identity_status(
             };
         }
     };
-    match native_embedding_process_start_identity(pid) {
-        Ok(Some(actual)) if start_identity_before != actual => {
+    let final_start_probe = probe_process_start_identity(pid);
+    match &final_start_probe {
+        ProcessStartProbe::Running {
+            start_identity: actual,
+        } if start_identity_before != *actual => {
             return NativeEmbeddingLaunchIdentityStatus::Unverified {
                 pid: Some(pid),
                 reason: format!(
@@ -626,8 +604,12 @@ pub fn native_embedding_launch_identity_status(
                 ),
             };
         }
-        Ok(Some(actual)) if actual == expected_start_identity => {}
-        Ok(Some(actual)) => {
+        ProcessStartProbe::Running { .. }
+            if process_owner_state(&final_start_probe, Some(expected_start_identity))
+                == ProcessOwnerState::Matching => {}
+        ProcessStartProbe::Running {
+            start_identity: actual,
+        } => {
             return NativeEmbeddingLaunchIdentityStatus::Mismatched {
                 pid,
                 reason: format!(
@@ -635,16 +617,16 @@ pub fn native_embedding_launch_identity_status(
                 ),
             };
         }
-        Ok(None) => {
+        ProcessStartProbe::NotRunning => {
             return NativeEmbeddingLaunchIdentityStatus::Unverified {
                 pid: Some(pid),
                 reason: "live native embedding process start identity is unavailable".to_string(),
             };
         }
-        Err(error) => {
+        ProcessStartProbe::Unknown { reason } => {
             return NativeEmbeddingLaunchIdentityStatus::Unverified {
                 pid: Some(pid),
-                reason: format!("query live native embedding process start identity: {error}"),
+                reason: format!("query live native embedding process start identity: {reason}"),
             };
         }
     }
@@ -882,104 +864,6 @@ fn normalized_identity_path(path: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_process_creation_time(pid: u32) -> Result<Option<WindowsFileTime>> {
-    if pid == 0 {
-        bail!("native embedding process pid must be greater than zero");
-    }
-    let raw_handle = unsafe { OpenProcess(WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if raw_handle.is_null() {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(WINDOWS_ERROR_INVALID_PARAMETER) {
-            return Ok(None);
-        }
-        return Err(error).with_context(|| format!("open native embedding process {pid}"));
-    }
-    let process = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
-    let mut creation_time = WindowsFileTime::default();
-    let mut exit_time = WindowsFileTime::default();
-    let mut kernel_time = WindowsFileTime::default();
-    let mut user_time = WindowsFileTime::default();
-    if unsafe {
-        GetProcessTimes(
-            process.as_raw_handle(),
-            &mut creation_time,
-            &mut exit_time,
-            &mut kernel_time,
-            &mut user_time,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("query native embedding start identity for pid {pid}"));
-    }
-    Ok(Some(creation_time))
-}
-
-#[cfg(windows)]
-pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String>> {
-    let Some(creation_time) = windows_process_creation_time(pid)? else {
-        return Ok(None);
-    };
-    let ticks = windows_datetime_ticks_from_filetime(&creation_time)?;
-    Ok(Some(format!("windows:{ticks}")))
-}
-
-#[cfg(windows)]
-fn windows_filetime_ticks(filetime: &WindowsFileTime) -> u64 {
-    (u64::from(filetime.high_date_time) << 32) | u64::from(filetime.low_date_time)
-}
-
-#[cfg(windows)]
-fn windows_datetime_ticks_from_filetime(filetime: &WindowsFileTime) -> Result<u64> {
-    let filetime_ticks = windows_filetime_ticks(filetime);
-    // Win32_Process.CreationDate exposes microseconds, so discard sub-microsecond
-    // FILETIME ticks to preserve identities serialized by the previous CIM query.
-    let legacy_filetime_ticks = filetime_ticks / 10 * 10;
-    legacy_filetime_ticks
-        .checked_add(WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH)
-        .context("convert Windows process creation time to DateTime ticks")
-}
-
-#[cfg(windows)]
-fn windows_epoch_ms_from_filetime(filetime: &WindowsFileTime) -> Result<i64> {
-    let elapsed_ticks = windows_filetime_ticks(filetime)
-        .checked_sub(WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH)
-        .context("convert Windows process creation time to Unix epoch")?;
-    i64::try_from(elapsed_ticks / 10_000)
-        .context("convert Windows process creation time to epoch milliseconds")
-}
-
-#[cfg(target_os = "linux")]
-pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String>> {
-    let stat_path = Path::new("/proc").join(pid.to_string()).join("stat");
-    let stat = match fs::read_to_string(&stat_path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("read {}", stat_path.display())),
-    };
-    let start_ticks = stat
-        .rsplit_once(") ")
-        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
-        .with_context(|| format!("parse process start identity from {}", stat_path.display()))?;
-    Ok(Some(format!("linux:{start_ticks}")))
-}
-
-#[cfg(all(not(windows), not(target_os = "linux")))]
-pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String>> {
-    let output = Command::new("ps")
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()
-        .with_context(|| format!("query native embedding start identity for pid {pid}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!identity.is_empty()).then(|| format!("unix:{identity}")))
-}
-
-#[cfg(windows)]
 fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingProcessSnapshot>> {
     #[derive(Deserialize)]
     struct WindowsProcessInfo {
@@ -989,15 +873,15 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
         command_line: Option<String>,
     }
 
-    let Some(creation_time) = windows_process_creation_time(pid)? else {
+    let Some(started_at_epoch_ms) = process_started_at_epoch_ms(pid)? else {
         return Ok(None);
     };
     let script = format!(
         "$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $p) {{ exit 2 }}; [pscustomobject]@{{ExecutablePath=$p.ExecutablePath;CommandLine=$p.CommandLine}} | ConvertTo-Json -Compress"
     );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output()
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let output = bounded_process_command_output(&mut command)
         .with_context(|| format!("query native embedding pid {pid}"))?;
     if output.status.code() == Some(2) {
         return Ok(None);
@@ -1014,7 +898,7 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
         executable_path: info.executable_path,
         command_line: info.command_line,
         arguments: None,
-        started_at_epoch_ms: Some(windows_epoch_ms_from_filetime(&creation_time)?),
+        started_at_epoch_ms: Some(started_at_epoch_ms),
     }))
 }
 
@@ -1041,7 +925,7 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
             .collect::<Vec<_>>()
             .join(" ")
     });
-    let started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
+    let started_at_epoch_ms = process_started_at_epoch_ms(pid).ok().flatten();
     Ok(Some(NativeEmbeddingProcessSnapshot {
         executable_path,
         command_line,
@@ -1068,12 +952,13 @@ fn native_embedding_linux_process_state(process_dir: &Path) -> Result<Option<cha
 
 #[cfg(all(not(windows), not(target_os = "linux")))]
 fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingProcessSnapshot>> {
-    let output = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "state=", "-o", "command="])
-        .output()
+    let mut command = Command::new("ps");
+    command.args(["-p", &pid.to_string(), "-o", "state=", "-o", "command="]);
+    let output = bounded_process_command_output(&mut command)
         .with_context(|| format!("query native embedding pid {pid}"))?;
-    if !output.status.success() {
-        return Ok(None);
+    match classify_ps_probe_output(&output)? {
+        PsProbeOutputStatus::Success => {}
+        PsProbeOutputStatus::ProcessMissing => return Ok(None),
     }
     let mut snapshot =
         native_embedding_non_linux_unix_process_snapshot_from_ps_output(&output.stdout);
@@ -1084,7 +969,7 @@ fn native_embedding_process_snapshot(pid: u32) -> Result<Option<NativeEmbeddingP
             snapshot.executable_path = Some(executable_path);
             snapshot.arguments = Some(arguments);
         }
-        snapshot.started_at_epoch_ms = native_embedding_process_started_at_epoch_ms(pid);
+        snapshot.started_at_epoch_ms = process_started_at_epoch_ms(pid).ok().flatten();
     }
     Ok(snapshot)
 }
@@ -1213,32 +1098,6 @@ fn native_embedding_non_linux_unix_process_snapshot_from_ps_output(
         arguments: None,
         started_at_epoch_ms: None,
     })
-}
-
-#[cfg(not(windows))]
-fn native_embedding_process_started_at_epoch_ms(pid: u32) -> Option<i64> {
-    let output = Command::new("ps")
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    native_embedding_process_started_at_epoch_ms_from_lstart(&output.stdout)
-}
-
-#[cfg(any(test, not(windows)))]
-fn native_embedding_process_started_at_epoch_ms_from_lstart(output: &[u8]) -> Option<i64> {
-    use chrono::TimeZone;
-
-    let started = chrono::NaiveDateTime::parse_from_str(
-        String::from_utf8_lossy(output).trim(),
-        "%a %b %e %H:%M:%S %Y",
-    )
-    .ok()?;
-    Some(chrono::Utc.from_utc_datetime(&started).timestamp_millis())
 }
 
 /// Probe sidecar health and attach the latest retrieval manifest when storage is available.
@@ -2224,18 +2083,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_native_embedding_identity_and_snapshot_are_stable_and_compatible() -> Result<()> {
-        const DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH: u64 = 621_355_968_000_000_000;
-
-        let unix_epoch_with_sub_microsecond_ticks = WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH + 8;
-        let unix_epoch = WindowsFileTime {
-            low_date_time: unix_epoch_with_sub_microsecond_ticks as u32,
-            high_date_time: (unix_epoch_with_sub_microsecond_ticks >> 32) as u32,
-        };
-        assert_eq!(
-            windows_datetime_ticks_from_filetime(&unix_epoch)?,
-            DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH
-        );
-        assert_eq!(windows_epoch_ms_from_filetime(&unix_epoch)?, 0);
         assert!(native_embedding_process_start_identity(0).is_err());
 
         let before_spawn_epoch_ms = std::time::SystemTime::now()

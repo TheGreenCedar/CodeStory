@@ -25,6 +25,7 @@ mod lexical_index;
 mod mode;
 pub mod outbound_http;
 mod planner;
+mod process_identity;
 mod qdrant_client;
 mod qdrant_storage;
 mod query;
@@ -101,6 +102,10 @@ pub use lexical_index::LEXICAL_INDEX_VERSION;
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
+pub use process_identity::{
+    ProcessOwnerState, ProcessStartProbe, native_embedding_process_start_identity,
+    probe_process_start_identity, process_owner_state,
+};
 pub use qdrant_client::{
     QDRANT_INDEX_UPSERT_BATCH_SIZE, QDRANT_VECTOR_DIM, QdrantClient, QdrantUpsertPoint,
     diagnostic_query_vector,
@@ -122,8 +127,7 @@ pub use retention::{GenerationRetentionApplyReport, GenerationRetentionPlan};
 pub use scip_client::ScipClient;
 pub use sidecar::{
     EmbeddingLaunchOwnership, NativeEmbeddingLaunchIdentityStatus, SidecarStateFile,
-    ensure_native_embedding_launch_identity, native_embedding_launch_identity_status,
-    native_embedding_process_start_identity, sidecar_down,
+    ensure_native_embedding_launch_identity, native_embedding_launch_identity_status, sidecar_down,
     sidecar_down_after_failed_bootstrap_for_runtime, sidecar_down_for_project,
     sidecar_down_for_runtime, sidecar_state_matches_runtime, sidecar_status, sidecar_up,
     sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch,
