@@ -113,6 +113,8 @@ jobs:
       drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
       embedding_model_dir: /srv/codestory-release-evidence/models
       source_run_id: ${{ inputs.source_run_id }}
+    secrets:
+      CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: ${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}
 
   packaged-proof:
     needs:
