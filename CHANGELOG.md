@@ -102,6 +102,9 @@
   and workflow policy rejects unlocked Cargo commands. Project-controlled
   network endpoints remain disabled unless a trusted operator enables the
   process-wide project-network opt-in.
+- Workflow policy now parses YAML structure with one exact-pinned dependency.
+  Trigger, permission, job, matrix, secret, dependency, condition, and named
+  step checks no longer accept comments or unrelated command text as evidence.
 - Release proof is staged by maturity and changed surface. Draft changes use
   focused source checks; exact-head, platform, protected hardware, signing, and
   installation proof run only at their explicit promotion boundaries. The

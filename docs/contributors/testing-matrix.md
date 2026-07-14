@@ -106,9 +106,16 @@ release version, update every `codestory-*` workspace crate version and
 `Cargo.lock` in the same change.
 
 ```sh
+npm ci --ignore-scripts
 node .github/scripts/check-workflow-policy.mjs
+node --test .github/scripts/check-workflow-policy.test.mjs
 python .github/scripts/check-codestory-release.py --version <version>
 ```
+
+The workflow policy checker parses YAML before inspecting triggers,
+permissions, jobs, matrices, secrets, dependencies, conditions, and named step
+commands. Keep its single exact-pinned parser dependency in `package-lock.json`;
+comments and unrelated steps are not policy evidence.
 
 After a `main` release, run the release version check on `dev/codestory-next`
 with the released version before starting the next release lane.

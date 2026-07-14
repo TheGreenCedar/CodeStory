@@ -598,7 +598,7 @@ fn linter_binds_policy_allowances_to_the_exact_approved_use() {
         ),
         (
             ".github/scripts/check-workflow-policy.mjs",
-            "const retrievalSidecarSmoke = path.join(workflowRoot, \"retrieval-sidecar-smoke.yml\");\nviolations.push(\"retrieval-sidecar-smoke.yml must exist\");\nviolations.push(\"retrieval-sidecar-smoke.yml Windows proof must be workflow_dispatch-only\");\n",
+            "const retrievalFile = \"retrieval-sidecar-smoke.yml\";\n",
         ),
     ]);
     let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
@@ -614,7 +614,7 @@ fn linter_binds_policy_allowances_to_the_exact_approved_use() {
         ),
         (
             ".github/scripts/check-workflow-policy.mjs",
-            "const retrievalSidecarSmoke = path.join(workflowRoot, \"retrieval-sidecar-smoke.yml\");\nconst hostile = \".github/workflows/retrieval-\" + \"sidecar-smoke.yml\";\n",
+            "const retrievalFile = \"retrieval-sidecar-smoke.yml\";\nconst hostile = \".github/workflows/retrieval-\" + \"sidecar-smoke.yml\";\n",
         ),
     ]);
     let rejected_stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
