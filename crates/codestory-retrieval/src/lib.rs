@@ -77,7 +77,8 @@ pub use embeddings::{
     qdrant_vector_dim,
 };
 pub use executor::{
-    QueryExecutor, QueryResult, QueryTrace, StageCompletionStatus, StageTrace, cancellation_flag,
+    QueryExecutor, QueryResult, QueryTrace, RetrievalPublicationIdentity, StageCompletionStatus,
+    StageTrace, cancellation_flag,
 };
 pub use generation::{SIDECAR_SCHEMA_VERSION, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED};
 pub use health::{
@@ -119,10 +120,14 @@ pub use query::{
     execute_retrieval_query_with_cache, execute_retrieval_query_with_cache_for_runtime,
     execute_strict_retrieval_query_batch_with_cache,
     execute_strict_retrieval_query_batch_with_cache_for_runtime,
+    retrieval_publication_identity_from_storage,
 };
 pub use query_features::{QueryFeatures, QueryShape, classify_query};
 pub use ranker::rank_candidates;
-pub use retention::{GenerationRetentionApplyReport, GenerationRetentionPlan};
+pub use retention::{
+    GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport, GenerationRetentionLock,
+    GenerationRetentionPlan, global_generation_gc_state_file,
+};
 pub use scip_client::ScipClient;
 pub use sidecar::{
     EmbeddingLaunchOwnership, NativeEmbeddingLaunchIdentityStatus, SidecarStateFile,

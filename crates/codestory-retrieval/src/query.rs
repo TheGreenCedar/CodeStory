@@ -1,8 +1,11 @@
 use crate::cache::RetrievalCache;
+#[cfg(test)]
 use crate::cache::RetrievalCacheKey;
 use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embeddings::{EmbeddingDeviceReadiness, embedding_device_readiness_for_runtime};
-use crate::executor::{QueryExecutor, QueryResult, cancellation_flag};
+use crate::executor::{
+    QueryExecutor, QueryResult, RetrievalPublicationIdentity, cancellation_flag,
+};
 use crate::generation::manifest_unavailable_reason_for_runtime;
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
@@ -71,7 +74,9 @@ pub fn execute_retrieval_query_with_cache_for_runtime(
         manifest,
         file_roles,
         embedding_device,
+        publication_identity,
     } = load_query_context(request.project_root, request.storage_path, runtime)?;
+    cache.scope_to_publication(&publication_identity);
     let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
         runtime,
         layout,
@@ -87,7 +92,9 @@ pub fn execute_retrieval_query_with_cache_for_runtime(
         cancelled,
         mode_override: None,
     };
-    executor.execute(request.query, request.budget_ms)
+    executor
+        .execute(request.query, request.budget_ms)
+        .map(|result| result.with_publication_identity(&publication_identity))
 }
 
 pub fn execute_strict_retrieval_query_batch_with_cache(
@@ -116,7 +123,9 @@ pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
         manifest,
         file_roles,
         embedding_device,
+        publication_identity,
     } = load_query_context(request.project_root, request.storage_path, runtime)?;
+    cache.scope_to_publication(&publication_identity);
     let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
         runtime,
         layout,
@@ -137,7 +146,7 @@ pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
             degraded_reason.as_deref().unwrap_or("unknown")
         );
     }
-    execute_strict_retrieval_query_batch_against_sidecars(
+    let mut results = execute_strict_retrieval_query_batch_against_sidecars(
         sidecars,
         manifest,
         file_roles,
@@ -146,7 +155,11 @@ pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
         request.queries,
         cache,
         strict_batch_worker_limit(request.queries.len()),
-    )
+    )?;
+    for result in &mut results {
+        result.publication_identity = Some(publication_identity.clone());
+    }
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -247,12 +260,13 @@ fn cached_batch_result(
     }
     let manifest = manifest?;
     let features = classify_query(query);
-    let key = RetrievalCacheKey::from_manifest(manifest, query_fingerprint(&features.raw_query));
+    let key = cache.key_for_manifest(manifest, query_fingerprint(&features.raw_query));
     let hits = cache.get(&key)?.to_vec();
     if cancelled.load(Ordering::Acquire) {
         return None;
     }
     Some(QueryResult {
+        publication_identity: None,
         query: features.raw_query.clone(),
         features,
         hits,
@@ -278,10 +292,7 @@ fn cache_completed_batch_result(
         return;
     }
     if let Some(manifest) = manifest {
-        let key = RetrievalCacheKey::from_manifest(
-            manifest,
-            query_fingerprint(&result.features.raw_query),
-        );
+        let key = cache.key_for_manifest(manifest, query_fingerprint(&result.features.raw_query));
         if !cancelled.load(Ordering::Acquire) {
             cache.insert(key.clone(), result.hits.clone());
             if cancelled.load(Ordering::Acquire) {
@@ -308,6 +319,36 @@ struct QueryContext {
     manifest: Option<RetrievalIndexManifest>,
     file_roles: Arc<HashMap<String, FileRole>>,
     embedding_device: EmbeddingDeviceReadiness,
+    publication_identity: RetrievalPublicationIdentity,
+}
+
+pub fn retrieval_publication_identity_from_storage(
+    storage: &Store,
+    project_id: &str,
+) -> Result<RetrievalPublicationIdentity> {
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication")?
+        .context("complete core publication is missing")?;
+    let manifest = storage
+        .get_retrieval_index_manifest(project_id)
+        .context("load retrieval manifest identity")?
+        .context("retrieval manifest is missing")?;
+    Ok(RetrievalPublicationIdentity {
+        core_generation_id: publication.generation_id,
+        core_run_id: publication.run_id,
+        sidecar_generation: manifest
+            .sidecar_generation
+            .filter(|value| !value.trim().is_empty())
+            .context("retrieval manifest sidecar generation is missing")?,
+        sidecar_input_hash: manifest
+            .sidecar_input_hash
+            .filter(|value| !value.trim().is_empty())
+            .context("retrieval manifest input hash is missing")?,
+        qdrant_collection: (!manifest.qdrant_collection.trim().is_empty())
+            .then_some(manifest.qdrant_collection)
+            .context("retrieval manifest Qdrant collection is missing")?,
+    })
 }
 
 fn load_query_context(
@@ -318,8 +359,12 @@ fn load_query_context(
     let embedding_device = embedding_device_readiness_for_runtime(runtime);
     let layout = runtime.layout.clone();
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
-    let (manifest, file_roles) = if storage_path.exists() {
-        let storage = Store::open(storage_path).context("open storage for query")?;
+    let (manifest, file_roles, publication_identity) = if storage_path.exists() {
+        let storage = Store::open_read_only(storage_path).context("open storage for query")?;
+        let snapshot = storage
+            .read_snapshot()
+            .context("pin core publication for retrieval query")?;
+        let storage = snapshot.storage();
         let manifest = storage
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
@@ -327,7 +372,7 @@ fn load_query_context(
             if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
                 project_root,
                 storage_path,
-                &storage,
+                storage,
                 runtime,
             ) {
                 bail!(
@@ -335,7 +380,7 @@ fn load_query_context(
                 );
             }
             if let Some(reason) =
-                manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
+                manifest_unavailable_reason_for_runtime(&project_id, storage, manifest, runtime)
             {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
@@ -355,7 +400,12 @@ fn load_query_context(
                     .collect()
             })
             .unwrap_or_default();
-        (manifest, roles)
+        let publication_identity =
+            retrieval_publication_identity_from_storage(storage, &project_id)?;
+        snapshot
+            .finish()
+            .context("finish pinned retrieval query context")?;
+        (manifest, roles, publication_identity)
     } else {
         bail!("retrieval sidecar storage is missing; run retrieval index for project {project_id}");
     };
@@ -366,6 +416,7 @@ fn load_query_context(
         manifest,
         file_roles: Arc::new(file_roles),
         embedding_device,
+        publication_identity,
     })
 }
 

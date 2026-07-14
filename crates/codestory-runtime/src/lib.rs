@@ -9846,6 +9846,12 @@ impl AppController {
     /// The returned retrieval state distinguishes full sidecar evidence from degraded or
     /// diagnostic-only paths. Callers should not collapse those states into a generic success.
     pub fn search_results(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
+        agent::retrieval_primary::with_stable_retrieval_publication(self, "search output", || {
+            self.search_results_once(req.clone())
+        })
+    }
+
+    fn search_results_once(&self, req: SearchRequest) -> Result<SearchResultsDto, ApiError> {
         self.ensure_consistent_read_state("Search")?;
         let original_query = req.query.clone();
         let intent_query = parse_search_intent_query(&original_query);
@@ -9884,27 +9890,12 @@ impl AppController {
         }
 
         let query = intent_query.effective_query.clone();
-        let query_result = agent::retrieval_primary::run_sidecar_query(self, &query, None)
-            .map_err(|error| {
-                agent::retrieval_primary::sidecar_retrieval_unavailable_error(
-                    self,
-                    format!("sidecar search failed: {error}"),
-                )
-            })?;
-        let resolution = agent::retrieval_primary::resolve_sidecar_candidates_with_stats(
+        let (query_result, resolution) = agent::retrieval_primary::run_and_resolve_sidecar_query(
             self,
-            &query_result.hits,
+            &query,
             limit_per_source,
-        )
-        .map_err(|error| {
-            agent::retrieval_primary::sidecar_retrieval_unavailable_error(
-                self,
-                format!(
-                    "sidecar search rejected query: candidate resolution failed: {}",
-                    error.message
-                ),
-            )
-        })?;
+            None,
+        )?;
         let mut indexed_symbol_hits = resolution.resolved_hits.clone();
         if let Some(reason) = agent::retrieval_primary::sidecar_primary_result_rejection_reason(
             &query_result,
@@ -11009,7 +11000,9 @@ impl AppController {
     /// Degraded sidecar state is reported through retrieval diagnostics or an error rather than
     /// silently substituting legacy search as answer-quality proof.
     pub fn agent_ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
-        agent::agent_ask(self, req)
+        agent::retrieval_primary::with_stable_retrieval_publication(self, "agent answer", || {
+            agent::agent_ask(self, req.clone())
+        })
     }
 
     pub fn begin_packet_retrieval(&self) {
@@ -11028,7 +11021,9 @@ impl AppController {
     /// candidates that fail symbol resolution remain diagnostics and do not become supported
     /// claims merely because retrieval returned them.
     pub fn agent_packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
-        agent::agent_packet(self, req)
+        agent::retrieval_primary::with_stable_retrieval_publication(self, "packet output", || {
+            agent::agent_packet(self, req.clone())
+        })
     }
 
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {

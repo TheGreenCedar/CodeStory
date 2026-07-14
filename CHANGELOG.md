@@ -61,6 +61,10 @@
   remain at build, publication, readiness, and explicit health boundaries.
 - MCP resource reads now reject malformed or unknown URIs before selecting,
   refreshing, or repairing a project, leaving runtime and status state untouched.
+- Retrieval queries, numeric candidate resolution, file-role reads, and final
+  packet/search output now stay pinned to one core and sidecar publication.
+  Concurrent publication drift returns `cache_busy` and retries once instead of
+  resolving an older candidate ID against a newer graph.
 - Express, Fastify, and FastAPI route extraction now builds one ordered
   binding timeline per module. Route queries reuse that timeline instead of
   rescanning prior statements, and FastAPI imports are resolved from parsed

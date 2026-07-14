@@ -24,6 +24,7 @@ fn phantom_only_candidates_are_detected() {
     ]));
 
     let _query = QueryResult {
+        publication_identity: None,
         query: "handler".into(),
         features: classify_query("handler"),
         hits,

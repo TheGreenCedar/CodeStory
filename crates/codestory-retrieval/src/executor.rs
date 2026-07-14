@@ -1,4 +1,6 @@
-use crate::cache::{RetrievalCache, RetrievalCacheKey};
+use crate::cache::RetrievalCache;
+#[cfg(test)]
+use crate::cache::RetrievalCacheKey;
 use crate::candidate::CandidateHit;
 use crate::health::{
     probe_sidecar_health, probe_sidecar_health_for_runtime,
@@ -89,16 +91,37 @@ pub struct QueryTrace {
     pub stages: Vec<StageTrace>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalPublicationIdentity {
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub sidecar_generation: String,
+    pub sidecar_input_hash: String,
+    pub qdrant_collection: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Result of executing one retrieval query against the sidecar stack.
 ///
 /// Hits may include lexical, graph, or dense-anchor candidates. Runtime packet code must still
 /// resolve candidates to indexed symbols before treating them as answer support.
 pub struct QueryResult {
+    #[serde(skip)]
+    pub publication_identity: Option<RetrievalPublicationIdentity>,
     pub query: String,
     pub features: QueryFeatures,
     pub hits: Vec<CandidateHit>,
     pub trace: QueryTrace,
+}
+
+impl QueryResult {
+    pub(crate) fn with_publication_identity(
+        mut self,
+        identity: &RetrievalPublicationIdentity,
+    ) -> Self {
+        self.publication_identity = Some(identity.clone());
+        self
+    }
 }
 
 /// Executes sidecar retrieval stages with manifest-scoped caching.
@@ -137,7 +160,7 @@ impl<'a> QueryExecutor<'a> {
         if !self.cancelled.load(Ordering::Acquire)
             && let Some(manifest) = self.manifest.as_ref()
         {
-            let key = RetrievalCacheKey::from_manifest(manifest, fingerprint.clone());
+            let key = self.cache.key_for_manifest(manifest, fingerprint.clone());
             if let Some(cached) = self.cache.get(&key) {
                 let cached = cached.to_vec();
                 if self.cancelled.load(Ordering::Acquire) {
@@ -149,6 +172,7 @@ impl<'a> QueryExecutor<'a> {
                     ));
                 }
                 return Ok(QueryResult {
+                    publication_identity: None,
                     query: features.raw_query.clone(),
                     features,
                     hits: cached,
@@ -209,7 +233,7 @@ impl<'a> QueryExecutor<'a> {
             && Instant::now() < deadline
             && let Some(manifest) = self.manifest.as_ref()
         {
-            let key = RetrievalCacheKey::from_manifest(manifest, fingerprint);
+            let key = self.cache.key_for_manifest(manifest, fingerprint);
             if !self.cancelled.load(Ordering::Acquire) {
                 self.cache.insert(key.clone(), hits.clone());
                 if self.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
@@ -220,6 +244,7 @@ impl<'a> QueryExecutor<'a> {
         }
 
         Ok(QueryResult {
+            publication_identity: None,
             query: features.raw_query.clone(),
             features,
             hits,
@@ -541,6 +566,7 @@ fn cancelled_query_result(
     reason: &str,
 ) -> QueryResult {
     QueryResult {
+        publication_identity: None,
         query: features.raw_query.clone(),
         features,
         hits: Vec::new(),
