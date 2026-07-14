@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-#[cfg(test)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +55,10 @@ const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
 const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
 #[cfg(test)]
 const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
+const PROMOTION_JOURNAL_VERSION: u32 = 1;
+#[cfg(test)]
+const PROMOTION_BACKUP_CLEANUP_FAILURE_LIVE_ENV: &str =
+    "CODESTORY_TEST_PROMOTION_BACKUP_CLEANUP_FAILURE_LIVE";
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -178,8 +181,170 @@ struct PromotionLock {
     file: File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PromotionJournalPhase {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PromotionDatabaseIdentity {
+    schema_version: u32,
+    publication: Option<IndexPublicationRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PromotionJournal {
+    version: u32,
+    phase: PromotionJournalPhase,
+    previous: Option<PromotionDatabaseIdentity>,
+    candidate: PromotionDatabaseIdentity,
+}
+
 fn promotion_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.promotion.lock", path.display()))
+}
+
+fn promotion_prepared_journal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.promotion.prepared.json", path.display()))
+}
+
+fn promotion_committed_journal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.promotion.committed.json", path.display()))
+}
+
+fn promotion_artifacts_exist(path: &Path) -> bool {
+    path.with_extension("sqlite.backup").exists()
+        || promotion_prepared_journal_path(path).exists()
+        || promotion_committed_journal_path(path).exists()
+}
+
+fn promotion_error(message: impl Into<String>) -> StorageError {
+    StorageError::Other(message.into())
+}
+
+fn read_promotion_database_identity(
+    path: &Path,
+) -> Result<Option<PromotionDatabaseIdentity>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.busy_timeout(Duration::from_millis(2_500));
+    let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(promotion_error(format!(
+            "SQLite promotion artifact {} failed quick_check: {quick_check}",
+            path.display()
+        )));
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let schema_version = version.max(0) as u32;
+    if schema_version != SCHEMA_VERSION {
+        return Err(promotion_error(format!(
+            "SQLite promotion artifact {} has schema version {schema_version}, expected {SCHEMA_VERSION}",
+            path.display()
+        )));
+    }
+    let publication = read_complete_index_publication(&conn)?;
+    Ok(Some(PromotionDatabaseIdentity {
+        schema_version,
+        publication,
+    }))
+}
+
+fn read_promotion_journal(
+    path: &Path,
+    expected_phase: PromotionJournalPhase,
+) -> Result<PromotionJournal, StorageError> {
+    let bytes = fs::read(path).map_err(|error| {
+        promotion_error(format!(
+            "Failed to read promotion journal {}: {error}",
+            path.display()
+        ))
+    })?;
+    let journal: PromotionJournal = serde_json::from_slice(&bytes).map_err(|error| {
+        promotion_error(format!(
+            "Failed to parse promotion journal {}: {error}",
+            path.display()
+        ))
+    })?;
+    if journal.version != PROMOTION_JOURNAL_VERSION || journal.phase != expected_phase {
+        return Err(promotion_error(format!(
+            "Unsupported promotion journal {}: version={} phase={:?}",
+            path.display(),
+            journal.version,
+            journal.phase
+        )));
+    }
+    Ok(journal)
+}
+
+fn sync_promotion_parent(path: &Path) -> Result<(), StorageError> {
+    #[cfg(not(windows))]
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                promotion_error(format!(
+                    "Failed to sync promotion journal directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+    }
+    #[cfg(windows)]
+    let _ = path;
+    Ok(())
+}
+
+fn write_promotion_journal(path: &Path, journal: &PromotionJournal) -> Result<(), StorageError> {
+    let bytes = serde_json::to_vec(journal).map_err(|error| {
+        promotion_error(format!(
+            "Failed to serialize promotion journal {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| {
+            promotion_error(format!(
+                "Failed to create promotion journal {}: {error}",
+                path.display()
+            ))
+        })?;
+    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let cleanup = fs::remove_file(path);
+        let _ = sync_promotion_parent(path);
+        return Err(promotion_error(format!(
+            "Failed to persist promotion journal {}: {error}; cleanup={cleanup:?}",
+            path.display()
+        )));
+    }
+    if let Err(error) = sync_promotion_parent(path) {
+        let cleanup = fs::remove_file(path);
+        let _ = sync_promotion_parent(path);
+        return Err(promotion_error(format!(
+            "Failed to publish promotion journal {}: {error}; cleanup={cleanup:?}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn remove_promotion_file(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_promotion_parent(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(promotion_error(format!(
+            "Failed to remove promotion artifact {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 impl PromotionLock {
@@ -238,7 +403,7 @@ impl Drop for PromotionLock {
 }
 
 fn recover_interrupted_promotion(path: &Path) -> Result<(), StorageError> {
-    if !path.with_extension("sqlite.backup").exists() {
+    if !promotion_artifacts_exist(path) {
         return Ok(());
     }
     let Some(_lock) = PromotionLock::try_acquire(path)? else {
@@ -251,18 +416,188 @@ fn recover_interrupted_promotion(path: &Path) -> Result<(), StorageError> {
 
 fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError> {
     let backup_path = path.with_extension("sqlite.backup");
-    if !backup_path.exists() {
+    let prepared_path = promotion_prepared_journal_path(path);
+    let committed_path = promotion_committed_journal_path(path);
+
+    if committed_path.exists() {
+        let committed = read_promotion_journal(&committed_path, PromotionJournalPhase::Committed)?;
+        if prepared_path.exists() {
+            let prepared = read_promotion_journal(&prepared_path, PromotionJournalPhase::Prepared)?;
+            if prepared.previous != committed.previous || prepared.candidate != committed.candidate
+            {
+                return Err(promotion_error(format!(
+                    "Promotion journals disagree for {}",
+                    path.display()
+                )));
+            }
+        }
+        let live_identity = read_promotion_database_identity(path)?.ok_or_else(|| {
+            promotion_error(format!(
+                "Committed promotion for {} has no live database",
+                path.display()
+            ))
+        })?;
+        if live_identity != committed.candidate {
+            return Err(promotion_error(format!(
+                "Committed promotion identity does not match live database {}",
+                path.display()
+            )));
+        }
+        cleanup_committed_promotion_artifacts(path);
         return Ok(());
     }
-    let mut live = Connection::open(path)?;
+
+    if prepared_path.exists() {
+        let prepared = read_promotion_journal(&prepared_path, PromotionJournalPhase::Prepared)?;
+        return rollback_prepared_promotion(path, &prepared);
+    }
+
+    if backup_path.exists() {
+        return recover_legacy_promotion_backup(path, &backup_path);
+    }
+    Ok(())
+}
+
+fn restore_promotion_database(source_path: &Path, live_path: &Path) -> Result<(), StorageError> {
+    let mut live = Connection::open(live_path)?;
     let _ = live.busy_timeout(Duration::from_millis(2_500));
-    live.restore(
-        MAIN_DB,
-        &backup_path,
-        None::<fn(rusqlite::backup::Progress)>,
-    )?;
-    drop(live);
-    cleanup_sqlite_sidecars(&backup_path)
+    live.restore(MAIN_DB, source_path, None::<fn(rusqlite::backup::Progress)>)?;
+    Ok(())
+}
+
+fn rollback_prepared_promotion(
+    live_path: &Path,
+    prepared: &PromotionJournal,
+) -> Result<(), StorageError> {
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let prepared_path = promotion_prepared_journal_path(live_path);
+    match prepared.previous.as_ref() {
+        Some(expected_previous) => {
+            let backup_identity =
+                read_promotion_database_identity(&backup_path)?.ok_or_else(|| {
+                    promotion_error(format!(
+                        "Prepared promotion for {} has no recovery backup",
+                        live_path.display()
+                    ))
+                })?;
+            if &backup_identity != expected_previous {
+                return Err(promotion_error(format!(
+                    "Prepared promotion backup identity does not match {}",
+                    live_path.display()
+                )));
+            }
+            restore_promotion_database(&backup_path, live_path)?;
+            let restored = read_promotion_database_identity(live_path)?.ok_or_else(|| {
+                promotion_error(format!(
+                    "Prepared promotion rollback removed live database {}",
+                    live_path.display()
+                ))
+            })?;
+            if &restored != expected_previous {
+                return Err(promotion_error(format!(
+                    "Prepared promotion rollback did not restore the recorded identity for {}",
+                    live_path.display()
+                )));
+            }
+            remove_promotion_file(&prepared_path)?;
+            cleanup_sqlite_sidecars(&backup_path)
+        }
+        None => {
+            if backup_path.exists() {
+                return Err(promotion_error(format!(
+                    "Prepared first publication for {} unexpectedly has a backup",
+                    live_path.display()
+                )));
+            }
+            cleanup_sqlite_sidecars(live_path)?;
+            remove_promotion_file(&prepared_path)
+        }
+    }
+}
+
+fn recover_legacy_promotion_backup(
+    live_path: &Path,
+    backup_path: &Path,
+) -> Result<(), StorageError> {
+    let backup_identity = read_promotion_database_identity(backup_path)?.ok_or_else(|| {
+        promotion_error(format!(
+            "Legacy promotion backup {} disappeared during validation",
+            backup_path.display()
+        ))
+    })?;
+    let live_identity = read_promotion_database_identity(live_path);
+    let restore_backup = match live_identity {
+        Ok(None) => true,
+        Err(error) => {
+            return Err(promotion_error(format!(
+                "Cannot validate live database {} while a legacy promotion backup exists: {error}",
+                live_path.display()
+            )));
+        }
+        Ok(Some(ref live)) if live == &backup_identity => false,
+        Ok(Some(ref live)) => match (&live.publication, &backup_identity.publication) {
+            (Some(current), Some(previous)) if current.generation > previous.generation => false,
+            (None, Some(_)) => true,
+            _ => {
+                return Err(promotion_error(format!(
+                    "Ambiguous legacy promotion backup for {}; refusing to overwrite the live database",
+                    live_path.display()
+                )));
+            }
+        },
+    };
+    if restore_backup {
+        restore_promotion_database(backup_path, live_path)?;
+        let restored = read_promotion_database_identity(live_path)?.ok_or_else(|| {
+            promotion_error(format!(
+                "Legacy promotion recovery removed live database {}",
+                live_path.display()
+            ))
+        })?;
+        if restored != backup_identity {
+            return Err(promotion_error(format!(
+                "Legacy promotion recovery produced an unexpected identity for {}",
+                live_path.display()
+            )));
+        }
+    }
+    cleanup_sqlite_sidecars(backup_path)
+}
+
+fn cleanup_committed_promotion_artifacts(live_path: &Path) {
+    #[cfg(test)]
+    if std::env::var_os(PROMOTION_BACKUP_CLEANUP_FAILURE_LIVE_ENV).as_deref()
+        == Some(live_path.as_os_str())
+    {
+        return;
+    }
+
+    let backup_path = live_path.with_extension("sqlite.backup");
+    if let Err(error) = cleanup_sqlite_sidecars(&backup_path) {
+        tracing::warn!(
+            live_path = %live_path.display(),
+            error = %error,
+            "committed promotion retained its journal because backup cleanup failed"
+        );
+        return;
+    }
+    let prepared_path = promotion_prepared_journal_path(live_path);
+    if let Err(error) = remove_promotion_file(&prepared_path) {
+        tracing::warn!(
+            live_path = %live_path.display(),
+            error = %error,
+            "committed promotion retained its commit journal because prepared cleanup failed"
+        );
+        return;
+    }
+    let committed_path = promotion_committed_journal_path(live_path);
+    if let Err(error) = remove_promotion_file(&committed_path) {
+        tracing::warn!(
+            live_path = %live_path.display(),
+            error = %error,
+            "committed promotion journal cleanup failed"
+        );
+    }
 }
 
 fn grounding_display_name_expr(alias: &str) -> String {
@@ -2373,6 +2708,15 @@ impl Storage {
         let _promotion_lock = PromotionLock::acquire(live_path)?;
         recover_interrupted_promotion_locked(live_path)?;
         let backup_path = live_path.with_extension("sqlite.backup");
+        let prepared_path = promotion_prepared_journal_path(live_path);
+        let committed_path = promotion_committed_journal_path(live_path);
+        let candidate = read_promotion_database_identity(staged_path)?.ok_or_else(|| {
+            promotion_error(format!(
+                "Staged promotion candidate {} does not exist",
+                staged_path.display()
+            ))
+        })?;
+        let previous = read_promotion_database_identity(live_path)?;
         let live_exists = live_path.exists();
         cleanup_sqlite_sidecars(&backup_path)?;
         let mut live_conn = Connection::open(live_path)?;
@@ -2384,6 +2728,33 @@ impl Storage {
                 &backup_path,
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
+            let backup_identity =
+                read_promotion_database_identity(&backup_path)?.ok_or_else(|| {
+                    promotion_error(format!(
+                        "Promotion backup {} disappeared after creation",
+                        backup_path.display()
+                    ))
+                })?;
+            if Some(&backup_identity) != previous.as_ref() {
+                return Err(promotion_error(format!(
+                    "Promotion backup identity does not match live database {}",
+                    live_path.display()
+                )));
+            }
+        }
+
+        let prepared = PromotionJournal {
+            version: PROMOTION_JOURNAL_VERSION,
+            phase: PromotionJournalPhase::Prepared,
+            previous: previous.clone(),
+            candidate: candidate.clone(),
+        };
+        if let Err(error) = write_promotion_journal(&prepared_path, &prepared) {
+            drop(live_conn);
+            if !prepared_path.exists() {
+                let _ = cleanup_sqlite_sidecars(&backup_path);
+            }
+            return Err(error);
         }
 
         #[cfg(test)]
@@ -2411,15 +2782,8 @@ impl Storage {
             live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>);
 
         if let Err(err) = restore_result {
-            if live_exists && backup_path.exists() {
-                let _ = live_conn.restore(
-                    MAIN_DB,
-                    &backup_path,
-                    None::<fn(rusqlite::backup::Progress)>,
-                );
-            } else {
-                let _ = cleanup_sqlite_sidecars(live_path);
-            }
+            drop(live_conn);
+            let _ = rollback_prepared_promotion(live_path, &prepared);
             return Err(StorageError::Other(format!(
                 "Failed to promote staged snapshot {} -> {}: {err}",
                 staged_path.display(),
@@ -2427,10 +2791,40 @@ impl Storage {
             )));
         }
         drop(live_conn);
-        cleanup_sqlite_sidecars(staged_path)?;
-        if backup_path.exists() {
-            let _ = cleanup_sqlite_sidecars(&backup_path);
+
+        let published = read_promotion_database_identity(live_path)?.ok_or_else(|| {
+            promotion_error(format!(
+                "Promoted live database {} disappeared during validation",
+                live_path.display()
+            ))
+        })?;
+        if published != candidate {
+            let _ = rollback_prepared_promotion(live_path, &prepared);
+            return Err(promotion_error(format!(
+                "Promoted live database identity does not match staged candidate {}",
+                staged_path.display()
+            )));
         }
+
+        let committed = PromotionJournal {
+            phase: PromotionJournalPhase::Committed,
+            ..prepared.clone()
+        };
+        if let Err(error) = write_promotion_journal(&committed_path, &committed) {
+            if !committed_path.exists() {
+                let _ = rollback_prepared_promotion(live_path, &prepared);
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = cleanup_sqlite_sidecars(staged_path) {
+            tracing::warn!(
+                staged_path = %staged_path.display(),
+                error = %error,
+                "committed promotion left a staged cleanup artifact"
+            );
+        }
+        cleanup_committed_promotion_artifacts(live_path);
         Ok(())
     }
 

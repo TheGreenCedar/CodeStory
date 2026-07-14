@@ -60,6 +60,10 @@
   binding timeline per module. Route queries reuse that timeline instead of
   rescanning prior statements, and FastAPI imports are resolved from parsed
   nodes so multiline aliases, comments, and later shadowing remain accurate.
+- Core snapshot promotion now records durable prepared and committed identities.
+  A committed generation cannot be rolled back by a retained cleanup backup,
+  while interrupted and legacy recovery validates complete database identities
+  before replacing the live store.
 - Native process reuse and cleanup now bind executable filesystem identity,
   arguments, endpoint, and one shared cross-platform process start identity.
   macOS and Windows process inspection is bounded, dead, reused, or unverified

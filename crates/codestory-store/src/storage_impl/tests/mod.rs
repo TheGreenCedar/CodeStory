@@ -2103,6 +2103,17 @@ fn reader_open_during_healthy_promotion_does_not_recover_active_backup() -> Resu
 
     seed_promotion_file(&live_path, 2, "new.rs")?;
     seed_promotion_file(&backup_path, 1, "old.rs")?;
+    let prepared_path = promotion_prepared_journal_path(&live_path);
+    write_promotion_journal(
+        &prepared_path,
+        &PromotionJournal {
+            version: PROMOTION_JOURNAL_VERSION,
+            phase: PromotionJournalPhase::Prepared,
+            previous: read_promotion_database_identity(&backup_path)?,
+            candidate: read_promotion_database_identity(&live_path)?
+                .expect("live promotion identity"),
+        },
+    )?;
     let promotion_lock = PromotionLock::acquire(&live_path)?;
 
     let during_promotion = Storage::open(&live_path)?;
@@ -2124,6 +2135,7 @@ fn reader_open_during_healthy_promotion_does_not_recover_active_backup() -> Resu
         !backup_path.exists(),
         "recovery consumes the abandoned backup"
     );
+    assert!(!prepared_path.exists(), "recovery consumes its journal");
 
     let _ = cleanup_sqlite_sidecars(&live_path);
     let _ = cleanup_sqlite_sidecars(&backup_path);
@@ -2146,6 +2158,13 @@ fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageEr
         line_count: 1,
         file_role: FileRole::Source,
     }])?;
+    storage.put_index_publication(&IndexPublicationRecord {
+        generation: id.max(0) as u64,
+        generation_id: format!("generation-{id}"),
+        run_id: format!("run-{id}"),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: id.max(0),
+    })?;
     storage.finalize_staged_snapshot()
 }
 
@@ -2166,6 +2185,8 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
     let staged_path = unique_temp_db_path("promotion-abort-staged");
     let sentinel_path = unique_temp_db_path("promotion-abort-sentinel");
     let backup_path = live_path.with_extension("sqlite.backup");
+    let prepared_path = promotion_prepared_journal_path(&live_path);
+    let committed_path = promotion_committed_journal_path(&live_path);
     seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
     seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
 
@@ -2216,6 +2237,8 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
         !backup_path.exists(),
         "opening live storage must consume the recovery backup"
     );
+    assert!(!prepared_path.exists(), "rollback must consume its journal");
+    assert!(!committed_path.exists(), "aborted promotion cannot commit");
 
     Storage::promote_staged_snapshot(&staged_path, &live_path)
         .expect("retry promotion after abort");
@@ -2239,7 +2262,111 @@ fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
     let _ = cleanup_sqlite_sidecars(&live_path);
     let _ = cleanup_sqlite_sidecars(&staged_path);
     let _ = cleanup_sqlite_sidecars(&backup_path);
+    let _ = std::fs::remove_file(prepared_path);
+    let _ = std::fs::remove_file(committed_path);
     let _ = std::fs::remove_file(&sentinel_path);
+}
+
+#[test]
+fn staged_promotion_cleanup_failure_child() {
+    let Some(live_path) =
+        std::env::var_os(PROMOTION_BACKUP_CLEANUP_FAILURE_LIVE_ENV).map(PathBuf::from)
+    else {
+        return;
+    };
+    let staged_path =
+        PathBuf::from(std::env::var_os(PROMOTION_ABORT_STAGED_ENV).expect("child staged path"));
+    Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect("committed promotion must not fail when backup cleanup is deferred");
+}
+
+#[test]
+fn committed_promotion_never_rolls_back_when_backup_cleanup_fails() {
+    let live_path = unique_temp_db_path("promotion-cleanup-failure-live");
+    let staged_path = unique_temp_db_path("promotion-cleanup-failure-staged");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let prepared_path = promotion_prepared_journal_path(&live_path);
+    let committed_path = promotion_committed_journal_path(&live_path);
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
+
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("resolve store test executable"))
+            .arg("--exact")
+            .arg("storage_impl::tests::staged_promotion_cleanup_failure_child")
+            .arg("--nocapture")
+            .env(PROMOTION_BACKUP_CLEANUP_FAILURE_LIVE_ENV, &live_path)
+            .env(PROMOTION_ABORT_STAGED_ENV, &staged_path)
+            .status()
+            .expect("run cleanup-failure child");
+    assert!(status.success(), "committed cleanup-failure child failed");
+    assert!(
+        backup_path.exists(),
+        "fault injection must retain the backup"
+    );
+    assert!(
+        committed_path.exists(),
+        "a retained backup must keep its commit marker"
+    );
+
+    let reopened = Storage::open(&live_path).expect("reopen committed live generation");
+    assert_eq!(
+        reopened.get_files().expect("read committed generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(reopened);
+    assert!(!backup_path.exists(), "reopen cleans the retained backup");
+    assert!(!prepared_path.exists(), "reopen cleans the prepare marker");
+    assert!(!committed_path.exists(), "reopen cleans the commit marker");
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&staged_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+}
+
+#[test]
+fn legacy_backup_never_overwrites_a_newer_complete_publication() {
+    let live_path = unique_temp_db_path("newer-legacy-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&live_path, 2, "new.rs").expect("seed newer live generation");
+    seed_promotion_file(&backup_path, 1, "old.rs").expect("seed older backup generation");
+
+    let live = Storage::open(&live_path).expect("open newer live generation");
+    assert_eq!(
+        live.get_files().expect("read newer live generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(live);
+    assert!(!backup_path.exists(), "older backup should be cleaned");
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+}
+
+#[test]
+fn invalid_legacy_backup_fails_closed_without_overwriting_live() {
+    let live_path = unique_temp_db_path("invalid-legacy-backup-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&live_path, 2, "new.rs").expect("seed live generation");
+    std::fs::write(&backup_path, b"not a sqlite database").expect("write invalid backup");
+
+    let error = match Storage::open(&live_path) {
+        Ok(_) => panic!("invalid backup must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("database") || error.to_string().contains("SQLite"),
+        "unexpected recovery error: {error}"
+    );
+    std::fs::remove_file(&backup_path).expect("remove invalid backup");
+    let live = Storage::open(&live_path).expect("reopen untouched live generation");
+    assert_eq!(
+        live.get_files().expect("read untouched live generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+
+    drop(live);
+    let _ = cleanup_sqlite_sidecars(&live_path);
 }
 
 #[test]
