@@ -113,7 +113,7 @@ const allowedHarnessReferences = [
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
     ".github/workflows/release-candidate-evidence.yml",
-    'add(violations, evidence.uses === "./.github/workflows/release-candidate-evidence.yml", `${releaseFile} release-evidence must call the evidence workflow`);',
+    'export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";',
   ],
   [
     path.join(".github", "workflows", "packaged-platform-pr.yml"),
