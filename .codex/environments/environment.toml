@@ -3,4 +3,4 @@ version = 1
 name = "codestory"
 
 [setup]
-script = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/codex-worktree-setup.ps1"
+script = "node scripts/codex-worktree-setup.mjs"

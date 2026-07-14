@@ -6,60 +6,46 @@ name: retrieval-sidecar-smoke
 on:
   pull_request:
     paths:
-      - crates/codestory-retrieval/**
-      - crates/codestory-contracts/**
-      - crates/codestory-store/Cargo.toml
-      - crates/codestory-store/src/**
-      - crates/codestory-cli/src/retrieval.rs
-      - crates/codestory-cli/src/main.rs
-      - crates/codestory-cli/src/args.rs
-      - crates/codestory-cli/src/runtime.rs
-      - crates/codestory-cli/src/stdio_*.rs
-      - crates/codestory-cli/tests/fixtures/packet_search_eval/**
-      - crates/codestory-cli/tests/packet_search_eval.rs
-      - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
-      - crates/codestory-cli/tests/search_json_output.rs
-      - crates/codestory-cli/tests/stdio_protocol_contracts.rs
-      - crates/codestory-runtime/src/**
-      - crates/codestory-indexer/Cargo.toml
-      - crates/codestory-indexer/src/lib.rs
-      - scripts/lint-retrieval-generalization.mjs
-      - scripts/**retrieval**
+      - .codex/environments/**
+      - .cursor/rules/**
+      - .github/actions/**
+      - .github/scripts/**
+      - .github/workflows/**
+      - benchmarks/**
+      - crates/**
+      - docker/**
+      - docs/architecture/language-support.md
+      - docs/architecture/retrieval-*
+      - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-sidecars.md
-      - docs/architecture/retrieval-*.md
+      - docs/testing/codestory-e2e-stats-log.md
+      - docs/testing/performance-review-playbook.md
       - docs/testing/retrieval-architecture.md
-      - docker/retrieval-compose.yml
-      - .github/workflows/retrieval-sidecar-smoke.yml
+      - plugins/codestory/**
+      - scripts/**
   # Base-branch runs seed caches that sibling PRs are allowed to restore.
   push:
     branches:
       - main
       - dev/codestory-next
     paths:
-      - crates/codestory-retrieval/**
-      - crates/codestory-contracts/**
-      - crates/codestory-store/Cargo.toml
-      - crates/codestory-store/src/**
-      - crates/codestory-cli/src/retrieval.rs
-      - crates/codestory-cli/src/main.rs
-      - crates/codestory-cli/src/args.rs
-      - crates/codestory-cli/src/runtime.rs
-      - crates/codestory-cli/src/stdio_*.rs
-      - crates/codestory-cli/tests/fixtures/packet_search_eval/**
-      - crates/codestory-cli/tests/packet_search_eval.rs
-      - crates/codestory-cli/tests/retrieval_bootstrap_contracts.rs
-      - crates/codestory-cli/tests/search_json_output.rs
-      - crates/codestory-cli/tests/stdio_protocol_contracts.rs
-      - crates/codestory-runtime/src/**
-      - crates/codestory-indexer/Cargo.toml
-      - crates/codestory-indexer/src/lib.rs
-      - scripts/lint-retrieval-generalization.mjs
-      - scripts/**retrieval**
+      - .codex/environments/**
+      - .cursor/rules/**
+      - .github/actions/**
+      - .github/scripts/**
+      - .github/workflows/**
+      - benchmarks/**
+      - crates/**
+      - docker/**
+      - docs/architecture/language-support.md
+      - docs/architecture/retrieval-*
+      - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-sidecars.md
-      - docs/architecture/retrieval-*.md
+      - docs/testing/codestory-e2e-stats-log.md
+      - docs/testing/performance-review-playbook.md
       - docs/testing/retrieval-architecture.md
-      - docker/retrieval-compose.yml
-      - .github/workflows/retrieval-sidecar-smoke.yml
+      - plugins/codestory/**
+      - scripts/**
   workflow_dispatch:
 
 concurrency:
@@ -81,6 +67,9 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
+      - name: Release evidence gate contracts
+        run: node --test scripts/tests/codestory-release-evidence-gate.test.mjs
+
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal
@@ -91,6 +80,7 @@ jobs:
         shell: bash
         run: |
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
@@ -101,31 +91,33 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
-            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-
+
+      - name: Generalization lint regression contracts
+        run: cargo test --locked -p codestory-runtime --test retrieval_generalization_guard
 
       - name: Runtime sidecar and packet contract tests
         run: |
-          cargo test -p codestory-runtime --lib agent::retrieval_primary::tests
-          cargo test -p codestory-runtime --lib agent::packet_search::tests
-          cargo test -p codestory-runtime --lib agent::packet_claim_profiles::tests
-          cargo test -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_sidecars
-          cargo test -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_sidecars
-          cargo test -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_sidecars
+          cargo test --locked -p codestory-runtime --lib agent::retrieval_primary::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_search::tests
+          cargo test --locked -p codestory-runtime --lib agent::packet_claim_profiles::tests
+          cargo test --locked -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_sidecars
+          cargo test --locked -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_sidecars
+          cargo test --locked -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_sidecars
 
       - name: Stdio protocol contract tests
-        run: cargo test -p codestory-cli --test stdio_protocol_contracts
+        run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts
 
       - name: CLI search JSON fail-closed contract tests
-        run: cargo test -p codestory-cli --test search_json_output
+        run: cargo test --locked -p codestory-cli --test search_json_output
 
       - name: Packet/search fixture and baseline contract tests
-        run: cargo test -p codestory-cli --test packet_search_eval
+        run: cargo test --locked -p codestory-cli --test packet_search_eval
 
       - name: Retrieval crate unit tests
-        run: cargo test -p codestory-retrieval
+        run: cargo test --locked -p codestory-retrieval
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
@@ -139,7 +131,7 @@ jobs:
           key: ${{ steps.cargo-cache-restore.outputs.cache-primary-key }}
 
   windows-manifest-missing:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:windows-smoke')
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -154,7 +146,9 @@ jobs:
         id: rust-cache-key
         run: |
           $release = rustc -Vv | Select-String '^release: ' | ForEach-Object { $_.ToString().Substring(9) }
+          $target = rustc -Vv | Select-String '^host: ' | ForEach-Object { $_.ToString().Substring(6) }
           "version=$release" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "target=$target" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
@@ -165,13 +159,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
-            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-
 
       - name: Retrieval bootstrap manifest-missing contract
-        run: cargo test -p codestory-cli --test retrieval_bootstrap_contracts
+        run: cargo test --locked -p codestory-cli --test retrieval_bootstrap_contracts
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

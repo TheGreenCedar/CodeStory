@@ -7,47 +7,76 @@ on:
         description: Release version from crates/codestory-cli/Cargo.toml.
         required: true
         type: string
+      ref:
+        description: Exact source SHA to package.
+        required: false
+        default: ""
+        type: string
+      scope:
+        description: Native package matrix scope (windows, macos, or full).
+        required: false
+        default: full
+        type: string
+      proof_key:
+        description: Stable PR or integration identity for concurrency cancellation.
+        required: false
+        default: ""
+        type: string
+      sign_macos:
+        description: Require Developer ID signing and Apple notarization for macOS assets.
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      APPLE_DEVELOPER_ID_P12_BASE64:
+        required: false
+      APPLE_DEVELOPER_ID_P12_PASSWORD:
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      APPLE_NOTARY_KEY_P8_BASE64:
+        required: false
+      APPLE_NOTARY_KEY_ID:
+        required: false
+      APPLE_NOTARY_ISSUER_ID:
+        required: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: packaged-platform-proof-${{ inputs.proof_key || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   RELEASE_RUST_TOOLCHAIN: "1.95.0"
+  LINUX_GLIBC_BUILD_IMAGE: "rust:1.95.0-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf"
+  LINUX_GLIBC_BASELINE_IMAGE: "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"
+  APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"
 
 jobs:
   build:
     name: Build ${{ matrix.asset_target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The six APPLE_* credentials are an environment-scoped release contract;
+    # repository-only secrets are not the supported signing configuration.
+    environment: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 'macos-release-signing' || null }}
+    timeout-minutes: ${{ inputs.sign_macos && startsWith(matrix.asset_target, 'macos-') && 90 || 60 }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            rust_target: x86_64-unknown-linux-gnu
-            asset_target: linux-x64
-            exe_suffix: ""
-          - os: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-gnu
-            asset_target: linux-arm64
-            exe_suffix: ""
-          - os: windows-latest
-            rust_target: x86_64-pc-windows-msvc
-            asset_target: windows-x64
-            exe_suffix: ".exe"
-          - os: windows-11-arm
-            rust_target: aarch64-pc-windows-msvc
-            asset_target: windows-arm64
-            exe_suffix: ".exe"
-          # ponytail: ort-sys has no x86_64-apple-darwin prebuilt; add macos-x64
-          # when the release path links a custom ONNX Runtime build.
-          - os: macos-15
-            rust_target: aarch64-apple-darwin
-            asset_target: macos-arm64
-            exe_suffix: ""
+      # GitHub applies matrix exclusions before includes, so an include-only
+      # matrix must select the complete row set rather than trying to exclude
+      # rows after the fact.
+      matrix: ${{ fromJSON(inputs.scope == 'windows' && '{"include":[{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"}]}' || inputs.scope == 'macos' && '{"include":[{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}' || '{"include":[{"os":"ubuntu-latest","rust_target":"x86_64-unknown-linux-gnu","asset_target":"linux-x64","exe_suffix":"","extension":"tar.gz"},{"os":"ubuntu-24.04-arm","rust_target":"aarch64-unknown-linux-gnu","asset_target":"linux-arm64","exe_suffix":"","extension":"tar.gz"},{"os":"windows-latest","rust_target":"x86_64-pc-windows-msvc","asset_target":"windows-x64","exe_suffix":".exe","extension":"zip"},{"os":"windows-11-arm","rust_target":"aarch64-pc-windows-msvc","asset_target":"windows-arm64","exe_suffix":".exe","extension":"zip"},{"os":"macos-15-intel","rust_target":"x86_64-apple-darwin","asset_target":"macos-x64","exe_suffix":"","extension":"tar.gz"},{"os":"macos-15","rust_target":"aarch64-apple-darwin","asset_target":"macos-arm64","exe_suffix":"","extension":"tar.gz"}]}') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Check shared worktree setup and host adapter
+        if: matrix.asset_target == 'linux-x64' || matrix.asset_target == 'windows-x64'
+        run: node --test scripts/tests/codex-worktree-setup.test.mjs
 
       - name: Install pinned Rust
         run: |
@@ -70,12 +99,214 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-
+            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-
 
       - name: Build codestory-cli
-        run: cargo build --release -p codestory-cli --target "${{ matrix.rust_target }}"
+        if: matrix.asset_target != 'linux-x64'
+        run: cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
+
+      - name: Build Linux x64 at the glibc 2.31 baseline
+        if: matrix.asset_target == 'linux-x64'
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            --env CARGO_HOME=/cargo \
+            --env CARGO_TARGET_DIR=/workspace/target/glibc-2.31 \
+            --volume "$HOME/.cargo:/cargo" \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
+            cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
+          mkdir -p "target/${{ matrix.rust_target }}/release"
+          cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
+            "target/${{ matrix.rust_target }}/release/codestory-cli"
+
+      - name: Sign and notarize macOS CLI
+        if: runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for name in \
+            APPLE_DEVELOPER_ID_P12_BASE64 \
+            APPLE_DEVELOPER_ID_P12_PASSWORD \
+            APPLE_SIGNING_IDENTITY \
+            APPLE_NOTARY_KEY_P8_BASE64 \
+            APPLE_NOTARY_KEY_ID \
+            APPLE_NOTARY_ISSUER_ID
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required protected macOS release secret: $name"
+              exit 1
+            fi
+          done
+
+          bin="target/${{ matrix.rust_target }}/release/codestory-cli"
+          proof_dir="target/notarization-proof/${{ matrix.asset_target }}"
+          work_dir="$RUNNER_TEMP/codestory-notary-${{ matrix.asset_target }}"
+          keychain="$RUNNER_TEMP/codestory-signing-${{ matrix.asset_target }}.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          mkdir -p "$proof_dir" "$work_dir/stage"
+          printf '%s' "$APPLE_DEVELOPER_ID_P12_BASE64" | base64 -D > "$work_dir/developer-id.p12"
+          printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | base64 -D > "$work_dir/notary-key.p8"
+          chmod 600 "$work_dir/developer-id.p12" "$work_dir/notary-key.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$work_dir/developer-id.p12" \
+            -k "$keychain" \
+            -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" | tee "$proof_dir/signing-identities.txt"
+          signing_hash="$(awk -v identity="$APPLE_SIGNING_IDENTITY" \
+            'index($0, "\"" identity "\"") { print $2; exit }' \
+            "$proof_dir/signing-identities.txt")"
+          grep -Eq '^[0-9A-Fa-f]{40}$' <<<"$signing_hash"
+          codesign \
+            --force \
+            --options runtime \
+            --timestamp \
+            --keychain "$keychain" \
+            --sign "$signing_hash" \
+            "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+          codesign -dv --verbose=4 "$bin" 2> "$proof_dir/codesign-details.txt"
+          codesign -d -r- "$bin" > "$proof_dir/designated-requirement.txt" 2>&1
+          grep -F "Authority=$APPLE_SIGNING_IDENTITY" "$proof_dir/codesign-details.txt"
+          grep -E "flags=.*runtime" "$proof_dir/codesign-details.txt"
+          grep -E "^TeamIdentifier=${APPLE_DEVELOPER_TEAM_ID}$" "$proof_dir/codesign-details.txt"
+          grep -E "certificate leaf\\[subject\\.OU\\] = \"?${APPLE_DEVELOPER_TEAM_ID}\"?([[:space:]]|$)" \
+            "$proof_dir/designated-requirement.txt"
+
+          cp "$bin" "$work_dir/stage/codestory-cli"
+          ditto -c -k "$work_dir/stage" "$work_dir/codestory-cli-notary.zip"
+          xcrun notarytool submit "$work_dir/codestory-cli-notary.zip" \
+            --key "$work_dir/notary-key.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --no-wait \
+            --output-format json | tee "$proof_dir/notarytool-submission.json"
+          submission_id="$(jq -er \
+            '.id | select(type == "string" and test("^[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$"))' \
+            "$proof_dir/notarytool-submission.json")"
+          printf '%s\n' "$submission_id" > "$proof_dir/notarytool-submission-id.txt"
+
+          notary_accepted=false
+          max_notary_attempts=120
+          notary_poll_seconds=30
+          notary_poll_log="$proof_dir/notarytool-poll.log"
+          for attempt in $(seq 1 "$max_notary_attempts"); do
+            notary_info="$work_dir/notarytool-info.json"
+            notary_error="$work_dir/notarytool-info-error.txt"
+            if xcrun notarytool info "$submission_id" \
+              --key "$work_dir/notary-key.p8" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --output-format json > "$notary_info" 2> "$notary_error"
+            then
+              if notary_status="$(jq -er '.status | select(type == "string")' "$notary_info")"
+              then
+                cp "$notary_info" "$proof_dir/notarytool-result.json"
+                printf 'attempt=%s status=%s\n' "$attempt" "$notary_status" >> "$notary_poll_log"
+                case "$notary_status" in
+                  Accepted)
+                    notary_accepted=true
+                    break
+                    ;;
+                  "In Progress")
+                    ;;
+                  Invalid|Rejected)
+                    notary_log_retained=false
+                    for log_attempt in 1 2 3; do
+                      if xcrun notarytool log "$submission_id" \
+                        --key "$work_dir/notary-key.p8" \
+                        --key-id "$APPLE_NOTARY_KEY_ID" \
+                        --issuer "$APPLE_NOTARY_ISSUER_ID" \
+                        "$proof_dir/notarytool-log.json" \
+                        >> "$notary_poll_log" 2>&1 \
+                        && [ -s "$proof_dir/notarytool-log.json" ]
+                      then
+                        notary_log_retained=true
+                        break
+                      fi
+                      if [ "$log_attempt" -lt 3 ]; then
+                        sleep 5
+                      fi
+                    done
+                    if [ "$notary_log_retained" != true ]; then
+                      printf 'Apple rejected submission %s, but its notarization log could not be retrieved.\n' \
+                        "$submission_id" > "$proof_dir/notarytool-log-unavailable.txt"
+                    fi
+                    cat "$proof_dir/notarytool-result.json"
+                    echo "::error::Apple rejected notarization submission $submission_id with status $notary_status"
+                    exit 1
+                    ;;
+                  *)
+                    cat "$proof_dir/notarytool-result.json"
+                    echo "::error::Apple returned unexpected notarization status '$notary_status' for $submission_id"
+                    exit 1
+                    ;;
+                esac
+              else
+                printf 'attempt=%s malformed_info_response\n' "$attempt" >> "$notary_poll_log"
+                cat "$notary_info" >> "$notary_poll_log"
+              fi
+            else
+              printf 'attempt=%s transport_error\n' "$attempt" >> "$notary_poll_log"
+              cat "$notary_error" >> "$notary_poll_log"
+            fi
+            if [ "$attempt" -lt "$max_notary_attempts" ]; then
+              sleep "$notary_poll_seconds"
+            fi
+          done
+          if [ "$notary_accepted" != true ]; then
+            tail -n 40 "$notary_poll_log" || true
+            echo "::error::Notarization timed out after $((max_notary_attempts * notary_poll_seconds / 60)) minutes for submission $submission_id"
+            exit 1
+          fi
+          jq -e '.status == "Accepted"' "$proof_dir/notarytool-result.json"
+
+          cp "$bin" "$work_dir/codestory-cli-quarantined"
+          xattr -w com.apple.quarantine "0083;$(date +%s);CodeStory;" "$work_dir/codestory-cli-quarantined"
+          accepted=false
+          for _attempt in $(seq 1 12); do
+            if spctl --assess --type execute --verbose=4 "$work_dir/codestory-cli-quarantined" \
+              > "$proof_dir/spctl.txt" 2>&1
+            then
+              accepted=true
+              break
+            fi
+            sleep 5
+          done
+          if [ "$accepted" != true ]; then
+            cat "$proof_dir/spctl.txt"
+            echo "::error::Gatekeeper did not accept the signed and notarized CLI"
+            exit 1
+          fi
+          grep -F "source=Notarized Developer ID" "$proof_dir/spctl.txt"
+
+      - name: Execute notarized macOS CLI without signing credentials
+        if: runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        run: |
+          work_dir="$RUNNER_TEMP/codestory-notary-${{ matrix.asset_target }}"
+          "$work_dir/codestory-cli-quarantined" --version
+          "$work_dir/codestory-cli-quarantined" --help >/dev/null
 
       - name: Smoke codestory-cli
         if: runner.os != 'Windows'
@@ -104,6 +335,27 @@ jobs:
             --target "${{ matrix.asset_target }}" \
             --binary "$bin" \
             --out-dir target/release-dist
+
+      - name: Prove Linux x64 glibc 2.31 baseline
+        if: matrix.asset_target == 'linux-x64'
+        run: |
+          docker run --rm --platform linux/amd64 \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            "${{ env.LINUX_GLIBC_BASELINE_IMAGE }}" \
+            bash .github/scripts/check-linux-glibc-baseline.sh \
+              "target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz" \
+              "${{ inputs.version }}" \
+              target/linux-glibc-baseline \
+              "glibc 2.31"
+
+      - name: Upload Linux glibc baseline proof
+        if: always() && matrix.asset_target == 'linux-x64'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: linux-glibc-2.31-baseline-proof
+          path: target/linux-glibc-baseline
+          if-no-files-found: error
 
       - name: Smoke packaged release asset
         if: runner.os != 'Windows'
@@ -162,6 +414,25 @@ jobs:
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
+      - name: Prove Intel macOS backend policy and explicit CPU/external operation
+        if: matrix.asset_target == 'macos-x64'
+        run: >-
+          python3 .github/scripts/check-packaged-agent-proof.py
+          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-macos-x64.tar.gz"
+          --checksum-file target/release-dist/SHA256SUMS.txt
+          --expected-version "${{ inputs.version }}"
+          --project "${{ github.workspace }}"
+          --intel-runtime-policy
+          --out-dir target/packaged-intel-policy-proof
+
+      - name: Upload Intel macOS policy proof
+        if: always() && matrix.asset_target == 'macos-x64'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: packaged-intel-policy-proof-${{ matrix.asset_target }}
+          path: target/packaged-intel-policy-proof
+          if-no-files-found: warn
+
       - name: Upload packaged version proof
         if: always()
         uses: actions/upload-artifact@v7.0.1
@@ -175,12 +446,10 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/install-codestory.ps1 -SelfTest
 
-      - name: Prove Windows managed plugin handoff
-        if: matrix.asset_target == 'windows-x64'
-        shell: pwsh
+      - name: Prove managed plugin handoff
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
-          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.zip"
+          --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"
           --checksum-file target/release-dist/SHA256SUMS.txt
           --expected-version "${{ inputs.version }}"
           --project "${{ github.workspace }}"
@@ -188,8 +457,8 @@ jobs:
           --managed-plugin-handoff
           --out-dir target/packaged-managed-proof
 
-      - name: Upload Windows managed plugin proof
-        if: always() && matrix.asset_target == 'windows-x64'
+      - name: Upload managed plugin proof
+        if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: packaged-managed-proof-${{ matrix.asset_target }}
@@ -204,7 +473,23 @@ jobs:
             target/release-dist/*.tar.gz
             target/release-dist/*.zip
             target/release-dist/*.sha256
+            target/release-dist/SHA256SUMS.txt
           if-no-files-found: error
+
+      - name: Upload macOS notarization proof
+        if: always() && runner.os == 'macOS' && inputs.sign_macos
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: macos-notarization-proof-${{ matrix.asset_target }}
+          path: target/notarization-proof/${{ matrix.asset_target }}
+          if-no-files-found: error
+
+      - name: Remove temporary macOS signing material
+        if: always() && runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/codestory-signing-${{ matrix.asset_target }}.keychain-db" || true
+          rm -rf "$RUNNER_TEMP/codestory-notary-${{ matrix.asset_target }}"
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

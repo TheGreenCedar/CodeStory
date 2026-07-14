@@ -1,8 +1,34 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::sync::OnceLock;
 
 const PROJECT_NETWORK_CONFIG_OPT_IN_ENV: &str = "CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG";
+
+#[derive(Debug, Clone)]
+pub(crate) struct CliStartupConfig {
+    pub(crate) user_home: Option<PathBuf>,
+    pub(crate) project_network_config_allowed: bool,
+    pub(crate) stdio_cache_root: Option<PathBuf>,
+    pub(crate) sidecar_defaults: codestory_retrieval::SidecarProcessDefaults,
+}
+
+impl CliStartupConfig {
+    pub(crate) fn from_process_env() -> Self {
+        crate::sidecar_runtime::prepare_cache_access();
+        Self {
+            user_home: std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from),
+            project_network_config_allowed: std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)
+                .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false),
+            stdio_cache_root: std::env::var_os("CODESTORY_STDIO_CACHE_ROOT").map(PathBuf::from),
+            sidecar_defaults: crate::sidecar_runtime::process_defaults(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct CliConfig {
@@ -12,11 +38,15 @@ pub(crate) struct CliConfig {
     #[serde(default)]
     pub(crate) embedding_model: Option<String>,
     pub(crate) embedding_endpoint: Option<String>,
+    pub(crate) embedding_query_prefix: Option<String>,
+    pub(crate) embedding_document_prefix: Option<String>,
     pub(crate) hybrid_retrieval_enabled: Option<bool>,
     pub(crate) semantic_doc_scope: Option<String>,
     pub(crate) semantic_doc_alias_mode: Option<String>,
     pub(crate) summary_endpoint: Option<String>,
     pub(crate) summary_model: Option<String>,
+    #[serde(skip)]
+    embedding_endpoint_source: Option<ConfigSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,34 +55,59 @@ enum ConfigSource {
     Project,
 }
 
+#[cfg(test)]
 pub(crate) fn load_config(project_root: &Path) -> Result<CliConfig> {
+    load_config_with_startup(project_root, &process_startup_config())
+}
+
+pub(crate) fn load_config_with_startup(
+    project_root: &Path,
+    startup: &CliStartupConfig,
+) -> Result<CliConfig> {
     let mut config = CliConfig::default();
-    if let Some(home) = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-    {
+    if let Some(home) = startup.user_home.as_ref() {
         merge_config_file(
             &mut config,
             &home.join(".codestory.toml"),
             ConfigSource::TrustedUser,
+            startup.project_network_config_allowed,
         )?;
     }
     merge_config_file(
         &mut config,
         &project_root.join(".codestory.toml"),
         ConfigSource::Project,
+        startup.project_network_config_allowed,
     )?;
-    apply_env_defaults(&config);
     Ok(config)
 }
 
-fn merge_config_file(config: &mut CliConfig, path: &Path, source: ConfigSource) -> Result<()> {
+pub(crate) fn process_startup_config() -> CliStartupConfig {
+    #[cfg(test)]
+    {
+        CliStartupConfig::from_process_env()
+    }
+    #[cfg(not(test))]
+    {
+        static STARTUP: OnceLock<CliStartupConfig> = OnceLock::new();
+        STARTUP
+            .get_or_init(CliStartupConfig::from_process_env)
+            .clone()
+    }
+}
+
+fn merge_config_file(
+    config: &mut CliConfig,
+    path: &Path,
+    source: ConfigSource,
+    project_network_config_allowed: bool,
+) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config {}", path.display()))?;
-    validate_config_trust_boundary(&raw, source, path)?;
+    validate_config_trust_boundary(&raw, source, path, project_network_config_allowed)?;
     let file_config: CliConfig = toml::from_str(&raw)
         .with_context(|| format!("Failed to parse config {}", path.display()))?;
     if file_config.cache_dir.is_some() {
@@ -68,6 +123,13 @@ fn merge_config_file(config: &mut CliConfig, path: &Path, source: ConfigSource) 
     }
     if file_config.embedding_endpoint.is_some() {
         config.embedding_endpoint = file_config.embedding_endpoint;
+        config.embedding_endpoint_source = Some(source);
+    }
+    if file_config.embedding_query_prefix.is_some() {
+        config.embedding_query_prefix = file_config.embedding_query_prefix;
+    }
+    if file_config.embedding_document_prefix.is_some() {
+        config.embedding_document_prefix = file_config.embedding_document_prefix;
     }
     if file_config.hybrid_retrieval_enabled.is_some() {
         config.hybrid_retrieval_enabled = file_config.hybrid_retrieval_enabled;
@@ -87,7 +149,12 @@ fn merge_config_file(config: &mut CliConfig, path: &Path, source: ConfigSource) 
     Ok(())
 }
 
-fn validate_config_trust_boundary(raw: &str, source: ConfigSource, path: &Path) -> Result<()> {
+fn validate_config_trust_boundary(
+    raw: &str,
+    source: ConfigSource,
+    path: &Path,
+    project_network_config_allowed: bool,
+) -> Result<()> {
     if source != ConfigSource::Project {
         return Ok(());
     }
@@ -102,7 +169,7 @@ fn validate_config_trust_boundary(raw: &str, source: ConfigSource, path: &Path) 
         );
     }
     for field in ["summary_endpoint", "summary_model", "embedding_endpoint"] {
-        if table.contains_key(field) && !project_network_config_allowed() {
+        if table.contains_key(field) && !project_network_config_allowed {
             anyhow::bail!(
                 "project config field `{field}` is not trusted; set CODESTORY_SUMMARY_ENDPOINT, CODESTORY_SUMMARY_MODEL, CODESTORY_EMBED_LLAMACPP_URL, or pass a trusted CLI option instead"
             );
@@ -111,53 +178,27 @@ fn validate_config_trust_boundary(raw: &str, source: ConfigSource, path: &Path) 
     Ok(())
 }
 
-fn project_network_config_allowed() -> bool {
-    std::env::var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV)
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-fn apply_env_defaults(config: &CliConfig) {
-    set_env_if_absent(
-        "CODESTORY_EMBED_PROFILE",
-        config.embedding_profile.as_deref(),
-    );
-    set_env_if_absent(
-        "CODESTORY_EMBED_MODEL_ID",
-        config.embedding_model_id.as_deref(),
-    );
-    set_env_if_absent(
-        "CODESTORY_EMBED_LLAMACPP_URL",
-        config.embedding_endpoint.as_deref(),
-    );
-    set_env_if_absent(
-        "CODESTORY_HYBRID_RETRIEVAL_ENABLED",
-        config
-            .hybrid_retrieval_enabled
-            .map(|value| if value { "true" } else { "false" }),
-    );
-    set_env_if_absent(
-        "CODESTORY_SEMANTIC_DOC_SCOPE",
-        config.semantic_doc_scope.as_deref(),
-    );
-    set_env_if_absent(
-        "CODESTORY_SEMANTIC_DOC_ALIAS_MODE",
-        config.semantic_doc_alias_mode.as_deref(),
-    );
-    set_env_if_absent(
-        "CODESTORY_SUMMARY_ENDPOINT",
-        config.summary_endpoint.as_deref(),
-    );
-    set_env_if_absent("CODESTORY_SUMMARY_MODEL", config.summary_model.as_deref());
-}
-
-fn set_env_if_absent(name: &str, value: Option<&str>) {
-    if std::env::var_os(name).is_some() {
-        return;
-    }
-    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-        unsafe {
-            std::env::set_var(name, value);
+impl CliConfig {
+    pub(crate) fn runtime_overrides(&self) -> codestory_retrieval::SidecarRuntimeOverrides {
+        codestory_retrieval::SidecarRuntimeOverrides {
+            embedding_profile: self.embedding_profile.clone(),
+            embedding_model_id: self.embedding_model_id.clone(),
+            embedding_endpoint: self.embedding_endpoint.clone(),
+            embedding_endpoint_origin: self.embedding_endpoint_source.map(|source| match source {
+                ConfigSource::TrustedUser => {
+                    codestory_retrieval::EmbeddingEndpointOrigin::TrustedUserConfig
+                }
+                ConfigSource::Project => {
+                    codestory_retrieval::EmbeddingEndpointOrigin::TrustedProjectConfig
+                }
+            }),
+            embedding_query_prefix: self.embedding_query_prefix.clone(),
+            embedding_document_prefix: self.embedding_document_prefix.clone(),
+            hybrid_retrieval_enabled: self.hybrid_retrieval_enabled,
+            semantic_doc_scope: self.semantic_doc_scope.clone(),
+            semantic_doc_alias_mode: self.semantic_doc_alias_mode.clone(),
+            summary_endpoint: self.summary_endpoint.clone(),
+            summary_model: self.summary_model.clone(),
         }
     }
 }
@@ -169,7 +210,10 @@ static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(crate) fn config_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     CONFIG_ENV_TEST_LOCK
         .lock()
-        .expect("config env test lock should not be poisoned")
+        // A failed assertion must not turn one environment-sensitive test into
+        // a cascade of unrelated mutex-poison failures. Test snapshots restore
+        // their variables during unwinding, so retaining the guard is safe.
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -219,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn config_sets_embedding_profile_and_model_id_runtime_env_defaults() -> Result<()> {
+    fn config_retains_embedding_profile_and_model_without_mutating_environment() -> Result<()> {
         let _env = EnvRestore::capture(&[
             "USERPROFILE",
             "HOME",
@@ -254,14 +298,8 @@ embedding_model_id = "BAAI/bge-small-en-v1.5-local"
             config.embedding_model_id.as_deref(),
             Some("BAAI/bge-small-en-v1.5-local")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_PROFILE").as_deref(),
-            Ok("bge-small-en-v1.5")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_MODEL_ID").as_deref(),
-            Ok("BAAI/bge-small-en-v1.5-local")
-        );
+        assert!(std::env::var("CODESTORY_EMBED_PROFILE").is_err());
+        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
         assert!(std::env::var_os("CODESTORY_EMBEDDING_MODEL").is_none());
 
         Ok(())
@@ -294,10 +332,7 @@ embedding_model_id = "BAAI/bge-small-en-v1.5-local"
             config.embedding_model_id.as_deref(),
             Some("legacy/model-id")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_MODEL_ID").as_deref(),
-            Ok("legacy/model-id")
-        );
+        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
         assert!(std::env::var_os("CODESTORY_EMBEDDING_MODEL").is_none());
 
         Ok(())
@@ -333,10 +368,7 @@ embedding_model_id = "current/model-id"
             config.embedding_model_id.as_deref(),
             Some("current/model-id")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_MODEL_ID").as_deref(),
-            Ok("current/model-id")
-        );
+        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
 
         Ok(())
     }
@@ -424,14 +456,8 @@ embedding_model_id = "project/model-id"
             config.embedding_model_id.as_deref(),
             Some("project/model-id")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_PROFILE").as_deref(),
-            Ok("project-profile")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_MODEL_ID").as_deref(),
-            Ok("project/model-id")
-        );
+        assert!(std::env::var("CODESTORY_EMBED_PROFILE").is_err());
+        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
 
         Ok(())
     }
@@ -470,10 +496,7 @@ embedding_model_id = "project/model-id"
             config.embedding_model_id.as_deref(),
             Some("project/legacy-model-id")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_MODEL_ID").as_deref(),
-            Ok("project/legacy-model-id")
-        );
+        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
         assert!(std::env::var_os("CODESTORY_EMBEDDING_MODEL").is_none());
 
         Ok(())
@@ -604,10 +627,7 @@ embedding_model_id = "project/model-id"
             config.summary_endpoint.as_deref(),
             Some("https://example.invalid/v1/chat/completions")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_SUMMARY_ENDPOINT").as_deref(),
-            Ok("https://example.invalid/v1/chat/completions")
-        );
+        assert!(std::env::var("CODESTORY_SUMMARY_ENDPOINT").is_err());
 
         Ok(())
     }
@@ -637,10 +657,7 @@ embedding_model_id = "project/model-id"
             config.embedding_endpoint.as_deref(),
             Some("http://127.0.0.1:8080/v1/embeddings")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").as_deref(),
-            Ok("http://127.0.0.1:8080/v1/embeddings")
-        );
+        assert!(std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err());
 
         Ok(())
     }
@@ -691,18 +708,9 @@ embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings"
             config.embedding_endpoint.as_deref(),
             Some("http://127.0.0.1:8080/v1/embeddings")
         );
-        assert_eq!(
-            std::env::var("CODESTORY_SUMMARY_ENDPOINT").as_deref(),
-            Ok("https://example.invalid/v1/chat/completions")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_SUMMARY_MODEL").as_deref(),
-            Ok("trusted/model")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_LLAMACPP_URL").as_deref(),
-            Ok("http://127.0.0.1:8080/v1/embeddings")
-        );
+        assert!(std::env::var("CODESTORY_SUMMARY_ENDPOINT").is_err());
+        assert!(std::env::var("CODESTORY_SUMMARY_MODEL").is_err());
+        assert!(std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err());
 
         Ok(())
     }

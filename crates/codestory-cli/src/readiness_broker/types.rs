@@ -1,4 +1,4 @@
-use codestory_workspace::ProjectIdentityV2;
+use codestory_workspace::ProjectIdentityV3;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BrokerScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) identity: Option<ProjectIdentityV2>,
+    pub(crate) identity: Option<ProjectIdentityV3>,
     pub(crate) install_id: String,
     pub(crate) project_id: String,
     pub(crate) canonical_root_hash: String,
@@ -25,7 +25,7 @@ pub(crate) struct BrokerScope {
 pub(crate) struct ReadinessBrokerSnapshot {
     pub(crate) schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) identity: Option<ProjectIdentityV2>,
+    pub(crate) identity: Option<ProjectIdentityV3>,
     pub(crate) install_id: String,
     pub(crate) project_id: String,
     pub(crate) canonical_root_hash: String,
@@ -148,6 +148,10 @@ pub(crate) struct BrokerGpuRuntimeIdentity {
     pub(crate) namespace: String,
     pub(crate) compose_project: String,
     pub(crate) embed_url: String,
+    #[serde(default)]
+    pub(crate) embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin,
+    #[serde(default)]
+    pub(crate) embedding_endpoint_fingerprint_sha256: String,
     pub(crate) started_at_epoch_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) embedding_launch: Option<codestory_retrieval::EmbeddingLaunchMetadata>,

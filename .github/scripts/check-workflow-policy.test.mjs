@@ -1,0 +1,124 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  basicWorkflowViolations,
+  managedPluginViolations,
+  notaryStepViolations,
+  packagedPrSigningViolations,
+  parseWorkflow,
+} from "./check-workflow-policy.mjs";
+
+const fullSha = "0123456789abcdef0123456789abcdef01234567";
+
+function managedJob() {
+  return {
+    strategy: { "fail-fast": false, matrix: { include: [{ os: "ubuntu-latest" }] } },
+    steps: [
+      {
+        name: "Prove managed plugin handoff",
+        run: [
+          "python .github/scripts/check-packaged-agent-proof.py",
+          "--archive package.tar.gz",
+          "--managed-plugin-handoff",
+        ].join("\n"),
+      },
+    ],
+  };
+}
+
+test("parser ignores YAML comments and harmless formatting", () => {
+  const block = parseWorkflow(`
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vendor/action@${fullSha}
+# uses: vendor/action@main
+`);
+  const flow = parseWorkflow(`
+"on": { pull_request: null }
+permissions: { contents: read }
+jobs: { check: { runs-on: ubuntu-latest, steps: [ { uses: vendor/action@${fullSha} } ] } }
+`);
+  assert.deepEqual(block, flow);
+});
+
+test("third-party action policy reads only parsed uses values", () => {
+  const valid = parseWorkflow(`
+on: { workflow_dispatch: null }
+jobs:
+  check:
+    steps:
+      - uses: vendor/action@${fullSha}
+# uses: vendor/action@main
+`);
+  assert.deepEqual(basicWorkflowViolations("fixture.yml", valid), []);
+
+  const invalid = structuredClone(valid);
+  invalid.jobs.check.steps[0].uses = "vendor/action@main";
+  assert.match(basicWorkflowViolations("fixture.yml", invalid).join("\n"), /full-length SHA/u);
+});
+
+test("Cargo lock policy reads executable step commands", () => {
+  const workflow = parseWorkflow(`
+on: { workflow_dispatch: null }
+jobs:
+  check:
+    steps:
+      - run: |
+          # cargo test --workspace
+          cargo test --workspace --locked
+`);
+  assert.deepEqual(basicWorkflowViolations("fixture.yml", workflow), []);
+
+  workflow.jobs.check.steps[0].run += "\ncargo check --workspace\n";
+  assert.match(basicWorkflowViolations("fixture.yml", workflow).join("\n"), /must use --locked/u);
+});
+
+test("managed proof rejects structural bypasses and decoy commands", () => {
+  assert.deepEqual(managedPluginViolations(managedJob(), "--archive package.tar.gz"), []);
+
+  const mutations = [
+    job => { job.strategy["fail-fast"] = true; },
+    job => { job.strategy.matrix.exclude = [{ os: "ubuntu-latest" }]; },
+    job => { job.if = "always()"; },
+    job => { job.steps[0]["continue-on-error"] = true; },
+    job => {
+      job.steps[0].run = "python .github/scripts/check-packaged-agent-proof.py\n--archive package.tar.gz\n# --managed-plugin-handoff";
+      job.steps.push({ name: "Decoy", run: "--managed-plugin-handoff" });
+    },
+  ];
+  for (const mutate of mutations) {
+    const candidate = managedJob();
+    mutate(candidate);
+    assert.notDeepEqual(managedPluginViolations(candidate, "--archive package.tar.gz"), []);
+  }
+});
+
+test("PR package proof cannot opt into signing credentials", () => {
+  const workflow = { jobs: { "packaged-proof": { with: { sign_macos: false } } } };
+  assert.deepEqual(packagedPrSigningViolations(workflow), []);
+
+  for (const mutate of [
+    candidate => { candidate.jobs["packaged-proof"].with.sign_macos = true; },
+    candidate => { candidate.jobs["packaged-proof"].secrets = "inherit"; },
+    candidate => { candidate.jobs["packaged-proof"].environment = "macos-release-signing"; },
+    candidate => { candidate.env = { APPLE_NOTARY_KEY_ID: "forbidden" }; },
+  ]) {
+    const candidate = structuredClone(workflow);
+    mutate(candidate);
+    assert.notDeepEqual(packagedPrSigningViolations(candidate), []);
+  }
+});
+
+test("notarization must use explicit polling", () => {
+  assert.deepEqual(notaryStepViolations({ run: "xcrun notarytool submit bundle.zip \\\n  --no-wait" }), []);
+  assert.match(
+    notaryStepViolations({ run: "xcrun notarytool submit bundle.zip \\\n  --wait" }).join("\n"),
+    /poll explicitly/u,
+  );
+});

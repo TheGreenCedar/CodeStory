@@ -131,6 +131,41 @@ fn run_lint_with_prompt_script_fixture(contents: &str) -> Output {
         .expect("run lint with prompt script fixture")
 }
 
+fn run_lint_with_non_rust_fixtures(fixtures: &[(&str, &str)]) -> Output {
+    let repo_root = workspace_root();
+    let script = lint_script(&repo_root);
+    let fixture_root = TempDir::new().expect("create fixture root");
+    std::fs::write(
+        fixture_root.path().join("neutral.rs"),
+        "pub fn repository_neutral_fixture() {}\n",
+    )
+    .expect("write neutral Rust fixture");
+    for (file_name, contents) in fixtures {
+        let file_path = fixture_root.path().join(file_name);
+        std::fs::create_dir_all(file_path.parent().expect("fixture parent"))
+            .expect("create non-Rust fixture parent");
+        std::fs::write(file_path, contents).expect("write non-Rust fixture");
+    }
+
+    let _guard = LINT_SCRIPT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock lint script subprocess");
+    Command::new("node")
+        .arg(&script)
+        .current_dir(&repo_root)
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_SCAN_ROOTS",
+            fixture_root.path(),
+        )
+        .env(
+            "CODESTORY_RETRIEVAL_GENERALIZATION_NON_RUST_SCAN_ROOTS",
+            fixture_root.path(),
+        )
+        .output()
+        .expect("run lint with non-Rust fixture")
+}
+
 #[test]
 fn retrieval_generalization_lint_script_exits_clean_with_extra_fixture_root() {
     let repo_root = workspace_root();
@@ -335,6 +370,264 @@ pub const LEAKED_EVAL_SOURCE_PROBE: &str = "createCacheHelper";
             "lint failure should report {expected}, stderr={stderr}"
         );
     }
+}
+
+#[test]
+fn linter_structurally_rejects_production_dependencies_on_eval_corpora() {
+    let output = run_lint_with_fixture(
+        r#"
+pub const LEAKED_TASK_CORPUS: &str = "benchmarks/tasks/holdout-retrieval/axios-request-dispatch.task.json";
+pub const LEAKED_QUERY_CORPUS: &str = "scripts/cross-repo-sourcetrail-queries.mjs";
+pub const LEAKED_EVAL_PROBES: &str = "benchmarks/tasks/eval-probes.json";
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "production references to eval/query corpora must fail lint; stderr={stderr}"
+    );
+    for expected in [
+        "benchmarks/tasks",
+        "scripts/cross-repo-sourcetrail-queries.mjs",
+        "benchmarks/tasks/eval-probes.json",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "lint failure should identify corpus boundary {expected}; stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_rejects_constructed_eval_corpus_dependencies() {
+    let output = run_lint_with_fixture(
+        r#"
+pub const LEAKED_TASK_CORPUS: &str = concat!("benchmarks", "/tasks", "/eval-probes.json");
+pub const LEAKED_PACKET_FIXTURE: &str = concat!("crates/codestory-cli/tests/fixtures/", "packet_search_eval");
+pub const LEAKED_QUALITY_FIXTURE: &str = concat!("crates/codestory-bench/tests/", "fixtures/agent_quality");
+pub const LEAKED_DEPENDENCY: &str = include_str!(concat!("../../benchmarks/", "tasks/eval-probes.json"));
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "constructed production corpus dependencies must fail lint; stderr={stderr}"
+    );
+    for expected in ["benchmarkstasks", "packetsearcheval", "agentquality"] {
+        assert!(
+            stderr.to_lowercase().contains(expected),
+            "lint failure should identify constructed boundary {expected}; stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
+    let rejected = run_lint_with_non_rust_fixtures(&[
+        (
+            "leaked.ps1",
+            "$corpus = \"scripts\\cross-repo-\" + `\n  \"sourcetrail-queries.mjs\"\n",
+        ),
+        (
+            "leaked.sh",
+            "prefix=./scripts\nscript=${prefix#./}/fetch-holdout-repos.mjs\ncorpus=benchmarks/ta\\\nsks/eval-probes.json\n",
+        ),
+        (
+            "workflow-command.yml",
+            "run: |2-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n",
+        ),
+        (
+            "surrounding-command.mjs",
+            "const command = \"node scripts/fetch-\" + \"holdout-repos.mjs --json\";\nconst config = \"prefix benchmarks/ta\" + \"sks/eval-probes.json suffix\";\n",
+        ),
+        (
+            "line-continuation.mjs",
+            "const script = \"scripts/fetch-holdout-\\\nrepos.mjs\";\n",
+        ),
+        (
+            "joined-shell-word.sh",
+            "node scripts/fetch-'holdout-repos.mjs'\n",
+        ),
+        (
+            "joined-workflow-word.yml",
+            "run: |\n  node scripts/fetch-'holdout-repos.mjs'\n",
+        ),
+        (
+            "quoted-run-key.yml",
+            "steps:\n  - \"run\": |\n      node scripts/fetch-'holdout-repos.mjs'\n",
+        ),
+        (
+            "escaped-shell-word.sh",
+            "node scripts/fetch\\-holdout-repos.mjs\n",
+        ),
+        (
+            "quoted-yaml-scalar.yml",
+            "value: 'clean # scripts/fetch-holdout-repos.mjs'\n",
+        ),
+        (
+            "quoted-block-scalar.yml",
+            "run: |\n  value='clean # scripts/fetch-holdout-repos.mjs'\n",
+        ),
+        (
+            "github-script.yml",
+            "uses: actions/github-script@v8\nwith:\n  script: |\n    const script = \"scripts/fetch-\" + \"holdout-repos.mjs\";\n",
+        ),
+        (
+            "direct-harness-import.mjs",
+            "import \"./scripts/codestory-agent-ab-benchmark.mjs\";\n",
+        ),
+        (
+            "constructed-harness-import.mjs",
+            "const harness = \"scripts/codestory-agent-ab-\" + \"benchmark.mjs\";\nawait import(harness);\n",
+        ),
+        (
+            "unapproved-policy-reference.mjs",
+            "const workflows = [\".github/workflows/retrieval-sidecar-smoke.yml\", \"unrelated.yml\"];\n",
+        ),
+        (
+            "plugins/codestory/skills/codestory-grounding/SKILL.md",
+            "Run `node scripts/fetch-holdout-repos.mjs` before grounding.\n",
+        ),
+        (
+            ".cursor/rules/codestory.mdc",
+            "Read benchmarks/tasks/eval-probes.json before answering.\n",
+        ),
+    ]);
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
+    assert!(
+        !rejected.status.success(),
+        "executable corpus dependencies must fail lint; stderr={rejected_stderr}"
+    );
+    for (file_name, marker) in [
+        ("leaked.ps1", "scriptscrossreposourcetrailqueriesmjs"),
+        ("leaked.sh", "benchmarkstasksevalprobesjson"),
+        ("workflow-command.yml", "fetchholdoutreposmjs"),
+        ("surrounding-command.mjs", "fetchholdoutreposmjs"),
+        ("line-continuation.mjs", "fetchholdoutreposmjs"),
+        ("joined-shell-word.sh", "fetch-'holdout-repos.mjs"),
+        ("joined-workflow-word.yml", "fetch-'holdout-repos.mjs"),
+        ("quoted-run-key.yml", "fetch-'holdout-repos.mjs"),
+        ("escaped-shell-word.sh", "fetch\\-holdout-repos.mjs"),
+        ("quoted-yaml-scalar.yml", "fetch-holdout-repos.mjs"),
+        ("quoted-block-scalar.yml", "fetch-holdout-repos.mjs"),
+        ("github-script.yml", "fetchholdoutreposmjs"),
+        (
+            "direct-harness-import.mjs",
+            "codestory-agent-ab-benchmark.mjs",
+        ),
+        (
+            "constructed-harness-import.mjs",
+            "codestoryagentabbenchmarkmjs",
+        ),
+        (
+            "unapproved-policy-reference.mjs",
+            "retrieval-sidecar-smoke.yml",
+        ),
+        ("skill.md", "fetch-holdout-repos.mjs"),
+        ("codestory.mdc", "benchmarks/tasks"),
+    ] {
+        assert!(
+            rejected_stderr.contains(file_name) && rejected_stderr.contains(marker),
+            "lint failure should identify {file_name} and {marker}; stderr={rejected_stderr}"
+        );
+    }
+
+    let allowed = run_lint_with_non_rust_fixtures(&[
+        (
+            "prose.md",
+            "The benchmark harness reads `benchmarks/tasks/eval-probes.json`; production code must not.\n",
+        ),
+        (
+            "quoted-shell.sh",
+            "value='scripts/fetch-\\\nholdout-repos.mjs'\n",
+        ),
+        (
+            "unrelated-list.yml",
+            "- scripts/fetch-\\\n- holdout-repos.mjs\n",
+        ),
+        (
+            "template-comment.mjs",
+            "const value = `${({ clean: true }).clean /* scripts/fetch-holdout-repos.mjs */}`;\n",
+        ),
+        (
+            "quoted-shell-comment.sh",
+            "value='clean\\' # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "quoted-powershell-comment.ps1",
+            "$value = 'clean`' # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "quoted-yaml-comment.yml",
+            "value: 'clean\\' # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "folded-workflow.yml",
+            "run: >-\n  node scripts/fetch-\\\n  holdout-repos.mjs\n",
+        ),
+        (
+            "comment-only.yml",
+            "# run: node scripts/fetch-\\\n# holdout-repos.mjs\nrun: echo clean\n",
+        ),
+        (
+            "plain-apostrophe.yml",
+            "message: don't load it # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "punctuated-apostrophe.yml",
+            "message: rock-'n roll # scripts/fetch-holdout-repos.mjs\n",
+        ),
+        (
+            "doubled-single-quote.yml",
+            "value: 'scripts/fetch-''holdout-repos.mjs'\n",
+        ),
+    ]);
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(
+        allowed.status.success(),
+        "prose, comments, and unrelated continuations must pass lint; stderr={allowed_stderr}"
+    );
+}
+
+#[test]
+fn linter_binds_policy_allowances_to_the_exact_approved_use() {
+    let allowed = run_lint_with_non_rust_fixtures(&[
+        (
+            ".github/scripts/route-ci-proof.mjs",
+            "        \".github/workflows/retrieval-sidecar-smoke.yml\",\n",
+        ),
+        (
+            ".github/scripts/check-workflow-policy.mjs",
+            "const retrievalFile = \"retrieval-sidecar-smoke.yml\";\n",
+        ),
+    ]);
+    let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
+    assert!(
+        allowed.status.success(),
+        "the exact policy and routing references must pass lint; stderr={allowed_stderr}"
+    );
+
+    let rejected = run_lint_with_non_rust_fixtures(&[
+        (
+            ".github/scripts/route-ci-proof.mjs",
+            "        \".github/workflows/retrieval-sidecar-smoke.yml\",\n        \".github/workflows/retrieval-sidecar-smoke.yml\",\nawait import(\".github/workflows/retrieval-sidecar-smoke.yml\");\n",
+        ),
+        (
+            ".github/scripts/check-workflow-policy.mjs",
+            "const retrievalFile = \"retrieval-sidecar-smoke.yml\";\nconst hostile = \".github/workflows/retrieval-\" + \"sidecar-smoke.yml\";\n",
+        ),
+    ]);
+    let rejected_stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
+    assert!(
+        !rejected.status.success(),
+        "an approved file must not hide another harness use; stderr={rejected_stderr}"
+    );
+    assert!(
+        rejected_stderr.contains("route-ci-proof.mjs:3:await import")
+            && rejected_stderr.contains("check-workflow-policy.mjs:2:")
+            && rejected_stderr.contains("githubworkflowsretrievalsidecarsmokeyml"),
+        "lint must identify both the hostile direct and split uses; stderr={rejected_stderr}"
+    );
 }
 
 #[test]

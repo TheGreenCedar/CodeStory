@@ -41,15 +41,15 @@ pub struct CandidateHit {
 #[serde(rename_all = "snake_case")]
 /// Sidecar lane that produced a retrieval candidate.
 pub enum CandidateSource {
-    Zoekt,
+    Lexical,
     Qdrant,
     Scip,
     Legacy,
 }
 
-/// Dev-only synthetic hit prefix (`zoekt:`, `semantic:`, `scip:`).
+/// Dev-only synthetic hit prefix (`lexical:`, `semantic:`, `scip:`).
 pub fn is_phantom_sidecar_hit(hit: &CandidateHit) -> bool {
-    hit.file_path.starts_with("zoekt:")
+    hit.file_path.starts_with("lexical:")
         || hit.file_path.starts_with("semantic:")
         || hit.file_path.starts_with("scip:")
 }
@@ -66,7 +66,7 @@ impl CandidateHit {
             symbol_name: None,
             start_line: None,
             score,
-            source: CandidateSource::Zoekt,
+            source: CandidateSource::Lexical,
             provenance: vec!["lexical_source".into()],
             file_role: None,
             scip_hop_distance: None,

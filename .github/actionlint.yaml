@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - codestory-metal
+    - codestory-release-evidence
+
+config-variables: null

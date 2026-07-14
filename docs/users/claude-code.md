@@ -8,11 +8,13 @@ grounding. MCP setup is manual unless your Claude Code plugin flow wires it.
 | You | Agent |
 | --- | --- |
 | Install the CodeStory Claude plugin | Hooks run `codestory-activate.cjs` on session start and prompts |
-| Open your repo | Attempts strict startup grounding and request-aware packets |
-| Ask concrete questions | Uses MCP when configured; obeys `allowed_surfaces` from status |
+| Open your repo | Receives a compact task router; the hook does not run MCP or inject source claims |
+| Ask concrete questions | Uses the routed MCP surface when configured and obeys `allowed_surfaces` from status |
 
 Hooks fail open: missing Node, MCP, or degraded sidecars do not block the host.
-The agent should still read `codestory://status` when MCP is live.
+The agent reads project-scoped status once, reuses it while repository/runtime
+state is unchanged, and follows the routed local graph when deep retrieval is
+blocked. Sidecar repair is reserved for tasks that actually need packet/search.
 
 ## Install
 
@@ -112,8 +114,8 @@ minutes. Let the agent finish grounding before you ask it to edit files.
 broad search is available, and does not report a missing CLI or broken MCP
 connection.
 
-Hooks may already inject grounding context; treat it as a starting point and
-follow gaps before making source claims.
+Hooks inject routing, not grounding evidence. Follow the selected live MCP
+surface and its evidence gaps before making source claims.
 
 ## Example prompts
 

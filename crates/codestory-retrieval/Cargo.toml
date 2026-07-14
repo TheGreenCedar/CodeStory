@@ -1,6 +1,6 @@
 [package]
 name = "codestory-retrieval"
-version = "0.14.3"
+version = "0.15.0"
 edition = "2024"
 
 [features]
@@ -17,9 +17,12 @@ fs4 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+rusqlite = { workspace = true }
+ring = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ureq = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -4,6 +4,11 @@ use crate::agent::eval_probes::{
     push_prompt_concept_derived_symbol_probes,
 };
 use crate::agent::packet_batch::packet_file_stem_matches_query;
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_citation_owns_interceptor_management,
+    packet_citation_owns_request_pipeline, packet_citation_owns_transport_adapter,
+    packet_evidence_role,
+};
 use crate::agent::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_display_path, packet_query_stop_term,
@@ -420,7 +425,6 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
     #[cfg(test)]
     if eval_probes_enabled() {
         push_eval_required_probe_queries(terms, &mut queries);
-        return queries;
     }
 
     if has("exec") && has_any(&["runtime", "session"]) {
@@ -1022,6 +1026,9 @@ pub(crate) fn packet_citation_probe_match_rank(
     if packet_citation_matches_required_coverage_role(query, citation) {
         return Some(6);
     }
+    if packet_citation_matches_behavior_owning_required_probe(query, citation) {
+        return Some(6);
+    }
     let normalized_display = normalize_identifier(&citation.display_name);
     let normalized_path = citation
         .file_path
@@ -1068,6 +1075,57 @@ pub(crate) fn packet_citation_probe_match_rank(
     } else {
         None
     }
+}
+
+fn packet_citation_matches_behavior_owning_required_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    let normalized_query = normalize_identifier(query);
+    match normalized_query.as_str() {
+        "requestentrypoint" => {
+            packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ClientFactory])
+                || packet_citation_owns_request_pipeline(citation)
+        }
+        "defaultinstance" => {
+            packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ClientFactory])
+        }
+        "requestdispatch" | "requestmethod" => packet_citation_owns_request_pipeline(citation),
+        "requestinterceptor" | "interceptorhandlers" => {
+            packet_citation_owns_interceptor_management(citation)
+        }
+        "adapters" | "transportadapter" => packet_citation_owns_transport_adapter(citation),
+        "searchentrypoint" => packet_citation_has_behavior_role(
+            citation,
+            &[
+                PacketEvidenceRole::CommandEntrypoint,
+                PacketEvidenceRole::SearchDriver,
+            ],
+        ),
+        "searchexecution" | "parallelsearch" | "searchexecutionunit" => {
+            packet_citation_has_behavior_role(
+                citation,
+                &[
+                    PacketEvidenceRole::SearchDriver,
+                    PacketEvidenceRole::SearchExecutionUnit,
+                ],
+            )
+        }
+        "argumentplanning" | "flagparsing" => {
+            packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ArgumentPlanning])
+        }
+        _ => false,
+    }
+}
+
+fn packet_citation_has_behavior_role(
+    citation: &AgentCitationDto,
+    expected_roles: &[PacketEvidenceRole],
+) -> bool {
+    matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
+    ) && packet_evidence_role(citation).is_some_and(|role| expected_roles.contains(&role))
 }
 
 fn packet_required_probe_needs_request_validation_anchor(query: &str) -> bool {
@@ -2207,6 +2265,104 @@ mod tests {
             "url session callback boundary",
             &citation
         ));
+    }
+
+    #[test]
+    fn generic_probes_prefer_behavior_owners_without_removing_lexical_fallback() {
+        let assert_role_match = |query, display_name, path, kind| {
+            let mut citation = test_packet_citation(display_name, path, 0.7);
+            citation.kind = kind;
+            assert_eq!(packet_citation_probe_match_rank(query, &citation), Some(6));
+        };
+        assert_role_match(
+            "request entrypoint",
+            "createClientInstance",
+            "src/client/factory.ts",
+            NodeKind::FUNCTION,
+        );
+        assert_role_match(
+            "request entrypoint",
+            "HttpClient.request",
+            "src/client/http_client.ts",
+            NodeKind::METHOD,
+        );
+        assert_role_match(
+            "default instance",
+            "createClientInstance",
+            "src/client/factory.ts",
+            NodeKind::FUNCTION,
+        );
+        for query in ["request dispatch", "request method"] {
+            assert_role_match(
+                query,
+                "HttpClient.request",
+                "src/client/http_client.ts",
+                NodeKind::METHOD,
+            );
+        }
+        for query in ["request interceptor", "interceptor handlers"] {
+            assert_role_match(
+                query,
+                "RequestInterceptorRegistry",
+                "src/client/interceptors.ts",
+                NodeKind::CLASS,
+            );
+            assert_role_match(
+                query,
+                "RequestInterceptorRegistry.constructor",
+                "src/client/interceptors.ts",
+                NodeKind::METHOD,
+            );
+        }
+        assert_role_match(
+            "adapters",
+            "selectAdapter",
+            "src/client/adapters/select.ts",
+            NodeKind::FUNCTION,
+        );
+        assert_role_match(
+            "transport adapter",
+            "selectAdapter",
+            "src/client/adapters/select.ts",
+            NodeKind::FUNCTION,
+        );
+        assert_role_match(
+            "search entrypoint",
+            "cli::main",
+            "src/main.rs",
+            NodeKind::FUNCTION,
+        );
+        assert_role_match(
+            "parallel search",
+            "ParallelSearchDriver",
+            "src/search/driver.rs",
+            NodeKind::FUNCTION,
+        );
+        assert_role_match(
+            "search execution unit",
+            "SearchExecutor",
+            "src/search/executor.rs",
+            NodeKind::STRUCT,
+        );
+        assert_role_match(
+            "flag parsing",
+            "CliArgs",
+            "src/flags/arguments.rs",
+            NodeKind::STRUCT,
+        );
+
+        let assert_lexical_fallback = |query, path| {
+            let display_name = query;
+            let mut citation = test_packet_citation(display_name, path, 0.9);
+            citation.kind = NodeKind::MODULE;
+            assert_eq!(
+                packet_citation_probe_match_rank(query, &citation),
+                Some(4),
+                "non-owning lexical evidence remains a fallback"
+            );
+        };
+        assert_lexical_fallback("transport adapter", "src/client/adapters/imports.ts");
+        assert_lexical_fallback("search entrypoint", "src/search/imports.rs");
     }
 
     #[test]

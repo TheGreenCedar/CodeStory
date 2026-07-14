@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn, spawnSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import fs from "node:fs";
+import { access, chmod, copyFile, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { once } from "node:events";
+import { deflateRawSync, gunzipSync, gzipSync } from "node:zlib";
+import { PassThrough, Writable } from "node:stream";
+import { EventEmitter } from "node:events";
 
 const pluginRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const repoRoot = dirname(dirname(pluginRoot));
@@ -20,6 +24,7 @@ const {
   uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
+const genericBaselineHook = join(pluginRoot, "tests", "fixtures", "hook-generic-baseline.cjs");
 
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
@@ -59,19 +64,213 @@ function releaseAssetForPlatform(version) {
       ? "windows-arm64"
       : process.platform === "linux" && process.arch === "x64"
         ? "linux-x64"
-        : process.platform === "linux" && process.arch === "arm64"
+      : process.platform === "linux" && process.arch === "arm64"
           ? "linux-arm64"
-          : process.platform === "darwin" && process.arch === "arm64"
-            ? "macos-arm64"
-            : null;
+          : process.platform === "darwin" && process.arch === "x64"
+            ? "macos-x64"
+            : process.platform === "darwin" && process.arch === "arm64"
+              ? "macos-arm64"
+              : null;
   assert.ok(target, `unsupported test platform: ${process.platform}-${process.arch}`);
   const archiveBase = `codestory-cli-v${version}-${target}`;
   const archiveName = `${archiveBase}.${target.startsWith("windows-") ? "zip" : "tar.gz"}`;
   return { archiveBase, archiveName };
 }
 
+function managedReleaseManifest(version, executablePath, sha256) {
+  const { archiveName } = releaseAssetForPlatform(version);
+  const target = archiveName.slice(`codestory-cli-v${version}-`.length).replace(/\.(?:zip|tar\.gz)$/u, "");
+  return {
+    path: executablePath,
+    sha256,
+    version,
+    build_source: "github_release",
+    repo_ref: `v${version}`,
+    archive: archiveName,
+    archive_url: `https://github.com/TheGreenCedar/CodeStory/releases/download/v${version}/${archiveName}`,
+    archive_sha256: "0".repeat(64),
+    target,
+    stdio_initialize_verified: true,
+  };
+}
+
+function crc32(content) {
+  let crc = 0xffffffff;
+  for (const byte of content) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function tarField(header, offset, length, value) {
+  const encoded = value.toString(8).padStart(length - 1, "0");
+  header.write(encoded, offset, length - 1, "ascii");
+  header[offset + length - 1] = 0;
+}
+
+function tarGzFixture(name, content) {
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 100, "utf8");
+  tarField(header, 100, 8, 0o755);
+  tarField(header, 108, 8, 0);
+  tarField(header, 116, 8, 0);
+  tarField(header, 124, 12, content.length);
+  tarField(header, 136, 12, 315532800);
+  header.fill(0x20, 148, 156);
+  header[156] = "0".charCodeAt(0);
+  header.write("ustar\0", 257, 6, "ascii");
+  header.write("00", 263, 2, "ascii");
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+  header[154] = 0;
+  header[155] = 0x20;
+  const padding = Buffer.alloc((512 - (content.length % 512)) % 512);
+  return gzipSync(Buffer.concat([header, content, padding, Buffer.alloc(1024)]), { mtime: 0 });
+}
+
+function rewriteTarChecksum(header) {
+  header.fill(0x20, 148, 156);
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  header.write(checksum.toString(8).padStart(6, "0"), 148, 6, "ascii");
+  header[154] = 0;
+  header[155] = 0x20;
+}
+
+function zipFixture(name, content, options = {}) {
+  const encodedName = Buffer.from(name, "utf8");
+  const compressed = deflateRawSync(content);
+  const checksum = crc32(content);
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  const flags = 0x800 | (options.dataDescriptor ? 0x8 : 0);
+  local.writeUInt16LE(flags, 6);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt32LE(options.dataDescriptor ? 0 : checksum, 14);
+  local.writeUInt32LE(options.dataDescriptor ? 0 : compressed.length, 18);
+  local.writeUInt32LE(options.dataDescriptor ? 0 : content.length, 22);
+  local.writeUInt16LE(encodedName.length, 26);
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(0x0314, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(flags, 8);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt32LE(checksum, 16);
+  central.writeUInt32LE(compressed.length, 20);
+  central.writeUInt32LE(content.length, 24);
+  central.writeUInt16LE(encodedName.length, 28);
+  central.writeUInt32LE((0o100755 << 16) >>> 0, 38);
+  const descriptor = options.dataDescriptor ? Buffer.alloc(16) : Buffer.alloc(0);
+  if (options.dataDescriptor) {
+    descriptor.writeUInt32LE(0x08074b50, 0);
+    descriptor.writeUInt32LE(checksum, 4);
+    descriptor.writeUInt32LE(compressed.length, 8);
+    descriptor.writeUInt32LE(content.length, 12);
+  }
+  const centralOffset = local.length + encodedName.length + compressed.length + descriptor.length;
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(central.length + encodedName.length, 12);
+  eocd.writeUInt32LE(centralOffset, 16);
+  return Buffer.concat([local, encodedName, compressed, descriptor, central, encodedName, eocd]);
+}
+
+async function writeArchiveFixture(archivePath, entryName, content) {
+  await writeFile(
+    archivePath,
+    archivePath.endsWith(".zip") ? zipFixture(entryName, content) : tarGzFixture(entryName, content),
+  );
+}
+
+function fakeProbeChild(response, options = {}) {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.killSignals = [];
+  child.kill = (signal = "SIGTERM") => {
+    child.killSignals.push(signal);
+    if (signal === "SIGKILL" && !options.ignoreSigkill) {
+      process.nextTick(() => child.emit("exit", null, signal));
+    }
+    return true;
+  };
+  child.stdin = new Writable({
+    write(_chunk, _encoding, callback) { callback(); },
+    final(callback) {
+      process.nextTick(() => {
+        if (options.stdoutError) child.stdout.emit("error", new Error("synthetic stdout failure"));
+        else child.stdout.write(`${JSON.stringify(response)}\n`);
+      });
+      callback();
+    },
+  });
+  return child;
+}
+
+async function writeReleaseFixture(releaseDir, version, writeCli = writeFakeCli) {
+  const { archiveBase, archiveName } = releaseAssetForPlatform(version);
+  const stageDir = join(releaseDir, archiveBase);
+  const cliName = process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli";
+  const cliPath = join(stageDir, cliName);
+  const archivePath = join(releaseDir, archiveName);
+  await mkdir(stageDir, { recursive: true });
+  await writeCli(cliPath);
+  await writeArchiveFixture(archivePath, `${archiveBase}/${cliName}`, await readFile(cliPath));
+  const archiveSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
+  const sumsPath = join(releaseDir, "SHA256SUMS.txt");
+  await writeFile(sumsPath, `${archiveSha256}  ${archiveName}\n`, "utf8");
+  return { archiveName, archivePath, archiveSha256, cliName, sumsPath };
+}
+
+function spawnLauncher(launcher, env) {
+  const child = spawn(process.execPath, [launcher], {
+    env: { ...process.env, CODESTORY_CLI: "", ...env },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "resources/read", params: { uri: "codestory://status" } })}\n`);
+  const runtimeMetadata = env.PLUGIN_DATA && join(env.PLUGIN_DATA, ".codestory-mcp-runtime.json");
+  let handoffRequestId = 2;
+  const handoffPoll = runtimeMetadata && setInterval(() => {
+    try {
+      if (child.exitCode !== null || (env.TEST_OUT && fs.existsSync(env.TEST_OUT))) {
+        clearInterval(handoffPoll);
+        return;
+      }
+      if (JSON.parse(fs.readFileSync(runtimeMetadata, "utf8")).source !== "managed") return;
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: handoffRequestId, method: "tools/list" })}\n`);
+      handoffRequestId += 1;
+    } catch {
+      // Provisioning has not published runtime metadata yet.
+    }
+  }, 10);
+  child.once("close", () => clearInterval(handoffPoll));
+  const completed = once(child, "close").then(([status, signal]) => ({ status, signal, stdout, stderr }));
+  return { child, completed };
+}
+
+async function waitForPath(pathname, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await access(pathname);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  assert.fail(`timed out waiting for ${pathname}`);
+}
+
 async function writeFakeCli(cliPath) {
-  const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))";
+  const script = "const fs=require('fs');const args=process.argv.slice(1);if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'}}})+'\\n',()=>process.exit(0))})}else{if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'){if(args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}process.exit(9)}fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,activeStatePath:process.env.CODESTORY_PLUGIN_ACTIVE_STATE_PATH,sidecarPolicy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,sidecarEnable:process.env.CODESTORY_PLUGIN_SIDECAR_ENABLE_COMMAND,sidecarRepair:process.env.CODESTORY_PLUGIN_SIDECAR_NEXT_REPAIR_COMMAND,dirtyMarkerPath:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PATH,dirtyMarkerRoot:process.env.CODESTORY_PLUGIN_DIRTY_MARKER_PROJECT_ROOT,args}))}";
   if (process.platform === "win32") {
     await writeFile(
       cliPath,
@@ -88,6 +287,24 @@ async function writeFakeCli(cliPath) {
   await chmod(cliPath, 0o755);
 }
 
+async function writeLifecycleCli(cliPath) {
+  const script = [
+    "const fs=require('fs');",
+    "const args=process.argv.slice(1);",
+    "if(args[0]==='--version'){console.log('codestory-cli '+process.env.TEST_CODESTORY_VERSION);process.exit(0)}",
+    "if(args[0]!=='serve')process.exit(2);",
+    "let initialized=false;let notified=false;let input='';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});",
+  ].join("");
+  if (process.platform === "win32") {
+    await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
+    return;
+  }
+  await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
+  await chmod(cliPath, 0o755);
+}
+
 async function writeRecordingCli(cliPath) {
   const script = "const fs=require('fs');const args=process.argv.slice(1);if(args[0]==='--version'){console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}if(args[0]==='ready'&&process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR!=='1'&&args.includes('--wait-fresh')&&!args.includes('--repair')&&!args.includes('agent')){console.log(JSON.stringify({verdicts:[{goal:'local_navigation',status:'ready',summary:'ready',minimum_next:[],full_repair:[]}],local_refresh:{state:'fresh',reason:'already_fresh',blocks_local_surfaces:false,readiness_status:'ready',changed_file_count:0,new_file_count:0,removed_file_count:0,fatal_error_count:0}}));process.exit(0)}fs.appendFileSync(process.env.TEST_LOG,JSON.stringify({repair:process.env.CODESTORY_PLUGIN_SIDECAR_REPAIR==='1',policy:process.env.CODESTORY_PLUGIN_SIDECAR_POLICY_STATE,args})+'\\n')";
   if (process.platform === "win32") {
@@ -95,6 +312,15 @@ async function writeRecordingCli(cliPath) {
     return;
   }
   await writeFile(cliPath, `#!/bin/sh\n${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} -- "$@"\n`, "utf8");
+  await chmod(cliPath, 0o755);
+}
+
+async function writeVersionOnlyCli(cliPath) {
+  if (process.platform === "win32") {
+    await writeFile(cliPath, "@echo off\r\necho codestory-cli %TEST_CODESTORY_VERSION%\r\n", "utf8");
+    return;
+  }
+  await writeFile(cliPath, "#!/bin/sh\necho codestory-cli \"$TEST_CODESTORY_VERSION\"\n", "utf8");
   await chmod(cliPath, 0o755);
 }
 
@@ -364,7 +590,11 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256, version }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
     const result = spawnSync(process.execPath, [launcher], {
@@ -381,7 +611,7 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
     assert.equal(observed.source, "managed");
-    assert.equal(observed.path, cliPath);
+    assert.equal(await realpath(observed.path), await realpath(cliPath));
     assert.equal(observed.sha256, sha256);
     const retention = JSON.parse(observed.retention);
     assert.deepEqual(
@@ -417,6 +647,24 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(policy.state, "enabled");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("plugin path comparison uses file identity and platform missing-path rules", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-path-identity-"));
+  const executable = join(root, "codestory-cli");
+  const hardLink = join(root, "codestory-cli-link");
+  try {
+    await writeFile(executable, "fixture", "utf8");
+    await link(executable, hardLink);
+    assert.equal(launcherTest.sameFilesystemPath(executable, hardLink), true);
+    assert.equal(launcherTest.sameFilesystemPath(executable, join(root, "missing")), false);
+    assert.equal(
+      launcherTest.sameFilesystemPath(join(root, "Missing"), join(root, "missing")),
+      process.platform === "win32",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -570,9 +818,10 @@ test("managed cli retention reclaims an abandoned lock and provisioning sentinel
     await writeFile(
       join(lockDir, "owner.json"),
       JSON.stringify({
-        pid: process.pid,
+        pid: 2147483647,
         token: "abandoned",
         purpose: "retention",
+        process_start_identity: "dead:process",
         started_at: "2000-01-01T00:00:00.000Z",
       }),
       "utf8",
@@ -595,6 +844,528 @@ test("managed cli retention reclaims an abandoned lock and provisioning sentinel
     await assert.rejects(access(stale.versionDir));
     await assert.rejects(access(lockDir));
   } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli retention never reclaims an old lock owned by the live process", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-retention-live-lock-"));
+  try {
+    const processStartIdentity = launcherTest.processStartIdentity(process.pid);
+    assert.ok(processStartIdentity, `process start identity unavailable on ${process.platform}`);
+    const stale = await writeManagedCliFixture(dataDir, "0.13.9");
+    await writeManagedCliFixture(dataDir, "0.14.0");
+    const active = await writeManagedCliFixture(dataDir, "0.14.1");
+    const lockDir = join(dataDir, "codestory-cli", ".retention-lock");
+    await mkdir(lockDir);
+    await writeFile(join(lockDir, "owner.json"), JSON.stringify({
+      pid: process.pid,
+      token: "live",
+      purpose: "retention",
+      process_start_identity: processStartIdentity,
+      started_at: "2000-01-01T00:00:00.000Z",
+    }), "utf8");
+    const probeVersion = (resolved) => ({ status: 0, error: null, version: resolved.version });
+    const report = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probeVersion({ version: "0.14.1" }),
+      { dataDir, probeVersion },
+    );
+    assert.deepEqual(report.removed, []);
+    assert.equal(report.warnings.includes("managed_cli_retention_locked"), true);
+    await access(lockDir);
+    await access(stale.versionDir);
+
+    await writeFile(join(lockDir, "owner.json"), JSON.stringify({
+      pid: process.pid,
+      token: "reused-pid",
+      purpose: "retention",
+      process_start_identity: "different-process-start",
+      started_at: "2000-01-01T00:00:00.000Z",
+    }), "utf8");
+    const reclaimed = launcherTest.managedCliRetentionReport(
+      { source: "managed", version: "0.14.1", path: active.cliPath, warnings: [] },
+      probeVersion({ version: "0.14.1" }),
+      { dataDir, probeVersion },
+    );
+    assert.deepEqual(reclaimed.removed.map((entry) => entry.version), ["0.13.9"]);
+    await assert.rejects(access(lockDir));
+    await assert.rejects(access(stale.versionDir));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli lock fails closed when self process identity is unavailable", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-lock-no-identity-"));
+  const root = join(dataDir, "codestory-cli");
+  await mkdir(root);
+  try {
+    assert.throws(
+      () => launcherTest.acquireManagedCliLock(root, "no-identity", 0, {
+        processStartIdentity: () => null,
+      }),
+      /managed_cli_process_identity_unavailable/u,
+    );
+    assert.deepEqual(await readdir(root), []);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli pending-owner cleanup protects live and young artifacts", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-pending-owner-"));
+  const root = join(dataDir, "codestory-cli");
+  await mkdir(root);
+  const identity = launcherTest.processStartIdentity(process.pid);
+  assert.ok(identity, `process start identity unavailable on ${process.platform}`);
+  const liveToken = "1".repeat(32);
+  const deadToken = "2".repeat(32);
+  const youngToken = "3".repeat(32);
+  const oldToken = "4".repeat(32);
+  const reusedToken = "5".repeat(32);
+  const live = join(root, `.retention-lock.owner-${process.pid}-${liveToken}`);
+  const dead = join(root, `.retention-lock.owner-2147483647-${deadToken}`);
+  const young = join(root, `.retention-lock.owner-8-${youngToken}`);
+  const old = join(root, `.retention-lock.owner-9-${oldToken}`);
+  const reused = join(root, `.retention-lock.owner-${process.pid}-${reusedToken}`);
+  try {
+    await writeFile(live, JSON.stringify({
+      pid: process.pid,
+      purpose: "waiter",
+      token: liveToken,
+      process_start_identity: identity,
+      started_at: "2000-01-01T00:00:00.000Z",
+    }));
+    await writeFile(dead, JSON.stringify({
+      pid: 2147483647,
+      purpose: "waiter",
+      token: deadToken,
+      process_start_identity: "dead:process",
+      started_at: new Date().toISOString(),
+    }));
+    await writeFile(young, "{partial");
+    await writeFile(old, "{malformed");
+    await writeFile(reused, JSON.stringify({
+      pid: process.pid,
+      purpose: "waiter",
+      token: reusedToken,
+      process_start_identity: "different-process-start",
+      started_at: "2000-01-01T00:00:00.000Z",
+    }));
+    const staleTime = new Date(Date.now() - 11 * 60 * 1000);
+    await utimes(old, staleTime, staleTime);
+    await utimes(reused, staleTime, staleTime);
+
+    assert.equal(launcherTest.reclaimStaleManagedCliPendingOwners(root), 3);
+    await access(live);
+    await access(young);
+    await assert.rejects(access(dead));
+    await assert.rejects(access(old));
+    await assert.rejects(access(reused));
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli waiter covers both configured asset retry windows", () => {
+  assert.ok(launcherTest.releaseAssetRetryBudgetMs > 3 * 60 * 1000);
+  assert.ok(launcherTest.managedCliLockWaitMs >= 2 * launcherTest.releaseAssetRetryBudgetMs);
+});
+
+test("managed cli initializing reclaim preserves a new ABA owner", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-initializing-aba-"));
+  const initializing = join(dataDir, ".retention-lock.initializing");
+  const oldOwner = { pid: 1, token: "old", purpose: "old" };
+  const newOwner = { pid: process.pid, token: "new", purpose: "new" };
+  try {
+    await writeFile(initializing, JSON.stringify(oldOwner));
+    const removed = launcherTest.removeManagedCliInitializationIf(
+      initializing,
+      (owner) => owner?.token === oldOwner.token,
+      {
+        afterRename() {
+          fs.writeFileSync(initializing, JSON.stringify(newOwner), { flag: "wx" });
+        },
+      },
+    );
+    assert.equal(removed, true);
+    assert.deepEqual(JSON.parse(await readFile(initializing, "utf8")), newOwner);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli staging rejects a version-only binary without MCP initialize", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-stdio-probe-"));
+  const cliPath = join(dataDir, process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli");
+  try {
+    await writeVersionOnlyCli(cliPath);
+    await assert.rejects(launcherTest.probeManagedCliStdio(cliPath, 1000), /stdio_initialize_/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli staging uses direct executables and requires the exact MCP contract", async () => {
+  assert.equal(launcherTest.isWindowsBatchCli("C:\\tools\\codestory-cli.cmd", "win32"), true);
+  assert.equal(launcherTest.isWindowsBatchCli("C:\\tools\\codestory-cli.bat", "win32"), true);
+  assert.equal(launcherTest.isWindowsBatchCli("C:\\tools\\codestory-cli.exe", "win32"), false);
+  assert.throws(
+    () => launcherTest.requireDirectCli("C:\\tools\\codestory-cli.cmd", "win32"),
+    /codestory_cli_batch_override_rejected/u,
+  );
+  const incompatible = {
+    jsonrpc: "2.0",
+    id: "managed-cli-staging",
+    result: {
+      protocolVersion: "2099-01-01",
+      capabilities: [],
+      serverInfo: { name: "", version: 1 },
+    },
+  };
+  let spawnOptions;
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: (_file, _args, options) => {
+        spawnOptions = options;
+        return fakeProbeChild(incompatible);
+      },
+      terminationGraceMs: 5,
+      forceKillGraceMs: 20,
+    }),
+    /stdio_initialize_incompatible/u,
+  );
+  assert.equal(spawnOptions.shell, false);
+});
+
+test("managed cli staging escalates and awaits a stubborn child", async () => {
+  const compatible = {
+    jsonrpc: "2.0",
+    id: "managed-cli-staging",
+    result: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      serverInfo: { name: "fixture", version: "1" },
+    },
+  };
+  const child = fakeProbeChild(compatible);
+  await launcherTest.probeManagedCliStdio("fixture", 100, {
+    spawn: () => child,
+    terminationGraceMs: 5,
+    forceKillGraceMs: 20,
+  });
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"]);
+
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: () => fakeProbeChild(compatible, { ignoreSigkill: true }),
+      terminationGraceMs: 5,
+      forceKillGraceMs: 10,
+    }),
+    /stdio_initialize_termination_timeout/u,
+  );
+});
+
+test("managed cli staging bounds output and handles stream errors", async () => {
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: () => fakeProbeChild(null, { stdoutError: true }),
+      terminationGraceMs: 5,
+      forceKillGraceMs: 20,
+    }),
+    /managed_cli_stdio_initialize_stdout/u,
+  );
+  const child = fakeProbeChild(null);
+  child.stdin = new Writable({
+    write(_chunk, _encoding, callback) { callback(); },
+    final(callback) {
+      child.stdout.write("x".repeat(70 * 1024));
+      callback();
+    },
+  });
+  await assert.rejects(
+    launcherTest.probeManagedCliStdio("fixture", 100, {
+      spawn: () => child,
+      terminationGraceMs: 5,
+      forceKillGraceMs: 20,
+    }),
+    /stdio_initialize_stdout_limit/u,
+  );
+});
+
+test("managed cli extracts zip and tar.gz with Node platform APIs", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-native-extract-"));
+  const content = Buffer.from("native archive fixture\n");
+  try {
+    for (const extension of ["zip", "tar.gz"]) {
+      const archive = join(dataDir, `fixture.${extension}`);
+      const destination = join(dataDir, `extract-${extension.replace(".", "-")}`);
+      await writeArchiveFixture(archive, "release/bin/codestory-cli", content);
+      launcherTest.extractArchive(archive, destination);
+      assert.deepEqual(await readFile(join(destination, "release", "bin", "codestory-cli")), content);
+    }
+    const descriptorArchive = join(dataDir, "descriptor.zip");
+    await writeFile(
+      descriptorArchive,
+      zipFixture("release/bin/codestory-cli", content, { dataDescriptor: true }),
+    );
+    const descriptorDestination = join(dataDir, "extract-descriptor");
+    launcherTest.extractArchive(descriptorArchive, descriptorDestination);
+    assert.deepEqual(
+      await readFile(join(descriptorDestination, "release", "bin", "codestory-cli")),
+      content,
+    );
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli archive extraction fails closed on bombs and malformed metadata", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-bad-archive-"));
+  const content = Buffer.from("fixture\n");
+  const extract = (archive) => launcherTest.extractArchive(archive, join(dataDir, `out-${Math.random()}`));
+  try {
+    const crcArchive = join(dataDir, "crc.zip");
+    const crcBytes = zipFixture("release/codestory-cli", content);
+    const central = crcBytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    crcBytes.writeUInt32LE(0, 14);
+    crcBytes.writeUInt32LE(0, central + 16);
+    await writeFile(crcArchive, crcBytes);
+    assert.throws(() => extract(crcArchive), /zip_entry_crc_mismatch/u);
+
+    const bombArchive = join(dataDir, "bomb.zip");
+    const bombBytes = zipFixture("release/codestory-cli", content);
+    const bombCentral = bombBytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    bombBytes.writeUInt32LE(300 * 1024 * 1024, bombCentral + 24);
+    await writeFile(bombArchive, bombBytes);
+    assert.throws(() => extract(bombArchive), /archive_entry_size_limit_exceeded/u);
+
+    const nameArchive = join(dataDir, "name.zip");
+    const nameBytes = zipFixture("release/codestory-cli", content);
+    nameBytes[30] ^= 1;
+    await writeFile(nameArchive, nameBytes);
+    assert.throws(() => extract(nameArchive), /zip_local_name_mismatch/u);
+
+    for (const [label, mutate] of [
+      ["flags", (bytes) => bytes.writeUInt16LE(0x808, 6)],
+      ["method", (bytes) => bytes.writeUInt16LE(0, 8)],
+      ["crc", (bytes) => bytes.writeUInt32LE(0, 14)],
+      ["compressed-size", (bytes) => bytes.writeUInt32LE(1, 18)],
+      ["uncompressed-size", (bytes) => bytes.writeUInt32LE(1, 22)],
+    ]) {
+      const archive = join(dataDir, `local-${label}.zip`);
+      const bytes = zipFixture("release/codestory-cli", content);
+      mutate(bytes);
+      await writeFile(archive, bytes);
+      assert.throws(() => extract(archive), /zip_local_metadata_mismatch/u);
+    }
+
+    const descriptorArchive = join(dataDir, "bad-descriptor.zip");
+    const descriptorBytes = zipFixture("release/codestory-cli", content, { dataDescriptor: true });
+    const descriptorCentral = descriptorBytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    descriptorBytes.writeUInt32LE(0, descriptorCentral - 12);
+    await writeFile(descriptorArchive, descriptorBytes);
+    assert.throws(() => extract(descriptorArchive), /zip_data_descriptor_mismatch/u);
+
+    const commentArchive = join(dataDir, "comment.zip");
+    const commentBytes = zipFixture("release/codestory-cli", content);
+    commentBytes.writeUInt16LE(4, commentBytes.length - 2);
+    await writeFile(commentArchive, commentBytes);
+    assert.throws(() => extract(commentArchive), /zip_end_of_central_directory_missing/u);
+
+    for (const [name, mode] of [["../escape", 0o100755], ["release/link", 0o120777]]) {
+      const archive = join(dataDir, `${mode}.zip`);
+      const bytes = zipFixture(name, content);
+      const directory = bytes.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+      bytes.writeUInt32LE((mode << 16) >>> 0, directory + 38);
+      await writeFile(archive, bytes);
+      assert.throws(
+        () => extract(archive),
+        mode === 0o120777 ? /zip_symlink_unsupported/u : /archive_path_escape/u,
+      );
+    }
+
+    const malformedTar = join(dataDir, "malformed.tar.gz");
+    const malformed = gunzipSync(tarGzFixture("release/codestory-cli", content));
+    malformed.fill("z".charCodeAt(0), 124, 136);
+    rewriteTarChecksum(malformed.subarray(0, 512));
+    await writeFile(malformedTar, gzipSync(malformed));
+    assert.throws(() => extract(malformedTar), /tar_numeric_field_invalid/u);
+
+    const unterminatedTar = join(dataDir, "unterminated.tar.gz");
+    const unterminated = gunzipSync(tarGzFixture("release/codestory-cli", content));
+    await writeFile(unterminatedTar, gzipSync(unterminated.subarray(0, unterminated.length - 512)));
+    assert.throws(() => extract(unterminatedTar), /tar_terminator_invalid|tar_terminator_missing/u);
+
+    const tarBomb = join(dataDir, "bomb.tar.gz");
+    const tarBombBytes = gunzipSync(tarGzFixture("release/codestory-cli", content));
+    tarField(tarBombBytes, 124, 12, 300 * 1024 * 1024);
+    rewriteTarChecksum(tarBombBytes.subarray(0, 512));
+    await writeFile(tarBomb, gzipSync(tarBombBytes));
+    assert.throws(() => extract(tarBomb), /archive_entry_size_limit_exceeded/u);
+
+    for (const [label, type] of [["extended", "x"], ["global", "g"]]) {
+      const paxTar = join(dataDir, `bad-pax-${label}.tar.gz`);
+      const paxBytes = gunzipSync(tarGzFixture("PaxHeader", Buffer.from("8x p=a\n")));
+      paxBytes[156] = type.charCodeAt(0);
+      rewriteTarChecksum(paxBytes.subarray(0, 512));
+      await writeFile(paxTar, gzipSync(paxBytes));
+      assert.throws(() => extract(paxTar), /tar_pax_length_invalid/u);
+    }
+
+    for (const [filename, type, expected] of [
+      ["../escape", "0", /archive_path_escape/u],
+      ["release/link", "2", /tar_entry_type_unsupported/u],
+    ]) {
+      const archive = join(dataDir, `tar-${type.charCodeAt(0)}.tar.gz`);
+      const bytes = gunzipSync(tarGzFixture("release/codestory-cli", content));
+      bytes.fill(0, 0, 100);
+      bytes.write(filename, 0, 100, "utf8");
+      bytes[156] = type.charCodeAt(0);
+      rewriteTarChecksum(bytes.subarray(0, 512));
+      await writeFile(archive, gzipSync(bytes));
+      assert.throws(() => extract(archive), expected);
+    }
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli pending-owner cleanup skips identity probes for 64 young live records", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-young-pending-"));
+  const root = join(dataDir, "codestory-cli");
+  await mkdir(root);
+  let identityProbes = 0;
+  try {
+    for (let index = 0; index < 64; index += 1) {
+      const token = index.toString(16).padStart(32, "0");
+      await writeFile(
+        join(root, `.retention-lock.owner-${process.pid}-${token}`),
+        JSON.stringify({
+          pid: process.pid,
+          purpose: "waiter",
+          token,
+          process_start_identity: "young-live-owner",
+          started_at: new Date().toISOString(),
+        }),
+      );
+    }
+
+    assert.equal(launcherTest.reclaimStaleManagedCliPendingOwners(root, true, () => {
+      identityProbes += 1;
+      return "young-live-owner";
+    }), 0);
+    assert.equal(identityProbes, 0);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli publication removes a killed waiter's pending owner", { timeout: 15000 }, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-killed-waiter-"));
+  const root = join(dataDir, "codestory-cli");
+  const launcherPath = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  await mkdir(root);
+  const held = launcherTest.acquireManagedCliLock(root, "holder");
+  assert.ok(held);
+  const childScript = String.raw`
+    require(process.argv[1])._test.acquireManagedCliLock(process.argv[2], 'waiter', 60000);
+  `;
+  const waiter = spawn(process.execPath, ["-e", childScript, launcherPath, root], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let waiterStderr = "";
+  waiter.stderr.on("data", (chunk) => { waiterStderr += chunk; });
+  const completed = once(waiter, "close");
+  try {
+    const prefix = `.retention-lock.owner-${waiter.pid}-`;
+    const deadline = Date.now() + 5000;
+    let pending;
+    while (Date.now() < deadline && !pending) {
+      pending = (await readdir(root)).find((name) => name.startsWith(prefix));
+      if (!pending) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(pending, waiterStderr);
+    waiter.kill("SIGKILL");
+    await completed;
+    await access(join(root, pending));
+
+    launcherTest.releaseManagedCliLock(held);
+    const recovered = launcherTest.acquireManagedCliLock(root, "recovered");
+    assert.ok(recovered);
+    launcherTest.releaseManagedCliLock(recovered);
+    assert.equal(
+      (await readdir(root)).some((name) => name.startsWith(".retention-lock.owner-")),
+      false,
+    );
+  } finally {
+    waiter.kill("SIGKILL");
+    await completed;
+    try { launcherTest.releaseManagedCliLock(held); } catch {}
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli publication recovers a killed initializer before owner publication", { timeout: 15000 }, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-lock-initialization-"));
+  const root = join(dataDir, "codestory-cli");
+  const lockPath = join(root, ".retention-lock");
+  const readyPath = join(dataDir, "initializer-ready");
+  const launcherPath = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const childScript = String.raw`
+    const fs = require('fs');
+    const path = require('path');
+    const launcher = require(process.argv[1])._test;
+    const root = process.argv[2];
+    const ready = process.argv[3];
+    const linkSync = fs.linkSync;
+    fs.linkSync = (existing, destination) => {
+      if (path.basename(destination) === 'owner.json') {
+        fs.writeFileSync(ready, 'ready');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);
+      }
+      return linkSync(existing, destination);
+    };
+    launcher.acquireManagedCliLock(root, 'initializer', 1000);
+  `;
+  await mkdir(root, { recursive: true });
+  const initializer = spawn(process.execPath, ["-e", childScript, launcherPath, root, readyPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let initializerStderr = "";
+  initializer.stderr.on("data", (chunk) => { initializerStderr += chunk; });
+  const completed = once(initializer, "close");
+  try {
+    await waitForPath(readyPath);
+    await access(lockPath);
+    await assert.rejects(access(join(lockPath, "owner.json")));
+    const initializationOwner = JSON.parse(await readFile(`${lockPath}.initializing`, "utf8"));
+    assert.equal(initializationOwner.pid, initializer.pid);
+
+    const blocked = launcherTest.acquireManagedCliLock(root, "live-contender", 100);
+    assert.equal(blocked, null, "a live initializer must retain its claim");
+    await access(`${lockPath}.initializing`);
+    await assert.rejects(access(join(lockPath, "owner.json")));
+
+    initializer.kill("SIGKILL");
+    await completed;
+    const startedAt = Date.now();
+    const recovered = launcherTest.acquireManagedCliLock(root, "recovered", 2000);
+    assert.ok(recovered, initializerStderr);
+    assert.equal(recovered.waited, true);
+    assert.equal(recovered.reclaimed, true);
+    assert.ok(Date.now() - startedAt < 2000, "recovery must beat the waiter timeout");
+    launcherTest.releaseManagedCliLock(recovered);
+    await assert.rejects(access(lockPath));
+    await assert.rejects(access(`${lockPath}.initializing`));
+    assert.equal(
+      (await readdir(root)).some((name) => name.startsWith(".retention-lock.owner-")),
+      false,
+    );
+  } finally {
+    initializer.kill("SIGKILL");
+    await completed;
     await rm(dataDir, { recursive: true, force: true });
   }
 });
@@ -1495,7 +2266,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
   }
 });
 
-test("bootstrap-status fails open when plugin-root launch lacks project state", async () => {
+test("bootstrap-status rejects missing and invalid project selection", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-no-project-"));
@@ -1551,14 +2322,41 @@ test("bootstrap-status fails open when plugin-root launch lacks project state", 
     assert.equal(status.ready, false);
     assert.equal(status.degraded_reason, "project_root_unavailable");
     assert.equal(status.project_root, null);
-    assert.equal(status.project_root_source, "plugin_active_state_missing");
+    assert.equal(status.project_root_source, "request_argument_missing");
     assert.equal(status.readiness[0].goal, "project_root");
+
+    for (const explicit of [
+      { args: ["--project", join(dataDir, "missing-project")], env: {}, source: "argument_invalid" },
+      { args: [], env: { CODESTORY_PROJECT_ROOT: join(dataDir, "missing-project") }, source: "env_invalid" },
+    ]) {
+      const invalid = spawnSync(process.execPath, [launcher, "bootstrap-status", ...explicit.args], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          ...explicit.env,
+          CODESTORY_CLI: cliPath,
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_LOG: logFile,
+          TEST_OUT: marker,
+        },
+        encoding: "utf8",
+        timeout: 5000,
+      });
+      assert.equal(invalid.status, 0, invalid.stderr);
+      const invalidStatus = JSON.parse(invalid.stdout.trim());
+      assert.equal(invalidStatus.ready, false);
+      assert.equal(invalidStatus.degraded_reason, "project_root_invalid");
+      assert.equal(invalidStatus.project_root, null);
+      assert.equal(invalidStatus.project_root_source, explicit.source);
+    }
+    await assert.rejects(access(marker));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
 });
 
-test("bootstrap-status carries Rust agent readiness into runtime truth", async () => {
+test("bootstrap-status binds Rust readiness to request-scoped project identity", async () => {
   const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-bootstrap-agent-ready-"));
@@ -1572,12 +2370,18 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
       "const args = process.argv.slice(2);",
       "fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\\n');",
       "if (args[0] === '--version') { console.log('codestory-cli ' + process.env.TEST_CODESTORY_VERSION); process.exit(0); }",
+      "if (args[0] === 'cache' && args[1] === 'identity') {",
+      "  const project = args[args.indexOf('--project') + 1];",
+      "  console.log(JSON.stringify({ project, project_identity_schema_version: 3, project_id: 'project-123', workspace_id: 'workspace-123', artifact_scope_id: 'project-123', portable_reuse_eligible: true, legacy_alias_disposition: 'unavailable_without_provenance', legacy_project_id: null }));",
+      "  process.exit(0);",
+      "}",
       "if (args[0] === 'ready' && args.includes('--goal') && args.includes('local')) {",
       "  console.log(JSON.stringify({ verdicts: [{ goal: 'local_navigation', status: 'ready', summary: 'ready', minimum_next: [], full_repair: [] }], local_refresh: { state: 'fresh', reason: 'already_fresh', blocks_local_surfaces: false, readiness_status: 'ready', changed_file_count: 0, new_file_count: 0, removed_file_count: 0, fatal_error_count: 0 } }));",
       "  process.exit(0);",
       "}",
       "if (args[0] === 'ready' && args.includes('--goal') && args.includes('agent')) {",
-      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'zoekt_unreachable' } }, readiness_broker: { schema_version: 2, project_id: 'project-123', persistence_status: 'observed' } }));",
+      "  const workspaceId = process.env.TEST_STALE_IDENTITY === '1' ? 'workspace-stale' : 'workspace-123';",
+      "  console.log(JSON.stringify({ verdicts: [{ goal: 'agent_packet_search', status: 'ready', summary: 'agent ready', minimum_next: [], full_repair: [] }], readiness_lanes: { agent_packet_search: { status: 'ready', profile: 'agent', run_id: 'shared-agent', sidecar_mode: 'full', next_command: 'codestory-cli retrieval status --profile agent --run-id shared-agent --format json' }, local_default: { status: 'repair_retrieval', profile: 'local', sidecar_mode: 'unavailable', degraded_reason: 'lexical_shard_unavailable' } }, readiness_broker: { schema_version: 3, identity: { project_identity_schema_version: 3, project_id: 'project-123', workspace_id: workspaceId }, project_id: 'project-123', persistence_status: 'observed' } }));",
       "  process.exit(0);",
       "}",
       "process.exit(2);",
@@ -1607,8 +2411,16 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
     assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
     assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
+    assert.equal(status.project_identity.project_identity_schema_version, 3);
+    assert.equal(status.project_identity.project_id, "project-123");
+    assert.equal(status.project_identity.workspace_id, "workspace-123");
     assert.deepEqual(status.readiness_broker, {
-      schema_version: 2,
+      schema_version: 3,
+      identity: {
+        project_identity_schema_version: 3,
+        project_id: "project-123",
+        workspace_id: "workspace-123",
+      },
       project_id: "project-123",
       persistence_status: "observed",
     });
@@ -1616,10 +2428,30 @@ test("bootstrap-status carries Rust agent readiness into runtime truth", async (
     const calls = (await readFile(logFile, "utf8")).trim().split(/\r?\n/u).map((line) => JSON.parse(line));
     assert.deepEqual(calls.map((args) => args.slice(0, 3)), [
       ["--version"],
+      ["cache", "identity", "--project"],
       ["ready", "--goal", "local"],
       ["ready", "--goal", "agent"],
     ]);
     assert.equal(calls.some((args) => args.includes("--repair")), false);
+
+    const stale = spawnSync(process.execPath, [launcher, "bootstrap-status", "--project", dataDir], {
+      cwd: pluginRoot,
+      env: {
+        ...process.env,
+        CODESTORY_CLI: cliPath,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_LOG: logFile,
+        TEST_STALE_IDENTITY: "1",
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(stale.status, 0, stale.stderr);
+    const staleStatus = JSON.parse(stale.stdout.trim());
+    assert.equal(staleStatus.ready, false);
+    assert.equal(staleStatus.degraded_reason, "readiness_broker_identity_mismatch");
+    assert.equal(staleStatus.project_root, await realpath(dataDir));
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(binDir, { recursive: true, force: true });
@@ -1666,7 +2498,11 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
     await writeFile(
@@ -1683,6 +2519,7 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
         PLUGIN_DATA: "",
         COPILOT_PLUGIN_DATA: "",
         TEST_OUT: outFile,
+        TEST_CODESTORY_VERSION: version,
         PATH: pathDir,
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -1694,8 +2531,8 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
     assert.equal(observed.source, "managed");
-    assert.equal(observed.path, cliPath);
-    assert.equal(observed.pluginRoot, installRoot);
+    assert.equal(await realpath(observed.path), await realpath(cliPath));
+    assert.equal(await realpath(observed.pluginRoot), await realpath(installRoot));
     assert.equal(observed.pluginCacheVersion, version);
     assert.equal(observed.dirtyMarkerPath, undefined);
   } finally {
@@ -1969,7 +2806,6 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
 });
 
 test("mcp launcher fails open when managed cli probe fails", async () => {
-  const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-managed-"));
   const cliDir = join(dataDir, "codestory-cli", version);
@@ -1998,27 +2834,57 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
 
-    const result = spawnSync(process.execPath, [launcher], {
+    const child = spawn(process.execPath, [launcher], {
       env: {
+        ...process.env,
         PLUGIN_DATA: dataDir,
+        CODESTORY_PLUGIN_RELEASE_DIR: join(dataDir, "missing-release"),
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
-      input,
-      encoding: "utf8",
-      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
     });
-
-    assert.equal(result.status, 0, result.stderr);
-    const response = JSON.parse(result.stdout.trim());
+    const completed = once(child, "close");
+    let buffer = "";
+    const responses = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/u);
+      buffer = lines.pop() || "";
+      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
+    });
+    child.stdin.write(input);
+    const firstDeadline = Date.now() + 2000;
+    while (Date.now() < firstDeadline && responses.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const firstReason = JSON.parse(responses[0].result.contents[0].text).degraded_reason;
+    assert.equal([
+      "managed_cli_provisioning",
+      "managed_cli_provision_failed:managed_cli_asset_fetch_failed",
+    ].includes(firstReason), true);
+    if (firstReason === "managed_cli_provisioning") {
+      await waitForPath(join(dataDir, ".codestory-mcp-runtime.json"));
+      child.stdin.end(input.replace('"status"', '"terminal"'));
+    } else {
+      child.stdin.end();
+    }
+    const [exitCode] = await completed;
+    assert.equal(exitCode, 0);
+    const response = responses.find((entry) => entry.id === "terminal") || responses[0];
     const status = JSON.parse(response.result.contents[0].text);
     assert.equal(
       status.readiness[0].repair_reason,
-      "managed_cli_unspawnable",
+      "managed_cli_provision_failed:managed_cli_asset_fetch_failed",
     );
     assert.equal(
       status.plugin_runtime.plugin_version,
@@ -2086,7 +2952,11 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
       .digest("hex");
     await writeFile(
       join(cliDir, "manifest.json"),
-      JSON.stringify({ path: process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli", sha256 }),
+      JSON.stringify(managedReleaseManifest(
+        version,
+        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
+        sha256,
+      )),
       "utf8",
     );
     await writeFile(
@@ -2099,6 +2969,7 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
       env: {
         PLUGIN_DATA: dataDir,
         TEST_LOG: logFile,
+        TEST_CODESTORY_VERSION: version,
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
@@ -2129,14 +3000,7 @@ test("enabled sidecar policy defers repair until after MCP startup", async () =>
   }
 });
 
-test("mcp launcher provisions a checksummed release asset into plugin data", async (t) => {
-  const { spawnSync } = await import("node:child_process");
-  const tarProbe = spawnSync("tar", ["--version"], { encoding: "utf8" });
-  if (tarProbe.status !== 0) {
-    t.skip("tar unavailable for archive fixture");
-    return;
-  }
-
+test("mcp launcher upgrades a verified prior managed cli to the checksummed release", async () => {
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-provisioned-cli-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-release-"));
@@ -2149,13 +3013,35 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
   const archivePath = join(releaseDir, archiveName);
 
   try {
+    const priorVersion = "0.0.0";
+    const priorRelease = releaseAssetForPlatform(priorVersion);
+    const priorDir = join(dataDir, "codestory-cli", priorVersion);
+    const priorCli = join(priorDir, "bin", cliName);
+    await mkdir(dirname(priorCli), { recursive: true });
+    if (process.platform === "win32") {
+      await writeFile(priorCli, `@echo off\r\nif "%1"=="--version" (echo codestory-cli ${priorVersion}& exit /b 0)\r\nexit /b 90\r\n`, "utf8");
+    } else {
+      await writeFile(priorCli, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codestory-cli ${priorVersion}'; exit 0; fi\nexit 90\n`, "utf8");
+      await chmod(priorCli, 0o755);
+    }
+    const priorSha256 = createHash("sha256").update(await readFile(priorCli)).digest("hex");
+    await writeFile(join(priorDir, "manifest.json"), JSON.stringify({
+      path: `bin/${cliName}`,
+      sha256: priorSha256,
+      version: priorVersion,
+      build_source: "github_release",
+      repo_ref: `v${priorVersion}`,
+      archive: priorRelease.archiveName,
+      archive_url: pathToFileURL(join(releaseDir, priorRelease.archiveName)).toString(),
+      archive_sha256: "0".repeat(64),
+      target: priorRelease.archiveBase.slice(`codestory-cli-v${priorVersion}-`.length),
+      provisioned_at: "1970-01-01T00:00:00.000Z",
+      stdio_initialize_verified: true,
+    }), "utf8");
+
     await mkdir(stageDir, { recursive: true });
     await writeFakeCli(cliPath);
-    const packArgs = archiveName.endsWith(".zip")
-      ? ["-a", "-cf", archivePath, "-C", releaseDir, archiveBase]
-      : ["-czf", archivePath, "-C", releaseDir, archiveBase];
-    const pack = spawnSync("tar", packArgs, { encoding: "utf8" });
-    assert.equal(pack.status, 0, pack.stderr);
+    await writeArchiveFixture(archivePath, `${archiveBase}/${cliName}`, await readFile(cliPath));
     const archiveSha256 = createHash("sha256")
       .update(await readFile(archivePath))
       .digest("hex");
@@ -2165,17 +3051,13 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
       "utf8",
     );
 
-    const result = spawnSync(process.execPath, [launcher], {
-      env: {
-        ...process.env,
-        CODESTORY_CLI: "",
-        CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
-        PLUGIN_DATA: dataDir,
-        TEST_OUT: outFile,
-        TEST_CODESTORY_VERSION: version,
-      },
-      encoding: "utf8",
+    const launched = spawnLauncher(launcher, {
+      CODESTORY_PLUGIN_RELEASE_DIR: releaseDir,
+      PLUGIN_DATA: dataDir,
+      TEST_OUT: outFile,
+      TEST_CODESTORY_VERSION: version,
     });
+    const result = await launched.completed;
 
     assert.equal(result.status, 0, result.stderr);
     const observed = JSON.parse(await readFile(outFile, "utf8"));
@@ -2184,6 +3066,14 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     assert.equal(observed.repoRef, `v${version}`);
     assert.equal(observed.buildSource, "github_release");
     assert.equal(observed.archiveSha256, archiveSha256);
+    assert.notEqual(observed.path, priorCli);
+    const retention = JSON.parse(observed.retention);
+    assert.equal(retention.active_version, version);
+    assert.equal(
+      retention.retained.some((entry) => entry.version === priorVersion && entry.reason === "rollback"),
+      true,
+      JSON.stringify(retention),
+    );
     assert.match(
       observed.path,
       new RegExp(String.raw`codestory-cli[\\/]+${version.replaceAll(".", String.raw`\.`)}[\\/]bin[\\/]codestory-cli`, "u"),
@@ -2198,10 +3088,545 @@ test("mcp launcher provisions a checksummed release asset into plugin data", asy
     assert.equal(manifest.build_source, "github_release");
     assert.equal(manifest.archive, archiveName);
     assert.equal(manifest.archive_sha256, archiveSha256);
+    assert.equal(manifest.stdio_initialize_verified, true);
     assert.equal(typeof manifest.sha256, "string");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("mcp launcher serves diagnostics while managed provisioning runs, then hands off", { timeout: 30000 }, async () => {
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-background-provision-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-background-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const outFile = join(dataDir, "runtime.json");
+  let child;
+  let server;
+  let releaseAssets = () => {};
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version, writeLifecycleCli);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    const assetGate = new Promise((resolve) => { releaseAssets = resolve; });
+    server = createServer(async (request, response) => {
+      await assetGate;
+      const body = assets.get(request.url);
+      if (!body) return response.writeHead(404).end();
+      response.writeHead(200).end(body);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    child = spawn(process.execPath, [launcher], {
+      env: {
+        ...process.env,
+        CODESTORY_CLI: "",
+        CODESTORY_PLUGIN_RELEASE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+        PLUGIN_DATA: dataDir,
+        TEST_CODESTORY_VERSION: version,
+        TEST_OUT: outFile,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const completed = once(child, "close");
+    let buffered = "";
+    const responses = [];
+    const waiters = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      const lines = buffered.split(/\r?\n/u);
+      buffered = lines.pop() || "";
+      for (const line of lines.filter(Boolean)) {
+        const response = JSON.parse(line);
+        if (waiters.length) waiters.shift()(response); else responses.push(response);
+      }
+    });
+    const nextResponse = () => responses.shift() || Promise.race([
+      new Promise((resolve) => waiters.push(resolve)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for diagnostic MCP")), 2000)),
+    ]);
+    const request = async (message) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+      return nextResponse();
+    };
+
+    const initialized = await request({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    });
+    assert.equal(initialized.result.serverInfo.name, "codestory");
+    assert.equal(initialized.result.capabilities.tools.listChanged, true);
+    assert.equal(initialized.result.capabilities.prompts.listChanged, true);
+    const statusResponse = await request({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "resources/read",
+      params: { uri: "codestory://status" },
+    });
+    const status = JSON.parse(statusResponse.result.contents[0].text);
+    assert.equal(status.degraded_reason, "managed_cli_provisioning");
+    assert.equal(status.runtime_boundary.restart_required_for_runtime_change, false);
+
+    releaseAssets();
+    const runtimeMetadata = join(dataDir, ".codestory-mcp-runtime.json");
+    await waitForPath(runtimeMetadata);
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const metadata = JSON.parse(await readFile(runtimeMetadata, "utf8"));
+      if (metadata.source === "managed") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(JSON.parse(await readFile(runtimeMetadata, "utf8")).source, "managed");
+    assert.equal(
+      responses.some((response) => response.method === "notifications/tools/list_changed"),
+      false,
+    );
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
+    const notificationDeadline = Date.now() + 2000;
+    while (
+      Date.now() < notificationDeadline &&
+      !responses.some((response) => response.method === "notifications/tools/list_changed")
+    ) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(
+      responses.some((response) => response.method === "notifications/tools/list_changed"),
+      true,
+    );
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" })}\n`);
+    let handedOff = null;
+    const handoffDeadline = Date.now() + 2000;
+    while (Date.now() < handoffDeadline && !handedOff) {
+      try {
+        handedOff = JSON.parse(await readFile(outFile, "utf8"));
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    assert.ok(handedOff);
+    assert.equal(handedOff.initialized, true);
+    assert.equal(handedOff.notified, true);
+    assert.deepEqual(handedOff.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "resources/list" })}\n`);
+    const failureDeadline = Date.now() + 2000;
+    while (Date.now() < failureDeadline && !responses.some((response) => response.id === 4)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(responses.filter((response) => response.id === 4).length, 1);
+    assert.deepEqual(responses.find((response) => response.id === 4)?.result.resources, []);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "resources/read",
+      params: { uri: "codestory://status" },
+    })}\n`);
+    const recoveryDeadline = Date.now() + 2000;
+    while (Date.now() < recoveryDeadline && !responses.some((response) => response.id === 5)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const recoveredStatus = responses.find((response) => response.id === 5);
+    assert.equal(
+      JSON.parse(recoveredStatus.result.contents[0].text).degraded_reason,
+      "runtime_stdio_child_exit",
+    );
+    child.stdin.end();
+    assert.equal((await completed)[0], 0);
+    child = null;
+  } finally {
+    releaseAssets();
+    if (child) child.kill("SIGKILL");
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed publication waiter keeps diagnostic MCP responsive", { timeout: 15000 }, async () => {
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-responsive-waiter-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-responsive-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  let publisher;
+  let waiter;
+  let server;
+  let releaseAssets = () => {};
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    const gate = new Promise((resolve) => { releaseAssets = resolve; });
+    server = createServer(async (request, response) => {
+      await gate;
+      response.writeHead(200).end(assets.get(request.url));
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const env = {
+      ...process.env,
+      CODESTORY_CLI: "",
+      CODESTORY_PLUGIN_RELEASE_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+      PLUGIN_DATA: dataDir,
+      TEST_CODESTORY_VERSION: version,
+    };
+    publisher = spawn(process.execPath, [launcher], { env, stdio: ["pipe", "pipe", "pipe"] });
+    publisher.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } })}\n`);
+    await waitForPath(join(dataDir, "codestory-cli", ".retention-lock", "owner.json"));
+
+    waiter = spawn(process.execPath, [launcher], { env, stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    waiter.stdout.setEncoding("utf8");
+    waiter.stdout.on("data", (chunk) => { output += chunk; });
+    waiter.stdin.write([
+      JSON.stringify({ jsonrpc: "2.0", id: 2, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+      JSON.stringify({ jsonrpc: "2.0", id: 3, method: "resources/read", params: { uri: "codestory://status" } }),
+      "",
+    ].join("\n"));
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && !output.split(/\r?\n/u).some((line) => {
+      if (!line) return false;
+      return JSON.parse(line).id === 3;
+    })) await new Promise((resolve) => setTimeout(resolve, 10));
+    const statusResponse = output.split(/\r?\n/u).filter(Boolean)
+      .map((line) => JSON.parse(line)).find((response) => response.id === 3);
+    assert.ok(statusResponse, output);
+    assert.equal(JSON.parse(statusResponse.result.contents[0].text).degraded_reason, "managed_cli_provisioning");
+  } finally {
+    releaseAssets();
+    for (const child of [publisher, waiter]) {
+      if (child && child.exitCode === null) child.kill("SIGKILL");
+    }
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic handoff recovers a child spawn error", { timeout: 5000 }, async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    "const {EventEmitter}=require('node:events');",
+    "const {PassThrough}=require('node:stream');",
+    "let failed=false;",
+    "const status=()=>({plugin_runtime:{plugin_version:'test'},degraded_reason:failed?'managed_cli_handoff_unspawnable':'managed_cli_provisioning',recommended_next_calls:[]});",
+    "run(status,{shouldHandoff:()=>!failed,startRuntime:()=>{const child=new EventEmitter();child.stdin=new PassThrough();child.stdout=new PassThrough();child.stderr=new PassThrough();process.nextTick(()=>child.emit('error',new Error('synthetic spawn error')));return child},onRuntimeFailure:()=>{failed=true}});",
+  ].join("");
+  const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+  const completed = once(child, "close");
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stdin.write([
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    "",
+  ].join("\n"));
+  const errorDeadline = Date.now() + 2000;
+  while (Date.now() < errorDeadline && !output.split(/\r?\n/u).filter(Boolean)
+    .map((line) => JSON.parse(line)).some((response) => response.id === 2)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  child.stdin.end(`${JSON.stringify({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  })}\n`);
+  assert.equal((await completed)[0], 0);
+  const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(responses.find((response) => response.id === 2)?.error.code, -32000);
+  const status = JSON.parse(responses.find((response) => response.id === 3).result.contents[0].text);
+  assert.equal(status.degraded_reason, "managed_cli_handoff_unspawnable");
+});
+
+test("managed cli publication is single-flight and atomically visible across two processes", { timeout: 30000 }, async () => {
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-publication-contention-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-publication-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const outA = join(dataDir, "a.json");
+  const outB = join(dataDir, "b.json");
+  const probeLog = join(dataDir, "probes.log");
+  let server;
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    const requests = [];
+    server = createServer((request, response) => {
+      requests.push(request.url);
+      const body = assets.get(request.url);
+      if (!body) {
+        response.writeHead(404).end();
+        return;
+      }
+      setTimeout(() => response.writeHead(200).end(body), requests.length === 1 ? 250 : 0);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const baseUrl = `http://publication-secret@127.0.0.1:${server.address().port}`;
+    const common = {
+      CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+      PLUGIN_DATA: dataDir,
+      TEST_CODESTORY_VERSION: version,
+      CODESTORY_TEST_PROBE_LOG: probeLog,
+    };
+    const first = spawnLauncher(launcher, { ...common, TEST_OUT: outA });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const second = spawnLauncher(launcher, { ...common, TEST_OUT: outB });
+    const versionDir = join(dataDir, "codestory-cli", version);
+    let finished = false;
+    const visibility = (async () => {
+      while (!finished) {
+        try {
+          await access(versionDir);
+        } catch (error) {
+          if (error.code === "ENOENT") {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            continue;
+          }
+          throw error;
+        }
+        const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+        const executable = join(versionDir, ...manifest.path.split("/"));
+        const actual = createHash("sha256").update(await readFile(executable)).digest("hex");
+        assert.equal(actual, manifest.sha256);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    })();
+    const results = await Promise.all([first.completed, second.completed]);
+    finished = true;
+    await visibility;
+    for (const result of results) assert.equal(result.status, 0, result.stderr);
+    for (const file of [outA, outB]) {
+      await access(file).catch(() => assert.fail(JSON.stringify(results)));
+    }
+    const observed = await Promise.all([outA, outB].map(async (file) => JSON.parse(await readFile(file, "utf8"))));
+    assert.equal(observed[0].path, observed[1].path);
+    assert.equal(observed[0].sha256, observed[1].sha256);
+    const publishedManifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+    assert.doesNotMatch(publishedManifest.archive_url, /publication-secret/u);
+    assert.equal(requests.filter((url) => url === "/SHA256SUMS.txt").length, 1, JSON.stringify(requests));
+    assert.equal(requests.filter((url) => url === `/${fixture.archiveName}`).length, 1, JSON.stringify(requests));
+    assert.equal((await readFile(probeLog, "utf8")).trim().split(/\r?\n/u).filter(Boolean).length, 1);
+    assert.equal(observed.some((entry) => entry.warnings.includes("managed_cli_publication:publisher")), true);
+    assert.equal(observed.some((entry) => entry.warnings.includes("managed_cli_publication:waiter")), true);
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli publication reclaims crashes after lock and before publication", { timeout: 45000 }, async () => {
+  const { createServer } = await import("node:http");
+  const version = await readPluginVersion();
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-crash-release-"));
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  let server;
+  try {
+    const fixture = await writeReleaseFixture(releaseDir, version);
+    const assets = new Map([
+      ["/SHA256SUMS.txt", await readFile(fixture.sumsPath)],
+      [`/${fixture.archiveName}`, await readFile(fixture.archivePath)],
+    ]);
+    let holdResponses = true;
+    server = createServer((request, response) => {
+      const body = assets.get(request.url);
+      if (!body) return response.writeHead(404).end();
+      const send = () => response.writeHead(200).end(body);
+      if (holdResponses) setTimeout(send, 5000);
+      else send();
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+    for (const crashPoint of ["after-lock", "before-publication"]) {
+      const dataDir = await mkdtemp(join(tmpdir(), `codestory-${crashPoint}-`));
+      try {
+        const failedOut = join(dataDir, "failed.json");
+        const recoveredOut = join(dataDir, "recovered.json");
+        holdResponses = crashPoint === "after-lock";
+        const crashed = spawnLauncher(launcher, {
+          CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_OUT: failedOut,
+          CODESTORY_TEST_PROBE_DELAY_MS: crashPoint === "before-publication" ? "5000" : "0",
+        });
+        if (crashPoint === "after-lock") {
+          await waitForPath(join(dataDir, "codestory-cli", ".retention-lock", "owner.json"));
+        } else {
+          const root = join(dataDir, "codestory-cli");
+          const deadline = Date.now() + 15000;
+          while (Date.now() < deadline) {
+            const children = await readdir(root).catch(() => []);
+            if (children.some((name) => name.startsWith(`.provisioning-${version}-`))) break;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert.equal((await readdir(root)).some((name) => name.startsWith(`.provisioning-${version}-`)), true);
+        }
+        crashed.child.kill("SIGKILL");
+        await crashed.completed;
+        holdResponses = false;
+        const recovered = spawnLauncher(launcher, {
+          CODESTORY_PLUGIN_RELEASE_BASE_URL: baseUrl,
+          PLUGIN_DATA: dataDir,
+          TEST_CODESTORY_VERSION: version,
+          TEST_OUT: recoveredOut,
+          CODESTORY_TEST_PROBE_DELAY_MS: "0",
+        });
+        const result = await recovered.completed;
+        assert.equal(result.status, 0, result.stderr);
+        await access(recoveredOut).catch(() => assert.fail(JSON.stringify(result)));
+        const observed = JSON.parse(await readFile(recoveredOut, "utf8"));
+        assert.match(observed.warnings, /managed_cli_publication:reclaimed_lock/u);
+        const root = join(dataDir, "codestory-cli");
+        await access(join(root, version, "manifest.json"));
+        assert.equal(
+          (await readdir(root)).some((name) => name.startsWith(".retention-lock.owner-")),
+          false,
+        );
+      } finally {
+        await rm(dataDir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve));
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli quarantines corrupt installs, retains two, and fails closed on a locked directory", { timeout: 30000 }, async () => {
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-corrupt-install-"));
+  const releaseDir = await mkdtemp(join(tmpdir(), "codestory-corrupt-release-"));
+  const root = join(dataDir, "codestory-cli");
+  const versionDir = join(root, version);
+  const previousReleaseDir = process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+  const previousTestVersion = process.env.TEST_CODESTORY_VERSION;
+  try {
+    await writeReleaseFixture(releaseDir, version);
+    process.env.CODESTORY_PLUGIN_RELEASE_DIR = releaseDir;
+    process.env.TEST_CODESTORY_VERSION = version;
+    await launcherTest.provisionManagedCli(dataDir, version, []);
+    const corruptions = [
+      async () => writeFile(join(versionDir, "manifest.json"), "{", "utf8"),
+      async () => {
+        const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+        manifest.version = "0.0.0";
+        await writeFile(join(versionDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+      },
+      async () => {
+        const manifest = JSON.parse(await readFile(join(versionDir, "manifest.json"), "utf8"));
+        manifest.sha256 = "f".repeat(64);
+        await writeFile(join(versionDir, "manifest.json"), JSON.stringify(manifest), "utf8");
+      },
+      async () => {
+        const manifestPath = join(versionDir, "manifest.json");
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+        const executable = join(versionDir, ...manifest.path.split("/"));
+        if (process.platform === "win32") {
+          await writeFile(executable, "@echo off\r\necho codestory-cli 0.0.0\r\n", "utf8");
+        } else {
+          await writeFile(executable, "#!/bin/sh\necho codestory-cli 0.0.0\n", "utf8");
+          await chmod(executable, 0o755);
+        }
+        manifest.sha256 = createHash("sha256").update(await readFile(executable)).digest("hex");
+        await writeFile(manifestPath, JSON.stringify(manifest), "utf8");
+      },
+    ];
+    for (const corrupt of corruptions) {
+      await corrupt();
+      const warnings = [];
+      const resolved = await launcherTest.provisionManagedCli(dataDir, version, warnings);
+      assert.ok(resolved.path);
+      assert.equal(warnings.some((warning) => warning.startsWith("managed_cli_publication:quarantine:")), true);
+      assert.equal(warnings.some((warning) => warning.startsWith("managed_cli_publication:reprovision:")), true);
+    }
+    const quarantines = (await readdir(root)).filter((name) => name.startsWith(`.quarantine-${version}-`));
+    assert.equal(quarantines.length, 2, JSON.stringify(quarantines));
+
+    const lockedDir = join(root, "locked");
+    await mkdir(lockedDir);
+    assert.throws(
+      () => launcherTest.quarantineManagedCliVersion(root, lockedDir, version, "locked", {
+        renameSync() {
+          const error = new Error("locked");
+          error.code = "EPERM";
+          throw error;
+        },
+      }),
+      /managed_cli_quarantine_failed:EPERM/u,
+    );
+    await access(lockedDir);
+  } finally {
+    if (previousReleaseDir === undefined) delete process.env.CODESTORY_PLUGIN_RELEASE_DIR;
+    else process.env.CODESTORY_PLUGIN_RELEASE_DIR = previousReleaseDir;
+    if (previousTestVersion === undefined) delete process.env.TEST_CODESTORY_VERSION;
+    else process.env.TEST_CODESTORY_VERSION = previousTestVersion;
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(releaseDir, { recursive: true, force: true });
+  }
+});
+
+test("managed cli resolution fails closed on a running Windows executable", { timeout: 15000 }, async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows executable locking semantics");
+    return;
+  }
+  const version = await readPluginVersion();
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-locked-windows-cli-"));
+  const versionDir = join(dataDir, "codestory-cli", version);
+  const cliPath = join(versionDir, "bin", "codestory-cli.exe");
+  const readyPath = join(dataDir, "ready");
+  let locked;
+  try {
+    await mkdir(dirname(cliPath), { recursive: true });
+    await copyFile(process.execPath, cliPath);
+    const sha256 = createHash("sha256").update(await readFile(cliPath)).digest("hex");
+    await writeFile(
+      join(versionDir, "manifest.json"),
+      JSON.stringify(managedReleaseManifest(version, "bin/codestory-cli.exe", sha256)),
+      "utf8",
+    );
+    locked = spawn(cliPath, ["-e", `require('fs').writeFileSync(${JSON.stringify(readyPath)}, 'ready');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,60000)`], {
+      cwd: dirname(cliPath),
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    await waitForPath(readyPath);
+    await assert.rejects(
+      rm(cliPath),
+      (error) => ["EACCES", "EBUSY", "EPERM"].includes(error.code),
+    );
+
+    const warnings = [];
+    const resolved = await launcherTest.resolveManagedCli(dataDir, version, warnings);
+    assert.equal(resolved, null);
+    assert.equal(
+      warnings.some((warning) => warning.startsWith("managed_cli_publication:terminal_failure:managed_cli_quarantine_failed")),
+      true,
+      JSON.stringify(warnings),
+    );
+    await access(cliPath);
+  } finally {
+    if (locked) {
+      locked.kill("SIGKILL");
+      await once(locked, "close");
+    }
+    await rm(dataDir, { recursive: true, force: true });
   }
 });
 
@@ -2230,8 +3655,8 @@ test("startup hook records active project without runtime bootstrap", async () =
     const output = JSON.parse(result.stdout);
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY SESSION GROUNDING ACTIVE/u);
-    assert.match(context, /CodeStory MCP startup path/u);
+    assert.match(context, /CODESTORY SESSION ROUTING ACTIVE/u);
+    assert.match(context, /Task router: orientation/u);
     assert.match(context, /tool_search/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
@@ -2294,8 +3719,69 @@ test("release asset downloader retries a transient failure", async () => {
   }
 });
 
+test("release asset downloader enforces a total body deadline", async () => {
+  const { createServer } = await import("node:http");
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-deadline-"));
+  const destination = join(dataDir, "slow.bin");
+  const server = createServer((_request, response) => {
+    response.writeHead(200);
+    const interval = setInterval(() => response.write("x"), 10);
+    response.on("close", () => clearInterval(interval));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      launcherTest.downloadFile(`http://127.0.0.1:${server.address().port}/slow`, destination, {
+        attempts: 1,
+        timeoutMs: 60,
+      }),
+      /timed out.*total/u,
+    );
+    assert.ok(Date.now() - started < 1000);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("release asset downloader bounds announced and streamed bytes without partial files", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-download-bounds-"));
+  const fakeGet = (headers, body) => (_url, onResponse) => {
+    const request = new EventEmitter();
+    request.destroy = () => request;
+    process.nextTick(() => {
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = headers;
+      onResponse(response);
+      response.end(body);
+    });
+    return request;
+  };
+  try {
+    for (const [name, headers] of [
+      ["announced.bin", { "content-length": "5" }],
+      ["streamed.bin", {}],
+    ]) {
+      const destination = join(dataDir, name);
+      await assert.rejects(
+        launcherTest.downloadFile("https://example.invalid/bounded", destination, {
+          attempts: 1,
+          get: fakeGet(headers, "12345"),
+          maxBytes: 4,
+          timeoutMs: 100,
+        }),
+        /download_size_limit_exceeded/u,
+      );
+      assert.equal(fs.existsSync(destination), false);
+    }
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("mcp launcher keeps managed provision failures primary", async () => {
-  const { spawnSync } = await import("node:child_process");
   const version = await readPluginVersion();
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-managed-provision-fail-"));
   const releaseDir = await mkdtemp(join(tmpdir(), "codestory-empty-release-"));
@@ -2308,7 +3794,7 @@ test("mcp launcher keeps managed provision failures primary", async () => {
   }) + "\n";
 
   try {
-    const result = spawnSync(process.execPath, [launcher], {
+    const child = spawn(process.execPath, [launcher], {
       env: {
         ...process.env,
         CODESTORY_CLI: "",
@@ -2317,17 +3803,38 @@ test("mcp launcher keeps managed provision failures primary", async () => {
         PATH: "",
         ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
       },
-      input,
-      encoding: "utf8",
-      timeout: 5000,
+      stdio: ["pipe", "pipe", "pipe"],
     });
-
-    assert.equal(result.status, 0, result.stderr);
-    const response = JSON.parse(result.stdout.trim());
+    const completed = once(child, "close");
+    let buffer = "";
+    const responses = [];
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split(/\r?\n/u);
+      buffer = lines.pop() || "";
+      responses.push(...lines.filter(Boolean).map((line) => JSON.parse(line)));
+    });
+    child.stdin.write(input);
+    const firstDeadline = Date.now() + 2000;
+    while (Date.now() < firstDeadline && responses.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const first = JSON.parse(responses[0].result.contents[0].text);
+    if (first.degraded_reason === "managed_cli_provisioning") {
+      await waitForPath(join(dataDir, ".codestory-mcp-runtime.json"));
+      child.stdin.end(input.replace('"id":1', '"id":2'));
+    } else {
+      child.stdin.end();
+    }
+    assert.equal((await completed)[0], 0);
+    const response = responses.find((entry) => entry.id === 2) || responses[0];
     const status = JSON.parse(response.result.contents[0].text);
-    assert.match(
-      status.degraded_reason,
-      /^managed_cli_provision_failed:managed_cli_asset_fetch_failed:SHA256SUMS\.txt:elapsed_ms=\d+:attempts=1:retry=restart_reload_status:/u,
+    assert.equal(status.degraded_reason, "managed_cli_provision_failed:managed_cli_asset_fetch_failed");
+    assert.doesNotMatch(JSON.stringify(status), new RegExp(releaseDir.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+    assert.equal(
+      status.plugin_runtime.warnings.includes("managed_cli_publication:terminal_failure:managed_cli_asset_fetch_failed"),
+      true,
     );
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
     assert.equal(
@@ -2450,8 +3957,8 @@ async function writeNodeCli(binDir, source) {
   return cliPath;
 }
 
-function runCodexHook(input, env) {
-  const result = spawnSync(process.execPath, [join(pluginRoot, "hooks", "codestory-activate.cjs")], {
+function runHookProcess(script, input, env) {
+  const result = spawnSync(process.execPath, [script], {
     env: {
       ...process.env,
       COPILOT_PLUGIN_DATA: "",
@@ -2462,6 +3969,31 @@ function runCodexHook(input, env) {
   });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
+}
+
+function runCodexHook(input, env) {
+  return runHookProcess(join(pluginRoot, "hooks", "codestory-activate.cjs"), input, env);
+}
+
+async function runCodexHookAsync(input, env) {
+  const child = spawn(process.execPath, [join(pluginRoot, "hooks", "codestory-activate.cjs")], {
+    env: {
+      ...process.env,
+      COPILOT_PLUGIN_DATA: "",
+      ...env,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  child.stdin.end(JSON.stringify(input));
+  const [status] = await once(child, "close");
+  assert.equal(status, 0, stderr);
+  return JSON.parse(stdout);
 }
 
 test("hook emits MCP activation guidance without running CLI", async () => {
@@ -2484,10 +4016,14 @@ test("hook emits MCP activation guidance without running CLI", async () => {
 
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
-    assert.match(context, /CODESTORY REQUEST GROUNDING ACTIVE/u);
-    assert.match(context, /CodeStory MCP startup path/u);
+    assert.match(context, /CODESTORY REQUEST ROUTING ACTIVE/u);
+    assert.match(context, /Route: Symbol ownership/u);
     assert.match(context, /codestory mcp ground status packet search/u);
-    assert.match(context, /Do not treat hook text as grounding evidence/u);
+    assert.match(context, /absolute repository cwd/u);
+    assert.match(context, /local graph surfaces before source/u);
+    assert.match(context, /Repair only when packet\/search is required/u);
+    assert.match(context, /Hook text routes; only live MCP or verified source is evidence/u);
+    assert.doesNotMatch(context, /CodeStory hook output truncated/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
     assert.doesNotMatch(context, /packet ok/u);
@@ -2498,36 +4034,224 @@ test("hook emits MCP activation guidance without running CLI", async () => {
   }
 });
 
-test("hook dedupes repeated request prompts without storing prompt text", async () => {
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-prompt-dedupe-"));
+test("hook routing is stateless across repeated and parallel processes", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-stateless-"));
+  const input = {
+    hook_event_name: "UserPromptSubmit",
+    prompt: "Where is RefreshMode defined?",
+    cwd: repoRoot,
+  };
 
   try {
-    const first = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is RefreshMode defined?",
-      cwd: repoRoot,
-    }, { PLUGIN_DATA: dataDir, PATH: "" });
-    const second = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is RefreshMode defined?",
-      cwd: repoRoot,
-    }, { PLUGIN_DATA: dataDir, PATH: "" });
-    const third = runCodexHook({
-      hook_event_name: "UserPromptSubmit",
-      prompt: "Where is strict_sidecar_status defined?",
-      cwd: repoRoot,
-    }, { PLUGIN_DATA: dataDir, PATH: "" });
+    const serial = [runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" }), runCodexHook(input, { PLUGIN_DATA: dataDir, PATH: "" })];
+    const parallel = await Promise.all(Array.from({ length: 6 }, () => runCodexHookAsync(input, {
+      CODEX_THREAD_ID: "shared-task",
+      PLUGIN_DATA: dataDir,
+      PATH: "",
+    })));
+    for (const output of [...serial, ...parallel]) {
+      assert.match(output.hookSpecificOutput.additionalContext, /Route: Symbol ownership/u);
+      assert.doesNotMatch(output.hookSpecificOutput.additionalContext, /Where is RefreshMode defined/u);
+    }
+    await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
 
-    assert.match(first.hookSpecificOutput.additionalContext, /Where is RefreshMode defined?/u);
-    assert.equal(Object.hasOwn(second, "hookSpecificOutput"), false);
-    assert.match(third.hookSpecificOutput.additionalContext, /Where is strict_sidecar_status defined?/u);
-    const stateText = await readFile(join(dataDir, ".codestory-hook-output-state.json"), "utf8");
-    const promptHash = createHash("sha256")
-      .update("Where is RefreshMode defined?")
-      .digest("hex")
-      .slice(0, 16);
-    assert.match(stateText, new RegExp(promptHash, "u"));
-    assert.doesNotMatch(stateText, /Where is RefreshMode defined/u);
+test("hook qualification compares executable policies with sourced MCP observations", async (t) => {
+  const fixture = JSON.parse(await readFile(
+    join(pluginRoot, "tests", "fixtures", "hook-route-qualification.json"),
+    "utf8",
+  ));
+  const observedDrills = JSON.parse(await readFile(
+    join(pluginRoot, "tests", "fixtures", "hook-observed-mcp-drills.json"),
+    "utf8",
+  ));
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-qualification-"));
+  const toolVocabulary = new Set([
+    "affected", "callees", "callers", "definition", "files", "ground", "packet",
+    "search", "sidecar_setup", "snippet", "status", "symbol", "trace", "trail",
+  ]);
+  const record = (output) => {
+    const context = output.hookSpecificOutput?.additionalContext || "";
+    const plan = context.match(/^Plan: category=([a-z_]+); tools=([a-z_,]+)$/mu);
+    const instructedTools = plan
+      ? [...new Set(plan[2].split(","))].sort()
+      : [];
+    assert.ok(instructedTools.every((tool) => toolVocabulary.has(tool)));
+    return {
+      suppressed: !context,
+      category: plan?.[1] || null,
+      instructed_tools: instructedTools,
+    };
+  };
+  const failures = (actual, expected) => {
+    const result = [];
+    if (actual.suppressed !== Boolean(expected.suppressed)) result.push("suppression");
+    if (!expected.suppressed && actual.category !== expected.category) result.push("category");
+    const expectedTools = [...(expected.instructed_tools || [])].sort();
+    if (!expected.suppressed && actual.instructed_tools.join("\0") !== expectedTools.join("\0")) {
+      result.push(`tools:${actual.instructed_tools.join(",")}`);
+    }
+    for (const tool of expected.forbidden_tools || []) {
+      if (actual.instructed_tools.includes(tool)) result.push(`forbidden:${tool}`);
+    }
+    return result;
+  };
+
+  try {
+    const cases = fixture.cases.map((entry) => {
+      const currentOutput = runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        prompt: entry.prompt,
+        cwd: repoRoot,
+      }, { PLUGIN_DATA: dataDir, PATH: "" });
+      const context = currentOutput.hookSpecificOutput?.additionalContext || "";
+      assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
+      assert.equal(context.includes(entry.prompt), false);
+      assert.doesNotMatch(context, /hook output truncated/u);
+      const current = record(currentOutput);
+      const baseline = record(runHookProcess(genericBaselineHook, {
+        hook_event_name: "UserPromptSubmit",
+        prompt: entry.prompt,
+        cwd: repoRoot,
+      }, { PLUGIN_DATA: dataDir, PATH: "" }));
+      return {
+        slug: entry.slug,
+        current,
+        baseline,
+        current_failures: failures(current, entry),
+        baseline_failures: failures(baseline, entry),
+      };
+    });
+
+    const requiredObservedTools = {
+      orientation: ["ground", "files"],
+      symbol_ownership: ["symbol", "definition"],
+      call_flow: ["symbol", "callers", "callees"],
+      change_impact: ["affected"],
+      broad_question: ["ground", "symbol", "trace"],
+    };
+    assert.equal(observedDrills.artifact_kind, "sourced_observed_mcp_drill_traces");
+    assert.equal(observedDrills.test_execution.executes_mcp, false);
+    for (const drill of observedDrills.observations) {
+      const emitted = record(runCodexHook({
+        hook_event_name: "UserPromptSubmit",
+        prompt: drill.prompt,
+        cwd: repoRoot,
+      }, { PLUGIN_DATA: dataDir, PATH: "" }));
+      const observedTools = drill.steps.map(({ tool }) => tool);
+      const sourceIndex = observedTools.indexOf("source");
+      const graphIndex = observedTools.findIndex((tool) =>
+        ["ground", "symbol", "callers", "callees", "trace", "trail", "affected"].includes(tool));
+      assert.ok(
+        observedTools.every((tool) => tool === "source" || toolVocabulary.has(tool)),
+        drill.source.location,
+      );
+      assert.equal(drill.source_fallback.used, sourceIndex >= 0, drill.source.location);
+      assert.equal(emitted.category, drill.category);
+      assert.equal(observedTools[0], "status");
+      assert.equal(drill.source.kind, "agent_observation");
+      assert.equal(drill.source.url, "https://github.com/TheGreenCedar/CodeStory/pull/982");
+      assert.match(drill.source.commit, /^[0-9a-f]{40}$/u);
+      assert.ok(requiredObservedTools[drill.category].every((tool) =>
+        observedTools.includes(tool)), drill.source.location);
+      if (sourceIndex >= 0) {
+        assert.equal(drill.source_fallback.used, true);
+        assert.equal(drill.source_fallback.after_graph, true);
+        assert.ok(graphIndex > 0 && sourceIndex > graphIndex, drill.source.location);
+      }
+      if (drill.blocked_tools) {
+        assert.deepEqual([...drill.blocked_tools].sort(), ["packet", "search"]);
+      }
+      const affected = drill.steps.find(({ tool }) => tool === "affected");
+      if (affected) {
+        assert.deepEqual(affected.arguments.paths, [
+          "plugins/codestory/hooks/codestory-activate.cjs",
+          "plugins/codestory/tests/plugin-static.test.mjs",
+        ]);
+        assert.equal(affected.result_kind, "explicit_path_match");
+      }
+      assert.equal(observedTools.includes("sidecar_setup"), false);
+      assert.equal(drill.repair_attempted, false);
+    }
+
+    t.diagnostic(JSON.stringify({
+      cases,
+      observed_drills: observedDrills.observations.map(({ slug, source, steps }) => ({
+        slug,
+        source,
+        observed_tools: steps.map(({ tool }) => tool),
+      })),
+    }));
+    assert.deepEqual(cases.flatMap(({ slug, current_failures }) =>
+      current_failures.map((failure) => `${slug}:${failure}`)), []);
+    assert.deepEqual(cases.filter(({ baseline_failures }) => baseline_failures.length === 0), []);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("suppressed hook events write no active or thread state", async () => {
+  for (const input of [
+    { hook_event_name: "UserPromptSubmit", prompt: "Can you review this restaurant?", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Explain the egg method.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "I registered for semester classes.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Tell me about compiler design.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "What is the movie runtime?", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "I bought an iPhone.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Search for eBay.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Please update my social_security_number.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Help me build a birdhouse.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Explain liver function tests.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Organize my grocery list.", cwd: repoRoot },
+    { hook_event_name: "UserPromptSubmit", prompt: "Update issue #897.", cwd: repoRoot },
+    { hook_event_name: "GoalLoopHeartbeat", cwd: repoRoot },
+  ]) {
+    const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-no-state-"));
+    try {
+      const output = runCodexHook(input, {
+        CODEX_THREAD_ID: "suppressed-task",
+        PLUGIN_DATA: dataDir,
+        PATH: "",
+      });
+      assert.equal(Object.hasOwn(output, "hookSpecificOutput"), false);
+      await assert.rejects(access(join(dataDir, ".codestory-active")), /ENOENT/u);
+      await assert.rejects(access(threadActiveStatePath(dataDir, "suppressed-task")), /ENOENT/u);
+      await assert.rejects(access(join(dataDir, ".codestory-hook-output-state.json")), /ENOENT/u);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("compact and resume session starts re-inject complete bounded routing", async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-reinject-"));
+  const longCwd = `C:\\${"very-long-directory\\".repeat(200)}repo`;
+  try {
+    for (const source of ["compact", "resume", "compact"]) {
+      const output = runCodexHook({
+        hook_event_name: "SessionStart",
+        source,
+        cwd: longCwd,
+      }, { PLUGIN_DATA: dataDir, PATH: "" });
+      const context = output.hookSpecificOutput.additionalContext;
+      assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
+      assert.match(context, /absolute repository cwd/u);
+      assert.match(context, /codestory mcp ground status packet search/u);
+      assert.doesNotMatch(context, /truncated/u);
+      assert.equal(context.endsWith("tools."), true);
+    }
+    const promptContext = runCodexHook({
+      hook_event_name: "UserPromptSubmit",
+      prompt: "Where is RuntimeContext defined?",
+      cwd: longCwd,
+    }, { PLUGIN_DATA: dataDir, PATH: "" }).hookSpecificOutput.additionalContext;
+    assert.ok(promptContext.length <= 900, `hook output was ${promptContext.length} characters`);
+    assert.match(promptContext, /absolute repository cwd/u);
+    assert.doesNotMatch(promptContext, /truncated/u);
+    assert.equal(promptContext.endsWith("evidence."), true);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2595,7 +4319,7 @@ test("hook script executes under Codex home module scope", async () => {
         },
         input: JSON.stringify({
           hook_event_name: "UserPromptSubmit",
-          prompt: "Explain hook loading.",
+          prompt: "Explain CodeStory hook loading.",
           cwd: repoRoot,
         }),
         encoding: "utf8",
@@ -2606,7 +4330,7 @@ test("hook script executes under Codex home module scope", async () => {
     assert.doesNotMatch(result.stderr, /require is not defined/u);
     assert.match(
       JSON.parse(result.stdout).hookSpecificOutput.additionalContext,
-      /CODESTORY REQUEST GROUNDING ACTIVE/u,
+      /CODESTORY REQUEST ROUTING ACTIVE/u,
     );
   } finally {
     await rm(codexHome, { recursive: true, force: true });

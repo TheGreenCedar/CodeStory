@@ -1,8 +1,63 @@
 use anyhow::{Context, Result};
-use codestory_contracts::api::{NodeKind, SearchHit, SearchMatchQualityDto};
-use codestory_runtime::{compare_ranked_hits, retrieval_file_role_for_hit, symbol_name_match_rank};
+use codestory_contracts::api::{
+    ApiError, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, SearchHit, SearchHitOrigin,
+    SearchMatchQualityDto,
+};
+use serde::Serialize;
 use std::fs;
 use std::path::Path;
+
+use crate::{
+    AppController, compare_ranked_hits, retrieval_file_role_for_hit, symbol_name_match_rank,
+};
+
+const HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT: usize = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetSelector {
+    Id,
+    Query,
+}
+
+#[derive(Debug, Clone)]
+pub enum TargetSelection {
+    Id(NodeId),
+    Query {
+        query: String,
+        choose: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedTarget {
+    pub selector: TargetSelector,
+    pub requested: String,
+    pub file_filter: Option<String>,
+    pub selected: SearchHit,
+    pub alternatives: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AmbiguousTarget {
+    pub query: String,
+    pub file_filter: Option<String>,
+    pub alternatives: Vec<SearchHit>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum TargetResolution {
+    Resolved(Box<ResolvedTarget>),
+    Ambiguous(AmbiguousTarget),
+    Rejected(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ResolutionCandidateRank {
+    file_filter_match: u8,
+    resolution: ResolutionRank,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ResolutionRank {
@@ -78,16 +133,16 @@ pub(crate) fn is_name_resolvable_graph_target(query: &str, hit: &SearchHit) -> b
         return true;
     }
 
-    let query = codestory_runtime::normalize_symbol_query(query);
+    let query = crate::normalize_symbol_query(query);
     if query.is_empty() {
         return false;
     }
-    let display = codestory_runtime::normalize_symbol_query(&hit.display_name);
+    let display = crate::normalize_symbol_query(&hit.display_name);
     if query.contains('/') && display.contains(&query) {
         return true;
     }
-    let terminal = codestory_runtime::terminal_symbol_segment(&hit.display_name);
-    let leading = codestory_runtime::leading_symbol_segment(&hit.display_name);
+    let terminal = crate::terminal_symbol_segment(&hit.display_name);
+    let leading = crate::leading_symbol_segment(&hit.display_name);
     display.starts_with(&query) || terminal.starts_with(&query) || leading.starts_with(&query)
 }
 
@@ -100,8 +155,8 @@ fn inexact_query_prefix_match_bucket(query: &str, hit: &SearchHit) -> u8 {
     if rank.exact_display != 0 || rank.exact_terminal != 0 || rank.exact_leading != 0 {
         return 0;
     }
-    let query = codestory_runtime::normalize_symbol_query(query);
-    let terminal = codestory_runtime::terminal_symbol_segment(&hit.display_name);
+    let query = crate::normalize_symbol_query(query);
+    let terminal = crate::terminal_symbol_segment(&hit.display_name);
     if terminal.len() < 4 || query == terminal {
         return 0;
     }
@@ -219,7 +274,7 @@ pub(crate) fn file_filter_match_bucket(project_root: &Path, hit: &SearchHit, fra
     };
 
     let absolute = normalize_path_fragment(file_path);
-    let relative = normalize_path_fragment(&crate::display::relative_path(project_root, file_path));
+    let relative = normalize_path_fragment(&relative_path(project_root, file_path));
     let fragment = normalize_path_fragment(fragment);
     let fragment = fragment.trim_matches('/').to_string();
     if fragment.is_empty() {
@@ -283,7 +338,24 @@ fn resolution_kind_bucket(kind: NodeKind) -> u8 {
 }
 
 fn normalize_path_fragment(value: &str) -> String {
-    crate::display::clean_path_string(value).to_ascii_lowercase()
+    clean_path_string(value).to_ascii_lowercase()
+}
+
+fn clean_path_string(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/");
+    if let Some(stripped) = normalized.strip_prefix("//?/UNC/") {
+        normalized = format!("//{stripped}");
+    } else if normalized.starts_with("//?/") {
+        normalized = normalized[4..].to_string();
+    }
+    normalized
+}
+
+fn relative_path(project_root: &Path, raw: &str) -> String {
+    let normalized = clean_path_string(raw);
+    codestory_workspace::workspace_relative_path(project_root, Path::new(&normalized))
+        .map(|path| clean_path_string(&path.to_string_lossy()))
+        .unwrap_or(normalized)
 }
 
 fn declaration_anchor_bucket(hit: &SearchHit) -> u8 {
@@ -334,7 +406,7 @@ fn type_definition_line_bucket(project_root: Option<&Path>, query: &str, hit: &S
         return 0;
     };
     let trimmed = source_line.split("//").next().unwrap_or(source_line).trim();
-    let expected = codestory_runtime::terminal_symbol_segment(query);
+    let expected = crate::terminal_symbol_segment(query);
     let tokens = trimmed
         .split(|ch: char| ch.is_whitespace() || ch == ':' || ch == ';' || ch == '{')
         .map(|token| token.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')))
@@ -390,7 +462,7 @@ fn callable_definition_line_bucket(
         return 0;
     };
     let trimmed = source_line.split("//").next().unwrap_or(source_line).trim();
-    let expected = codestory_runtime::terminal_symbol_segment(query);
+    let expected = crate::terminal_symbol_segment(query);
     if expected.is_empty() || !line_contains_symbol_name(trimmed, &expected) {
         return 0;
     }
@@ -478,10 +550,348 @@ fn read_file_contents_for_resolution(project_root: Option<&Path>, path: &str) ->
     fs::read_to_string(path).with_context(|| format!("Failed to read file `{path}`"))
 }
 
+impl AppController {
+    pub fn resolve_target(
+        &self,
+        target: TargetSelection,
+        file_filter: Option<&str>,
+    ) -> Result<TargetResolution, ApiError> {
+        match target {
+            TargetSelection::Id(id) => {
+                let details = self.node_details(NodeDetailsRequest { id: id.clone() })?;
+                Ok(TargetResolution::Resolved(Box::new(ResolvedTarget {
+                    selector: TargetSelector::Id,
+                    requested: id.0,
+                    file_filter: None,
+                    selected: search_hit_from_node(&details),
+                    alternatives: Vec::new(),
+                })))
+            }
+            TargetSelection::Query { query, choose } => {
+                self.resolve_query_target(query, choose, file_filter)
+            }
+        }
+    }
+
+    fn resolve_query_target(
+        &self,
+        query: String,
+        choose: Option<usize>,
+        file_filter: Option<&str>,
+    ) -> Result<TargetResolution, ApiError> {
+        let project_root = self.require_project_root()?;
+        let mut alternatives = self.query_resolution_alternatives(&query)?;
+        if alternatives.is_empty()
+            && let Some(stem) = command_query_resolution_stem(&query)
+        {
+            alternatives = self.query_resolution_alternatives(&stem)?;
+        }
+        alternatives.retain(|hit| is_resolvable_graph_target(&query, hit));
+        if let Some(file_filter) = file_filter {
+            alternatives
+                .retain(|hit| search_hit_matches_file_filter(&project_root, hit, file_filter));
+        }
+        if alternatives.is_empty() {
+            return Ok(TargetResolution::Rejected(no_query_match_error(
+                &project_root,
+                &query,
+                file_filter,
+            )));
+        }
+        alternatives.sort_by(|left, right| {
+            compare_resolution_candidates(&project_root, &query, file_filter, left, right)
+        });
+        let tied = tied_top_alternatives(&project_root, &query, file_filter, &alternatives);
+        if let Some(choice) = choose {
+            if choice == 0 || choice > tied.len() {
+                return Ok(TargetResolution::Rejected(format!(
+                    "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
+                    tied.len()
+                )));
+            }
+            let selected = tied[choice - 1].clone();
+            promote_selected_alternative(&mut alternatives, &selected);
+            return Ok(TargetResolution::Resolved(Box::new(query_resolved_target(
+                query,
+                file_filter,
+                selected,
+                alternatives,
+            ))));
+        }
+        if tied.len() > 1 {
+            return Ok(TargetResolution::Ambiguous(AmbiguousTarget {
+                query: query.clone(),
+                file_filter: file_filter.map(ToOwned::to_owned),
+                message: ambiguous_query_error(&project_root, &query, file_filter, &tied),
+                alternatives: tied,
+            }));
+        }
+        debug_assert_unique_top_candidate(&project_root, &query, file_filter, &alternatives);
+        let selected = alternatives
+            .first()
+            .cloned()
+            .expect("non-empty alternatives checked above");
+        Ok(TargetResolution::Resolved(Box::new(query_resolved_target(
+            query,
+            file_filter,
+            selected,
+            alternatives,
+        ))))
+    }
+
+    fn query_resolution_alternatives(&self, query: &str) -> Result<Vec<SearchHit>, ApiError> {
+        let mut alternatives = self.resolve_indexed_symbol_candidates(query, 50)?;
+        alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
+        Ok(alternatives)
+    }
+}
+
+fn command_query_resolution_stem(query: &str) -> Option<String> {
+    ["_command", "_cmd", "_handler"]
+        .into_iter()
+        .find_map(|suffix| {
+            query
+                .strip_suffix(suffix)
+                .filter(|stem| stem.len() >= 4)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn query_resolved_target(
+    query: String,
+    file_filter: Option<&str>,
+    selected: SearchHit,
+    alternatives: Vec<SearchHit>,
+) -> ResolvedTarget {
+    ResolvedTarget {
+        selector: TargetSelector::Query,
+        requested: query,
+        file_filter: file_filter.map(ToOwned::to_owned),
+        selected,
+        alternatives,
+    }
+}
+
+fn promote_selected_alternative(alternatives: &mut Vec<SearchHit>, selected: &SearchHit) {
+    if let Some(position) = alternatives
+        .iter()
+        .position(|hit| hit.node_id == selected.node_id)
+    {
+        let selected = alternatives.remove(position);
+        alternatives.insert(0, selected);
+    }
+}
+
+fn tied_top_alternatives(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    alternatives: &[SearchHit],
+) -> Vec<SearchHit> {
+    let Some(first) = alternatives.first() else {
+        return Vec::new();
+    };
+    let top_rank = resolution_candidate_rank(project_root, query, file_filter, first);
+    alternatives
+        .iter()
+        .take_while(|hit| {
+            resolution_candidate_rank(project_root, query, file_filter, hit) == top_rank
+        })
+        .cloned()
+        .collect()
+}
+
+fn debug_assert_unique_top_candidate(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    alternatives: &[SearchHit],
+) {
+    if alternatives.len() > 1 {
+        debug_assert_ne!(
+            resolution_candidate_rank(project_root, query, file_filter, &alternatives[0]),
+            resolution_candidate_rank(project_root, query, file_filter, &alternatives[1])
+        );
+    }
+}
+
+fn resolution_candidate_rank(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    hit: &SearchHit,
+) -> ResolutionCandidateRank {
+    ResolutionCandidateRank {
+        file_filter_match: file_filter
+            .map(|filter| file_filter_match_bucket(project_root, hit, filter))
+            .unwrap_or(0),
+        resolution: resolution_rank_with_project_root(Some(project_root), query, hit),
+    }
+}
+
+fn compare_resolution_candidates(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    left: &SearchHit,
+    right: &SearchHit,
+) -> std::cmp::Ordering {
+    resolution_candidate_rank(project_root, query, file_filter, right)
+        .cmp(&resolution_candidate_rank(
+            project_root,
+            query,
+            file_filter,
+            left,
+        ))
+        .then_with(|| compare_resolution_hits(query, left, right))
+        .then_with(|| left.node_id.0.cmp(&right.node_id.0))
+}
+
+fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
+    SearchHit {
+        node_id: node.id.clone(),
+        display_name: node.display_name.clone(),
+        kind: node.kind,
+        file_path: node.file_path.clone(),
+        line: node.start_line,
+        score: 0.0,
+        origin: SearchHitOrigin::IndexedSymbol,
+        match_quality: None,
+        resolvable: true,
+        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
+        evidence_producer: Some("node_details".to_string()),
+        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
+        loss_reason: None,
+        coverage_role: None,
+        eligible_for_sufficiency: Some(true),
+        score_breakdown: None,
+    }
+}
+
+fn no_query_match_error(project_root: &Path, query: &str, file_filter: Option<&str>) -> String {
+    let search_command = format!(
+        "codestory-cli search --project {} --query {} --limit 10",
+        quote_cli_path(project_root),
+        quote_cli_value(query)
+    );
+    match file_filter {
+        Some(file_filter) => format!(
+            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `{search_command}` to inspect candidates, or relax `--file`.",
+            clean_path_string(file_filter)
+        ),
+        None => format!(
+            "query_resolution: No symbol matched query `{query}`. Run `{search_command}` to inspect candidates."
+        ),
+    }
+}
+
+fn ambiguous_query_error(
+    project_root: &Path,
+    query: &str,
+    file_filter: Option<&str>,
+    alternatives: &[SearchHit],
+) -> String {
+    let scope = file_filter
+        .map(|value| format!(" even after applying `--file {}`", clean_path_string(value)))
+        .unwrap_or_default();
+    let mut message = format!(
+        "Query `{query}` is ambiguous{scope}; choose a match or pass a stable id.\n\nNext commands:\n"
+    );
+    let filter_arg = file_filter
+        .map(|value| format!(" --file {}", quote_cli_value(&clean_path_string(value))))
+        .unwrap_or_default();
+    message.push_str(&format!(
+        "  codestory-cli symbol --project {} --query {}{filter_arg} --choose 1\n",
+        quote_cli_path(project_root),
+        quote_cli_value(query)
+    ));
+    if let Some(first) = alternatives.first() {
+        message.push_str(&format!(
+            "  codestory-cli symbol --project {} --id {}\n",
+            quote_cli_path(project_root),
+            first.node_id.0
+        ));
+        if let Some(path) = first.file_path.as_deref() {
+            message.push_str(&format!(
+                "  codestory-cli symbol --project {} --query {} --file {}\n",
+                quote_cli_path(project_root),
+                quote_cli_value(query),
+                quote_cli_value(&relative_path(project_root, path))
+            ));
+        }
+    }
+    message.push_str(if file_filter.is_some() {
+        "\nPass a more qualified symbol name, a stable `--id`, or a narrower `--file` fragment."
+    } else {
+        "\nPass a more qualified symbol name, add `--file <path-fragment>`, or resolve the exact `--id` from `search` output."
+    });
+    let displayed = alternatives.len().min(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT);
+    message.push_str(&format!(
+        "\n\nTop equally ranked matches (showing {displayed} of {}):\n",
+        alternatives.len()
+    ));
+    for (index, hit) in alternatives
+        .iter()
+        .take(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT)
+        .enumerate()
+    {
+        message.push_str(&format!(
+            "  {}. {} id=`{}`",
+            index + 1,
+            format_search_hit_target(project_root, hit),
+            hit.node_id.0
+        ));
+        if let Some(reference) = node_ref(project_root, hit) {
+            message.push_str(&format!(" ref=`{reference}`"));
+        }
+        message.push('\n');
+    }
+    message
+}
+
+fn format_search_hit_target(project_root: &Path, hit: &SearchHit) -> String {
+    let mut output = format!(
+        "{} [{}]",
+        hit.display_name,
+        format!("{:?}", hit.kind).to_ascii_lowercase()
+    );
+    if let Some(path) = hit.file_path.as_deref() {
+        output.push(' ');
+        output.push_str(&relative_path(project_root, path));
+    }
+    if let Some(line) = hit.line {
+        output.push(':');
+        output.push_str(&line.to_string());
+    }
+    output
+}
+
+fn node_ref(project_root: &Path, hit: &SearchHit) -> Option<String> {
+    Some(format!(
+        "{}:{}:{}",
+        relative_path(project_root, hit.file_path.as_deref()?),
+        hit.line?,
+        hit.display_name
+    ))
+}
+
+fn quote_cli_path(path: &Path) -> String {
+    quote_cli_value(&clean_path_string(&path.to_string_lossy()))
+}
+
+fn quote_cli_value(value: &str) -> String {
+    if value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"')) {
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use codestory_contracts::api::{NodeId, SearchHitOrigin};
+    use tempfile::tempdir;
 
     fn test_search_hit_defaults() -> SearchHit {
         SearchHit {
@@ -820,5 +1230,77 @@ mod tests {
             hits.first().map(|hit| &hit.node_id),
             Some(&implementation.node_id)
         );
+    }
+
+    #[test]
+    fn exact_type_query_prefers_declaration_over_impl_and_member() {
+        let temp = tempdir().expect("create temp dir");
+        let source = temp.path().join("lib.rs");
+        fs::write(
+            &source,
+            "pub struct AppController;\nimpl AppController {\n    fn open_project(&self) {}\n}\n",
+        )
+        .expect("write source");
+        let path = source.to_string_lossy();
+        let declaration = hit("declaration", "AppController", NodeKind::STRUCT, 1.0, &path);
+        let mut implementation = hit(
+            "implementation",
+            "AppController",
+            NodeKind::CLASS,
+            1.0,
+            &path,
+        );
+        implementation.line = Some(2);
+        let mut member = hit(
+            "member",
+            "AppController::open_project",
+            NodeKind::FUNCTION,
+            1.0,
+            &path,
+        );
+        member.line = Some(3);
+        let mut hits = [implementation, member, declaration.clone()];
+
+        hits.sort_by(|left, right| compare_resolution_hits("AppController", left, right));
+
+        assert_eq!(hits[0].node_id, declaration.node_id);
+    }
+
+    #[test]
+    fn callable_query_prefers_multiline_definition_with_assignment() {
+        let temp = tempdir().expect("create temp dir");
+        let declaration_path = temp.path().join("Indexer.h");
+        let implementation_path = temp.path().join("Indexer.cpp");
+        fs::write(
+            &declaration_path,
+            "void doIndex(\n    Command command,\n    State state) override;\n",
+        )
+        .expect("write declaration");
+        fs::write(
+            &implementation_path,
+            "void Indexer::doIndex(\n    Command command,\n    State state)\n{\n    int status = 0;\n    parse(command, status);\n}\n",
+        )
+        .expect("write implementation");
+        let declaration_path = declaration_path.to_string_lossy();
+        let implementation_path = implementation_path.to_string_lossy();
+        let declaration = hit(
+            "declaration",
+            "Indexer::doIndex",
+            NodeKind::METHOD,
+            1.0,
+            &declaration_path,
+        );
+        let implementation = hit(
+            "implementation",
+            "Indexer::doIndex",
+            NodeKind::FUNCTION,
+            1.0,
+            &implementation_path,
+        );
+        let mut hits = [declaration, implementation.clone()];
+
+        hits.sort_by(|left, right| compare_resolution_hits("Indexer::doIndex", left, right));
+
+        assert_eq!(hits[0].node_id, implementation.node_id);
     }
 }

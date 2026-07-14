@@ -15,19 +15,17 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
     AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAnswerDto,
-    AgentAskRequest, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AnswerReadinessReportDto, ApiError,
-    ApiErrorDetails, AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto,
-    CommandFailureEnvelope, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EvidenceItemDto,
-    EvidencePacketDto, EvidenceSourceLocationDto, EvidenceTypeDto, FrameworkRouteCoverageDto,
+    AgentAskRequest, AgentCitationDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, ApiError, ApiErrorDetails,
+    AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CommandFailureEnvelope,
+    CreateBookmarkCategoryRequest, CreateBookmarkRequest, FrameworkRouteCoverageDto,
     GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
     IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto,
-    PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
-    ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
+    PacketProofStatusDto, PacketSufficiencyStatusDto, PacketTaskClassDto, ProjectSummary,
+    ReadinessGoalDto, ReadinessStatusDto, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
     RetrievalScoreBreakdownDto, RetrievalShadowDto, SearchHit, SearchMatchQualityDto,
     SearchQueryAssessmentDto, SearchRepoTextMode, SearchRequest, SourceOccurrenceDto,
-    SourceTruthCheckDto, TrailCallerScope, TrailConfigDto, TrailContextDto, TrailDirection,
-    TrailMode,
+    TrailContextDto,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -51,19 +49,19 @@ mod args;
 mod config;
 mod display;
 mod drill_targeting;
+mod embedding_config;
 mod explore;
 mod file_state;
 mod http_transport;
 mod local_refresh_status;
-mod managed_embeddings;
 mod output;
-mod query_resolution;
 mod readiness;
 mod readiness_broker;
 mod ready_repair_status;
 mod report;
 mod retrieval;
 mod runtime;
+mod sidecar_runtime;
 mod stdio_catalog;
 mod stdio_transport;
 
@@ -74,26 +72,22 @@ use args::{
     BookmarkAddOutput, BookmarkCommand, BookmarkListCommand, BookmarkListOutput, BookmarkOutput,
     BookmarkRemoveCommand, BookmarkRemoveOutput, CacheAction, CacheCommand, Cli, CliDirection,
     CliTrailMode, Command, CompletionShell, ContextCommand, DoctorCheckOutput, DoctorCommand,
-    DoctorOutput, DoctorSidecarStatusOutput, DrillAnchorConsumerOutput,
-    DrillAnchorConsumerSummaryOutput, DrillAnchorOutput, DrillAnchorTextConsumerHintOutput,
-    DrillAnchorTimingsOutput, DrillAnswerQualityContractOutput, DrillBridgeEvidenceOutput,
-    DrillBridgeGraphPathOutput, DrillBridgeOutput, DrillClaimLedgerEntryOutput,
-    DrillClaimLedgerOutput, DrillClaimLedgerScoringOutput, DrillCommand, DrillCommandStatusOutput,
+    DoctorOutput, DoctorSidecarStatusOutput, DrillAnchorOutput, DrillAnchorTimingsOutput,
+    DrillBridgeEvidenceOutput, DrillBridgeOutput, DrillCommand, DrillCommandStatusOutput,
     DrillExecutionBoundaryOutput, DrillMechanicalOutput, DrillOutput, DrillRuntimeTimingsOutput,
-    DrillSuiteAnswerQualityOutput, DrillSuiteCommand, DrillSuiteExpectationOutput,
-    DrillSuiteLayerFindingOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
+    DrillSuiteCommand, DrillSuiteExpectationOutput, DrillSuiteOutput, DrillSuiteRepoOutput,
     DrillSuiteRetrievalBlockerOutput, DrillSummaryAnchorStatusOutput, DrillSummaryAnchorsOutput,
     DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
     DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput, DrillSummaryVerdictOutput,
-    DrillVerificationChecklistItemOutput, FilesCommand, FixCommand, FixOutput,
-    GenerateCompletionsCommand, GroundCommand, IndexCommand, IndexDryRunOutput, IndexOutput,
-    PacketCommand, ProjectArgs, QueryCommand, QueryOutput, QueryResolutionOutput,
-    QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand, ReadyOutput, RepoTextMode,
-    SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SetupAction, SetupCommand,
-    SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput,
-    SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand, TaskAction, TaskBriefCommand,
-    TaskCommand, TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    FilesCommand, FixCommand, FixOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand,
+    IndexDryRunOutput, IndexOutput, InternalOwnedDeleteCommand, PacketCommand, ProjectArgs,
+    QueryCommand, QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput,
+    ReadyCommand, ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput,
+    ServeCommand, SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand,
+    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand, TaskAction,
+    TaskBriefCommand, TaskCommand, TrailCommand, TrailJsonOutput, VerificationTargetOutput,
+    build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -103,10 +97,9 @@ use output::{
     REPO_CONTENT_BOUNDARY_LINE, context_packet_json, emit, emit_text, render_agent_citation,
     render_context_markdown, render_doctor_markdown, render_drill_markdown, render_fix_markdown,
     render_ground_markdown, render_index_dry_run_markdown, render_index_markdown,
-    render_query_markdown, render_ready_markdown, render_search_hit_output, render_search_markdown,
-    render_snippet_markdown, render_symbol_markdown, render_symbol_mermaid, render_trail_dot,
-    render_trail_markdown, render_trail_mermaid, render_trail_story_markdown,
-    validate_output_file_parent,
+    render_query_markdown, render_ready_markdown, render_search_markdown, render_snippet_markdown,
+    render_symbol_markdown, render_symbol_mermaid, render_trail_dot, render_trail_markdown,
+    render_trail_mermaid, render_trail_story_markdown, validate_output_file_parent,
 };
 use runtime::{
     AmbiguousTargetError, RuntimeContext, ensure_index_ready, map_api_error, refresh_label,
@@ -130,6 +123,7 @@ const CONTEXT_BUNDLE_MARKDOWN_SOFT_CAP: usize = 2 * 1024 * 1024;
 const CONTEXT_BUNDLE_TRUNCATION_SUFFIX: &str =
     "\n\n... bundle content truncated by context bundle byte cap\n";
 const READY_REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+const READY_REPAIR_LOCAL_REFRESH_WAIT: Duration = Duration::from_secs(5 * 60);
 const READY_REPAIR_EMBED_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_REPAIR_EMBED_OBSERVATION_POLL: Duration = Duration::from_millis(250);
 const MAX_DRILL_JOBS: usize = 8;
@@ -158,14 +152,6 @@ fn drill_read_only_jobs(requested: usize, refresh: args::RefreshMode) -> usize {
     }
 }
 
-fn drill_anchor_jobs(requested: usize, refresh: args::RefreshMode, total_anchors: usize) -> usize {
-    if total_anchors <= 1 {
-        1
-    } else {
-        drill_read_only_jobs(requested, refresh).min(total_anchors)
-    }
-}
-
 fn normalize_drill_jobs(requested: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
@@ -179,14 +165,6 @@ fn normalize_drill_jobs_with_limit(requested: usize, available: usize) -> usize 
 
 fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
-}
-
-fn with_drill_command_duration(
-    start: Instant,
-    mut status: DrillCommandStatusOutput,
-) -> DrillCommandStatusOutput {
-    status.duration_ms = elapsed_ms(start);
-    status
 }
 
 #[tokio::main]
@@ -259,14 +237,17 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Fix(cmd) => run_fix(cmd),
         Command::Smoke(cmd) => run_smoke(cmd),
         Command::Agent(cmd) => run_agent(cmd),
-        Command::Setup(cmd) => run_setup(cmd),
         Command::Cache(cmd) => run_cache(cmd),
         Command::Search(cmd) => run_search(cmd),
         Command::Drill(cmd) => run_drill(cmd),
         Command::DrillSuite(cmd) => run_drill_suite(cmd),
         Command::Symbol(cmd) => run_symbol(cmd),
-        Command::Impact(cmd) => run_symbol_workflow(SymbolWorkflowKind::Impact, cmd),
-        Command::TestMap(cmd) => run_symbol_workflow(SymbolWorkflowKind::TestMap, cmd),
+        Command::Impact(cmd) => {
+            run_symbol_workflow(codestory_runtime::SymbolWorkflowMode::Impact, cmd)
+        }
+        Command::TestMap(cmd) => {
+            run_symbol_workflow(codestory_runtime::SymbolWorkflowMode::TestMap, cmd)
+        }
         Command::Trail(cmd) => run_trail(cmd),
         Command::Callers(cmd) => run_callers(cmd),
         Command::Callees(cmd) => run_callees(cmd),
@@ -281,7 +262,21 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::Sidecar(cmd) => run_sidecar(cmd),
+        Command::InternalOwnedDelete(cmd) => run_internal_owned_delete(cmd),
     }
+}
+
+fn run_internal_owned_delete(cmd: InternalOwnedDeleteCommand) -> Result<()> {
+    let deletion = codestory_workspace::owned_deletion::OwnedDeletionRoot::open(&cmd.root)
+        .with_context(|| format!("open owned deletion root {}", cmd.root.display()))?;
+    deletion.remove(&cmd.relative).with_context(|| {
+        format!(
+            "remove owned relative path {} below {}",
+            cmd.relative.display(),
+            cmd.root.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -380,8 +375,37 @@ fn run_sidecar(cmd: SidecarCommand) -> Result<()> {
     }
 }
 
-fn new_agent_surface_runtime(project: &ProjectArgs) -> Result<RuntimeContext> {
-    RuntimeContext::new_agent_sidecar(project)
+fn new_agent_surface_runtime(
+    project: &ProjectArgs,
+    profile: Option<args::CliSidecarProfile>,
+    run_id: Option<&str>,
+) -> Result<RuntimeContext> {
+    RuntimeContext::new_agent_sidecar_with_selection(project, profile, run_id)
+}
+
+struct OpenedAgentSurface {
+    runtime: RuntimeContext,
+    before: ProjectSummary,
+    opened: runtime::OpenedProject,
+}
+
+fn open_agent_surface(
+    project: &ProjectArgs,
+    profile: Option<args::CliSidecarProfile>,
+    run_id: Option<&str>,
+    refresh: args::RefreshMode,
+    surface: &'static str,
+) -> Result<OpenedAgentSurface> {
+    let runtime = new_agent_surface_runtime(project, profile, run_id)?;
+    let before = runtime.open_project_summary()?;
+    let opened = runtime.ensure_open_from_summary(refresh, before.clone())?;
+    ensure_index_ready(&opened, surface)?;
+    ensure_agent_surface_gpu_proof(&runtime, surface)?;
+    Ok(OpenedAgentSurface {
+        runtime,
+        before,
+        opened,
+    })
 }
 
 fn run_cache(cmd: CacheCommand) -> Result<()> {
@@ -404,6 +428,18 @@ fn render_cache_identity_markdown(output: &codestory_runtime::RepositoryIdentity
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Cache Identity");
     let _ = writeln!(markdown, "project: `{}`", output.project);
+    let _ = writeln!(
+        markdown,
+        "project_identity_schema_version: `{}`",
+        output.project_identity_schema_version
+    );
+    let _ = writeln!(markdown, "project_id: `{}`", output.project_id);
+    let _ = writeln!(markdown, "workspace_id: `{}`", output.workspace_id);
+    let _ = writeln!(
+        markdown,
+        "artifact_scope_id: `{}`",
+        output.artifact_scope_id
+    );
     let _ = writeln!(
         markdown,
         "root_derived_project_id: `{}`",
@@ -429,6 +465,16 @@ fn render_cache_identity_markdown(output: &codestory_runtime::RepositoryIdentity
             .normalized_repository_identity
             .as_deref()
             .unwrap_or("unavailable")
+    );
+    let _ = writeln!(
+        markdown,
+        "legacy_alias_disposition: `{}`",
+        output.legacy_alias_disposition
+    );
+    let _ = writeln!(
+        markdown,
+        "legacy_project_id: `{}`",
+        output.legacy_project_id.as_deref().unwrap_or("unavailable")
     );
     let _ = writeln!(
         markdown,
@@ -460,12 +506,6 @@ fn render_cache_identity_markdown(output: &codestory_runtime::RepositoryIdentity
         let _ = writeln!(markdown, "- `{input}`");
     }
     markdown
-}
-
-fn run_setup(cmd: SetupCommand) -> Result<()> {
-    match cmd.action {
-        SetupAction::Embeddings(cmd) => run_setup_embeddings(cmd),
-    }
 }
 
 fn run_cache_rehydrate(cmd: args::CacheRehydrateCommand) -> Result<()> {
@@ -535,42 +575,6 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
         }
     }
     markdown
-}
-
-fn run_setup_embeddings(cmd: args::SetupEmbeddingsCommand) -> Result<()> {
-    ensure_dot_only_for_trail(cmd.format, "setup embeddings")?;
-    preflight_output_file(cmd.output_file.as_deref())?;
-    let project_root = runtime::canonicalize_project_root(&cmd.project.project)?;
-    let cache_override =
-        runtime::trusted_cache_override(&project_root, cmd.project.cache_dir.as_deref())?;
-    let next_commands =
-        setup_embeddings_next_commands(&cmd.project.project, cmd.project.cache_dir.as_deref());
-    let managed_root = managed_embeddings::managed_root(cache_override.as_deref())?;
-    let mut output = managed_embeddings::setup_embeddings(
-        &managed_root,
-        cmd.quant,
-        cmd.variant,
-        cmd.dry_run,
-        !cmd.no_start,
-    )?;
-    output.next_commands = next_commands;
-    let markdown = managed_embeddings::render_setup_embeddings_markdown(&output);
-    emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
-}
-
-fn setup_embeddings_next_commands(
-    project: &std::path::Path,
-    cache_dir: Option<&std::path::Path>,
-) -> Vec<String> {
-    let mut args = format!(" --project {}", quote_command_path(project));
-    if let Some(cache_dir) = cache_dir {
-        let _ = write!(args, " --cache-dir {}", quote_command_path(cache_dir));
-    }
-    vec![
-        format!("codestory-cli doctor{args}"),
-        format!("codestory-cli retrieval bootstrap{args}"),
-        format!("codestory-cli retrieval index{args} --refresh full"),
-    ]
 }
 
 fn quote_command_path(path: &std::path::Path) -> String {
@@ -1250,7 +1254,7 @@ fn run_ci_agent_smoke(project: &ProjectArgs) -> SmokeOutput {
 
     let start = Instant::now();
     let sidecar = doctor_sidecar_status(&runtime);
-    if sidecar.retrieval_mode == "full" {
+    if doctor_sidecar_status_is_live_ready(&sidecar) {
         smoke_pass(
             &mut output,
             "sidecar_full_mode",
@@ -1381,9 +1385,8 @@ struct ResolvedContextTarget {
 fn run_context(cmd: ContextCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "context")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "context")?;
+    let OpenedAgentSurface { runtime, .. } =
+        open_agent_surface(&cmd.project, None, None, cmd.refresh, "context")?;
 
     let resolved = resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
     let target_prompt = context_target_prompt(&resolved);
@@ -1428,10 +1431,13 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
 fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    retrieval::activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "packet")?;
+    let OpenedAgentSurface { runtime, .. } = open_agent_surface(
+        &cmd.project,
+        cmd.profile,
+        cmd.run_id.as_deref(),
+        cmd.refresh,
+        "packet",
+    )?;
 
     let packet = runtime
         .browser
@@ -1461,9 +1467,8 @@ fn run_task(cmd: TaskCommand) -> Result<()> {
 fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "task brief")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "task brief")?;
+    let OpenedAgentSurface { runtime, .. } =
+        open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
     let packet = runtime
         .browser
@@ -2374,7 +2379,7 @@ fn run_fix(cmd: FixCommand) -> Result<()> {
 fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
     let runtime = if cmd.repair {
         if matches!(cmd.goal, None | Some(args::ReadyGoal::Agent)) {
-            new_agent_surface_runtime(&cmd.project)?
+            new_agent_surface_runtime(&cmd.project, None, None)?
         } else {
             RuntimeContext::new(&cmd.project)?
         }
@@ -2398,25 +2403,25 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
     } else {
         raw_sidecar
     };
+    let selected_agent_run_id =
+        selected_agent_broker_run_id(readiness_sidecar.run_id.as_deref(), agent_run_id);
+    let readiness_broker = observe_readiness_broker(
+        &runtime,
+        &readiness_sidecar,
+        selected_agent_run_id.as_deref(),
+    );
+    let readiness_sidecar =
+        agent_sidecar_with_gpu_proof(&readiness_sidecar, readiness_broker.gpu_proof.as_ref());
     let mut verdicts = build_summary_readiness(
         &summary.root,
         &summary.stats,
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_broker =
-        readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-            project_root: runtime.project_root.clone(),
-            cache_root: runtime.cache_root.clone(),
-            agent_run_id: agent_run_id.map(str::to_string),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&readiness_sidecar)),
-            reconciliation: None,
-        });
     let readiness_lanes = build_readiness_lanes_for_runtime(
         &runtime,
         &verdicts,
-        agent_run_id,
+        selected_agent_run_id.as_deref(),
         Some(&readiness_sidecar),
         Some(&readiness_broker),
     );
@@ -2431,6 +2436,13 @@ fn build_ready_output(cmd: &ReadyCommand) -> Result<ReadyOutput> {
         readiness_broker: Some(readiness_broker),
     };
     Ok(output)
+}
+
+fn selected_agent_broker_run_id(
+    selected_run_id: Option<&str>,
+    requested_run_id: Option<&str>,
+) -> Option<String> {
+    selected_run_id.or(requested_run_id).map(str::to_string)
 }
 
 pub(crate) fn broker_gpu_proof_input_from_sidecar(
@@ -2454,6 +2466,148 @@ pub(crate) fn broker_gpu_proof_input_from_sidecar(
         embed_smoke_ms: None,
         degraded_reason: sidecar.degraded_reason.clone(),
     }
+}
+
+fn observe_readiness_broker(
+    runtime: &RuntimeContext,
+    sidecar: &DoctorSidecarStatusOutput,
+    agent_run_id: Option<&str>,
+) -> readiness_broker::ReadinessBrokerSnapshot {
+    readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
+        project_root: runtime.project_root.clone(),
+        cache_root: runtime.cache_root.clone(),
+        agent_run_id: agent_run_id.map(str::to_string),
+        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+        gpu_proof: Some(broker_gpu_proof_input_from_sidecar(sidecar)),
+        reconciliation: None,
+    })
+}
+
+pub(crate) fn agent_sidecar_with_gpu_proof(
+    sidecar: &DoctorSidecarStatusOutput,
+    gpu_proof: Option<&readiness_broker::BrokerGpuProofSnapshot>,
+) -> DoctorSidecarStatusOutput {
+    let mut sidecar = sidecar.clone();
+    if agent_surface_requires_identity_bound_gpu_proof(&sidecar)
+        && !gpu_proof.is_some_and(identity_bound_gpu_proof_is_verified)
+        && sidecar.degraded_reason.is_none()
+    {
+        sidecar.degraded_reason = Some("gpu_unverified".to_string());
+    }
+    sidecar
+}
+
+fn ensure_agent_surface_gpu_proof(runtime: &RuntimeContext, surface: &str) -> Result<()> {
+    let sidecar = runtime.sidecar.clone();
+    let status = doctor_sidecar_status_for_runtime(runtime, sidecar.clone());
+    if sidecar.profile != codestory_retrieval::SidecarProfile::Agent
+        || !agent_surface_requires_identity_bound_gpu_proof(&status)
+    {
+        return Ok(());
+    }
+
+    let broker = readiness_broker::observe_broker_snapshot_for_sidecar(
+        readiness_broker::BrokerSnapshotInput {
+            project_root: runtime.project_root.clone(),
+            cache_root: runtime.cache_root.clone(),
+            agent_run_id: sidecar.run_id.clone(),
+            cli_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&status)),
+            reconciliation: None,
+        },
+        &sidecar,
+    );
+    let live_degraded_reason = status.degraded_reason.clone();
+    if live_degraded_reason.is_none()
+        && agent_surface_gpu_proof_is_valid(&status, &sidecar, broker.gpu_proof.as_ref())
+    {
+        return Ok(());
+    }
+
+    let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
+    let project_arg = display::quote_command_argument_value(&project);
+    let repair = agent_ready_repair_command(&project_arg, sidecar.run_id.as_deref());
+    let status_command =
+        retrieval_status_command_for_agent(&project_arg, sidecar.run_id.as_deref());
+    let next_commands = vec![repair, status_command];
+    let proof_status = broker
+        .gpu_proof
+        .as_ref()
+        .map(|proof| proof.proof_status.as_str())
+        .unwrap_or("missing");
+    let degraded_reason = live_degraded_reason.unwrap_or_else(|| "gpu_unverified".to_string());
+    let message = if degraded_reason == "gpu_unverified" {
+        format!(
+            "gpu_unverified: `{surface}` requires identity-bound accelerator smoke proof for the selected agent runtime; current broker proof is `{proof_status}`"
+        )
+    } else {
+        format!(
+            "{degraded_reason}: `{surface}` requires a live selected agent runtime with matching process identity and verified accelerator proof"
+        )
+    };
+    Err(StructuredCommandFailure {
+        envelope: CommandFailureEnvelope::new(ApiError::retrieval_unavailable(
+            message,
+            project,
+            next_commands,
+        ))
+        .with_context(serde_json::json!({
+            "degraded_reason": degraded_reason,
+            "profile": sidecar.profile.as_str(),
+            "run_id": sidecar.run_id,
+            "namespace": sidecar.namespace,
+            "proof_status": proof_status,
+            "surface": surface,
+        })),
+        output_file: None,
+        markdown: None,
+    }
+    .into())
+}
+
+fn identity_bound_gpu_proof_is_verified(proof: &readiness_broker::BrokerGpuProofSnapshot) -> bool {
+    proof.proof_status == "verified" && proof.runtime_identity.is_some()
+}
+
+fn gpu_proof_matches_selected_runtime(
+    proof: &readiness_broker::BrokerGpuProofSnapshot,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> bool {
+    if !identity_bound_gpu_proof_is_verified(proof) {
+        return false;
+    }
+    let identity = proof
+        .runtime_identity
+        .as_ref()
+        .expect("verified proof identity checked above");
+    identity.profile == runtime.profile.as_str()
+        && identity.run_id == runtime.run_id
+        && identity.namespace == runtime.namespace
+        && identity.compose_project == runtime.compose_project
+        && identity.embed_url == runtime.ownership().ports.embed_url
+        && runtime
+            .project_identity
+            .as_ref()
+            .is_none_or(|expected| identity.workspace_id == expected.workspace_id)
+}
+
+fn agent_surface_gpu_proof_is_valid(
+    status: &DoctorSidecarStatusOutput,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    proof: Option<&readiness_broker::BrokerGpuProofSnapshot>,
+) -> bool {
+    !agent_surface_requires_identity_bound_gpu_proof(status)
+        || proof.is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, runtime))
+}
+
+fn agent_surface_requires_identity_bound_gpu_proof(status: &DoctorSidecarStatusOutput) -> bool {
+    status.retrieval_mode == "full"
+        && status.embedding_device_policy == "accelerator_required"
+        && !status.embedding_cpu_allowed
+}
+
+fn doctor_sidecar_status_is_live_ready(status: &DoctorSidecarStatusOutput) -> bool {
+    status.retrieval_mode == "full" && status.degraded_reason.is_none()
 }
 
 fn fix_status(output: &ReadyOutput) -> &'static str {
@@ -2492,17 +2646,13 @@ pub(crate) fn wait_for_local_freshness(
         local_refresh_status::LocalRefreshLockAttempt::Acquired(lock) => lock,
         local_refresh_status::LocalRefreshLockAttempt::Busy(busy) => {
             let mut output = local_refresh_output_from_summary(&summary);
-            output.state = if busy.status.is_some() {
-                readiness::LocalRefreshState::Refreshing
-            } else {
-                readiness::LocalRefreshState::Skipped
-            };
+            output.state = readiness::LocalRefreshState::Refreshing;
             output.blocks_local_surfaces = true;
             output.readiness_status = ReadinessStatusDto::RepairIndex;
             output.reason = Some(if busy.status.is_some() {
                 "refreshing".to_string()
             } else {
-                "skipped_locked".to_string()
+                "refresh_lock_held".to_string()
             });
             if let Some(status) = busy.status {
                 output.phase = Some(status.phase);
@@ -2513,36 +2663,47 @@ pub(crate) fn wait_for_local_freshness(
             } else {
                 output.pid = busy.pid;
                 output.started_at_epoch_ms = busy.started_at_epoch_ms;
+                output.phase = Some("starting".to_string());
             }
             output.lock_path = Some(display::clean_path_string(
                 &busy.lock_path.to_string_lossy(),
             ));
+            attach_complete_publication(&mut output, &summary);
             return Ok((summary, Some(output)));
         }
     };
+    let summary = inspect_runtime.open_project_summary()?;
+    if !local_freshness_needs_refresh(&summary) {
+        let mut output = local_refresh_output_from_summary(&summary);
+        output.reason = Some("coalesced_refresh_completed".to_string());
+        return Ok((summary, Some(output)));
+    }
     let refresh_started_at_epoch_ms = lock.started_at_epoch_ms();
     let refresh_pid = lock.pid();
     let refresh_phase = "incremental_index";
-    local_refresh_status::write_local_refresh_status(
-        &inspect_runtime.cache_root,
+    if !lock.write_status(
         &inspect_runtime.project_root,
         "refreshing",
         refresh_phase,
-        refresh_started_at_epoch_ms,
-        refresh_pid,
         None,
-    )?;
+    )? {
+        anyhow::bail!("local refresh ownership changed before indexing");
+    }
+    let heartbeat = local_refresh_status::LocalRefreshHeartbeat::start(
+        &lock,
+        &inspect_runtime.project_root,
+        refresh_phase,
+    );
 
     let index_runtime = RuntimeContext::new(project)?;
-    match index_runtime.ensure_open(args::RefreshMode::Incremental) {
+    let refresh_result = index_runtime.ensure_open(args::RefreshMode::Incremental);
+    heartbeat.stop();
+    match refresh_result {
         Ok(opened) => {
-            let _ = local_refresh_status::write_local_refresh_status(
-                &inspect_runtime.cache_root,
+            let _ = lock.write_status(
                 &inspect_runtime.project_root,
                 "refreshed",
                 refresh_phase,
-                refresh_started_at_epoch_ms,
-                refresh_pid,
                 None,
             );
             let mut output = local_refresh_output_from_summary(&opened.summary);
@@ -2557,17 +2718,15 @@ pub(crate) fn wait_for_local_freshness(
                 output.blocks_local_surfaces = true;
                 output.reason = Some("refresh_did_not_reach_fresh".to_string());
             }
+            attach_complete_publication(&mut output, &opened.summary);
             Ok((opened.summary, Some(output)))
         }
         Err(error) => {
             let error_text = error.to_string();
-            let _ = local_refresh_status::write_local_refresh_status(
-                &inspect_runtime.cache_root,
+            let _ = lock.write_status(
                 &inspect_runtime.project_root,
                 "failed",
                 refresh_phase,
-                refresh_started_at_epoch_ms,
-                refresh_pid,
                 Some(error_text.clone()),
             );
             let mut output = local_refresh_output_from_summary(&summary);
@@ -2580,8 +2739,25 @@ pub(crate) fn wait_for_local_freshness(
             output.started_at_epoch_ms = Some(refresh_started_at_epoch_ms);
             output.updated_at_epoch_ms = Some(local_refresh_status::now_epoch_ms());
             output.last_failure_reason = Some(error_text);
+            attach_complete_publication(&mut output, &summary);
             Ok((summary, Some(output)))
         }
+    }
+}
+
+pub(crate) fn attach_complete_publication(
+    output: &mut readiness::LocalRefreshOutput,
+    summary: &ProjectSummary,
+) {
+    output.serving_publication = summary
+        .publication
+        .as_ref()
+        .and_then(|publication| serde_json::to_value(publication).ok());
+    if output.serving_publication.is_some()
+        && output.state == readiness::LocalRefreshState::Refreshing
+    {
+        output.blocks_local_surfaces = false;
+        output.readiness_status = ReadinessStatusDto::Ready;
     }
 }
 
@@ -2640,6 +2816,13 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
     };
     let sidecar = doctor_sidecar_status(&runtime);
     let readiness_sidecar = selected_agent_readiness_sidecar_status(&runtime, None, &sidecar);
+    let readiness_broker = observe_readiness_broker(
+        &runtime,
+        &readiness_sidecar,
+        readiness_sidecar.run_id.as_deref(),
+    );
+    let readiness_sidecar =
+        agent_sidecar_with_gpu_proof(&readiness_sidecar, readiness_broker.gpu_proof.as_ref());
     let readiness = build_summary_readiness(
         &summary.root,
         &summary.stats,
@@ -2651,7 +2834,7 @@ fn run_agent_preflight(cmd: args::AgentPreflightCommand) -> Result<()> {
         &readiness,
         None,
         Some(&readiness_sidecar),
-        None,
+        Some(&readiness_broker),
     );
     let output = build_agent_preflight_output(
         &readiness,
@@ -2729,8 +2912,8 @@ fn repair_ready_state(
 ) -> Result<Option<codestory_retrieval::SidecarRuntimeConfig>> {
     let agent_goal = matches!(goal, None | Some(args::ReadyGoal::Agent));
     let sidecar = agent_goal.then(|| {
-        codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-            &runtime.project_root,
+        runtime.sidecar.with_profile_and_run_id(
+            Some(&runtime.project_root),
             codestory_retrieval::SidecarProfile::Agent,
             run_id,
         )
@@ -2758,24 +2941,52 @@ fn repair_ready_state(
     if let Some(reservation) = handoff_reservation.as_mut() {
         reservation.disarm();
     }
+    let local_refresh_handoff = if plugin_worker {
+        Some(
+            local_refresh_status::wait_for_local_refresh_lock(
+                &runtime.cache_root,
+                &runtime.project_root,
+                READY_REPAIR_LOCAL_REFRESH_WAIT,
+            )
+            .context("wait for local refresh before MCP ready repair")?,
+        )
+    } else {
+        None
+    };
     if let Some(sidecar) = sidecar.as_ref()
         && let Ok(existing_status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
             sidecar.clone(),
         )
-        && ready_repair_existing_sidecar_is_reusable(&existing_status)
     {
-        eprintln!(
-            "ready repair agent sidecar already full: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
-            sidecar.run_id.as_deref().unwrap_or("none"),
-            sidecar.namespace,
-            sidecar.compose_project,
-            existing_status.embedding_device_state,
-            existing_status.embedding_device_observation_source,
-            existing_status.embedding_cpu_allowed
+        let broker = readiness_broker::observe_broker_snapshot_for_sidecar(
+            readiness_broker::BrokerSnapshotInput {
+                project_root: runtime.project_root.clone(),
+                cache_root: runtime.cache_root.clone(),
+                agent_run_id: sidecar.run_id.clone(),
+                cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                gpu_proof: Some(broker_gpu_proof_input_from_report(&existing_status)),
+                reconciliation: None,
+            },
+            sidecar,
         );
-        return Ok(Some(sidecar.clone()));
+        if ready_repair_existing_sidecar_is_reusable(
+            &existing_status,
+            broker.gpu_proof.as_ref(),
+            sidecar,
+        ) {
+            eprintln!(
+                "ready repair agent sidecar already full with identity-bound GPU proof: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
+                sidecar.run_id.as_deref().unwrap_or("none"),
+                sidecar.namespace,
+                sidecar.compose_project,
+                existing_status.embedding_device_state,
+                existing_status.embedding_device_observation_source,
+                existing_status.embedding_cpu_allowed
+            );
+            return Ok(Some(sidecar.clone()));
+        }
     }
 
     if let Some(sidecar) = sidecar.as_ref() {
@@ -2811,6 +3022,7 @@ fn repair_ready_state(
 
     let opened = runtime.ensure_open(args::RefreshMode::Auto)?;
     ensure_index_ready(&opened, "ready repair")?;
+    drop(local_refresh_handoff);
     if !agent_goal {
         return Ok(None);
     }
@@ -2820,7 +3032,7 @@ fn repair_ready_state(
         Some(runtime.storage_path.as_path()),
         Some(runtime.cache_root.as_path()),
     );
-    let sidecar = sidecar.expect("agent sidecar should be selected for agent goal");
+    let mut sidecar = sidecar.expect("agent sidecar should be selected for agent goal");
     let _project_repair_lock = match ready_repair_status::try_acquire_project_ready_repair_lock(
         &sidecar,
         &runtime.project_root,
@@ -2897,7 +3109,7 @@ fn repair_ready_state(
         gpu_proof,
     } = run_ready_repair_with_native_embedding_lease(
         runtime,
-        &sidecar,
+        &mut sidecar,
         &broker_scope,
         &storage_scope,
     )?;
@@ -2958,7 +3170,7 @@ struct ReadyRepairResult {
 
 fn run_ready_repair_with_native_embedding_lease(
     runtime: &RuntimeContext,
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+    sidecar: &mut codestory_retrieval::SidecarRuntimeConfig,
     broker_scope: &readiness_broker::BrokerScope,
     storage_scope: &codestory_retrieval::BootstrapStorageScope,
 ) -> Result<ReadyRepairResult> {
@@ -2973,14 +3185,18 @@ fn run_ready_repair_with_native_embedding_lease(
         readiness_broker::NativeEmbeddingLeaseLifecycleParams {
             scope: broker_scope,
             sidecar,
+            resource: readiness_broker::NATIVE_EMBEDDING_RESOURCE,
             wait: Duration::from_secs(30),
             poll: Duration::from_millis(250),
             bootstrap_context: "ready repair retrieval bootstrap",
             sidecar_cleanup_label: "ready repair sidecar",
         },
-        |allow_native_embedding_spawn| {
-            codestory_retrieval::bootstrap_sidecars_with_runtime_progress(
-                sidecar,
+        |selected_sidecar,
+         allow_native_embedding_spawn,
+         reusable_native_embedding_launch,
+         observe_new_native_launch| {
+            codestory_retrieval::bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
+                selected_sidecar,
                 Some(runtime.project_root.as_path()),
                 codestory_retrieval::BootstrapSidecarsOptions {
                     storage_scope: storage_scope.clone(),
@@ -2988,26 +3204,73 @@ fn run_ready_repair_with_native_embedding_lease(
                     skip_compose: false,
                     wait_timeout: Duration::from_secs(90),
                     allow_native_embedding_spawn,
+                    reusable_native_embedding_launch: reusable_native_embedding_launch.cloned(),
                 },
                 |phase| progress.set_phase(phase),
+                observe_new_native_launch,
             )
         },
         |bootstrap| &bootstrap.state,
-        |bootstrap| {
+        |bootstrap, selected_sidecar| {
             let infrastructure = ready_repair_infrastructure_with_runtime_observation(
                 &bootstrap.infrastructure,
                 &runtime.project_root,
                 &runtime.storage_path,
-                sidecar,
+                selected_sidecar,
             );
-            let embed_smoke = ensure_ready_repair_embed_liveness(&infrastructure)?;
-            let gpu_proof =
-                broker_gpu_proof_input_from_infrastructure_with_smoke(&infrastructure, embed_smoke);
+            let embed_smoke =
+                match ensure_ready_repair_embed_liveness(&infrastructure, selected_sidecar) {
+                    Ok(smoke) => smoke,
+                    Err(error) => {
+                        let mut failed = broker_gpu_proof_input_from_infrastructure_with_smoke(
+                            &infrastructure,
+                            None,
+                        );
+                        failed.embed_smoke_ok = Some(false);
+                        failed.degraded_reason = Some("gpu_unverified".into());
+                        let _ = readiness_broker::refresh_broker_snapshot(
+                            readiness_broker::BrokerSnapshotInput {
+                                project_root: runtime.project_root.clone(),
+                                cache_root: runtime.cache_root.clone(),
+                                agent_run_id: selected_sidecar.run_id.clone(),
+                                cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                                gpu_proof: Some(failed),
+                                reconciliation: None,
+                            },
+                        );
+                        return Err(error);
+                    }
+                };
+            let mut infrastructure = infrastructure;
+            if let Some(smoke) = embed_smoke.as_ref() {
+                infrastructure.embedding_device_policy = smoke.device.requested_policy.into();
+                infrastructure.embedding_device_state = smoke.device.observed_state.into();
+                infrastructure.embedding_device_observation_source =
+                    smoke.device.observation_source.into();
+                infrastructure.embedding_detected_provider = smoke.device.detected_provider.clone();
+                infrastructure.embedding_detected_gpu = smoke.device.detected_gpu.clone();
+                infrastructure.embedding_accelerator_requested = smoke.device.accelerator_requested;
+                infrastructure.embedding_accelerator_request_provider =
+                    smoke.device.accelerator_request_provider.clone();
+                infrastructure.embedding_accelerator_request_device =
+                    smoke.device.accelerator_request_device.clone();
+            }
+            let gpu_proof = broker_gpu_proof_input_from_infrastructure_with_smoke(
+                &infrastructure,
+                embed_smoke.as_ref(),
+            );
+            if !infrastructure.embedding_cpu_allowed
+                && readiness_broker::gpu_proof(gpu_proof.clone()).proof_status != "verified"
+            {
+                bail!(
+                    "gpu_unverified: native embedding smoke did not prove requested accelerator work before long semantic indexing"
+                );
+            }
             let _ =
                 readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
                     project_root: runtime.project_root.clone(),
                     cache_root: runtime.cache_root.clone(),
-                    agent_run_id: sidecar.run_id.clone(),
+                    agent_run_id: selected_sidecar.run_id.clone(),
                     cli_version: env!("CARGO_PKG_VERSION").to_string(),
                     gpu_proof: Some(gpu_proof.clone()),
                     reconciliation: None,
@@ -3016,7 +3279,7 @@ fn run_ready_repair_with_native_embedding_lease(
             codestory_retrieval::repair_project_qdrant_collection_for_runtime(
                 &runtime.project_root,
                 &runtime.storage_path,
-                sidecar,
+                selected_sidecar,
             )
             .context("ready repair project qdrant repair")?;
             progress.set_phase("graph artifact");
@@ -3028,20 +3291,20 @@ fn run_ready_repair_with_native_embedding_lease(
             codestory_retrieval::finalize_index_for_runtime_with_progress(
                 &runtime.project_root,
                 &runtime.storage_path,
-                sidecar,
+                selected_sidecar,
                 |phase| progress.set_phase(phase),
             )
             .with_context(|| {
                 format!(
                     "ready repair retrieval index finalize using {}",
-                    retrieval::format_sidecar_runtime(sidecar)
+                    retrieval::format_sidecar_runtime(selected_sidecar)
                 )
             })?;
             progress.set_phase("readiness check");
             let final_status = codestory_retrieval::strict_sidecar_status_for_runtime(
                 &runtime.project_root,
                 Some(&runtime.storage_path),
-                sidecar.clone(),
+                selected_sidecar.clone(),
             )
             .context("ready repair final retrieval status")?;
             ensure_ready_repair_full_sidecar(&final_status)?;
@@ -3053,6 +3316,7 @@ fn run_ready_repair_with_native_embedding_lease(
     )
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReadyRepairEmbedSmoke {
     ok: Option<bool>,
@@ -3061,12 +3325,15 @@ struct ReadyRepairEmbedSmoke {
 
 fn ensure_ready_repair_embed_liveness(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
-) -> Result<ReadyRepairEmbedSmoke> {
-    ensure_ready_repair_embed_liveness_with_probe(infrastructure, || {
-        codestory_retrieval::probe_product_embedding_runtime()
-    })
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<Option<codestory_retrieval::EmbeddingAcceleratorSmoke>> {
+    if infrastructure.embedding_cpu_allowed {
+        return Ok(None);
+    }
+    codestory_retrieval::ensure_embedding_accelerator_smoke_for_runtime(sidecar)
 }
 
+#[cfg(test)]
 fn ensure_ready_repair_embed_liveness_with_probe(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
     probe: impl FnOnce() -> codestory_retrieval::EmbeddingRuntimeProbe,
@@ -3086,10 +3353,10 @@ fn ensure_ready_repair_embed_liveness_with_probe(
     let smoke = probe();
     if !smoke.reachable {
         bail!(
-            "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; zoekt_reachable={} ({}); qdrant_reachable={} ({})",
+            "ready repair embedding sidecar liveness failed before mandatory Qdrant semantic smoke: {}; lexical_ready={} ({}); qdrant_reachable={} ({})",
             smoke.detail,
-            infrastructure.zoekt_reachable,
-            infrastructure.zoekt_detail,
+            infrastructure.lexical_ready,
+            infrastructure.lexical_detail,
             infrastructure.qdrant_reachable,
             infrastructure.qdrant_detail
         );
@@ -3102,7 +3369,7 @@ fn ensure_ready_repair_embed_liveness_with_probe(
 
 fn broker_gpu_proof_input_from_infrastructure_with_smoke(
     infrastructure: &codestory_retrieval::InfrastructureHealth,
-    smoke: ReadyRepairEmbedSmoke,
+    smoke: Option<&codestory_retrieval::EmbeddingAcceleratorSmoke>,
 ) -> readiness_broker::BrokerGpuProofInput {
     readiness_broker::BrokerGpuProofInput {
         embedding_device_policy: Some(infrastructure.embedding_device_policy.clone()),
@@ -3120,10 +3387,10 @@ fn broker_gpu_proof_input_from_infrastructure_with_smoke(
             .embedding_accelerator_request_device
             .clone(),
         embedding_cpu_allowed: Some(infrastructure.embedding_cpu_allowed),
-        embed_smoke_ok: smoke.ok,
-        embed_smoke_ms: smoke.ms,
+        embed_smoke_ok: smoke.map(|_| true),
+        embed_smoke_ms: smoke.map(|smoke| smoke.elapsed_ms),
         degraded_reason: (!infrastructure.embedding_cpu_allowed
-            && (infrastructure.embedding_device_state != "accelerated" || smoke.ok != Some(true)))
+            && (infrastructure.embedding_device_state != "accelerated" || smoke.is_none()))
         .then(|| "gpu_unverified".to_string()),
     }
 }
@@ -3212,7 +3479,7 @@ fn ready_repair_observed_infrastructure(
 fn ensure_ready_repair_full_sidecar(
     report: &codestory_retrieval::RetrievalStatusReport,
 ) -> Result<()> {
-    if report.retrieval_mode == "full" {
+    if report.is_live_ready() {
         return Ok(());
     }
     let reason = report.degraded_reason.as_deref().unwrap_or("unknown");
@@ -3227,7 +3494,7 @@ fn ensure_ready_repair_full_sidecar(
         reason,
         report.embedding_device_state,
         report.embedding_device_observation_source,
-        ready_repair_component_detail(&report.zoekt),
+        ready_repair_component_detail(&report.lexical),
         ready_repair_component_detail(&report.qdrant),
         ready_repair_component_detail(&report.scip)
     )
@@ -3235,11 +3502,14 @@ fn ensure_ready_repair_full_sidecar(
 
 fn ready_repair_existing_sidecar_is_reusable(
     report: &codestory_retrieval::RetrievalStatusReport,
+    gpu_proof: Option<&readiness_broker::BrokerGpuProofSnapshot>,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> bool {
     ensure_ready_repair_full_sidecar(report).is_ok()
         && report.embedding_device_policy == "accelerator_required"
         && report.embedding_device_state == "accelerated"
         && !report.embedding_cpu_allowed
+        && gpu_proof.is_some_and(|proof| gpu_proof_matches_selected_runtime(proof, sidecar))
 }
 
 fn ready_repair_component_detail(component: &codestory_retrieval::ComponentHealth) -> String {
@@ -3460,10 +3730,13 @@ fn render_agent_preflight_markdown(output: &args::AgentPreflightOutput) -> Strin
 fn run_search(cmd: SearchCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "search")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    retrieval::activate_retrieval_profile_env(cmd.profile, cmd.run_id.as_deref());
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, "search")?;
+    let OpenedAgentSurface { runtime, .. } = open_agent_surface(
+        &cmd.project,
+        cmd.profile,
+        cmd.run_id.as_deref(),
+        cmd.refresh,
+        "search",
+    )?;
     let search_results = runtime
         .browser
         .search_results(search_request_from_command(&cmd))
@@ -3493,128 +3766,75 @@ fn run_drill(cmd: DrillCommand) -> Result<()> {
 }
 
 fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
+    let _ = cmd.jobs; // retained CLI compatibility; packet owns internal batch scheduling
     let total_timer = Instant::now();
     let setup_timer = Instant::now();
     validate_drill_output_dir(&cmd.output_dir)?;
-    let runtime = RuntimeContext::new(&cmd.project)?;
-    let before = runtime.open_project_summary()?;
-    let opened = runtime.ensure_open_from_summary(cmd.refresh, before.clone())?;
-    ensure_index_ready(&opened, "drill")?;
+    let OpenedAgentSurface {
+        runtime,
+        before,
+        opened,
+    } = open_agent_surface(
+        &cmd.project,
+        cmd.profile,
+        cmd.run_id.as_deref(),
+        cmd.refresh,
+        "drill",
+    )?;
     if cmd.refresh != args::RefreshMode::None {
         retrieval::finalize_retrieval_index_for_runtime(&runtime)
             .context("drill retrieval index finalize")?;
     }
-    let sidecar_retrieval_mode = codestory_retrieval::strict_sidecar_status(
+    let sidecar_retrieval_mode = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
+        runtime.sidecar.clone(),
     )
     .ok()
     .map(|status| status.retrieval_mode);
     let refresh = refresh_label(cmd.refresh, opened.refresh_mode);
     let setup_ms = elapsed_ms(setup_timer);
 
-    let mut all_verification_targets = Vec::new();
-    let stale_freshness = opened
-        .summary
-        .freshness
-        .as_ref()
-        .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
     let drill_anchors = drill_targeting::validated_drill_anchors(&cmd.anchors, "drill")?;
-    let question_search_timer = Instant::now();
-    let question_search_result = cmd
+    let question = cmd
         .question
-        .as_deref()
-        .map(|question| {
-            run_drill_question_search(
-                &runtime,
-                &cmd.output_dir,
-                cmd.format,
-                question,
-                &drill_anchors,
-            )
-        })
-        .transpose()?;
-    let (question_search, question_search_output) = match question_search_result {
-        Some((status, output)) => (Some(status), Some(output)),
-        None => (None, None),
+        .clone()
+        .unwrap_or_else(|| format!("Investigate anchors: {}", drill_anchors.join(", ")));
+    let packet_timer = Instant::now();
+    let packet_request = AgentPacketRequestDto {
+        question,
+        budget: PacketBudgetModeDto::Standard,
+        task_class: None,
+        extra_probes: drill_anchors.clone(),
+        include_evidence: true,
+        latency_budget_ms: None,
     };
-    let question_search_ms = elapsed_ms(question_search_timer);
-    let drill_jobs = drill_read_only_jobs(cmd.jobs, cmd.refresh);
-    let anchor_resolution_timer = Instant::now();
-    let anchor_outputs = run_drill_anchors_in_order(
-        &runtime,
-        &opened,
-        &cmd.output_dir,
-        cmd.format,
-        &drill_anchors,
-        drill_anchor_jobs(cmd.jobs, cmd.refresh, drill_anchors.len()),
-    )?;
-    for anchor_output in &anchor_outputs {
-        all_verification_targets.extend(anchor_output.verification_targets.iter().cloned());
-    }
-    let anchor_resolution_ms = elapsed_ms(anchor_resolution_timer);
-    if let Some(search_output) = question_search_output.as_ref() {
-        all_verification_targets.extend(drill_question_search_verification_targets(
-            search_output,
-            "question search source-truth target",
-            16,
-        ));
-    }
-    let mut question_supplemental_searches = Vec::new();
-    let supplemental_search_timer = Instant::now();
-    if let Some(question) = cmd.question.as_deref() {
-        for (status, search_output) in run_drill_question_supplemental_searches(
-            &runtime,
-            &cmd.output_dir,
-            cmd.format,
-            question,
-            &anchor_outputs,
-        )? {
-            all_verification_targets.extend(drill_question_search_verification_targets(
-                &search_output,
-                "supplemental question search source-truth target",
-                6,
-            ));
-            question_supplemental_searches.push(status);
-        }
-    }
-    let supplemental_search_ms = elapsed_ms(supplemental_search_timer);
-    dedupe_verification_targets(&mut all_verification_targets);
-    let bridge_evidence_timer = Instant::now();
-    let bridge_outputs = run_drill_bridges(
-        &runtime,
-        &cmd.output_dir,
-        cmd.format,
-        &anchor_outputs,
-        stale_freshness,
-        drill_jobs,
-    );
-    let bridge_evidence_ms = elapsed_ms(bridge_evidence_timer);
+    let evidence_packet =
+        execute_drill_packet(packet_request, |request| runtime.browser.packet(request))?;
+    let question_search_ms = elapsed_ms(packet_timer);
     let evidence_assembly_timer = Instant::now();
-    let claim_ledger_template = drill_claim_ledger_template(&anchor_outputs, &bridge_outputs);
-    let next_commands = drill_next_commands(
-        &runtime.project_root,
-        &anchor_outputs,
-        &bridge_outputs,
-        stale_freshness,
-    );
-    let evidence_packet = drill_evidence_packet(
-        cmd.question.as_deref(),
-        question_search.as_ref(),
-        &question_supplemental_searches,
-        &anchor_outputs,
-        &bridge_outputs,
-        &all_verification_targets,
-        &next_commands,
-    );
+    let citations = drill_packet_citations(&evidence_packet);
+    let anchor_outputs = drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
+    let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
+    let mut all_verification_targets =
+        drill_packet_verification_targets(&runtime.project_root, &citations);
+    dedupe_verification_targets(&mut all_verification_targets);
+    let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
+    let question_search = Some(DrillCommandStatusOutput {
+        command: "packet".to_string(),
+        status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
+        duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
+        artifact: None,
+        error: None,
+    });
     let evidence_assembly_ms = elapsed_ms(evidence_assembly_timer);
     let drill_timings = DrillRuntimeTimingsOutput {
         total_ms: elapsed_ms(total_timer),
         setup_ms,
         question_search_ms,
-        anchor_resolution_ms,
-        supplemental_search_ms,
-        bridge_evidence_ms,
+        anchor_resolution_ms: 0,
+        supplemental_search_ms: 0,
+        bridge_evidence_ms: 0,
         evidence_assembly_ms,
     };
 
@@ -3640,17 +3860,252 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
             drill_timings,
         },
         question_search,
-        question_supplemental_searches,
+        question_supplemental_searches: Vec::new(),
         anchors: anchor_outputs,
         bridges: bridge_outputs,
-        execution_boundaries: drill_execution_boundaries(),
+        execution_boundaries: vec![DrillExecutionBoundaryOutput {
+            command: "packet".to_string(),
+            flow: vec![
+                "plan question and explicit anchor probes".to_string(),
+                "execute one bounded batch retrieval".to_string(),
+                "adapt citations and sufficiency into drill reports".to_string(),
+            ],
+            source_files: vec![
+                "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
+                "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
+            ],
+        }],
         verification_targets: all_verification_targets,
         evidence_packet,
-        answer_quality_contract: drill_answer_quality_contract(),
-        claim_ledger_template,
-        verification_checklist: drill_verification_checklist(),
         next_commands,
     })
+}
+
+fn execute_drill_packet(
+    request: AgentPacketRequestDto,
+    execute: impl FnOnce(AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError>,
+) -> Result<AgentPacketDto> {
+    execute(request).map_err(map_api_error)
+}
+
+fn drill_packet_citations(packet: &AgentPacketDto) -> Vec<AgentCitationDto> {
+    let mut citations = packet.answer.citations.clone();
+    for claim in &packet.sufficiency.covered_claims {
+        citations.extend(claim.citations.iter().cloned());
+    }
+    let mut seen = HashSet::new();
+    citations.retain(|citation| {
+        seen.insert((
+            citation.node_id.0.clone(),
+            citation.file_path.clone(),
+            citation.line,
+        ))
+    });
+    citations
+}
+
+fn drill_packet_anchors(
+    project_root: &std::path::Path,
+    anchors: &[String],
+    citations: &[AgentCitationDto],
+) -> Vec<DrillAnchorOutput> {
+    anchors
+        .iter()
+        .map(|anchor| {
+            let normalized = codestory_runtime::normalize_symbol_query(anchor);
+            let citation = citations
+                .iter()
+                .filter(|citation| drill_packet_citation_is_typed_resolvable(citation))
+                .filter(|citation| {
+                    let display = codestory_runtime::normalize_symbol_query(&citation.display_name);
+                    display == normalized
+                        || codestory_runtime::terminal_symbol_segment(&citation.display_name)
+                            == normalized
+                })
+                .max_by(|left, right| left.score.total_cmp(&right.score));
+            let chosen_anchor = citation.map(|citation| {
+                drill_search_hit_from_packet_citation(project_root, anchor, citation)
+            });
+            let verification_targets = citation
+                .and_then(|citation| drill_packet_verification_target(project_root, citation))
+                .into_iter()
+                .collect();
+            DrillAnchorOutput {
+                anchor: anchor.clone(),
+                typed_hit_count: usize::from(citation.is_some()),
+                chosen_anchor,
+                verification_targets,
+                consumer_summary: None,
+                timings: DrillAnchorTimingsOutput::default(),
+                commands: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn drill_search_hit_from_packet_citation(
+    project_root: &std::path::Path,
+    query: &str,
+    citation: &AgentCitationDto,
+) -> SearchHitOutput {
+    let file_path = citation
+        .file_path
+        .as_deref()
+        .map(|path| display::relative_path(project_root, path));
+    let match_quality = if codestory_runtime::normalize_symbol_query(query)
+        == codestory_runtime::normalize_symbol_query(&citation.display_name)
+    {
+        SearchMatchQualityDto::NormalizedExact
+    } else {
+        SearchMatchQualityDto::SemanticSuggestion
+    };
+    let verification_targets = drill_packet_verification_target(project_root, citation)
+        .into_iter()
+        .collect();
+    SearchHitOutput {
+        number: None,
+        node_id: citation.node_id.0.clone(),
+        node_ref: crate::output::node_ref(
+            project_root,
+            citation.file_path.as_deref(),
+            citation.line,
+            &citation.display_name,
+        ),
+        display_name: citation.display_name.clone(),
+        kind: citation.kind,
+        file_path,
+        line: citation.line,
+        score: citation.score,
+        origin: citation.origin,
+        match_quality,
+        resolvable: citation.resolvable,
+        score_breakdown: citation.retrieval_score_breakdown.clone(),
+        duplicate_of: None,
+        excerpt: None,
+        primary_occurrence_kind: None,
+        symbol_role: citation.coverage_role.clone(),
+        paired_refs: Vec::new(),
+        verification_targets,
+        resolution_hints: Vec::new(),
+        why: citation
+            .evidence_producer
+            .iter()
+            .map(|producer| format!("packet evidence producer: {producer}"))
+            .collect(),
+    }
+}
+
+fn drill_packet_verification_target(
+    project_root: &std::path::Path,
+    citation: &AgentCitationDto,
+) -> Option<VerificationTargetOutput> {
+    if !drill_packet_citation_is_typed_resolvable(citation) {
+        return None;
+    }
+    Some(VerificationTargetOutput {
+        role: citation
+            .coverage_role
+            .clone()
+            .unwrap_or_else(|| "packet citation".to_string()),
+        path: display::relative_path(project_root, citation.file_path.as_deref()?),
+        line: citation.line.unwrap_or(1),
+        node_ref: None,
+        reason: format!("packet citation for {}", citation.display_name),
+    })
+}
+
+fn drill_packet_citation_is_typed_resolvable(citation: &AgentCitationDto) -> bool {
+    citation.resolvable && citation.kind != NodeKind::UNKNOWN
+}
+
+fn drill_packet_verification_targets(
+    project_root: &std::path::Path,
+    citations: &[AgentCitationDto],
+) -> Vec<VerificationTargetOutput> {
+    citations
+        .iter()
+        .filter_map(|citation| drill_packet_verification_target(project_root, citation))
+        .collect()
+}
+
+fn drill_packet_bridges(
+    project_root: &std::path::Path,
+    packet: &AgentPacketDto,
+) -> Vec<DrillBridgeOutput> {
+    packet
+        .sufficiency
+        .covered_claims
+        .iter()
+        .filter_map(|claim| {
+            let from = claim
+                .citations
+                .iter()
+                .find(|citation| drill_packet_citation_is_typed_resolvable(citation))?;
+            let to = claim.citations.iter().find(|citation| {
+                citation.node_id != from.node_id
+                    && drill_packet_citation_is_typed_resolvable(citation)
+            })?;
+            let graph_backed = drill_packet_citations_share_graph_evidence(from, to);
+            let mut endpoint_files = [from.file_path.clone(), to.file_path.clone()]
+                .into_iter()
+                .flatten()
+                .map(|path| display::relative_path(project_root, &path))
+                .collect::<Vec<_>>();
+            endpoint_files.sort();
+            endpoint_files.dedup();
+            Some(DrillBridgeOutput {
+                evidence: DrillBridgeEvidenceOutput {
+                    from_anchor: from.display_name.clone(),
+                    to_anchor: to.display_name.clone(),
+                    status: if graph_backed {
+                        "graph_path".to_string()
+                    } else {
+                        "source_truth_only".to_string()
+                    },
+                    strategy: "packet_claim".to_string(),
+                    confidence: match claim.proof_status {
+                        Some(PacketProofStatusDto::Proven) => "high",
+                        Some(PacketProofStatusDto::Likely) => "medium",
+                        _ => "low",
+                    }
+                    .to_string(),
+                    evidence_kind: "packet_citations".to_string(),
+                    from_node: Some(drill_search_hit_from_packet_citation(
+                        project_root,
+                        &from.display_name,
+                        from,
+                    )),
+                    to_node: Some(drill_search_hit_from_packet_citation(
+                        project_root,
+                        &to.display_name,
+                        to,
+                    )),
+                    graph_path: None,
+                    shared_files: Vec::new(),
+                    endpoint_files: endpoint_files.clone(),
+                    evidence_files: endpoint_files,
+                    next_commands: packet.sufficiency.follow_up_commands.clone(),
+                    notes: vec![claim.claim.clone()],
+                },
+                command: DrillCommandStatusOutput {
+                    command: "packet".to_string(),
+                    status: packet_sufficiency_label(packet.sufficiency.status).to_string(),
+                    duration_ms: 0,
+                    artifact: None,
+                    error: None,
+                },
+            })
+        })
+        .collect()
+}
+
+fn drill_packet_citations_share_graph_evidence(
+    from: &AgentCitationDto,
+    to: &AgentCitationDto,
+) -> bool {
+    from.evidence_edge_ids
+        .iter()
+        .any(|edge| to.evidence_edge_ids.contains(edge))
 }
 
 fn write_drill_outputs(
@@ -3693,15 +4148,11 @@ fn run_drill_suite(cmd: DrillSuiteCommand) -> Result<()> {
     ));
     write_drill_suite_outputs(cmd.format, &cmd.output_dir, &suite_output)?;
     emit_drill_suite_progress(format!(
-        "done repos={} ready={} degraded={} blocked={} answer_ready={} answer_degraded={} answer_failed={} answer_pending={} output_dir={}",
+        "done repos={} ready={} degraded={} blocked={} output_dir={}",
         suite_output.repo_count,
         suite_output.ready_count,
         suite_output.degraded_count,
         suite_output.blocked_count,
-        suite_output.answer_ready_count,
-        suite_output.answer_degraded_count,
-        suite_output.answer_failed_count,
-        suite_output.answer_pending_count,
         suite_output.output_dir
     ));
     let markdown = render_drill_suite_markdown(&suite_output);
@@ -3755,56 +4206,6 @@ struct DrillSuiteCase {
     expectations: DrillSuiteExpectationOutput,
 }
 
-#[derive(Debug, Deserialize)]
-struct DrillSuiteSourceTruthLedger {
-    #[allow(dead_code)]
-    schema_version: Option<u32>,
-    #[allow(dead_code)]
-    suite: Option<String>,
-    #[serde(default)]
-    cases: Vec<DrillSuiteLedgerCase>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DrillSuiteLedgerCase {
-    slug: String,
-    #[serde(default)]
-    draft_written: Option<bool>,
-    #[serde(default)]
-    claims: Vec<DrillSuiteLedgerClaim>,
-    #[serde(default)]
-    layer_findings: Vec<DrillSuiteLedgerLayerFinding>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DrillSuiteLedgerClaim {
-    id: String,
-    text: String,
-    classification: DrillSuiteClaimClassification,
-    #[serde(default)]
-    changed_after_source_read: Option<bool>,
-    #[serde(default)]
-    source_files: Vec<String>,
-    #[allow(dead_code)]
-    notes: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum DrillSuiteClaimClassification {
-    Correct,
-    Partial,
-    Misleading,
-    Unsupported,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct DrillSuiteLedgerLayerFinding {
-    layer: String,
-    status: String,
-    detail: String,
-}
-
 fn emit_drill_suite_progress(message: impl AsRef<str>) {
     eprintln!("[drill-suite] {}", message.as_ref());
 }
@@ -3848,8 +4249,6 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
         .canonicalize()
         .with_context(|| format!("Failed to resolve {}", cmd.project.project.display()))?;
     let (suite_name, cases) = drill_suite_cases_from_manifest(&cmd.case_file, &owner_root)?;
-    let ledger_supplied = cmd.ledger.is_some();
-    let ledger_cases = drill_suite_ledger_cases(cmd.ledger.as_deref())?;
     let total_cases = cases.len();
     emit_drill_suite_progress(format!(
         "start cases={} refresh={} output_dir={}",
@@ -3863,25 +4262,14 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
     } else {
         drill_read_only_jobs(cmd.jobs, cmd.refresh)
     };
-    let repos = run_drill_suite_cases(
-        cmd,
-        cases,
-        &ledger_cases,
-        ledger_supplied,
-        suite_jobs,
-        drill_jobs,
-    );
+    let repos = run_drill_suite_cases(cmd, cases, suite_jobs, drill_jobs);
 
     let degraded_count = drill_suite_verdict_count(&repos, "degraded");
     let blocked_count = drill_suite_verdict_count(&repos, "blocked");
     let ready_count = drill_suite_verdict_count(&repos, "ready");
-    let answer_ready_count = drill_suite_answer_status_count(&repos, "ready");
-    let answer_degraded_count = drill_suite_answer_status_count(&repos, "degraded");
-    let answer_failed_count = drill_suite_answer_status_count(&repos, "failed");
-    let answer_pending_count = drill_suite_answer_pending_count(&repos);
     let next_actions = repos
         .iter()
-        .map(|repo| format!("{}: {}", repo.slug, drill_suite_next_action(repo)))
+        .map(|repo| format!("{}: {}", repo.slug, repo.summary.verdict.next_action))
         .collect::<Vec<_>>();
     let retrieval_blockers = drill_suite_retrieval_blockers(&repos);
 
@@ -3894,10 +4282,6 @@ fn execute_codestory_real_repo_drill_suite(cmd: &DrillSuiteCommand) -> Result<Dr
         degraded_count,
         blocked_count,
         ready_count,
-        answer_ready_count,
-        answer_degraded_count,
-        answer_failed_count,
-        answer_pending_count,
         repos,
         retrieval_blockers,
         next_actions,
@@ -3919,8 +4303,6 @@ fn drill_suite_case_jobs(
 fn run_drill_suite_cases(
     cmd: &DrillSuiteCommand,
     cases: Vec<DrillSuiteCase>,
-    ledger_cases: &BTreeMap<String, DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
     jobs: usize,
     drill_jobs: usize,
 ) -> Vec<DrillSuiteRepoOutput> {
@@ -3930,15 +4312,7 @@ fn run_drill_suite_cases(
             .iter()
             .enumerate()
             .map(|(case_index, case)| {
-                run_drill_suite_case(
-                    cmd,
-                    case_index,
-                    total_cases,
-                    case,
-                    ledger_cases.get(&case.slug),
-                    ledger_supplied,
-                    drill_jobs,
-                )
+                run_drill_suite_case(cmd, case_index, total_cases, case, drill_jobs)
             })
             .collect();
     }
@@ -3953,15 +4327,7 @@ fn run_drill_suite_cases(
                 chunk
                     .iter()
                     .map(|(case_index, case)| {
-                        let repo = run_drill_suite_case(
-                            cmd,
-                            *case_index,
-                            total_cases,
-                            case,
-                            ledger_cases.get(&case.slug),
-                            ledger_supplied,
-                            1,
-                        );
+                        let repo = run_drill_suite_case(cmd, *case_index, total_cases, case, 1);
                         (*case_index, repo)
                     })
                     .collect::<Vec<_>>()
@@ -3986,8 +4352,6 @@ fn run_drill_suite_case(
     case_index: usize,
     total_cases: usize,
     case: &DrillSuiteCase,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
     drill_jobs: usize,
 ) -> DrillSuiteRepoOutput {
     let progress_index = case_index + 1;
@@ -4012,6 +4376,8 @@ fn run_drill_suite_case(
         question: Some(case.question.clone()),
         output_dir: repo_output_dir.clone(),
         refresh: cmd.refresh,
+        profile: None,
+        run_id: None,
         format: cmd.format,
         jobs: drill_jobs,
     };
@@ -4020,12 +4386,6 @@ fn run_drill_suite_case(
         Ok(drill_summary(&drill_output))
     }) {
         Ok(summary) => {
-            let answer_quality = drill_suite_answer_quality(
-                &summary,
-                &case.expectations,
-                ledger_case,
-                ledger_supplied,
-            );
             emit_drill_suite_progress(drill_suite_repo_progress_done_message(
                 progress_index,
                 total_cases,
@@ -4041,7 +4401,6 @@ fn run_drill_suite_case(
                 artifact_extension: drill_artifact_extension(cmd.format).to_string(),
                 summary,
                 expectations: case.expectations.clone(),
-                answer_quality,
             }
         }
         Err(error) => {
@@ -4055,8 +4414,6 @@ fn run_drill_suite_case(
                 cmd.refresh,
                 cmd.format,
                 &error.to_string(),
-                ledger_case,
-                ledger_supplied,
             )
         }
     }
@@ -4067,26 +4424,6 @@ fn drill_suite_verdict_count(repos: &[DrillSuiteRepoOutput], status: &str) -> us
         .iter()
         .filter(|repo| repo.summary.verdict.status == status)
         .count()
-}
-
-fn drill_suite_answer_status_count(repos: &[DrillSuiteRepoOutput], status: &str) -> usize {
-    repos
-        .iter()
-        .filter(|repo| repo.answer_quality.final_answer_status == status)
-        .count()
-}
-
-fn drill_suite_answer_pending_count(repos: &[DrillSuiteRepoOutput]) -> usize {
-    repos
-        .iter()
-        .filter(|repo| {
-            drill_suite_answer_status_is_pending(&repo.answer_quality.final_answer_status)
-        })
-        .count()
-}
-
-fn drill_suite_answer_status_is_pending(status: &str) -> bool {
-    matches!(status, "pending_source_verification" | "blocked")
 }
 
 fn drill_suite_case_cache_dir(
@@ -4191,54 +4528,6 @@ fn drill_suite_expectations_from_config(
     }
 }
 
-#[cfg(test)]
-fn empty_drill_suite_expectations() -> DrillSuiteExpectationOutput {
-    DrillSuiteExpectationOutput {
-        source_truth_files: Vec::new(),
-        false_claims: Vec::new(),
-        min_anchor_resolution: None,
-        allow_partial_bridges: None,
-    }
-}
-
-fn drill_suite_ledger_cases(
-    ledger_path: Option<&std::path::Path>,
-) -> Result<BTreeMap<String, DrillSuiteLedgerCase>> {
-    let Some(ledger_path) = ledger_path else {
-        return Ok(BTreeMap::new());
-    };
-    let ledger_path = absolute_existing_path(ledger_path).with_context(|| {
-        format!(
-            "Failed to resolve drill-suite ledger file {}",
-            display::clean_path_string(&ledger_path.to_string_lossy())
-        )
-    })?;
-    let ledger_text = fs::read_to_string(&ledger_path).with_context(|| {
-        format!(
-            "Failed to read drill-suite ledger file {}",
-            display::clean_path_string(&ledger_path.to_string_lossy())
-        )
-    })?;
-    let ledger: DrillSuiteSourceTruthLedger =
-        serde_json::from_str(&ledger_text).with_context(|| {
-            format!(
-                "Failed to parse drill-suite ledger file {} as JSON",
-                display::clean_path_string(&ledger_path.to_string_lossy())
-            )
-        })?;
-    let mut cases = BTreeMap::new();
-    for case in ledger.cases {
-        let slug = output_slug(&case.slug);
-        if slug.is_empty() {
-            bail!("drill-suite ledger case slug cannot be empty");
-        }
-        if cases.insert(slug.clone(), case).is_some() {
-            bail!("drill-suite ledger case slug `{slug}` is duplicated");
-        }
-    }
-    Ok(cases)
-}
-
 fn absolute_existing_path(path: &std::path::Path) -> Result<std::path::PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -4262,8 +4551,6 @@ fn blocked_drill_suite_repo_output(
     refresh: args::RefreshMode,
     format: args::OutputFormat,
     error: &str,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
 ) -> DrillSuiteRepoOutput {
     let project = display::clean_path_string(&case.project_root.to_string_lossy());
     let output_dir = display::clean_path_string(&repo_output_dir.to_string_lossy());
@@ -4374,11 +4661,6 @@ fn blocked_drill_suite_repo_output(
             },
         },
         expectations: case.expectations.clone(),
-        answer_quality: drill_suite_blocked_answer_quality(
-            &case.expectations,
-            ledger_case,
-            ledger_supplied,
-        ),
     }
 }
 
@@ -4418,7 +4700,6 @@ fn render_drill_suite_markdown(output: &DrillSuiteOutput) -> String {
     render_drill_suite_header(&mut markdown, output);
     render_drill_suite_retrieval_blockers(&mut markdown, &output.retrieval_blockers);
     render_drill_suite_repo_table(&mut markdown, &output.repos);
-    render_drill_suite_answer_quality_findings(&mut markdown, &output.repos);
     render_drill_suite_repo_artifacts(&mut markdown, &output.repos);
     render_drill_suite_next_actions(&mut markdown, &output.next_actions);
     ensure_trailing_newline(markdown)
@@ -4435,14 +4716,6 @@ fn render_drill_suite_header(markdown: &mut String, output: &DrillSuiteOutput) {
         markdown,
         "- repos: {} total, {} ready, {} degraded, {} blocked",
         output.repo_count, output.ready_count, output.degraded_count, output.blocked_count
-    );
-    let _ = writeln!(
-        markdown,
-        "- answer_quality: {} ready, {} degraded, {} failed, {} pending",
-        output.answer_ready_count,
-        output.answer_degraded_count,
-        output.answer_failed_count,
-        output.answer_pending_count
     );
 }
 
@@ -4472,17 +4745,16 @@ fn render_drill_suite_repo_table(markdown: &mut String, repos: &[DrillSuiteRepoO
     let _ = writeln!(markdown);
     let _ = writeln!(
         markdown,
-        "| repo | verdict | answer quality | freshness | retrieval | anchors | bridges | source truth | reports | next action |"
+        "| repo | verdict | freshness | retrieval | anchors | bridges | source truth | reports | next action |"
     );
-    let _ = writeln!(markdown, "|---|---|---|---|---|---:|---:|---|---|---|");
+    let _ = writeln!(markdown, "|---|---|---|---|---:|---:|---|---|---|");
     for repo in repos {
         let reports = drill_suite_repo_report_label(repo);
         let _ = writeln!(
             markdown,
-            "| `{}` | {} | {} | {} | {} | {}/{} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {}/{} | {} | {} | {} | {} |",
             repo.slug,
             repo.summary.verdict.status,
-            drill_suite_answer_quality_label(&repo.answer_quality),
             repo.summary
                 .mechanical
                 .freshness_status
@@ -4492,61 +4764,10 @@ fn render_drill_suite_repo_table(markdown: &mut String, repos: &[DrillSuiteRepoO
             repo.summary.anchors.resolved,
             repo.summary.anchors.requested,
             drill_suite_bridge_label(&repo.summary.bridges),
-            drill_suite_source_truth_label_for_repo(repo),
+            drill_suite_source_truth_label(&repo.summary.source_truth),
             reports,
-            drill_suite_next_action(repo).replace('|', "\\|")
+            repo.summary.verdict.next_action.replace('|', "\\|")
         );
-    }
-}
-
-fn render_drill_suite_answer_quality_findings(
-    markdown: &mut String,
-    repos: &[DrillSuiteRepoOutput],
-) {
-    if !repos.iter().any(|repo| {
-        !repo.answer_quality.warnings.is_empty()
-            || !repo.answer_quality.missing_expected_files.is_empty()
-            || !repo.answer_quality.forbidden_claim_hits.is_empty()
-    }) {
-        return;
-    }
-
-    let _ = writeln!(markdown);
-    let _ = writeln!(markdown, "## Answer Quality Findings");
-    for repo in repos {
-        let quality = &repo.answer_quality;
-        if quality.warnings.is_empty()
-            && quality.missing_expected_files.is_empty()
-            && quality.forbidden_claim_hits.is_empty()
-        {
-            continue;
-        }
-        let _ = writeln!(
-            markdown,
-            "- `{}`: status={} ledger={} claims={}/{} correct partial={} misleading={} unsupported={} material_revisions={}",
-            repo.slug,
-            quality.final_answer_status,
-            quality.ledger_status,
-            quality.claim_correct_count,
-            quality.claim_count,
-            quality.claim_partial_count,
-            quality.claim_misleading_count,
-            quality.claim_unsupported_count,
-            quality.material_revision_count
-        );
-        if !quality.missing_expected_files.is_empty() {
-            let _ = writeln!(
-                markdown,
-                "  - missing_expected_files: {}",
-                quality.missing_expected_files.join(", ")
-            );
-        }
-        for hit in &quality.forbidden_claim_hits {
-            let _ = writeln!(markdown, "  - forbidden_claim_hit: {hit}");
-        }
-        for warning in &quality.warnings {
-            let _ = writeln!(markdown, "  - {warning}");
-        }
     }
 }
 
@@ -4595,30 +4816,6 @@ fn render_drill_suite_next_actions(markdown: &mut String, next_actions: &[String
     }
 }
 
-fn drill_suite_answer_quality_label(quality: &DrillSuiteAnswerQualityOutput) -> String {
-    let expected = if quality.expected_file_count > 0 {
-        format!(
-            "; expected_files={}/{}",
-            quality.expected_file_found_count, quality.expected_file_count
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "{} ({}, claims={} correct={} partial={} misleading={} unsupported={} revisions={}{})",
-        quality.final_answer_status,
-        quality.ledger_status,
-        quality.claim_count,
-        quality.claim_correct_count,
-        quality.claim_partial_count,
-        quality.claim_misleading_count,
-        quality.claim_unsupported_count,
-        quality.material_revision_count,
-        expected
-    )
-    .replace('|', "\\|")
-}
-
 fn drill_suite_repo_report_label(repo: &DrillSuiteRepoOutput) -> String {
     if repo.summary.full_report_markdown.is_empty() && repo.summary.full_report_json.is_empty() {
         return "not written (blocked before evidence)".to_string();
@@ -4653,30 +4850,6 @@ fn drill_suite_bridge_label(bridges: &DrillSummaryBridgesOutput) -> String {
     )
 }
 
-fn drill_suite_source_truth_label_for_repo(repo: &DrillSuiteRepoOutput) -> String {
-    let quality = &repo.answer_quality;
-    if quality.ledger_status == "present"
-        && !matches!(
-            quality.final_answer_status.as_str(),
-            "pending_source_verification" | "blocked"
-        )
-    {
-        return format!(
-            "ledger claims={} correct={} partial={} misleading={} unsupported={} revisions={}; packet {} targets / {} pending",
-            quality.claim_count,
-            quality.claim_correct_count,
-            quality.claim_partial_count,
-            quality.claim_misleading_count,
-            quality.claim_unsupported_count,
-            quality.material_revision_count,
-            repo.summary.source_truth.target_file_count,
-            repo.summary.source_truth.pending_check_count
-        )
-        .replace('|', "\\|");
-    }
-    drill_suite_source_truth_label(&repo.summary.source_truth)
-}
-
 fn drill_suite_source_truth_label(source_truth: &DrillSummarySourceTruthOutput) -> String {
     if source_truth.required
         || source_truth.pending_check_count > 0
@@ -4693,42 +4866,6 @@ fn drill_suite_source_truth_label(source_truth: &DrillSummarySourceTruthOutput) 
         "{} targets / {} checks",
         source_truth.target_file_count, source_truth.check_count
     )
-}
-
-fn drill_suite_next_action(repo: &DrillSuiteRepoOutput) -> String {
-    let quality = &repo.answer_quality;
-    match quality.final_answer_status.as_str() {
-        "ready" => {
-            if repo.summary.verdict.status == "ready" {
-                "answer is source-verified; keep the artifacts as the ready baseline".to_string()
-            } else if repo.summary.bridges.partial > 0 || repo.summary.bridges.graph_path == 0 {
-                format!(
-                    "answer is source-verified; improve graph/bridge evidence before promoting the mechanical verdict ({} partial bridge(s), {} graph bridge(s))",
-                    repo.summary.bridges.partial, repo.summary.bridges.graph_path
-                )
-            } else {
-                "answer is source-verified; inspect the mechanical degraded reason before promotion"
-                    .to_string()
-            }
-        }
-        "degraded" => {
-            if quality.material_revision_count > 0 || quality.claim_partial_count > 0 {
-                format!(
-                    "revise partial or materially changed claims, then rerun with the updated ledger (partial={}, revisions={})",
-                    quality.claim_partial_count, quality.material_revision_count
-                )
-            } else {
-                "inspect answer-quality warnings and update the ledger or expected evidence"
-                    .to_string()
-            }
-        }
-        "failed" => format!(
-            "remove or correct misleading/unsupported final claims before trusting the answer (misleading={}, unsupported={})",
-            quality.claim_misleading_count, quality.claim_unsupported_count
-        ),
-        "blocked" => repo.summary.verdict.next_action.clone(),
-        _ => repo.summary.verdict.next_action.clone(),
-    }
 }
 
 fn drill_suite_retrieval_blockers(
@@ -4767,341 +4904,12 @@ fn drill_suite_retrieval_blockers(
         .collect()
 }
 
-fn drill_suite_answer_quality(
-    summary: &DrillSummaryOutput,
-    expectations: &DrillSuiteExpectationOutput,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
-) -> DrillSuiteAnswerQualityOutput {
-    let (missing_expected_files, expected_file_found_count, expected_file_recall) =
-        drill_suite_expected_file_stats(expectations, &summary.source_truth.target_files);
-    let expected_file_count = expectations.source_truth_files.len();
-    let ledger_status = drill_suite_ledger_status(ledger_case, ledger_supplied);
-    let mut warnings = Vec::new();
-    let mut layer_findings = Vec::new();
-    let mut draft_written = None;
-    let mut claim_count = 0usize;
-    let mut claim_correct_count = 0usize;
-    let mut claim_partial_count = 0usize;
-    let mut claim_misleading_count = 0usize;
-    let mut claim_unsupported_count = 0usize;
-    let claim_unclassified_count = 0usize;
-    let mut material_revision_count = 0usize;
-    let mut forbidden_claim_hits = Vec::new();
-
-    if !missing_expected_files.is_empty() {
-        warnings.push(format!(
-            "{} expected source-truth file(s) were not emitted as drill targets",
-            missing_expected_files.len()
-        ));
-    }
-
-    if summary.verdict.status == "blocked" {
-        warnings.push("drill blocked before answer-quality scoring could complete".to_string());
-        return DrillSuiteAnswerQualityOutput {
-            ledger_status,
-            final_answer_status: "blocked".to_string(),
-            draft_written,
-            claim_count,
-            claim_correct_count,
-            claim_partial_count,
-            claim_misleading_count,
-            claim_unsupported_count,
-            claim_unclassified_count,
-            material_revision_count,
-            expected_file_count,
-            expected_file_found_count,
-            expected_file_missing_count: missing_expected_files.len(),
-            expected_file_recall,
-            missing_expected_files,
-            forbidden_claim_count: 0,
-            forbidden_claim_hits,
-            layer_findings,
-            warnings,
-        };
-    }
-
-    let Some(ledger_case) = ledger_case else {
-        warnings.push(if ledger_supplied {
-            "ledger was supplied, but this repo slug had no matching case".to_string()
-        } else {
-            "no source-truth ledger supplied; final answer quality is still pending".to_string()
-        });
-        return DrillSuiteAnswerQualityOutput {
-            ledger_status,
-            final_answer_status: "pending_source_verification".to_string(),
-            draft_written,
-            claim_count,
-            claim_correct_count,
-            claim_partial_count,
-            claim_misleading_count,
-            claim_unsupported_count,
-            claim_unclassified_count,
-            material_revision_count,
-            expected_file_count,
-            expected_file_found_count,
-            expected_file_missing_count: missing_expected_files.len(),
-            expected_file_recall,
-            missing_expected_files,
-            forbidden_claim_count: 0,
-            forbidden_claim_hits,
-            layer_findings,
-            warnings,
-        };
-    };
-
-    draft_written = ledger_case.draft_written;
-    claim_count = ledger_case.claims.len();
-    for claim in &ledger_case.claims {
-        match claim.classification {
-            DrillSuiteClaimClassification::Correct => claim_correct_count += 1,
-            DrillSuiteClaimClassification::Partial => claim_partial_count += 1,
-            DrillSuiteClaimClassification::Misleading => claim_misleading_count += 1,
-            DrillSuiteClaimClassification::Unsupported => claim_unsupported_count += 1,
-        }
-        if claim.source_files.is_empty() {
-            warnings.push(format!(
-                "ledger claim `{}` has no source_files verification evidence",
-                claim.id
-            ));
-        }
-        if claim.changed_after_source_read.unwrap_or(false) {
-            material_revision_count += 1;
-        }
-        if drill_suite_claim_has_forbidden_final_text(claim, expectations) {
-            forbidden_claim_hits.push(format!("{}: {}", claim.id, claim.text));
-        }
-    }
-    layer_findings = ledger_case
-        .layer_findings
-        .iter()
-        .map(|finding| DrillSuiteLayerFindingOutput {
-            layer: finding.layer.clone(),
-            status: finding.status.clone(),
-            detail: finding.detail.clone(),
-        })
-        .collect();
-
-    if claim_count == 0 {
-        warnings.push("ledger case has no verified claims".to_string());
-    }
-    if draft_written == Some(false) {
-        warnings.push("ledger reports that no CodeStory-only draft was written".to_string());
-    }
-
-    let final_answer_status = if draft_written == Some(false) || claim_count == 0 {
-        "pending_source_verification"
-    } else if claim_unsupported_count > 0
-        || claim_misleading_count > 0
-        || !forbidden_claim_hits.is_empty()
-    {
-        "failed"
-    } else if claim_partial_count > 0
-        || material_revision_count > 0
-        || !missing_expected_files.is_empty()
-    {
-        "degraded"
-    } else {
-        "ready"
-    };
-
-    DrillSuiteAnswerQualityOutput {
-        ledger_status,
-        final_answer_status: final_answer_status.to_string(),
-        draft_written,
-        claim_count,
-        claim_correct_count,
-        claim_partial_count,
-        claim_misleading_count,
-        claim_unsupported_count,
-        claim_unclassified_count,
-        material_revision_count,
-        expected_file_count,
-        expected_file_found_count,
-        expected_file_missing_count: missing_expected_files.len(),
-        expected_file_recall,
-        missing_expected_files,
-        forbidden_claim_count: forbidden_claim_hits.len(),
-        forbidden_claim_hits,
-        layer_findings,
-        warnings,
-    }
-}
-
-fn drill_suite_blocked_answer_quality(
-    expectations: &DrillSuiteExpectationOutput,
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
-) -> DrillSuiteAnswerQualityOutput {
-    let (missing_expected_files, expected_file_found_count, expected_file_recall) =
-        drill_suite_expected_file_stats(expectations, &[]);
-    let ledger_status = drill_suite_ledger_status(ledger_case, ledger_supplied);
-    DrillSuiteAnswerQualityOutput {
-        ledger_status,
-        final_answer_status: "blocked".to_string(),
-        draft_written: ledger_case.and_then(|case| case.draft_written),
-        claim_count: ledger_case
-            .map(|case| case.claims.len())
-            .unwrap_or_default(),
-        claim_correct_count: 0,
-        claim_partial_count: 0,
-        claim_misleading_count: 0,
-        claim_unsupported_count: 0,
-        claim_unclassified_count: 0,
-        material_revision_count: 0,
-        expected_file_count: expectations.source_truth_files.len(),
-        expected_file_found_count,
-        expected_file_missing_count: missing_expected_files.len(),
-        expected_file_recall,
-        missing_expected_files,
-        forbidden_claim_count: 0,
-        forbidden_claim_hits: Vec::new(),
-        layer_findings: ledger_case
-            .map(|case| {
-                case.layer_findings
-                    .iter()
-                    .map(|finding| DrillSuiteLayerFindingOutput {
-                        layer: finding.layer.clone(),
-                        status: finding.status.clone(),
-                        detail: finding.detail.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        warnings: vec!["drill blocked before answer-quality scoring could complete".to_string()],
-    }
-}
-
-fn drill_suite_ledger_status(
-    ledger_case: Option<&DrillSuiteLedgerCase>,
-    ledger_supplied: bool,
-) -> String {
-    if ledger_case.is_some() {
-        "present".to_string()
-    } else if ledger_supplied {
-        "case_missing".to_string()
-    } else {
-        "not_supplied".to_string()
-    }
-}
-
-fn drill_suite_expected_file_stats(
-    expectations: &DrillSuiteExpectationOutput,
-    target_files: &[String],
-) -> (Vec<String>, usize, Option<f32>) {
-    if expectations.source_truth_files.is_empty() {
-        return (Vec::new(), 0, None);
-    }
-    let target_keys = target_files
-        .iter()
-        .map(|path| drill_suite_path_key(path))
-        .collect::<HashSet<_>>();
-    let mut missing = Vec::new();
-    let mut found = 0usize;
-    for expected in &expectations.source_truth_files {
-        if target_keys.contains(&drill_suite_path_key(expected)) {
-            found += 1;
-        } else {
-            missing.push(expected.clone());
-        }
-    }
-    (
-        missing,
-        found,
-        Some(found as f32 / expectations.source_truth_files.len() as f32),
-    )
-}
-
-fn drill_suite_claim_has_forbidden_final_text(
-    claim: &DrillSuiteLedgerClaim,
-    expectations: &DrillSuiteExpectationOutput,
-) -> bool {
-    if matches!(
-        claim.classification,
-        DrillSuiteClaimClassification::Misleading | DrillSuiteClaimClassification::Unsupported
-    ) {
-        return false;
-    }
-    let claim_text = drill_suite_text_key(&claim.text);
-    expectations.false_claims.iter().any(|false_claim| {
-        let false_claim = drill_suite_text_key(false_claim);
-        !false_claim.is_empty() && claim_text.contains(&false_claim)
-    })
-}
-
-fn drill_suite_path_key(path: &str) -> String {
-    let mut value = path.trim().replace('\\', "/");
-    while let Some(stripped) = value.strip_prefix("./") {
-        value = stripped.to_string();
-    }
-    value.trim_matches('/').to_ascii_lowercase()
-}
-
 fn drill_suite_text_key(value: &str) -> String {
     value
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
-}
-
-fn drill_execution_boundaries() -> Vec<DrillExecutionBoundaryOutput> {
-    vec![
-        DrillExecutionBoundaryOutput {
-            command: "drill".to_string(),
-            flow: vec![
-                "codestory-cli::run_drill validates output dir and opens RuntimeContext"
-                    .to_string(),
-                "RuntimeContext::ensure_open refreshes workspace/index state before evidence commands"
-                    .to_string(),
-                "run_drill_anchor runs search, symbol, trail, explore, and function-body snippet artifacts"
-                    .to_string(),
-                "drill_evidence_packet and drill_summary turn artifacts into answer-readiness evidence"
-                    .to_string(),
-            ],
-            source_files: vec![
-                "crates/codestory-cli/src/main.rs".to_string(),
-                "crates/codestory-runtime/src/lib.rs".to_string(),
-                "crates/codestory-runtime/src/grounding.rs".to_string(),
-            ],
-        },
-        DrillExecutionBoundaryOutput {
-            command: "trail".to_string(),
-            flow: vec![
-                "codestory-cli::run_trail resolves the requested symbol into a NodeId".to_string(),
-                "CodebaseBrowser::trail_context loads focus details and delegates graph traversal"
-                    .to_string(),
-                "graph_builders::graph_trail converts TrailConfigDto into store traversal and DTO edges"
-                    .to_string(),
-                "codestory-store::get_trail performs bounded graph traversal over persisted index edges"
-                    .to_string(),
-            ],
-            source_files: vec![
-                "crates/codestory-cli/src/main.rs".to_string(),
-                "crates/codestory-runtime/src/browser.rs".to_string(),
-                "crates/codestory-runtime/src/grounding.rs".to_string(),
-                "crates/codestory-runtime/src/graph_builders.rs".to_string(),
-                "crates/codestory-store/src/storage_impl/trail.rs".to_string(),
-            ],
-        },
-        DrillExecutionBoundaryOutput {
-            command: "search/snippet".to_string(),
-            flow: vec![
-                "codestory-cli search/snippet requests go through RuntimeContext and CodebaseBrowser"
-                    .to_string(),
-                "SearchService combines indexed-symbol, repo-text, semantic, graph, and search-plan evidence"
-                    .to_string(),
-                "snippet_context reads source-backed line/function ranges for the selected NodeId"
-                    .to_string(),
-            ],
-            source_files: vec![
-                "crates/codestory-cli/src/main.rs".to_string(),
-                "crates/codestory-runtime/src/services.rs".to_string(),
-                "crates/codestory-runtime/src/grounding.rs".to_string(),
-                "crates/codestory-store/src/search.rs".to_string(),
-            ],
-        },
-    ]
 }
 
 fn validate_drill_output_dir(output_dir: &std::path::Path) -> Result<()> {
@@ -5150,7 +4958,7 @@ fn write_drill_report_file(path: &std::path::Path, content: &str) -> Result<()> 
 }
 
 fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
-    let readiness = &output.evidence_packet.readiness;
+    let sufficiency = &output.evidence_packet.sufficiency;
     let anchor_statuses: Vec<_> = output
         .anchors
         .iter()
@@ -5257,24 +5065,25 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         })
         .count();
 
-    let mut target_files: Vec<_> = readiness
-        .source_truth_checks
+    let mut target_files: Vec<_> = output
+        .verification_targets
         .iter()
-        .map(|check| check.path.clone())
+        .map(|target| target.path.clone())
         .collect();
     dedupe_and_rank_drill_files(&mut target_files);
+    let target_file_count = target_files.len();
     let target_file_details =
-        drill_summary_source_truth_target_details(&target_files, &readiness.source_truth_checks);
+        drill_summary_source_truth_target_details(&target_files, &output.verification_targets);
 
-    let has_source_truth_checks = !readiness.source_truth_checks.is_empty();
-    let needs_source_truth = has_source_truth_checks;
+    let has_source_truth_checks = !target_files.is_empty();
+    let needs_source_truth = sufficiency.status != PacketSufficiencyStatusDto::Sufficient;
     let stale_freshness = output
         .mechanical
         .freshness
         .as_ref()
         .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
-    let open_gap_friendly = !readiness.needs_verification.is_empty()
-        || !readiness.inferred_claims.is_empty()
+    let open_gap_friendly = !sufficiency.gaps.is_empty()
+        || !sufficiency.open_next.is_empty()
         || needs_source_truth
         || stale_freshness;
 
@@ -5350,42 +5159,47 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         },
         source_truth: DrillSummarySourceTruthOutput {
             required: needs_source_truth,
-            check_count: readiness.source_truth_checks.len(),
+            check_count: target_file_count,
             pending_check_count: if has_source_truth_checks {
-                readiness.source_truth_checks.len()
+                usize::from(needs_source_truth) * target_file_count
             } else {
                 0
             },
-            verified_check_count: 0,
-            target_file_count: target_files.len(),
+            verified_check_count: if needs_source_truth {
+                0
+            } else {
+                target_file_count
+            },
+            target_file_count,
             target_files,
             target_file_details,
-            checklist_item_count: output.verification_checklist.len(),
-            claim_count: output.claim_ledger_template.claims.len(),
-            pending_claim_count: output.claim_ledger_template.claims.len(),
-            verified_claim_count: 0,
+            checklist_item_count: 0,
+            claim_count: sufficiency.covered_claims.len(),
+            pending_claim_count: sufficiency.gaps.len(),
+            verified_claim_count: sufficiency.covered_claims.len(),
         },
         open_gaps: DrillSummaryOpenGapsOutput {
-            overall_status: readiness.overall_status,
-            answer_quality_status: drill_answer_quality_status(
-                needs_source_truth,
-                output.claim_ledger_template.claims.len(),
-            ),
-            safe_to_say_count: readiness.safe_to_say.len(),
-            inferred_claim_count: readiness.inferred_claims.len(),
-            needs_verification_count: readiness.needs_verification.len(),
-            needs_verification_claim_count: readiness.needs_verification.len(),
+            overall_status: drill_packet_claim_readiness(sufficiency.status),
+            answer_quality_status: packet_sufficiency_label(sufficiency.status).to_string(),
+            safe_to_say_count: sufficiency.covered_claims.len(),
+            inferred_claim_count: sufficiency
+                .covered_claims
+                .iter()
+                .filter(|claim| claim.proof_status != Some(PacketProofStatusDto::Proven))
+                .count(),
+            needs_verification_count: sufficiency.gaps.len(),
+            needs_verification_claim_count: sufficiency.gaps.len(),
             pending_claim_count: if needs_source_truth {
-                output.claim_ledger_template.claims.len()
+                sufficiency.gaps.len()
             } else {
                 0
             },
             pending_source_truth_check_count: if needs_source_truth {
-                readiness.source_truth_checks.len()
+                target_file_count
             } else {
                 0
             },
-            next_command_count: readiness.next_commands.len(),
+            next_command_count: sufficiency.follow_up_commands.len(),
             open_gap_friendly,
             status: if open_gap_friendly {
                 "open_gaps_explicit".to_string()
@@ -5406,13 +5220,11 @@ fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
     }
 }
 
-fn drill_answer_quality_status(needs_source_truth: bool, claim_count: usize) -> String {
-    if needs_source_truth && claim_count > 0 {
-        "pending_source_verification".to_string()
-    } else if needs_source_truth {
-        "pending_source_truth_checks".to_string()
-    } else {
-        "ready_from_codestory_evidence".to_string()
+fn drill_packet_claim_readiness(status: PacketSufficiencyStatusDto) -> ClaimReadinessDto {
+    match status {
+        PacketSufficiencyStatusDto::Sufficient => ClaimReadinessDto::Supported,
+        PacketSufficiencyStatusDto::Partial => ClaimReadinessDto::Partial,
+        PacketSufficiencyStatusDto::Insufficient => ClaimReadinessDto::NeedsSourceRead,
     }
 }
 
@@ -5481,7 +5293,7 @@ fn drill_summary_verdict(
                 "index_freshness=stale source_truth_required={} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_source_truth_checks={}",
                 needs_source_truth,
                 output.bridges.len(),
-                output.evidence_packet.readiness.source_truth_checks.len()
+                output.verification_targets.len()
             ),
             next_action: drill_stale_freshness_next_action(output),
         };
@@ -5493,7 +5305,7 @@ fn drill_summary_verdict(
                 "source_truth_required={} graph_bridges={graph_path_bridges}/{} partial_bridges={partial_bridges} unresolved_or_error_bridges={unresolved_or_error_bridges} pending_source_truth_checks={}",
                 needs_source_truth,
                 output.bridges.len(),
-                output.evidence_packet.readiness.source_truth_checks.len()
+                output.verification_targets.len()
             ),
             next_action: drill_degraded_next_action(output, unresolved_or_error_bridges),
         };
@@ -5543,16 +5355,14 @@ fn drill_degraded_next_action(output: &DrillOutput, unresolved_or_error_bridges:
         .count()
         .max(unresolved_or_error_bridges);
     let mut files = output
-        .evidence_packet
-        .readiness
-        .source_truth_checks
+        .verification_targets
         .iter()
-        .map(|check| check.path.clone())
+        .map(|target| target.path.clone())
         .collect::<Vec<_>>();
     dedupe_and_rank_drill_files(&mut files);
 
     let mut action = "write a CodeStory-only draft".to_string();
-    let pending_claim_count = output.claim_ledger_template.claims.len();
+    let pending_claim_count = output.evidence_packet.sufficiency.gaps.len();
     if pending_claim_count > 0 && degraded_bridge_count > 0 {
         let _ = write!(
             action,
@@ -5575,8 +5385,13 @@ fn drill_degraded_next_action(output: &DrillOutput, unresolved_or_error_bridges:
         let preview = files.into_iter().take(3).collect::<Vec<_>>().join("; ");
         let _ = write!(action, " including {preview}");
     }
-    if !output.evidence_packet.readiness.next_commands.is_empty() {
-        action.push_str("; use emitted bridge/consumer follow-up commands before finalizing");
+    if !output
+        .evidence_packet
+        .sufficiency
+        .follow_up_commands
+        .is_empty()
+    {
+        action.push_str("; use emitted packet follow-up commands before finalizing");
     }
     action
 }
@@ -5639,15 +5454,15 @@ fn drill_suite_retrieval_label(status: Option<&str>) -> &str {
 
 fn drill_summary_source_truth_target_details(
     target_files: &[String],
-    checks: &[SourceTruthCheckDto],
+    targets: &[VerificationTargetOutput],
 ) -> Vec<DrillSummarySourceTruthTargetOutput> {
     target_files
         .iter()
         .map(|path| {
-            let check_reasons = checks
+            let check_reasons = targets
                 .iter()
-                .filter(|check| normalize_drill_path(&check.path) == normalize_drill_path(path))
-                .map(|check| check.reason.clone())
+                .filter(|target| normalize_drill_path(&target.path) == normalize_drill_path(path))
+                .map(|target| target.reason.clone())
                 .collect::<Vec<_>>();
             let role = drill_source_truth_target_role(path, &check_reasons);
             DrillSummarySourceTruthTargetOutput {
@@ -5674,14 +5489,6 @@ fn drill_path_is_framework_route_or_page(path: &str) -> bool {
         || normalized.ends_with("/page.jsx")
         || ((normalized.contains("/app/") || normalized.contains("/pages/"))
             && (normalized.ends_with(".tsx") || normalized.ends_with(".jsx")))
-}
-
-fn drill_path_is_native_or_jvm_source(path: &str) -> bool {
-    let normalized = normalize_drill_path(path);
-    matches!(
-        normalized.rsplit('.').next(),
-        Some("c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" | "java")
-    )
 }
 
 fn drill_source_truth_target_role(path: &str, reasons: &[String]) -> String {
@@ -5757,2191 +5564,6 @@ fn drill_summary_freshness_samples(freshness: &IndexFreshnessDto) -> Vec<String>
         .collect()
 }
 
-fn run_drill_anchors_in_order(
-    runtime: &RuntimeContext,
-    opened: &runtime::OpenedProject,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    anchors: &[String],
-    jobs: usize,
-) -> Result<Vec<DrillAnchorOutput>> {
-    let jobs = jobs.min(anchors.len()).max(1);
-    if jobs == 1 || anchors.len() <= 1 {
-        return anchors
-            .iter()
-            .map(|anchor| run_drill_anchor(runtime, opened, output_dir, format, anchor))
-            .collect();
-    }
-
-    let indexed_anchors = anchors.iter().enumerate().collect::<Vec<_>>();
-    let chunk_size = indexed_anchors.len().div_ceil(jobs);
-    let mut indexed_outputs = Vec::with_capacity(anchors.len());
-    std::thread::scope(|scope| -> Result<()> {
-        let mut handles = Vec::new();
-        for chunk in indexed_anchors.chunks(chunk_size) {
-            handles.push(scope.spawn(move || {
-                chunk
-                    .iter()
-                    .map(|(index, anchor)| {
-                        (
-                            *index,
-                            run_drill_anchor(runtime, opened, output_dir, format, anchor),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            }));
-        }
-        for handle in handles {
-            let mut chunk = match handle.join() {
-                Ok(chunk) => chunk,
-                Err(_) => bail!("drill anchor worker panicked"),
-            };
-            indexed_outputs.append(&mut chunk);
-        }
-        Ok(())
-    })?;
-
-    indexed_outputs.sort_by_key(|(index, _)| *index);
-    indexed_outputs
-        .into_iter()
-        .map(|(_, output)| output)
-        .collect()
-}
-
-fn run_drill_anchor(
-    runtime: &RuntimeContext,
-    opened: &runtime::OpenedProject,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    anchor: &str,
-) -> Result<DrillAnchorOutput> {
-    let anchor_timer = Instant::now();
-    let mut commands = Vec::new();
-    let safe_anchor = output_slug(anchor);
-    let search_timer = Instant::now();
-    let search_results = runtime
-        .browser
-        .search_results(SearchRequest {
-            query: anchor.to_string(),
-            repo_text: SearchRepoTextMode::Auto,
-            limit_per_source: 10,
-            expand_search_plan: false,
-            hybrid_weights: None,
-            hybrid_limits: None,
-        })
-        .map_err(map_api_error)?;
-    let search_output = search_output_from_results(runtime, &search_results, true);
-    let search_markdown = render_search_markdown(&runtime.project_root, &search_output);
-    let search_status = with_drill_command_duration(
-        search_timer,
-        write_drill_artifact(
-            output_dir,
-            format,
-            &format!("{safe_anchor}-search"),
-            "search",
-            &search_output,
-            search_markdown,
-        ),
-    );
-    let search_ms = search_status.duration_ms;
-    commands.push(search_status);
-
-    let chosen =
-        drill_targeting::choose_drill_anchor_hit(anchor, &search_results.indexed_symbol_hits)
-            .cloned();
-    let typed_hit_count = search_results
-        .indexed_symbol_hits
-        .iter()
-        .filter(|hit| hit.kind != NodeKind::UNKNOWN)
-        .count();
-    let Some(chosen) = chosen else {
-        let timings = DrillAnchorTimingsOutput {
-            total_ms: elapsed_ms(anchor_timer),
-            search_ms,
-            resolution_ms: 0,
-            consumer_summary_ms: 0,
-            command_artifacts_ms: commands.iter().map(|command| command.duration_ms).sum(),
-        };
-        return Ok(DrillAnchorOutput {
-            anchor: anchor.to_string(),
-            typed_hit_count,
-            chosen_anchor: None,
-            verification_targets: Vec::new(),
-            consumer_summary: None,
-            timings,
-            commands,
-        });
-    };
-
-    let target = runtime::ResolvedTarget {
-        selector: QuerySelectorOutput::Query,
-        requested: anchor.to_string(),
-        file_filter: None,
-        selected: chosen.clone(),
-        alternatives: search_results.indexed_symbol_hits.clone(),
-    };
-    let resolution_timer = Instant::now();
-    let resolution = build_query_resolution_output_with_runtime(runtime, &target);
-    let resolution_ms = elapsed_ms(resolution_timer);
-    let verification_targets = resolution.resolved.verification_targets.clone();
-    let consumer_summary_timer = Instant::now();
-    let consumer_summary =
-        drill_anchor_consumer_summary(runtime, anchor, &chosen, &verification_targets);
-    let consumer_summary_ms = elapsed_ms(consumer_summary_timer);
-
-    commands.push(run_drill_symbol_context(
-        runtime,
-        output_dir,
-        format,
-        &safe_anchor,
-        &target,
-        &resolution,
-        &verification_targets,
-    ));
-    commands.push(run_drill_trail_context(
-        runtime,
-        output_dir,
-        format,
-        &safe_anchor,
-        &target,
-        &resolution,
-    ));
-    commands.push(run_drill_explore_context(
-        runtime,
-        opened,
-        output_dir,
-        format,
-        &safe_anchor,
-        &target,
-    ));
-    commands.push(run_drill_snippet_context(
-        runtime,
-        output_dir,
-        format,
-        &safe_anchor,
-        &target,
-        &resolution,
-        &verification_targets,
-    ));
-    let timings = DrillAnchorTimingsOutput {
-        total_ms: elapsed_ms(anchor_timer),
-        search_ms,
-        resolution_ms,
-        consumer_summary_ms,
-        command_artifacts_ms: commands.iter().map(|command| command.duration_ms).sum(),
-    };
-
-    Ok(DrillAnchorOutput {
-        anchor: anchor.to_string(),
-        typed_hit_count,
-        chosen_anchor: Some(resolution.resolved),
-        verification_targets,
-        consumer_summary,
-        timings,
-        commands,
-    })
-}
-
-fn run_drill_explore_context(
-    runtime: &RuntimeContext,
-    opened: &runtime::OpenedProject,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    safe_anchor: &str,
-    target: &runtime::ResolvedTarget,
-) -> DrillCommandStatusOutput {
-    let command_timer = Instant::now();
-    let status = match explore::build_explore_artifact_for_target(
-        runtime,
-        opened,
-        target,
-        args::RefreshMode::None,
-        Some(args::ExploreProfile::Architecture),
-        3,
-        48,
-    ) {
-        Ok(artifact) => write_drill_artifact(
-            output_dir,
-            format,
-            &format!("{safe_anchor}-explore"),
-            "explore",
-            &artifact.json,
-            artifact.markdown,
-        ),
-        Err(error) => drill_status_error("explore", error),
-    };
-    with_drill_command_duration(command_timer, status)
-}
-
-fn run_drill_symbol_context(
-    runtime: &RuntimeContext,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    safe_anchor: &str,
-    target: &runtime::ResolvedTarget,
-    resolution: &QueryResolutionOutput,
-    verification_targets: &[VerificationTargetOutput],
-) -> DrillCommandStatusOutput {
-    let command_timer = Instant::now();
-    let status = match runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-    {
-        Ok(symbol) => {
-            let markdown = render_symbol_markdown(
-                &runtime.project_root,
-                target,
-                &symbol,
-                verification_targets,
-            );
-            let output = SymbolJsonOutput {
-                resolution: resolution.clone(),
-                symbol: &symbol,
-                verification_targets: verification_targets.to_vec(),
-            };
-            write_drill_artifact(
-                output_dir,
-                format,
-                &format!("{safe_anchor}-symbol"),
-                "symbol",
-                &output,
-                markdown,
-            )
-        }
-        Err(error) => drill_status_error("symbol", error),
-    };
-    with_drill_command_duration(command_timer, status)
-}
-
-fn run_drill_trail_context(
-    runtime: &RuntimeContext,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    safe_anchor: &str,
-    target: &runtime::ResolvedTarget,
-    resolution: &QueryResolutionOutput,
-) -> DrillCommandStatusOutput {
-    let command_timer = Instant::now();
-    let status = match runtime
-        .browser
-        .trail_context(drill_trail_request(&target.selected.node_id))
-    {
-        Ok(trail) => {
-            let notes = trail_guidance_notes(&trail);
-            let trail_cmd = drill_trail_command(&cmd_project_args(&runtime.project_root), target);
-            let mut markdown = if let Some(story) = trail.story.as_ref() {
-                render_trail_story_markdown(
-                    &runtime.project_root,
-                    target,
-                    &trail,
-                    &trail_cmd,
-                    story,
-                )
-            } else {
-                render_trail_markdown(&runtime.project_root, target, &trail, &trail_cmd)
-            };
-            if !notes.is_empty() {
-                let _ = writeln!(markdown, "notes:");
-                for note in &notes {
-                    let _ = writeln!(markdown, "- {note}");
-                }
-            }
-            let output = TrailJsonOutput {
-                resolution: resolution.clone(),
-                trail: &trail,
-                notes,
-            };
-            write_drill_artifact(
-                output_dir,
-                format,
-                &format!("{safe_anchor}-trail"),
-                "trail",
-                &output,
-                markdown,
-            )
-        }
-        Err(error) => drill_status_error("trail", error),
-    };
-    with_drill_command_duration(command_timer, status)
-}
-
-fn run_drill_snippet_context(
-    runtime: &RuntimeContext,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    safe_anchor: &str,
-    target: &runtime::ResolvedTarget,
-    resolution: &QueryResolutionOutput,
-    verification_targets: &[VerificationTargetOutput],
-) -> DrillCommandStatusOutput {
-    let command_timer = Instant::now();
-    let target = prefer_function_body_target(&runtime.project_root, target.clone());
-    let target_changed = target.selected.node_id.0 != resolution.resolved.node_id;
-    let resolution = if target_changed {
-        build_query_resolution_output_with_runtime(runtime, &target)
-    } else {
-        resolution.clone()
-    };
-    let verification_targets = if target_changed {
-        resolution.resolved.verification_targets.clone()
-    } else {
-        verification_targets.to_vec()
-    };
-    let status = match runtime
-        .browser
-        .snippet_function_body_context(target.selected.node_id.clone(), 40)
-    {
-        Ok(snippet) => {
-            let markdown = render_snippet_markdown(
-                &runtime.project_root,
-                &target,
-                &snippet,
-                false,
-                &verification_targets,
-            );
-            let output = SnippetJsonOutput {
-                resolution,
-                snippet: &snippet,
-                verification_targets,
-            };
-            write_drill_artifact(
-                output_dir,
-                format,
-                &format!("{safe_anchor}-snippet"),
-                "snippet",
-                &output,
-                markdown,
-            )
-        }
-        Err(error) => drill_status_error("snippet", error),
-    };
-    with_drill_command_duration(command_timer, status)
-}
-
-fn run_drill_question_search(
-    runtime: &RuntimeContext,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    question: &str,
-    anchors: &[String],
-) -> Result<(DrillCommandStatusOutput, SearchOutput)> {
-    let command_timer = Instant::now();
-    let query = drill_question_search_query(question, anchors);
-    let search_results = runtime
-        .browser
-        .search_results(SearchRequest {
-            query,
-            repo_text: SearchRepoTextMode::On,
-            limit_per_source: 25,
-            expand_search_plan: true,
-            hybrid_weights: None,
-            hybrid_limits: None,
-        })
-        .map_err(map_api_error)?;
-    let search_output = search_output_from_results(runtime, &search_results, true);
-    let search_markdown = render_search_markdown(&runtime.project_root, &search_output);
-    let status = write_drill_artifact(
-        output_dir,
-        format,
-        "question-search",
-        "question_search",
-        &search_output,
-        search_markdown,
-    );
-    Ok((
-        with_drill_command_duration(command_timer, status),
-        search_output,
-    ))
-}
-
-fn drill_question_search_query(question: &str, anchors: &[String]) -> String {
-    if anchors.is_empty() {
-        return question.to_string();
-    }
-    format!("{question}\nSeed anchors: {}", anchors.join(", "))
-}
-
-fn run_drill_question_supplemental_searches(
-    runtime: &RuntimeContext,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    question: &str,
-    anchors: &[DrillAnchorOutput],
-) -> Result<Vec<(DrillCommandStatusOutput, SearchOutput)>> {
-    let mut outputs = Vec::new();
-    for query in drill_question_supplemental_queries(&runtime.project_root, question, anchors) {
-        let command_timer = Instant::now();
-        let search_results = runtime
-            .browser
-            .search_results(SearchRequest {
-                query: query.clone(),
-                repo_text: SearchRepoTextMode::Auto,
-                limit_per_source: 10,
-                expand_search_plan: true,
-                hybrid_weights: None,
-                hybrid_limits: None,
-            })
-            .map_err(map_api_error)?;
-        let search_output = search_output_from_results(runtime, &search_results, true);
-        let search_markdown = render_search_markdown(&runtime.project_root, &search_output);
-        let slug = format!("question-supplement-{}", output_slug(&query));
-        let status = write_drill_artifact(
-            output_dir,
-            format,
-            &slug,
-            "question_supplement_search",
-            &search_output,
-            search_markdown,
-        );
-        outputs.push((
-            with_drill_command_duration(command_timer, status),
-            search_output,
-        ));
-    }
-    Ok(outputs)
-}
-
-fn drill_question_supplemental_queries(
-    project_root: &std::path::Path,
-    question: &str,
-    anchors: &[DrillAnchorOutput],
-) -> Vec<String> {
-    let lower = question.to_ascii_lowercase();
-    let tokens = drill_question_alnum_tokens(&lower);
-    let mut queries = Vec::new();
-    if contains_any_token(
-        &tokens,
-        &["public", "page", "pages", "surface", "surfaces", "home"],
-    ) {
-        queries.push("Home".to_string());
-    }
-    if contains_any_token(&tokens, &["comment", "comments"]) {
-        queries.push("Comments".to_string());
-    }
-    if contains_any_token(
-        &tokens,
-        &["post", "posts", "writing", "article", "articles"],
-    ) {
-        queries.push("Posts".to_string());
-    }
-    if contains_any_token(&tokens, &["social", "elsewhere", "feed"]) {
-        queries.push("social entries".to_string());
-        queries.push("elsewhere feed".to_string());
-    }
-    if contains_any_token(&tokens, &["store", "storage", "persist", "persistence"]) {
-        if let Some(project_name) = project_root.file_name().and_then(|name| name.to_str()) {
-            queries.push(format!("{project_name}-store"));
-        }
-        queries.push("Store".to_string());
-    }
-    for anchor in anchors {
-        if let Some(path) = anchor
-            .chosen_anchor
-            .as_ref()
-            .and_then(|hit| hit.file_path.as_deref())
-            && path.contains("/collections/")
-            && !queries.iter().any(|query| query == &anchor.anchor)
-        {
-            queries.push(anchor.anchor.clone());
-        }
-    }
-    let mut seen = HashSet::new();
-    queries
-        .into_iter()
-        .filter(|query| seen.insert(query.to_ascii_lowercase()))
-        .take(10)
-        .collect()
-}
-
-fn contains_any_token(tokens: &[String], needles: &[&str]) -> bool {
-    needles.iter().any(|needle| {
-        tokens
-            .iter()
-            .any(|token| token.eq_ignore_ascii_case(needle))
-    })
-}
-
-fn drill_question_search_verification_targets(
-    search_output: &SearchOutput,
-    reason_prefix: &str,
-    max_files: usize,
-) -> Vec<VerificationTargetOutput> {
-    let mut candidates = search_output
-        .indexed_symbol_hits
-        .iter()
-        .chain(search_output.suggestions.iter())
-        .chain(search_output.repo_text_hits.iter())
-        .filter_map(|hit| {
-            drill_question_search_verification_target(search_output, hit, reason_prefix)
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by_cached_key(|target| {
-        (
-            drill_file_rank_for_agent(Some(&target.path)),
-            drill_question_target_path_rank(&target.path),
-            target.path.clone(),
-            target.line,
-        )
-    });
-
-    let mut seen_paths = HashSet::new();
-    candidates
-        .into_iter()
-        .filter(|target| seen_paths.insert(normalize_drill_path(&target.path)))
-        .take(max_files)
-        .collect()
-}
-
-fn drill_question_search_verification_target(
-    search_output: &SearchOutput,
-    hit: &SearchHitOutput,
-    reason_prefix: &str,
-) -> Option<VerificationTargetOutput> {
-    let base_target = hit.verification_targets.first();
-    let path = base_target
-        .map(|target| target.path.clone())
-        .or_else(|| hit.file_path.clone())?;
-    if path.trim().is_empty() || drill_question_target_is_low_signal(&path) {
-        return None;
-    }
-    if !drill_question_hit_should_be_target(search_output, hit, &path, reason_prefix) {
-        return None;
-    }
-    let line = base_target
-        .map(|target| target.line)
-        .or(hit.line)
-        .unwrap_or(1);
-    let node_ref = base_target
-        .and_then(|target| target.node_ref.clone())
-        .or_else(|| hit.node_ref.clone());
-    let query = truncate_utf8_with_suffix(&search_output.query.replace('\n', " "), 96, "...");
-    Some(VerificationTargetOutput {
-        role: "question_search".to_string(),
-        path,
-        line,
-        node_ref,
-        reason: format!(
-            "{reason_prefix}: {} matched {} ({})",
-            hit.display_name,
-            query,
-            drill_question_match_quality_label(hit.match_quality)
-        ),
-    })
-}
-
-fn drill_question_hit_should_be_target(
-    search_output: &SearchOutput,
-    hit: &SearchHitOutput,
-    path: &str,
-    reason_prefix: &str,
-) -> bool {
-    if hit.match_quality == SearchMatchQualityDto::RepoText {
-        return true;
-    }
-    if reason_prefix.starts_with("supplemental") {
-        return drill_supplemental_hit_matches_query(&search_output.query, hit, path);
-    }
-    matches!(
-        hit.match_quality,
-        SearchMatchQualityDto::Exact
-            | SearchMatchQualityDto::NormalizedExact
-            | SearchMatchQualityDto::Prefix
-    )
-}
-
-fn drill_supplemental_hit_matches_query(query: &str, hit: &SearchHitOutput, path: &str) -> bool {
-    let query = query.trim().to_ascii_lowercase();
-    let haystack = format!(
-        "{} {} {}",
-        hit.display_name,
-        path,
-        hit.excerpt.as_deref().unwrap_or_default()
-    )
-    .to_ascii_lowercase();
-    if query == "get /" {
-        return haystack.contains("get / ") || haystack.contains("get /(");
-    }
-
-    drill_question_alnum_tokens(&query)
-        .into_iter()
-        .any(|token| haystack.contains(&token))
-}
-
-fn drill_question_alnum_tokens(value: &str) -> Vec<String> {
-    value
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|token| token.len() >= 3)
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn drill_question_target_is_low_signal(path: &str) -> bool {
-    let normalized = normalize_drill_path(path);
-    normalized.contains("/node_modules/")
-        || normalized.ends_with("package-lock.json")
-        || normalized.ends_with("pnpm-lock.yaml")
-        || normalized.ends_with("yarn.lock")
-        || normalized.ends_with("cargo.lock")
-}
-
-fn drill_question_target_path_rank(path: &str) -> u8 {
-    let normalized = normalize_drill_path(path);
-    if drill_path_is_framework_route_or_page(&normalized) {
-        0
-    } else if normalized.contains("/components/") && !normalized.contains("/components/admin/") {
-        1
-    } else if normalized.contains("/collections/") {
-        2
-    } else if normalized.contains("/src/lib/") || normalized.contains("/src/") {
-        3
-    } else if normalized.contains("/tests/") || normalized.contains(".spec.") {
-        8
-    } else {
-        5
-    }
-}
-
-fn drill_question_match_quality_label(quality: SearchMatchQualityDto) -> &'static str {
-    match quality {
-        SearchMatchQualityDto::Exact => "exact",
-        SearchMatchQualityDto::NormalizedExact => "normalized_exact",
-        SearchMatchQualityDto::Prefix => "prefix",
-        SearchMatchQualityDto::Fuzzy => "fuzzy",
-        SearchMatchQualityDto::SemanticSuggestion => "semantic_suggestion",
-        SearchMatchQualityDto::RepoText => "repo_text",
-    }
-}
-
-fn run_drill_bridges(
-    runtime: &RuntimeContext,
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    anchors: &[DrillAnchorOutput],
-    stale_freshness: bool,
-    jobs: usize,
-) -> Vec<DrillBridgeOutput> {
-    let pairs = drill_bridge_pairs(anchors);
-    let evidence =
-        build_drill_bridge_evidence_in_order(runtime, anchors, &pairs, stale_freshness, jobs);
-    let mut bridges = Vec::new();
-    for ((from_index, to_index), evidence) in pairs.into_iter().zip(evidence) {
-        let command_timer = Instant::now();
-        let from = &anchors[from_index];
-        let to = &anchors[to_index];
-        let markdown = render_drill_bridge_markdown(&evidence);
-        let command = with_drill_command_duration(
-            command_timer,
-            write_drill_artifact(
-                output_dir,
-                format,
-                &format!(
-                    "{}-to-{}-bridge",
-                    output_slug(&from.anchor),
-                    output_slug(&to.anchor)
-                ),
-                "bridge",
-                &evidence,
-                markdown,
-            ),
-        );
-        bridges.push(DrillBridgeOutput { evidence, command });
-    }
-    bridges
-}
-
-fn drill_bridge_pairs(anchors: &[DrillAnchorOutput]) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for from_index in 0..anchors.len() {
-        for to_index in from_index.saturating_add(1)..anchors.len() {
-            pairs.push((from_index, to_index));
-        }
-    }
-    pairs
-}
-
-fn build_drill_bridge_evidence_in_order(
-    runtime: &RuntimeContext,
-    anchors: &[DrillAnchorOutput],
-    pairs: &[(usize, usize)],
-    stale_freshness: bool,
-    jobs: usize,
-) -> Vec<DrillBridgeEvidenceOutput> {
-    let neighborhood_file_cache = DrillBridgeNeighborhoodFileCache::default();
-    let jobs = jobs.min(pairs.len()).max(1);
-    if jobs == 1 || pairs.len() <= 1 {
-        return pairs
-            .iter()
-            .map(|(from_index, to_index)| {
-                build_drill_bridge_evidence(
-                    runtime,
-                    &anchors[*from_index],
-                    &anchors[*to_index],
-                    stale_freshness,
-                    &neighborhood_file_cache,
-                )
-            })
-            .collect();
-    }
-
-    let mut evidence_by_pair = vec![None; pairs.len()];
-    let chunk_size = pairs.len().div_ceil(jobs);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (chunk_index, chunk) in pairs.chunks(chunk_size).enumerate() {
-            let start_index = chunk_index * chunk_size;
-            let neighborhood_file_cache = &neighborhood_file_cache;
-            handles.push(scope.spawn(move || {
-                chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, (from_index, to_index))| {
-                        let evidence = build_drill_bridge_evidence(
-                            runtime,
-                            &anchors[*from_index],
-                            &anchors[*to_index],
-                            stale_freshness,
-                            neighborhood_file_cache,
-                        );
-                        (start_index + offset, evidence)
-                    })
-                    .collect::<Vec<_>>()
-            }));
-        }
-
-        for handle in handles {
-            for (pair_index, evidence) in handle.join().expect("drill bridge worker panicked") {
-                evidence_by_pair[pair_index] = Some(evidence);
-            }
-        }
-    });
-
-    evidence_by_pair
-        .into_iter()
-        .map(|evidence| evidence.expect("drill bridge worker should fill every pair"))
-        .collect()
-}
-
-fn build_drill_bridge_evidence(
-    runtime: &RuntimeContext,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    stale_freshness: bool,
-    neighborhood_file_cache: &DrillBridgeNeighborhoodFileCache,
-) -> DrillBridgeEvidenceOutput {
-    let Some(from_node) = from.chosen_anchor.clone() else {
-        return unresolved_drill_bridge(from, to, "from anchor was not resolved");
-    };
-    let Some(to_node) = to.chosen_anchor.clone() else {
-        return unresolved_drill_bridge(from, to, "to anchor was not resolved");
-    };
-
-    let from_id = NodeId(from_node.node_id.clone());
-    let to_id = NodeId(to_node.node_id.clone());
-    let forward = runtime
-        .browser
-        .trail_context(drill_bridge_request(&from_id, &to_id));
-
-    match forward {
-        Ok(trail) if drill_bridge_has_graph_path(&trail, &from_id, &to_id) => {
-            graph_path_drill_bridge(
-                &runtime.project_root,
-                from,
-                to,
-                from_node,
-                to_node,
-                &trail,
-                stale_freshness,
-            )
-        }
-        Ok(trail) => {
-            let reverse = runtime
-                .browser
-                .trail_context(drill_bridge_request(&to_id, &from_id));
-            if let Ok(reverse_trail) = reverse
-                && drill_bridge_has_graph_path(&reverse_trail, &to_id, &from_id)
-            {
-                return reverse_graph_path_drill_bridge(
-                    &runtime.project_root,
-                    from,
-                    to,
-                    from_node,
-                    to_node,
-                    &reverse_trail,
-                    stale_freshness,
-                );
-            }
-
-            let shared_files = neighborhood_file_cache.shared_files(runtime, &from_id, &to_id);
-            fallback_drill_bridge_with_search_hints(
-                runtime,
-                &runtime.project_root,
-                from,
-                to,
-                from_node,
-                to_node,
-                &trail,
-                shared_files,
-                stale_freshness,
-            )
-        }
-        Err(error) => drill_bridge_error(
-            &runtime.project_root,
-            from,
-            to,
-            from_node,
-            to_node,
-            &error.code,
-            &error.message,
-            stale_freshness,
-        ),
-    }
-}
-
-#[derive(Default)]
-struct DrillBridgeNeighborhoodFileCache {
-    files_by_node: Mutex<HashMap<String, HashSet<String>>>,
-}
-
-impl DrillBridgeNeighborhoodFileCache {
-    fn shared_files(
-        &self,
-        runtime: &RuntimeContext,
-        from_id: &NodeId,
-        to_id: &NodeId,
-    ) -> Vec<String> {
-        let from_files = self.files_for(runtime, from_id);
-        let to_files = self.files_for(runtime, to_id);
-        drill_bridge_shared_files_from_neighborhoods(&from_files, &to_files)
-    }
-
-    fn files_for(&self, runtime: &RuntimeContext, node_id: &NodeId) -> HashSet<String> {
-        self.files_for_key(&node_id.0, || {
-            drill_bridge_neighborhood_files(runtime, node_id)
-        })
-    }
-
-    fn files_for_key(
-        &self,
-        node_key: &str,
-        load: impl FnOnce() -> HashSet<String>,
-    ) -> HashSet<String> {
-        let mut files_by_node = self
-            .files_by_node
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(files) = files_by_node.get(node_key) {
-            return files.clone();
-        }
-        let files = load();
-        files_by_node.insert(node_key.to_string(), files.clone());
-        files
-    }
-}
-
-fn graph_path_drill_bridge(
-    project_root: &std::path::Path,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    from_node: SearchHitOutput,
-    to_node: SearchHitOutput,
-    trail: &TrailContextDto,
-    stale_freshness: bool,
-) -> DrillBridgeEvidenceOutput {
-    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
-    let mut evidence = DrillBridgeEvidenceOutput {
-        from_anchor: from.anchor.clone(),
-        to_anchor: to.anchor.clone(),
-        status: "graph_path".to_string(),
-        strategy: "to_target_symbol_forward".to_string(),
-        confidence: drill_graph_path_confidence(trail.trail.truncated, "high", "medium"),
-        evidence_kind: drill_bridge_evidence_kind_for_trail(trail),
-        from_node: Some(from_node),
-        to_node: Some(to_node),
-        graph_path: Some(drill_bridge_graph_path_output(
-            project_root,
-            "forward",
-            trail,
-        )),
-        shared_files: Vec::new(),
-        endpoint_files,
-        evidence_files: Vec::new(),
-        next_commands: Vec::new(),
-        notes: vec![
-            "bridge uses TrailMode::ToTargetSymbol from the earlier anchor to the later anchor"
-                .to_string(),
-        ],
-    };
-    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
-    evidence
-}
-
-fn reverse_graph_path_drill_bridge(
-    project_root: &std::path::Path,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    from_node: SearchHitOutput,
-    to_node: SearchHitOutput,
-    trail: &TrailContextDto,
-    stale_freshness: bool,
-) -> DrillBridgeEvidenceOutput {
-    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
-    let mut evidence = DrillBridgeEvidenceOutput {
-        from_anchor: from.anchor.clone(),
-        to_anchor: to.anchor.clone(),
-        status: "reverse_graph_path".to_string(),
-        strategy: "to_target_symbol_reverse".to_string(),
-        confidence: drill_graph_path_confidence(trail.trail.truncated, "medium", "low"),
-        evidence_kind: drill_bridge_evidence_kind_for_trail(trail),
-        from_node: Some(from_node),
-        to_node: Some(to_node),
-        graph_path: Some(drill_bridge_graph_path_output(project_root, "reverse", trail)),
-        shared_files: Vec::new(),
-        endpoint_files,
-        evidence_files: Vec::new(),
-        next_commands: Vec::new(),
-        notes: vec![
-            "no forward graph path was visible; a reverse graph path was found".to_string(),
-            "treat reverse paths as relationship evidence, not proof of the requested execution direction"
-                .to_string(),
-        ],
-    };
-    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
-    evidence
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn fallback_drill_bridge(
-    project_root: &std::path::Path,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    from_node: SearchHitOutput,
-    to_node: SearchHitOutput,
-    trail: &TrailContextDto,
-    shared_files: Vec<String>,
-    stale_freshness: bool,
-) -> DrillBridgeEvidenceOutput {
-    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
-    let evidence_files = drill_bridge_evidence_hint_files(from, to);
-    fallback_drill_bridge_with_evidence_files(
-        project_root,
-        from,
-        to,
-        from_node,
-        to_node,
-        trail,
-        shared_files,
-        endpoint_files,
-        evidence_files,
-        stale_freshness,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fallback_drill_bridge_with_search_hints(
-    runtime: &RuntimeContext,
-    project_root: &std::path::Path,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    from_node: SearchHitOutput,
-    to_node: SearchHitOutput,
-    trail: &TrailContextDto,
-    shared_files: Vec<String>,
-    stale_freshness: bool,
-) -> DrillBridgeEvidenceOutput {
-    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
-    let mut evidence_files = drill_bridge_evidence_hint_files(from, to);
-    let import_hints = drill_bridge_import_hub_hint_files(runtime, from, to, &from_node, &to_node);
-    evidence_files.extend(import_hints.iter().cloned());
-    if import_hints.is_empty() {
-        evidence_files.extend(drill_bridge_search_hint_files(
-            runtime,
-            from,
-            to,
-            &endpoint_files,
-        ));
-    }
-    dedupe_and_rank_drill_files(&mut evidence_files);
-    evidence_files.truncate(12);
-    fallback_drill_bridge_with_evidence_files(
-        project_root,
-        from,
-        to,
-        from_node,
-        to_node,
-        trail,
-        shared_files,
-        endpoint_files,
-        evidence_files,
-        stale_freshness,
-    )
-}
-
-fn drill_bridge_import_hub_hint_files(
-    runtime: &RuntimeContext,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    from_node: &SearchHitOutput,
-    to_node: &SearchHitOutput,
-) -> Vec<String> {
-    let mut files = Vec::new();
-    if let Some(path) = from_node.file_path.as_deref() {
-        files.extend(drill_bridge_import_hub_candidates_from_endpoint(
-            runtime, path, &to.anchor,
-        ));
-    }
-    if let Some(path) = to_node.file_path.as_deref() {
-        files.extend(drill_bridge_import_hub_candidates_from_endpoint(
-            runtime,
-            path,
-            &from.anchor,
-        ));
-    }
-    dedupe_and_rank_drill_files(&mut files);
-    files.truncate(12);
-    files
-}
-
-fn drill_bridge_import_hub_candidates_from_endpoint(
-    runtime: &RuntimeContext,
-    endpoint_file: &str,
-    opposite_anchor: &str,
-) -> Vec<String> {
-    let Some(endpoint_path) = drill_relative_source_path(&runtime.project_root, endpoint_file)
-    else {
-        return Vec::new();
-    };
-    let Some(source) = drill_read_source_file(&endpoint_path) else {
-        return Vec::new();
-    };
-    let mut files = Vec::new();
-    for specifier in drill_js_relative_import_specifiers(&source)
-        .into_iter()
-        .take(32)
-    {
-        let Some(candidate) =
-            drill_resolve_relative_import(&runtime.project_root, &endpoint_path, &specifier)
-        else {
-            continue;
-        };
-        let relative = display::relative_path(&runtime.project_root, &candidate.to_string_lossy());
-        if drill_bridge_evidence_file_rank(&relative) >= 9 {
-            continue;
-        }
-        let Some(candidate_source) = drill_read_source_file(&candidate) else {
-            continue;
-        };
-        if candidate_source.contains(opposite_anchor) {
-            files.push(relative);
-        }
-    }
-    files
-}
-
-fn drill_bridge_search_hint_files(
-    runtime: &RuntimeContext,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    endpoint_files: &[String],
-) -> Vec<String> {
-    let Ok(results) = runtime.browser.search_results(SearchRequest {
-        query: format!("{} {}", from.anchor, to.anchor),
-        repo_text: SearchRepoTextMode::On,
-        limit_per_source: 25,
-        expand_search_plan: false,
-        hybrid_weights: None,
-        hybrid_limits: None,
-    }) else {
-        return Vec::new();
-    };
-    let mut files = drill_bridge_search_hint_files_from_hits(
-        &runtime.project_root,
-        endpoint_files,
-        &results.repo_text_hits,
-        &results.indexed_symbol_hits,
-    );
-    files.retain(|path| {
-        drill_file_contains_terms(&runtime.project_root, path, &[&from.anchor, &to.anchor])
-    });
-    files
-}
-
-fn drill_relative_source_path(
-    project_root: &std::path::Path,
-    path: &str,
-) -> Option<std::path::PathBuf> {
-    let path = std::path::Path::new(path);
-    if path.is_absolute() || drill_path_has_escape_component(path) {
-        return None;
-    }
-    let root = fs::canonicalize(project_root).ok()?;
-    let candidate = fs::canonicalize(project_root.join(path)).ok()?;
-    candidate.starts_with(&root).then_some(candidate)
-}
-
-fn drill_path_has_escape_component(path: &std::path::Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    })
-}
-
-fn drill_read_source_file(path: &std::path::Path) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > 1_000_000 {
-        return None;
-    }
-    fs::read_to_string(path).ok()
-}
-
-fn drill_file_contains_terms(project_root: &std::path::Path, path: &str, terms: &[&str]) -> bool {
-    let Some(path) = drill_relative_source_path(project_root, path) else {
-        return false;
-    };
-    let Some(source) = drill_read_source_file(&path) else {
-        return false;
-    };
-    terms.iter().all(|term| source.contains(term))
-}
-
-fn drill_js_relative_import_specifiers(source: &str) -> Vec<String> {
-    let mut specifiers = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("import ") {
-            continue;
-        }
-        if let Some(specifier) = drill_quoted_js_specifier(trimmed)
-            && specifier.starts_with('.')
-        {
-            specifiers.push(specifier.to_string());
-        }
-    }
-    specifiers
-}
-
-fn drill_quoted_js_specifier(line: &str) -> Option<&str> {
-    let from_index = line.find(" from ");
-    let search = from_index
-        .map(|index| &line[index + " from ".len()..])
-        .unwrap_or(line);
-    let quote_index = search.find(['\'', '"'])?;
-    let quote = search[quote_index..].chars().next()?;
-    let rest = &search[quote_index + quote.len_utf8()..];
-    let end = rest.find(quote)?;
-    Some(&rest[..end])
-}
-
-fn drill_resolve_relative_import(
-    project_root: &std::path::Path,
-    endpoint_path: &std::path::Path,
-    specifier: &str,
-) -> Option<std::path::PathBuf> {
-    let specifier_path = std::path::Path::new(specifier);
-    if specifier_path.is_absolute() || !specifier.starts_with('.') {
-        return None;
-    }
-    let root = fs::canonicalize(project_root).ok()?;
-    let endpoint = fs::canonicalize(endpoint_path).ok()?;
-    if !endpoint.starts_with(&root) {
-        return None;
-    }
-    let base = endpoint.parent()?.join(specifier_path);
-    let mut candidates = vec![base.clone()];
-    if base.extension().is_none() {
-        for extension in ["js", "jsx", "ts", "tsx", "mjs", "cjs"] {
-            candidates.push(base.with_extension(extension));
-        }
-        for extension in ["js", "jsx", "ts", "tsx", "mjs", "cjs"] {
-            candidates.push(base.join(format!("index.{extension}")));
-        }
-    }
-    candidates.into_iter().find_map(|candidate| {
-        let candidate = fs::canonicalize(candidate).ok()?;
-        (candidate.is_file() && candidate.starts_with(&root)).then_some(candidate)
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fallback_drill_bridge_with_evidence_files(
-    project_root: &std::path::Path,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    from_node: SearchHitOutput,
-    to_node: SearchHitOutput,
-    trail: &TrailContextDto,
-    shared_files: Vec<String>,
-    endpoint_files: Vec<String>,
-    evidence_files: Vec<String>,
-    stale_freshness: bool,
-) -> DrillBridgeEvidenceOutput {
-    let classification = drill_fallback_bridge_classification(
-        from,
-        to,
-        &endpoint_files,
-        &shared_files,
-        &evidence_files,
-    );
-    let mut notes = vec![
-        "no forward TrailMode::ToTargetSymbol graph path was visible between these anchors"
-            .to_string(),
-    ];
-    notes.push(classification.note.clone());
-    notes.push(if !shared_files.is_empty() {
-        "fallback neighborhood comparison found shared source files but no graph path".to_string()
-    } else if !evidence_files.is_empty() {
-        "fallback consumer/text evidence found source files to inspect but no graph path or shared file"
-            .to_string()
-    } else {
-        "fallback neighborhood comparison found no shared source files or consumer/text evidence"
-            .to_string()
-    });
-    let mut evidence = DrillBridgeEvidenceOutput {
-        from_anchor: from.anchor.clone(),
-        to_anchor: to.anchor.clone(),
-        status: classification.status,
-        strategy: classification.strategy,
-        confidence: classification.confidence,
-        evidence_kind: classification.evidence_kind,
-        from_node: Some(from_node),
-        to_node: Some(to_node),
-        graph_path: Some(drill_bridge_graph_path_output(
-            project_root,
-            "forward_no_path",
-            trail,
-        )),
-        shared_files,
-        endpoint_files,
-        evidence_files,
-        next_commands: Vec::new(),
-        notes,
-    };
-    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
-    evidence
-}
-
-#[derive(Debug, Clone)]
-struct DrillFallbackBridgeClassification {
-    status: String,
-    strategy: String,
-    confidence: String,
-    evidence_kind: String,
-    note: String,
-}
-
-fn drill_fallback_bridge_classification(
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    endpoint_files: &[String],
-    shared_files: &[String],
-    evidence_files: &[String],
-) -> DrillFallbackBridgeClassification {
-    if !shared_files.is_empty() {
-        return DrillFallbackBridgeClassification {
-            status: "graph_shared_file".to_string(),
-            strategy: "to_target_symbol_then_graph_shared_files".to_string(),
-            confidence: "medium".to_string(),
-            evidence_kind: "graph_shared_file".to_string(),
-            note: "typed graph neighborhoods found shared source files; this proves shared graph context, not execution direction"
-                .to_string(),
-        };
-    }
-    if evidence_files.is_empty() {
-        return DrillFallbackBridgeClassification {
-            status: "no_bridge_found".to_string(),
-            strategy: "to_target_symbol_then_shared_files".to_string(),
-            confidence: "low".to_string(),
-            evidence_kind: "isolated_anchors".to_string(),
-            note: "no bridge, shared-file, or source-truth candidate was found".to_string(),
-        };
-    }
-
-    let mut files = endpoint_files
-        .iter()
-        .chain(evidence_files.iter())
-        .map(|path| normalize_drill_path(path))
-        .collect::<Vec<_>>();
-    files.sort();
-    files.dedup();
-    let anchor_text = format!("{} {}", from.anchor, to.anchor);
-    let anchor_tokens = drill_related_query_tokens(&anchor_text);
-    if (drill_tokens_contain_all(&anchor_tokens, &["source", "group"]))
-        || (drill_tokens_contain_all(&anchor_tokens, &["indexer", "java"]))
-        || (drill_tokens_contain_all(&anchor_tokens, &["storage", "access"]))
-        || files
-            .iter()
-            .any(|path| drill_path_is_native_or_jvm_source(path))
-    {
-        return DrillFallbackBridgeClassification {
-            status: "source_truth_only".to_string(),
-            strategy: "native_related_source_truth_targets".to_string(),
-            confidence: "medium".to_string(),
-            evidence_kind: "source_truth_only".to_string(),
-            note: "native C++/Java bridge evidence requires source-truth verification because no typed cross-anchor graph path was visible"
-                .to_string(),
-        };
-    }
-
-    let has_payload_collection = files.iter().any(|path| path.contains("/collections/"))
-        || [from, to].iter().any(|anchor| {
-            anchor
-                .chosen_anchor
-                .as_ref()
-                .and_then(|hit| hit.file_path.as_deref())
-                .is_some_and(|path| normalize_drill_path(path).contains("/collections/"))
-        });
-    let has_payload_usage_surface = files.iter().any(|path| {
-        drill_path_is_framework_route_or_page(path)
-            || path.contains("/content-data/")
-            || path.contains("/lib/comment-auth")
-            || path.contains("/lib/social-feed")
-    });
-    if has_payload_collection && has_payload_usage_surface {
-        return DrillFallbackBridgeClassification {
-            status: "data_collection_usage".to_string(),
-            strategy: "payload_collection_usage_source_targets".to_string(),
-            confidence: "medium".to_string(),
-            evidence_kind: "data_collection_usage".to_string(),
-            note: "Payload collection and runtime usage files were surfaced as bridge candidates; source verification is still required"
-                .to_string(),
-        };
-    }
-
-    if files
-        .iter()
-        .any(|path| drill_path_is_framework_route_or_page(path))
-    {
-        return DrillFallbackBridgeClassification {
-            status: "framework_route".to_string(),
-            strategy: "framework_route_source_targets".to_string(),
-            confidence: "medium".to_string(),
-            evidence_kind: "framework_route".to_string(),
-            note: "framework route/page evidence was surfaced as a bridge candidate; source verification is still required"
-                .to_string(),
-        };
-    }
-
-    if files
-        .iter()
-        .any(|path| path.contains("/components/") && !path.contains("/components/admin/"))
-    {
-        return DrillFallbackBridgeClassification {
-            status: "component_usage".to_string(),
-            strategy: "component_usage_source_targets".to_string(),
-            confidence: "medium".to_string(),
-            evidence_kind: "component_usage".to_string(),
-            note: "component usage evidence was surfaced as a bridge candidate; source verification is still required"
-                .to_string(),
-        };
-    }
-
-    if files
-        .iter()
-        .any(|path| path.starts_with("crates/codestory-"))
-    {
-        return DrillFallbackBridgeClassification {
-            status: "source_truth_only".to_string(),
-            strategy: "codestory_layer_source_truth_targets".to_string(),
-            confidence: "medium".to_string(),
-            evidence_kind: "source_truth_only".to_string(),
-            note: "CodeStory layer bridge evidence requires source-truth verification because the graph did not expose a direct typed path"
-                .to_string(),
-        };
-    }
-
-    DrillFallbackBridgeClassification {
-        status: "evidence_hint_only".to_string(),
-        strategy: "to_target_symbol_then_consumer_text_hints".to_string(),
-        confidence: "low".to_string(),
-        evidence_kind: "repo_text_hint".to_string(),
-        note: "only generic repo-text or consumer hint evidence was found".to_string(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn drill_bridge_error(
-    project_root: &std::path::Path,
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    from_node: SearchHitOutput,
-    to_node: SearchHitOutput,
-    code: &str,
-    message: &str,
-    stale_freshness: bool,
-) -> DrillBridgeEvidenceOutput {
-    let endpoint_files = drill_bridge_endpoint_files(Some(&from_node), Some(&to_node));
-    let mut evidence = DrillBridgeEvidenceOutput {
-        from_anchor: from.anchor.clone(),
-        to_anchor: to.anchor.clone(),
-        status: "error".to_string(),
-        strategy: "to_target_symbol_forward".to_string(),
-        confidence: "low".to_string(),
-        evidence_kind: "isolated_anchors".to_string(),
-        from_node: Some(from_node),
-        to_node: Some(to_node),
-        graph_path: None,
-        shared_files: Vec::new(),
-        endpoint_files,
-        evidence_files: Vec::new(),
-        next_commands: Vec::new(),
-        notes: vec![format!("bridge graph query failed: {code}: {message}")],
-    };
-    evidence.next_commands = drill_bridge_next_commands(project_root, &evidence, stale_freshness);
-    evidence
-}
-
-fn drill_graph_path_confidence(truncated: bool, complete: &str, truncated_value: &str) -> String {
-    if truncated { truncated_value } else { complete }.to_string()
-}
-
-fn drill_bridge_evidence_kind_for_trail(trail: &TrailContextDto) -> String {
-    if trail.trail.edges.iter().any(|edge| {
-        edge.callsite_identity
-            .as_deref()
-            .is_some_and(|identity| identity.starts_with("payload:"))
-    }) || trail
-        .trail
-        .nodes
-        .iter()
-        .any(|node| node.label.contains("payload collection "))
-    {
-        return "data_collection_usage".to_string();
-    }
-    if trail.trail.nodes.iter().any(|node| {
-        node.label.contains(" route; confidence=")
-            || node
-                .qualified_name
-                .as_deref()
-                .is_some_and(|name| name.starts_with("framework::"))
-    }) {
-        return "framework_route".to_string();
-    }
-    if trail
-        .trail
-        .edges
-        .iter()
-        .any(|edge| edge.kind == codestory_contracts::api::EdgeKind::CALL)
-        && trail.trail.nodes.iter().any(|node| {
-            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-                && node.file_path.as_deref().is_some_and(|path| {
-                    let path = path.to_ascii_lowercase();
-                    path.ends_with(".tsx") || path.ends_with(".jsx")
-                })
-                && node
-                    .label
-                    .chars()
-                    .next()
-                    .is_some_and(|ch| ch.is_ascii_uppercase())
-        })
-    {
-        return "component_usage".to_string();
-    }
-    "graph_path".to_string()
-}
-
-fn unresolved_drill_bridge(
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-    reason: &str,
-) -> DrillBridgeEvidenceOutput {
-    let endpoint_files =
-        drill_bridge_endpoint_files(from.chosen_anchor.as_ref(), to.chosen_anchor.as_ref());
-    DrillBridgeEvidenceOutput {
-        from_anchor: from.anchor.clone(),
-        to_anchor: to.anchor.clone(),
-        status: "unresolved_anchor".to_string(),
-        strategy: "not_run".to_string(),
-        confidence: "low".to_string(),
-        evidence_kind: "isolated_anchors".to_string(),
-        from_node: from.chosen_anchor.clone(),
-        to_node: to.chosen_anchor.clone(),
-        graph_path: None,
-        shared_files: Vec::new(),
-        endpoint_files,
-        evidence_files: Vec::new(),
-        next_commands: Vec::new(),
-        notes: vec![reason.to_string()],
-    }
-}
-
-fn drill_bridge_endpoint_files(
-    from_node: Option<&SearchHitOutput>,
-    to_node: Option<&SearchHitOutput>,
-) -> Vec<String> {
-    let mut files = Vec::new();
-    if let Some(path) = from_node.and_then(|node| node.file_path.clone()) {
-        files.push(path);
-    }
-    if let Some(path) = to_node.and_then(|node| node.file_path.clone()) {
-        files.push(path);
-    }
-    dedupe_and_rank_drill_files(&mut files);
-    files
-}
-
-fn drill_bridge_next_commands(
-    project_root: &std::path::Path,
-    evidence: &DrillBridgeEvidenceOutput,
-    stale_freshness: bool,
-) -> Vec<String> {
-    let project = quote_command_path(project_root);
-    let refresh = if stale_freshness {
-        "incremental"
-    } else {
-        "none"
-    };
-    let mut commands = Vec::new();
-    let bridge_query =
-        quote_command_value(&format!("{} {}", evidence.from_anchor, evidence.to_anchor));
-    commands.push(format!(
-        "codestory-cli search --project {project} --query {bridge_query} --refresh {refresh} --why"
-    ));
-    for node in [evidence.from_node.as_ref(), evidence.to_node.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        let id = quote_command_value(&node.node_id);
-        commands.push(format!(
-            "codestory-cli trail --project {project} --id {id} --refresh {refresh} --story --hide-speculative"
-        ));
-        commands.push(format!(
-            "codestory-cli snippet --project {project} --id {id} --function-body --context 40 --refresh {refresh}"
-        ));
-    }
-
-    let mut files = evidence
-        .evidence_files
-        .iter()
-        .chain(evidence.shared_files.iter())
-        .chain(evidence.endpoint_files.iter())
-        .cloned()
-        .collect::<Vec<_>>();
-    dedupe_and_rank_drill_files(&mut files);
-    for file in files.into_iter().take(5) {
-        let query = quote_command_value(&file);
-        commands.push(format!(
-            "codestory-cli search --project {project} --query {query} --refresh {refresh} --why"
-        ));
-    }
-
-    let mut seen = HashSet::new();
-    commands
-        .into_iter()
-        .filter(|command| seen.insert(command.clone()))
-        .collect()
-}
-
-fn drill_bridge_evidence_hint_files(
-    from: &DrillAnchorOutput,
-    to: &DrillAnchorOutput,
-) -> Vec<String> {
-    let mut files = Vec::new();
-    push_anchor_evidence_hint_files(&mut files, from);
-    push_anchor_evidence_hint_files(&mut files, to);
-    let mut seen = HashSet::new();
-    files.retain(|path| seen.insert(path.clone()));
-    rank_drill_bridge_evidence_files(&mut files);
-    files.truncate(12);
-    files
-}
-
-fn drill_bridge_search_hint_files_from_hits(
-    project_root: &std::path::Path,
-    endpoint_files: &[String],
-    repo_text_hits: &[SearchHit],
-    indexed_symbol_hits: &[SearchHit],
-) -> Vec<String> {
-    let endpoint_keys = endpoint_files
-        .iter()
-        .map(|path| normalize_drill_path(path))
-        .collect::<HashSet<_>>();
-    let mut seen = HashSet::new();
-    let mut files = Vec::new();
-    for hit in repo_text_hits.iter().chain(indexed_symbol_hits.iter()) {
-        let Some(path) = hit.file_path.as_deref() else {
-            continue;
-        };
-        let path = display::relative_path(project_root, path);
-        let key = normalize_drill_path(&path);
-        if endpoint_keys.contains(&key)
-            || drill_question_target_is_low_signal(&path)
-            || drill_bridge_evidence_file_rank(&path) >= 9
-        {
-            continue;
-        }
-        if seen.insert(key) {
-            files.push(path);
-        }
-    }
-    rank_drill_bridge_evidence_files(&mut files);
-    files.truncate(12);
-    files
-}
-
-fn dedupe_and_rank_drill_files(files: &mut Vec<String>) {
-    let mut seen = HashSet::new();
-    files.retain(|path| seen.insert(path.clone()));
-    rank_drill_bridge_evidence_files(files);
-}
-
-fn rank_drill_bridge_evidence_files(files: &mut Vec<String>) {
-    let mut ranked = std::mem::take(files)
-        .into_iter()
-        .enumerate()
-        .collect::<Vec<_>>();
-    ranked.sort_by_key(|(index, path)| {
-        (
-            drill_bridge_evidence_file_rank(path),
-            drill_bridge_evidence_file_subrank(path),
-            *index,
-        )
-    });
-    files.extend(ranked.into_iter().map(|(_, path)| path));
-}
-
-fn drill_bridge_evidence_file_rank(path: &str) -> u8 {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let normalized_with_root = format!("/{normalized}");
-    if drill_bridge_evidence_is_generated_path(&normalized_with_root) {
-        return 9;
-    }
-    if normalized.contains("/tests/")
-        || normalized.starts_with("tests/")
-        || normalized.contains("/test/")
-        || normalized.contains(".test.")
-        || normalized.contains(".spec.")
-        || normalized.contains("/__tests__/")
-    {
-        return 7;
-    }
-    if normalized.contains("/benches/") || normalized.starts_with("benches/") {
-        return 8;
-    }
-    if normalized.starts_with("scripts/")
-        || normalized.contains("/scripts/")
-        || normalized.contains("migration")
-        || normalized.contains("migrate")
-        || normalized.contains("import-")
-    {
-        return 10;
-    }
-    if drill_bridge_evidence_is_admin_path(&normalized_with_root) {
-        return 6;
-    }
-    if normalized.starts_with("crates/") && normalized.contains("/src/") {
-        return 0;
-    }
-    if normalized.starts_with("src/app/") || normalized.contains("/src/app/") {
-        return 0;
-    }
-    if normalized.starts_with("src/pages/") || normalized.contains("/src/pages/") {
-        return 0;
-    }
-    if normalized.starts_with("src/routes/") || normalized.contains("/src/routes/") {
-        return 0;
-    }
-    if normalized.ends_with("/route.ts")
-        || normalized.ends_with("/route.tsx")
-        || normalized.ends_with("/page.ts")
-        || normalized.ends_with("/page.tsx")
-    {
-        return 0;
-    }
-    if normalized.starts_with("src/components/") || normalized.contains("/src/components/") {
-        return 1;
-    }
-    if normalized.starts_with("src/lib/content-data/")
-        || normalized.contains("/src/lib/content-data/")
-        || normalized.starts_with("src/lib/comment-auth")
-        || normalized.contains("/src/lib/comment-auth")
-        || normalized.starts_with("src/lib/comments")
-        || normalized.contains("/src/lib/comments")
-        || normalized.starts_with("src/lib/elsewhere")
-        || normalized.contains("/src/lib/elsewhere")
-        || normalized.starts_with("src/lib/social-feed")
-        || normalized.contains("/src/lib/social-feed")
-    {
-        return 2;
-    }
-    if normalized.starts_with("src/collections/") || normalized.contains("/src/collections/") {
-        return 3;
-    }
-    if normalized.starts_with("src/")
-        || (normalized.contains("/src/")
-            && !normalized.contains("/test")
-            && !normalized.contains("/__tests__/"))
-    {
-        return 4;
-    }
-    5
-}
-
-fn drill_bridge_evidence_file_subrank(path: &str) -> u8 {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    if normalized.ends_with("/page.ts") || normalized.ends_with("/page.tsx") {
-        return 0;
-    }
-    if normalized.ends_with("/route.ts") || normalized.ends_with("/route.tsx") {
-        return 1;
-    }
-    if normalized.contains("/rootruntimehome") {
-        return 2;
-    }
-    if normalized.contains("/content-data/") {
-        return 3;
-    }
-    if normalized.contains("/comment-auth") || normalized.contains("/comments") {
-        return 4;
-    }
-    if normalized.contains("/elsewhere") || normalized.contains("/social-feed") {
-        return 5;
-    }
-    if normalized.contains("/collections/") {
-        return 6;
-    }
-    7
-}
-
-fn drill_bridge_evidence_is_admin_path(normalized_with_root: &str) -> bool {
-    normalized_with_root.contains("/admin/")
-        || normalized_with_root.contains("/components/admin")
-        || normalized_with_root.contains("/app/(payload)")
-        || normalized_with_root.contains("/payload-admin")
-}
-
-fn drill_bridge_evidence_is_generated_path(normalized_with_root: &str) -> bool {
-    normalized_with_root.contains("/generated/")
-        || normalized_with_root.contains("payload-types")
-        || normalized_with_root.contains("/target/")
-        || normalized_with_root.contains("/dist/")
-        || normalized_with_root.contains("/build/")
-}
-
-fn push_anchor_evidence_hint_files(files: &mut Vec<String>, anchor: &DrillAnchorOutput) {
-    let Some(summary) = anchor.consumer_summary.as_ref() else {
-        return;
-    };
-    for caller in summary.callers.iter().take(3) {
-        if let Some(path) = caller.file_path.as_ref() {
-            files.push(path.clone());
-        }
-    }
-    for consumer in summary.consumers.iter().take(3) {
-        if let Some(path) = consumer.file_path.as_ref() {
-            files.push(path.clone());
-        }
-        if let Some(path) = consumer.target_file_path.as_ref() {
-            files.push(path.clone());
-        }
-    }
-    for hint in summary.text_consumer_hints.iter().take(3) {
-        if let Some(path) = hint.file_path.as_ref() {
-            files.push(path.clone());
-        }
-    }
-}
-
-fn drill_file_rank_for_agent(path: Option<&str>) -> u8 {
-    path.map(drill_bridge_evidence_file_rank).unwrap_or(9)
-}
-
-fn drill_bridge_request(root_id: &NodeId, target_id: &NodeId) -> TrailConfigDto {
-    TrailConfigDto {
-        root_id: root_id.clone(),
-        mode: TrailMode::ToTargetSymbol,
-        target_id: Some(target_id.clone()),
-        depth: 0,
-        direction: TrailDirection::Outgoing,
-        caller_scope: TrailCallerScope::ProductionOnly,
-        edge_filter: Vec::new(),
-        show_utility_calls: false,
-        hide_speculative: true,
-        story: true,
-        node_filter: Vec::new(),
-        max_nodes: 160,
-        layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
-    }
-}
-
-fn drill_bridge_has_graph_path(trail: &TrailContextDto, from_id: &NodeId, to_id: &NodeId) -> bool {
-    if from_id == to_id {
-        return true;
-    }
-    let has_from = trail.trail.nodes.iter().any(|node| node.id == *from_id);
-    let has_to = trail.trail.nodes.iter().any(|node| node.id == *to_id);
-    has_from && has_to && !trail.trail.edges.is_empty()
-}
-
-fn drill_bridge_graph_path_output(
-    project_root: &std::path::Path,
-    mode: &str,
-    trail: &TrailContextDto,
-) -> DrillBridgeGraphPathOutput {
-    let labels = trail
-        .trail
-        .nodes
-        .iter()
-        .map(|node| (node.id.0.clone(), node.label.clone()))
-        .collect::<HashMap<_, _>>();
-    let nodes = trail
-        .trail
-        .nodes
-        .iter()
-        .map(|node| {
-            let path = node
-                .file_path
-                .as_deref()
-                .map(|path| display::relative_path(project_root, path))
-                .unwrap_or_else(|| "<no-file>".to_string());
-            format!(
-                "{} [{:?}] {} depth={}",
-                node.label, node.kind, path, node.depth
-            )
-        })
-        .collect();
-    let edges = trail
-        .trail
-        .edges
-        .iter()
-        .map(|edge| {
-            let source = labels
-                .get(&edge.source.0)
-                .cloned()
-                .unwrap_or_else(|| edge.source.0.clone());
-            let target = labels
-                .get(&edge.target.0)
-                .cloned()
-                .unwrap_or_else(|| edge.target.0.clone());
-            let certainty = edge.certainty.as_deref().unwrap_or("unknown");
-            format!("{source} -{:?}/{certainty}-> {target}", edge.kind)
-        })
-        .collect();
-    let edge_count = trail.trail.edges.len();
-    let omitted_edge_count = trail.trail.omitted_edge_count;
-    let no_path_without_omissions =
-        mode.ends_with("_no_path") && edge_count == 0 && omitted_edge_count == 0;
-    DrillBridgeGraphPathOutput {
-        mode: mode.to_string(),
-        node_count: trail.trail.nodes.len(),
-        edge_count,
-        truncated: trail.trail.truncated && !no_path_without_omissions,
-        omitted_edge_count,
-        nodes,
-        edges,
-    }
-}
-
-fn drill_bridge_shared_files_from_neighborhoods(
-    from_files: &HashSet<String>,
-    to_files: &HashSet<String>,
-) -> Vec<String> {
-    let mut shared = from_files
-        .intersection(to_files)
-        .cloned()
-        .collect::<Vec<_>>();
-    shared.sort();
-    shared.truncate(12);
-    shared
-}
-
-fn drill_bridge_neighborhood_files(runtime: &RuntimeContext, node_id: &NodeId) -> HashSet<String> {
-    let Ok(trail) = runtime.browser.trail_context(TrailConfigDto {
-        root_id: node_id.clone(),
-        mode: TrailMode::Neighborhood,
-        target_id: None,
-        depth: 1,
-        direction: TrailDirection::Both,
-        caller_scope: TrailCallerScope::ProductionOnly,
-        edge_filter: Vec::new(),
-        show_utility_calls: false,
-        hide_speculative: true,
-        story: false,
-        node_filter: Vec::new(),
-        max_nodes: 80,
-        layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
-    }) else {
-        return HashSet::new();
-    };
-    trail
-        .trail
-        .nodes
-        .into_iter()
-        .filter_map(|node| node.file_path)
-        .map(|path| display::relative_path(&runtime.project_root, &path))
-        .collect()
-}
-
-fn render_drill_bridge_markdown(evidence: &DrillBridgeEvidenceOutput) -> String {
-    let mut markdown = String::new();
-    let _ = writeln!(markdown, "# Bridge");
-    let _ = writeln!(
-        markdown,
-        "from: `{}` to: `{}`",
-        evidence.from_anchor, evidence.to_anchor
-    );
-    let _ = writeln!(
-        markdown,
-        "status: {} strategy: {} confidence: {} evidence_kind: {}",
-        evidence.status, evidence.strategy, evidence.confidence, evidence.evidence_kind
-    );
-    if let Some(from_node) = evidence.from_node.as_ref() {
-        let _ = writeln!(
-            markdown,
-            "from_node: {}",
-            render_search_hit_output(from_node)
-        );
-    }
-    if let Some(to_node) = evidence.to_node.as_ref() {
-        let _ = writeln!(markdown, "to_node: {}", render_search_hit_output(to_node));
-    }
-    if let Some(path) = evidence.graph_path.as_ref() {
-        let _ = writeln!(
-            markdown,
-            "graph_path: mode={} nodes={} edges={} truncated={} omitted_edges={}",
-            path.mode, path.node_count, path.edge_count, path.truncated, path.omitted_edge_count
-        );
-        if !path.nodes.is_empty() {
-            let _ = writeln!(markdown, "path_nodes:");
-            for node in &path.nodes {
-                let _ = writeln!(markdown, "- {node}");
-            }
-        }
-        if !path.edges.is_empty() {
-            let _ = writeln!(markdown, "path_edges:");
-            for edge in &path.edges {
-                let _ = writeln!(markdown, "- {edge}");
-            }
-        }
-    }
-    if !evidence.shared_files.is_empty() {
-        let _ = writeln!(markdown, "shared_files:");
-        for file in &evidence.shared_files {
-            let _ = writeln!(markdown, "- `{file}`");
-        }
-    }
-    if !evidence.endpoint_files.is_empty() {
-        let _ = writeln!(markdown, "endpoint_files:");
-        for file in &evidence.endpoint_files {
-            let _ = writeln!(markdown, "- `{file}`");
-        }
-    }
-    if !evidence.evidence_files.is_empty() {
-        let _ = writeln!(markdown, "evidence_files:");
-        for file in &evidence.evidence_files {
-            let _ = writeln!(markdown, "- `{file}`");
-        }
-    }
-    if !evidence.notes.is_empty() {
-        let _ = writeln!(markdown, "notes:");
-        for note in &evidence.notes {
-            let _ = writeln!(markdown, "- {note}");
-        }
-    }
-    if !evidence.next_commands.is_empty() {
-        let _ = writeln!(markdown, "next_commands:");
-        for command in &evidence.next_commands {
-            let _ = writeln!(markdown, "- `{command}`");
-        }
-    }
-    markdown
-}
-
-fn drill_verification_checklist() -> Vec<DrillVerificationChecklistItemOutput> {
-    let allowed = ["correct", "partial", "misleading", "unsupported"]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    [
-        "Record the CodeStory-only architecture answer before opening source files.",
-        "Open only files named or implied by CodeStory evidence for source-truth verification.",
-        "Classify each major claim as correct, partial, misleading, or unsupported.",
-        "Record what changed after source reads; revisions are product findings, not cleanup.",
-    ]
-    .into_iter()
-    .map(|item| DrillVerificationChecklistItemOutput {
-        item: item.to_string(),
-        allowed_classifications: allowed.clone(),
-    })
-    .collect()
-}
-
-fn drill_answer_quality_contract() -> DrillAnswerQualityContractOutput {
-    DrillAnswerQualityContractOutput {
-        code_story_only_draft_required: true,
-        source_truth_verification_required: true,
-        pass_condition: "The source-verified answer must not materially revise the CodeStory-only architecture claims; material revisions are product findings."
-            .to_string(),
-        score_inputs: [
-            "anchor_recall: requested anchors with typed or resolvable hits",
-            "evidence_command_success: search, symbol, trail, explore, and snippet artifacts written successfully",
-            "verification_target_count: source files and lines named by CodeStory evidence",
-            "source_packet_coverage: files, related files, and truncation notes emitted by explore",
-            "source_correction_count: architecture claims changed after source reads",
-            "unsupported_claim_count: claims not backed by CodeStory evidence",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
-        correction_buckets: ["correct", "partial", "misleading", "unsupported"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    }
-}
-
-fn drill_claim_ledger_template(
-    anchors: &[DrillAnchorOutput],
-    bridges: &[DrillBridgeOutput],
-) -> DrillClaimLedgerOutput {
-    let mut claims = Vec::new();
-    for (index, anchor) in anchors.iter().enumerate() {
-        let expected_evidence = anchor
-            .commands
-            .iter()
-            .filter_map(|command| command.artifact.clone())
-            .collect::<Vec<_>>();
-        let mut source_truth_files = unique_verification_target_paths(&anchor.verification_targets);
-        dedupe_and_rank_drill_files(&mut source_truth_files);
-        claims.push(DrillClaimLedgerEntryOutput {
-            id: format!("anchor-{}", index + 1),
-            claim: format!(
-                "Candidate architecture claim involving `{}` requires source-truth verification before the final answer.",
-                anchor.anchor
-            ),
-            expected_evidence,
-            source_truth_files,
-            pre_verification_confidence: if anchor.chosen_anchor.is_some() {
-                "medium"
-            } else {
-                "low"
-            }
-            .to_string(),
-            classification: None,
-            changed_after_source_read: None,
-            correction_note: None,
-        });
-    }
-    for (index, bridge) in bridges.iter().enumerate() {
-        let evidence = &bridge.evidence;
-        let mut source_truth_files = evidence.shared_files.clone();
-        source_truth_files.extend(evidence.endpoint_files.iter().cloned());
-        source_truth_files.extend(evidence.evidence_files.iter().cloned());
-        if let Some(from_node) = evidence.from_node.as_ref()
-            && let Some(path) = from_node.file_path.as_ref()
-        {
-            source_truth_files.push(path.clone());
-        }
-        if let Some(to_node) = evidence.to_node.as_ref()
-            && let Some(path) = to_node.file_path.as_ref()
-        {
-            source_truth_files.push(path.clone());
-        }
-        dedupe_and_rank_drill_files(&mut source_truth_files);
-        let expected_evidence = bridge
-            .command
-            .artifact
-            .clone()
-            .into_iter()
-            .collect::<Vec<_>>();
-        claims.push(DrillClaimLedgerEntryOutput {
-            id: format!("bridge-{}", index + 1),
-            claim: format!(
-                "Candidate bridge claim involving `{}` to `{}` currently has status `{}` using `{}` and requires source-truth verification before the final answer.",
-                evidence.from_anchor, evidence.to_anchor, evidence.status, evidence.strategy
-            ),
-            expected_evidence,
-            source_truth_files,
-            pre_verification_confidence: evidence.confidence.clone(),
-            classification: None,
-            changed_after_source_read: None,
-            correction_note: None,
-        });
-    }
-
-    let pending_claim_count = claims.len() as u32;
-    DrillClaimLedgerOutput {
-        template_version: 1,
-        instructions: vec![
-            "Fill classification after source-truth verification: correct, partial, misleading, or unsupported."
-                .to_string(),
-            "Set changed_after_source_read=true when source reads materially revise the CodeStory-only claim."
-                .to_string(),
-            "Treat no_bridge_found as useful negative evidence, not as a silent failure.".to_string(),
-        ],
-        claims,
-        scoring: DrillClaimLedgerScoringOutput {
-            status: "pending_source_verification".to_string(),
-            pending_claim_count,
-            correct: 0,
-            partial: 0,
-            misleading: 0,
-            unsupported: 0,
-            material_revision_count: 0,
-            score_formula:
-                "quality_score=(correct + 0.5*partial) / max(1,total_claims); material revisions are reported separately"
-                    .to_string(),
-        },
-    }
-}
-
-fn unique_verification_target_paths(targets: &[VerificationTargetOutput]) -> Vec<String> {
-    let mut paths = targets
-        .iter()
-        .map(|target| target.path.clone())
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-fn write_drill_artifact<T: serde::Serialize>(
-    output_dir: &std::path::Path,
-    format: args::OutputFormat,
-    stem: &str,
-    command: &str,
-    output: &T,
-    markdown: String,
-) -> DrillCommandStatusOutput {
-    let ext = match format {
-        args::OutputFormat::Markdown => "md",
-        args::OutputFormat::Json => "json",
-        args::OutputFormat::Dot => "txt",
-    };
-    let path = output_dir.join(format!("{stem}.{ext}"));
-    let content = match format {
-        args::OutputFormat::Markdown => markdown,
-        args::OutputFormat::Json => match serde_json::to_string_pretty(output) {
-            Ok(value) => value,
-            Err(error) => return drill_status_error(command, error),
-        },
-        args::OutputFormat::Dot => unreachable!("dot was rejected by run_drill"),
-    };
-    match fs::write(&path, ensure_trailing_newline(content)) {
-        Ok(()) => DrillCommandStatusOutput {
-            command: command.to_string(),
-            status: "ok".to_string(),
-            duration_ms: 0,
-            artifact: Some(display::clean_path_string(&path.to_string_lossy())),
-            error: None,
-        },
-        Err(error) => drill_status_error(command, error),
-    }
-}
-
-fn drill_status_error(command: &str, error: impl std::fmt::Debug) -> DrillCommandStatusOutput {
-    DrillCommandStatusOutput {
-        command: command.to_string(),
-        status: "error".to_string(),
-        duration_ms: 0,
-        artifact: None,
-        error: Some(format!("{error:?}")),
-    }
-}
-
 fn ensure_trailing_newline(mut content: String) -> String {
     if !content.ends_with('\n') {
         content.push('\n');
@@ -7949,693 +5571,15 @@ fn ensure_trailing_newline(mut content: String) -> String {
     content
 }
 
-#[derive(Debug, Clone)]
-struct DrillConsumerTarget {
-    node_id: NodeId,
-    relation: String,
-    query: Option<String>,
-    preferred_file_path: Option<String>,
-}
-
-#[derive(Default)]
-struct DrillConsumerSummaryAccumulator {
-    inspected_any_target: bool,
-    truncated: bool,
-    omitted_edge_count: u32,
-    callers: Vec<DrillAnchorConsumerOutput>,
-    consumers: Vec<DrillAnchorConsumerOutput>,
-    seen_consumers: HashSet<String>,
-    seen_callers: HashSet<String>,
-    notes: Vec<String>,
-}
-
-fn drill_anchor_consumer_summary(
-    runtime: &RuntimeContext,
-    anchor: &str,
-    hit: &SearchHit,
-    verification_targets: &[VerificationTargetOutput],
-) -> Option<DrillAnchorConsumerSummaryOutput> {
-    let selected_target = DrillConsumerTarget {
-        node_id: hit.node_id.clone(),
-        relation: "selected_anchor".to_string(),
-        query: None,
-        preferred_file_path: None,
-    };
-
-    let mut acc = DrillConsumerSummaryAccumulator::default();
-    drill_inspect_consumer_target(runtime, selected_target, &mut acc);
-    if acc.consumers.is_empty() {
-        for target in drill_related_consumer_targets(runtime, anchor, hit, verification_targets) {
-            drill_inspect_consumer_target(runtime, target, &mut acc);
-        }
-    }
-
-    if !acc.inspected_any_target {
-        return None;
-    }
-
-    let caller_count = acc.callers.len();
-    let consumer_count = acc.consumers.len();
-    acc.callers.sort_by_cached_key(|consumer| {
-        (
-            drill_file_rank_for_agent(consumer.file_path.as_deref()),
-            consumer.file_path.clone().unwrap_or_default(),
-            consumer.name.clone(),
-        )
-    });
-    acc.consumers.sort_by_cached_key(|consumer| {
-        (
-            drill_file_rank_for_agent(consumer.file_path.as_deref()),
-            drill_file_rank_for_agent(consumer.target_file_path.as_deref()),
-            consumer.target_relation.clone().unwrap_or_default(),
-            consumer.file_path.clone().unwrap_or_default(),
-            format!("{:?}", consumer.edge_kind),
-            consumer.name.clone(),
-        )
-    });
-    acc.callers.truncate(10);
-    acc.consumers.truncate(12);
-
-    let mut text_consumer_hints = if consumer_count == 0 {
-        drill_anchor_text_consumer_hints(runtime, anchor, hit)
-    } else {
-        Vec::new()
-    };
-    let text_hint_count = text_consumer_hints.len();
-    text_consumer_hints.sort_by(|left, right| {
-        drill_file_rank_for_agent(left.file_path.as_deref())
-            .cmp(&drill_file_rank_for_agent(right.file_path.as_deref()))
-            .then_with(|| {
-                right
-                    .score
-                    .partial_cmp(&left.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                left.file_path
-                    .as_deref()
-                    .unwrap_or_default()
-                    .cmp(right.file_path.as_deref().unwrap_or_default())
-            })
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    text_consumer_hints.truncate(12);
-
-    if caller_count == 0 {
-        acc.notes.push(
-            "no visible production callers were found in the incoming trail; runtime participation still needs source-truth verification"
-                .to_string(),
-        );
-    }
-    if consumer_count == 0 {
-        acc.notes.push(
-            "no visible production graph consumers were found in the bounded incoming trail"
-                .to_string(),
-        );
-        if text_hint_count > 0 {
-            acc.notes.push(format!(
-                "repo-text found {text_hint_count} consumer hints; treat them as source-truth pointers, not typed graph edges"
-            ));
-        }
-    }
-    if acc.truncated || acc.omitted_edge_count > 0 {
-        acc.notes.push(format!(
-            "consumer summary is bounded: truncated={} omitted_edges={}",
-            acc.truncated, acc.omitted_edge_count
-        ));
-    }
-
-    Some(DrillAnchorConsumerSummaryOutput {
-        caller_count,
-        consumer_count,
-        truncated: acc.truncated,
-        omitted_edge_count: acc.omitted_edge_count,
-        callers: acc.callers,
-        consumers: acc.consumers,
-        text_hint_count,
-        text_consumer_hints,
-        notes: acc.notes,
-    })
-}
-
-fn drill_inspect_consumer_target(
-    runtime: &RuntimeContext,
-    target: DrillConsumerTarget,
-    acc: &mut DrillConsumerSummaryAccumulator,
-) {
-    let Ok(references) =
-        runtime
-            .browser
-            .direct_references_graph(DrillAnchorConsumerSummaryOutput::trail_request(
-                &target.node_id,
-            ))
-    else {
-        acc.notes.push(format!(
-            "could not inspect consumer target `{}`{}",
-            target.relation,
-            target
-                .query
-                .as_ref()
-                .map(|query| format!(" from query `{query}`"))
-                .unwrap_or_default()
-        ));
-        return;
-    };
-    acc.inspected_any_target = true;
-    acc.truncated |= references.truncated;
-    acc.omitted_edge_count = acc
-        .omitted_edge_count
-        .saturating_add(references.omitted_edge_count);
-
-    let nodes_by_id = references
-        .nodes
-        .iter()
-        .map(|node| (node.id.0.clone(), node))
-        .collect::<HashMap<_, _>>();
-    let (target_name, target_kind, mut target_file_path) = nodes_by_id
-        .get(&target.node_id.0)
-        .map(|node| {
-            (
-                node.label.clone(),
-                Some(node.kind),
-                node.file_path
-                    .as_deref()
-                    .map(|path| display::relative_path(&runtime.project_root, path)),
-            )
-        })
-        .unwrap_or_else(|| (target.relation.clone(), None, None));
-    if target_file_path
-        .as_ref()
-        .is_none_or(|path| drill_file_rank_for_agent(Some(path)) > 0)
-        && let Some(path) = target.preferred_file_path.clone()
-    {
-        target_file_path = Some(path);
-    }
-
-    if target.relation != "selected_anchor" {
-        let query_note = target
-            .query
-            .as_ref()
-            .map(|query| format!(" from query `{query}`"))
-            .unwrap_or_default();
-        acc.notes.push(format!(
-            "included related consumer target `{target_name}` via `{}`{query_note}",
-            target.relation
-        ));
-    }
-
-    for edge in &references.edges {
-        if edge.target != target.node_id || edge.source == target.node_id {
-            continue;
-        }
-        let Some(source) = nodes_by_id.get(&edge.source.0) else {
-            continue;
-        };
-        let consumer = DrillAnchorConsumerOutput {
-            name: source.label.clone(),
-            kind: source.kind,
-            file_path: source
-                .file_path
-                .as_deref()
-                .map(|path| display::relative_path(&runtime.project_root, path)),
-            qualified_name: source.qualified_name.clone(),
-            target_name: Some(target_name.clone()),
-            target_kind,
-            target_file_path: target_file_path.clone(),
-            target_relation: Some(target.relation.clone()),
-            edge_kind: edge.kind,
-            confidence: edge.confidence,
-            certainty: edge.certainty.clone(),
-        };
-        let consumer_key = format!("{}:{}:{:?}", edge.source.0, target.node_id.0, edge.kind);
-        if acc.seen_consumers.insert(consumer_key) {
-            acc.consumers.push(consumer.clone());
-        }
-        let caller_key = format!("{}:{}", edge.source.0, target.node_id.0);
-        if edge.kind == codestory_contracts::api::EdgeKind::CALL
-            && acc.seen_callers.insert(caller_key)
-        {
-            acc.callers.push(consumer);
-        }
-    }
-}
-
-fn drill_anchor_text_consumer_hints(
-    runtime: &RuntimeContext,
-    anchor: &str,
-    hit: &SearchHit,
-) -> Vec<DrillAnchorTextConsumerHintOutput> {
-    let Ok(results) = runtime.browser.search_results(SearchRequest {
-        query: anchor.to_string(),
-        repo_text: SearchRepoTextMode::On,
-        limit_per_source: 25,
-        expand_search_plan: false,
-        hybrid_weights: None,
-        hybrid_limits: None,
-    }) else {
-        return Vec::new();
-    };
-
-    let selected_path = hit
-        .file_path
-        .as_deref()
-        .map(|path| display::relative_path(&runtime.project_root, path));
-    let mut seen = HashSet::new();
-    let mut hints = Vec::new();
-    for text_hit in results.repo_text_hits {
-        let file_path = text_hit
-            .file_path
-            .as_deref()
-            .map(|path| display::relative_path(&runtime.project_root, path));
-        if selected_path.as_ref().is_some_and(|selected| {
-            file_path
-                .as_ref()
-                .is_some_and(|candidate| candidate == selected)
-        }) {
-            continue;
-        }
-        let key = format!(
-            "{}:{}",
-            file_path.as_deref().unwrap_or(&text_hit.display_name),
-            text_hit.line.unwrap_or_default()
-        );
-        if !seen.insert(key) {
-            continue;
-        }
-        hints.push(DrillAnchorTextConsumerHintOutput {
-            name: text_hit.display_name,
-            kind: text_hit.kind,
-            file_path,
-            line: text_hit.line,
-            score: text_hit.score,
-        });
-    }
-    hints
-}
-
-impl DrillAnchorConsumerSummaryOutput {
-    fn trail_request(node_id: &NodeId) -> TrailConfigDto {
-        TrailConfigDto {
-            root_id: node_id.clone(),
-            mode: TrailMode::AllReferencing,
-            target_id: None,
-            depth: 0,
-            direction: TrailDirection::Incoming,
-            caller_scope: TrailCallerScope::ProductionOnly,
-            edge_filter: Vec::new(),
-            show_utility_calls: false,
-            hide_speculative: true,
-            story: false,
-            node_filter: Vec::new(),
-            max_nodes: 120,
-            layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
-        }
-    }
-}
-
-fn drill_related_consumer_targets(
-    runtime: &RuntimeContext,
-    anchor: &str,
-    hit: &SearchHit,
-    verification_targets: &[VerificationTargetOutput],
-) -> Vec<DrillConsumerTarget> {
-    let mut related = Vec::new();
-    let mut seen_nodes = HashSet::new();
-    let mut slug_candidates =
-        drill_payload_collection_slug_candidates(anchor, hit, verification_targets);
-    slug_candidates.truncate(4);
-
-    for slug in slug_candidates {
-        for query in [
-            format!("payload:collection:{slug}"),
-            format!("payload collection {slug}"),
-        ] {
-            let Ok(results) = runtime.browser.search_results(SearchRequest {
-                query: query.clone(),
-                repo_text: SearchRepoTextMode::Off,
-                limit_per_source: 25,
-                expand_search_plan: true,
-                hybrid_weights: None,
-                hybrid_limits: None,
-            }) else {
-                continue;
-            };
-            let Some(payload_hit) = results.indexed_symbol_hits.iter().find(|candidate| {
-                candidate.resolvable
-                    && candidate.node_id != hit.node_id
-                    && drill_is_payload_collection_hit(candidate, &slug)
-            }) else {
-                continue;
-            };
-            if seen_nodes.insert(payload_hit.node_id.0.clone()) {
-                related.push(DrillConsumerTarget {
-                    node_id: payload_hit.node_id.clone(),
-                    relation: format!("related_payload_collection:{slug}"),
-                    query: Some(query),
-                    preferred_file_path: drill_preferred_payload_collection_source_file(
-                        verification_targets,
-                        &slug,
-                    ),
-                });
-            }
-            break;
-        }
-    }
-
-    for (relation, query) in drill_native_related_queries(anchor, hit) {
-        let Ok(results) = runtime.browser.search_results(SearchRequest {
-            query: query.clone(),
-            repo_text: SearchRepoTextMode::Off,
-            limit_per_source: 25,
-            expand_search_plan: false,
-            hybrid_weights: None,
-            hybrid_limits: None,
-        }) else {
-            continue;
-        };
-        let Some(native_hit) = results.indexed_symbol_hits.iter().find(|candidate| {
-            candidate.resolvable
-                && candidate.node_id != hit.node_id
-                && drill_native_related_query_matches(candidate, &query)
-        }) else {
-            continue;
-        };
-        if seen_nodes.insert(native_hit.node_id.0.clone()) {
-            related.push(DrillConsumerTarget {
-                node_id: native_hit.node_id.clone(),
-                relation,
-                query: Some(query),
-                preferred_file_path: None,
-            });
-        }
-    }
-
-    related
-}
-
-fn drill_native_related_queries(anchor: &str, hit: &SearchHit) -> Vec<(String, String)> {
-    let mut queries = Vec::new();
-    let mut seen = HashSet::new();
-    let text = format!("{} {}", anchor, hit.display_name);
-    let tokens = drill_related_query_tokens(&text);
-    if drill_tokens_contain_all(&tokens, &["source", "group"])
-        && drill_tokens_contain_any(&tokens, &["cxx", "cdb", "compile", "database"])
-    {
-        for (relation, query) in [
-            (
-                "related_native_role:indexing",
-                "source group prepare indexing",
-            ),
-            (
-                "related_native_role:command_provider",
-                "source group indexer command provider",
-            ),
-            (
-                "related_native_role:commands",
-                "source group indexer commands",
-            ),
-            (
-                "related_native_role:compilation_database",
-                "source group compilation database pre index task",
-            ),
-            (
-                "related_native_role:pre_index",
-                "source group pre index task",
-            ),
-        ] {
-            let query = query.to_string();
-            if seen.insert(query.clone()) {
-                queries.push((relation.to_string(), query));
-            }
-        }
-    }
-    if drill_tokens_contain_all(&tokens, &["indexer", "java"]) {
-        let query = "java indexer do index".to_string();
-        if seen.insert(query.clone()) {
-            queries.push(("related_native_role:java_index".to_string(), query));
-        }
-    }
-    if drill_tokens_contain_all(&tokens, &["storage", "access"]) {
-        for query in [
-            "storage access proxy",
-            "persistent storage",
-            "component factory storage access",
-        ] {
-            if seen.insert(query.to_string()) {
-                queries.push((
-                    format!(
-                        "related_storage_access:{}",
-                        codestory_runtime::terminal_symbol_segment(query)
-                    ),
-                    query.to_string(),
-                ));
-            }
-        }
-    }
-    queries
-}
-
-fn drill_native_related_query_matches(hit: &SearchHit, query: &str) -> bool {
-    let display = codestory_runtime::normalize_symbol_query(&hit.display_name);
-    let query = codestory_runtime::normalize_symbol_query(query);
-    if display == query {
-        return true;
-    }
-    let query_terminal = codestory_runtime::terminal_symbol_segment(&query);
-    let display_terminal = codestory_runtime::terminal_symbol_segment(&display);
-    display.ends_with(&query)
-        || (!query_terminal.is_empty() && display_terminal == query_terminal)
-        || drill_related_query_matches_by_tokens(&hit.display_name, &query)
-}
-
-fn drill_related_query_matches_by_tokens(display_name: &str, query: &str) -> bool {
-    let display_tokens = drill_related_query_tokens(display_name);
-    let query_tokens = drill_related_query_tokens(query);
-    !query_tokens.is_empty()
-        && query_tokens
-            .iter()
-            .all(|token| display_tokens.contains(token))
-}
-
-fn drill_tokens_contain_all(tokens: &[String], required: &[&str]) -> bool {
-    required
-        .iter()
-        .all(|required| tokens.iter().any(|token| token == required))
-}
-
-fn drill_tokens_contain_any(tokens: &[String], required: &[&str]) -> bool {
-    required
-        .iter()
-        .any(|required| tokens.iter().any(|token| token == required))
-}
-
-fn drill_related_query_tokens(value: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut seen = HashSet::new();
-    for token in codestory_runtime::symbol_query_tokens(value) {
-        if token.len() >= 2 && seen.insert(token.clone()) {
-            tokens.push(token);
-        }
-    }
-    tokens
-}
-
-fn drill_is_payload_collection_hit(hit: &SearchHit, slug: &str) -> bool {
-    let display = hit.display_name.to_ascii_lowercase();
-    let slug = slug.to_ascii_lowercase();
-    display.contains(&format!("payload::collection::{slug}"))
-        || display.contains(&format!("payload collection {slug}"))
-        || display.contains(&format!("collection::{slug}"))
-}
-
-fn drill_preferred_payload_collection_source_file(
-    verification_targets: &[VerificationTargetOutput],
-    slug: &str,
-) -> Option<String> {
-    let slug = slug.to_ascii_lowercase();
-    verification_targets
-        .iter()
-        .filter(|target| {
-            let path = target.path.replace('\\', "/").to_ascii_lowercase();
-            path.contains("/collections/")
-                || path.contains("/collection/")
-                || path.contains(&format!("/{slug}."))
-                || target
-                    .node_ref
-                    .as_deref()
-                    .is_some_and(|node_ref| node_ref.to_ascii_lowercase().contains(&slug))
-        })
-        .min_by_key(|target| {
-            (
-                drill_file_rank_for_agent(Some(target.path.as_str())),
-                target.line,
-                target.path.clone(),
-            )
-        })
-        .map(|target| target.path.clone())
-}
-
-fn drill_payload_collection_slug_candidates(
-    anchor: &str,
-    hit: &SearchHit,
-    verification_targets: &[VerificationTargetOutput],
-) -> Vec<String> {
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-    for value in [anchor, hit.display_name.as_str()]
-        .into_iter()
-        .chain(hit.file_path.as_deref())
-        .chain(verification_targets.iter().flat_map(|target| {
-            [target.path.as_str()]
-                .into_iter()
-                .chain(target.node_ref.as_deref())
-        }))
-    {
-        for slug in drill_slug_candidates_from_value(value) {
-            if seen.insert(slug.clone()) {
-                candidates.push(slug);
-            }
-        }
-    }
-    candidates
-}
-
-fn drill_slug_candidates_from_value(value: &str) -> Vec<String> {
-    let mut raw = Vec::new();
-    raw.push(value.to_string());
-    if let Some((_, tail)) = value.rsplit_once("payload:collection:") {
-        raw.push(tail.to_string());
-    }
-    if let Some((_, tail)) = value.rsplit_once("payload::collection::") {
-        raw.push(tail.to_string());
-    }
-    if let Some((_, tail)) = value.rsplit_once("collection::") {
-        raw.push(tail.to_string());
-    }
-
-    let normalized_path = value.replace('\\', "/");
-    if let Some(file_name) = normalized_path.rsplit('/').next() {
-        raw.push(file_name.to_string());
-        if let Some((stem, _)) = file_name.rsplit_once('.') {
-            raw.push(stem.to_string());
-        }
-    }
-    if let Some((_, tail)) = value.rsplit_once("::") {
-        raw.push(tail.to_string());
-    }
-
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-    for raw_value in raw {
-        if let Some(slug) = drill_normalize_slug_candidate(&raw_value)
-            && seen.insert(slug.clone())
-        {
-            candidates.push(slug);
-        }
-    }
-    candidates
-}
-
-fn drill_normalize_slug_candidate(value: &str) -> Option<String> {
-    let trimmed = value
-        .trim()
-        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
-    if trimmed.is_empty() || trimmed.len() > 80 {
-        return None;
-    }
-
-    let mut slug = String::new();
-    let mut prev_was_sep = false;
-    let mut prev_was_lower_or_digit = false;
-    for ch in trimmed.chars() {
-        if ch.is_ascii_alphanumeric() {
-            if ch.is_ascii_uppercase() && prev_was_lower_or_digit && !prev_was_sep {
-                slug.push('-');
-            }
-            slug.push(ch.to_ascii_lowercase());
-            prev_was_sep = false;
-            prev_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-        } else if !slug.is_empty() && !prev_was_sep {
-            slug.push('-');
-            prev_was_sep = true;
-            prev_was_lower_or_digit = false;
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    if slug.is_empty()
-        || slug.contains("payload-collection")
-        || slug.contains("source-repos")
-        || slug.contains("src-")
-    {
-        return None;
-    }
-    Some(slug)
-}
-
-fn drill_trail_request(root_id: &NodeId) -> TrailConfigDto {
-    TrailConfigDto {
-        root_id: root_id.clone(),
-        mode: TrailMode::Neighborhood,
-        target_id: None,
-        depth: 2,
-        direction: TrailDirection::Both,
-        caller_scope: TrailCallerScope::ProductionOnly,
-        edge_filter: Vec::new(),
-        show_utility_calls: false,
-        hide_speculative: true,
-        story: true,
-        node_filter: Vec::new(),
-        max_nodes: 120,
-        layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
-    }
-}
-
-fn drill_trail_command(
-    project: &args::ProjectArgs,
-    target: &runtime::ResolvedTarget,
-) -> TrailCommand {
-    TrailCommand {
-        project: project.clone(),
-        target: args::TargetArgs {
-            id: Some(target.selected.node_id.0.clone()),
-            query: None,
-            file: None,
-            choose: None,
-        },
-        mode: args::CliTrailMode::Neighborhood,
-        depth: Some(2),
-        direction: Some(args::CliDirection::Both),
-        max_nodes: 120,
-        include_tests: false,
-        show_utility_calls: false,
-        hide_speculative: true,
-        story: true,
-        layout: args::CliLayout::Horizontal,
-        refresh: args::RefreshMode::None,
-        format: args::OutputFormat::Markdown,
-        output_file: None,
-        mermaid: false,
-    }
-}
-
-fn cmd_project_args(project_root: &std::path::Path) -> args::ProjectArgs {
-    args::ProjectArgs {
-        project: project_root.to_path_buf(),
-        cache_dir: None,
-    }
-}
-
 fn output_slug(value: &str) -> String {
-    let mut slug = String::new();
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+    let slug = value.chars().fold(String::new(), |mut slug, ch| {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
             slug.push(ch);
         } else if !slug.ends_with('-') {
             slug.push('-');
         }
-    }
+        slug
+    });
     let slug = slug.trim_matches('-');
     if slug.is_empty() {
         "anchor".to_string()
@@ -8656,810 +5600,16 @@ fn dedupe_verification_targets(targets: &mut Vec<VerificationTargetOutput>) {
     });
 }
 
-fn drill_evidence_packet(
-    question: Option<&str>,
-    question_search: Option<&DrillCommandStatusOutput>,
-    question_supplemental_searches: &[DrillCommandStatusOutput],
-    anchors: &[DrillAnchorOutput],
-    bridges: &[DrillBridgeOutput],
-    verification_targets: &[VerificationTargetOutput],
-    next_commands: &[String],
-) -> EvidencePacketDto {
-    let mut items = Vec::new();
-    if let Some(status) = question_search {
-        items.push(evidence_item_from_command(
-            "question-search",
-            EvidenceTypeDto::SearchHit,
-            status,
-            "medium",
-            ClaimReadinessDto::Partial,
-            vec![
-                "natural-language question search is broad discovery evidence; use drill anchors and source verification before answering"
-                    .to_string(),
-            ],
-        ));
-    }
-    for (index, status) in question_supplemental_searches.iter().enumerate() {
-        items.push(evidence_item_from_command(
-            &format!("question-supplemental-search-{}", index + 1),
-            EvidenceTypeDto::SearchHit,
-            status,
-            if status.status == "ok" { "medium" } else { "low" },
-            if status.status == "ok" {
-                ClaimReadinessDto::Partial
-            } else {
-                ClaimReadinessDto::NeedsSourceRead
-            },
-            vec![
-                "supplemental question search expands likely runtime/source-truth surfaces; verify source before final claims"
-                    .to_string(),
-            ],
-        ));
-    }
-
-    for (index, anchor) in anchors.iter().enumerate() {
-        let anchor_id = format!("anchor-{}", index + 1);
-        match anchor.chosen_anchor.as_ref() {
-            Some(hit) => items.push(evidence_item_from_hit(&anchor_id, anchor, hit)),
-            None => items.push(EvidenceItemDto {
-                id: anchor_id.clone(),
-                evidence_type: EvidenceTypeDto::Negative,
-                command: format!("search {}", anchor.anchor),
-                status: "no_resolvable_anchor".to_string(),
-                confidence: "low".to_string(),
-                verification_status: ClaimReadinessDto::NeedsSourceRead,
-                match_quality: None,
-                source: None,
-                artifacts: drill_command_artifacts(&anchor.commands),
-                notes: vec![
-                    "no typed/resolvable anchor was selected; do not make architecture claims from this anchor"
-                        .to_string(),
-                ],
-            }),
-        }
-
-        for (command_index, status) in anchor.commands.iter().enumerate() {
-            items.push(evidence_item_from_command(
-                &format!("{anchor_id}-command-{}", command_index + 1),
-                evidence_type_for_drill_command(&status.command),
-                status,
-                if status.status == "ok" {
-                    "medium"
-                } else {
-                    "low"
-                },
-                readiness_for_drill_command(status),
-                drill_command_notes(status),
-            ));
-        }
-    }
-
-    for (index, bridge) in bridges.iter().enumerate() {
-        items.push(evidence_item_from_bridge(index + 1, bridge));
-    }
-
-    let source_truth_checks =
-        source_truth_checks_from_drill_evidence(verification_targets, anchors, bridges);
-    let readiness = drill_answer_readiness(&items, &source_truth_checks, next_commands);
-    EvidencePacketDto {
-        packet_version: 1,
-        question: question.map(ToOwned::to_owned),
-        items,
-        readiness,
-    }
+fn dedupe_and_rank_drill_files(files: &mut Vec<String>) {
+    files.sort_by_cached_key(|path| normalize_drill_path(path));
+    files.dedup_by(|left, right| normalize_drill_path(left) == normalize_drill_path(right));
 }
 
-fn evidence_item_from_hit(
-    id: &str,
-    anchor: &DrillAnchorOutput,
-    hit: &SearchHitOutput,
-) -> EvidenceItemDto {
-    let is_repo_text = matches!(
-        hit.origin,
-        codestory_contracts::api::SearchHitOrigin::TextMatch
-    ) || !hit.resolvable;
-    EvidenceItemDto {
-        id: id.to_string(),
-        evidence_type: if is_repo_text {
-            EvidenceTypeDto::RepoText
-        } else {
-            EvidenceTypeDto::SearchHit
-        },
-        command: format!("search {}", anchor.anchor),
-        status: "selected_anchor".to_string(),
-        confidence: if is_repo_text { "low" } else { "high" }.to_string(),
-        verification_status: if is_repo_text {
-            ClaimReadinessDto::NeedsSourceRead
-        } else {
-            ClaimReadinessDto::Anchored
-        },
-        match_quality: Some(hit.match_quality),
-        source: hit
-            .file_path
-            .as_ref()
-            .map(|path| EvidenceSourceLocationDto {
-                path: path.clone(),
-                line_start: hit.line,
-                line_end: hit.line,
-            }),
-        artifacts: drill_command_artifacts(&anchor.commands),
-        notes: evidence_hit_notes(anchor, hit),
-    }
-}
-
-fn evidence_hit_notes(anchor: &DrillAnchorOutput, hit: &SearchHitOutput) -> Vec<String> {
-    let mut notes = Vec::new();
-    notes.push(format!("typed_hit_count={}", anchor.typed_hit_count));
-    if let Some(summary) = anchor.consumer_summary.as_ref() {
-        notes.push(format!(
-            "visible_production_callers={} visible_consumers={} text_consumer_hints={}",
-            summary.caller_count, summary.consumer_count, summary.text_hint_count
-        ));
-        for caller in summary.callers.iter().take(3) {
-            let path = caller.file_path.as_deref().unwrap_or("<no-file>");
-            let target = caller
-                .target_name
-                .as_deref()
-                .map(|name| format!(" -> {name}"))
-                .unwrap_or_default();
-            notes.push(format!(
-                "caller: {} [{:?}] {}{} via {:?}",
-                caller.name, caller.kind, path, target, caller.edge_kind
-            ));
-        }
-        for hint in summary.text_consumer_hints.iter().take(3) {
-            let path = hint.file_path.as_deref().unwrap_or("<no-file>");
-            notes.push(format!(
-                "text-hint: {} [{:?}] {}:{}",
-                hint.name,
-                hint.kind,
-                path,
-                hint.line
-                    .map(|line| line.to_string())
-                    .unwrap_or_else(|| "?".to_string())
-            ));
-        }
-        notes.extend(summary.notes.iter().take(2).cloned());
-    }
-    if matches!(
-        hit.origin,
-        codestory_contracts::api::SearchHitOrigin::TextMatch
-    ) {
-        notes.push(
-            "repo-text hits are file/line hints only; choose a typed symbol before graph browsing"
-                .to_string(),
-        );
-    }
-    if hit.verification_targets.is_empty() {
-        notes.push("no source occurrence metadata was available for this selected hit".to_string());
-    }
-    notes
-}
-
-fn evidence_item_from_command(
-    id: &str,
-    evidence_type: EvidenceTypeDto,
-    status: &DrillCommandStatusOutput,
-    confidence: &str,
-    verification_status: ClaimReadinessDto,
-    mut notes: Vec<String>,
-) -> EvidenceItemDto {
-    if let Some(error) = status.error.as_ref() {
-        notes.push(format!("command error: {error}"));
-    }
-    EvidenceItemDto {
-        id: id.to_string(),
-        evidence_type: if status.status == "ok" {
-            evidence_type
-        } else {
-            EvidenceTypeDto::Negative
-        },
-        command: status.command.clone(),
-        status: status.status.clone(),
-        confidence: confidence.to_string(),
-        verification_status,
-        match_quality: None,
-        source: None,
-        artifacts: status.artifact.iter().cloned().collect(),
-        notes,
-    }
-}
-
-fn evidence_item_from_bridge(index: usize, bridge: &DrillBridgeOutput) -> EvidenceItemDto {
-    let evidence = &bridge.evidence;
-    let verification_status = match evidence.status.as_str() {
-        "graph_path" => ClaimReadinessDto::Supported,
-        "reverse_graph_path" => ClaimReadinessDto::Partial,
-        "source_truth_only" => ClaimReadinessDto::NeedsSourceRead,
-        status if drill_bridge_status_is_partial(status) => ClaimReadinessDto::Partial,
-        "no_bridge_found" | "unresolved_anchor" | "error" => ClaimReadinessDto::NeedsSourceRead,
-        _ => ClaimReadinessDto::Inferred,
-    };
-    EvidenceItemDto {
-        id: format!("bridge-{index}"),
-        evidence_type: if bridge.command.status == "ok" {
-            EvidenceTypeDto::Bridge
-        } else {
-            EvidenceTypeDto::Negative
-        },
-        command: bridge.command.command.clone(),
-        status: evidence.status.clone(),
-        confidence: evidence.confidence.clone(),
-        verification_status,
-        match_quality: None,
-        source: None,
-        artifacts: bridge.command.artifact.iter().cloned().collect(),
-        notes: evidence.notes.clone(),
-    }
-}
-
-fn evidence_type_for_drill_command(command: &str) -> EvidenceTypeDto {
-    match command {
-        "search" | "question_search" => EvidenceTypeDto::SearchHit,
-        "symbol" => EvidenceTypeDto::SymbolContext,
-        "trail" => EvidenceTypeDto::Trail,
-        "snippet" => EvidenceTypeDto::Snippet,
-        "explore" => EvidenceTypeDto::Explore,
-        "bridge" => EvidenceTypeDto::Bridge,
-        _ => EvidenceTypeDto::Negative,
-    }
-}
-
-fn readiness_for_drill_command(status: &DrillCommandStatusOutput) -> ClaimReadinessDto {
-    if status.status != "ok" {
-        return ClaimReadinessDto::NeedsSourceRead;
-    }
-    match status.command.as_str() {
-        "symbol" | "snippet" | "explore" => ClaimReadinessDto::Supported,
-        "trail" => ClaimReadinessDto::Partial,
-        "search" => ClaimReadinessDto::Anchored,
-        "question_search" => ClaimReadinessDto::Partial,
-        _ => ClaimReadinessDto::Partial,
-    }
-}
-
-fn drill_command_notes(status: &DrillCommandStatusOutput) -> Vec<String> {
-    match status.command.as_str() {
-        "question_search" => {
-            vec![
-                "natural-language question search is broad discovery evidence; use drill anchors and source verification before answering".to_string(),
-            ]
-        }
-        "search" => {
-            vec!["search is anchor discovery, not final source-truth verification".to_string()]
-        }
-        "trail" => vec![
-            "trail evidence may omit speculative edges and should be checked against snippets/source when architecture direction matters"
-                .to_string(),
-        ],
-        "snippet" => vec!["snippet is source-backed local context for the selected target".to_string()],
-        "explore" => vec!["explore packet broadens nearby files and related symbols".to_string()],
-        _ => Vec::new(),
-    }
-}
-
-fn drill_command_artifacts(commands: &[DrillCommandStatusOutput]) -> Vec<String> {
-    commands
-        .iter()
-        .filter_map(|command| command.artifact.clone())
-        .collect()
-}
-
-#[derive(Debug, Clone)]
-struct SourceTruthCheckSeed {
-    role: String,
-    detail: String,
-    path: String,
-    line: Option<u32>,
-    required: bool,
-}
-
-#[derive(Debug)]
-struct SourceTruthCheckGroup {
-    path: String,
-    line: Option<u32>,
-    required: bool,
-    roles: BTreeSet<String>,
-    details: Vec<String>,
-    omitted_detail_count: usize,
-}
-
-fn source_truth_checks_from_drill_evidence(
-    targets: &[VerificationTargetOutput],
-    anchors: &[DrillAnchorOutput],
-    bridges: &[DrillBridgeOutput],
-) -> Vec<SourceTruthCheckDto> {
-    let mut checks = Vec::new();
-    let mut seen = HashSet::new();
-    for target in targets {
-        push_source_truth_check(
-            &mut checks,
-            &mut seen,
-            source_truth_role_for_verification_reason(&target.reason),
-            target.reason.clone(),
-            target.path.clone(),
-            Some(target.line),
-            true,
-        );
-    }
-    for anchor in anchors {
-        push_consumer_source_truth_checks(&mut checks, &mut seen, anchor);
-    }
-    for bridge in bridges {
-        push_bridge_source_truth_checks(&mut checks, &mut seen, &bridge.evidence);
-    }
-    rank_source_truth_checks(&mut checks);
-    let mut checks = compact_source_truth_checks(checks);
-    rank_source_truth_checks(&mut checks);
-
-    checks
-        .into_iter()
-        .enumerate()
-        .map(
-            |(index, check): (usize, SourceTruthCheckSeed)| SourceTruthCheckDto {
-                id: format!("source-truth-{}", index + 1),
-                reason: check.detail,
-                path: check.path,
-                line: check.line,
-                required: check.required,
-            },
-        )
-        .collect()
-}
-
-fn rank_source_truth_checks(checks: &mut [SourceTruthCheckSeed]) {
-    checks.sort_by_cached_key(|check| {
-        (
-            drill_file_rank_for_agent(Some(check.path.as_str())),
-            check.path.clone(),
-            check.line.unwrap_or_default(),
-            check.role.clone(),
-            check.detail.clone(),
-        )
-    });
-}
-
-fn push_source_truth_check(
-    checks: &mut Vec<SourceTruthCheckSeed>,
-    seen: &mut HashSet<(String, Option<u32>, String, String)>,
-    role: impl Into<String>,
-    detail: String,
-    path: String,
-    line: Option<u32>,
-    required: bool,
-) {
-    if path.trim().is_empty() {
-        return;
-    }
-    let role = role.into();
-    if seen.insert((path.clone(), line, role.clone(), detail.clone())) {
-        checks.push(SourceTruthCheckSeed {
-            role,
-            detail,
-            path,
-            line,
-            required,
-        });
-    }
-}
-
-fn push_consumer_source_truth_checks(
-    checks: &mut Vec<SourceTruthCheckSeed>,
-    seen: &mut HashSet<(String, Option<u32>, String, String)>,
-    anchor: &DrillAnchorOutput,
-) {
-    let Some(summary) = anchor.consumer_summary.as_ref() else {
-        return;
-    };
-
-    for caller in summary.callers.iter().take(2) {
-        if let Some(path) = caller.file_path.as_ref() {
-            push_source_truth_check(
-                checks,
-                seen,
-                "consumer",
-                format!(
-                    "consumer evidence for {}: caller {} reaches {} via {:?}",
-                    anchor.anchor,
-                    caller.name,
-                    caller
-                        .target_name
-                        .as_deref()
-                        .unwrap_or(anchor.anchor.as_str()),
-                    caller.edge_kind
-                ),
-                path.clone(),
-                None,
-                true,
-            );
-        }
-    }
-
-    for consumer in summary.consumers.iter().take(3) {
-        if let Some(path) = consumer.file_path.as_ref() {
-            push_source_truth_check(
-                checks,
-                seen,
-                "consumer",
-                format!(
-                    "consumer evidence for {}: {} uses {} via {:?}",
-                    anchor.anchor,
-                    consumer.name,
-                    consumer
-                        .target_name
-                        .as_deref()
-                        .unwrap_or(anchor.anchor.as_str()),
-                    consumer.edge_kind
-                ),
-                path.clone(),
-                None,
-                true,
-            );
-        }
-        if let Some(path) = consumer.target_file_path.as_ref() {
-            push_source_truth_check(
-                checks,
-                seen,
-                "related target",
-                format!(
-                    "consumer target for {}: verify related target {}",
-                    anchor.anchor,
-                    consumer
-                        .target_name
-                        .as_deref()
-                        .unwrap_or(anchor.anchor.as_str())
-                ),
-                path.clone(),
-                None,
-                true,
-            );
-        }
-    }
-
-    for hint in summary.text_consumer_hints.iter().take(3) {
-        if let Some(path) = hint.file_path.as_ref() {
-            push_source_truth_check(
-                checks,
-                seen,
-                "text hint",
-                format!(
-                    "text consumer hint for {}: {} matched repo text",
-                    anchor.anchor, hint.name
-                ),
-                path.clone(),
-                hint.line,
-                true,
-            );
-        }
-    }
-}
-
-fn push_bridge_source_truth_checks(
-    checks: &mut Vec<SourceTruthCheckSeed>,
-    seen: &mut HashSet<(String, Option<u32>, String, String)>,
-    bridge: &DrillBridgeEvidenceOutput,
-) {
-    let prefix = format!("bridge {} -> {}", bridge.from_anchor, bridge.to_anchor);
-    if let Some(from_node) = bridge.from_node.as_ref()
-        && let Some(path) = from_node.file_path.as_ref()
-    {
-        push_source_truth_check(
-            checks,
-            seen,
-            "bridge endpoint",
-            format!("{prefix}: verify from endpoint {}", from_node.display_name),
-            path.clone(),
-            from_node.line,
-            true,
-        );
-    }
-    if let Some(to_node) = bridge.to_node.as_ref()
-        && let Some(path) = to_node.file_path.as_ref()
-    {
-        push_source_truth_check(
-            checks,
-            seen,
-            "bridge endpoint",
-            format!("{prefix}: verify to endpoint {}", to_node.display_name),
-            path.clone(),
-            to_node.line,
-            true,
-        );
-    }
-    for path in bridge.shared_files.iter().take(3) {
-        push_source_truth_check(
-            checks,
-            seen,
-            "bridge shared file",
-            format!(
-                "{prefix}: inspect shared file for {} bridge evidence",
-                bridge.status
-            ),
-            path.clone(),
-            None,
-            true,
-        );
-    }
-    for path in bridge.evidence_files.iter().take(3) {
-        push_source_truth_check(
-            checks,
-            seen,
-            "bridge hint",
-            format!(
-                "{prefix}: inspect consumer/text evidence file for {} bridge evidence",
-                bridge.status
-            ),
-            path.clone(),
-            None,
-            true,
-        );
-    }
-}
-
-fn source_truth_role_for_verification_reason(reason: &str) -> &'static str {
-    let lower = reason.to_ascii_lowercase();
-    if lower.contains("primary source occurrence") || lower.contains("selected") {
-        "selected anchor"
-    } else if lower.contains("snippet") || lower.contains("body") {
-        "source body"
-    } else {
-        "source target"
-    }
-}
-
-fn compact_source_truth_checks(checks: Vec<SourceTruthCheckSeed>) -> Vec<SourceTruthCheckSeed> {
-    let mut groups = Vec::<SourceTruthCheckGroup>::new();
-    let mut group_by_path = HashMap::<String, usize>::new();
-    for check in checks {
-        let index = if let Some(index) = group_by_path.get(&check.path) {
-            *index
-        } else {
-            let index = groups.len();
-            group_by_path.insert(check.path.clone(), index);
-            groups.push(SourceTruthCheckGroup {
-                path: check.path.clone(),
-                line: check.line,
-                required: false,
-                roles: BTreeSet::new(),
-                details: Vec::new(),
-                omitted_detail_count: 0,
-            });
-            index
-        };
-        groups[index].push(check);
-    }
-    groups
-        .into_iter()
-        .map(SourceTruthCheckGroup::into_seed)
-        .collect()
-}
-
-impl SourceTruthCheckGroup {
-    fn push(&mut self, check: SourceTruthCheckSeed) {
-        self.required |= check.required;
-        self.roles.insert(check.role);
-        self.line = match (self.line, check.line) {
-            (Some(current), Some(next)) => Some(current.min(next)),
-            (None, Some(next)) => Some(next),
-            (current, None) => current,
-        };
-        if self.details.iter().any(|detail| detail == &check.detail) {
-            return;
-        }
-        if self.details.len() < 4 {
-            self.details.push(check.detail);
-        } else {
-            self.omitted_detail_count += 1;
-        }
-    }
-
-    fn into_seed(self) -> SourceTruthCheckSeed {
-        let roles = self.roles.into_iter().collect::<Vec<_>>().join(", ");
-        let mut detail = format!("verify {roles} evidence");
-        if !self.details.is_empty() {
-            detail.push_str(": ");
-            detail.push_str(&self.details.join("; "));
-        }
-        if self.omitted_detail_count > 0 {
-            let _ = write!(
-                detail,
-                "; plus {} more signal{}",
-                self.omitted_detail_count,
-                if self.omitted_detail_count == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            );
-        }
-        SourceTruthCheckSeed {
-            role: roles,
-            detail,
-            path: self.path,
-            line: self.line,
-            required: self.required,
-        }
-    }
-}
-
-fn drill_answer_readiness(
-    items: &[EvidenceItemDto],
-    source_truth_checks: &[SourceTruthCheckDto],
-    next_commands: &[String],
-) -> AnswerReadinessReportDto {
-    let pending_required_source_truth = source_truth_checks.iter().any(|check| check.required);
-    let has_source_blocked_item = items.iter().any(|item| {
-        matches!(
-            item.verification_status,
-            ClaimReadinessDto::NeedsSourceRead | ClaimReadinessDto::ContradictedBySource
-        )
-    });
-    let has_partial_item = items
-        .iter()
-        .any(|item| matches!(item.verification_status, ClaimReadinessDto::Partial));
-    let overall_status = if source_truth_checks.is_empty() || has_source_blocked_item {
-        ClaimReadinessDto::NeedsSourceRead
-    } else if has_partial_item {
-        ClaimReadinessDto::Partial
-    } else if pending_required_source_truth {
-        ClaimReadinessDto::NeedsSourceRead
-    } else {
-        ClaimReadinessDto::Supported
-    };
-
-    let mut safe_to_say = Vec::new();
-    let mut inferred_claims = Vec::new();
-    let mut needs_verification = Vec::new();
-    for item in items {
-        match item.verification_status {
-            ClaimReadinessDto::Anchored | ClaimReadinessDto::Supported => {
-                safe_to_say.push(format!(
-                    "{} evidence `{}` is available with {} confidence",
-                    evidence_type_label(item.evidence_type),
-                    item.id,
-                    item.confidence
-                ));
-            }
-            ClaimReadinessDto::Partial | ClaimReadinessDto::Inferred => {
-                inferred_claims.push(format!(
-                    "{} evidence `{}` is {} and must not be presented as verified architecture",
-                    evidence_type_label(item.evidence_type),
-                    item.id,
-                    readiness_label(item.verification_status)
-                ));
-            }
-            ClaimReadinessDto::NeedsSourceRead | ClaimReadinessDto::ContradictedBySource => {
-                needs_verification.push(format!(
-                    "{} evidence `{}` requires source-truth verification",
-                    evidence_type_label(item.evidence_type),
-                    item.id
-                ));
-            }
-        }
-    }
-    if source_truth_checks.is_empty() {
-        needs_verification.push(
-            "no source-truth targets were emitted; verify candidate source files before finalizing"
-                .to_string(),
-        );
-    } else if pending_required_source_truth {
-        needs_verification.push(
-            "required source-truth checks are pending; read the listed files before treating the packet as supported"
-                .to_string(),
-        );
-    }
-
-    AnswerReadinessReportDto {
-        overall_status,
-        safe_to_say,
-        inferred_claims,
-        needs_verification,
-        next_commands: next_commands.to_vec(),
-        source_truth_checks: source_truth_checks.to_vec(),
-    }
-}
-
-fn evidence_type_label(evidence_type: EvidenceTypeDto) -> &'static str {
-    match evidence_type {
-        EvidenceTypeDto::SearchHit => "search",
-        EvidenceTypeDto::SymbolContext => "symbol",
-        EvidenceTypeDto::Trail => "trail",
-        EvidenceTypeDto::Snippet => "snippet",
-        EvidenceTypeDto::Explore => "explore",
-        EvidenceTypeDto::Bridge => "bridge",
-        EvidenceTypeDto::RepoText => "repo-text",
-        EvidenceTypeDto::Negative => "negative",
-    }
-}
-
-fn readiness_label(readiness: ClaimReadinessDto) -> &'static str {
-    match readiness {
-        ClaimReadinessDto::Anchored => "anchored",
-        ClaimReadinessDto::Supported => "supported",
-        ClaimReadinessDto::Partial => "partial",
-        ClaimReadinessDto::Inferred => "inferred",
-        ClaimReadinessDto::NeedsSourceRead => "needs_source_read",
-        ClaimReadinessDto::ContradictedBySource => "contradicted_by_source",
-    }
-}
-
-fn drill_next_commands(
-    project_root: &std::path::Path,
-    anchors: &[DrillAnchorOutput],
-    bridges: &[DrillBridgeOutput],
-    stale_freshness: bool,
-) -> Vec<String> {
-    let project = quote_command_path(project_root);
-    let refresh = if stale_freshness {
-        "incremental"
-    } else {
-        "none"
-    };
-    let mut commands = anchors
-        .iter()
-        .take(5)
-        .flat_map(|anchor| {
-            let query = quote_command_value(&anchor.anchor);
-            let mut commands = vec![
-                format!(
-                    "codestory-cli search --project {project} --query {query} --refresh {refresh} --repo-text auto --why"
-                ),
-            ];
-            if let Some(hit) = anchor.chosen_anchor.as_ref() {
-                let id = quote_command_value(&hit.node_id);
-                commands.push(format!(
-                    "codestory-cli symbol --project {project} --id {id} --refresh {refresh}"
-                ));
-                commands.push(format!(
-                    "codestory-cli snippet --project {project} --id {id} --function-body --context 40 --refresh {refresh}"
-                ));
-            } else {
-                commands.push(format!(
-                    "codestory-cli snippet --project {project} --query {query} --function-body --context 40 --refresh {refresh}"
-                ));
-            }
-            commands
-        })
-        .collect::<Vec<_>>();
-
-    if stale_freshness {
-        commands.insert(
-            0,
-            format!("codestory-cli index --project {project} --refresh incremental"),
-        );
-    }
-
-    for bridge in bridges.iter().take(5) {
-        let evidence = &bridge.evidence;
-        if evidence.next_commands.is_empty() {
-            let bridge_query =
-                quote_command_value(&format!("{} {}", evidence.from_anchor, evidence.to_anchor));
-            commands.push(format!(
-                "codestory-cli search --project {project} --query {bridge_query} --refresh {refresh} --why"
-            ));
-            if let Some(from_node) = evidence.from_node.as_ref() {
-                let from_id = quote_command_value(&from_node.node_id);
-                commands.push(format!(
-                    "codestory-cli trail --project {project} --id {from_id} --refresh {refresh} --story --hide-speculative"
-                ));
-            } else {
-                let from_query = quote_command_value(&evidence.from_anchor);
-                commands.push(format!(
-                    "codestory-cli trail --project {project} --query {from_query} --refresh {refresh} --story --hide-speculative"
-                ));
-            }
-        } else {
-            for command in &evidence.next_commands {
-                commands.push(command.clone());
-            }
-        }
-    }
-
-    let mut seen = HashSet::new();
-    commands
-        .into_iter()
-        .filter(|command| seen.insert(command.clone()))
-        .collect()
+fn drill_bridge_evidence_is_generated_path(normalized_with_root: &str) -> bool {
+    normalized_with_root.contains("/target/")
+        || normalized_with_root.contains("/dist/")
+        || normalized_with_root.contains("/build/")
+        || normalized_with_root.contains("/node_modules/")
 }
 
 fn search_output_from_results(
@@ -9534,478 +5684,102 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SymbolWorkflowKind {
-    Impact,
-    TestMap,
-}
-
-impl SymbolWorkflowKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Impact => "impact",
-            Self::TestMap => "test_map",
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Impact => "Symbol Impact",
-            Self::TestMap => "Symbol Test Map",
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowNodeOutput {
-    node_id: NodeId,
-    display_name: String,
-    kind: String,
-    file_path: Option<String>,
-    depth: u32,
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowRouteOutput {
-    display_name: String,
-    method: String,
-    path: String,
-    file_path: Option<String>,
-    line: Option<u32>,
-    confidence: String,
-    reason: String,
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowTestOutput {
-    path: String,
-    reason: String,
-    confidence: String,
-    graph_depth: u32,
-    impacted_symbol_count: u32,
-}
-
-#[derive(serde::Serialize)]
-struct SymbolWorkflowCapsOutput {
-    caller_depth: u32,
-    caller_max_nodes: u32,
-    affected_depth: u32,
-    impacted_symbols_cap: u32,
-    impacted_routes_cap: u32,
-    affected_seed: String,
-}
-
 #[derive(serde::Serialize)]
 struct SymbolWorkflowOutput<'a> {
     workflow: &'static str,
-    project_root: String,
+    project_root: &'a str,
     resolution: QueryResolutionOutput,
     symbol: &'a codestory_contracts::api::SymbolContextDto,
-    direct_callers: Vec<SymbolWorkflowNodeOutput>,
-    transitive_callers: Vec<SymbolWorkflowNodeOutput>,
-    impacted_files: Vec<String>,
-    impacted_routes: Vec<SymbolWorkflowRouteOutput>,
-    likely_tests: Vec<SymbolWorkflowTestOutput>,
-    caps: SymbolWorkflowCapsOutput,
-    unknowns: Vec<String>,
-    next_commands: Vec<String>,
+    direct_callers: &'a [codestory_runtime::SymbolWorkflowNode],
+    transitive_callers: &'a [codestory_runtime::SymbolWorkflowNode],
+    impacted_files: &'a [String],
+    impacted_routes: &'a [codestory_runtime::SymbolWorkflowRoute],
+    likely_tests: &'a [codestory_runtime::SymbolWorkflowTest],
+    caps: &'a codestory_runtime::SymbolWorkflowCaps,
+    unknowns: &'a [String],
+    next_commands: &'a [String],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     affected: Option<&'a codestory_contracts::api::AffectedAnalysisDto>,
     trail: &'a TrailContextDto,
 }
 
-fn run_symbol_workflow(kind: SymbolWorkflowKind, cmd: SymbolWorkflowCommand) -> Result<()> {
-    ensure_dot_only_for_trail(cmd.format, kind.label())?;
+fn run_symbol_workflow(
+    mode: codestory_runtime::SymbolWorkflowMode,
+    cmd: SymbolWorkflowCommand,
+) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, mode.label())?;
     preflight_output_file(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
-    ensure_index_ready(&opened, kind.label())?;
+    ensure_index_ready(&opened, mode.label())?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let symbol = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-
-    let depth = cmd.depth.clamp(1, 8);
-    let max_nodes = cmd.max_nodes.clamp(1, 200);
-    let include_tests = cmd.include_tests || matches!(kind, SymbolWorkflowKind::TestMap);
-    let trail = runtime
-        .browser
-        .trail_context(TrailConfigDto {
-            root_id: target.selected.node_id.clone(),
-            mode: TrailMode::AllReferencing,
-            target_id: None,
-            depth,
-            direction: TrailDirection::Incoming,
-            caller_scope: if include_tests {
-                TrailCallerScope::IncludeTestsAndBenches
-            } else {
-                TrailCallerScope::ProductionOnly
-            },
-            edge_filter: Vec::new(),
-            show_utility_calls: false,
-            hide_speculative: true,
-            story: false,
-            node_filter: Vec::new(),
-            max_nodes,
-            layout_direction: codestory_contracts::api::LayoutDirection::Horizontal,
-        })
-        .map_err(map_api_error)?;
-
-    let affected_seed = target
-        .selected
-        .file_path
-        .clone()
-        .or_else(|| symbol.node.file_path.clone())
-        .map(|path| symbol_workflow_seed_path(&runtime.project_root, &path));
-    let affected = if let Some(path) = affected_seed.as_ref() {
-        Some(
-            runtime
-                .browser
-                .affected_analysis(AffectedAnalysisRequest {
-                    changed_paths: vec![path.clone()],
-                    change_records: vec![AffectedChangeRecordDto {
-                        path: path.clone(),
-                        kind: AffectedChangeKindDto::Unknown,
-                        status: "symbol_file".to_string(),
-                        previous_path: None,
-                    }],
-                    depth: Some(depth),
-                    filter: None,
-                })
-                .map_err(map_api_error)?,
-        )
-    } else {
-        None
+    let target = match cmd.target.selection()? {
+        args::TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
+        args::TargetSelection::Query { query, choose } => {
+            codestory_runtime::TargetSelection::Query { query, choose }
+        }
     };
-
-    let direct_callers = symbol_workflow_direct_callers(&trail);
-    let transitive_callers = symbol_workflow_transitive_callers(&trail, &direct_callers);
-    let impacted_files = symbol_workflow_impacted_files(affected.as_ref());
-    let impacted_routes = symbol_workflow_routes(affected.as_ref());
-    let likely_tests = symbol_workflow_tests(affected.as_ref());
-    let unknowns = symbol_workflow_unknowns(
-        affected.as_ref(),
-        &trail,
-        &direct_callers,
-        &transitive_callers,
-        &likely_tests,
-        affected_seed.as_deref(),
-        max_nodes,
-    );
-    let next_commands = symbol_workflow_next_commands(
+    let response = match runtime
+        .browser
+        .symbol_workflow(codestory_runtime::SymbolWorkflowRequest {
+            mode,
+            target,
+            file_filter,
+            depth: cmd.depth,
+            max_nodes: cmd.max_nodes,
+            include_tests: cmd.include_tests,
+        }) {
+        Ok(codestory_runtime::SymbolWorkflowOutcome::Complete(response)) => *response,
+        Ok(codestory_runtime::SymbolWorkflowOutcome::Ambiguous(ambiguous)) => {
+            return structured_ambiguous_target_failure(
+                &runtime,
+                AmbiguousTargetError {
+                    query: ambiguous.query,
+                    file_filter: ambiguous.file_filter,
+                    alternatives: ambiguous.alternatives,
+                    message: ambiguous.message,
+                },
+                cmd.format,
+                cmd.output_file.as_deref(),
+            );
+        }
+        Ok(codestory_runtime::SymbolWorkflowOutcome::Rejected(message)) => bail!(message),
+        Err(error) => return Err(map_api_error(error)),
+    };
+    let resolution_target =
+        runtime::ResolvedTarget::from_runtime(response.resolution.target.clone());
+    let resolution = build_query_resolution_output_from_occurrences(
         &runtime.project_root,
-        &target.selected.node_id,
-        affected_seed.as_deref(),
-        depth,
-        max_nodes,
-        kind,
-        include_tests,
+        &resolution_target,
+        &response.resolution.occurrences,
     );
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
-    let caps = SymbolWorkflowCapsOutput {
-        caller_depth: depth,
-        caller_max_nodes: max_nodes,
-        affected_depth: depth,
-        impacted_symbols_cap: 200,
-        impacted_routes_cap: 100,
-        affected_seed: affected_seed
-            .clone()
-            .unwrap_or_else(|| "none: selected symbol has no indexed file path".to_string()),
-    };
     let output = SymbolWorkflowOutput {
-        workflow: kind.label(),
-        project_root: runtime.project_root.to_string_lossy().to_string(),
+        workflow: response.workflow,
+        project_root: &response.project_root,
         resolution,
-        symbol: &symbol,
-        direct_callers,
-        transitive_callers,
-        impacted_files,
-        impacted_routes,
-        likely_tests,
-        caps,
-        unknowns,
-        next_commands,
-        affected: affected.as_ref(),
-        trail: &trail,
+        symbol: &response.symbol,
+        direct_callers: &response.direct_callers,
+        transitive_callers: &response.transitive_callers,
+        impacted_files: &response.impacted_files,
+        impacted_routes: &response.impacted_routes,
+        likely_tests: &response.likely_tests,
+        caps: &response.caps,
+        unknowns: &response.unknowns,
+        next_commands: &response.next_commands,
+        affected: response.affected.as_ref(),
+        trail: &response.trail,
     };
-    let markdown = render_symbol_workflow_markdown(kind, &output);
+    let markdown = render_symbol_workflow_markdown(mode, &output);
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
-fn symbol_workflow_direct_callers(trail: &TrailContextDto) -> Vec<SymbolWorkflowNodeOutput> {
-    let nodes = trail
-        .trail
-        .nodes
-        .iter()
-        .map(|node| (node.id.0.clone(), node))
-        .collect::<HashMap<_, _>>();
-    let mut seen = HashSet::new();
-    let mut callers = trail
-        .trail
-        .edges
-        .iter()
-        .filter(|edge| {
-            edge.kind == codestory_contracts::api::EdgeKind::CALL
-                && edge.target == trail.focus.id
-                && edge.source != trail.focus.id
-        })
-        .filter_map(|edge| {
-            if !seen.insert(edge.source.0.clone()) {
-                return None;
-            }
-            nodes
-                .get(&edge.source.0)
-                .map(|node| symbol_workflow_node_output(node))
-        })
-        .collect::<Vec<_>>();
-    callers.sort_by(|left, right| {
-        left.file_path
-            .cmp(&right.file_path)
-            .then(left.display_name.cmp(&right.display_name))
-    });
-    callers
-}
-
-fn symbol_workflow_transitive_callers(
-    trail: &TrailContextDto,
-    direct_callers: &[SymbolWorkflowNodeOutput],
-) -> Vec<SymbolWorkflowNodeOutput> {
-    let direct_ids = direct_callers
-        .iter()
-        .map(|caller| caller.node_id.0.clone())
-        .collect::<HashSet<_>>();
-    let mut callers = trail
-        .trail
-        .nodes
-        .iter()
-        .filter(|node| {
-            node.id != trail.focus.id
-                && node.depth > 1
-                && !direct_ids.contains(&node.id.0)
-                && symbol_workflow_has_call_path_to_focus(trail, &node.id)
-        })
-        .map(symbol_workflow_node_output)
-        .collect::<Vec<_>>();
-    callers.sort_by(|left, right| {
-        left.depth
-            .cmp(&right.depth)
-            .then(left.file_path.cmp(&right.file_path))
-            .then(left.display_name.cmp(&right.display_name))
-    });
-    callers.truncate(50);
-    callers
-}
-
-fn symbol_workflow_has_call_path_to_focus(trail: &TrailContextDto, start: &NodeId) -> bool {
-    let mut seen = HashSet::new();
-    let mut stack = vec![start.clone()];
-    while let Some(current) = stack.pop() {
-        if !seen.insert(current.0.clone()) {
-            continue;
-        }
-        for edge in trail.trail.edges.iter().filter(|edge| {
-            edge.kind == codestory_contracts::api::EdgeKind::CALL && edge.source == current
-        }) {
-            if edge.target == trail.focus.id {
-                return true;
-            }
-            stack.push(edge.target.clone());
-        }
-    }
-    false
-}
-
-fn symbol_workflow_node_output(
-    node: &codestory_contracts::api::GraphNodeDto,
-) -> SymbolWorkflowNodeOutput {
-    SymbolWorkflowNodeOutput {
-        node_id: node.id.clone(),
-        display_name: node
-            .qualified_name
-            .clone()
-            .unwrap_or_else(|| node.label.clone()),
-        kind: format!("{:?}", node.kind).to_ascii_lowercase(),
-        file_path: node.file_path.clone(),
-        depth: node.depth,
-    }
-}
-
-fn symbol_workflow_seed_path(project_root: &Path, path: &str) -> String {
-    let clean_path = path
-        .strip_prefix(r"\\?\")
-        .unwrap_or(path)
-        .replace('\\', "/");
-    let root_lossy = project_root.to_string_lossy();
-    let root = root_lossy
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&root_lossy)
-        .replace('\\', "/");
-    clean_path
-        .strip_prefix(&format!("{root}/"))
-        .unwrap_or(&clean_path)
-        .to_string()
-}
-
-fn symbol_workflow_impacted_files(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-) -> Vec<String> {
-    let mut files = BTreeSet::new();
-    if let Some(affected) = affected {
-        files.extend(affected.matched_files.iter().map(|file| file.path.clone()));
-        files.extend(
-            affected
-                .impacted_symbols
-                .iter()
-                .filter_map(|symbol| symbol.file_path.clone()),
-        );
-        files.extend(
-            affected
-                .impacted_routes
-                .iter()
-                .filter_map(|route| route.file_path.clone()),
-        );
-        files.extend(
-            affected
-                .impacted_routes
-                .iter()
-                .filter_map(|route| route.route.source_file.clone()),
-        );
-        files.extend(affected.impacted_tests.iter().map(|test| test.path.clone()));
-    }
-    files.into_iter().collect()
-}
-
-fn symbol_workflow_routes(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-) -> Vec<SymbolWorkflowRouteOutput> {
-    affected
-        .into_iter()
-        .flat_map(|affected| affected.impacted_routes.iter())
-        .map(|route| SymbolWorkflowRouteOutput {
-            display_name: route.display_name.clone(),
-            method: route.route.method.clone(),
-            path: route.route.path.clone(),
-            file_path: route
-                .file_path
-                .clone()
-                .or_else(|| route.route.source_file.clone()),
-            line: route.line.or(route.route.line),
-            confidence: route.confidence.clone(),
-            reason: route.reason.clone(),
-        })
-        .collect()
-}
-
-fn symbol_workflow_tests(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-) -> Vec<SymbolWorkflowTestOutput> {
-    affected
-        .into_iter()
-        .flat_map(|affected| affected.impacted_tests.iter())
-        .map(|test| SymbolWorkflowTestOutput {
-            path: test.path.clone(),
-            reason: test.reason.clone(),
-            confidence: test.confidence.clone(),
-            graph_depth: test.graph_depth,
-            impacted_symbol_count: test.impacted_symbol_count,
-        })
-        .collect()
-}
-
-fn symbol_workflow_unknowns(
-    affected: Option<&codestory_contracts::api::AffectedAnalysisDto>,
-    trail: &TrailContextDto,
-    direct_callers: &[SymbolWorkflowNodeOutput],
-    transitive_callers: &[SymbolWorkflowNodeOutput],
-    likely_tests: &[SymbolWorkflowTestOutput],
-    affected_seed: Option<&str>,
-    max_nodes: u32,
-) -> Vec<String> {
-    let mut unknowns = Vec::new();
-    unknowns.push(
-        "affected files/routes/tests are seeded from the selected symbol's file, not a symbol-level change slice"
-            .to_string(),
-    );
-    if affected_seed.is_none() {
-        unknowns.push(
-            "selected symbol has no indexed file path; affected analysis was skipped".to_string(),
-        );
-    }
-    if direct_callers.is_empty() {
-        unknowns.push("no direct callers found in the incoming trail".to_string());
-    }
-    if transitive_callers.is_empty() {
-        unknowns.push("no transitive callers found inside the caller depth cap".to_string());
-    }
-    if likely_tests.is_empty() {
-        unknowns.push("no test-like file reached by the affected graph walk".to_string());
-    }
-    if trail.trail.truncated {
-        unknowns.push(format!(
-            "caller trail truncated at max_nodes={max_nodes}; rerun with a narrower symbol or higher cap"
-        ));
-    }
-    if let Some(affected) = affected {
-        unknowns.extend(affected.blind_spots.iter().cloned());
-    }
-    unknowns.sort();
-    unknowns.dedup();
-    unknowns
-}
-
-fn symbol_workflow_next_commands(
-    project_root: &Path,
-    node_id: &NodeId,
-    affected_seed: Option<&str>,
-    depth: u32,
-    max_nodes: u32,
-    kind: SymbolWorkflowKind,
-    include_tests: bool,
-) -> Vec<String> {
-    let project = quote_command_path(project_root);
-    let id = quote_command_value(&node_id.0);
-    let caller_scope_flag = if include_tests {
-        " --include-tests"
-    } else {
-        ""
-    };
-    let mut commands = vec![
-        format!("codestory-cli symbol --project {project} --id {id}"),
-        format!(
-            "codestory-cli callers --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}{caller_scope_flag}"
-        ),
-    ];
-    if let Some(path) = affected_seed {
-        commands.push(format!(
-            "codestory-cli affected --project {project} {} --depth {depth}",
-            quote_command_value(path)
-        ));
-    }
-    let paired = match kind {
-        SymbolWorkflowKind::Impact => "test-map",
-        SymbolWorkflowKind::TestMap => "impact",
-    };
-    commands.push(format!(
-        "codestory-cli {paired} --project {project} --id {id} --depth {depth} --max-nodes {max_nodes}{caller_scope_flag}"
-    ));
-    commands
-}
-
 fn render_symbol_workflow_markdown(
-    kind: SymbolWorkflowKind,
+    mode: codestory_runtime::SymbolWorkflowMode,
     output: &SymbolWorkflowOutput<'_>,
 ) -> String {
     let mut markdown = String::new();
-    let _ = writeln!(markdown, "# {}", kind.title());
+    let _ = writeln!(markdown, "# {}", mode.title());
     let _ = writeln!(
         markdown,
         "symbol: {} [{}]",
@@ -10026,19 +5800,19 @@ fn render_symbol_workflow_markdown(
         output.caps.caller_depth, output.caps.caller_max_nodes, output.caps.affected_depth
     );
 
-    append_symbol_workflow_nodes(&mut markdown, "direct_callers", &output.direct_callers);
+    append_symbol_workflow_nodes(&mut markdown, "direct_callers", output.direct_callers);
     append_symbol_workflow_nodes(
         &mut markdown,
         "transitive_callers",
-        &output.transitive_callers,
+        output.transitive_callers,
     );
-    append_symbol_workflow_strings(&mut markdown, "impacted_files", &output.impacted_files);
+    append_symbol_workflow_strings(&mut markdown, "impacted_files", output.impacted_files);
 
     let _ = writeln!(markdown, "impacted_routes:");
     if output.impacted_routes.is_empty() {
         let _ = writeln!(markdown, "- none");
     } else {
-        for route in &output.impacted_routes {
+        for route in output.impacted_routes {
             let location = route
                 .file_path
                 .as_deref()
@@ -10062,7 +5836,7 @@ fn render_symbol_workflow_markdown(
     if output.likely_tests.is_empty() {
         let _ = writeln!(markdown, "- none");
     } else {
-        for test in &output.likely_tests {
+        for test in output.likely_tests {
             let _ = writeln!(
                 markdown,
                 "- {} confidence={} graph_depth={} impacted_symbols={}",
@@ -10072,15 +5846,15 @@ fn render_symbol_workflow_markdown(
         }
     }
 
-    append_symbol_workflow_strings(&mut markdown, "unknowns", &output.unknowns);
-    append_symbol_workflow_strings(&mut markdown, "next_commands", &output.next_commands);
+    append_symbol_workflow_strings(&mut markdown, "unknowns", output.unknowns);
+    append_symbol_workflow_strings(&mut markdown, "next_commands", output.next_commands);
     markdown
 }
 
 fn append_symbol_workflow_nodes(
     markdown: &mut String,
     label: &str,
-    nodes: &[SymbolWorkflowNodeOutput],
+    nodes: &[codestory_runtime::SymbolWorkflowNode],
 ) {
     let _ = writeln!(markdown, "{label}:");
     if nodes.is_empty() {
@@ -10391,7 +6165,8 @@ fn run_affected(cmd: AffectedCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "affected")?;
-    let change_records = affected_change_records(&cmd)?;
+    let change_records =
+        affected_change_records(&cmd).map_err(|error| affected_discovery_error(&cmd, error))?;
     let changed_paths = change_records
         .iter()
         .map(|record| record.path.clone())
@@ -10416,20 +6191,17 @@ fn affected_change_records(cmd: &AffectedCommand) -> Result<Vec<AffectedChangeRe
         .map(|path| affected_path_record(path, AffectedChangeKindDto::Unknown, "path"))
         .collect::<Vec<_>>();
     if cmd.stdin {
-        let mut input = String::new();
+        let mut input = Vec::new();
         std::io::stdin()
-            .read_to_string(&mut input)
+            .read_to_end(&mut input)
             .context("Failed to read changed paths from stdin")?;
+        let input = path_text_from_bytes(&input, "stdin")?;
         match cmd.stdin_format {
-            AffectedStdinFormat::Path => records.extend(
-                input
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(|path| {
-                        affected_path_record(path, AffectedChangeKindDto::Unknown, "stdin")
-                    }),
-            ),
+            AffectedStdinFormat::Path => {
+                records.extend(input.lines().filter(|line| !line.is_empty()).map(|path| {
+                    affected_path_record(path, AffectedChangeKindDto::Unknown, "stdin")
+                }))
+            }
             AffectedStdinFormat::NameStatus => {
                 records.extend(parse_git_name_status_records(&input)?);
             }
@@ -10446,17 +6218,16 @@ fn affected_change_records(cmd: &AffectedCommand) -> Result<Vec<AffectedChangeRe
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut records = match cmd.changes {
-        AffectedChangeSource::Untracked => stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|path| affected_path_record(path, AffectedChangeKindDto::Untracked, "??"))
-            .collect::<Vec<_>>(),
+        AffectedChangeSource::Untracked => parse_git_nul_path_records(
+            &output.stdout,
+            AffectedChangeKindDto::Untracked,
+            "??",
+            "git_ls_files",
+        )?,
         AffectedChangeSource::Head
         | AffectedChangeSource::Staged
-        | AffectedChangeSource::Unstaged => parse_git_name_status_records(&stdout)?,
+        | AffectedChangeSource::Unstaged => parse_git_name_status_records_z(&output.stdout)?,
     };
     dedupe_affected_change_records(&mut records);
     Ok(records)
@@ -10467,17 +6238,26 @@ fn affected_git_change_output(cmd: &AffectedCommand) -> Result<std::process::Out
     command.arg("-C").arg(&cmd.project.project);
     match cmd.changes {
         AffectedChangeSource::Head => {
-            command.arg("diff").arg("--name-status").arg("HEAD");
+            command
+                .arg("diff")
+                .arg("--name-status")
+                .arg("-z")
+                .arg("HEAD");
         }
         AffectedChangeSource::Staged => {
-            command.arg("diff").arg("--cached").arg("--name-status");
+            command
+                .arg("diff")
+                .arg("--cached")
+                .arg("--name-status")
+                .arg("-z");
         }
         AffectedChangeSource::Unstaged => {
-            command.arg("diff").arg("--name-status");
+            command.arg("diff").arg("--name-status").arg("-z");
         }
         AffectedChangeSource::Untracked => {
             command
                 .arg("ls-files")
+                .arg("-z")
                 .arg("--others")
                 .arg("--exclude-standard");
         }
@@ -10487,10 +6267,119 @@ fn affected_git_change_output(cmd: &AffectedCommand) -> Result<std::process::Out
         .context("Failed to run git change discovery")
 }
 
+#[derive(Debug)]
+struct UnsupportedNonUtf8Path {
+    source: &'static str,
+}
+
+impl std::fmt::Display for UnsupportedNonUtf8Path {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported_non_utf8_path: {} returned a path that cannot be represented in UTF-8",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedNonUtf8Path {}
+
+fn affected_discovery_error(cmd: &AffectedCommand, error: anyhow::Error) -> anyhow::Error {
+    let Some(unsupported) = error.downcast_ref::<UnsupportedNonUtf8Path>() else {
+        return error;
+    };
+    StructuredCommandFailure {
+        envelope: unsupported_non_utf8_path_envelope(unsupported),
+        output_file: cmd.output_file.clone(),
+        markdown: None,
+    }
+    .into()
+}
+
+fn unsupported_non_utf8_path_envelope(error: &UnsupportedNonUtf8Path) -> CommandFailureEnvelope {
+    command_failure_envelope(
+        "unsupported_non_utf8_path",
+        "git_change_discovery",
+        error.to_string(),
+        serde_json::json!({"source": error.source}),
+    )
+}
+
+fn nul_delimited_git_fields(input: &[u8]) -> Result<Vec<&[u8]>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if input.last() != Some(&0) {
+        bail!("git NUL-delimited path output is missing its terminator");
+    }
+    let fields = input[..input.len() - 1]
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>();
+    if fields.iter().any(|field| field.is_empty()) {
+        bail!("git NUL-delimited path output contains an empty field");
+    }
+    Ok(fields)
+}
+
+fn path_text_from_bytes(bytes: &[u8], source: &'static str) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| anyhow::Error::new(UnsupportedNonUtf8Path { source }))
+}
+
+fn parse_git_nul_path_records(
+    input: &[u8],
+    kind: AffectedChangeKindDto,
+    status: &str,
+    source: &'static str,
+) -> Result<Vec<AffectedChangeRecordDto>> {
+    nul_delimited_git_fields(input)?
+        .into_iter()
+        .map(|field| {
+            path_text_from_bytes(field, source)
+                .map(|path| affected_path_record(&path, kind.clone(), status))
+        })
+        .collect()
+}
+
+fn parse_git_name_status_records_z(input: &[u8]) -> Result<Vec<AffectedChangeRecordDto>> {
+    let fields = nul_delimited_git_fields(input)?;
+    let mut records = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let status = std::str::from_utf8(fields[index])
+            .context("git name-status status is not valid UTF-8")?;
+        index += 1;
+        let kind = affected_change_kind_from_status(status);
+        let previous_path = if matches!(
+            kind,
+            AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied
+        ) {
+            let field = fields
+                .get(index)
+                .context("git name-status rename/copy record is missing the previous path")?;
+            index += 1;
+            Some(path_text_from_bytes(field, "git_name_status")?)
+        } else {
+            None
+        };
+        let field = fields
+            .get(index)
+            .context("git name-status record is missing the path")?;
+        index += 1;
+        records.push(AffectedChangeRecordDto {
+            path: path_text_from_bytes(field, "git_name_status")?,
+            kind,
+            status: status.to_string(),
+            previous_path,
+        });
+    }
+    Ok(records)
+}
+
 fn parse_git_name_status_records(input: &str) -> Result<Vec<AffectedChangeRecordDto>> {
     input
         .lines()
-        .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(parse_git_name_status_record)
         .collect()
@@ -10505,7 +6394,7 @@ fn parse_git_name_status_record(line: &str) -> Result<AffectedChangeRecordDto> {
             "path",
         ));
     }
-    let status = parts[0].trim();
+    let status = parts[0];
     let kind = affected_change_kind_from_status(status);
     let (previous_path, path) = if matches!(
         kind,
@@ -10513,19 +6402,19 @@ fn parse_git_name_status_record(line: &str) -> Result<AffectedChangeRecordDto> {
     ) {
         let previous = parts
             .get(1)
-            .map(|path| path.trim())
+            .copied()
             .filter(|path| !path.is_empty())
             .context("git name-status rename/copy row is missing the previous path")?;
         let current = parts
             .get(2)
-            .map(|path| path.trim())
+            .copied()
             .filter(|path| !path.is_empty())
             .context("git name-status rename/copy row is missing the current path")?;
         (Some(previous.to_string()), current)
     } else {
         let path = parts
             .get(1)
-            .map(|path| path.trim())
+            .copied()
             .filter(|path| !path.is_empty())
             .context("git name-status row is missing the path")?;
         (None, path)
@@ -10544,7 +6433,7 @@ fn affected_path_record(
     status: &str,
 ) -> AffectedChangeRecordDto {
     AffectedChangeRecordDto {
-        path: path.trim().to_string(),
+        path: path.to_string(),
         kind,
         status: status.to_string(),
         previous_path: None,
@@ -10564,7 +6453,7 @@ fn affected_change_kind_from_status(status: &str) -> AffectedChangeKindDto {
 }
 
 fn dedupe_affected_change_records(records: &mut Vec<AffectedChangeRecordDto>) {
-    records.retain(|record| !record.path.trim().is_empty());
+    records.retain(|record| !record.path.is_empty());
     records.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -10922,7 +6811,7 @@ async fn run_serve(cmd: ServeCommand) -> Result<()> {
     if cmd.multi_project {
         return stdio_transport::run_stdio_server(None, cmd.refresh).await;
     }
-    let runtime = new_agent_surface_runtime(&cmd.project)?;
+    let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
         return stdio_transport::run_stdio_server(Some(runtime), cmd.refresh).await;
@@ -11014,19 +6903,32 @@ fn resolve_target_or_emit_ambiguity(
         Ok(target) => Ok(target),
         Err(error) => {
             if let Some(ambiguous) = error.downcast_ref::<AmbiguousTargetError>() {
-                let output = build_ambiguous_target_error_output(&runtime.project_root, ambiguous);
-                let markdown = (format != args::OutputFormat::Json)
-                    .then(|| render_cli_error_markdown(&output));
-                return Err(StructuredCommandFailure {
-                    envelope: ambiguous_command_failure(&output, &runtime.project_root),
-                    output_file: output_file.map(Path::to_path_buf),
-                    markdown,
-                }
-                .into());
+                return structured_ambiguous_target_failure(
+                    runtime,
+                    ambiguous.clone(),
+                    format,
+                    output_file,
+                );
             }
             Err(error)
         }
     }
+}
+
+fn structured_ambiguous_target_failure<T>(
+    runtime: &RuntimeContext,
+    ambiguous: AmbiguousTargetError,
+    format: args::OutputFormat,
+    output_file: Option<&Path>,
+) -> Result<T> {
+    let output = build_ambiguous_target_error_output(&runtime.project_root, &ambiguous);
+    let markdown = (format != args::OutputFormat::Json).then(|| render_cli_error_markdown(&output));
+    Err(StructuredCommandFailure {
+        envelope: ambiguous_command_failure(&output, &runtime.project_root),
+        output_file: output_file.map(Path::to_path_buf),
+        markdown,
+    }
+    .into())
 }
 
 fn ambiguous_command_failure(
@@ -11219,21 +7121,19 @@ fn build_doctor_output(
     let sidecar_retrieval = doctor_sidecar_status(runtime);
     let readiness_sidecar =
         selected_agent_readiness_sidecar_status(runtime, None, &sidecar_retrieval);
+    let readiness_broker = observe_readiness_broker(
+        runtime,
+        &readiness_sidecar,
+        readiness_sidecar.run_id.as_deref(),
+    );
+    let readiness_sidecar =
+        agent_sidecar_with_gpu_proof(&readiness_sidecar, readiness_broker.gpu_proof.as_ref());
     let readiness = build_summary_readiness(
         &project,
         &summary.stats,
         summary.freshness.as_ref(),
         &readiness_sidecar,
     );
-    let readiness_broker =
-        readiness_broker::observe_broker_snapshot(readiness_broker::BrokerSnapshotInput {
-            project_root: runtime.project_root.clone(),
-            cache_root: runtime.cache_root.clone(),
-            agent_run_id: readiness_sidecar.run_id.clone(),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: Some(broker_gpu_proof_input_from_sidecar(&readiness_sidecar)),
-            reconciliation: None,
-        });
     let readiness_lanes = build_readiness_lanes_for_runtime(
         runtime,
         &readiness,
@@ -11285,12 +7185,6 @@ fn build_doctor_output(
             checks.push(semantic_contract_check(retrieval));
         }
     }
-    let managed_status = managed_embeddings::inspect_status(&runtime.managed_embeddings_root);
-    checks.push(doctor_check(
-        "managed_embeddings",
-        managed_doctor_status(&managed_status.state),
-        managed_status.message,
-    ));
     if let Some(freshness) = summary.freshness.as_ref() {
         checks.push(index_freshness_check(freshness));
     }
@@ -11300,11 +7194,6 @@ fn build_doctor_output(
         "CODESTORY_EMBED_MODEL_ID",
         "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_RUNTIME_MODE",
-        "CODESTORY_EMBED_ONNX_MODEL",
-        "CODESTORY_EMBED_ONNX_TOKENIZER",
-        "CODESTORY_EMBED_ONNX_PROVIDER",
-        "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
-        "CODESTORY_EMBED_ONNX_THREADS",
         "CODESTORY_EMBED_LLAMACPP_URL",
         "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT",
         "CODESTORY_STORED_VECTOR_ENCODING",
@@ -11382,7 +7271,7 @@ fn readiness_sidecar_input(
 }
 
 fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput {
-    let sidecar = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    let sidecar = runtime.sidecar.clone();
     match codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
@@ -11390,7 +7279,7 @@ fn doctor_sidecar_status(runtime: &RuntimeContext) -> DoctorSidecarStatusOutput 
     ) {
         Ok(report) => {
             let status = doctor_sidecar_status_from_report(report, Some(&sidecar));
-            let handoff_failure = (status.retrieval_mode == "full")
+            let handoff_failure = doctor_sidecar_status_is_live_ready(&status)
                 .then(|| doctor_sidecar_profile_handoff_failure(runtime))
                 .flatten();
             apply_sidecar_profile_handoff(status, handoff_failure)
@@ -11411,8 +7300,8 @@ fn ready_sidecar_status(
     if matches!(goal, Some(args::ReadyGoal::Agent))
         && let Some(run_id) = run_id
     {
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-            &runtime.project_root,
+        let sidecar = runtime.sidecar.with_profile_and_run_id(
+            Some(&runtime.project_root),
             codestory_retrieval::SidecarProfile::Agent,
             Some(run_id),
         );
@@ -11525,7 +7414,11 @@ pub(crate) fn selected_agent_readiness_sidecar_status(
     run_id: Option<&str>,
     fallback: &DoctorSidecarStatusOutput,
 ) -> DoctorSidecarStatusOutput {
-    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, run_id);
+    let agent_runtime = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
+        codestory_retrieval::SidecarProfile::Agent,
+        run_id,
+    );
     let agent_status = doctor_sidecar_status_for_runtime(runtime, agent_runtime);
     lane_scoped_agent_readiness_sidecar(fallback, agent_status)
 }
@@ -11534,7 +7427,7 @@ fn lane_scoped_agent_readiness_sidecar(
     fallback: &DoctorSidecarStatusOutput,
     agent_status: DoctorSidecarStatusOutput,
 ) -> DoctorSidecarStatusOutput {
-    if agent_status.retrieval_mode == "full" {
+    if doctor_sidecar_status_is_live_ready(&agent_status) {
         return agent_status;
     }
     if fallback.profile.as_deref() == Some("agent")
@@ -11557,15 +7450,24 @@ pub(crate) fn build_readiness_lanes_for_runtime(
 ) -> BTreeMap<String, ReadinessLaneOutput> {
     let project = display::clean_path_string(&runtime.project_root.to_string_lossy());
     let project_arg = display::quote_command_argument_value(&project);
-    let local_runtime = codestory_retrieval::sidecar_runtime_for_project(
-        &runtime.project_root,
+    let local_runtime = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
         codestory_retrieval::SidecarProfile::Local,
+        None,
     );
-    let agent_runtime = agent_readiness_sidecar_runtime(&runtime.project_root, agent_run_id);
+    let agent_runtime = runtime.sidecar.with_profile_and_run_id(
+        Some(&runtime.project_root),
+        codestory_retrieval::SidecarProfile::Agent,
+        agent_run_id,
+    );
     let local_status = doctor_sidecar_status_for_runtime(runtime, local_runtime);
     let agent_status = selected_agent_status
         .cloned()
-        .unwrap_or_else(|| doctor_sidecar_status_for_runtime(runtime, agent_runtime));
+        .unwrap_or_else(|| doctor_sidecar_status_for_runtime(runtime, agent_runtime.clone()));
+    let agent_status = agent_sidecar_with_gpu_proof(
+        &agent_status,
+        broker.and_then(|snapshot| snapshot.gpu_proof.as_ref()),
+    );
     let agent_verdict = readiness
         .iter()
         .find(|verdict| verdict.goal == ReadinessGoalDto::AgentPacketSearch);
@@ -11583,15 +7485,14 @@ pub(crate) fn build_readiness_lanes_for_runtime(
             &project_arg,
         ),
     );
+    apply_ready_repair_status_overlay(
+        &mut lanes,
+        &runtime.project_root,
+        &agent_runtime,
+        &project_arg,
+    );
     if let Some(broker) = broker {
         apply_broker_ready_repair_overlay(&mut lanes, broker, &project_arg);
-    } else {
-        apply_ready_repair_status_overlay(
-            &mut lanes,
-            &runtime.project_root,
-            agent_run_id,
-            &project_arg,
-        );
     }
     lanes
 }
@@ -11622,11 +7523,12 @@ fn apply_broker_ready_repair_overlay(
     ));
 }
 
+#[cfg(test)]
 fn agent_readiness_sidecar_runtime(
     project_root: &Path,
     run_id: Option<&str>,
 ) -> codestory_retrieval::SidecarRuntimeConfig {
-    codestory_retrieval::sidecar_runtime_for_project_with_run_id(
+    crate::sidecar_runtime::for_project_with_run_id(
         project_root,
         codestory_retrieval::SidecarProfile::Agent,
         run_id,
@@ -11660,10 +7562,11 @@ fn readiness_lane_output(
 fn apply_ready_repair_status_overlay(
     lanes: &mut BTreeMap<String, ReadinessLaneOutput>,
     project_root: &Path,
-    agent_run_id: Option<&str>,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
     project_arg: &str,
 ) {
-    let Some(status) = ready_repair_status::active_ready_repair_status(project_root, agent_run_id)
+    let Some(status) =
+        ready_repair_status::active_ready_repair_status_for_sidecar(project_root, sidecar)
     else {
         return;
     };
@@ -11687,11 +7590,20 @@ fn readiness_lane_status(
     sidecar: &DoctorSidecarStatusOutput,
     verdict: Option<&codestory_contracts::api::ReadinessVerdictDto>,
 ) -> ReadinessStatusDto {
-    let sidecar_status = if sidecar.retrieval_mode == "full" {
+    let sidecar_status = if doctor_sidecar_status_is_live_ready(sidecar) {
         ReadinessStatusDto::Ready
     } else {
         ReadinessStatusDto::RepairRetrieval
     };
+    if sidecar.profile.as_deref() == Some("agent")
+        && sidecar_status == ReadinessStatusDto::RepairRetrieval
+        && sidecar
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("embedding_runtime_unavailable:"))
+    {
+        return ReadinessStatusDto::RepairRetrieval;
+    }
     match verdict.map(|verdict| verdict.status) {
         Some(ReadinessStatusDto::Blocked) => ReadinessStatusDto::Blocked,
         Some(status @ (ReadinessStatusDto::RepairSetup | ReadinessStatusDto::RepairIndex)) => {
@@ -11718,10 +7630,10 @@ fn lane_next_command(
         return Some(command.clone());
     }
     match lane {
-        "agent_packet_search" if sidecar.retrieval_mode != "full" => Some(
+        "agent_packet_search" if !doctor_sidecar_status_is_live_ready(sidecar) => Some(
             agent_ready_repair_command(project_arg, sidecar.run_id.as_deref()),
         ),
-        "local_default" if sidecar.retrieval_mode != "full" => Some(format!(
+        "local_default" if !doctor_sidecar_status_is_live_ready(sidecar) => Some(format!(
             "codestory-cli retrieval index --project {project_arg} --profile local --refresh full --format json"
         )),
         _ => Some(retrieval_status_command(sidecar, project_arg)),
@@ -11766,27 +7678,27 @@ fn apply_sidecar_profile_handoff(
     mut status: DoctorSidecarStatusOutput,
     handoff_failure: Option<String>,
 ) -> DoctorSidecarStatusOutput {
-    if status.retrieval_mode == "full"
-        && let Some(reason) = handoff_failure
-    {
-        status.retrieval_mode = "unavailable".to_string();
+    if let Some(reason) = handoff_failure {
         status.degraded_reason = Some(reason);
     }
     status
 }
 
 fn doctor_sidecar_profile_handoff_failure(runtime: &RuntimeContext) -> Option<String> {
-    let active = codestory_retrieval::sidecar_runtime_auto(&runtime.project_root);
+    let active = runtime.sidecar.clone();
     if active.profile == codestory_retrieval::SidecarProfile::Local {
         return None;
     }
-    let local = codestory_retrieval::strict_sidecar_status_for_profile(
+    let local = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
         Some(&runtime.storage_path),
-        codestory_retrieval::SidecarProfile::Local,
+        crate::sidecar_runtime::for_project(
+            &runtime.project_root,
+            codestory_retrieval::SidecarProfile::Local,
+        ),
     );
     match local {
-        Ok(report) if report.retrieval_mode == "full" => None,
+        Ok(report) if report.is_live_ready() => None,
         Ok(report) => Some(format!(
             "profile_handoff_mismatch: active profile={} namespace={} is full but local/default profile is mode={} reason={}",
             active.profile.as_str(),
@@ -11807,7 +7719,7 @@ fn doctor_env_check_message(name: &str, value: &str) -> String {
     if name.ends_with("_URL") || trimmed.contains("://") {
         return format!(
             "set to `{}`",
-            managed_embeddings::redact_url_for_display(trimmed)
+            embedding_config::redact_url_for_display(trimmed)
         );
     }
     format!("set to `{trimmed}`")
@@ -11842,7 +7754,7 @@ fn redact_url_token(token: &str) -> String {
     let (url, suffix) = url_and_suffix.split_at(suffix_start);
     format!(
         "{prefix}{}{suffix}",
-        managed_embeddings::redact_url_for_display(url)
+        embedding_config::redact_url_for_display(url)
     )
 }
 
@@ -12028,15 +7940,6 @@ fn semantic_contract_check(
     }
 }
 
-fn managed_doctor_status(state: &str) -> &'static str {
-    match state {
-        "managed_onnx_ready" | "external_llama_configured" | "disabled_by_config" => "ok",
-        "missing_managed_assets" => "info",
-        "external_llama_unreachable" | "managed_onnx_unusable" => "warn",
-        _ => "info",
-    }
-}
-
 fn compare_contract_field(
     gaps: &mut Vec<String>,
     label: &str,
@@ -12071,7 +7974,7 @@ fn doctor_check(
 }
 
 fn doctor_sidecar_check(sidecar: &DoctorSidecarStatusOutput) -> DoctorCheckOutput {
-    if sidecar.retrieval_mode == "full" {
+    if doctor_sidecar_status_is_live_ready(sidecar) {
         let device_note = if sidecar.embedding_cpu_allowed {
             format!(
                 " embedding device policy allows CPU-backed mode (observed_device={}).",
@@ -12508,6 +8411,14 @@ fn build_query_resolution_output_with_runtime(
         runtime,
         std::iter::once(&target.selected).chain(target.alternatives.iter()),
     );
+    build_query_resolution_output_from_occurrences(&runtime.project_root, target, &occurrences)
+}
+
+fn build_query_resolution_output_from_occurrences(
+    project_root: &Path,
+    target: &runtime::ResolvedTarget,
+    occurrences: &HashMap<NodeId, Vec<SourceOccurrenceDto>>,
+) -> QueryResolutionOutput {
     QueryResolutionOutput {
         selector: target.selector,
         requested: target.requested.clone(),
@@ -12516,11 +8427,11 @@ fn build_query_resolution_output_with_runtime(
             .as_deref()
             .map(crate::display::clean_path_string),
         resolved: build_search_hit_output(
-            &runtime.project_root,
+            project_root,
             &target.selected,
             Some(&target.requested),
             false,
-            occurrences_for_hit(&occurrences, &target.selected),
+            occurrences_for_hit(occurrences, &target.selected),
         ),
         alternatives: target
             .alternatives
@@ -12528,11 +8439,11 @@ fn build_query_resolution_output_with_runtime(
             .skip(1)
             .map(|hit| {
                 build_search_hit_output(
-                    &runtime.project_root,
+                    project_root,
                     hit,
                     Some(&target.requested),
                     false,
-                    occurrences_for_hit(&occurrences, hit),
+                    occurrences_for_hit(occurrences, hit),
                 )
             })
             .collect(),
@@ -13240,7 +9151,6 @@ mod tests {
     use super::*;
     use crate::args::RefreshMode;
     use crate::display::{clean_path_string, relative_path};
-    use crate::query_resolution::compare_resolution_hits;
     use crate::runtime::{cache_root_for_project, fnv1a_hex, resolve_refresh_request};
     use codestory_contracts::api::{
         AgentAnswerDto, AgentCitationDto, AgentRetrievalPolicyModeDto, AgentRetrievalPresetDto,
@@ -13431,8 +9341,8 @@ mod tests {
             embedding_accelerator_request_device: Some("Vulkan0".into()),
             embedding_cpu_allowed: false,
             embedding_launch: None,
-            zoekt: ready_repair_test_component(
-                "zoekt",
+            lexical: ready_repair_test_component(
+                "lexical",
                 codestory_retrieval::ComponentStatus::Unavailable,
                 "retrieval_manifest_missing",
             ),
@@ -13462,7 +9372,7 @@ mod tests {
     fn ready_repair_final_snapshot_preserves_embed_smoke_proof() {
         let final_status = ready_repair_test_report("full", None);
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
@@ -13474,7 +9384,7 @@ mod tests {
             embedding_accelerator_request_provider: Some("vulkan".into()),
             embedding_accelerator_request_device: Some("Vulkan0".into()),
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
@@ -13482,10 +9392,22 @@ mod tests {
             final_status,
             gpu_proof: broker_gpu_proof_input_from_infrastructure_with_smoke(
                 &infrastructure,
-                ReadyRepairEmbedSmoke {
-                    ok: Some(true),
-                    ms: Some(17),
-                },
+                Some(&codestory_retrieval::EmbeddingAcceleratorSmoke {
+                    elapsed_ms: 17,
+                    device: codestory_retrieval::EmbeddingDeviceReadiness {
+                        requested_policy: "accelerator_required",
+                        observed_state: "accelerated",
+                        observation_source: "native_log",
+                        detected_provider: Some("amd".into()),
+                        detected_gpu: Some("Vulkan0".into()),
+                        accelerator_requested: true,
+                        accelerator_request_provider: Some("vulkan".into()),
+                        accelerator_request_device: Some("Vulkan0".into()),
+                        cpu_allowed: false,
+                        full_retrieval_allowed: true,
+                        degraded_reason: None,
+                    },
+                }),
             ),
         };
 
@@ -13501,18 +9423,132 @@ mod tests {
     }
 
     #[test]
-    fn ready_repair_reuses_only_accelerated_cpu_disabled_sidecar() {
+    fn ready_repair_reuses_only_accelerated_sidecar_with_identity_bound_proof() {
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
+            project.path(),
+            codestory_retrieval::SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
         let full_accelerated = ready_repair_test_report("full", None);
-        assert!(ready_repair_existing_sidecar_is_reusable(&full_accelerated));
+        let mut proof_input = broker_gpu_proof_input_from_report(&full_accelerated);
+        proof_input.embed_smoke_ok = Some(true);
+        proof_input.embed_smoke_ms = Some(17);
+        let mut verified = readiness_broker::gpu_proof(proof_input);
+        verified.runtime_identity = Some(readiness_broker::BrokerGpuRuntimeIdentity {
+            workspace_id: sidecar
+                .project_identity
+                .as_ref()
+                .expect("project identity")
+                .workspace_id
+                .clone(),
+            profile: sidecar.profile.as_str().into(),
+            run_id: sidecar.run_id.clone(),
+            namespace: sidecar.namespace.clone(),
+            compose_project: sidecar.compose_project.clone(),
+            embed_url: codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port),
+            embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
+            embedding_endpoint_fingerprint_sha256: sidecar
+                .ownership()
+                .embedding_endpoint_fingerprint_sha256,
+            started_at_epoch_ms: 1,
+            embedding_launch: Some(codestory_retrieval::EmbeddingLaunchMetadata {
+                provider: "vulkan".into(),
+                launch_mode: codestory_retrieval::EmbeddingServerLaunchMode::NativeSpawned
+                    .as_str()
+                    .into(),
+                endpoint: "http://127.0.0.1:18080".into(),
+                pid: Some(1234),
+                spawned_at_epoch_ms: Some(1),
+                process_start_identity: None,
+                spawn_protocol: None,
+                launch_args: vec!["--port".into(), "18080".into()],
+                launch_fingerprint_sha256: Some("fingerprint".into()),
+                executable_source: Some("managed".into()),
+                executable_path: Some("C:/cache/llama-server.exe".into()),
+                model_path: Some("C:/cache/model.gguf".into()),
+                log_path: Some("C:/cache/llama-server-native.log".into()),
+                requested_device: Some("Vulkan0".into()),
+            }),
+        });
+        let surface_status = doctor_sidecar_status_from_report(
+            ready_repair_test_report("full", None),
+            Some(&sidecar),
+        );
+        assert!(!agent_surface_gpu_proof_is_valid(
+            &surface_status,
+            &sidecar,
+            None,
+        ));
+        assert!(agent_surface_gpu_proof_is_valid(
+            &surface_status,
+            &sidecar,
+            Some(&verified),
+        ));
+        assert!(ready_repair_existing_sidecar_is_reusable(
+            &full_accelerated,
+            Some(&verified),
+            &sidecar,
+        ));
+
+        let mut shared_endpoint_sidecar = sidecar.clone();
+        shared_endpoint_sidecar
+            .use_broker_verified_native_embedding_endpoint(8080)
+            .expect("retarget agent runtime to broker-verified endpoint");
+        let mut shared_endpoint_proof = verified.clone();
+        shared_endpoint_proof
+            .runtime_identity
+            .as_mut()
+            .expect("runtime identity")
+            .embed_url = shared_endpoint_sidecar.ownership().ports.embed_url.clone();
+        assert_ne!(shared_endpoint_sidecar.embed_http_port, 8080);
+        assert!(ready_repair_existing_sidecar_is_reusable(
+            &full_accelerated,
+            Some(&shared_endpoint_proof),
+            &shared_endpoint_sidecar,
+        ));
+        assert!(!ready_repair_existing_sidecar_is_reusable(
+            &full_accelerated,
+            None,
+            &sidecar,
+        ));
+
+        let mut unbound = verified.clone();
+        unbound.runtime_identity = None;
+        assert!(!ready_repair_existing_sidecar_is_reusable(
+            &full_accelerated,
+            Some(&unbound),
+            &sidecar,
+        ));
+        let mut mismatched = verified.clone();
+        mismatched
+            .runtime_identity
+            .as_mut()
+            .expect("runtime identity")
+            .namespace
+            .push_str("-other");
+        assert!(!ready_repair_existing_sidecar_is_reusable(
+            &full_accelerated,
+            Some(&mismatched),
+            &sidecar,
+        ));
 
         let mut cpu_full = ready_repair_test_report("full", None);
         cpu_full.embedding_device_state = "cpu".into();
         cpu_full.embedding_cpu_allowed = true;
-        assert!(!ready_repair_existing_sidecar_is_reusable(&cpu_full));
+        assert!(!ready_repair_existing_sidecar_is_reusable(
+            &cpu_full,
+            Some(&verified),
+            &sidecar,
+        ));
 
         let mut unknown_full = ready_repair_test_report("full", None);
         unknown_full.embedding_device_state = "unknown".into();
-        assert!(!ready_repair_existing_sidecar_is_reusable(&unknown_full));
+        assert!(!ready_repair_existing_sidecar_is_reusable(
+            &unknown_full,
+            Some(&verified),
+            &sidecar,
+        ));
     }
 
     #[test]
@@ -13547,7 +9583,7 @@ mod tests {
         assert!(message.contains("retrieval manifest was not persisted"));
         assert!(message.contains("embedding_device_state=accelerated"));
         assert!(message.contains("observation_source=native_log"));
-        assert!(message.contains("zoekt=Unavailable"));
+        assert!(message.contains("lexical=Unavailable"));
         assert!(message.contains("qdrant=Unavailable"));
         assert!(message.contains("scip=Unavailable"));
     }
@@ -13555,7 +9591,7 @@ mod tests {
     #[test]
     fn ready_repair_embed_liveness_blocks_before_semantic_smoke() {
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: false,
             embedding_device_policy: "accelerator_required".into(),
@@ -13567,7 +9603,7 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail:
                 "llama.cpp embeddings unavailable: http://127.0.0.1:55280/v1/embeddings: Connection Failed"
@@ -13593,7 +9629,7 @@ mod tests {
     #[test]
     fn ready_repair_blocks_unknown_embedding_device_before_indexing() {
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
@@ -13605,13 +9641,15 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
 
-        let error = ensure_ready_repair_embed_liveness(&infrastructure)
-            .expect_err("unknown device should stop ready repair before indexing");
+        let error = ensure_ready_repair_embed_liveness_with_probe(&infrastructure, || {
+            unreachable!("device policy must fail before probing")
+        })
+        .expect_err("unknown device should stop ready repair before indexing");
         let message = format!("{error:#}");
 
         assert!(message.contains("embedding device policy failed before long semantic indexing"));
@@ -13621,6 +9659,7 @@ mod tests {
 
     #[test]
     fn ready_repair_waits_for_native_log_before_liveness_failure() {
+        let _env_lock = crate::config::config_env_test_lock();
         let _env = EnvVarSnapshot::clear(&[
             "CODESTORY_EMBED_SERVER_LAUNCH",
             "CODESTORY_EMBED_ALLOW_CPU",
@@ -13636,10 +9675,9 @@ mod tests {
         let sidecar = codestory_retrieval::SidecarRuntimeConfig {
             project_identity: None,
             layout: codestory_retrieval::SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.path().join("zoekt"),
+                lexical_data_dir: root.path().join("lexical"),
                 qdrant_data_dir: root.path().join("qdrant"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
@@ -13651,12 +9689,13 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
+            ..crate::sidecar_runtime::local()
         };
         let state_dir = sidecar.layout.state_file.parent().expect("state parent");
         fs::create_dir_all(state_dir).expect("create state dir");
         let log_path = state_dir.join("llama-server-native.log");
         let stale = codestory_retrieval::InfrastructureHealth {
-            zoekt_reachable: true,
+            lexical_ready: true,
             qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
@@ -13668,7 +9707,7 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            zoekt_detail: "http 200".into(),
+            lexical_detail: "http 200".into(),
             qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
@@ -13681,7 +9720,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             fs::write(
                 log_path,
-                "using device Vulkan0\noffloaded 13/13 layers to GPU\n",
+                "starting native llama.cpp embedding server: test --device Vulkan0\nusing device Vulkan0\noffloaded 13/13 layers to GPU\n",
             )
             .expect("write native log");
         });
@@ -13708,7 +9747,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_profile_handoff_downgrades_full_readiness() {
+    fn sidecar_profile_handoff_preserves_full_manifest_classification() {
         let status = DoctorSidecarStatusOutput {
             profile: Some("agent".to_string()),
             run_id: Some("run".to_string()),
@@ -13734,16 +9773,16 @@ mod tests {
         let downgraded = apply_sidecar_profile_handoff(
             status,
             Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
                     .to_string(),
             ),
         );
 
-        assert_eq!(downgraded.retrieval_mode, "unavailable");
+        assert_eq!(downgraded.retrieval_mode, "full");
         assert_eq!(
             downgraded.degraded_reason.as_deref(),
             Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
             )
         );
     }
@@ -13771,6 +9810,19 @@ mod tests {
         assert_eq!(
             runtime.run_id.as_deref(),
             Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+        );
+    }
+
+    #[test]
+    fn default_agent_readiness_binds_broker_to_selected_shared_run() {
+        assert_eq!(
+            selected_agent_broker_run_id(Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID), None,)
+                .as_deref(),
+            Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+        );
+        assert_eq!(
+            selected_agent_broker_run_id(Some("selected-run"), Some("requested-run")).as_deref(),
+            Some("selected-run")
         );
     }
 
@@ -13833,13 +9885,71 @@ mod tests {
     }
 
     #[test]
+    fn dead_agent_endpoint_emits_repair_retrieval_even_with_blocked_aggregate_verdict() {
+        let sidecar = DoctorSidecarStatusOutput {
+            profile: Some("agent".to_string()),
+            run_id: Some("run".to_string()),
+            retrieval_mode: "full".to_string(),
+            degraded_reason: Some("embedding_runtime_unavailable: connection refused".to_string()),
+            embedding_device_policy: "accelerator_required".to_string(),
+            embedding_device_state: "accelerated".to_string(),
+            embedding_device_observation_source: "sidecar_log".to_string(),
+            embedding_detected_provider: Some("metal".to_string()),
+            embedding_detected_gpu: Some("Apple GPU".to_string()),
+            embedding_accelerator_requested: true,
+            embedding_accelerator_request_provider: Some("metal".to_string()),
+            embedding_accelerator_request_device: Some("Metal".to_string()),
+            embedding_cpu_allowed: false,
+            manifest_generation: Some("generation".to_string()),
+            manifest_input_hash: Some("hash".to_string()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        };
+        let aggregate_verdict = codestory_contracts::api::ReadinessVerdictDto {
+            goal: ReadinessGoalDto::AgentPacketSearch,
+            status: ReadinessStatusDto::Blocked,
+            summary: "aggregate sidecar unavailable".to_string(),
+            minimum_next: vec![
+                "codestory-cli ready --goal agent --repair --project C:/repo --format json"
+                    .to_string(),
+            ],
+            full_repair: Vec::new(),
+            setup: None,
+            index: None,
+            sidecar: None,
+        };
+
+        let lane = readiness_lane_output(
+            "agent_packet_search",
+            &sidecar,
+            Some(&aggregate_verdict),
+            "C:/repo",
+        );
+
+        assert_eq!(lane.status, ReadinessStatusDto::RepairRetrieval);
+        assert_eq!(lane.sidecar_mode, "full");
+        assert!(
+            lane.degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("embedding_runtime_unavailable:"))
+        );
+        assert!(
+            lane.next_command
+                .as_deref()
+                .is_some_and(|command| command.contains("ready --goal agent --repair"))
+        );
+    }
+
+    #[test]
     fn agent_goal_readiness_uses_full_agent_lane_despite_local_handoff_mismatch() {
         let fallback = DoctorSidecarStatusOutput {
             profile: Some("agent".to_string()),
             run_id: Some("run".to_string()),
             retrieval_mode: "unavailable".to_string(),
             degraded_reason: Some(
-                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=zoekt_stub"
+                "profile_handoff_mismatch: active profile=agent namespace=run is full but local/default profile is mode=unavailable reason=lexical_stub"
                     .to_string(),
             ),
             embedding_device_policy: "accelerator_required".to_string(),
@@ -14287,20 +10397,42 @@ mod tests {
     }
 
     #[test]
-    fn affected_name_status_parser_preserves_status_and_renames() {
-        let records = parse_git_name_status_records(
-            "M\tcrates/codestory-cli/src/main.rs\nD\tsrc/old.ts\nR100\tsrc/before.ts\tsrc/after.ts\nC75\tsrc/base.ts\tsrc/copy.ts\n",
+    fn affected_name_status_parser_preserves_nul_delimited_special_paths() {
+        let records = parse_git_name_status_records_z(
+            b"M\0 leading and trailing \t\n \0D\0src/old.ts\0R100\0 before.ts \0after\nname.ts\0C75\0src/base.ts\0src/copy.ts\0",
         )
-        .expect("parse name-status");
+        .expect("parse NUL-delimited name-status");
 
         assert_eq!(records[0].kind, AffectedChangeKindDto::Modified);
         assert_eq!(records[0].status, "M");
+        assert_eq!(records[0].path, " leading and trailing \t\n ");
         assert_eq!(records[1].kind, AffectedChangeKindDto::Deleted);
         assert_eq!(records[2].kind, AffectedChangeKindDto::Renamed);
-        assert_eq!(records[2].previous_path.as_deref(), Some("src/before.ts"));
-        assert_eq!(records[2].path, "src/after.ts");
+        assert_eq!(records[2].previous_path.as_deref(), Some(" before.ts "));
+        assert_eq!(records[2].path, "after\nname.ts");
         assert_eq!(records[3].kind, AffectedChangeKindDto::Copied);
         assert_eq!(records[3].previous_path.as_deref(), Some("src/base.ts"));
+    }
+
+    #[test]
+    fn affected_non_utf8_git_path_has_a_typed_failure_envelope() {
+        let error = parse_git_name_status_records_z(b"M\0src/invalid-\xff.rs\0")
+            .expect_err("non-UTF-8 Git paths cannot enter string DTOs");
+        let unsupported = error
+            .downcast_ref::<UnsupportedNonUtf8Path>()
+            .expect("typed non-UTF-8 path error");
+        let envelope = unsupported_non_utf8_path_envelope(unsupported);
+
+        assert_eq!(envelope.error.code, "unsupported_non_utf8_path");
+        assert_eq!(
+            envelope
+                .error
+                .details
+                .as_deref()
+                .and_then(|details| details.failed_layer.as_deref()),
+            Some("git_change_discovery")
+        );
+        assert!(!unsupported.to_string().contains('\u{fffd}'));
     }
 
     fn sample_retrieval() -> RetrievalStateDto {
@@ -14499,6 +10631,7 @@ mod tests {
             members: Vec::new(),
             retrieval: None,
             freshness: None,
+            publication: None,
         }
     }
 
@@ -14582,18 +10715,6 @@ mod tests {
         }
     }
 
-    fn sample_drill_runtime_timings() -> DrillRuntimeTimingsOutput {
-        DrillRuntimeTimingsOutput {
-            total_ms: 42,
-            setup_ms: 3,
-            question_search_ms: 5,
-            anchor_resolution_ms: 13,
-            supplemental_search_ms: 7,
-            bridge_evidence_ms: 11,
-            evidence_assembly_ms: 3,
-        }
-    }
-
     fn sample_node_details(id: &str, display_name: &str) -> NodeDetailsDto {
         NodeDetailsDto {
             id: NodeId(id.to_string()),
@@ -14656,996 +10777,25 @@ mod tests {
         }
     }
 
-    fn sample_search_hit_output(id: &str, name: &str) -> SearchHitOutput {
-        SearchHitOutput {
-            number: None,
-            node_id: id.to_string(),
-            node_ref: Some(format!("src/lib.rs:1:{name}")),
-            display_name: name.to_string(),
-            kind: NodeKind::FUNCTION,
-            file_path: Some("src/lib.rs".to_string()),
-            line: Some(1),
-            score: 1.0,
-            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-            match_quality: SearchMatchQualityDto::Exact,
-            resolvable: true,
-            score_breakdown: None,
-            duplicate_of: None,
-            excerpt: None,
-            primary_occurrence_kind: None,
-            symbol_role: None,
-            paired_refs: Vec::new(),
-            verification_targets: Vec::new(),
-            resolution_hints: Vec::new(),
-            why: Vec::new(),
-        }
-    }
-
-    fn sample_drill_anchor(anchor: &str, node_id: &str) -> DrillAnchorOutput {
-        DrillAnchorOutput {
-            anchor: anchor.to_string(),
-            typed_hit_count: 1,
-            chosen_anchor: Some(sample_search_hit_output(node_id, anchor)),
-            verification_targets: Vec::new(),
-            consumer_summary: None,
-            timings: DrillAnchorTimingsOutput::default(),
-            commands: Vec::new(),
-        }
-    }
-
-    fn sample_drill_anchor_with_file(anchor: &str, node_id: &str, path: &str) -> DrillAnchorOutput {
-        let mut output = sample_drill_anchor(anchor, node_id);
-        if let Some(hit) = output.chosen_anchor.as_mut() {
-            hit.node_ref = Some(format!("{path}:1:{anchor}"));
-            hit.file_path = Some(path.to_string());
-        }
-        output
-    }
-
-    fn add_text_hint(anchor: &mut DrillAnchorOutput, path: &str) {
-        anchor.consumer_summary = Some(DrillAnchorConsumerSummaryOutput {
-            caller_count: 0,
-            consumer_count: 0,
-            text_hint_count: 1,
-            truncated: false,
-            omitted_edge_count: 0,
-            callers: Vec::new(),
-            consumers: Vec::new(),
-            text_consumer_hints: vec![DrillAnchorTextConsumerHintOutput {
-                name: format!("{} usage", anchor.anchor),
-                kind: NodeKind::FUNCTION,
-                file_path: Some(path.to_string()),
-                line: Some(12),
-                score: 1.0,
-            }],
-            notes: Vec::new(),
-        });
-    }
-
-    fn sample_bridge_trail(truncated: bool) -> TrailContextDto {
-        TrailContextDto {
-            focus: sample_node_details("a", "A"),
-            trail: GraphResponse {
-                center_id: NodeId("a".to_string()),
-                nodes: vec![sample_graph_node("a", "A"), sample_graph_node("b", "B")],
-                edges: vec![sample_graph_edge("e1", "a", "b", Some("certain"))],
-                truncated,
-                omitted_edge_count: if truncated { 1 } else { 0 },
-                canonical_layout: None,
-            },
-            story: None,
-        }
-    }
-
     #[test]
-    fn symbol_workflow_transitive_callers_render_only_call_paths() {
-        let focus = sample_graph_node("focus", "Focus");
-        let mut direct = sample_graph_node("direct", "DirectCaller");
-        let mut transitive = sample_graph_node("transitive", "TransitiveCaller");
-        let mut reference = sample_graph_node("reference", "ReferenceOnly");
-        direct.depth = 1;
-        transitive.depth = 2;
-        reference.depth = 2;
-        let trail = TrailContextDto {
-            focus: sample_node_details("focus", "Focus"),
-            trail: GraphResponse {
-                center_id: NodeId("focus".to_string()),
-                nodes: vec![focus, direct, transitive, reference],
-                edges: vec![
-                    sample_graph_edge("direct-focus", "direct", "focus", Some("certain")),
-                    sample_graph_edge("transitive-direct", "transitive", "direct", Some("certain")),
-                    sample_graph_edge_with_kind(
-                        "reference-direct",
-                        "reference",
-                        "direct",
-                        EdgeKind::USAGE,
-                        Some("certain"),
-                    ),
-                ],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-            story: None,
-        };
-        let symbol = codestory_contracts::api::SymbolContextDto {
-            node: sample_node_details("focus", "Focus"),
-            summary: None,
-            children: Vec::new(),
-            related_hits: Vec::new(),
-            edge_digest: Vec::new(),
-        };
-        let direct_callers = symbol_workflow_direct_callers(&trail);
-        let transitive_callers = symbol_workflow_transitive_callers(&trail, &direct_callers);
-        let output = SymbolWorkflowOutput {
-            workflow: SymbolWorkflowKind::Impact.label(),
-            project_root: "C:/repo".to_string(),
-            resolution: QueryResolutionOutput {
-                selector: QuerySelectorOutput::Id,
-                requested: "focus".to_string(),
-                file_filter: None,
-                resolved: sample_search_hit_output("focus", "Focus"),
-                alternatives: Vec::new(),
-            },
-            symbol: &symbol,
-            direct_callers,
-            transitive_callers,
-            impacted_files: Vec::new(),
-            impacted_routes: Vec::new(),
-            likely_tests: Vec::new(),
-            caps: SymbolWorkflowCapsOutput {
-                caller_depth: 3,
-                caller_max_nodes: 20,
-                affected_depth: 3,
-                impacted_symbols_cap: 200,
-                impacted_routes_cap: 100,
-                affected_seed: "none".to_string(),
-            },
-            unknowns: Vec::new(),
-            next_commands: Vec::new(),
-            affected: None,
-            trail: &trail,
-        };
-
-        let markdown = render_symbol_workflow_markdown(SymbolWorkflowKind::Impact, &output);
-
-        assert!(markdown.contains("transitive_callers:"));
-        assert!(markdown.contains("TransitiveCaller"));
-        assert!(
-            !markdown.contains("ReferenceOnly"),
-            "non-CALL depth-2 nodes must not render as transitive callers:\n{markdown}"
-        );
-    }
-
-    #[test]
-    fn symbol_workflow_next_commands_preserve_include_tests_scope() {
-        let commands = symbol_workflow_next_commands(
-            Path::new("C:/repo"),
-            &NodeId("focus".to_string()),
-            None,
-            3,
-            20,
-            SymbolWorkflowKind::Impact,
-            true,
-        );
-
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.contains("callers") && command.contains("--include-tests")),
-            "callers next command should preserve include-tests scope: {commands:#?}"
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.contains("test-map") && command.contains("--include-tests")),
-            "paired workflow next command should preserve include-tests scope: {commands:#?}"
-        );
-    }
-
-    fn sample_drill_output_with_source_truth_files(paths: Vec<&str>) -> DrillOutput {
-        let from = sample_drill_anchor("WorkspaceIndexer", "a");
-        let to = sample_drill_anchor("SearchService", "b");
-        let mut bridge = DrillBridgeOutput {
-            evidence: fallback_drill_bridge(
-                Path::new("C:/repo"),
-                &from,
-                &to,
-                from.chosen_anchor.clone().expect("from"),
-                to.chosen_anchor.clone().expect("to"),
-                &sample_bridge_trail(false),
-                Vec::new(),
-                false,
-            ),
-            command: DrillCommandStatusOutput {
-                command: "bridge".to_string(),
-                status: "ok".to_string(),
-                duration_ms: 2,
-                artifact: Some("bridge.md".to_string()),
-                error: None,
-            },
-        };
-        bridge.evidence.evidence_files = paths.iter().map(|path| (*path).to_string()).collect();
-        let source_truth_checks = paths
-            .into_iter()
-            .enumerate()
-            .map(|(index, path)| SourceTruthCheckDto {
-                id: format!("source-truth-{}", index + 1),
-                reason: "verify surface ordering".to_string(),
-                path: path.to_string(),
-                line: None,
-                required: true,
-            })
-            .collect::<Vec<_>>();
-        DrillOutput {
-            project: "C:/repo".to_string(),
-            label: Some("sample".to_string()),
-            question: Some("How does indexing work?".to_string()),
-            output_dir: "target/drill/sample".to_string(),
-            mechanical: DrillMechanicalOutput {
-                before_files: 1,
-                before_nodes: 10,
-                before_edges: 2,
-                before_errors: 0,
-                after_files: 2,
-                after_nodes: 20,
-                after_edges: 4,
-                after_errors: 0,
-                refresh: "full".to_string(),
-                retrieval: Some(sample_retrieval()),
-                sidecar_retrieval_mode: Some("full".to_string()),
-                freshness: None,
-                phase_timings: Some(sample_phase_timings()),
-                drill_timings: sample_drill_runtime_timings(),
-            },
-            question_search: None,
-            question_supplemental_searches: Vec::new(),
-            anchors: vec![from, to],
-            bridges: vec![bridge],
-            execution_boundaries: drill_execution_boundaries(),
-            verification_targets: Vec::new(),
-            evidence_packet: EvidencePacketDto {
-                packet_version: 1,
-                question: Some("How does indexing work?".to_string()),
-                items: Vec::new(),
-                readiness: AnswerReadinessReportDto {
-                    overall_status: ClaimReadinessDto::NeedsSourceRead,
-                    safe_to_say: Vec::new(),
-                    inferred_claims: Vec::new(),
-                    needs_verification: Vec::new(),
-                    next_commands: Vec::new(),
-                    source_truth_checks,
-                },
-            },
-            answer_quality_contract: drill_answer_quality_contract(),
-            claim_ledger_template: DrillClaimLedgerOutput {
-                template_version: 1,
-                instructions: Vec::new(),
-                claims: Vec::new(),
-                scoring: DrillClaimLedgerScoringOutput {
-                    status: "pending_source_verification".to_string(),
-                    pending_claim_count: 0,
-                    correct: 0,
-                    partial: 0,
-                    misleading: 0,
-                    unsupported: 0,
-                    material_revision_count: 0,
-                    score_formula: "manual".to_string(),
-                },
-            },
-            verification_checklist: drill_verification_checklist(),
-            next_commands: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn drill_bridge_search_hints_keep_middle_source_files() {
-        fn search_hit(
-            name: &str,
-            path: &str,
-            origin: codestory_contracts::api::SearchHitOrigin,
-        ) -> SearchHit {
-            SearchHit {
-                node_id: NodeId(format!("{path}:{name}")),
-                display_name: name.to_string(),
-                kind: NodeKind::FUNCTION,
-                file_path: Some(path.to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            }
-        }
-
-        let endpoint_files = vec![
-            "lib/axios.js".to_string(),
-            "lib/core/dispatchRequest.js".to_string(),
-        ];
-        let repo_text_hits = vec![
-            search_hit(
-                "Axios.js",
-                "lib/core/Axios.js",
-                codestory_contracts::api::SearchHitOrigin::TextMatch,
-            ),
-            search_hit(
-                "axios.js",
-                "lib/axios.js",
-                codestory_contracts::api::SearchHitOrigin::TextMatch,
-            ),
-            search_hit(
-                "bundle.js",
-                "dist/bundle.js",
-                codestory_contracts::api::SearchHitOrigin::TextMatch,
-            ),
-        ];
-        let indexed_symbol_hits = vec![
-            search_hit(
-                "Axios",
-                "lib/core/Axios.js",
-                codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-            ),
-            search_hit(
-                "InterceptorManager",
-                "lib/core/InterceptorManager.js",
-                codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-            ),
-        ];
-
-        let files = drill_bridge_search_hint_files_from_hits(
-            Path::new("C:/repo"),
-            &endpoint_files,
-            &repo_text_hits,
-            &indexed_symbol_hits,
-        );
-
-        assert_eq!(
-            files,
-            vec![
-                "lib/core/Axios.js".to_string(),
-                "lib/core/InterceptorManager.js".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn drill_import_hub_helpers_resolve_relative_js_imports() {
-        let temp = tempdir().expect("temp dir");
-        let lib_dir = temp.path().join("lib");
-        let core_dir = lib_dir.join("core");
-        fs::create_dir_all(&core_dir).expect("create dirs");
-        let endpoint = lib_dir.join("axios.js");
-        let axios_core = core_dir.join("Axios.js");
-        fs::write(
-            &endpoint,
-            "import Axios from './core/Axios.js';\nimport './polyfill.js';\n",
-        )
-        .expect("write endpoint");
-        fs::write(
-            &axios_core,
-            "import dispatchRequest from './dispatchRequest.js';\nclass Axios {}\n",
-        )
-        .expect("write candidate");
-        let outside = temp.path().with_file_name(format!(
-            "{}-outside.js",
-            temp.path().file_name().unwrap().to_string_lossy()
-        ));
-        fs::write(&outside, "class Outside {}\n").expect("write outside file");
-
-        let source = fs::read_to_string(&endpoint).expect("read endpoint");
-        let specifiers = drill_js_relative_import_specifiers(&source);
-
-        assert_eq!(
-            specifiers,
-            vec!["./core/Axios.js".to_string(), "./polyfill.js".to_string()]
-        );
-        assert_eq!(
-            drill_resolve_relative_import(temp.path(), &endpoint, "./core/Axios.js"),
-            Some(fs::canonicalize(&axios_core).expect("canonical axios core"))
-        );
-        assert_eq!(
-            drill_relative_source_path(temp.path(), &axios_core.to_string_lossy()),
-            None
-        );
-        assert_eq!(
-            drill_relative_source_path(temp.path(), "../outside.js"),
-            None
-        );
-        assert_eq!(
-            drill_resolve_relative_import(
-                temp.path(),
-                &endpoint,
-                &format!("../{}", outside.file_name().unwrap().to_string_lossy())
-            ),
-            None
-        );
-        assert_eq!(
-            drill_resolve_relative_import(temp.path(), &endpoint, &outside.to_string_lossy()),
-            None
-        );
-        assert!(drill_file_contains_terms(
-            temp.path(),
-            "lib/core/Axios.js",
-            &["dispatchRequest", "Axios"]
-        ));
-        assert!(!drill_file_contains_terms(
-            temp.path(),
-            "lib/core/Axios.js",
-            &["createInstance", "dispatchRequest"]
-        ));
-    }
-
-    #[test]
-    fn drill_bridge_constructors_preserve_status_contract() {
-        let from = sample_drill_anchor("FromAnchor", "a");
-        let to = sample_drill_anchor("ToAnchor", "b");
-        let project_root = Path::new("C:/repo");
-        let complete_trail = sample_bridge_trail(false);
-        let truncated_trail = sample_bridge_trail(true);
-
-        let forward = graph_path_drill_bridge(
-            project_root,
-            &from,
-            &to,
-            from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            &complete_trail,
-            false,
-        );
-        assert_eq!(forward.status, "graph_path");
-        assert_eq!(forward.strategy, "to_target_symbol_forward");
-        assert_eq!(forward.confidence, "high");
-        assert_eq!(forward.graph_path.as_ref().expect("path").mode, "forward");
-        assert_eq!(forward.endpoint_files, vec!["src/lib.rs"]);
-
-        let reverse = reverse_graph_path_drill_bridge(
-            project_root,
-            &from,
-            &to,
-            from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            &truncated_trail,
-            false,
-        );
-        assert_eq!(reverse.status, "reverse_graph_path");
-        assert_eq!(reverse.strategy, "to_target_symbol_reverse");
-        assert_eq!(reverse.confidence, "low");
-        assert_eq!(reverse.graph_path.as_ref().expect("path").mode, "reverse");
-
-        let shared_file = fallback_drill_bridge(
-            project_root,
-            &from,
-            &to,
-            from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            &complete_trail,
-            vec!["src/lib.rs".to_string()],
-            false,
-        );
-        assert_eq!(shared_file.status, "graph_shared_file");
-        assert_eq!(
-            shared_file.strategy,
-            "to_target_symbol_then_graph_shared_files"
-        );
-        assert_eq!(shared_file.confidence, "medium");
-
-        let mut hinted_from = sample_drill_anchor("FromAnchor", "a");
-        hinted_from.consumer_summary = Some(DrillAnchorConsumerSummaryOutput {
-            caller_count: 0,
-            consumer_count: 0,
-            text_hint_count: 1,
-            truncated: false,
-            omitted_edge_count: 0,
-            callers: Vec::new(),
-            consumers: Vec::new(),
-            text_consumer_hints: vec![DrillAnchorTextConsumerHintOutput {
-                name: "FromAnchorUser".to_string(),
-                kind: NodeKind::FUNCTION,
-                file_path: Some("src/from-user.rs".to_string()),
-                line: Some(12),
-                score: 1.0,
-            }],
-            notes: Vec::new(),
-        });
-        let hint_only = fallback_drill_bridge(
-            project_root,
-            &hinted_from,
-            &to,
-            hinted_from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            &complete_trail,
-            Vec::new(),
-            false,
-        );
-        assert_eq!(hint_only.status, "evidence_hint_only");
-        assert_eq!(
-            hint_only.strategy,
-            "to_target_symbol_then_consumer_text_hints"
-        );
-        assert_eq!(hint_only.endpoint_files, vec!["src/lib.rs"]);
-        assert_eq!(hint_only.evidence_files, vec!["src/from-user.rs"]);
-        assert!(
-            hint_only
-                .next_commands
-                .iter()
-                .any(|command| command.contains("search --project")
-                    && command.contains("FromAnchor ToAnchor")),
-            "hint-only bridges should keep a bridge search follow-up: {hint_only:#?}"
-        );
-        assert!(
-            hint_only
-                .next_commands
-                .iter()
-                .any(|command| command.contains("trail --project") && command.contains("--id")),
-            "hint-only bridges should keep id-based trail follow-up: {hint_only:#?}"
-        );
-        assert!(
-            hint_only
-                .next_commands
-                .iter()
-                .any(|command| command.contains("snippet --project")
-                    && command.contains("--id")
-                    && command.contains("--function-body")),
-            "hint-only bridges should keep id-based function-body snippets: {hint_only:#?}"
-        );
-        assert!(
-            hint_only
-                .next_commands
-                .iter()
-                .any(|command| command.contains("src/from-user.rs")),
-            "hint-only bridges should search the text-hint evidence file: {hint_only:#?}"
-        );
-        let hint_markdown = render_drill_bridge_markdown(&hint_only);
-        assert!(hint_markdown.contains("next_commands:"));
-        assert!(hint_markdown.contains("src/from-user.rs"));
-
-        let shared_with_hints = fallback_drill_bridge(
-            project_root,
-            &hinted_from,
-            &to,
-            hinted_from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            &complete_trail,
-            vec!["src/shared.rs".to_string()],
-            false,
-        );
-        assert_eq!(shared_with_hints.status, "graph_shared_file");
-        assert_eq!(shared_with_hints.shared_files, vec!["src/shared.rs"]);
-        assert_eq!(shared_with_hints.evidence_files, vec!["src/from-user.rs"]);
-
-        let missing = fallback_drill_bridge(
-            project_root,
-            &from,
-            &to,
-            from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            &complete_trail,
-            Vec::new(),
-            false,
-        );
-        assert_eq!(missing.status, "no_bridge_found");
-
-        let error = drill_bridge_error(
-            project_root,
-            &from,
-            &to,
-            from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            "internal",
-            "failed",
-            false,
-        );
-        assert_eq!(error.status, "error");
-        assert_eq!(error.strategy, "to_target_symbol_forward");
-        assert!(error.notes[0].contains("internal: failed"));
-        assert!(error.graph_path.is_none());
-    }
-
-    #[test]
-    fn drill_fallback_bridge_promotes_typed_source_truth_candidates() {
-        let project_root = Path::new("C:/repo");
-        let complete_trail = sample_bridge_trail(false);
-        assert!(drill_path_is_framework_route_or_page(
-            "src/app/(frontend)/posts/[slug]/comments/route.ts"
-        ));
-        assert!(!drill_path_is_framework_route_or_page(
-            "src/lib/app/Application.cpp"
-        ));
-
-        let posts = sample_drill_anchor_with_file("Posts", "posts", "src/collections/Posts.ts");
-        let mut comment_auth =
-            sample_drill_anchor_with_file("getCommentAuth", "auth", "src/lib/comment-auth.ts");
-        add_text_hint(
-            &mut comment_auth,
-            "src/app/(frontend)/posts/[slug]/comments/route.ts",
-        );
-
-        let payload_bridge = fallback_drill_bridge(
-            project_root,
-            &posts,
-            &comment_auth,
-            posts.chosen_anchor.clone().expect("from"),
-            comment_auth.chosen_anchor.clone().expect("to"),
-            &complete_trail,
-            Vec::new(),
-            false,
-        );
-        assert_eq!(payload_bridge.status, "data_collection_usage");
-        assert_eq!(
-            payload_bridge.strategy,
-            "payload_collection_usage_source_targets"
-        );
-        assert_eq!(payload_bridge.confidence, "medium");
-        assert_eq!(payload_bridge.evidence_kind, "data_collection_usage");
-        assert!(drill_bridge_status_is_partial(&payload_bridge.status));
-
-        let payload_item = evidence_item_from_bridge(
-            1,
-            &DrillBridgeOutput {
-                evidence: payload_bridge,
-                command: DrillCommandStatusOutput {
-                    command: "bridge".to_string(),
-                    status: "ok".to_string(),
-                    duration_ms: 2,
-                    artifact: Some("bridge.md".to_string()),
-                    error: None,
-                },
-            },
-        );
-        assert_eq!(payload_item.verification_status, ClaimReadinessDto::Partial);
-
-        let source_group = sample_drill_anchor_with_file(
-            "SourceGroupCxxCdb",
-            "source-group",
-            "src/lib_cxx/project/SourceGroupCxxCdb.h",
-        );
-        let mut storage = sample_drill_anchor_with_file(
-            "StorageAccess",
-            "storage",
-            "src/lib/data/storage/StorageAccess.h",
-        );
-        add_text_hint(&mut storage, "src/lib/data/storage/StorageAccess.cpp");
-
-        let native_bridge = fallback_drill_bridge(
-            project_root,
-            &source_group,
-            &storage,
-            source_group.chosen_anchor.clone().expect("from"),
-            storage.chosen_anchor.clone().expect("to"),
-            &complete_trail,
-            Vec::new(),
-            false,
-        );
-        assert_eq!(native_bridge.status, "source_truth_only");
-        assert_eq!(
-            native_bridge.strategy,
-            "native_related_source_truth_targets"
-        );
-        assert_eq!(native_bridge.evidence_kind, "source_truth_only");
-        assert!(drill_bridge_status_is_partial(&native_bridge.status));
-        assert!(!drill_bridge_status_is_unresolved(&native_bridge.status));
-
-        let native_item = evidence_item_from_bridge(
-            2,
-            &DrillBridgeOutput {
-                evidence: native_bridge,
-                command: DrillCommandStatusOutput {
-                    command: "bridge".to_string(),
-                    status: "ok".to_string(),
-                    duration_ms: 2,
-                    artifact: Some("bridge.md".to_string()),
-                    error: None,
-                },
-            },
-        );
-        assert_eq!(
-            native_item.verification_status,
-            ClaimReadinessDto::NeedsSourceRead
-        );
-    }
-
-    #[test]
-    fn no_path_bridge_graphs_do_not_report_truncated_when_nothing_was_omitted() {
-        let mut no_path = sample_bridge_trail(true);
-        no_path.trail.nodes = vec![sample_graph_node("a", "A")];
-        no_path.trail.edges.clear();
-        no_path.trail.omitted_edge_count = 0;
-
-        let graph =
-            drill_bridge_graph_path_output(Path::new("C:/repo"), "forward_no_path", &no_path);
-
-        assert_eq!(graph.edge_count, 0);
-        assert_eq!(graph.omitted_edge_count, 0);
-        assert!(
-            !graph.truncated,
-            "zero-edge no-path bridge payloads should not look like clipped path evidence"
-        );
-
-        no_path.trail.omitted_edge_count = 2;
-        let omitted_graph =
-            drill_bridge_graph_path_output(Path::new("C:/repo"), "forward_no_path", &no_path);
-
-        assert!(omitted_graph.truncated);
-        assert_eq!(omitted_graph.omitted_edge_count, 2);
-    }
-
-    #[test]
-    fn drill_bridge_evidence_kind_distinguishes_framework_and_data_paths() {
-        let mut payload = sample_bridge_trail(false);
-        payload.trail.edges[0].callsite_identity = Some("payload:create:comments:7:18".to_string());
-        assert_eq!(
-            drill_bridge_evidence_kind_for_trail(&payload),
-            "data_collection_usage"
-        );
-
-        let mut route = sample_bridge_trail(false);
-        route.trail.nodes[0].label =
-            "POST /api/comments (nextjs route; confidence=file_convention)".to_string();
-        assert_eq!(
-            drill_bridge_evidence_kind_for_trail(&route),
-            "framework_route"
-        );
-
-        let mut component = sample_bridge_trail(false);
-        component.trail.nodes[1].label = "RootRuntimeHome".to_string();
-        component.trail.nodes[1].file_path = Some("src/components/RootRuntimeHome.tsx".to_string());
-        assert_eq!(
-            drill_bridge_evidence_kind_for_trail(&component),
-            "component_usage"
-        );
-    }
-
-    #[test]
-    fn drill_native_related_queries_cover_sourcetrail_anchor_methods() {
-        let source_group = SearchHit {
-            node_id: NodeId("source-group".to_string()),
-            display_name: "SourceGroupCxxCdb".to_string(),
-            kind: codestory_contracts::api::NodeKind::CLASS,
-            file_path: Some("src/lib_cxx/project/SourceGroupCxxCdb.h".to_string()),
-            line: Some(12),
-            score: 0.9,
-            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-            match_quality: None,
-            resolvable: true,
-            score_breakdown: None,
-            ..test_search_hit_defaults()
-        };
-        let queries = drill_native_related_queries("SourceGroupCxxCdb", &source_group);
-        assert!(
-            queries.iter().any(|(relation, query)| {
-                relation == "related_native_role:commands"
-                    && query == "source group indexer commands"
-            }),
-            "source-group anchors should expand to role-based command queries: {queries:#?}"
-        );
-
-        let indexer = SearchHit {
-            node_id: NodeId("indexer-java".to_string()),
-            display_name: "IndexerJava".to_string(),
-            ..source_group
-        };
-        let queries = drill_native_related_queries("IndexerJava", &indexer);
-        assert!(
-            queries.iter().any(|(relation, query)| {
-                relation == "related_native_role:java_index" && query == "java indexer do index"
-            }),
-            "Java indexer anchors should expand to role-based parser dispatch queries: {queries:#?}"
-        );
-
-        let method_hit = SearchHit {
-            node_id: NodeId("method".to_string()),
-            display_name: "sourcetrail::SourceGroupCxxCdb::getIndexerCommands".to_string(),
-            kind: codestory_contracts::api::NodeKind::METHOD,
-            file_path: Some("src/lib_cxx/project/SourceGroupCxxCdb.cpp".to_string()),
-            line: Some(44),
-            score: 0.8,
-            origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-            match_quality: None,
-            resolvable: true,
-            score_breakdown: None,
-            ..test_search_hit_defaults()
-        };
-        assert!(drill_native_related_query_matches(
-            &method_hit,
-            "source group indexer commands"
-        ));
-    }
-
-    #[test]
-    fn bridge_evidence_files_rank_runtime_paths_before_auxiliary_files() {
-        let mut files = vec![
-            "crates/codestory-bench/benches/ask_latency.rs".to_string(),
-            "scripts/import-wordpress-rich-content.ts".to_string(),
-            "tests/int/social-feed.int.spec.ts".to_string(),
-            "crates/codestory-runtime/src/services.rs".to_string(),
-            "src/lib/comment-auth.ts".to_string(),
-        ];
-
-        rank_drill_bridge_evidence_files(&mut files);
-
-        assert_eq!(files[0], "crates/codestory-runtime/src/services.rs");
-        assert_eq!(files[1], "src/lib/comment-auth.ts");
-        assert!(files[4].starts_with("scripts/"));
-    }
-
-    #[test]
-    fn source_truth_files_rank_runtime_paths_before_auxiliary_files() {
-        let mut output = sample_drill_output_with_source_truth_files(vec![
-            "scripts/migrate-wordpress-rich-content.ts",
-            "crates/codestory-bench/benches/ask_latency.rs",
-            "crates/codestory-runtime/src/lib.rs",
-            "tests/int/social-feed.int.spec.ts",
-            "src/lib/comment-auth.ts",
-        ]);
-
-        let summary = drill_summary(&output);
-
-        assert_eq!(
-            summary.source_truth.target_files,
-            vec![
-                "crates/codestory-runtime/src/lib.rs",
-                "src/lib/comment-auth.ts",
-                "tests/int/social-feed.int.spec.ts",
-                "crates/codestory-bench/benches/ask_latency.rs",
-                "scripts/migrate-wordpress-rich-content.ts",
-            ]
-        );
-
-        output.claim_ledger_template =
-            drill_claim_ledger_template(&output.anchors, &output.bridges);
-        let bridge_claim = output
-            .claim_ledger_template
-            .claims
-            .iter()
-            .find(|claim| claim.id == "bridge-1")
-            .expect("bridge claim");
-        let anchor_claim = output
-            .claim_ledger_template
-            .claims
-            .iter()
-            .find(|claim| claim.id == "anchor-1")
-            .expect("anchor claim");
-        assert!(
-            anchor_claim
-                .claim
-                .contains("requires source-truth verification before the final answer")
-        );
-        assert!(
-            !anchor_claim
-                .claim
-                .contains("CodeStory evidence is sufficient")
-        );
-        assert!(
-            bridge_claim
-                .claim
-                .contains("requires source-truth verification before the final answer")
-        );
-        assert!(
-            !bridge_claim
-                .claim
-                .contains("CodeStory evidence is sufficient")
-        );
-        assert!(
-            bridge_claim
-                .source_truth_files
-                .first()
-                .is_some_and(|path| path.contains("/src/") || path.starts_with("src/")),
-            "bridge claim should send agents to runtime/source files before auxiliary files: {bridge_claim:#?}"
-        );
-    }
-
-    #[test]
-    fn source_truth_files_rank_public_surfaces_before_admin_and_generated_files() {
-        let output = sample_drill_output_with_source_truth_files(vec![
-            "src/components/admin/DashboardWidgets.tsx",
-            "src/payload-types.ts",
-            "tests/int/social-feed.int.spec.ts",
-            "src/collections/SocialEntries.ts",
-            "src/lib/content-data/social-entry-content.ts",
-            "src/components/RootRuntimeHome.tsx",
-            "src/app/(frontend)/page.tsx",
-            "src/app/api/comments/route.ts",
-            "src/lib/comment-auth.ts",
-        ]);
-
-        let summary = drill_summary(&output);
-
-        assert_eq!(
-            summary.source_truth.target_files,
-            vec![
-                "src/app/(frontend)/page.tsx",
-                "src/app/api/comments/route.ts",
-                "src/components/RootRuntimeHome.tsx",
-                "src/lib/content-data/social-entry-content.ts",
-                "src/lib/comment-auth.ts",
-                "src/collections/SocialEntries.ts",
-                "src/components/admin/DashboardWidgets.tsx",
-                "tests/int/social-feed.int.spec.ts",
-                "src/payload-types.ts",
-            ]
-        );
-    }
-
-    #[test]
-    fn source_truth_checks_group_repeated_files_without_dropping_roles() {
-        let mut from = sample_drill_anchor("WorkspaceIndexer", "a");
-        from.consumer_summary = Some(DrillAnchorConsumerSummaryOutput {
-            caller_count: 1,
-            consumer_count: 1,
-            text_hint_count: 1,
-            truncated: false,
-            omitted_edge_count: 0,
-            callers: Vec::new(),
-            consumers: vec![DrillAnchorConsumerOutput {
-                name: "SearchService".to_string(),
-                kind: NodeKind::STRUCT,
+    fn symbol_workflow_renderer_keeps_caller_shape() {
+        let mut markdown = String::new();
+        append_symbol_workflow_nodes(
+            &mut markdown,
+            "direct_callers",
+            &[codestory_runtime::SymbolWorkflowNode {
+                node_id: NodeId("caller".to_string()),
+                display_name: "Caller".to_string(),
+                kind: "function".to_string(),
                 file_path: Some("src/lib.rs".to_string()),
-                qualified_name: None,
-                target_name: Some("WorkspaceIndexer".to_string()),
-                target_kind: Some(NodeKind::FUNCTION),
-                target_file_path: Some("src/lib.rs".to_string()),
-                target_relation: Some("test".to_string()),
-                edge_kind: codestory_contracts::api::EdgeKind::CALL,
-                confidence: Some(0.95),
-                certainty: Some("certain".to_string()),
+                depth: 1,
             }],
-            text_consumer_hints: vec![DrillAnchorTextConsumerHintOutput {
-                name: "WorkspaceIndexer text hint".to_string(),
-                kind: NodeKind::FUNCTION,
-                file_path: Some("src/lib.rs".to_string()),
-                line: Some(42),
-                score: 12.0,
-            }],
-            notes: Vec::new(),
-        });
-        let to = sample_drill_anchor("SearchService", "b");
-        let mut bridge = fallback_drill_bridge(
-            Path::new("C:/repo"),
-            &from,
-            &to,
-            from.chosen_anchor.clone().expect("from"),
-            to.chosen_anchor.clone().expect("to"),
-            &sample_bridge_trail(false),
-            Vec::new(),
-            false,
         );
-        bridge.evidence_files = vec!["src/lib.rs".to_string()];
-        let bridge = DrillBridgeOutput {
-            evidence: bridge,
-            command: DrillCommandStatusOutput {
-                command: "bridge".to_string(),
-                status: "ok".to_string(),
-                duration_ms: 2,
-                artifact: Some("bridge.md".to_string()),
-                error: None,
-            },
-        };
-        let targets = vec![VerificationTargetOutput {
-            role: "definition".to_string(),
-            path: "src/lib.rs".to_string(),
-            line: 7,
-            node_ref: None,
-            reason: "primary source occurrence selected for this symbol".to_string(),
-        }];
-
-        let checks = source_truth_checks_from_drill_evidence(&targets, &[from, to], &[bridge]);
 
         assert_eq!(
-            checks.len(),
-            1,
-            "checks should collapse by file: {checks:#?}"
+            markdown,
+            "direct_callers:\n- [caller] Caller (function) depth=1 src/lib.rs\n"
         );
-        let check = &checks[0];
-        assert_eq!(check.path, "src/lib.rs");
-        assert!(check.required);
-        assert!(check.reason.contains("selected anchor"), "{check:#?}");
-        assert!(check.reason.contains("consumer"), "{check:#?}");
-        assert!(check.reason.contains("related target"), "{check:#?}");
-        assert!(check.reason.contains("text hint"), "{check:#?}");
-        assert!(check.reason.contains("bridge endpoint"), "{check:#?}");
-        assert!(check.reason.contains("bridge hint"), "{check:#?}");
     }
 
     #[test]
@@ -16562,55 +11712,248 @@ mod tests {
     }
 
     #[test]
-    fn drill_anchor_helpers_normalize_and_sanitize_inputs() {
+    fn drill_packet_adapter_reuses_packet_citations_and_sufficiency() {
+        let packet = sample_task_brief_packet();
+        let citations = drill_packet_citations(&packet);
+        let anchor_name = packet.answer.citations[0].display_name.clone();
+        let anchors = drill_packet_anchors(
+            Path::new("C:/repo"),
+            std::slice::from_ref(&anchor_name),
+            &citations,
+        );
+        let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
+
+        assert_eq!(anchors.len(), 1);
         assert_eq!(
-            drill_targeting::normalized_drill_anchors(&[
-                "WorkspaceIndexer, SearchService".to_string(),
-                "WorkspaceIndexer".to_string(),
-                " TrailResult ".to_string(),
-            ]),
-            vec!["WorkspaceIndexer", "SearchService", "TrailResult"]
+            anchors[0]
+                .chosen_anchor
+                .as_ref()
+                .map(|hit| hit.display_name.as_str()),
+            Some(anchor_name.as_str())
+        );
+        assert_eq!(anchors[0].verification_targets.len(), 1);
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(bridges[0].evidence.strategy, "packet_claim");
+        assert_eq!(bridges[0].evidence.status, "source_truth_only");
+        assert_eq!(
+            drill_packet_claim_readiness(packet.sufficiency.status),
+            ClaimReadinessDto::Partial
         );
         assert_eq!(
-            output_slug("getElsewhereFeed() / posts"),
-            "getElsewhereFeed-posts"
+            bridges[0].evidence.next_commands,
+            packet.sufficiency.follow_up_commands
         );
     }
 
     #[test]
-    fn drill_next_commands_push_body_aware_snippets_after_search() {
-        let anchors = vec![sample_drill_anchor(
-            "WorkspaceIndexer",
-            "workspace-indexer-id",
-        )];
-        let commands = drill_next_commands(Path::new("C:/repo"), &anchors, &[], false);
+    fn drill_executes_one_packet_with_explicit_anchor_probes() {
+        let packet = sample_task_brief_packet();
+        let calls = std::cell::Cell::new(0);
+        let request = AgentPacketRequestDto {
+            question: packet.question.clone(),
+            budget: PacketBudgetModeDto::Standard,
+            task_class: None,
+            extra_probes: vec!["WorkspaceIndexer".to_string()],
+            include_evidence: true,
+            latency_budget_ms: None,
+        };
 
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.contains("codestory-cli search")
-                    && command.contains("--query")
-                    && command.contains("WorkspaceIndexer")),
-            "drill should preserve the exact-anchor search handoff: {commands:#?}"
+        let result = execute_drill_packet(request, |request| {
+            calls.set(calls.get() + 1);
+            assert_eq!(request.extra_probes, ["WorkspaceIndexer"]);
+            Ok(packet.clone())
+        })
+        .expect("execute packet");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.packet_id, packet.packet_id);
+    }
+
+    #[test]
+    fn drill_retained_fields_match_pre_adapter_fixture() {
+        let mut packet = sample_task_brief_packet();
+        let source = sample_task_brief_citation(
+            "WorkspaceIndexer",
+            NodeKind::FUNCTION,
+            "src/indexer.rs",
+            12,
         );
-        assert!(
-            commands
-                .iter()
-                .any(|command| command.contains("codestory-cli snippet")
-                    && command.contains("--id")
-                    && command.contains("workspace-indexer-id")
-                    && command.contains("--function-body")
-                    && command.contains("--context 40")),
-            "drill should advertise body-aware snippets for decisive operations: {commands:#?}"
+        let search =
+            sample_task_brief_citation("SearchService", NodeKind::STRUCT, "src/search.rs", 24);
+        packet.question = "How does indexing feed search?".to_string();
+        packet.answer.prompt = packet.question.clone();
+        packet.answer.citations = vec![source.clone(), search.clone()];
+        packet.plan.queries = vec![PacketPlanQueryDto {
+            query: "WorkspaceIndexer".to_string(),
+            purpose: "explicit symbol probe from packet request".to_string(),
+        }];
+        packet.sufficiency.covered_claims[0].citations = vec![source, search];
+        packet.sufficiency.follow_up_commands =
+            vec!["codestory-cli snippet --query WorkspaceIndexer --project .".to_string()];
+
+        let citations = drill_packet_citations(&packet);
+        let anchors = drill_packet_anchors(
+            Path::new("C:/repo"),
+            &["WorkspaceIndexer".to_string()],
+            &citations,
         );
-        assert!(
-            !commands
+        let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
+        let verification_targets =
+            drill_packet_verification_targets(Path::new("C:/repo"), &citations);
+        let output = DrillOutput {
+            project: "C:/repo".to_string(),
+            label: Some("fixture".to_string()),
+            question: Some(packet.question.clone()),
+            output_dir: "artifacts/drill".to_string(),
+            mechanical: DrillMechanicalOutput {
+                before_files: 2,
+                before_nodes: 4,
+                before_edges: 2,
+                before_errors: 0,
+                after_files: 2,
+                after_nodes: 4,
+                after_edges: 2,
+                after_errors: 0,
+                refresh: "none".to_string(),
+                retrieval: Some(sample_retrieval()),
+                sidecar_retrieval_mode: Some("full".to_string()),
+                freshness: None,
+                phase_timings: None,
+                drill_timings: DrillRuntimeTimingsOutput::default(),
+            },
+            question_search: Some(DrillCommandStatusOutput {
+                command: "packet".to_string(),
+                status: "partial".to_string(),
+                duration_ms: 1,
+                artifact: None,
+                error: None,
+            }),
+            question_supplemental_searches: Vec::new(),
+            anchors,
+            bridges,
+            execution_boundaries: vec![DrillExecutionBoundaryOutput {
+                command: "packet".to_string(),
+                flow: vec!["execute one bounded batch retrieval".to_string()],
+                source_files: vec![
+                    "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
+                ],
+            }],
+            verification_targets,
+            next_commands: packet.sufficiency.follow_up_commands.clone(),
+            evidence_packet: packet,
+        };
+        let output_dir = tempdir().expect("output dir");
+        write_drill_outputs(args::OutputFormat::Json, output_dir.path(), &output)
+            .expect("write drill fixtures");
+
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(output_dir.path().join("drill-report.json")).expect("read report"),
+        )
+        .expect("parse report");
+        let summary: serde_json::Value = serde_json::from_slice(
+            &fs::read(output_dir.path().join("drill-summary.json")).expect("read summary"),
+        )
+        .expect("parse summary");
+        let markdown =
+            fs::read_to_string(output_dir.path().join("drill-report.md")).expect("read markdown");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/drill_packet_parity/retained-fields.json"
+        ))
+        .expect("parse retained-field fixture");
+
+        for (document, expected) in [
+            (&report, &fixture["report"]),
+            (&summary, &fixture["summary"]),
+        ] {
+            for (pointer, expected) in expected.as_object().expect("pointer map") {
+                assert_eq!(
+                    document.pointer(pointer),
+                    Some(expected),
+                    "retained field changed at {pointer}"
+                );
+            }
+        }
+        for marker in fixture["markdown_contains"]
+            .as_array()
+            .expect("markdown markers")
+        {
+            let marker = marker.as_str().expect("markdown marker string");
+            assert!(
+                markdown.contains(marker),
+                "missing retained Markdown `{marker}`"
+            );
+        }
+        let mut artifacts = fs::read_dir(output_dir.path())
+            .expect("list artifacts")
+            .map(|entry| {
+                entry
+                    .expect("artifact entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort();
+        assert_eq!(
+            artifacts,
+            fixture["artifacts"]
+                .as_array()
+                .expect("artifact names")
                 .iter()
-                .any(|command| command.contains("codestory-cli snippet")
-                    && command.contains("--query")
-                    && command.contains("WorkspaceIndexer")),
-            "drill should use the selected anchor id for unambiguous snippet follow-ups: {commands:#?}"
+                .map(|value| value.as_str().expect("artifact name").to_string())
+                .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn drill_packet_anchor_rejects_exact_unresolvable_or_unknown_citations() {
+        let mut citation = sample_task_brief_citation(
+            "WorkspaceIndexer",
+            NodeKind::FUNCTION,
+            "src/indexer.rs",
+            12,
+        );
+        citation.resolvable = false;
+        let anchors = drill_packet_anchors(
+            Path::new("C:/repo"),
+            &["WorkspaceIndexer".to_string()],
+            std::slice::from_ref(&citation),
+        );
+        assert_eq!(anchors[0].typed_hit_count, 0);
+        assert!(anchors[0].chosen_anchor.is_none());
+        assert!(anchors[0].verification_targets.is_empty());
+
+        citation.resolvable = true;
+        citation.kind = NodeKind::UNKNOWN;
+        let anchors = drill_packet_anchors(
+            Path::new("C:/repo"),
+            &["WorkspaceIndexer".to_string()],
+            &[citation],
+        );
+        assert!(anchors[0].chosen_anchor.is_none());
+    }
+
+    #[test]
+    fn drill_packet_bridge_requires_shared_concrete_edge_evidence() {
+        let mut packet = sample_task_brief_packet();
+        packet.sufficiency.covered_claims[0].citations[0].subgraph_id =
+            Some("only-from".to_string());
+        let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
+        assert_eq!(bridges[0].evidence.status, "source_truth_only");
+
+        packet.sufficiency.covered_claims[0].citations[0].subgraph_id = Some("shared".to_string());
+        packet.sufficiency.covered_claims[0].citations[1].subgraph_id = Some("shared".to_string());
+        let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
+        assert_eq!(bridges[0].evidence.status, "source_truth_only");
+
+        packet.sufficiency.covered_claims[0].citations[0].subgraph_id = None;
+        packet.sufficiency.covered_claims[0].citations[1].subgraph_id = None;
+        packet.sufficiency.covered_claims[0].citations[0].evidence_edge_ids =
+            vec![EdgeId("shared-edge".to_string())];
+        packet.sufficiency.covered_claims[0].citations[1].evidence_edge_ids =
+            vec![EdgeId("shared-edge".to_string())];
+        let bridges = drill_packet_bridges(Path::new("C:/repo"), &packet);
+        assert_eq!(bridges[0].evidence.status, "graph_path");
     }
 
     #[test]
@@ -16634,1075 +11977,6 @@ mod tests {
             "'C:/repo/quoted\"path'"
         );
         assert_eq!(quote_command_path(Path::new("C:/repo")), "\"C:/repo\"");
-    }
-
-    #[test]
-    fn drill_summary_compacts_statuses_for_report_synthesis() {
-        let resolved_anchor = sample_drill_anchor("WorkspaceIndexer", "a");
-        let unresolved_anchor = DrillAnchorOutput {
-            anchor: "MissingAnchor".to_string(),
-            typed_hit_count: 0,
-            chosen_anchor: None,
-            verification_targets: Vec::new(),
-            consumer_summary: None,
-            timings: DrillAnchorTimingsOutput {
-                total_ms: 17,
-                search_ms: 17,
-                resolution_ms: 0,
-                consumer_summary_ms: 0,
-                command_artifacts_ms: 17,
-            },
-            commands: vec![DrillCommandStatusOutput {
-                command: "search".to_string(),
-                status: "error".to_string(),
-                duration_ms: 17,
-                artifact: None,
-                error: Some("not found".to_string()),
-            }],
-        };
-        let bridge = DrillBridgeOutput {
-            evidence: unresolved_drill_bridge(
-                &resolved_anchor,
-                &unresolved_anchor,
-                "to anchor was not resolved",
-            ),
-            command: DrillCommandStatusOutput {
-                command: "bridge".to_string(),
-                status: "ok".to_string(),
-                duration_ms: 2,
-                artifact: Some("bridge-1.md".to_string()),
-                error: None,
-            },
-        };
-        let output = DrillOutput {
-            project: "C:/repo".to_string(),
-            label: Some("sample".to_string()),
-            question: Some("How does indexing work?".to_string()),
-            output_dir: "target/drill/sample".to_string(),
-            mechanical: DrillMechanicalOutput {
-                before_files: 1,
-                before_nodes: 10,
-                before_edges: 2,
-                before_errors: 1,
-                after_files: 2,
-                after_nodes: 20,
-                after_edges: 4,
-                after_errors: 0,
-                refresh: "full".to_string(),
-                retrieval: Some(sample_retrieval()),
-                sidecar_retrieval_mode: Some("full".to_string()),
-                freshness: None,
-                phase_timings: Some(sample_phase_timings()),
-                drill_timings: sample_drill_runtime_timings(),
-            },
-            question_search: None,
-            question_supplemental_searches: Vec::new(),
-            anchors: vec![resolved_anchor, unresolved_anchor],
-            bridges: vec![bridge],
-            execution_boundaries: drill_execution_boundaries(),
-            verification_targets: Vec::new(),
-            evidence_packet: EvidencePacketDto {
-                packet_version: 1,
-                question: Some("How does indexing work?".to_string()),
-                items: Vec::new(),
-                readiness: AnswerReadinessReportDto {
-                    overall_status: ClaimReadinessDto::NeedsSourceRead,
-                    safe_to_say: vec!["anchor evidence is available".to_string()],
-                    inferred_claims: vec!["bridge is unresolved".to_string()],
-                    needs_verification: vec!["read the source".to_string()],
-                    next_commands: vec![
-                        "codestory-cli snippet --query WorkspaceIndexer".to_string(),
-                    ],
-                    source_truth_checks: vec![SourceTruthCheckDto {
-                        id: "source-truth-1".to_string(),
-                        reason: "primary source occurrence".to_string(),
-                        path: "src/indexer.rs".to_string(),
-                        line: Some(12),
-                        required: true,
-                    }],
-                },
-            },
-            answer_quality_contract: drill_answer_quality_contract(),
-            claim_ledger_template: DrillClaimLedgerOutput {
-                template_version: 1,
-                instructions: Vec::new(),
-                claims: vec![DrillClaimLedgerEntryOutput {
-                    id: "claim-1".to_string(),
-                    claim: "anchor claim".to_string(),
-                    expected_evidence: Vec::new(),
-                    source_truth_files: vec!["src/indexer.rs".to_string()],
-                    pre_verification_confidence: "medium".to_string(),
-                    classification: None,
-                    changed_after_source_read: None,
-                    correction_note: None,
-                }],
-                scoring: DrillClaimLedgerScoringOutput {
-                    status: "pending_source_verification".to_string(),
-                    pending_claim_count: 1,
-                    correct: 0,
-                    partial: 0,
-                    misleading: 0,
-                    unsupported: 0,
-                    material_revision_count: 0,
-                    score_formula: "manual".to_string(),
-                },
-            },
-            verification_checklist: drill_verification_checklist(),
-            next_commands: Vec::new(),
-        };
-
-        let markdown = render_drill_markdown(&output);
-        assert!(
-            markdown.contains(
-                "drill_timings_ms: total=42 setup=3 question_search=5 anchors=13 supplemental_search=7 bridges=11 evidence_assembly=3"
-            ),
-            "drill report markdown should expose diagnostic runtime timings: {markdown}"
-        );
-        assert!(
-            markdown.contains("search [error duration_ms=17"),
-            "drill report markdown should expose per-command timings: {markdown}"
-        );
-
-        let summary = drill_summary(&output);
-
-        assert_eq!(summary.mechanical.error_delta, -1);
-        assert!(summary.mechanical.index_ready);
-        assert_eq!(summary.anchors.requested, 2);
-        assert_eq!(summary.anchors.resolved, 1);
-        assert_eq!(summary.anchors.unresolved, 1);
-        assert_eq!(summary.anchors.failed_command_count, 1);
-        let missing_anchor = summary
-            .anchors
-            .statuses
-            .iter()
-            .find(|anchor| anchor.anchor == "MissingAnchor")
-            .expect("missing anchor status");
-        assert_eq!(missing_anchor.command_duration_ms, 17);
-        assert_eq!(missing_anchor.slowest_command.as_deref(), Some("search"));
-        assert_eq!(missing_anchor.slowest_command_ms, 17);
-        assert_eq!(summary.bridges.total, 1);
-        assert_eq!(summary.bridges.unresolved_or_error, 1);
-        assert_eq!(summary.mechanical.drill_timings.total_ms, 42);
-        assert_eq!(summary.mechanical.drill_timings.bridge_evidence_ms, 11);
-        assert!(summary.source_truth.required);
-        assert_eq!(summary.source_truth.target_files, vec!["src/indexer.rs"]);
-        assert_eq!(
-            summary.open_gaps.overall_status,
-            ClaimReadinessDto::NeedsSourceRead
-        );
-        assert!(summary.open_gaps.open_gap_friendly);
-        assert_eq!(summary.open_gaps.status, "open_gaps_explicit");
-
-        let from = sample_drill_anchor("FromAnchor", "from");
-        let to = sample_drill_anchor("ToAnchor", "to");
-        let mut failed_bridge_output = output.clone();
-        failed_bridge_output.anchors = vec![from.clone(), to.clone()];
-        failed_bridge_output.bridges = vec![DrillBridgeOutput {
-            evidence: drill_bridge_error(
-                Path::new("C:/repo"),
-                &from,
-                &to,
-                from.chosen_anchor.clone().expect("from"),
-                to.chosen_anchor.clone().expect("to"),
-                "internal",
-                "failed",
-                false,
-            ),
-            command: DrillCommandStatusOutput {
-                command: "bridge".to_string(),
-                status: "error".to_string(),
-                duration_ms: 3,
-                artifact: None,
-                error: Some("failed".to_string()),
-            },
-        }];
-        let failed_summary = drill_summary(&failed_bridge_output);
-        assert!(
-            failed_summary
-                .verdict
-                .next_action
-                .contains("repair or rerun"),
-            "failed bridge commands should not be presented as ordinary verification work: {failed_summary:#?}"
-        );
-    }
-
-    #[test]
-    fn drill_suite_cases_load_manifest_order_and_anchors() {
-        let temp = tempdir().expect("manifest dir");
-        let manifest_path = temp.path().join("agent-drill-cases.json");
-        fs::write(
-            &manifest_path,
-            serde_json::json!({
-                "suite": "generic-agent-drill",
-                "cases": [
-                    {
-                        "slug": "alpha repo",
-                        "project": "alpha-project",
-                        "question": "Explain how alpha works.",
-                        "anchors": [" AlphaRoot ", "", "AlphaStore"]
-                    },
-                    {
-                        "slug": "beta",
-                        "project": "beta-project",
-                        "question": "Explain how beta works.",
-                        "anchors": ["BetaRoot"]
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .expect("write manifest");
-        let owner_root = PathBuf::from("C:/owner");
-        let (suite, cases) =
-            drill_suite_cases_from_manifest(&manifest_path, &owner_root).expect("suite cases");
-
-        assert_eq!(suite, "generic-agent-drill");
-        assert_eq!(
-            cases
-                .iter()
-                .map(|case| case.slug.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha-repo", "beta"]
-        );
-        assert_eq!(cases[0].project_root, temp.path().join("alpha-project"));
-        assert_eq!(cases[1].project_root, temp.path().join("beta-project"));
-        assert_eq!(
-            cases[0].anchors,
-            vec!["AlphaRoot".to_string(), "AlphaStore".to_string()]
-        );
-        assert!(cases[1].question.contains("beta"));
-    }
-
-    #[test]
-    fn drill_jobs_normalize_to_safe_bounded_workers() {
-        assert_eq!(normalize_drill_jobs_with_limit(0, 4), 1);
-        assert_eq!(normalize_drill_jobs_with_limit(4, 16), 4);
-        assert_eq!(normalize_drill_jobs_with_limit(99, 16), MAX_DRILL_JOBS);
-        assert_eq!(normalize_drill_jobs_with_limit(8, 2), 2);
-        assert_eq!(drill_read_only_jobs(4, RefreshMode::Full), 1);
-        assert_eq!(drill_read_only_jobs(4, RefreshMode::Incremental), 1);
-        assert_eq!(drill_read_only_jobs(4, RefreshMode::None), 4);
-        assert_eq!(drill_anchor_jobs(4, RefreshMode::None, 5), 4);
-        assert_eq!(drill_anchor_jobs(4, RefreshMode::None, 1), 1);
-        assert_eq!(drill_anchor_jobs(4, RefreshMode::Full, 5), 1);
-        assert_eq!(drill_anchor_jobs(99, RefreshMode::None, 2), 2);
-        assert_eq!(drill_suite_case_jobs(4, RefreshMode::Full, 3), 1);
-        assert_eq!(drill_suite_case_jobs(4, RefreshMode::None, 3), 3);
-        assert_eq!(drill_suite_case_jobs(4, RefreshMode::None, 1), 1);
-    }
-
-    #[test]
-    fn drill_bridge_neighborhood_file_cache_loads_each_node_once() {
-        let cache = DrillBridgeNeighborhoodFileCache::default();
-        let load_count = std::sync::atomic::AtomicUsize::new(0);
-
-        let first = cache.files_for_key("node-a", || {
-            load_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            HashSet::from(["src/a.rs".to_string()])
-        });
-        let second = cache.files_for_key("node-a", || {
-            load_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            HashSet::from(["src/other.rs".to_string()])
-        });
-        let third = cache.files_for_key("node-b", || {
-            load_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            HashSet::from(["src/b.rs".to_string()])
-        });
-
-        assert_eq!(load_count.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(first, HashSet::from(["src/a.rs".to_string()]));
-        assert_eq!(
-            second,
-            HashSet::from(["src/a.rs".to_string()]),
-            "repeat fallback bridges should reuse the first neighborhood file result"
-        );
-        assert_eq!(third, HashSet::from(["src/b.rs".to_string()]));
-    }
-
-    #[test]
-    fn drill_bridge_pairs_preserve_deterministic_anchor_pair_order() {
-        let anchors = vec![
-            sample_drill_anchor("Alpha", "a"),
-            sample_drill_anchor("Beta", "b"),
-            sample_drill_anchor("Gamma", "c"),
-            sample_drill_anchor("Delta", "d"),
-        ];
-
-        assert_eq!(
-            drill_bridge_pairs(&anchors),
-            vec![(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
-        );
-    }
-
-    #[test]
-    fn drill_suite_manifest_expectations_and_ledger_score_answer_quality() {
-        let temp = tempdir().expect("manifest dir");
-        let manifest_path = temp.path().join("agent-drill-cases.json");
-        fs::write(
-            &manifest_path,
-            serde_json::json!({
-                "suite": "answer-quality-suite",
-                "cases": [
-                    {
-                        "slug": "alpha repo",
-                        "project": "alpha-project",
-                        "question": "Explain the public feed path.",
-                        "anchors": ["Posts", "getElsewhereFeed", "getCommentAuth"],
-                        "expect": {
-                            "source_truth_files": [
-                                "src/app/(frontend)/page.tsx",
-                                "src/components/RootRuntimeHome.tsx",
-                                "src/collections/SocialEntries.ts"
-                            ],
-                            "false_claims": [
-                                "public homepage calls getElsewhereFeed directly"
-                            ],
-                            "min_anchor_resolution": 3,
-                            "allow_partial_bridges": true
-                        }
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .expect("write manifest");
-        let owner_root = PathBuf::from("C:/owner");
-        let (_suite, cases) =
-            drill_suite_cases_from_manifest(&manifest_path, &owner_root).expect("suite cases");
-        let expectations = cases[0].expectations.clone();
-        assert_eq!(expectations.min_anchor_resolution, Some(3));
-        assert_eq!(expectations.allow_partial_bridges, Some(true));
-        assert_eq!(expectations.source_truth_files.len(), 3);
-        assert_eq!(expectations.false_claims.len(), 1);
-
-        let ledger_path = temp.path().join("ledger.json");
-        fs::write(
-            &ledger_path,
-            serde_json::json!({
-                "schema_version": 1,
-                "suite": "answer-quality-suite",
-                "cases": [
-                    {
-                        "slug": "alpha repo",
-                        "draft_written": true,
-                        "claims": [
-                            {
-                                "id": "claim-1",
-                                "text": "Public homepage calls getElsewhereFeed directly.",
-                                "classification": "correct",
-                                "changed_after_source_read": false,
-                                "source_files": ["src/app/(frontend)/page.tsx"]
-                            },
-                            {
-                                "id": "claim-2",
-                                "text": "Comments are persisted through Payload.",
-                                "classification": "partial",
-                                "changed_after_source_read": true,
-                                "source_files": ["src/app/(frontend)/posts/[slug]/comments/route.ts"]
-                            }
-                        ],
-                        "layer_findings": [
-                            {
-                                "layer": "graph_trail",
-                                "status": "partial",
-                                "detail": "component trail was incomplete"
-                            }
-                        ]
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .expect("write ledger");
-        let ledger_cases = drill_suite_ledger_cases(Some(&ledger_path)).expect("ledger cases");
-        let ledger_case = ledger_cases.get("alpha-repo").expect("alpha ledger");
-
-        let mut summary = sample_drill_summary("alpha", "ready", 3, 0, 0);
-        summary.source_truth.target_files = vec![
-            "src/app/(frontend)/page.tsx".to_string(),
-            "src/components/RootRuntimeHome.tsx".to_string(),
-        ];
-        let quality = drill_suite_answer_quality(&summary, &expectations, Some(ledger_case), true);
-
-        assert_eq!(quality.ledger_status, "present");
-        assert_eq!(quality.final_answer_status, "failed");
-        assert_eq!(quality.claim_count, 2);
-        assert_eq!(quality.claim_correct_count, 1);
-        assert_eq!(quality.claim_partial_count, 1);
-        assert_eq!(quality.material_revision_count, 1);
-        assert_eq!(quality.expected_file_count, 3);
-        assert_eq!(quality.expected_file_found_count, 2);
-        assert_eq!(
-            quality.missing_expected_files,
-            vec!["src/collections/SocialEntries.ts"]
-        );
-        assert_eq!(quality.forbidden_claim_count, 1);
-        assert_eq!(quality.layer_findings.len(), 1);
-    }
-
-    #[test]
-    fn drill_suite_answer_quality_stays_pending_without_ledger() {
-        let mut summary = sample_drill_summary("alpha", "degraded", 3, 1, 2);
-        summary.source_truth.target_files = vec!["src/lib.rs".to_string()];
-        let expectations = DrillSuiteExpectationOutput {
-            source_truth_files: vec!["src/lib.rs".to_string()],
-            false_claims: Vec::new(),
-            min_anchor_resolution: Some(3),
-            allow_partial_bridges: None,
-        };
-
-        let quality = drill_suite_answer_quality(&summary, &expectations, None, false);
-
-        assert_eq!(quality.ledger_status, "not_supplied");
-        assert_eq!(quality.final_answer_status, "pending_source_verification");
-        assert_eq!(quality.expected_file_found_count, 1);
-        assert!(
-            quality
-                .warnings
-                .iter()
-                .any(|item| item.contains("no source-truth ledger"))
-        );
-    }
-
-    #[test]
-    fn drill_suite_cache_dir_isolated_per_case_when_explicit() {
-        assert_eq!(drill_suite_case_cache_dir(None, "alpha"), None);
-        assert_eq!(
-            drill_suite_case_cache_dir(Some(Path::new("C:/cache/codestory-suite")), "beta/runtime"),
-            Some(PathBuf::from("C:/cache/codestory-suite/beta-runtime"))
-        );
-    }
-
-    #[test]
-    fn drill_suite_progress_messages_include_repo_index_and_verdict() {
-        let case = DrillSuiteCase {
-            slug: "alpha".to_string(),
-            project_root: PathBuf::from("C:/repos/alpha"),
-            question: "Explain how alpha indexes.".to_string(),
-            anchors: vec!["AlphaRoot".to_string(), "AlphaStore".to_string()],
-            expectations: empty_drill_suite_expectations(),
-        };
-        let start = drill_suite_repo_progress_start_message(
-            1,
-            3,
-            &case,
-            Path::new("target/drill-suite/alpha-drill"),
-        );
-        assert!(start.contains("[1/3] start alpha"));
-        assert!(start.contains("C:/repos/alpha"));
-        assert!(start.contains("target/drill-suite/alpha-drill"));
-
-        let repo = sample_drill_suite_repo("alpha", "degraded", 3, 1, 4);
-        let done = drill_suite_repo_progress_done_message(1, 3, "alpha", &repo.summary);
-        assert!(done.contains("[1/3] done alpha"));
-        assert!(done.contains("verdict=degraded"));
-        assert!(done.contains("anchors=3/3"));
-        assert!(done.contains("bridges=graph:2 partial:0 unresolved:1"));
-    }
-
-    #[test]
-    fn drill_suite_markdown_summarizes_verdicts_and_source_truth() {
-        let mut output = DrillSuiteOutput {
-            suite: "generic-agent-drill".to_string(),
-            project: "C:/repos/owner".to_string(),
-            case_file: "C:/repos/owner/drill-cases.json".to_string(),
-            output_dir: "target/drill-suite".to_string(),
-            repo_count: 2,
-            degraded_count: 1,
-            blocked_count: 1,
-            ready_count: 0,
-            answer_ready_count: 0,
-            answer_degraded_count: 0,
-            answer_failed_count: 0,
-            answer_pending_count: 2,
-            repos: vec![
-                sample_drill_suite_repo("alpha", "degraded", 3, 1, 4),
-                sample_drill_suite_repo("beta", "blocked", 0, 0, 2),
-            ],
-            next_actions: vec![
-                "alpha: Read source truth files named by the drill.".to_string(),
-                "beta: Re-run after fixing index failure.".to_string(),
-            ],
-            retrieval_blockers: Vec::new(),
-        };
-        output.repos[0].summary.bridges.graph_path = 0;
-        output.repos[0].summary.bridges.partial = 2;
-
-        let markdown = render_drill_suite_markdown(&output);
-
-        assert!(markdown.contains("- repos: 2 total, 0 ready, 1 degraded, 1 blocked"));
-        assert!(markdown.contains("- answer_quality: 0 ready, 0 degraded, 0 failed, 2 pending"));
-        assert!(markdown.contains("| source truth | reports | next action |"));
-        assert!(markdown.contains("| `alpha` | degraded | pending_source_verification"));
-        assert!(markdown.contains("| `beta` | blocked | pending_source_verification"));
-        assert!(markdown.contains("## Repo Artifacts"));
-        assert!(markdown.contains("`alpha`: report `target/drill-suite/alpha/drill-report.md`; json `target/drill-suite/alpha/drill-report.json`; bridge artifacts `target/drill-suite/alpha/*-bridge.json`"));
-        assert!(markdown.contains("## Next Actions"));
-        assert!(markdown.contains("beta: Re-run after fixing index failure."));
-    }
-
-    #[test]
-    fn drill_suite_markdown_uses_ledger_ready_next_action() {
-        let mut repo = sample_drill_suite_repo("alpha", "degraded", 3, 0, 4);
-        repo.summary.bridges.graph_path = 0;
-        repo.summary.bridges.partial = 3;
-        repo.answer_quality = sample_drill_suite_answer_quality("ready");
-        repo.answer_quality.ledger_status = "present".to_string();
-        repo.answer_quality.draft_written = Some(true);
-        repo.answer_quality.claim_count = 3;
-        repo.answer_quality.claim_correct_count = 3;
-        let next_action = format!("{}: {}", repo.slug, drill_suite_next_action(&repo));
-        let output = DrillSuiteOutput {
-            suite: "generic-agent-drill".to_string(),
-            project: "C:/repos/owner".to_string(),
-            case_file: "C:/repos/owner/drill-cases.json".to_string(),
-            output_dir: "target/drill-suite".to_string(),
-            repo_count: 1,
-            degraded_count: 1,
-            blocked_count: 0,
-            ready_count: 0,
-            answer_ready_count: 1,
-            answer_degraded_count: 0,
-            answer_failed_count: 0,
-            answer_pending_count: 0,
-            repos: vec![repo],
-            next_actions: vec![next_action],
-            retrieval_blockers: Vec::new(),
-        };
-
-        let markdown = render_drill_suite_markdown(&output);
-
-        assert!(markdown.contains("- answer_quality: 1 ready, 0 degraded, 0 failed, 0 pending"));
-        assert!(markdown.contains("ledger claims=3 correct=3 partial=0 misleading=0 unsupported=0 revisions=0; packet 1 targets / 4 pending"));
-        assert!(markdown.contains("answer is source-verified; improve graph/bridge evidence"));
-        assert!(!markdown.contains("Read source truth files named by the drill."));
-    }
-
-    #[test]
-    fn drill_suite_blocked_case_reports_case_local_failure() {
-        let case = DrillSuiteCase {
-            slug: "alpha".to_string(),
-            project_root: PathBuf::from("C:/repos/alpha"),
-            question: "Explain alpha.".to_string(),
-            anchors: vec!["AlphaRoot".to_string(), "AlphaStore".to_string()],
-            expectations: empty_drill_suite_expectations(),
-        };
-
-        let repo = blocked_drill_suite_repo_output(
-            &case,
-            Path::new("target/drill-suite/alpha-drill"),
-            RefreshMode::Full,
-            args::OutputFormat::Markdown,
-            "missing checkout",
-            None,
-            false,
-        );
-
-        assert_eq!(repo.slug, "alpha");
-        assert_eq!(repo.artifact_extension, "md");
-        assert_eq!(repo.summary.verdict.status, "blocked");
-        assert_eq!(repo.summary.anchors.requested, 2);
-        assert_eq!(repo.summary.anchors.resolved, 0);
-        assert_eq!(repo.summary.anchors.unresolved, 2);
-        assert!(
-            repo.summary
-                .verdict
-                .next_action
-                .contains("missing checkout")
-        );
-    }
-
-    #[test]
-    fn drill_suite_retrieval_blockers_group_non_hybrid_repos() {
-        let mut output = DrillSuiteOutput {
-            suite: "generic-agent-drill".to_string(),
-            project: "C:/repos/owner".to_string(),
-            case_file: "C:/repos/owner/drill-cases.json".to_string(),
-            output_dir: "target/drill-suite".to_string(),
-            repo_count: 3,
-            degraded_count: 2,
-            blocked_count: 0,
-            ready_count: 1,
-            answer_ready_count: 0,
-            answer_degraded_count: 0,
-            answer_failed_count: 0,
-            answer_pending_count: 3,
-            repos: vec![
-                sample_drill_suite_repo("alpha", "degraded", 3, 1, 4),
-                sample_drill_suite_repo("beta", "ready", 3, 0, 4),
-                sample_drill_suite_repo("gamma", "degraded", 3, 1, 4),
-            ],
-            next_actions: Vec::new(),
-            retrieval_blockers: Vec::new(),
-        };
-        output.repos[0].summary.mechanical.retrieval_status =
-            Some("symbolic:semantic_unavailable:diagnostic=MissingEmbeddingRuntime".to_string());
-        output.repos[1].summary.mechanical.retrieval_status = Some("full".to_string());
-        output.repos[2].summary.mechanical.retrieval_status =
-            Some("symbolic:semantic_unavailable:diagnostic=MissingEmbeddingRuntime".to_string());
-
-        output.retrieval_blockers = drill_suite_retrieval_blockers(&output.repos);
-
-        assert_eq!(output.retrieval_blockers.len(), 1);
-        let blocker = &output.retrieval_blockers[0];
-        assert_eq!(
-            blocker.status,
-            "symbolic:semantic_unavailable:diagnostic=MissingEmbeddingRuntime"
-        );
-        assert_eq!(blocker.repo_count, 2);
-        assert_eq!(blocker.repos, vec!["alpha", "gamma"]);
-        assert!(blocker.next_action.contains("retrieval bootstrap"));
-        assert!(!blocker.next_action.contains("setup embeddings"));
-
-        let markdown = render_drill_suite_markdown(&output);
-        assert!(markdown.contains("## Retrieval Blockers"));
-        assert!(markdown.contains("MissingEmbeddingRuntime"));
-        assert!(markdown.contains("[alpha, gamma]"));
-        assert!(!markdown.contains("beta]"));
-    }
-
-    #[test]
-    fn drill_suite_retrieval_label_requires_full_sidecar_mode() {
-        assert_eq!(drill_suite_retrieval_label(Some("full")), "full");
-        assert_eq!(
-            drill_suite_retrieval_label(Some("hybrid:semantic_ready")),
-            "degraded"
-        );
-        assert_eq!(
-            drill_suite_retrieval_label(Some(
-                "no_semantic:sidecar_degraded; legacy=hybrid:semantic_ready"
-            )),
-            "needs-retrieval-repair"
-        );
-    }
-
-    fn sample_drill_suite_repo(
-        slug: &str,
-        verdict: &str,
-        bridge_total: usize,
-        bridge_unresolved: usize,
-        source_check_count: usize,
-    ) -> DrillSuiteRepoOutput {
-        DrillSuiteRepoOutput {
-            slug: slug.to_string(),
-            project: format!("C:/repos/{slug}"),
-            question: format!("Question for {slug}"),
-            anchors: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            output_dir: format!("target/drill-suite/{slug}"),
-            artifact_extension: "json".to_string(),
-            summary: sample_drill_summary(
-                slug,
-                verdict,
-                bridge_total,
-                bridge_unresolved,
-                source_check_count,
-            ),
-            expectations: empty_drill_suite_expectations(),
-            answer_quality: sample_drill_suite_answer_quality("pending_source_verification"),
-        }
-    }
-
-    fn sample_drill_suite_answer_quality(status: &str) -> DrillSuiteAnswerQualityOutput {
-        DrillSuiteAnswerQualityOutput {
-            ledger_status: "not_supplied".to_string(),
-            final_answer_status: status.to_string(),
-            draft_written: None,
-            claim_count: 0,
-            claim_correct_count: 0,
-            claim_partial_count: 0,
-            claim_misleading_count: 0,
-            claim_unsupported_count: 0,
-            claim_unclassified_count: 0,
-            material_revision_count: 0,
-            expected_file_count: 0,
-            expected_file_found_count: 0,
-            expected_file_missing_count: 0,
-            expected_file_recall: None,
-            missing_expected_files: Vec::new(),
-            forbidden_claim_count: 0,
-            forbidden_claim_hits: Vec::new(),
-            layer_findings: Vec::new(),
-            warnings: Vec::new(),
-        }
-    }
-
-    fn sample_drill_summary(
-        slug: &str,
-        verdict: &str,
-        bridge_total: usize,
-        bridge_unresolved: usize,
-        source_check_count: usize,
-    ) -> DrillSummaryOutput {
-        DrillSummaryOutput {
-            summary_version: 1,
-            project: format!("C:/repos/{slug}"),
-            label: Some(slug.to_string()),
-            question: Some(format!("Question for {slug}")),
-            output_dir: format!("target/drill-suite/{slug}"),
-            full_report_json: format!("target/drill-suite/{slug}/drill-report.json"),
-            full_report_markdown: format!("target/drill-suite/{slug}/drill-report.md"),
-            mechanical: DrillSummaryMechanicalOutput {
-                refresh: "none".to_string(),
-                before: drill_summary_stats(1, 2, 3, 0),
-                after: drill_summary_stats(1, 2, 3, 0),
-                index_ready: verdict != "blocked",
-                error_delta: 0,
-                retrieval_status: Some("full".to_string()),
-                freshness_status: Some("fresh".to_string()),
-                stale_file_count: 0,
-                freshness_samples: Vec::new(),
-                phase_timing_available: true,
-                drill_timings: DrillRuntimeTimingsOutput::default(),
-            },
-            anchors: DrillSummaryAnchorsOutput {
-                requested: 3,
-                resolved: 3,
-                unresolved: 0,
-                failed_command_count: 0,
-                statuses: Vec::new(),
-            },
-            bridges: DrillSummaryBridgesOutput {
-                total: bridge_total,
-                graph_path: bridge_total.saturating_sub(bridge_unresolved),
-                partial: 0,
-                unresolved_or_error: bridge_unresolved,
-                statuses: Vec::new(),
-            },
-            source_truth: DrillSummarySourceTruthOutput {
-                required: true,
-                check_count: source_check_count,
-                pending_check_count: source_check_count,
-                verified_check_count: 0,
-                target_file_count: 1,
-                target_files: vec![format!("src/{slug}.rs")],
-                target_file_details: Vec::new(),
-                checklist_item_count: 4,
-                claim_count: 3,
-                pending_claim_count: 3,
-                verified_claim_count: 0,
-            },
-            open_gaps: DrillSummaryOpenGapsOutput {
-                overall_status: ClaimReadinessDto::NeedsSourceRead,
-                safe_to_say_count: 1,
-                inferred_claim_count: 1,
-                needs_verification_count: source_check_count,
-                needs_verification_claim_count: source_check_count,
-                pending_source_truth_check_count: source_check_count,
-                next_command_count: 1,
-                answer_quality_status: "pending_source_verification".to_string(),
-                pending_claim_count: 3,
-                open_gap_friendly: true,
-                status: "open_gaps_explicit".to_string(),
-            },
-            verdict: DrillSummaryVerdictOutput {
-                status: verdict.to_string(),
-                reason: "sample".to_string(),
-                next_action: "Read source truth files named by the drill.".to_string(),
-            },
-        }
-    }
-
-    #[test]
-    fn drill_evidence_packet_marks_partial_readiness_and_source_checks() {
-        let mut anchor = sample_drill_anchor("WorkspaceIndexer", "a");
-        anchor.commands.push(DrillCommandStatusOutput {
-            command: "search".to_string(),
-            status: "ok".to_string(),
-            duration_ms: 19,
-            artifact: Some("WorkspaceIndexer-search.md".to_string()),
-            error: None,
-        });
-        anchor.verification_targets.push(VerificationTargetOutput {
-            role: "definition".to_string(),
-            path: "crates/codestory-indexer/src/lib.rs".to_string(),
-            line: 644,
-            node_ref: Some("crates/codestory-indexer/src/lib.rs:644:WorkspaceIndexer".to_string()),
-            reason: "selected symbol definition".to_string(),
-        });
-        let bridge = DrillBridgeOutput {
-            evidence: fallback_drill_bridge(
-                Path::new("C:/repo"),
-                &anchor,
-                &sample_drill_anchor("SearchService", "b"),
-                anchor.chosen_anchor.clone().expect("from"),
-                sample_search_hit_output("b", "SearchService"),
-                &sample_bridge_trail(false),
-                Vec::new(),
-                false,
-            ),
-            command: DrillCommandStatusOutput {
-                command: "bridge".to_string(),
-                status: "ok".to_string(),
-                duration_ms: 2,
-                artifact: Some("bridge.md".to_string()),
-                error: None,
-            },
-        };
-        let next_commands = vec![
-            "codestory-cli search --project C:/repo --query WorkspaceIndexer --refresh none"
-                .to_string(),
-        ];
-
-        let packet = drill_evidence_packet(
-            Some("How does indexing flow?"),
-            None,
-            &[],
-            &[anchor.clone()],
-            &[bridge],
-            &anchor.verification_targets,
-            &next_commands,
-        );
-
-        assert_eq!(packet.packet_version, 1);
-        assert!(
-            packet.items.iter().any(|item| item.id == "anchor-1"
-                && item.verification_status == ClaimReadinessDto::Anchored)
-        );
-        assert!(packet.items.iter().any(|item| item.id == "bridge-1"
-            && item.verification_status == ClaimReadinessDto::NeedsSourceRead));
-        assert_eq!(
-            packet.readiness.overall_status,
-            ClaimReadinessDto::NeedsSourceRead
-        );
-        assert_eq!(
-            packet.readiness.source_truth_checks.len(),
-            2,
-            "source-truth checks should group repeated bridge endpoint files: {packet:#?}"
-        );
-        assert!(
-            packet
-                .readiness
-                .source_truth_checks
-                .iter()
-                .any(|check| check.reason.contains("bridge endpoint")),
-            "grouped source-truth checks should preserve bridge endpoint role: {packet:#?}"
-        );
-        assert_eq!(packet.readiness.next_commands, next_commands);
-    }
-
-    #[test]
-    fn drill_evidence_packet_requires_source_truth_targets() {
-        let anchor = sample_drill_anchor("WorkspaceIndexer", "a");
-
-        let packet = drill_evidence_packet(None, None, &[], &[anchor], &[], &[], &[]);
-
-        assert_eq!(
-            packet.readiness.overall_status,
-            ClaimReadinessDto::NeedsSourceRead
-        );
-        assert!(
-            packet
-                .readiness
-                .needs_verification
-                .iter()
-                .any(|item| item.contains("no source-truth targets were emitted"))
-        );
-    }
-
-    #[test]
-    fn drill_answer_readiness_requires_pending_source_truth_checks() {
-        let item = EvidenceItemDto {
-            id: "symbol-1".to_string(),
-            evidence_type: EvidenceTypeDto::SymbolContext,
-            command: "symbol".to_string(),
-            status: "ok".to_string(),
-            confidence: "high".to_string(),
-            verification_status: ClaimReadinessDto::Supported,
-            match_quality: None,
-            source: None,
-            artifacts: Vec::new(),
-            notes: Vec::new(),
-        };
-        let check = SourceTruthCheckDto {
-            id: "source-truth-1".to_string(),
-            reason: "verify definition evidence".to_string(),
-            path: "src/lib.rs".to_string(),
-            line: Some(12),
-            required: true,
-        };
-
-        let readiness = drill_answer_readiness(&[item], &[check], &[]);
-
-        assert_eq!(readiness.overall_status, ClaimReadinessDto::NeedsSourceRead);
-        assert!(
-            readiness
-                .needs_verification
-                .iter()
-                .any(|item| item.contains("required source-truth checks are pending"))
-        );
-    }
-
-    #[test]
-    fn drill_anchor_validation_rejects_empty_after_normalization() {
-        let error =
-            drill_targeting::validated_drill_anchors(&[",, ,".to_string()], "drill").unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("drill must name at least one anchor"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn drill_anchor_selection_does_not_guess_semantic_neighbors() {
-        let neighbor = sample_runtime_hit(
-            "neighbor",
-            "ElsewhereFeedProps",
-            NodeKind::TYPEDEF,
-            Path::new("src/components/ElsewhereFeed.tsx"),
-            1,
-        );
-
-        assert!(drill_targeting::choose_drill_anchor_hit("ElsewherePage", &[neighbor]).is_none());
-    }
-
-    #[test]
-    fn drill_question_search_is_partial_discovery_evidence() {
-        let question_search = DrillCommandStatusOutput {
-            command: "question_search".to_string(),
-            status: "ok".to_string(),
-            duration_ms: 23,
-            artifact: Some("question-search.md".to_string()),
-            error: None,
-        };
-
-        let packet = drill_evidence_packet(
-            Some("How does the public page connect to the feed?"),
-            Some(&question_search),
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-        );
-
-        let question_item = packet
-            .items
-            .iter()
-            .find(|item| item.id == "question-search")
-            .expect("question search evidence item");
-        assert_eq!(
-            question_item.verification_status,
-            ClaimReadinessDto::Partial
-        );
-        assert!(
-            question_item
-                .notes
-                .iter()
-                .any(|note| note.contains("broad discovery evidence")),
-            "question search should not look like proof: {question_item:#?}"
-        );
-    }
-
-    #[test]
-    fn drill_question_search_targets_runtime_files_without_claiming_proof() {
-        let mut page = sample_search_hit_output("page", "HomePage");
-        page.file_path = Some("src/app/(frontend)/page.tsx".to_string());
-        page.line = Some(11);
-        page.match_quality = SearchMatchQualityDto::Prefix;
-        page.verification_targets = vec![VerificationTargetOutput {
-            role: "definition".to_string(),
-            path: "src/app/(frontend)/page.tsx".to_string(),
-            line: 11,
-            node_ref: Some("src/app/(frontend)/page.tsx:11:HomePage".to_string()),
-            reason: "primary source occurrence selected for this symbol".to_string(),
-        }];
-        let mut component = sample_search_hit_output("home", "RootRuntimeHome");
-        component.file_path = Some("src/components/RootRuntimeHome.tsx".to_string());
-        component.line = Some(237);
-        component.match_quality = SearchMatchQualityDto::Prefix;
-        component.verification_targets = vec![VerificationTargetOutput {
-            role: "definition".to_string(),
-            path: "src/components/RootRuntimeHome.tsx".to_string(),
-            line: 237,
-            node_ref: Some("src/components/RootRuntimeHome.tsx:237:RootRuntimeHome".to_string()),
-            reason: "primary source occurrence selected for this symbol".to_string(),
-        }];
-        let mut collection = sample_search_hit_output("comments", "Comments");
-        collection.file_path = Some("src/collections/Comments.ts".to_string());
-        collection.line = Some(11);
-        collection.verification_targets = vec![VerificationTargetOutput {
-            role: "definition".to_string(),
-            path: "src/collections/Comments.ts".to_string(),
-            line: 11,
-            node_ref: Some("src/collections/Comments.ts:11:Comments".to_string()),
-            reason: "primary source occurrence selected for this symbol".to_string(),
-        }];
-        let mut lockfile = sample_search_hit_output("lock", "Cargo.lock");
-        lockfile.file_path = Some("Cargo.lock".to_string());
-        lockfile.line = Some(1);
-
-        let output = SearchOutput {
-            query: "How do public pages connect to comments?".to_string(),
-            retrieval: sample_retrieval(),
-            retrieval_shadow: None,
-            freshness: None,
-            limit_per_source: 10,
-            repo_text_mode: RepoTextMode::On,
-            repo_text_enabled: true,
-            query_assessment: None,
-            search_plan: None,
-            explain: true,
-            query_hints: Vec::new(),
-            suggestions: Vec::new(),
-            indexed_symbol_hits: vec![lockfile, collection, component, page],
-            repo_text_hits: Vec::new(),
-            repo_text_stats: None,
-        };
-
-        let targets = drill_question_search_verification_targets(
-            &output,
-            "question search source-truth target",
-            8,
-        );
-        let paths = targets
-            .iter()
-            .map(|target| target.path.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            paths,
-            vec![
-                "src/app/(frontend)/page.tsx",
-                "src/components/RootRuntimeHome.tsx",
-                "src/collections/Comments.ts",
-            ]
-        );
-        assert!(
-            targets.iter().all(|target| target
-                .reason
-                .contains("question search source-truth target")),
-            "question-derived targets must stay explicitly provisional: {targets:#?}"
-        );
-    }
-
-    #[test]
-    fn drill_question_supplemental_queries_cover_public_payload_and_store_terms() {
-        let mut posts = sample_drill_anchor("Posts", "posts");
-        posts.chosen_anchor.as_mut().expect("anchor").file_path =
-            Some("src/collections/Posts.ts".to_string());
-
-        let queries = drill_question_supplemental_queries(
-            Path::new("C:/repo/codestory"),
-            "Explain how public writing/social surfaces connect to Payload collections, comment auth, and the elsewhere feed.",
-            &[posts],
-        );
-
-        assert!(queries.iter().any(|query| query == "Home"));
-        assert!(queries.iter().any(|query| query == "Comments"));
-        assert!(queries.iter().any(|query| query == "Posts"));
-        assert!(queries.iter().any(|query| query == "social entries"));
-        assert!(queries.iter().any(|query| query == "elsewhere feed"));
-
-        let store_queries = drill_question_supplemental_queries(
-            Path::new("C:/repo/codestory"),
-            "Explain how the indexer store supports search, trail, and snippet.",
-            &[],
-        );
-        assert!(store_queries.iter().any(|query| query == "codestory-store"));
-        assert!(store_queries.iter().any(|query| query == "Store"));
     }
 
     #[test]
@@ -17841,265 +12115,6 @@ mod tests {
             cache_root.ends_with(&fnv1a_hex(b"C:/repo")),
             "default cache root should end with the project hash"
         );
-    }
-
-    #[test]
-    fn resolution_prefers_exact_type_name_over_member_hits() {
-        let query = "AppController";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("2".to_string()),
-                display_name: "AppController::open_project".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: None,
-                line: None,
-                score: 0.9,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("1".to_string()),
-                display_name: "AppController".to_string(),
-                kind: codestory_contracts::api::NodeKind::CLASS,
-                file_path: None,
-                line: None,
-                score: 0.9,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].display_name, "AppController");
-    }
-
-    #[test]
-    fn resolution_prefers_declaration_anchor_over_impl_anchor() {
-        let temp = tempdir().expect("create temp dir");
-        let file_path = temp.path().join("lib.rs");
-        fs::write(
-            &file_path,
-            "pub struct AppController;\nimpl AppController {\n    fn open_project(&self) {}\n}\n",
-        )
-        .expect("write file");
-
-        let query = "AppController";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("2".to_string()),
-                display_name: "AppController".to_string(),
-                kind: codestory_contracts::api::NodeKind::CLASS,
-                file_path: Some(file_path.to_string_lossy().to_string()),
-                line: Some(2),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("1".to_string()),
-                display_name: "AppController".to_string(),
-                kind: codestory_contracts::api::NodeKind::STRUCT,
-                file_path: Some(file_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].line, Some(1));
-        assert_eq!(hits[0].kind, codestory_contracts::api::NodeKind::STRUCT);
-    }
-
-    #[test]
-    fn resolution_prefers_callable_definitions_over_unknown_hits() {
-        let query = "check_winner";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("2".to_string()),
-                display_name: "check_winner".to_string(),
-                kind: codestory_contracts::api::NodeKind::UNKNOWN,
-                file_path: Some("src/callsite.rs".to_string()),
-                line: Some(20),
-                score: 0.9,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("1".to_string()),
-                display_name: "check_winner".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some("src/game.rs".to_string()),
-                line: Some(10),
-                score: 0.8,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].kind, codestory_contracts::api::NodeKind::FUNCTION);
-    }
-
-    #[test]
-    fn resolution_prefers_callable_implementation_over_declaration() {
-        let temp = tempdir().expect("create temp dir");
-        let declaration_path = temp.path().join("Project.h");
-        let implementation_path = temp.path().join("Project.cpp");
-        fs::write(&declaration_path, "void buildIndex() const;\n").expect("write declaration");
-        fs::write(
-            &implementation_path,
-            "void Project::buildIndex() const\n{\n    runIndexer();\n}\n",
-        )
-        .expect("write implementation");
-
-        let query = "Project::buildIndex";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("declaration".to_string()),
-                display_name: "Project::buildIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::METHOD,
-                file_path: Some(declaration_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("implementation".to_string()),
-                display_name: "Project::buildIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some(implementation_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].node_id.0, "implementation");
-    }
-
-    #[test]
-    fn resolution_prefers_multiline_callable_implementation_over_declaration() {
-        let temp = tempdir().expect("create temp dir");
-        let declaration_path = temp.path().join("IndexerJava.h");
-        let implementation_path = temp.path().join("IndexerJava.cpp");
-        fs::write(
-            &declaration_path,
-            "void doIndex(\n    Command command,\n    State state) override;\n",
-        )
-        .expect("write declaration");
-        fs::write(
-            &implementation_path,
-            "void IndexerJava::doIndex(\n    Command command,\n    State state)\n{\n    parse(command);\n}\n",
-        )
-        .expect("write implementation");
-
-        let query = "IndexerJava::doIndex";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("declaration".to_string()),
-                display_name: "IndexerJava::doIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::METHOD,
-                file_path: Some(declaration_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("implementation".to_string()),
-                display_name: "IndexerJava::doIndex".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some(implementation_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].node_id.0, "implementation");
-    }
-
-    #[test]
-    fn resolution_keeps_callable_implementation_when_body_contains_assignment() {
-        let temp = tempdir().expect("create temp dir");
-        let declaration_path = temp.path().join("Foo.h");
-        let implementation_path = temp.path().join("Foo.cpp");
-        fs::write(&declaration_path, "void bar();\n").expect("write declaration");
-        fs::write(
-            &implementation_path,
-            "void Foo::bar()\n{\n    int status = 0;\n    use(status);\n}\n",
-        )
-        .expect("write implementation");
-
-        let query = "Foo::bar";
-        let mut hits = [
-            SearchHit {
-                node_id: NodeId("declaration".to_string()),
-                display_name: "Foo::bar".to_string(),
-                kind: codestory_contracts::api::NodeKind::METHOD,
-                file_path: Some(declaration_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-            SearchHit {
-                node_id: NodeId("implementation".to_string()),
-                display_name: "Foo::bar".to_string(),
-                kind: codestory_contracts::api::NodeKind::FUNCTION,
-                file_path: Some(implementation_path.to_string_lossy().to_string()),
-                line: Some(1),
-                score: 1.0,
-                origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-                match_quality: None,
-                resolvable: true,
-                score_breakdown: None,
-                ..test_search_hit_defaults()
-            },
-        ];
-
-        hits.sort_by(|left, right| compare_resolution_hits(query, left, right));
-        assert_eq!(hits[0].node_id.0, "implementation");
     }
 
     fn sample_runtime_hit(

@@ -284,7 +284,6 @@ fn top_level_help_names_command_purposes() {
             "smoke",
             "Run a machine-readable smoke profile for CI and agent images.",
         ),
-        ("setup", "Install or check local setup assets."),
         ("cache", "Prepare or inspect local cache artifacts."),
         ("symbol", "Inspect a symbol by query or id."),
         (
@@ -299,6 +298,30 @@ fn top_level_help_names_command_purposes() {
             "top-level help should show {command:?} purpose {purpose:?}, not only command names:\n{help_text}"
         );
     }
+}
+
+#[test]
+fn removed_setup_embeddings_command_is_rejected() {
+    let help = test_support::cli_command()
+        .arg("--help")
+        .output()
+        .expect("run top-level help");
+    assert!(help.status.success());
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(!stdout.contains("setup"), "{stdout}");
+    assert!(!stdout.contains("embeddings"), "{stdout}");
+
+    let output = test_support::cli_command()
+        .args(["setup", "embeddings"])
+        .output()
+        .expect("run removed setup command");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand 'setup'"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -519,7 +542,7 @@ fn cache_identity_json_reports_canonical_contract_fields() {
             "remote",
             "add",
             "origin",
-            "git@github.com:TheGreenCedar/CodeStory.git",
+            "ssh://git@EXAMPLE.com:2222/TheGreenCedar/CodeStory.git",
         ],
     );
     git(workspace.path(), &["add", "."]);
@@ -535,14 +558,31 @@ fn cache_identity_json_reports_canonical_contract_fields() {
 
     assert_eq!(
         json["normalized_repository_identity"],
-        "github.com/thegreencedar/codestory"
+        "ssh://example.com:2222/TheGreenCedar/CodeStory"
     );
-    assert_eq!(json["repository_identity_schema_version"], 1);
+    assert_eq!(json["repository_identity_schema_version"], 2);
+    assert_eq!(json["project_identity_schema_version"], 3);
+    assert!(
+        json["project_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("repo-v2-"))
+    );
+    assert!(
+        json["workspace_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(json["artifact_scope_id"], json["project_id"]);
+    assert_eq!(
+        json["legacy_alias_disposition"],
+        "unavailable_without_provenance"
+    );
+    assert_eq!(json["legacy_project_id"], serde_json::Value::Null);
     assert_eq!(json["portable_reuse_eligible"], true);
     assert!(
         json["canonical_repository_id"]
             .as_str()
-            .is_some_and(|value| value.starts_with("repo-v1-"))
+            .is_some_and(|value| value.starts_with("repo-v2-"))
     );
     assert!(json["root_derived_project_id"].as_str().is_some());
     assert!(json["git_tree"].as_str().is_some());

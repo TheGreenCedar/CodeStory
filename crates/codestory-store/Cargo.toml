@@ -1,11 +1,12 @@
 [package]
 name = "codestory-store"
-version = "0.14.3"
+version = "0.15.0"
 edition = "2024"
 
 [dependencies]
 codestory-contracts = { workspace = true }
 anyhow = { workspace = true }
+fs4 = { workspace = true }
 parking_lot = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

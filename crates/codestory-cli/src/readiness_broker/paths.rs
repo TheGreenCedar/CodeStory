@@ -94,7 +94,7 @@ pub(crate) fn install_id() -> String {
 
 #[cfg(not(test))]
 pub(crate) fn broker_cache_root() -> PathBuf {
-    codestory_retrieval::SidecarRuntimeConfig::local()
+    crate::sidecar_runtime::local()
         .layout
         .state_file
         .parent()
@@ -104,6 +104,7 @@ pub(crate) fn broker_cache_root() -> PathBuf {
 
 #[cfg(test)]
 pub(crate) fn broker_cache_root() -> PathBuf {
+    crate::sidecar_runtime::prepare_cache_access();
     if let Some(root) = codestory_retrieval::active_test_cache_root() {
         return root;
     }

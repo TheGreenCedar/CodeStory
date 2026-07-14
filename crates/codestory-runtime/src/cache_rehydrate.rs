@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use codestory_store::{CURRENT_SCHEMA_VERSION, Store};
-use codestory_workspace::{RefreshInputs, WorkspaceInventory, WorkspaceManifest};
+use codestory_workspace::{
+    RefreshInputs, WorkspaceInventory, WorkspaceInventoryOutcome, WorkspaceManifest,
+};
 use serde::Serialize;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -289,12 +291,19 @@ fn source_cache_freshness(project: &Path, source_db: &Path) -> Result<SourceCach
     {
         bail!("source cache has an incomplete incremental index run");
     }
-    let plan = workspace
-        .build_execution_plan(&RefreshInputs {
+    let refresh = workspace
+        .build_execution_outcome(&RefreshInputs {
             stored_files: storage.files().inventory()?,
             inventory: WorkspaceInventory::default(),
         })
         .context("build source cache refresh plan")?;
+    if refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
+        bail!(
+            "source workspace inventory is {:?}; cache freshness cannot be proven",
+            refresh.inventory_outcome
+        );
+    }
+    let plan = refresh.plan;
     Ok(SourceCacheFreshness {
         changed_or_new_files: plan.files_to_index.len(),
         removed_files: plan.files_to_remove.len(),
@@ -539,7 +548,7 @@ fn retrieval_rehydrate_status(dry_run: bool) -> String {
 }
 
 fn retrieval_rehydrate_reason() -> String {
-    "cache rehydrate copies SQLite graph/search/doc state only; sidecar manifests and Zoekt/Qdrant/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
+    "cache rehydrate copies SQLite graph/search/doc state only; sidecar manifests and Lexical/Qdrant/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
 }
 
 fn retrieval_rehydrate_policy(dry_run: bool) -> String {
@@ -549,7 +558,7 @@ fn retrieval_rehydrate_policy(dry_run: bool) -> String {
         "invalidated"
     };
     format!(
-        "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests {action} because cache rehydrate copies SQLite cache state only; Zoekt/Qdrant/SCIP sidecar directories live outside the copied cache and must be revalidated by retrieval index before reuse"
+        "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests {action} because cache rehydrate copies SQLite cache state only; Lexical/Qdrant/SCIP sidecar directories live outside the copied cache and must be revalidated by retrieval index before reuse"
     )
 }
 
@@ -1083,7 +1092,7 @@ mod tests {
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: codestory_retrieval::project_id_for_root(project),
-                zoekt_version: "zoekt-real-v1".into(),
+                lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
                 qdrant_collection: "codestory_old".into(),
                 scip_revision: None,
                 built_at_epoch_ms: 1,

@@ -3,26 +3,16 @@ use crate::symbol_query::RetrievalFileRole;
 use crate::symbol_query::query_mentions_non_primary_source;
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::graph::NodeId;
+use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use fs4::fs_std::FileExt;
-use ndarray::Array2;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
-use ort::{
-    ep, inputs,
-    session::{Session, builder::GraphOptimizationLevel},
-    value::TensorRef,
-};
-use parking_lot::Mutex;
 use rayon::prelude::*;
-use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::doc;
 use tantivy::query::QueryParser;
@@ -33,7 +23,6 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 pub const EMBEDDING_DIM: usize = 384;
 const SEARCH_WRITER_HEAP_BYTES: usize = 20_000_000;
 pub const EMBEDDING_MODEL_ID_ENV: &str = "CODESTORY_EMBED_MODEL_ID";
-pub const EMBEDDING_MAX_TOKENS_ENV: &str = "CODESTORY_EMBED_MAX_TOKENS";
 pub const EMBEDDING_RUNTIME_MODE_ENV: &str = "CODESTORY_EMBED_RUNTIME_MODE";
 pub const EMBEDDING_BACKEND_ENV: &str = "CODESTORY_EMBED_BACKEND";
 pub const EMBEDDING_PROFILE_ENV: &str = "CODESTORY_EMBED_PROFILE";
@@ -43,24 +32,20 @@ pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX
 pub const EMBEDDING_LAYER_NORM_ENV: &str = "CODESTORY_EMBED_LAYER_NORM";
 pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
 pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
-pub const ONNX_MODEL_PATH_ENV: &str = "CODESTORY_EMBED_ONNX_MODEL";
-pub const ONNX_TOKENIZER_PATH_ENV: &str = "CODESTORY_EMBED_ONNX_TOKENIZER";
-pub const ONNX_PROVIDER_ENV: &str = "CODESTORY_EMBED_ONNX_PROVIDER";
-pub const ONNX_THREADS_ENV: &str = "CODESTORY_EMBED_ONNX_THREADS";
-pub const ONNX_BATCH_TOKENS_ENV: &str = "CODESTORY_EMBED_ONNX_BATCH_TOKENS";
+#[cfg(test)]
+const REMOVED_ONNX_ENV_VARS: &[&str] = &[
+    "CODESTORY_EMBED_ONNX_MODEL",
+    "CODESTORY_EMBED_ONNX_TOKENIZER",
+    "CODESTORY_EMBED_ONNX_PROVIDER",
+    "CODESTORY_EMBED_ONNX_THREADS",
+    "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
+];
 pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
 pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
-const DEFAULT_LLAMACPP_EMBEDDINGS_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
-const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 1;
-const MAX_LLAMACPP_REQUEST_COUNT: usize = 16;
-const DEFAULT_ONNX_BATCH_TOKENS: usize = 32_768;
 #[cfg(test)]
 const SEMANTIC_QUANTIZED_RESCORE_MULTIPLIER: usize = 4;
-
-type HttpHeaders = Vec<(String, String)>;
-type RawHttpResponse = (u16, HttpHeaders, Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SymbolCandidateRank {
@@ -86,13 +71,6 @@ pub struct EmbeddingProfileContract {
     pub dimension: Option<u32>,
 }
 
-fn env_usize(key: &str, min: usize, max: usize) -> Option<usize> {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(min, max))
-}
-
 fn env_bool_override(key: &str) -> Option<bool> {
     std::env::var(key).ok().and_then(|raw| {
         let normalized = raw.trim().to_ascii_lowercase();
@@ -108,97 +86,75 @@ fn symbol_full_text_index_enabled_from_env() -> bool {
     env_bool_override(SYMBOL_FULL_TEXT_INDEX_ENV).unwrap_or(true)
 }
 
+#[cfg(test)]
 fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usize {
     let workers = worker_count.max(1).min(text_count.max(1));
     text_count.max(1).div_ceil(workers).max(1)
 }
 
-fn llamacpp_request_count_from_env() -> usize {
-    let Ok(raw) = std::env::var(LLAMACPP_REQUEST_COUNT_ENV) else {
-        return DEFAULT_LLAMACPP_REQUEST_COUNT;
-    };
-    let normalized = raw.trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "auto" | "available_parallelism") {
-        return std::thread::available_parallelism()
-            .map(|workers| workers.get())
-            .unwrap_or(DEFAULT_LLAMACPP_REQUEST_COUNT)
-            .clamp(1, MAX_LLAMACPP_REQUEST_COUNT);
-    }
-    normalized
-        .parse::<usize>()
-        .map(|value| value.clamp(1, MAX_LLAMACPP_REQUEST_COUNT))
-        .unwrap_or(DEFAULT_LLAMACPP_REQUEST_COUNT)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EmbeddingBackendSelection {
-    Onnx,
     LlamaCpp,
     HashProjection,
 }
 
 impl EmbeddingBackendSelection {
+    #[cfg(test)]
     fn from_env() -> Result<Self> {
-        let runtime_mode_raw = std::env::var(EMBEDDING_RUNTIME_MODE_ENV).ok();
-        let backend_raw = std::env::var(EMBEDDING_BACKEND_ENV).ok();
-        let runtime_mode = runtime_mode_raw
-            .as_deref()
-            .unwrap_or("llamacpp")
-            .trim()
-            .to_ascii_lowercase();
+        if let Some(name) = REMOVED_ONNX_ENV_VARS
+            .iter()
+            .find(|name| std::env::var_os(name).is_some())
+        {
+            bail!(
+                "{name} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+            );
+        }
+        if let Ok(runtime_mode) = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
+            && matches!(
+                runtime_mode.trim().to_ascii_lowercase().as_str(),
+                "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
+            )
+        {
+            bail!(
+                "{EMBEDDING_RUNTIME_MODE_ENV}={runtime_mode} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+            );
+        }
+        Self::from_config(&crate::test_sidecar_runtime_from_env().embedding)
+    }
+
+    fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
+        let runtime_mode = config.backend.trim().to_ascii_lowercase();
+        if matches!(
+            runtime_mode.as_str(),
+            "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
+        ) {
+            bail!(
+                "{EMBEDDING_RUNTIME_MODE_ENV}={runtime_mode} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+            );
+        }
         if runtime_mode == "hash" || runtime_mode == "hash_projection" {
             return Ok(Self::HashProjection);
         }
 
-        let backend = backend_raw
-            .as_deref()
-            .unwrap_or(&runtime_mode)
-            .trim()
-            .to_ascii_lowercase();
-        if backend_is_auto_or_default(&backend)
-            && runtime_mode_raw
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            && backend_raw
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            && std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV)
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some()
-        {
-            return Ok(Self::LlamaCpp);
-        }
-        match backend.as_str() {
-            "" | "auto" | "onnx" | "ort" | "onnxruntime" | "onnx-runtime" => Ok(Self::Onnx),
+        match runtime_mode.as_str() {
+            "" | "auto" => Ok(Self::LlamaCpp),
+            "onnx" | "ort" | "onnxruntime" | "onnx-runtime" => Err(anyhow!(
+                "embedding backend `{runtime_mode}` is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
+            )),
             "llamacpp" | "llama.cpp" | "llama-cpp" | "gguf" => Ok(Self::LlamaCpp),
             "hash" | "hash_projection" => Ok(Self::HashProjection),
             other => Err(anyhow!(
-                "unsupported embedding backend `{other}` (set {EMBEDDING_BACKEND_ENV}=onnx, llamacpp, or hash)"
+                "unsupported embedding backend `{other}` (set {EMBEDDING_BACKEND_ENV}=llamacpp or hash)"
             )),
         }
     }
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Onnx => "onnx",
             Self::LlamaCpp => "llamacpp",
             Self::HashProjection => "hash",
         }
     }
-}
-
-fn backend_is_auto_or_default(value: &str) -> bool {
-    matches!(
-        value,
-        "" | "auto" | "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,7 +179,6 @@ impl EmbeddingPooling {
 struct EmbeddingProfile {
     name: String,
     model_id: String,
-    max_tokens: usize,
     pooling: EmbeddingPooling,
     query_prefix: String,
     document_prefix: String,
@@ -233,17 +188,18 @@ struct EmbeddingProfile {
 }
 
 impl EmbeddingProfile {
+    #[cfg(test)]
     fn from_env() -> Result<Self> {
-        let name = std::env::var(EMBEDDING_PROFILE_ENV)
-            .unwrap_or_else(|_| "bge-base-en-v1.5".to_string())
-            .trim()
-            .to_ascii_lowercase();
+        Self::from_config(&crate::test_sidecar_runtime_from_env().embedding)
+    }
+
+    fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
+        let name = config.profile.trim().to_ascii_lowercase();
 
         let mut profile = match name.as_str() {
             "" | "minilm" | "all-minilm-l6-v2" => Self {
                 name: "minilm".to_string(),
                 model_id: "sentence-transformers/all-MiniLM-L6-v2-local".to_string(),
-                max_tokens: 256,
                 pooling: EmbeddingPooling::Mean,
                 query_prefix: String::new(),
                 document_prefix: String::new(),
@@ -254,7 +210,6 @@ impl EmbeddingProfile {
             "bge-small" | "bge-small-en-v1.5" => Self {
                 name: "bge-small-en-v1.5".to_string(),
                 model_id: "BAAI/bge-small-en-v1.5-local".to_string(),
-                max_tokens: 512,
                 pooling: EmbeddingPooling::Cls,
                 query_prefix: "Represent this sentence for searching relevant passages: "
                     .to_string(),
@@ -266,7 +221,6 @@ impl EmbeddingProfile {
             "bge-base" | "bge-base-en-v1.5" => Self {
                 name: "bge-base-en-v1.5".to_string(),
                 model_id: "BAAI/bge-base-en-v1.5-local".to_string(),
-                max_tokens: 512,
                 pooling: EmbeddingPooling::Cls,
                 query_prefix: "Represent this sentence for searching relevant passages: "
                     .to_string(),
@@ -278,7 +232,6 @@ impl EmbeddingProfile {
             "qwen" | "qwen3" | "qwen3-embedding-0.6b" => Self {
                 name: "qwen3-embedding-0.6b".to_string(),
                 model_id: "Qwen/Qwen3-Embedding-0.6B-local".to_string(),
-                max_tokens: 32_768,
                 pooling: EmbeddingPooling::LastToken,
                 query_prefix:
                     "Instruct: Retrieve relevant code symbols and implementation details\nQuery: "
@@ -291,7 +244,6 @@ impl EmbeddingProfile {
             "embeddinggemma" | "embeddinggemma-300m" | "gemma" | "gemma-embedding-300m" => Self {
                 name: "embeddinggemma-300m".to_string(),
                 model_id: "google/embeddinggemma-300m-local".to_string(),
-                max_tokens: 2048,
                 pooling: EmbeddingPooling::Mean,
                 query_prefix: "task: search result | query: ".to_string(),
                 document_prefix: "title: none | text: ".to_string(),
@@ -302,7 +254,6 @@ impl EmbeddingProfile {
             "nomic" | "nomic-v1.5" | "nomic-embed-text-v1.5" => Self {
                 name: "nomic-embed-text-v1.5".to_string(),
                 model_id: "nomic-ai/nomic-embed-text-v1.5-local".to_string(),
-                max_tokens: 8192,
                 pooling: EmbeddingPooling::Mean,
                 query_prefix: "search_query: ".to_string(),
                 document_prefix: "search_document: ".to_string(),
@@ -313,7 +264,6 @@ impl EmbeddingProfile {
             "nomic-v2" | "nomic-embed-text-v2" | "nomic-embed-text-v2-moe" => Self {
                 name: "nomic-embed-text-v2-moe".to_string(),
                 model_id: "nomic-ai/nomic-embed-text-v2-moe-local".to_string(),
-                max_tokens: 512,
                 pooling: EmbeddingPooling::Mean,
                 query_prefix: "search_query: ".to_string(),
                 document_prefix: "search_document: ".to_string(),
@@ -324,7 +274,6 @@ impl EmbeddingProfile {
             "custom" => Self {
                 name: "custom".to_string(),
                 model_id: "custom-local".to_string(),
-                max_tokens: 256,
                 pooling: EmbeddingPooling::Mean,
                 query_prefix: String::new(),
                 document_prefix: String::new(),
@@ -339,32 +288,27 @@ impl EmbeddingProfile {
             }
         };
 
-        if let Ok(model_id) = std::env::var(EMBEDDING_MODEL_ID_ENV)
-            && !model_id.trim().is_empty()
-        {
-            profile.model_id = model_id;
+        if let Some(model_id) = config.model_id.as_ref() {
+            profile.model_id = model_id.clone();
         }
-        if let Some(max_tokens) = env_usize(EMBEDDING_MAX_TOKENS_ENV, 8, 32_768) {
-            profile.max_tokens = max_tokens;
-        }
-        if let Ok(raw) = std::env::var(EMBEDDING_POOLING_ENV) {
-            profile.pooling = EmbeddingPooling::from_value(&raw)
+        if let Some(raw) = config.pooling.as_ref() {
+            profile.pooling = EmbeddingPooling::from_value(raw)
                 .ok_or_else(|| anyhow!("unsupported {EMBEDDING_POOLING_ENV} value `{raw}`"))?;
         }
-        if let Ok(prefix) = std::env::var(EMBEDDING_QUERY_PREFIX_ENV) {
-            profile.query_prefix = prefix;
+        if let Some(prefix) = config.query_prefix.as_ref() {
+            profile.query_prefix = prefix.clone();
         }
-        if let Ok(prefix) = std::env::var(EMBEDDING_DOCUMENT_PREFIX_ENV) {
-            profile.document_prefix = prefix;
+        if let Some(prefix) = config.document_prefix.as_ref() {
+            profile.document_prefix = prefix.clone();
         }
-        if let Some(layer_norm) = env_bool_override(EMBEDDING_LAYER_NORM_ENV) {
+        if let Some(layer_norm) = config.layer_norm {
             profile.layer_norm = layer_norm;
         }
-        if let Some(truncate_dim) = env_usize(EMBEDDING_TRUNCATE_DIM_ENV, 1, 8192) {
+        if let Some(truncate_dim) = config.truncate_dim {
             profile.truncate_dim = Some(truncate_dim);
             profile.expected_dim = Some(truncate_dim);
         }
-        if let Some(expected_dim) = env_usize(EMBEDDING_EXPECTED_DIM_ENV, 1, 8192) {
+        if let Some(expected_dim) = config.expected_dim {
             profile.expected_dim = Some(expected_dim);
         }
 
@@ -391,13 +335,21 @@ impl EmbeddingProfile {
 }
 
 pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability {
-    let profile = match EmbeddingProfile::from_env() {
+    embedding_runtime_availability_from_config(
+        &codestory_retrieval::SidecarRuntimeConfig::local().embedding,
+    )
+}
+
+pub fn embedding_runtime_availability_from_config(
+    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+) -> EmbeddingRuntimeAvailability {
+    let profile = match EmbeddingProfile::from_config(config) {
         Ok(profile) => profile,
         Err(error) => {
             return unavailable_embedding_runtime(None, error);
         }
     };
-    let backend = match EmbeddingBackendSelection::from_env() {
+    let backend = match EmbeddingBackendSelection::from_config(config) {
         Ok(backend) => backend,
         Err(error) => {
             return unavailable_embedding_runtime(Some(profile.model_id.clone()), error);
@@ -409,7 +361,7 @@ pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability
         return available_embedding_runtime(model_id);
     }
 
-    if let Err(error) = ensure_embedding_backend_available(backend) {
+    if let Err(error) = ensure_embedding_backend_available(backend, config) {
         return unavailable_embedding_runtime(Some(model_id), error);
     }
 
@@ -435,19 +387,34 @@ fn unavailable_embedding_runtime(
     }
 }
 
-fn ensure_embedding_backend_available(backend: EmbeddingBackendSelection) -> Result<()> {
+fn ensure_embedding_backend_available(
+    backend: EmbeddingBackendSelection,
+    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+) -> Result<()> {
     match backend {
-        EmbeddingBackendSelection::Onnx => OnnxEmbeddingRuntime::probe_from_env().map(|_| ()),
         EmbeddingBackendSelection::LlamaCpp => {
-            LlamaCppEndpoint::from_env().and_then(|endpoint| endpoint.ensure_reachable())
+            let probe = codestory_retrieval::LlamaCppEmbeddingClient::new(config)?.probe();
+            if probe.reachable {
+                Ok(())
+            } else {
+                bail!("{}", probe.detail)
+            }
         }
         EmbeddingBackendSelection::HashProjection => Ok(()),
     }
 }
 
 pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract> {
-    let profile = EmbeddingProfile::from_env()?;
-    let backend = EmbeddingBackendSelection::from_env()?;
+    embedding_profile_contract_from_config(
+        &codestory_retrieval::SidecarRuntimeConfig::local().embedding,
+    )
+}
+
+pub fn embedding_profile_contract_from_config(
+    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+) -> Result<EmbeddingProfileContract> {
+    let profile = EmbeddingProfile::from_config(config)?;
+    let backend = EmbeddingBackendSelection::from_config(config)?;
     let cache_key = profile.cache_model_id(backend);
     Ok(EmbeddingProfileContract {
         profile: profile.name.clone(),
@@ -458,14 +425,6 @@ pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract>
             .expected_dim
             .map(|value| value.min(u32::MAX as usize) as u32),
     })
-}
-
-pub fn probe_onnx_runtime_paths(model_path: &Path, tokenizer_path: &Path) -> Result<()> {
-    OnnxEmbeddingRuntime::from_paths(OnnxModelPaths {
-        model_path: model_path.to_path_buf(),
-        tokenizer_path: tokenizer_path.to_path_buf(),
-    })
-    .map(|_| ())
 }
 
 #[derive(Debug, Clone)]
@@ -480,464 +439,6 @@ pub struct LlmSearchDoc {
 pub struct EmbeddingRuntimeProbe {
     pub model_path: PathBuf,
     pub model_id: String,
-}
-
-#[derive(Debug, Clone)]
-struct OnnxModelPaths {
-    model_path: PathBuf,
-    tokenizer_path: PathBuf,
-}
-
-impl OnnxModelPaths {
-    fn from_env() -> Result<Self> {
-        let model_path = required_path_env(ONNX_MODEL_PATH_ENV)?;
-        let tokenizer_path = required_path_env(ONNX_TOKENIZER_PATH_ENV)?;
-        Ok(Self {
-            model_path,
-            tokenizer_path,
-        })
-    }
-}
-
-fn required_path_env(key: &str) -> Result<PathBuf> {
-    let raw = std::env::var(key).with_context(|| {
-        format!(
-            "{key} is not set; ONNX is diagnostic-only, so set {ONNX_MODEL_PATH_ENV} and {ONNX_TOKENIZER_PATH_ENV} explicitly or use product llama.cpp sidecar retrieval"
-        )
-    })?;
-    let path = PathBuf::from(raw.trim());
-    if raw.trim().is_empty() {
-        bail!("{key} is empty");
-    }
-    if !path.exists() {
-        bail!("{key} points at a missing path: {}", path.display());
-    }
-    Ok(path)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OnnxProvider {
-    Auto,
-    DirectMl,
-    Cpu,
-}
-
-impl OnnxProvider {
-    fn from_env() -> Result<Self> {
-        let raw = std::env::var(ONNX_PROVIDER_ENV)
-            .unwrap_or_else(|_| "auto".to_string())
-            .trim()
-            .to_ascii_lowercase();
-        match raw.as_str() {
-            "" | "auto" => Ok(Self::Auto),
-            "directml" | "dml" | "gpu" => Ok(Self::DirectMl),
-            "cpu" => Ok(Self::Cpu),
-            other => Err(anyhow!(
-                "unsupported {ONNX_PROVIDER_ENV} value `{other}` (expected auto, directml, or cpu)"
-            )),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct OnnxEmbeddingRuntime {
-    tokenizer: tokenizers::Tokenizer,
-    session: Mutex<Session>,
-}
-
-struct OnnxEncodedRow {
-    ids: Vec<i64>,
-    attention: Vec<i64>,
-    token_types: Vec<i64>,
-}
-
-struct OnnxEncodedBatch {
-    input_ids: Array2<i64>,
-    attention_mask: Array2<i64>,
-    token_type_ids: Array2<i64>,
-    attention_values: Option<Vec<i64>>,
-    sequence_len: usize,
-}
-
-impl OnnxEmbeddingRuntime {
-    fn from_env() -> Result<(PathBuf, Self)> {
-        let paths = OnnxModelPaths::from_env()?;
-        Self::from_paths(paths)
-    }
-
-    fn probe_from_env() -> Result<PathBuf> {
-        Self::from_env().map(|(path, _runtime)| path)
-    }
-
-    fn from_paths(paths: OnnxModelPaths) -> Result<(PathBuf, Self)> {
-        let tokenizer =
-            tokenizers::Tokenizer::from_file(&paths.tokenizer_path).map_err(|error| {
-                anyhow!(
-                    "failed to load ONNX tokenizer {}: {error}",
-                    paths.tokenizer_path.display()
-                )
-            })?;
-        let session = build_onnx_session(&paths.model_path)?;
-        Ok((
-            paths.model_path,
-            Self {
-                tokenizer,
-                session: Mutex::new(session),
-            },
-        ))
-    }
-
-    fn embed_texts(&self, texts: &[String], profile: &EmbeddingProfile) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let rows = self.encode_rows(texts, profile.max_tokens)?;
-        let max_batch_tokens =
-            env_usize(ONNX_BATCH_TOKENS_ENV, 1, 262_144).unwrap_or(DEFAULT_ONNX_BATCH_TOKENS);
-        let mut embeddings = Vec::with_capacity(texts.len());
-        let mut start = 0;
-        while start < rows.len() {
-            let end = onnx_batch_end_for_token_budget(&rows, start, max_batch_tokens);
-            let batch = shape_onnx_batch(&rows[start..end], profile.pooling)?;
-            embeddings.extend(self.run_encoded_batch(batch, profile)?);
-            start = end;
-        }
-        Ok(embeddings)
-    }
-
-    fn run_encoded_batch(
-        &self,
-        batch: OnnxEncodedBatch,
-        profile: &EmbeddingProfile,
-    ) -> Result<Vec<Vec<f32>>> {
-        let input_ids = TensorRef::from_array_view(batch.input_ids.view())
-            .context("failed to create ONNX input_ids tensor")?;
-        let attention_mask = TensorRef::from_array_view(batch.attention_mask.view())
-            .context("failed to create ONNX attention_mask tensor")?;
-        let token_type_ids = TensorRef::from_array_view(batch.token_type_ids.view())
-            .context("failed to create ONNX token_type_ids tensor")?;
-
-        let mut session = self.session.lock();
-        let outputs = session
-            .run(inputs![
-                "input_ids" => input_ids,
-                "attention_mask" => attention_mask,
-                "token_type_ids" => token_type_ids,
-            ])
-            .context("failed to run ONNX embedding model")?;
-        let output = outputs
-            .get("sentence_embedding")
-            .or_else(|| outputs.get("embeddings"))
-            .or_else(|| outputs.get("last_hidden_state"))
-            .unwrap_or_else(|| &outputs[0]);
-        let (shape, data) = output
-            .try_extract_tensor::<f32>()
-            .context("ONNX embedding output was not a float tensor")?;
-
-        let attention = batch.attention_values.as_deref();
-        extract_onnx_embeddings(
-            data,
-            shape,
-            attention,
-            batch.input_ids.nrows(),
-            batch.sequence_len,
-            profile.pooling,
-        )
-    }
-
-    fn encode_rows(&self, texts: &[String], max_tokens: usize) -> Result<Vec<OnnxEncodedRow>> {
-        let pad_id = self.tokenizer.token_to_id("[PAD]").unwrap_or(0) as i64;
-        let sep_id = self
-            .tokenizer
-            .token_to_id("[SEP]")
-            .map(|value| value as i64);
-        let encodings = self
-            .tokenizer
-            .encode_batch_fast(texts.iter().map(String::as_str).collect::<Vec<_>>(), true)
-            .map_err(|error| {
-                anyhow!("failed to tokenize input batch for ONNX embedding model: {error}")
-            })?;
-        let mut rows = Vec::with_capacity(texts.len());
-
-        for encoding in encodings {
-            let mut ids = encoding
-                .get_ids()
-                .iter()
-                .map(|value| *value as i64)
-                .collect::<Vec<_>>();
-            let mut attention = encoding
-                .get_attention_mask()
-                .iter()
-                .map(|value| *value as i64)
-                .collect::<Vec<_>>();
-            let mut token_types = encoding
-                .get_type_ids()
-                .iter()
-                .map(|value| *value as i64)
-                .collect::<Vec<_>>();
-
-            if ids.is_empty() {
-                ids.push(pad_id);
-                attention.push(0);
-                token_types.push(0);
-            }
-            if token_types.len() < ids.len() {
-                token_types.resize(ids.len(), 0);
-            }
-            if attention.len() < ids.len() {
-                attention.resize(ids.len(), 1);
-            }
-            if ids.len() > max_tokens {
-                ids.truncate(max_tokens);
-                attention.truncate(max_tokens);
-                token_types.truncate(max_tokens);
-                if let (Some(sep_id), Some(last)) = (sep_id, ids.last_mut()) {
-                    *last = sep_id;
-                }
-            }
-
-            rows.push(OnnxEncodedRow {
-                ids,
-                attention,
-                token_types,
-            });
-        }
-
-        Ok(rows)
-    }
-}
-
-fn onnx_batch_end_for_token_budget(
-    rows: &[OnnxEncodedRow],
-    start: usize,
-    max_batch_tokens: usize,
-) -> usize {
-    let mut end = start;
-    let mut sequence_len = 1_usize;
-    while end < rows.len() {
-        let next_sequence_len = sequence_len.max(rows[end].ids.len());
-        let next_row_count = end + 1 - start;
-        if end > start && next_sequence_len * next_row_count > max_batch_tokens {
-            break;
-        }
-        sequence_len = next_sequence_len;
-        end += 1;
-    }
-    end.max(start + 1)
-}
-
-fn shape_onnx_batch(
-    rows: &[OnnxEncodedRow],
-    pooling: EmbeddingPooling,
-) -> Result<OnnxEncodedBatch> {
-    let pad_id = 0_i64;
-    let row_count = rows.len();
-    let sequence_len = rows
-        .iter()
-        .map(|row| row.ids.len())
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let mut input_values = vec![pad_id; row_count * sequence_len];
-    let mut attention_values = vec![0_i64; row_count * sequence_len];
-    let mut token_type_values = vec![0_i64; row_count * sequence_len];
-
-    for (row_index, row) in rows.iter().enumerate() {
-        let offset = row_index * sequence_len;
-        input_values[offset..offset + row.ids.len()].copy_from_slice(&row.ids);
-        attention_values[offset..offset + row.attention.len()].copy_from_slice(&row.attention);
-        token_type_values[offset..offset + row.token_types.len()].copy_from_slice(&row.token_types);
-    }
-
-    let needs_attention_values = !matches!(pooling, EmbeddingPooling::Cls);
-    let pooling_attention_values = needs_attention_values.then(|| attention_values.clone());
-
-    Ok(OnnxEncodedBatch {
-        input_ids: Array2::from_shape_vec((row_count, sequence_len), input_values)
-            .context("failed to shape ONNX input_ids")?,
-        attention_mask: Array2::from_shape_vec((row_count, sequence_len), attention_values)
-            .context("failed to shape ONNX attention_mask")?,
-        token_type_ids: Array2::from_shape_vec((row_count, sequence_len), token_type_values)
-            .context("failed to shape ONNX token_type_ids")?,
-        attention_values: pooling_attention_values,
-        sequence_len,
-    })
-}
-
-fn build_onnx_session(model_path: &Path) -> Result<Session> {
-    match OnnxProvider::from_env()? {
-        OnnxProvider::Auto => {
-            if cfg!(target_os = "windows")
-                && let Ok(session) =
-                    build_onnx_session_for_provider(model_path, OnnxProvider::DirectMl)
-            {
-                return Ok(session);
-            }
-            build_onnx_session_for_provider(model_path, OnnxProvider::Cpu)
-        }
-        OnnxProvider::DirectMl => {
-            build_onnx_session_for_provider(model_path, OnnxProvider::DirectMl)
-        }
-        OnnxProvider::Cpu => build_onnx_session_for_provider(model_path, OnnxProvider::Cpu),
-    }
-}
-
-fn build_onnx_session_for_provider(model_path: &Path, provider: OnnxProvider) -> Result<Session> {
-    let mut builder = Session::builder()
-        .context("failed to initialize ONNX Runtime session builder")?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(ort::Error::<()>::from)
-        .context("failed to configure ONNX graph optimizations")?;
-    if let Some(threads) = env_usize(ONNX_THREADS_ENV, 1, 64) {
-        builder = builder
-            .with_intra_threads(threads)
-            .map_err(ort::Error::<()>::from)
-            .context("failed to configure ONNX intra-op threads")?;
-    }
-    builder = match provider {
-        OnnxProvider::DirectMl => builder
-            .with_execution_providers([ep::DirectML::default().build().error_on_failure()])
-            .map_err(ort::Error::<()>::from)
-            .context("failed to configure ONNX DirectML execution provider")?,
-        OnnxProvider::Cpu => builder
-            .with_execution_providers([ep::CPU::default().build()])
-            .map_err(ort::Error::<()>::from)
-            .context("failed to configure ONNX CPU execution provider")?,
-        OnnxProvider::Auto => unreachable!("auto provider is resolved before session creation"),
-    };
-    builder.commit_from_file(model_path).with_context(|| {
-        format!(
-            "failed to load ONNX embedding model {}",
-            model_path.display()
-        )
-    })
-}
-
-fn extract_onnx_embeddings(
-    data: &[f32],
-    shape: &[i64],
-    attention: Option<&[i64]>,
-    expected_batch: usize,
-    expected_sequence_len: usize,
-    pooling: EmbeddingPooling,
-) -> Result<Vec<Vec<f32>>> {
-    match shape.len() {
-        2 => collect_onnx_pooled_embeddings(data, shape, expected_batch),
-        3 => pool_onnx_hidden_state(
-            data,
-            shape,
-            attention,
-            expected_batch,
-            expected_sequence_len,
-            pooling,
-        ),
-        _ => bail!("ONNX embedding output must be rank 2 or rank 3, got shape {shape:?}"),
-    }
-}
-
-fn collect_onnx_pooled_embeddings(
-    data: &[f32],
-    shape: &[i64],
-    expected_batch: usize,
-) -> Result<Vec<Vec<f32>>> {
-    let batch = usize::try_from(shape[0]).context("invalid ONNX output batch dimension")?;
-    let hidden_dim = usize::try_from(shape[1]).context("invalid ONNX output hidden dimension")?;
-    if batch != expected_batch {
-        bail!("ONNX embedding output batch mismatch: expected {expected_batch}, got {batch}");
-    }
-    if data.len() != batch * hidden_dim {
-        bail!(
-            "ONNX embedding output data length mismatch: shape={shape:?}, values={}",
-            data.len()
-        );
-    }
-    Ok(data
-        .chunks_exact(hidden_dim)
-        .map(<[f32]>::to_vec)
-        .collect::<Vec<_>>())
-}
-
-fn pool_onnx_hidden_state(
-    data: &[f32],
-    shape: &[i64],
-    attention: Option<&[i64]>,
-    expected_batch: usize,
-    expected_sequence_len: usize,
-    pooling: EmbeddingPooling,
-) -> Result<Vec<Vec<f32>>> {
-    if shape.len() != 3 {
-        bail!("ONNX embedding output must be rank 3, got shape {shape:?}");
-    }
-    let batch = usize::try_from(shape[0]).context("invalid ONNX output batch dimension")?;
-    let sequence_len =
-        usize::try_from(shape[1]).context("invalid ONNX output sequence dimension")?;
-    let hidden_dim = usize::try_from(shape[2]).context("invalid ONNX output hidden dimension")?;
-    if batch != expected_batch {
-        bail!("ONNX embedding output batch mismatch: expected {expected_batch}, got {batch}");
-    }
-    if sequence_len != expected_sequence_len {
-        bail!(
-            "ONNX embedding output sequence mismatch: expected {expected_sequence_len}, got {sequence_len}"
-        );
-    }
-    if data.len() != batch * sequence_len * hidden_dim {
-        bail!(
-            "ONNX embedding output data length mismatch: shape={shape:?}, values={}",
-            data.len()
-        );
-    }
-
-    let mut embeddings = Vec::with_capacity(batch);
-    for row in 0..batch {
-        let vector = match pooling {
-            EmbeddingPooling::Cls => {
-                let start = row * sequence_len * hidden_dim;
-                data[start..start + hidden_dim].to_vec()
-            }
-            EmbeddingPooling::LastToken => {
-                let attention =
-                    attention.ok_or_else(|| anyhow!("ONNX last-token pooling needs attention"))?;
-                let token_index = last_attention_index(attention, row, sequence_len).unwrap_or(0);
-                let start = ((row * sequence_len) + token_index) * hidden_dim;
-                data[start..start + hidden_dim].to_vec()
-            }
-            EmbeddingPooling::Mean => {
-                let attention =
-                    attention.ok_or_else(|| anyhow!("ONNX mean pooling needs attention"))?;
-                let mut vector = vec![0.0_f32; hidden_dim];
-                let mut count = 0.0_f32;
-                for token_index in 0..sequence_len {
-                    if attention[row * sequence_len + token_index] == 0 {
-                        continue;
-                    }
-                    let start = ((row * sequence_len) + token_index) * hidden_dim;
-                    for (target, value) in vector
-                        .iter_mut()
-                        .zip(data[start..start + hidden_dim].iter().copied())
-                    {
-                        *target += value;
-                    }
-                    count += 1.0;
-                }
-                if count > 0.0 {
-                    for value in &mut vector {
-                        *value /= count;
-                    }
-                }
-                vector
-            }
-        };
-        embeddings.push(vector);
-    }
-    Ok(embeddings)
-}
-
-fn last_attention_index(attention: &[i64], row: usize, sequence_len: usize) -> Option<usize> {
-    let offset = row * sequence_len;
-    (0..sequence_len)
-        .rev()
-        .find(|token_index| attention[offset + *token_index] != 0)
 }
 
 #[derive(Debug, Clone)]
@@ -1150,255 +651,26 @@ pub struct EmbeddingRuntime {
 
 #[derive(Debug, Clone)]
 enum EmbeddingBackend {
-    Onnx(Arc<OnnxEmbeddingRuntime>),
     LlamaCpp(Arc<LlamaCppEmbeddingRuntime>),
     HashProjection,
 }
 
-#[derive(Debug, Clone)]
-struct LlamaCppEndpoint {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-impl LlamaCppEndpoint {
-    fn from_env() -> Result<Self> {
-        let raw = std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV)
-            .unwrap_or_else(|_| DEFAULT_LLAMACPP_EMBEDDINGS_URL.to_string());
-        Self::parse(&raw)
-    }
-
-    fn parse(raw: &str) -> Result<Self> {
-        let trimmed = raw.trim();
-        let rest = trimmed
-            .strip_prefix("http://")
-            .ok_or_else(|| anyhow!("{LLAMACPP_EMBEDDINGS_URL_ENV} must be an http:// URL"))?;
-        let (authority, path) = rest
-            .split_once('/')
-            .map(|(authority, path)| (authority, format!("/{path}")))
-            .unwrap_or((rest, "/v1/embeddings".to_string()));
-        let (host, port) = if let Some((host, raw_port)) = authority.rsplit_once(':') {
-            let port = raw_port
-                .parse::<u16>()
-                .with_context(|| format!("invalid port in {LLAMACPP_EMBEDDINGS_URL_ENV}"))?;
-            (host.to_string(), port)
-        } else {
-            (authority.to_string(), 80)
-        };
-        if host.trim().is_empty() {
-            return Err(anyhow!("{LLAMACPP_EMBEDDINGS_URL_ENV} must include a host"));
-        }
-        Ok(Self { host, port, path })
-    }
-
-    fn url(&self) -> String {
-        format!("http://{}:{}{}", self.host, self.port, self.path)
-    }
-
-    fn ensure_reachable(&self) -> Result<()> {
-        let mut addrs = (self.host.as_str(), self.port)
-            .to_socket_addrs()
-            .with_context(|| format!("failed to resolve llama.cpp endpoint {}", self.url()))?;
-        let addr = addrs
-            .next()
-            .ok_or_else(|| anyhow!("failed to resolve llama.cpp endpoint {}", self.url()))?;
-        TcpStream::connect_timeout(&addr, Duration::from_millis(750))
-            .with_context(|| format!("failed to connect to llama.cpp endpoint {}", self.url()))?;
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 struct LlamaCppEmbeddingRuntime {
-    endpoint: LlamaCppEndpoint,
-    request_count: usize,
+    client: codestory_retrieval::LlamaCppEmbeddingClient,
 }
 
 impl LlamaCppEmbeddingRuntime {
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.request_count > 1 && texts.len() > 1 {
-            let chunk_size = embedding_parallel_chunk_size(texts.len(), self.request_count);
-            let chunks = texts
-                .par_chunks(chunk_size)
-                .map(|chunk| self.embed_texts_serial(chunk))
-                .collect::<Result<Vec<_>>>()?;
-            return Ok(chunks.into_iter().flatten().collect());
-        }
-        self.embed_texts_serial(texts)
+        self.client.embed_prepared_texts(texts)
     }
-
-    fn embed_texts_serial(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let request = json!({
-            "input": texts,
-            "model": "codestory-local-embedding"
-        });
-        let response = post_json_to_http_endpoint(&self.endpoint, &request)?;
-        parse_openai_embeddings_response(response, texts.len())
-    }
-}
-
-fn post_json_to_http_endpoint(
-    endpoint: &LlamaCppEndpoint,
-    request: &JsonValue,
-) -> Result<JsonValue> {
-    let body = serde_json::to_vec(request).context("failed to serialize llama.cpp request")?;
-    let mut stream =
-        TcpStream::connect((endpoint.host.as_str(), endpoint.port)).with_context(|| {
-            format!(
-                "failed to connect to llama.cpp embeddings endpoint {}",
-                endpoint.url()
-            )
-        })?;
-    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-        endpoint.path,
-        endpoint.host,
-        endpoint.port,
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let (status_code, headers, body) = split_http_response(&response)?;
-    if !(200..300).contains(&status_code) {
-        return Err(anyhow!(
-            "llama.cpp embeddings endpoint {} returned HTTP {status_code}: {}",
-            endpoint.url(),
-            String::from_utf8_lossy(&body)
-        ));
-    }
-
-    let body = if headers
-        .iter()
-        .any(|(key, value)| key == "transfer-encoding" && value.contains("chunked"))
-    {
-        decode_chunked_http_body(&body)?
-    } else {
-        body
-    };
-
-    serde_json::from_slice(&body).with_context(|| {
-        format!(
-            "failed to parse JSON response from llama.cpp endpoint {}",
-            endpoint.url()
-        )
-    })
-}
-
-fn split_http_response(response: &[u8]) -> Result<RawHttpResponse> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| anyhow!("invalid HTTP response from llama.cpp endpoint"))?;
-    let header_text = String::from_utf8_lossy(&response[..header_end]);
-    let mut lines = header_text.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("missing HTTP status line from llama.cpp endpoint"))?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("missing HTTP status code from llama.cpp endpoint"))?
-        .parse::<u16>()
-        .context("invalid HTTP status code from llama.cpp endpoint")?;
-    let headers = lines
-        .filter_map(|line| {
-            line.split_once(':').map(|(key, value)| {
-                (
-                    key.trim().to_ascii_lowercase(),
-                    value.trim().to_ascii_lowercase(),
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok((status_code, headers, response[header_end + 4..].to_vec()))
-}
-
-fn decode_chunked_http_body(body: &[u8]) -> Result<Vec<u8>> {
-    let mut offset = 0;
-    let mut decoded = Vec::new();
-    while offset < body.len() {
-        let line_end = body[offset..]
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or_else(|| anyhow!("invalid chunked response from llama.cpp endpoint"))?
-            + offset;
-        let size_text = String::from_utf8_lossy(&body[offset..line_end]);
-        let size_hex = size_text.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_hex, 16)
-            .context("invalid chunk size from llama.cpp endpoint")?;
-        offset = line_end + 2;
-        if size == 0 {
-            break;
-        }
-        if offset + size > body.len() {
-            return Err(anyhow!(
-                "truncated chunked response from llama.cpp endpoint"
-            ));
-        }
-        decoded.extend_from_slice(&body[offset..offset + size]);
-        offset += size + 2;
-    }
-    Ok(decoded)
-}
-
-fn parse_openai_embeddings_response(
-    response: JsonValue,
-    expected_count: usize,
-) -> Result<Vec<Vec<f32>>> {
-    let data = response
-        .get("data")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| anyhow!("llama.cpp embeddings response missing `data` array"))?;
-    if data.len() != expected_count {
-        return Err(anyhow!(
-            "llama.cpp embeddings response returned {} vectors for {} inputs",
-            data.len(),
-            expected_count
-        ));
-    }
-
-    let mut indexed = Vec::with_capacity(data.len());
-    for (fallback_index, item) in data.iter().enumerate() {
-        let index = item
-            .get("index")
-            .and_then(JsonValue::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(fallback_index);
-        let embedding = item
-            .get("embedding")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| anyhow!("llama.cpp embeddings response item missing `embedding`"))?
-            .iter()
-            .map(|value| {
-                value
-                    .as_f64()
-                    .map(|number| number as f32)
-                    .ok_or_else(|| anyhow!("llama.cpp embedding contained a non-numeric value"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        indexed.push((index, embedding));
-    }
-    indexed.sort_by_key(|(index, _)| *index);
-    Ok(indexed
-        .into_iter()
-        .map(|(_, embedding)| embedding)
-        .collect())
 }
 
 impl EmbeddingRuntime {
     pub fn probe_from_env() -> Result<EmbeddingRuntimeProbe> {
-        let profile = EmbeddingProfile::from_env()?;
-        let backend = EmbeddingBackendSelection::from_env()?;
+        let config = codestory_retrieval::SidecarRuntimeConfig::local().embedding;
+        let profile = EmbeddingProfile::from_config(&config)?;
+        let backend = EmbeddingBackendSelection::from_config(&config)?;
         let model_id = profile.cache_model_id(backend);
 
         if backend == EmbeddingBackendSelection::HashProjection {
@@ -1408,19 +680,14 @@ impl EmbeddingRuntime {
             });
         }
 
-        if backend == EmbeddingBackendSelection::Onnx {
-            let model_path = OnnxEmbeddingRuntime::probe_from_env()?;
-            return Ok(EmbeddingRuntimeProbe {
-                model_path,
-                model_id,
-            });
-        }
-
         if backend == EmbeddingBackendSelection::LlamaCpp {
-            let endpoint = LlamaCppEndpoint::from_env()?;
-            endpoint.ensure_reachable()?;
+            let client = codestory_retrieval::LlamaCppEmbeddingClient::new(&config)?;
+            let probe = client.probe();
+            if !probe.reachable {
+                bail!("{}", probe.detail);
+            }
             return Ok(EmbeddingRuntimeProbe {
-                model_path: PathBuf::from(endpoint.url()),
+                model_path: PathBuf::from(client.endpoint()),
                 model_id,
             });
         }
@@ -1429,8 +696,12 @@ impl EmbeddingRuntime {
     }
 
     pub fn from_env() -> Result<Self> {
-        let profile = EmbeddingProfile::from_env()?;
-        let backend = EmbeddingBackendSelection::from_env()?;
+        Self::from_config(&codestory_retrieval::SidecarRuntimeConfig::local().embedding)
+    }
+
+    pub fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
+        let profile = EmbeddingProfile::from_config(config)?;
+        let backend = EmbeddingBackendSelection::from_config(config)?;
         let model_id = profile.cache_model_id(backend);
 
         match backend {
@@ -1440,25 +711,18 @@ impl EmbeddingRuntime {
                 profile,
                 backend: EmbeddingBackend::HashProjection,
             }),
-            EmbeddingBackendSelection::Onnx => {
-                let (model_path, runtime) = OnnxEmbeddingRuntime::from_env()?;
-                Ok(Self {
-                    model_path,
-                    model_id,
-                    profile,
-                    backend: EmbeddingBackend::Onnx(Arc::new(runtime)),
-                })
-            }
             EmbeddingBackendSelection::LlamaCpp => {
-                let endpoint = LlamaCppEndpoint::from_env()?;
-                endpoint.ensure_reachable()?;
+                let client = codestory_retrieval::LlamaCppEmbeddingClient::new(config)?;
+                let probe = client.probe();
+                if !probe.reachable {
+                    bail!("{}", probe.detail);
+                }
                 Ok(Self {
-                    model_path: PathBuf::from(endpoint.url()),
+                    model_path: PathBuf::from(client.endpoint()),
                     model_id,
                     profile,
                     backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
-                        endpoint,
-                        request_count: llamacpp_request_count_from_env(),
+                        client,
                     })),
                 })
             }
@@ -1519,7 +783,6 @@ impl EmbeddingRuntime {
                 }
                 Ok(out)
             }
-            EmbeddingBackend::Onnx(runtime) => runtime.embed_texts(texts, &self.profile),
             EmbeddingBackend::LlamaCpp(runtime) => runtime.embed_texts(texts),
         }?;
         postprocess_embeddings(&mut embeddings, &self.profile)?;
@@ -1531,7 +794,6 @@ impl EmbeddingRuntime {
         let profile = EmbeddingProfile {
             name: "test".to_string(),
             model_id: "test-model".to_string(),
-            max_tokens: 256,
             pooling: EmbeddingPooling::Mean,
             query_prefix: String::new(),
             document_prefix: String::new(),
@@ -1579,10 +841,6 @@ enum PersistedSearchIndexLockMode {
 impl PersistedSearchIndexGuard {
     fn acquire_shared(search_dir: &Path) -> Result<Self> {
         Self::acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Shared)
-    }
-
-    fn acquire_exclusive(search_dir: &Path) -> Result<Self> {
-        Self::acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Exclusive)
     }
 
     fn acquire_with_mode(search_dir: &Path, mode: PersistedSearchIndexLockMode) -> Result<Self> {
@@ -1634,12 +892,10 @@ impl PersistedSearchIndexGuard {
         Self::try_acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Shared)
     }
 
-    #[cfg(test)]
     fn try_acquire_exclusive(search_dir: &Path) -> Result<Self> {
         Self::try_acquire_with_mode(search_dir, PersistedSearchIndexLockMode::Exclusive)
     }
 
-    #[cfg(test)]
     fn try_acquire_with_mode(
         search_dir: &Path,
         mode: PersistedSearchIndexLockMode,
@@ -1697,6 +953,36 @@ impl PersistedSearchIndexGuard {
     fn is_exclusive(&self) -> bool {
         self.mode == PersistedSearchIndexLockMode::Exclusive
     }
+
+    fn downgrade_to_shared(&mut self) -> Result<()> {
+        if !self.is_exclusive() {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        FileExt::lock_shared(&self.file).with_context(|| {
+            format!(
+                "Failed to downgrade persisted search index lock {} to shared",
+                self.path.display()
+            )
+        })?;
+        #[cfg(not(unix))]
+        {
+            FileExt::unlock(&self.file).with_context(|| {
+                format!(
+                    "Failed to unlock persisted search index {} before shared reopen",
+                    self.path.display()
+                )
+            })?;
+            FileExt::lock_shared(&self.file).with_context(|| {
+                format!(
+                    "Failed to reacquire persisted search index lock {} as shared",
+                    self.path.display()
+                )
+            })?;
+        }
+        self.mode = PersistedSearchIndexLockMode::Shared;
+        Ok(())
+    }
 }
 
 impl Drop for PersistedSearchIndexGuard {
@@ -1710,7 +996,7 @@ impl Drop for PersistedSearchIndexGuard {
     }
 }
 
-fn persisted_search_index_lock_path(search_dir: &Path) -> PathBuf {
+pub(crate) fn persisted_search_index_lock_path(search_dir: &Path) -> PathBuf {
     let mut path = search_dir.as_os_str().to_os_string();
     path.push(".lock");
     PathBuf::from(path)
@@ -1811,7 +1097,7 @@ impl SearchEngine {
     pub fn new(storage_path: Option<&Path>) -> Result<Self> {
         let schema = Self::build_schema();
         let index = if let Some(path) = storage_path {
-            let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+            let guard = PersistedSearchIndexGuard::try_acquire_exclusive(path)?;
             return Self::new_persisted_with_guard(path, guard);
         } else {
             Index::create_in_ram(schema)
@@ -1825,18 +1111,26 @@ impl SearchEngine {
         Self::open_persisted_with_guard(path, guard)
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_open_existing(path: &Path) -> Result<Self> {
+        let guard = PersistedSearchIndexGuard::try_acquire_shared(path)?;
+        Self::open_persisted_with_guard(path, guard)
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_existing_or_recreate(path: &Path) -> Result<(Self, Option<anyhow::Error>)> {
         let shared_guard = PersistedSearchIndexGuard::acquire_shared(path)?;
         match Self::open_persisted_with_guard(path, shared_guard) {
             Ok(engine) => Ok((engine, None)),
             Err(open_error) => {
-                let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+                let guard = PersistedSearchIndexGuard::try_acquire_exclusive(path)?;
                 let engine = Self::new_persisted_with_guard(path, guard)?;
                 Ok((engine, Some(open_error)))
             }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn recreate_persisted_from_existing(
         path: &Path,
         mut existing: Self,
@@ -1846,10 +1140,17 @@ impl SearchEngine {
         match guard.filter(|guard| guard.is_exclusive()) {
             Some(guard) => Self::new_persisted_with_guard(path, guard),
             None => {
-                let guard = PersistedSearchIndexGuard::acquire_exclusive(path)?;
+                let guard = PersistedSearchIndexGuard::try_acquire_exclusive(path)?;
                 Self::new_persisted_with_guard(path, guard)
             }
         }
+    }
+
+    pub(crate) fn downgrade_persisted_lock_to_shared(&mut self) -> Result<()> {
+        if let Some(guard) = self._persisted_index_guard.as_mut() {
+            guard.downgrade_to_shared()?;
+        }
+        Ok(())
     }
 
     fn new_persisted_with_guard(path: &Path, guard: PersistedSearchIndexGuard) -> Result<Self> {
@@ -1863,14 +1164,19 @@ impl SearchEngine {
         let schema = Self::build_schema();
         let index = Index::create_in_dir(path, schema)
             .with_context(|| format!("Failed to create tantivy index at {}", path.display()))?;
-        Self::new_with_index(index, Some(guard))
+        let mut engine = Self::new_with_index(index, Some(guard))?;
+        engine.full_text_index_enabled = true;
+        Ok(engine)
     }
 
     fn open_persisted_with_guard(path: &Path, guard: PersistedSearchIndexGuard) -> Result<Self> {
         let index = Index::open_in_dir(path)
             .with_context(|| format!("Failed to open tantivy index at {}", path.display()))?;
-        Self::new_with_index(index, Some(guard))
-            .with_context(|| format!("Failed to initialize tantivy reader at {}", path.display()))
+        let mut engine = Self::new_with_index(index, Some(guard)).with_context(|| {
+            format!("Failed to initialize tantivy reader at {}", path.display())
+        })?;
+        engine.full_text_index_enabled = true;
+        Ok(engine)
     }
 
     #[cfg(test)]
@@ -1878,9 +1184,11 @@ impl SearchEngine {
         self.embedding_runtime = Some(runtime);
     }
 
-    pub fn set_embedding_runtime_from_env(&mut self) -> Result<()> {
-        let runtime = EmbeddingRuntime::from_env()?;
-        self.embedding_runtime = Some(runtime);
+    pub fn set_embedding_runtime_from_config(
+        &mut self,
+        config: &codestory_retrieval::EmbeddingRuntimeConfig,
+    ) -> Result<()> {
+        self.embedding_runtime = Some(EmbeddingRuntime::from_config(config)?);
         Ok(())
     }
 
@@ -1900,6 +1208,10 @@ impl SearchEngine {
         if !self.full_text_index_enabled {
             return self.symbols.len();
         }
+        self.tantivy_doc_count()
+    }
+
+    pub(crate) fn tantivy_doc_count(&self) -> usize {
         self.reader.searcher().num_docs() as usize
     }
 
@@ -1911,23 +1223,6 @@ impl SearchEngine {
     #[cfg(test)]
     pub fn semantic_doc_count(&self) -> u32 {
         self.llm_docs.len().min(u32::MAX as usize) as u32
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snapshot_content_version(&self) -> u64 {
-        let mut hash = 0xcbf29ce484222325_u64;
-        for value in [
-            self.symbols.len() as u64,
-            self.llm_docs.len() as u64,
-            self.quantized_llm_docs.len() as u64,
-            u64::from(self.semantic_doc_count()),
-            self.full_text_doc_count() as u64,
-            self.stored_vector_encoding as u8 as u64,
-        ] {
-            hash ^= value;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
     }
 
     pub fn embed_text_refs(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -2231,10 +1526,28 @@ fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> SymbolC
 }
 
 fn recreate_search_storage_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("Failed to clear search index dir {}", path.display()))?;
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create search index parent directory {}",
+            parent.display()
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        anyhow!(
+            "Search index path has no owned relative name: {}",
+            path.display()
+        )
+    })?;
+    let deletion = OwnedDeletionRoot::open(parent).with_context(|| {
+        format!(
+            "Failed to open search index deletion root {}",
+            parent.display()
+        )
+    })?;
+    deletion
+        .remove(Path::new(name))
+        .with_context(|| format!("Failed to clear search index artifact {}", path.display()))?;
     std::fs::create_dir_all(path)
         .with_context(|| format!("Failed to create search index dir {}", path.display()))?;
     Ok(())
@@ -2343,10 +1656,6 @@ impl HybridSearchState {
             quantized_llm_docs: Arc::new(engine.quantized_llm_docs.clone()),
             stored_vector_encoding: engine.stored_vector_encoding,
         }
-    }
-
-    pub fn symbols(&self) -> &[(Utf32String, NodeId)] {
-        self.symbols.as_slice()
     }
 
     pub fn semantic_index_ready(&self) -> bool {
@@ -2738,11 +2047,8 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Mutex as StdMutex;
     use std::thread;
     use tempfile::tempdir;
-
-    static ENV_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn test_axis_embedding(axis: usize) -> Vec<f32> {
         let mut embedding = vec![0.0; EMBEDDING_DIM];
@@ -2787,9 +2093,7 @@ mod tests {
 
     #[test]
     fn embedding_profile_defaults_to_bge_base() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::remove(EMBEDDING_PROFILE_ENV);
 
         let profile = EmbeddingProfile::from_env()?;
@@ -2802,9 +2106,7 @@ mod tests {
 
     #[test]
     fn mandatory_sidecar_defaults_to_llamacpp_backend_when_backend_is_unset() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
         let _backend = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
         let _url = EnvGuard::remove(LLAMACPP_EMBEDDINGS_URL_ENV);
@@ -2815,42 +2117,48 @@ mod tests {
             EmbeddingBackendSelection::LlamaCpp
         );
 
-        let _explicit_backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
-        assert_eq!(
-            EmbeddingBackendSelection::from_env()?,
-            EmbeddingBackendSelection::Onnx
-        );
         Ok(())
     }
 
     #[test]
-    fn onnx_runtime_availability_rejects_corrupt_assets() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempdir()?;
-        let model_path = temp.path().join("model.onnx");
-        let tokenizer_path = temp.path().join("tokenizer.json");
-        std::fs::write(&model_path, b"not an onnx model")?;
-        std::fs::write(&tokenizer_path, b"not a tokenizer")?;
-
+    fn removed_onnx_configuration_fails_explicitly() {
+        let _lock = crate::process_env_test_lock();
         let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
         let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
-        let _model = EnvGuard::set(ONNX_MODEL_PATH_ENV, &model_path.to_string_lossy());
-        let _tokenizer = EnvGuard::set(ONNX_TOKENIZER_PATH_ENV, &tokenizer_path.to_string_lossy());
-        let _provider = EnvGuard::set(ONNX_PROVIDER_ENV, "cpu");
 
-        let availability = embedding_runtime_availability_from_env();
+        let error = EmbeddingBackendSelection::from_env()
+            .expect_err("removed ONNX backend must not be accepted");
 
-        assert!(!availability.available);
-        assert!(
-            availability
-                .fallback_message
-                .as_deref()
-                .is_some_and(|message| message.contains("failed to load ONNX tokenizer")),
-            "availability should report a real ONNX asset load failure: {availability:?}"
-        );
-        Ok(())
+        assert!(error.to_string().contains("no longer supported"));
+    }
+
+    #[test]
+    fn removed_onnx_runtime_mode_fails_even_with_llamacpp_backend() {
+        let _lock = crate::process_env_test_lock();
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+
+        for alias in ["onnx", "ort", "onnxruntime", "onnx-runtime"] {
+            let mode = EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, alias);
+            let error = EmbeddingBackendSelection::from_env()
+                .expect_err("removed ONNX runtime mode must not be overridden");
+
+            assert!(error.to_string().contains(EMBEDDING_RUNTIME_MODE_ENV));
+            assert!(error.to_string().contains("no longer supported"));
+            drop(mode);
+        }
+    }
+
+    #[test]
+    fn removed_onnx_environment_fails_even_with_llamacpp_selected() {
+        let _lock = crate::process_env_test_lock();
+        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
+        let _legacy = EnvGuard::set("CODESTORY_EMBED_ONNX_MODEL", "legacy.onnx");
+
+        let error = EmbeddingBackendSelection::from_env()
+            .expect_err("removed ONNX environment must not be ignored");
+
+        assert!(error.to_string().contains("CODESTORY_EMBED_ONNX_MODEL"));
+        assert!(error.to_string().contains("no longer supported"));
     }
 
     #[test]
@@ -2861,84 +2169,10 @@ mod tests {
         assert_eq!(embedding_parallel_chunk_size(0, 4), 1);
     }
 
-    #[test]
-    fn onnx_hidden_state_pooling_respects_attention_mask() -> Result<()> {
-        let data = vec![
-            1.0, 2.0, 3.0, 4.0, //
-            10.0, 20.0, 30.0, 40.0, //
-        ];
-        let attention = vec![1, 0, 1, 1];
-
-        let cls = pool_onnx_hidden_state(&data, &[2, 2, 2], None, 2, 2, EmbeddingPooling::Cls)?;
-        assert_eq!(cls, vec![vec![1.0, 2.0], vec![10.0, 20.0]]);
-
-        let mean = pool_onnx_hidden_state(
-            &data,
-            &[2, 2, 2],
-            Some(&attention),
-            2,
-            2,
-            EmbeddingPooling::Mean,
-        )?;
-        assert_eq!(mean, vec![vec![1.0, 2.0], vec![20.0, 30.0]]);
-
-        let last = pool_onnx_hidden_state(
-            &data,
-            &[2, 2, 2],
-            Some(&attention),
-            2,
-            2,
-            EmbeddingPooling::LastToken,
-        )?;
-        assert_eq!(last, vec![vec![1.0, 2.0], vec![30.0, 40.0]]);
-        Ok(())
-    }
-
-    #[test]
-    fn onnx_rank2_output_is_treated_as_pooled_embeddings() -> Result<()> {
-        let data = vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0];
-
-        let embeddings =
-            extract_onnx_embeddings(&data, &[2, 4], None, 2, 1, EmbeddingPooling::Cls)?;
-
-        assert_eq!(
-            embeddings,
-            vec![vec![1.0, 2.0, 3.0, 4.0], vec![10.0, 20.0, 30.0, 40.0]]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn onnx_batch_token_budget_limits_padded_tensor_size() {
-        let rows = vec![
-            OnnxEncodedRow {
-                ids: vec![1; 4],
-                attention: vec![1; 4],
-                token_types: vec![0; 4],
-            },
-            OnnxEncodedRow {
-                ids: vec![1; 6],
-                attention: vec![1; 6],
-                token_types: vec![0; 6],
-            },
-            OnnxEncodedRow {
-                ids: vec![1; 6],
-                attention: vec![1; 6],
-                token_types: vec![0; 6],
-            },
-        ];
-
-        assert_eq!(onnx_batch_end_for_token_budget(&rows, 0, 12), 2);
-        assert_eq!(onnx_batch_end_for_token_budget(&rows, 2, 1), 3);
-
-        let cls_batch = shape_onnx_batch(&rows[..1], EmbeddingPooling::Cls).unwrap();
-        assert!(cls_batch.attention_values.is_none());
-        let mean_batch = shape_onnx_batch(&rows[..1], EmbeddingPooling::Mean).unwrap();
-        assert!(mean_batch.attention_values.is_some());
-    }
-
     fn run_one_fake_embedding_server(
-        response_body: &'static str,
+        status: &'static str,
+        response_headers: &'static str,
+        response_body: String,
     ) -> Result<(String, thread::JoinHandle<String>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -2981,7 +2215,7 @@ mod tests {
             }
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{response_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
                 response_body
             );
@@ -2996,11 +2230,10 @@ mod tests {
     #[test]
     fn llamacpp_backend_uses_openai_embedding_endpoint() -> Result<()> {
         let response = r#"{"data":[{"index":0,"embedding":[1.0,0.0,0.0]},{"index":1,"embedding":[0.0,2.0,0.0]}]}"#;
-        let (url, handle) = run_one_fake_embedding_server(response)?;
+        let (url, handle) = run_one_fake_embedding_server("200 OK", "", response.to_string())?;
         let profile = EmbeddingProfile {
             name: "custom".to_string(),
             model_id: "custom-local".to_string(),
-            max_tokens: 256,
             pooling: EmbeddingPooling::Mean,
             query_prefix: String::new(),
             document_prefix: "doc: ".to_string(),
@@ -3008,13 +2241,18 @@ mod tests {
             truncate_dim: None,
             expected_dim: Some(3),
         };
+        let mut client_config = crate::test_sidecar_runtime_from_env().embedding;
+        client_config.endpoint = url.clone();
+        client_config.endpoint_origin =
+            codestory_retrieval::EmbeddingEndpointOrigin::TrustedProjectConfig;
+        client_config.expected_dim = Some(3);
+        client_config.request_count = 1;
         let runtime = EmbeddingRuntime {
             model_path: PathBuf::from(&url),
             model_id: profile.cache_model_id(EmbeddingBackendSelection::LlamaCpp),
             profile,
             backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
-                endpoint: LlamaCppEndpoint::parse(&url)?,
-                request_count: 1,
+                client: codestory_retrieval::LlamaCppEmbeddingClient::new(&client_config)?,
             })),
         };
         let embeddings = runtime.embed_texts(&["alpha".to_string(), "beta".to_string()])?;
@@ -3037,9 +2275,7 @@ mod tests {
     #[test]
     #[ignore]
     fn embedding_identity_probe_from_env() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let query = std::env::var("CODESTORY_EMBED_IDENTITY_PROBE_QUERY").unwrap_or_else(|_| {
             "Where is the retrieval sidecar embedding contract enforced?".into()
         });
@@ -3051,8 +2287,7 @@ mod tests {
                 vec![
                     "llama.cpp embedding sidecar is mandatory for product retrieval_mode full."
                         .into(),
-                    "Managed ONNX assets are diagnostic until fresh quality evidence exists."
-                        .into(),
+                    "Stored vectors from unsupported embedding producers must be refreshed.".into(),
                     "Hash projection is deterministic but not semantic product readiness.".into(),
                     "Packet and search readiness require full sidecar retrieval evidence.".into(),
                 ]
@@ -3069,8 +2304,6 @@ mod tests {
                         "failure_text": error.to_string(),
                         "backend_env": std::env::var(EMBEDDING_BACKEND_ENV).ok(),
                         "profile_env": std::env::var(EMBEDDING_PROFILE_ENV).ok(),
-                        "model_env": std::env::var(ONNX_MODEL_PATH_ENV).ok(),
-                        "tokenizer_env": std::env::var(ONNX_TOKENIZER_PATH_ENV).ok(),
                         "url_env": std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV).ok(),
                     }))?
                 );
@@ -3101,14 +2334,7 @@ mod tests {
         });
 
         let model_path = runtime.model_path();
-        let cache_bytes = file_len(model_path)
-            .into_iter()
-            .chain(
-                std::env::var(ONNX_TOKENIZER_PATH_ENV)
-                    .ok()
-                    .and_then(|path| file_len(std::path::Path::new(&path))),
-            )
-            .sum::<u64>();
+        let cache_bytes = file_len(model_path).unwrap_or(0);
         let cache_bytes = if cache_bytes == 0 {
             None
         } else {
@@ -3160,16 +2386,6 @@ mod tests {
     }
 
     #[test]
-    fn llamacpp_endpoint_parse_accepts_openai_embeddings_url() -> Result<()> {
-        let endpoint = LlamaCppEndpoint::parse("http://127.0.0.1:8080/v1/embeddings")?;
-
-        assert_eq!(endpoint.host, "127.0.0.1");
-        assert_eq!(endpoint.port, 8080);
-        assert_eq!(endpoint.path, "/v1/embeddings");
-        Ok(())
-    }
-
-    #[test]
     fn test_search_engine() -> Result<()> {
         let mut engine = SearchEngine::new(None)?;
 
@@ -3218,9 +2434,7 @@ mod tests {
 
     #[test]
     fn symbol_full_text_index_can_be_disabled_for_projection_only_search() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(SYMBOL_FULL_TEXT_INDEX_ENV, "false");
         let mut engine = SearchEngine::new(None)?;
 
@@ -3528,9 +2742,7 @@ mod tests {
 
     #[test]
     fn test_hybrid_search_quantized_prefilter_rescores_full_precision() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
 
         let mut engine = SearchEngine::new(None)?;
@@ -3641,9 +2853,7 @@ mod tests {
 
     #[test]
     fn test_quantized_semantic_prefilter_prefers_primary_docs() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
 
         let mut engine = SearchEngine::new(None)?;
@@ -3672,9 +2882,7 @@ mod tests {
 
     #[test]
     fn test_float32_semantic_scores_return_bounded_top_candidates() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "float32");
 
         fn axis_embedding(axis: usize) -> Vec<f32> {
@@ -3704,9 +2912,7 @@ mod tests {
 
     #[test]
     fn test_quantized_semantic_scores_return_bounded_top_candidates() -> Result<()> {
-        let _lock = ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = crate::process_env_test_lock();
         let _guard = EnvGuard::set(STORED_VECTOR_ENCODING_ENV, "int8");
 
         fn axis_embedding(axis: usize) -> Vec<f32> {

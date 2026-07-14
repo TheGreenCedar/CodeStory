@@ -23,3 +23,17 @@ Adapter layout, MCP script, hooks, and plugin checks:
 
 Keep adapters thin: point hook-capable hosts at `hooks/` and `skills/`; align
 rule-only hosts with the grounding skill contract.
+
+## Hook qualification evidence
+
+The deterministic [route matrix](../tests/fixtures/hook-route-qualification.json)
+runs both the current hook and a test-only reproduction of the former policy's
+first `UserPromptSubmit` emission as child processes. It scores route categories
+and exact tool-name tokens, not rendered prose fragments; historical hook-state
+deduplication is outside this comparison.
+
+The separate [observed MCP drills](../tests/fixtures/hook-observed-mcp-drills.json)
+record sourced orientation, symbol, call-flow, change-impact, and blocked
+fallback observations. Static tests validate those artifacts and the matching
+hook category; they do not execute MCP or promote recorded observations into
+live proof.

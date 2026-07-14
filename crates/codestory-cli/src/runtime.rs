@@ -7,25 +7,17 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::api::{
-    ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, NodeDetailsDto, NodeDetailsRequest,
-    ProjectSummary, SearchHit,
+    ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, ProjectSummary, SearchHit,
 };
 use codestory_runtime::{
     BookmarkService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService,
-    Runtime,
+    Runtime, TargetResolution,
 };
 use std::path::{Path, PathBuf};
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
-use crate::display::{
-    clean_path_string, format_search_hit_target, quote_command_path, relative_path,
-};
-use crate::query_resolution::{
-    ResolutionRank, compare_resolution_hits, file_filter_match_bucket, is_resolvable_graph_target,
-    resolution_rank_with_project_root, search_hit_matches_file_filter,
-};
+use crate::display::{clean_path_string, quote_command_path};
 
-const HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT: usize = 10;
 const INCOMPLETE_INDEX_RECOVERY_REASON: &str =
     "previous_incremental_run_incomplete_full_refresh_required";
 
@@ -55,26 +47,31 @@ pub(crate) struct RuntimeContext {
     pub(crate) project_root: PathBuf,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
-    pub(crate) managed_embeddings_root: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ResolutionCandidateRank {
-    file_filter_match: u8,
-    resolution: ResolutionRank,
+    pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
 }
 
 #[derive(Debug, Clone)]
-/// A query or id after CLI target resolution has selected one graph-backed hit.
-///
-/// `alternatives` is ordered for reviewer/operator display and may be truncated
-/// by the search layer; it is not a complete search result set.
 pub(crate) struct ResolvedTarget {
     pub(crate) selector: QuerySelectorOutput,
     pub(crate) requested: String,
     pub(crate) file_filter: Option<String>,
     pub(crate) selected: SearchHit,
     pub(crate) alternatives: Vec<SearchHit>,
+}
+
+impl ResolvedTarget {
+    pub(crate) fn from_runtime(target: codestory_runtime::ResolvedTarget) -> Self {
+        Self {
+            selector: match target.selector {
+                codestory_runtime::TargetSelector::Id => QuerySelectorOutput::Id,
+                codestory_runtime::TargetSelector::Query => QuerySelectorOutput::Query,
+            },
+            requested: target.requested,
+            file_filter: target.file_filter,
+            selected: target.selected,
+            alternatives: target.alternatives,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,30 +95,92 @@ impl std::fmt::Display for AmbiguousTargetError {
 impl std::error::Error for AmbiguousTargetError {}
 
 impl RuntimeContext {
-    /// Open runtime services for a command that may use managed embeddings.
+    /// Open runtime services with the caller's embedding configuration.
     pub(crate) fn new(args: &ProjectArgs) -> Result<Self> {
-        Self::new_with_startup(args)
+        Self::new_with_startup(args, &crate::config::process_startup_config())
     }
 
     /// Open runtime services for agent-facing packet/search commands.
+    #[cfg(test)]
     pub(crate) fn new_agent_sidecar(args: &ProjectArgs) -> Result<Self> {
-        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
-        Self::new(args)
+        Self::new_agent_sidecar_with_selection(args, None, None)
+    }
+
+    pub(crate) fn new_agent_sidecar_with_startup(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+    ) -> Result<Self> {
+        Self::new_agent_sidecar_with_startup_and_selection(args, startup, None, None)
+    }
+
+    pub(crate) fn new_agent_sidecar_with_selection(
+        args: &ProjectArgs,
+        profile: Option<crate::args::CliSidecarProfile>,
+        run_id: Option<&str>,
+    ) -> Result<Self> {
+        Self::new_agent_sidecar_with_startup_and_selection(
+            args,
+            &crate::config::process_startup_config(),
+            profile,
+            run_id,
+        )
+    }
+
+    fn new_agent_sidecar_with_startup_and_selection(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+        profile: Option<crate::args::CliSidecarProfile>,
+        run_id: Option<&str>,
+    ) -> Result<Self> {
+        let mut context = Self::new_with_startup(args, startup)?;
+        let selected = profile
+            .map(Into::into)
+            .unwrap_or(codestory_retrieval::SidecarProfile::Agent);
+        context.sidecar =
+            context
+                .sidecar
+                .with_profile_and_run_id(Some(&context.project_root), selected, run_id);
+        let runtime = Runtime::new_with_config(context.sidecar.clone());
+        context.project = runtime.project_service();
+        context.index = runtime.index_service();
+        context.grounding = runtime.grounding_service();
+        context.bookmarks = runtime.bookmark_service();
+        context.browser = runtime.browser_service();
+        context.events = runtime.events();
+        Ok(context)
     }
 
     /// Open runtime services without starting managed embedding processes.
     pub(crate) fn new_inspect_only(args: &ProjectArgs) -> Result<Self> {
-        Self::new_with_startup(args)
+        Self::new(args)
     }
 
-    fn new_with_startup(args: &ProjectArgs) -> Result<Self> {
+    fn new_with_startup(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+    ) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
-        let cache_override = trusted_cache_override(&project_root, args.cache_dir.as_deref())?;
-        let cache_root = cache_root_for_project(&project_root, cache_override.as_deref())?;
-        let managed_embeddings_root =
-            crate::managed_embeddings::runtime_managed_root(cache_override.as_deref())?;
+        let config = crate::config::load_config_with_startup(&project_root, startup)?;
+        let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
+        let process_cache_root = startup
+            .stdio_cache_root
+            .as_deref()
+            .unwrap_or_else(|| startup.sidecar_defaults.cache_root());
+        let cache_root = cache_root_for_project_in(
+            &project_root,
+            cache_override.as_deref(),
+            process_cache_root,
+        )?;
         let storage_path = cache_root.join("codestory.db");
-        let runtime = Runtime::new();
+        let sidecar_defaults = startup
+            .sidecar_defaults
+            .with_cache_root(process_cache_root.to_path_buf());
+        let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults(
+            &project_root,
+            &sidecar_defaults,
+            &config.runtime_overrides(),
+        );
+        let runtime = Runtime::new_with_config(sidecar.clone());
         let events = runtime.events();
         Ok(Self {
             project: runtime.project_service(),
@@ -133,7 +192,7 @@ impl RuntimeContext {
             project_root,
             cache_root,
             storage_path,
-            managed_embeddings_root,
+            sidecar,
         })
     }
 
@@ -198,216 +257,24 @@ pub(crate) fn resolve_target(
     target: TargetSelection,
     file_filter: Option<&str>,
 ) -> Result<ResolvedTarget> {
-    match target {
-        TargetSelection::Id(id) => {
-            let details = runtime
-                .browser
-                .node_details(NodeDetailsRequest { id: id.clone() })
-                .map_err(map_api_error)?;
-            Ok(ResolvedTarget {
-                selector: QuerySelectorOutput::Id,
-                requested: id.0,
-                file_filter: None,
-                selected: search_hit_from_node(&details),
-                alternatives: Vec::new(),
-            })
-        }
+    let target = match target {
+        TargetSelection::Id(id) => codestory_runtime::TargetSelection::Id(id),
         TargetSelection::Query { query, choose } => {
-            resolve_query_target(runtime, query, choose, file_filter)
+            codestory_runtime::TargetSelection::Query { query, choose }
         }
-    }
-}
-
-fn resolve_query_target(
-    runtime: &RuntimeContext,
-    query: String,
-    choose: Option<usize>,
-    file_filter: Option<&str>,
-) -> Result<ResolvedTarget> {
-    let alternatives = query_resolution_alternatives(runtime, &query, file_filter)?;
-    let tied_alternatives =
-        tied_top_alternatives(&runtime.project_root, &query, file_filter, &alternatives);
-
-    if let Some(choice) = choose {
-        return resolve_chosen_query_target(
-            query,
-            file_filter,
-            alternatives,
-            tied_alternatives,
-            choice,
-        );
-    }
-
-    reject_ambiguous_query_target(
-        &runtime.project_root,
-        &query,
-        file_filter,
-        tied_alternatives,
-    )?;
-    debug_assert_unique_top_candidate(&runtime.project_root, &query, file_filter, &alternatives);
-
-    let selected = alternatives
-        .first()
-        .cloned()
-        .ok_or_else(|| no_query_match_error(&runtime.project_root, &query, file_filter))?;
-    Ok(query_resolved_target(
-        query,
-        file_filter,
-        selected,
-        alternatives,
-    ))
-}
-
-fn query_resolution_alternatives(
-    runtime: &RuntimeContext,
-    query: &str,
-    file_filter: Option<&str>,
-) -> Result<Vec<SearchHit>> {
-    let mut alternatives = query_resolution_search_hits(runtime, query)?;
-    alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
-    if alternatives.is_empty()
-        && let Some(stem) = command_query_resolution_stem(query)
-    {
-        alternatives = query_resolution_search_hits(runtime, &stem)?;
-        alternatives.retain(|hit| is_resolvable_graph_target(query, hit));
-    }
-    if let Some(file_filter) = file_filter {
-        alternatives
-            .retain(|hit| search_hit_matches_file_filter(&runtime.project_root, hit, file_filter));
-    }
-    if alternatives.is_empty() {
-        return Err(no_query_match_error(
-            &runtime.project_root,
-            query,
-            file_filter,
-        ));
-    }
-
-    alternatives.sort_by(|left, right| {
-        compare_resolution_candidates(&runtime.project_root, query, file_filter, left, right)
-    });
-    Ok(alternatives)
-}
-
-fn query_resolution_search_hits(runtime: &RuntimeContext, query: &str) -> Result<Vec<SearchHit>> {
-    runtime
-        .browser
-        .resolve_indexed_symbol_candidates(query, 50)
-        .map_err(map_api_error)
-}
-
-fn command_query_resolution_stem(query: &str) -> Option<String> {
-    for suffix in ["_command", "_cmd", "_handler"] {
-        if let Some(stem) = query.strip_suffix(suffix)
-            && stem.len() >= 4
-        {
-            return Some(stem.to_string());
-        }
-    }
-    None
-}
-
-fn resolve_chosen_query_target(
-    query: String,
-    file_filter: Option<&str>,
-    mut alternatives: Vec<SearchHit>,
-    tied_alternatives: Vec<SearchHit>,
-    choice: usize,
-) -> Result<ResolvedTarget> {
-    if choice == 0 || choice > tied_alternatives.len() {
-        bail!(
-            "`--choose {choice}` is outside the displayed alternative range 1..={}. Re-run without `--choose` to inspect the current alternatives.",
-            tied_alternatives.len()
-        );
-    }
-
-    let selected = tied_alternatives[choice - 1].clone();
-    promote_selected_alternative(&mut alternatives, &selected);
-    Ok(query_resolved_target(
-        query,
-        file_filter,
-        selected,
-        alternatives,
-    ))
-}
-
-fn promote_selected_alternative(alternatives: &mut Vec<SearchHit>, selected: &SearchHit) {
-    if let Some(position) = alternatives
-        .iter()
-        .position(|hit| hit.node_id == selected.node_id)
-    {
-        let chosen = alternatives.remove(position);
-        alternatives.insert(0, chosen);
-    }
-}
-
-fn reject_ambiguous_query_target(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    tied_alternatives: Vec<SearchHit>,
-) -> Result<()> {
-    if tied_alternatives.len() <= 1 {
-        return Ok(());
-    }
-
-    let message = ambiguous_query_error(project_root, query, file_filter, &tied_alternatives);
-    Err(AmbiguousTargetError {
-        query: query.to_owned(),
-        file_filter: file_filter.map(ToOwned::to_owned),
-        alternatives: tied_alternatives,
-        message,
-    }
-    .into())
-}
-
-fn debug_assert_unique_top_candidate(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    alternatives: &[SearchHit],
-) {
-    if alternatives.len() > 1 {
-        let rank1 = resolution_candidate_rank(project_root, query, file_filter, &alternatives[1]);
-        debug_assert_ne!(
-            resolution_candidate_rank(project_root, query, file_filter, &alternatives[0]),
-            rank1
-        );
-    }
-}
-
-fn query_resolved_target(
-    query: String,
-    file_filter: Option<&str>,
-    selected: SearchHit,
-    alternatives: Vec<SearchHit>,
-) -> ResolvedTarget {
-    ResolvedTarget {
-        selector: QuerySelectorOutput::Query,
-        requested: query,
-        file_filter: file_filter.map(ToOwned::to_owned),
-        selected,
-        alternatives,
-    }
-}
-
-fn tied_top_alternatives(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    alternatives: &[SearchHit],
-) -> Vec<SearchHit> {
-    let Some(first) = alternatives.first() else {
-        return Vec::new();
     };
-    let top_rank = resolution_candidate_rank(project_root, query, file_filter, first);
-    alternatives
-        .iter()
-        .take_while(|hit| {
-            resolution_candidate_rank(project_root, query, file_filter, hit) == top_rank
-        })
-        .cloned()
-        .collect()
+    match runtime.browser.resolve_target(target, file_filter) {
+        Ok(TargetResolution::Resolved(target)) => Ok(ResolvedTarget::from_runtime(*target)),
+        Ok(TargetResolution::Ambiguous(ambiguous)) => Err(AmbiguousTargetError {
+            query: ambiguous.query,
+            file_filter: ambiguous.file_filter,
+            alternatives: ambiguous.alternatives,
+            message: ambiguous.message,
+        }
+        .into()),
+        Ok(TargetResolution::Rejected(message)) => Err(anyhow!(message)),
+        Err(error) => Err(map_api_error(error)),
+    }
 }
 
 /// Canonicalize a project argument before deriving cache identity.
@@ -432,23 +299,27 @@ pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
 ///
 /// Explicit overrides are returned unchanged; otherwise the cache root is a
 /// stable hash of the canonical project path under the platform cache directory.
+#[cfg(test)]
 pub(crate) fn cache_root_for_project(
     project_root: &Path,
     override_dir: Option<&Path>,
 ) -> Result<PathBuf> {
-    match override_dir {
-        Some(path) => Ok(path.to_path_buf()),
-        None => Ok(codestory_retrieval::user_cache_root()
-            .join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
-    }
+    cache_root_for_project_in(
+        project_root,
+        override_dir,
+        &crate::sidecar_runtime::user_cache_root(),
+    )
 }
 
-pub(crate) fn trusted_cache_override(
+fn cache_root_for_project_in(
     project_root: &Path,
-    cli_cache_dir: Option<&Path>,
-) -> Result<Option<PathBuf>> {
-    let config = crate::config::load_config(project_root)?;
-    Ok(cli_cache_dir.map(Path::to_path_buf).or(config.cache_dir))
+    override_dir: Option<&Path>,
+    process_cache_root: &Path,
+) -> Result<PathBuf> {
+    match override_dir {
+        Some(path) => Ok(path.to_path_buf()),
+        None => Ok(process_cache_root.join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
+    }
 }
 
 /// Small stable hash used for path-derived cache directory names.
@@ -598,185 +469,6 @@ fn cache_busy_message(project: Option<&Path>) -> String {
     )
 }
 
-pub(crate) fn search_hit_from_node(node: &NodeDetailsDto) -> SearchHit {
-    SearchHit {
-        node_id: node.id.clone(),
-        display_name: node.display_name.clone(),
-        kind: node.kind,
-        file_path: node.file_path.clone(),
-        line: node.start_line,
-        score: 0.0,
-        origin: codestory_contracts::api::SearchHitOrigin::IndexedSymbol,
-        match_quality: None,
-        resolvable: true,
-        evidence_tier: Some(codestory_contracts::api::PacketEvidenceTierDto::ResolvedGraph),
-        evidence_producer: Some("node_details".to_string()),
-        resolution_status: Some(codestory_contracts::api::PacketEvidenceResolutionDto::Resolved),
-        loss_reason: None,
-        coverage_role: None,
-        eligible_for_sufficiency: Some(true),
-        score_breakdown: None,
-    }
-}
-
-fn resolution_candidate_rank(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    hit: &SearchHit,
-) -> ResolutionCandidateRank {
-    let rank = resolution_rank_with_project_root(Some(project_root), query, hit);
-    ResolutionCandidateRank {
-        file_filter_match: file_filter
-            .map(|filter| file_filter_match_bucket(project_root, hit, filter))
-            .unwrap_or(0),
-        resolution: rank,
-    }
-}
-
-fn compare_resolution_candidates(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    left: &SearchHit,
-    right: &SearchHit,
-) -> std::cmp::Ordering {
-    resolution_candidate_rank(project_root, query, file_filter, right)
-        .cmp(&resolution_candidate_rank(
-            project_root,
-            query,
-            file_filter,
-            left,
-        ))
-        .then_with(|| compare_resolution_hits(query, left, right))
-        .then_with(|| left.node_id.0.cmp(&right.node_id.0))
-}
-
-fn no_query_match_error(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-) -> anyhow::Error {
-    let search_command = format!(
-        "codestory-cli search --project {} --query {} --limit 10",
-        quote_cli_path(project_root),
-        quote_cli_value(query)
-    );
-    match file_filter {
-        Some(file_filter) => anyhow!(
-            "query_resolution: No symbol matched query `{query}` within files matching `{}`. Run `{search_command}` to inspect candidates, or relax `--file`.",
-            clean_path_string(file_filter)
-        ),
-        None => anyhow!(
-            "query_resolution: No symbol matched query `{query}`. Run `{search_command}` to inspect candidates."
-        ),
-    }
-}
-
-fn ambiguous_query_error(
-    project_root: &Path,
-    query: &str,
-    file_filter: Option<&str>,
-    alternatives: &[SearchHit],
-) -> String {
-    let mut message = String::new();
-    let scope = file_filter
-        .map(|value| format!(" even after applying `--file {}`", clean_path_string(value)))
-        .unwrap_or_default();
-    message.push_str(&format!(
-        "Query `{query}` is ambiguous{scope}; choose a match or pass a stable id.\n"
-    ));
-    message.push_str("\nNext commands:\n");
-    message.push_str(&format!(
-        "  codestory-cli symbol --project {} --query {}{} --choose 1\n",
-        quote_cli_path(project_root),
-        quote_cli_value(query),
-        file_filter
-            .map(|value| format!(" --file {}", quote_cli_value(&clean_path_string(value))))
-            .unwrap_or_default()
-    ));
-    if let Some(first) = alternatives.first() {
-        message.push_str(&format!(
-            "  codestory-cli symbol --project {} --id {}\n",
-            quote_cli_path(project_root),
-            first.node_id.0
-        ));
-        if let Some(path) = first.file_path.as_deref() {
-            message.push_str(&format!(
-                "  codestory-cli symbol --project {} --query {} --file {}\n",
-                quote_cli_path(project_root),
-                quote_cli_value(query),
-                quote_cli_value(&relative_path(project_root, path))
-            ));
-        }
-    }
-    if file_filter.is_some() {
-        message.push_str(
-            "\nPass a more qualified symbol name, a stable `--id`, or a narrower `--file` fragment.",
-        );
-    } else {
-        message.push_str(
-            "\nPass a more qualified symbol name, add `--file <path-fragment>`, or resolve the exact `--id` from `search` output.",
-        );
-    }
-    let displayed = alternatives.len().min(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT);
-    message.push_str(&format!(
-        "\n\nTop equally ranked matches (showing {displayed} of {}):\n",
-        alternatives.len()
-    ));
-    for (index, hit) in alternatives
-        .iter()
-        .take(HUMAN_AMBIGUOUS_ALTERNATIVE_LIMIT)
-        .enumerate()
-    {
-        let number = index + 1;
-        message.push_str("  ");
-        message.push_str(&number.to_string());
-        message.push_str(". ");
-        message.push_str(&format_search_hit_target(project_root, hit));
-        message.push_str(" id=`");
-        message.push_str(&hit.node_id.0);
-        message.push('`');
-        if let Some(node_ref) = node_ref(project_root, hit) {
-            message.push_str(" ref=`");
-            message.push_str(&node_ref);
-            message.push('`');
-        }
-        message.push('\n');
-    }
-    message
-}
-
-fn node_ref(project_root: &Path, hit: &SearchHit) -> Option<String> {
-    let file_path = hit.file_path.as_deref()?;
-    let line = hit.line?;
-    Some(format!(
-        "{}:{line}:{}",
-        relative_path(project_root, file_path),
-        hit.display_name
-    ))
-}
-
-fn quote_cli_path(path: &Path) -> String {
-    quote_cli_value(&clean_path_string(&path.to_string_lossy()))
-}
-
-fn quote_cli_value(value: &str) -> String {
-    if cli_value_needs_single_quotes(value) {
-        quote_cli_single_quoted_value(value)
-    } else {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    }
-}
-
-fn cli_value_needs_single_quotes(value: &str) -> bool {
-    value.chars().any(|ch| matches!(ch, '$' | '`' | '\'' | '"'))
-}
-
-fn quote_cli_single_quoted_value(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,10 +482,6 @@ mod tests {
         "CODESTORY_EMBED_BACKEND",
         "CODESTORY_EMBED_PORT",
         "CODESTORY_EMBED_LLAMACPP_URL",
-        "CODESTORY_EMBED_ONNX_MODEL",
-        "CODESTORY_EMBED_ONNX_TOKENIZER",
-        "CODESTORY_EMBED_ONNX_PROVIDER",
-        "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
         "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE",
         "CODESTORY_SEMANTIC_DOC_MAX_TOKENS",
         "CODESTORY_STORED_VECTOR_ENCODING",
@@ -834,23 +522,6 @@ mod tests {
         }
     }
 
-    fn write_fake_managed_onnx_assets(root: &Path) {
-        let model = root.join("assets").join("model.onnx");
-        let tokenizer = root.join("assets").join("tokenizer.json");
-        fs::create_dir_all(model.parent().expect("model parent")).expect("create model dir");
-        fs::write(&model, b"model").expect("write model");
-        fs::write(&tokenizer, b"tokenizer").expect("write tokenizer");
-        fs::write(
-            root.join("manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "onnx_model_path": model.to_string_lossy().replace('\\', "/"),
-                "onnx_tokenizer_path": tokenizer.to_string_lossy().replace('\\', "/"),
-            }))
-            .expect("manifest json"),
-        )
-        .expect("write manifest");
-    }
-
     #[test]
     fn project_config_cache_dir_is_rejected_before_runtime_paths() {
         let _env_lock = crate::config::config_env_test_lock();
@@ -878,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn home_config_cache_dir_resolves_storage_and_managed_embeddings_under_same_root() {
+    fn home_config_cache_dir_resolves_storage_under_trusted_root() {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
@@ -893,7 +564,6 @@ mod tests {
             format!("cache_dir = {:?}\n", cache.to_string_lossy()),
         )
         .expect("write home config");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
         unsafe {
             env::set_var("USERPROFILE", &home);
         }
@@ -906,27 +576,10 @@ mod tests {
 
         assert_eq!(runtime.cache_root, cache);
         assert_eq!(runtime.storage_path, cache.join("codestory.db"));
-        assert_eq!(
-            runtime.managed_embeddings_root,
-            cache.join("managed-embeddings")
-        );
-        for name in [
-            "CODESTORY_EMBED_BACKEND",
-            "CODESTORY_EMBED_ONNX_MODEL",
-            "CODESTORY_EMBED_ONNX_TOKENIZER",
-            "CODESTORY_EMBED_ONNX_PROVIDER",
-            "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
-        ] {
-            assert_eq!(
-                env::var(name).ok(),
-                None,
-                "runtime context must not promote managed ONNX assets via {name}"
-            );
-        }
     }
 
     #[test]
-    fn cli_cache_dir_overrides_home_config_for_storage_and_managed_embeddings() {
+    fn cli_cache_dir_overrides_home_config_for_storage() {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
@@ -942,7 +595,6 @@ mod tests {
             format!("cache_dir = {:?}\n", home_cache.to_string_lossy()),
         )
         .expect("write home config");
-        write_fake_managed_onnx_assets(&cli_cache.join("managed-embeddings"));
         unsafe {
             env::set_var("USERPROFILE", &home);
         }
@@ -955,94 +607,110 @@ mod tests {
 
         assert_eq!(runtime.cache_root, cli_cache);
         assert_eq!(runtime.storage_path, cli_cache.join("codestory.db"));
+    }
+
+    #[test]
+    fn explicit_startup_snapshots_isolate_concurrent_runtime_paths_and_endpoints() {
+        let temp = tempdir().expect("temp dir");
+        let first_project = temp.path().join("first-project");
+        let second_project = temp.path().join("second-project");
+        let first_cache = temp.path().join("first-cache");
+        let second_cache = temp.path().join("second-cache");
+        fs::create_dir_all(&first_project).expect("create first project");
+        fs::create_dir_all(&second_project).expect("create second project");
+        fs::write(
+            first_project.join(".codestory.toml"),
+            r#"embedding_endpoint = "http://127.0.0.1:41001/v1/embeddings""#,
+        )
+        .expect("write first config");
+        fs::write(
+            second_project.join(".codestory.toml"),
+            r#"embedding_endpoint = "http://127.0.0.1:41002/v1/embeddings""#,
+        )
+        .expect("write second config");
+        let startup = |cache_root: &Path| crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: true,
+            stdio_cache_root: Some(cache_root.to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache_root.to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+        let first_startup = startup(&first_cache);
+        let second_startup = startup(&second_cache);
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                RuntimeContext::new_agent_sidecar_with_startup(
+                    &ProjectArgs {
+                        project: first_project.clone(),
+                        cache_dir: None,
+                    },
+                    &first_startup,
+                )
+                .expect("first runtime")
+            });
+            let second = scope.spawn(|| {
+                RuntimeContext::new_agent_sidecar_with_startup(
+                    &ProjectArgs {
+                        project: second_project.clone(),
+                        cache_dir: None,
+                    },
+                    &second_startup,
+                )
+                .expect("second runtime")
+            });
+            (
+                first.join().expect("first runtime worker"),
+                second.join().expect("second runtime worker"),
+            )
+        });
+
+        assert!(first.storage_path.starts_with(&first_cache));
+        assert!(second.storage_path.starts_with(&second_cache));
+        assert!(first.sidecar.layout.state_file.starts_with(&first_cache));
+        assert!(second.sidecar.layout.state_file.starts_with(&second_cache));
         assert_eq!(
-            runtime.managed_embeddings_root,
-            cli_cache.join("managed-embeddings")
+            first.sidecar.embedding.endpoint,
+            "http://127.0.0.1:41001/v1/embeddings"
+        );
+        assert_eq!(
+            second.sidecar.embedding.endpoint,
+            "http://127.0.0.1:41002/v1/embeddings"
         );
     }
 
     #[test]
-    fn inspect_only_runtime_does_not_mutate_embedding_env_when_managed_assets_exist() {
+    fn agent_sidecar_runtime_defaults_to_bundled_llamacpp() {
         let _env_lock = crate::config::config_env_test_lock();
         let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let temp = tempdir().expect("temp dir");
         let project = temp.path().join("repo");
         let cache = temp.path().join("cache");
         fs::create_dir_all(&project).expect("create project");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
 
-        RuntimeContext::new_inspect_only(&ProjectArgs {
-            project,
-            cache_dir: Some(cache),
-        })
-        .expect("runtime context");
-
-        for name in MANAGED_ENV_VARS {
-            assert_eq!(
-                env::var(name).ok(),
-                None,
-                "inspect-only runtime must not set {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn default_runtime_does_not_promote_managed_onnx_assets() {
-        let _env_lock = crate::config::config_env_test_lock();
-        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
-        let temp = tempdir().expect("temp dir");
-        let project = temp.path().join("repo");
-        let cache = temp.path().join("cache");
-        fs::create_dir_all(&project).expect("create project");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
-
-        RuntimeContext::new(&ProjectArgs {
-            project,
-            cache_dir: Some(cache),
-        })
-        .expect("runtime context");
-
-        assert_eq!(env::var("CODESTORY_EMBED_BACKEND").ok(), None);
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_MODEL").ok(), None);
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").ok(), None);
-    }
-
-    #[test]
-    fn agent_sidecar_runtime_defaults_prevent_managed_onnx_autostart() {
-        let _env_lock = crate::config::config_env_test_lock();
-        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
-        let temp = tempdir().expect("temp dir");
-        let project = temp.path().join("repo");
-        let cache = temp.path().join("cache");
-        fs::create_dir_all(&project).expect("create project");
-        write_fake_managed_onnx_assets(&cache.join("managed-embeddings"));
-
-        RuntimeContext::new_agent_sidecar(&ProjectArgs {
+        let runtime = RuntimeContext::new_agent_sidecar(&ProjectArgs {
             project: project.clone(),
             cache_dir: Some(cache),
         })
         .expect("runtime context");
 
         assert_eq!(
-            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
-            Some("llamacpp")
+            runtime.sidecar.profile,
+            codestory_retrieval::SidecarProfile::Agent
         );
+        assert_eq!(runtime.sidecar.embedding.backend, "llamacpp");
         assert_eq!(env::var("CODESTORY_EMBED_LLAMACPP_URL").ok(), None);
-        let sidecar = codestory_retrieval::sidecar_runtime_for_project_with_run_id(
-            &project,
+        let sidecar = runtime.sidecar.with_profile_and_run_id(
+            Some(&project),
             codestory_retrieval::SidecarProfile::Agent,
             Some("ready-repair-test"),
         );
         let expected_url =
             codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
-        sidecar.activate_embed_url_default();
-        assert_eq!(
-            env::var("CODESTORY_EMBED_LLAMACPP_URL").ok().as_deref(),
-            Some(expected_url.as_str())
-        );
+        assert_eq!(sidecar.embedding.endpoint.as_str(), expected_url.as_str());
         assert_ne!(expected_url, "http://127.0.0.1:8080/v1/embeddings");
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_MODEL").ok(), None);
-        assert_eq!(env::var("CODESTORY_EMBED_ONNX_TOKENIZER").ok(), None);
     }
 
     #[test]
@@ -1057,15 +725,20 @@ mod tests {
             );
         }
 
-        crate::managed_embeddings::prepare_bundled_llamacpp_client_env_defaults();
+        let project = tempfile::tempdir().expect("project");
+        let runtime = RuntimeContext::new_agent_sidecar(&ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: None,
+        })
+        .expect("runtime context");
 
         assert_eq!(
             env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
             Some("llamacpp")
         );
         assert_eq!(
-            env::var("CODESTORY_EMBED_LLAMACPP_URL").ok().as_deref(),
-            Some("http://127.0.0.1:18080/v1/embeddings")
+            runtime.sidecar.embedding.endpoint.as_str(),
+            "http://127.0.0.1:18080/v1/embeddings"
         );
     }
 }

@@ -2,16 +2,19 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 struct StdioFixture {
-    workspace: TempDir,
-    cache_dir: TempDir,
+    workspace: PreservableTempDir,
+    cache_dir: PreservableTempDir,
     hash_embeddings: bool,
     latest_release_version: Option<String>,
     disable_release_probe: bool,
@@ -30,21 +33,404 @@ struct StdioServer {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    worker_roots: Vec<PathBuf>,
+    preserve_fixture_roots: Option<Arc<AtomicBool>>,
 }
 
-struct RemoveDirOnDrop(PathBuf);
+struct PreservableTempDir {
+    inner: Option<TempDir>,
+    preserve: Arc<AtomicBool>,
+}
 
-impl Drop for RemoveDirOnDrop {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+struct FakeEmbeddingEndpoint {
+    url: String,
+    response_vector: Vec<f32>,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeEmbeddingEndpoint {
+    fn spawn(vector: Vec<f32>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake embedding endpoint");
+        listener
+            .set_nonblocking(true)
+            .expect("set fake endpoint nonblocking");
+        let address = listener.local_addr().expect("fake endpoint address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_requests = Arc::clone(&requests);
+        let worker_stop = Arc::clone(&stop);
+        let response_vector = vector.clone();
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("make accepted fake endpoint stream blocking");
+                        let body = read_http_request_body(&mut stream);
+                        let input_count = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|request| {
+                                request.get("input").and_then(Value::as_array).map(Vec::len)
+                            })
+                            .expect("embedding request input array");
+                        worker_requests.lock().expect("request log").push(body);
+                        let response_body = json!({
+                            "data": (0..input_count)
+                                .map(|index| json!({"index": index, "embedding": &vector}))
+                                .collect::<Vec<_>>(),
+                        })
+                        .to_string();
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_body.len(),
+                            response_body
+                        )
+                        .expect("write fake embedding response");
+                        stream.flush().expect("flush fake embedding response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept fake embedding request: {error}"),
+                }
+            }
+        });
+        Self {
+            url: format!("http://{address}/v1/embeddings"),
+            response_vector,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.requests.lock().expect("request log").clone()
     }
 }
+
+impl Drop for FakeEmbeddingEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("join fake embedding endpoint");
+        }
+    }
+}
+
+fn read_http_request_body(stream: &mut TcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set fake endpoint read timeout");
+    let mut request = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !request.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("read request header");
+        request.push(byte[0]);
+        assert!(request.len() < 64 * 1024, "request header too large");
+    }
+    let header = String::from_utf8_lossy(&request);
+    let content_length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("content length"))
+        })
+        .unwrap_or(0);
+    let mut body = vec![0_u8; content_length];
+    stream.read_exact(&mut body).expect("read request body");
+    String::from_utf8(body).expect("embedding request utf8")
+}
+
+impl PreservableTempDir {
+    fn new(inner: TempDir, preserve: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: Some(inner),
+            preserve,
+        }
+    }
+}
+
+impl std::ops::Deref for PreservableTempDir {
+    type Target = TempDir;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref().expect("fixture root")
+    }
+}
+
+impl Drop for PreservableTempDir {
+    fn drop(&mut self) {
+        if self.preserve.load(Ordering::Acquire)
+            && let Some(root) = self.inner.take()
+        {
+            let _ = root.keep();
+        }
+    }
+}
+
+const FIXTURE_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Drop for StdioServer {
     fn drop(&mut self) {
+        let timed_out = !wait_for_fixture_workers(&self.worker_roots, FIXTURE_WORKER_DRAIN_TIMEOUT);
+        let timeout_cleanup = timed_out.then(|| {
+            if let Some(preserve) = self.preserve_fixture_roots.as_ref() {
+                preserve.store(true, Ordering::Release);
+            }
+            let reservations = fixture_worker_reservations(&self.worker_roots);
+            let termination = terminate_fixture_process_tree(self.child.id());
+            (reservations, termination)
+        });
+
         let _ = self.child.kill();
         let _ = self.child.wait();
+
+        if let Some((reservations, mut termination)) = timeout_cleanup {
+            let first_survivors = termination
+                .tracked_pids
+                .iter()
+                .copied()
+                .filter(|pid| process_is_running(*pid))
+                .collect::<Vec<_>>();
+            termination.attempts.extend(
+                first_survivors
+                    .iter()
+                    .map(|pid| force_terminate_process(*pid)),
+            );
+            if !first_survivors.is_empty() {
+                thread::sleep(Duration::from_millis(100));
+            }
+            let surviving_pids = termination
+                .tracked_pids
+                .iter()
+                .copied()
+                .filter(|pid| process_is_running(*pid))
+                .collect::<Vec<_>>();
+            let remaining_reservations = fixture_worker_reservations(&self.worker_roots);
+            let detail = format!(
+                "fixture-owned ready-repair workers did not drain within {:?}; preserved fixture roots; reservations={reservations:?}; termination_attempts={:?}; surviving_pids={surviving_pids:?}; remaining_reservations={remaining_reservations:?}",
+                FIXTURE_WORKER_DRAIN_TIMEOUT, termination.attempts
+            );
+            if thread::panicking() {
+                eprintln!("stdio fixture teardown failure while unwinding: {detail}");
+            } else {
+                panic!("stdio fixture teardown failure: {detail}");
+            }
+        }
     }
+}
+
+fn wait_for_fixture_workers(roots: &[PathBuf], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fixture_worker_reservations(roots).is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn fixture_worker_reservations(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut reservations = Vec::new();
+    for root in roots {
+        let mut pending = vec![root.clone()];
+        while let Some(path) = pending.pop() {
+            let Ok(children) = fs::read_dir(path) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let path = child.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.file_name().and_then(|name| name.to_str())
+                    == Some("ready-repair-enqueue.lock")
+                {
+                    reservations.push(path);
+                }
+            }
+        }
+    }
+    reservations
+}
+
+#[test]
+fn fixture_worker_wait_tracks_nested_reservations() {
+    let root = tempfile::tempdir().expect("fixture worker root");
+    let nested = root.path().join("sidecars").join("project");
+    fs::create_dir_all(&nested).expect("nested worker state");
+    let reservation = nested.join("ready-repair-enqueue.lock");
+    fs::write(&reservation, "fixture worker").expect("worker reservation");
+
+    assert!(!wait_for_fixture_workers(
+        &[root.path().to_path_buf()],
+        Duration::ZERO
+    ));
+    fs::remove_file(reservation).expect("remove worker reservation");
+    assert!(wait_for_fixture_workers(
+        &[root.path().to_path_buf()],
+        Duration::ZERO
+    ));
+}
+
+#[derive(Debug)]
+struct ProcessTreeTermination {
+    tracked_pids: Vec<u32>,
+    attempts: Vec<String>,
+}
+
+#[cfg(windows)]
+fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
+    let pid = pid.to_string();
+    let mut attempts = vec![run_taskkill(&pid, false)];
+    thread::sleep(Duration::from_millis(100));
+    for _ in 0..2 {
+        if !process_is_running(pid.parse().expect("numeric process id")) {
+            break;
+        }
+        attempts.push(run_taskkill(&pid, true));
+        thread::sleep(Duration::from_millis(100));
+    }
+    ProcessTreeTermination {
+        tracked_pids: vec![pid.parse().expect("numeric process id")],
+        attempts,
+    }
+}
+
+#[cfg(windows)]
+fn run_taskkill(pid: &str, force: bool) -> String {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", pid, "/T"]);
+    if force {
+        command.arg("/F");
+    }
+    match command.output() {
+        Ok(output) => format!(
+            "taskkill pid={pid} force={force} status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => format!("taskkill pid={pid} force={force} failed: {error}"),
+    }
+}
+
+#[cfg(windows)]
+fn force_terminate_process(pid: u32) -> String {
+    run_taskkill(&pid.to_string(), true)
+}
+
+#[cfg(unix)]
+fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
+    let mut descendants = Vec::new();
+    collect_descendant_processes(pid, &mut descendants);
+    let mut tracked_pids = vec![pid];
+    tracked_pids.extend(descendants.iter().copied());
+    let mut attempts = tracked_pids
+        .iter()
+        .map(|pid| run_unix_kill("-TERM", *pid))
+        .collect::<Vec<_>>();
+    thread::sleep(Duration::from_millis(100));
+    for descendant in descendants.iter().rev() {
+        if process_is_running(*descendant) {
+            attempts.push(run_unix_kill("-KILL", *descendant));
+        }
+    }
+    if process_is_running(pid) {
+        attempts.push(run_unix_kill("-KILL", pid));
+    }
+    ProcessTreeTermination {
+        tracked_pids,
+        attempts,
+    }
+}
+
+#[cfg(unix)]
+fn collect_descendant_processes(parent: u32, descendants: &mut Vec<u32>) {
+    let Ok(output) = Command::new("pgrep")
+        .args(["-P", &parent.to_string()])
+        .output()
+    else {
+        return;
+    };
+    for child in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+    {
+        if descendants.contains(&child) {
+            continue;
+        }
+        descendants.push(child);
+        collect_descendant_processes(child, descendants);
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_kill(signal: &str, pid: u32) -> String {
+    match Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()
+    {
+        Ok(status) => format!("kill {signal} {pid}: {status}"),
+        Err(error) => format!("kill {signal} {pid} failed: {error}"),
+    }
+}
+
+#[cfg(unix)]
+fn force_terminate_process(pid: u32) -> String {
+    run_unix_kill("-KILL", pid)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
+    ProcessTreeTermination {
+        tracked_pids: vec![pid],
+        attempts: vec![format!(
+            "process-tree termination is unsupported on this platform for pid={pid}"
+        )],
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn force_terminate_process(pid: u32) -> String {
+    format!("forced process termination is unsupported on this platform for pid={pid}")
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    let pid = pid.to_string();
+    let Ok(output) = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+    else {
+        return true;
+    };
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .map(|value| value.trim().trim_matches('"'))
+            == Some(pid.as_str())
+    })
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(_pid: u32) -> bool {
+    true
 }
 
 fn write_tiny_rust_workspace(root: &Path) {
@@ -151,8 +537,15 @@ fn refresh_fixture_index(fixture: &StdioFixture) {
 }
 
 fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
-    let workspace = tempfile::tempdir().expect("workspace dir");
-    let cache_dir = tempfile::tempdir().expect("cache dir");
+    let preserve = Arc::new(AtomicBool::new(false));
+    let workspace = PreservableTempDir::new(
+        tempfile::tempdir().expect("workspace dir"),
+        Arc::clone(&preserve),
+    );
+    let cache_dir = PreservableTempDir::new(
+        tempfile::tempdir().expect("cache dir"),
+        Arc::clone(&preserve),
+    );
     write_tiny_rust_workspace(workspace.path());
 
     let mut command = test_support::cli_command();
@@ -194,8 +587,15 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
 }
 
 fn unindexed_fixture() -> StdioFixture {
-    let workspace = tempfile::tempdir().expect("workspace dir");
-    let cache_dir = tempfile::tempdir().expect("cache dir");
+    let preserve = Arc::new(AtomicBool::new(false));
+    let workspace = PreservableTempDir::new(
+        tempfile::tempdir().expect("workspace dir"),
+        Arc::clone(&preserve),
+    );
+    let cache_dir = PreservableTempDir::new(
+        tempfile::tempdir().expect("cache dir"),
+        Arc::clone(&preserve),
+    );
     write_tiny_rust_workspace(workspace.path());
 
     StdioFixture {
@@ -310,6 +710,7 @@ fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
 }
 
 fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
+    let state_root = fixture.cache_dir.path().join("test-state");
     let mut command = test_support::cli_command();
     command
         .arg("serve")
@@ -322,7 +723,10 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .arg(fixture.cache_dir.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .env("CODESTORY_CACHE_ROOT", state_root.join("cache"))
+        .env("CODESTORY_STDIO_CACHE_ROOT", state_root.join("stdio-cache"))
+        .env("CODESTORY_PLUGIN_DATA", state_root.join("plugin-data"));
     apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
     if let Some(version) = &fixture.latest_release_version {
         command.env("CODESTORY_LATEST_RELEASE_VERSION", version);
@@ -384,6 +788,8 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         child,
         stdin,
         stdout,
+        worker_roots: vec![fixture.cache_dir.path().to_path_buf()],
+        preserve_fixture_roots: Some(Arc::clone(&fixture.workspace.preserve)),
     }
 }
 
@@ -408,6 +814,35 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         child,
         stdin,
         stdout,
+        worker_roots: vec![cache_root.to_path_buf()],
+        preserve_fixture_roots: None,
+    }
+}
+
+fn spawn_multi_project_stdio_server_with_project_network_config(cache_root: &Path) -> StdioServer {
+    let mut child = test_support::cli_command()
+        .arg("serve")
+        .arg("--stdio")
+        .arg("--multi-project")
+        .arg("--refresh")
+        .arg("full")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG", "1")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
+        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
+        .spawn()
+        .expect("spawn multi-project network-config stdio server");
+    let stdin = child.stdin.take().expect("multi-project stdio stdin");
+    let stdout = BufReader::new(child.stdout.take().expect("multi-project stdio stdout"));
+    StdioServer {
+        child,
+        stdin,
+        stdout,
+        worker_roots: vec![cache_root.to_path_buf()],
+        preserve_fixture_roots: None,
     }
 }
 
@@ -846,7 +1281,7 @@ fn write_active_repair_status_fixture(
     fixture: &StdioFixture,
     run_id: &str,
     phase: &str,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -858,7 +1293,7 @@ fn write_abandoned_repair_status_fixture(
     fixture: &StdioFixture,
     run_id: &str,
     phase: &str,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -871,7 +1306,7 @@ fn write_stale_live_repair_status_fixture(
     fixture: &StdioFixture,
     run_id: &str,
     phase: &str,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
@@ -886,10 +1321,10 @@ fn write_repair_status_fixture(
     phase: &str,
     updated_at_epoch_ms: i64,
     pid: u32,
-) -> (PathBuf, RemoveDirOnDrop) {
+) -> PathBuf {
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let sidecar = test_sidecar_runtime(&canonical_root, run_id);
+    let sidecar = test_sidecar_runtime(fixture, &canonical_root, run_id);
     let status_path = sidecar
         .layout
         .state_file
@@ -904,7 +1339,7 @@ fn write_repair_status_fixture(
         .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase();
+        .to_string();
     fs::write(
         &status_path,
         json!({
@@ -923,15 +1358,40 @@ fn write_repair_status_fixture(
         .to_string(),
     )
     .expect("write repair status fixture");
-    (status_path, RemoveDirOnDrop(status_dir))
+    status_path
 }
 
-fn test_sidecar_runtime(project: &Path, run_id: &str) -> codestory_retrieval::SidecarRuntimeConfig {
-    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_run_id_in_cache(
+fn test_sidecar_runtime(
+    fixture: &StdioFixture,
+    project: &Path,
+    run_id: &str,
+) -> codestory_retrieval::SidecarRuntimeConfig {
+    test_sidecar_runtime_in_cache(
+        project,
+        run_id,
+        &fixture
+            .cache_dir
+            .path()
+            .join("test-state")
+            .join("stdio-cache"),
+    )
+}
+
+fn test_sidecar_runtime_in_cache(
+    project: &Path,
+    run_id: &str,
+    cache_root: &Path,
+) -> codestory_retrieval::SidecarRuntimeConfig {
+    let defaults = codestory_retrieval::SidecarProcessDefaults::new(
+        cache_root.to_path_buf(),
+        codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+    );
+    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
         Some(project),
         codestory_retrieval::SidecarProfile::Agent,
         Some(run_id),
-        &test_support::test_state_root().join("cache"),
+        &defaults,
+        &codestory_retrieval::SidecarRuntimeOverrides::default(),
     )
 }
 
@@ -1085,7 +1545,7 @@ fn initialize_preserves_id_and_reports_server_info_and_capabilities() {
 }
 
 #[test]
-fn stdio_starts_without_prebuilt_index_and_reports_status() {
+fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     let fixture = unindexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -1116,9 +1576,36 @@ fn stdio_starts_without_prebuilt_index_and_reports_status() {
     let status_result = assert_success_envelope(&status_response, json!("status-unindexed"));
     let status = json_resource_content(status_result, "codestory://status");
 
-    assert_eq!(status["readiness"][0]["status"], json!("ready"));
-    assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
+    assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
+    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
     assert_allowed_surface(&status, "search", false, "agent_packet_search", "blocked");
+
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-unindexed",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&ground, json!("ground-unindexed"));
+
+    let refreshed = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-indexed-after-ground",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let refreshed = json_resource_content(
+        assert_success_envelope(&refreshed, json!("status-indexed-after-ground")),
+        "codestory://status",
+    );
+    assert_eq!(refreshed["readiness"][0]["status"], json!("ready"));
+    assert_allowed_surface(&refreshed, "ground", true, "local_navigation", "ready");
 }
 
 #[test]
@@ -1269,6 +1756,243 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
     );
     assert_eq!(first_snapshot["root"], first_again["root"]);
     assert_ne!(first_snapshot["root"], second_snapshot["root"]);
+
+    let status_request = |id: &str, project: &Path| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "resources/read",
+            "params": {"uri": "codestory://status", "project": project}
+        })
+    };
+    let read_status = |server: &mut StdioServer, id: &str, project: &Path| {
+        let response = send_json(server, status_request(id, project));
+        json_resource_content(
+            assert_success_envelope(&response, json!(id)),
+            "codestory://status",
+        )
+    };
+    let first_status = read_status(&mut server, "multi-first-status", first.path());
+    let second_status = read_status(&mut server, "multi-second-status", second.path());
+    let first_status_again = read_status(&mut server, "multi-first-status-again", first.path());
+    for (status, expected_root) in [
+        (&first_status, &first_root),
+        (&second_status, &second_root),
+        (&first_status_again, &first_root),
+    ] {
+        assert_eq!(
+            fs::canonicalize(
+                status["project_root"]
+                    .as_str()
+                    .expect("status project root")
+            )
+            .expect("canonical status project root"),
+            *expected_root,
+            "status crossed project roots: {status}"
+        );
+        assert!(
+            status["readiness_broker"]["operations"]
+                .as_array()
+                .is_some_and(|operations| operations.iter().all(|operation| {
+                    operation["workspace_root"].as_str().is_none_or(|root| {
+                        fs::canonicalize(root).is_ok_and(|observed| observed == *expected_root)
+                    })
+                })),
+            "readiness operation crossed project roots: {status}"
+        );
+    }
+    assert_ne!(first_status["storage_path"], second_status["storage_path"]);
+    assert_eq!(
+        first_status["readiness_broker"]["identity"]["project_identity_schema_version"],
+        3
+    );
+    assert_eq!(
+        second_status["readiness_broker"]["identity"]["project_identity_schema_version"],
+        3
+    );
+    assert_ne!(
+        first_status["readiness_broker"]["identity"]["project_id"],
+        second_status["readiness_broker"]["identity"]["project_id"]
+    );
+    assert_ne!(
+        first_status["readiness_broker"]["identity"]["workspace_id"],
+        second_status["readiness_broker"]["identity"]["workspace_id"]
+    );
+    assert_ne!(
+        first_status["sidecar_retrieval"]["ownership"]["labels"]["dev.codestory.workspace_id"],
+        second_status["sidecar_retrieval"]["ownership"]["labels"]["dev.codestory.workspace_id"]
+    );
+    assert_eq!(
+        first_status["sidecar_retrieval"]["ownership"]["profile"],
+        second_status["sidecar_retrieval"]["ownership"]["profile"],
+        "multi-project routing changed sidecar profile"
+    );
+    for pointer in [
+        "/project_root",
+        "/storage_path",
+        "/readiness_broker/identity/project_id",
+        "/readiness_broker/identity/workspace_id",
+        "/sidecar_retrieval/ownership/labels/dev.codestory.workspace_id",
+        "/sidecar_retrieval/ownership/profile",
+    ] {
+        assert_eq!(
+            first_status.pointer(pointer),
+            first_status_again.pointer(pointer),
+            "A/B/A status identity drifted at {pointer}"
+        );
+    }
+}
+
+#[test]
+fn multi_project_stdio_startup_snapshot_keeps_embedding_endpoints_isolated_across_a_b_a() {
+    let first = tempfile::tempdir().expect("first workspace");
+    let second = tempfile::tempdir().expect("second workspace");
+    let cache_root = tempfile::tempdir().expect("multi-project cache root");
+    let first_endpoint = FakeEmbeddingEndpoint::spawn(vec![1.0; 768]);
+    let second_endpoint = FakeEmbeddingEndpoint::spawn(vec![-1.0; 768]);
+    write_tiny_rust_workspace(first.path());
+    write_tiny_rust_workspace(second.path());
+    fs::write(
+        first.path().join(".codestory.toml"),
+        format!(
+            "embedding_endpoint = {:?}\nembedding_query_prefix = \"project-a:\"\nembedding_document_prefix = \"project-a:\"\n",
+            first_endpoint.url
+        ),
+    )
+    .expect("write first runtime config");
+    fs::write(
+        second.path().join(".codestory.toml"),
+        format!(
+            "embedding_endpoint = {:?}\nembedding_query_prefix = \"project-b:\"\nembedding_document_prefix = \"project-b:\"\n",
+            second_endpoint.url
+        ),
+    )
+    .expect("write second runtime config");
+
+    let mut server =
+        spawn_multi_project_stdio_server_with_project_network_config(cache_root.path());
+    let ground_request = |id: &str, project: &Path| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"project": project, "budget": "strict"}}
+        })
+    };
+    writeln!(server.stdin, "{}", ground_request("config-a", first.path()))
+        .expect("queue project A activation");
+    writeln!(
+        server.stdin,
+        "{}",
+        ground_request("config-b", second.path())
+    )
+    .expect("queue project B activation");
+    server.stdin.flush().expect("flush A/B activation requests");
+    assert_tool_success(&read_json(&mut server), json!("config-a"));
+    assert_tool_success(&read_json(&mut server), json!("config-b"));
+
+    let first_before = first_endpoint.snapshot();
+    let second_before = second_endpoint.snapshot();
+    assert!(!first_before.is_empty(), "project A endpoint was not used");
+    assert!(!second_before.is_empty(), "project B endpoint was not used");
+    assert!(
+        first_before
+            .iter()
+            .all(|request| request.contains("project-a:") && !request.contains("project-b:")),
+        "project A endpoint received cross-project input: {first_before:?}"
+    );
+    assert!(
+        second_before
+            .iter()
+            .all(|request| request.contains("project-b:") && !request.contains("project-a:")),
+        "project B endpoint received cross-project input: {second_before:?}"
+    );
+
+    assert_tool_success(
+        &send_json(&mut server, ground_request("config-a-again", first.path())),
+        json!("config-a-again"),
+    );
+    let first_after = first_endpoint.snapshot();
+    let second_after = second_endpoint.snapshot();
+    assert!(
+        first_after.len() > first_before.len(),
+        "A again must reuse project A's retained endpoint"
+    );
+    assert_eq!(
+        second_after.len(),
+        second_before.len(),
+        "A again must not touch project B's endpoint"
+    );
+
+    let persisted_embeddings = |project: &Path| {
+        let canonical = fs::canonicalize(project).expect("canonical project");
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in canonical.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let storage_path = cache_root
+            .path()
+            .join(format!("{hash:016x}"))
+            .join("codestory.db");
+        codestory_runtime::stored_semantic_embeddings_for_test(&storage_path)
+            .expect("read persisted semantic documents through runtime boundary")
+    };
+    let first_vectors = persisted_embeddings(first.path());
+    let second_vectors = persisted_embeddings(second.path());
+    assert!(
+        !first_vectors.is_empty(),
+        "project A persisted no embeddings"
+    );
+    assert!(
+        !second_vectors.is_empty(),
+        "project B persisted no embeddings"
+    );
+    assert!(
+        first_vectors
+            .iter()
+            .all(|vector| vector.len() == 768 && vector.iter().all(|value| *value > 0.0)),
+        "project A did not persist vectors returned by endpoint A"
+    );
+    assert!(
+        second_vectors
+            .iter()
+            .all(|vector| vector.len() == 768 && vector.iter().all(|value| *value < 0.0)),
+        "project B did not persist vectors returned by endpoint B"
+    );
+
+    assert!(
+        first_after
+            .iter()
+            .any(|request| request.contains("project-a:codestory health probe")),
+        "project A retained config never routed its semantic health query"
+    );
+    assert!(
+        second_after
+            .iter()
+            .any(|request| request.contains("project-b:codestory health probe")),
+        "project B retained config never routed its semantic health query"
+    );
+    let first_query = &first_endpoint.response_vector;
+    let second_query = &second_endpoint.response_vector;
+    let cosine = |left: &[f32], right: &[f32]| {
+        let dot = left
+            .iter()
+            .zip(right)
+            .map(|(left, right)| left * right)
+            .sum::<f32>();
+        let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+        let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
+        dot / (left_norm * right_norm)
+    };
+    assert!(
+        cosine(first_query, &first_vectors[0]) > cosine(first_query, &second_vectors[0]),
+        "project A semantic query must prefer project A's persisted vectors"
+    );
+    assert!(
+        cosine(second_query, &second_vectors[0]) > cosine(second_query, &first_vectors[0]),
+        "project B semantic query must prefer project B's persisted vectors"
+    );
 }
 
 #[test]
@@ -2767,7 +3491,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
 #[test]
 fn resources_read_status_reports_active_agent_repair_phase() {
     let fixture = indexed_fixture();
-    let (status_path, _cleanup) =
+    let status_path =
         write_active_repair_status_fixture(&fixture, "issue-661-proof", "Qdrant finalize");
     assert!(status_path.exists(), "repair status fixture should exist");
     let mut server = spawn_stdio_server(&fixture);
@@ -2827,7 +3551,7 @@ fn resources_read_status_reports_active_agent_repair_phase() {
 #[test]
 fn resources_read_status_reports_abandoned_agent_repair_actions() {
     let fixture = indexed_fixture();
-    let (status_path, _cleanup) =
+    let status_path =
         write_abandoned_repair_status_fixture(&fixture, "aborted-run", "Embedding documents");
     assert!(status_path.exists(), "repair status fixture should exist");
     let mut server = spawn_stdio_server(&fixture);
@@ -3020,10 +3744,14 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
     let status = json_resource_content(result, "codestory://status");
 
     assert_eq!(status["sidecar_setup"]["state"], json!("enabled"));
-    assert_eq!(status["sidecar_setup"]["auto_repair"], json!(false));
+    assert_eq!(status["sidecar_setup"]["auto_repair"], json!(true));
     assert_eq!(
         status["sidecar_setup"]["status_triggered_repair"],
         json!(false)
+    );
+    assert_eq!(
+        status["sidecar_setup"]["activation_triggered_repair"],
+        json!(true)
     );
     assert_eq!(
         status["sidecar_setup"]["explicit_repair_enabled"],
@@ -3031,7 +3759,7 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
     );
     assert_eq!(
         status["sidecar_setup"]["repair_mode"],
-        json!("explicit_mcp")
+        json!("activation_or_explicit_mcp")
     );
     let sidecar_repair_command = status["sidecar_setup"]["next_repair_command"]
         .as_str()
@@ -3079,11 +3807,117 @@ fn resources_read_status_recommends_explicit_repair_when_policy_enabled() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn ground_activation_enqueues_enabled_agent_repair() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(0);
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let result_path = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    )
+    .layout
+    .state_file
+    .with_file_name("ready-repair-result.json");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-auto-agent-repair",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&response, json!("ground-auto-agent-repair"));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !result_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "enabled grounding activation did not enqueue the broker-backed worker"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let result: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("automatic repair worker result"),
+    )
+    .expect("automatic repair worker result json");
+    assert_eq!(result["outcome"], json!("succeeded"), "{result}");
+    assert_eq!(
+        result["run_id"],
+        json!(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn repeated_grounding_cools_down_identical_failed_agent_repair_across_servers() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    fixture.ready_repair_worker_probe_exit_code = Some(17);
+    let canonical_root =
+        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
+    let result_path = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    )
+    .layout
+    .state_file
+    .with_file_name("ready-repair-result.json");
+
+    let ground = |server: &mut StdioServer, id: &str| {
+        let response = send_json(
+            server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "ground", "arguments": {"budget": "strict"}}
+            }),
+        );
+        assert_tool_success(&response, json!(id));
+    };
+    let mut first_server = spawn_stdio_server(&fixture);
+    ground(&mut first_server, "ground-failed-repair-first");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !result_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "first automatic repair did not finish"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let first: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("first automatic repair result"),
+    )
+    .expect("first automatic repair result json");
+    assert_eq!(first["outcome"], json!("failed"), "{first}");
+    assert!(first["auto_retry_fingerprint"].is_string(), "{first}");
+    let first_attempt = first["attempt_id"].clone();
+    drop(first_server);
+
+    let mut second_server = spawn_stdio_server(&fixture);
+    ground(&mut second_server, "ground-failed-repair-second");
+    thread::sleep(Duration::from_millis(250));
+    let second: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("cooled-down automatic repair result"),
+    )
+    .expect("cooled-down automatic repair result json");
+    assert_eq!(second["attempt_id"], first_attempt, "{second}");
+}
+
 #[test]
 fn resources_read_status_reports_abandoned_repair_without_starting_when_policy_enabled() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("enabled".to_string());
-    let (status_path, _cleanup) = write_abandoned_repair_status_fixture(
+    let status_path = write_abandoned_repair_status_fixture(
         &fixture,
         codestory_retrieval::DEFAULT_AGENT_RUN_ID,
         "graph artifact",
@@ -3264,15 +4098,11 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
     let policy_path = fixture.cache_dir.path().join("plugin-sidecar-policy.json");
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let repair_sidecar =
-        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
-    let repair_state_dir = repair_sidecar
-        .layout
-        .state_file
-        .parent()
-        .expect("repair state dir")
-        .to_path_buf();
-    let _repair_state_cleanup = RemoveDirOnDrop(repair_state_dir);
+    let repair_sidecar = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    );
     let mut server = spawn_stdio_server(&fixture);
 
     let response = send_json(
@@ -3364,6 +4194,7 @@ fn tools_call_sidecar_setup_updates_plugin_policy_without_cli_user_steps() {
         json!("background"),
         "sidecar_setup repair should not wait for full repair inside the MCP request: {repair}"
     );
+    assert_eq!(repair["reservation_published"], json!(true), "{repair}");
     assert!(
         repair["debug_status_command"]
             .as_str()
@@ -3465,15 +4296,19 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
     fixture.ready_repair_worker_probe_exit_code = Some(0);
     let canonical_root =
         fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let repair_sidecar =
-        test_sidecar_runtime(&canonical_root, codestory_retrieval::DEFAULT_AGENT_RUN_ID);
-    let _repair_state_cleanup = RemoveDirOnDrop(
-        repair_sidecar
-            .layout
-            .state_file
-            .parent()
-            .expect("repair state dir")
-            .to_path_buf(),
+    let repair_sidecar = test_sidecar_runtime(
+        &fixture,
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+    );
+    let mutable_cache_sidecar = test_sidecar_runtime_in_cache(
+        &canonical_root,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+        &fixture.cache_dir.path().join("test-state").join("cache"),
+    );
+    assert_ne!(
+        repair_sidecar.layout.state_file, mutable_cache_sidecar.layout.state_file,
+        "the regression contract requires distinct retained and mutable cache roots"
     );
     let mut server = spawn_stdio_server(&fixture);
 
@@ -3516,6 +4351,16 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
             .is_some_and(|tail| tail.contains(&attempt_id)),
         "{setup}"
     );
+    let retained_result_path = repair_sidecar
+        .layout
+        .state_file
+        .with_file_name("ready-repair-result.json");
+    let retained_result: Value = serde_json::from_str(
+        &fs::read_to_string(&retained_result_path).expect("retained repair worker result"),
+    )
+    .expect("retained repair worker result json");
+    assert_eq!(retained_result["attempt_id"], json!(attempt_id));
+    assert_eq!(retained_result["outcome"], json!("succeeded"));
     assert!(
         !repair_sidecar
             .layout
@@ -3530,12 +4375,95 @@ fn tools_call_sidecar_setup_records_successful_worker_terminal_state() {
             .with_file_name("ready-repair-status.json")
             .exists()
     );
+    for file_name in [
+        "ready-repair-result.json",
+        "ready-repair-status.json",
+        "ready-repair-enqueue.lock",
+    ] {
+        assert!(
+            !mutable_cache_sidecar
+                .layout
+                .state_file
+                .with_file_name(file_name)
+                .exists(),
+            "stdio repair state must not leak into the mutable cache root: {file_name}"
+        );
+    }
+}
+
+#[test]
+fn resources_read_status_surfaces_stale_live_repair_without_mutation() {
+    let mut fixture = indexed_fixture();
+    fixture.sidecar_policy_state = Some("enabled".to_string());
+    let status_path = write_stale_live_repair_status_fixture(
+        &fixture,
+        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
+        "Embedding documents",
+    );
+    let status_before = fs::read(&status_path).expect("stale-live status before read");
+    let state_dir = status_path.parent().expect("status parent");
+    let reservation_path = state_dir.join("ready-repair-enqueue.lock");
+    let result_path = state_dir.join("ready-repair-result.json");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-stale-live-observational",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let status = json_resource_content(
+        assert_success_envelope(&response, json!("status-stale-live-observational")),
+        "codestory://status",
+    );
+
+    assert_eq!(
+        status["sidecar_setup"]["stale_live_repair"]["status"],
+        json!("stale_live"),
+        "{status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["stale_live_repair"]["pid"],
+        json!(std::process::id()),
+        "{status}"
+    );
+    assert_eq!(
+        status["sidecar_setup"]["stale_live_repair"]["phase"],
+        json!("Embedding documents"),
+        "{status}"
+    );
+    assert!(
+        status["sidecar_setup"]["stale_live_repair"]
+            .get("cleanup_command")
+            .is_none(),
+        "live ownership must not expose destructive cleanup guidance: {status}"
+    );
+    assert!(
+        status["sidecar_setup"]["stale_live_repair"]["inspect_command"].is_string(),
+        "stale-live evidence should retain read-only inspection guidance: {status}"
+    );
+    assert_eq!(
+        fs::read(&status_path).expect("stale-live status after read"),
+        status_before,
+        "status read must not rewrite stale-live ownership"
+    );
+    assert!(
+        !reservation_path.exists(),
+        "status read must not reserve repair"
+    );
+    assert!(
+        !result_path.exists(),
+        "status read must not record a worker result"
+    );
 }
 
 #[test]
 fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting() {
     let fixture = indexed_fixture();
-    let (status_path, _cleanup) = write_active_repair_status_fixture(
+    let status_path = write_active_repair_status_fixture(
         &fixture,
         codestory_retrieval::DEFAULT_AGENT_RUN_ID,
         "Qdrant finalize",
@@ -3642,7 +4570,7 @@ fn tools_call_sidecar_setup_reports_active_shared_agent_repair_without_waiting()
 fn tools_call_sidecar_setup_preserves_stale_live_repair_ownership() {
     let mut fixture = indexed_fixture();
     fixture.sidecar_policy_state = Some("enabled".to_string());
-    let (status_path, _cleanup) = write_stale_live_repair_status_fixture(
+    let status_path = write_stale_live_repair_status_fixture(
         &fixture,
         codestory_retrieval::DEFAULT_AGENT_RUN_ID,
         "Embedding documents",
@@ -3682,8 +4610,7 @@ fn tools_call_sidecar_setup_preserves_stale_live_repair_ownership() {
 fn tools_call_sidecar_setup_reports_active_agent_repair_non_default_without_spawning_default() {
     let fixture = indexed_fixture();
     let run_id = "non-default-active";
-    let (status_path, _cleanup) =
-        write_active_repair_status_fixture(&fixture, run_id, "Embedding documents");
+    let status_path = write_active_repair_status_fixture(&fixture, run_id, "Embedding documents");
     assert!(status_path.exists(), "repair status fixture should exist");
     thread::sleep(Duration::from_millis(25));
     fs::write(
@@ -4206,7 +5133,7 @@ fn local_dev_override_does_not_recommend_restart_for_managed_history() {
 }
 
 #[test]
-fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded_latency() {
+fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
     let warmup = send_json(
@@ -4243,6 +5170,40 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     fs::remove_file(fixture.workspace.path().join("src").join("alpha.rs"))
         .expect("remove indexed file after indexing");
 
+    let stale = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-observes-stale",
+            "method": "resources/read",
+            "params": {"uri": "codestory://status"}
+        }),
+    );
+    let stale = json_resource_content(
+        assert_success_envelope(&stale, json!("status-observes-stale")),
+        "codestory://status",
+    );
+    assert_eq!(
+        find_index_freshness(&stale).and_then(|freshness| freshness.get("status")),
+        Some(&json!("stale")),
+        "status must observe source drift without repairing it: {stale}"
+    );
+    assert!(
+        !fixture.cache_dir.path().join("local-refresh.lock").exists(),
+        "status must not acquire refresh ownership"
+    );
+
+    let activation = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "ground-activates-refresh",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&activation, json!("ground-activates-refresh"));
+
     let refresh_deadline = Instant::now() + Duration::from_secs(15);
     let mut refresh_attempt = 0;
     let refreshed_status = loop {
@@ -4251,7 +5212,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
             &mut server,
             json!({
                 "jsonrpc": "2.0",
-                "id": id,
+                "id": id.clone(),
                 "method": "resources/read",
                 "params": {"uri": "codestory://status"}
             }),
@@ -4276,7 +5237,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     assert_eq!(
         refreshed_status["local_refresh"]["reason"],
         json!("refreshed"),
-        "long-lived status must not return the cached warm freshness result after source mutation: {refreshed_status}"
+        "ground activation must invalidate the cached warm freshness result: {refreshed_status}"
     );
     assert_eq!(
         refreshed_status["local_refresh"]["blocks_local_surfaces"],
@@ -4302,7 +5263,9 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
 
     let mut elapsed = Vec::new();
     let mut last_status = refreshed_status;
-    for index in 0..12 {
+    // Twenty samples are the minimum where this nearest-rank p95 is not just
+    // the single maximum scheduler outlier under the full parallel suite.
+    for index in 0..20 {
         let started = Instant::now();
         let response = send_json(
             &mut server,
@@ -4319,12 +5282,16 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
     }
 
     assert_fresh_freshness_counts(&last_status, "cached codestory://status after refresh");
-    assert!(
-        matches!(
-            last_status["local_refresh"]["reason"].as_str(),
-            Some("refreshed" | "already_fresh")
-        ),
+    assert_eq!(
+        last_status["local_refresh"]["state"],
+        json!("refreshed"),
         "status should stay fresh without stale cache masking after the bounded refresh: {last_status}"
+    );
+    assert!(
+        last_status["index_publication"]["generation"]
+            .as_u64()
+            .is_some(),
+        "fresh status should identify the complete publication: {last_status}"
     );
     elapsed.sort_unstable();
     let median = elapsed[elapsed.len() / 2];
@@ -4375,7 +5342,7 @@ fn background_local_refresh_status_refreshes_long_lived_stale_index_with_bounded
 }
 
 #[test]
-fn ground_tool_returns_degraded_local_refresh_when_stale_refresh_budget_expires() {
+fn ground_tool_serves_complete_publication_when_refresh_budget_expires() {
     let mut fixture = indexed_fixture();
     fixture.local_refresh_timeout_ms = Some(0);
 
@@ -4409,61 +5376,324 @@ fn ground_tool_returns_degraded_local_refresh_when_stale_refresh_budget_expires(
         "ground should return degraded local-refresh guidance before an MCP tool timeout, got {elapsed:?}: {response}"
     );
 
-    let error = assert_tool_error(&response, json!("ground-refresh-budget-expired"));
+    let result = assert_success_envelope(&response, json!("ground-refresh-budget-expired"));
+    let ground = assert_tool_success(&response, json!("ground-refresh-budget-expired"));
     assert_eq!(
-        error.pointer("/code").and_then(Value::as_str),
-        Some("codestory_tool_blocked")
+        ground.pointer("/stats/file_count").and_then(Value::as_u64),
+        Some(5),
+        "ground should serve the last complete publication: {response}"
     );
-    assert_eq!(
-        error.pointer("/tool").and_then(Value::as_str),
-        Some("ground")
-    );
-    assert_eq!(
-        error.pointer("/readiness_goal").and_then(Value::as_str),
-        Some("local_navigation")
-    );
-    assert_eq!(
-        error.pointer("/status").and_then(Value::as_str),
-        Some("repair_index")
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/state")
-            .and_then(Value::as_str),
-        Some("refreshing")
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/readiness_status")
-            .and_then(Value::as_str),
-        Some("repair_index")
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/blocks_local_surfaces")
-            .and_then(Value::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        error
-            .pointer("/local_refresh/reason")
-            .and_then(Value::as_str),
-        Some("refresh_timeout")
-    );
-    assert_ne!(
-        error
-            .pointer("/sidecar/retrieval_mode")
-            .and_then(Value::as_str),
-        Some("full"),
-        "local refresh degradation must not claim packet/search sidecar readiness: {error}"
+    let served_from = result
+        .pointer("/_meta/codestory_publication/served_from")
+        .and_then(Value::as_str);
+    assert!(
+        matches!(
+            served_from,
+            Some("last_complete_publication" | "complete_publication")
+        ),
+        "ground should identify the exact complete publication source: {response}"
     );
     assert!(
-        error
-            .pointer("/minimum_next")
-            .and_then(Value::as_array)
-            .is_some_and(|commands| !commands.is_empty()),
-        "blocked ground should include compact next-step guidance: {error}"
+        result
+            .pointer("/_meta/codestory_publication/publication/generation")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "served response should identify its durable publication: {response}"
     );
+    if served_from == Some("last_complete_publication") {
+        assert_eq!(
+            result
+                .pointer("/_meta/codestory_publication/refresh/state")
+                .and_then(Value::as_str),
+            Some("refreshing")
+        );
+    }
+}
+
+#[test]
+fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
+    let fixture = indexed_fixture();
+    thread::sleep(Duration::from_millis(25));
+    fs::write(
+        fixture.workspace.path().join("src").join("runtime.rs"),
+        "pub fn normalize_project(project_name: &str) -> String { format!(\"owned:{project_name}\") }\n",
+    )
+    .expect("make the published index stale");
+
+    let project_root = fs::canonicalize(fixture.workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as i64;
+    let pid = std::process::id();
+    fs::write(
+        fixture.cache_dir.path().join("local-refresh.lock"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "project_root": project_root,
+            "pid": pid,
+            "started_at_epoch_ms": now,
+            "token": format!("test:{pid}:{now}")
+        }))
+        .expect("serialize refresh lock"),
+    )
+    .expect("write refresh lock");
+    fs::write(
+        fixture.cache_dir.path().join("local-refresh-status.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "status": "refreshing",
+            "project_root": project_root,
+            "phase": "incremental_index",
+            "pid": pid,
+            "started_at_epoch_ms": now,
+            "updated_at_epoch_ms": now,
+            "last_failure_reason": null
+        }))
+        .expect("serialize refresh status"),
+    )
+    .expect("write refresh status");
+
+    let mut status_client = spawn_stdio_server(&fixture);
+    let status_response = send_json(
+        &mut status_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-status",
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        }),
+    );
+    let status = assert_tool_success(&status_response, json!("concurrent-status"));
+    assert_eq!(status["local_refresh"]["state"], json!("refreshing"));
+    assert_eq!(status["local_refresh"]["pid"], json!(pid));
+    assert_eq!(status["local_refresh"]["phase"], json!("incremental_index"));
+    assert_eq!(
+        status["local_refresh"]["blocks_local_surfaces"],
+        json!(false)
+    );
+    assert_eq!(status["allowed_surfaces"]["ground"]["allowed"], json!(true));
+    let generation = status["local_refresh"]["serving_publication"]["generation"]
+        .as_u64()
+        .expect("status serving generation");
+
+    let mut ground_client = spawn_stdio_server(&fixture);
+    let ground_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-ground",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    let ground = assert_tool_success(&ground_response, json!("concurrent-ground"));
+    assert_eq!(ground["stats"]["file_count"], json!(5));
+    let ground_result = assert_success_envelope(&ground_response, json!("concurrent-ground"));
+    assert_eq!(
+        ground_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(generation)
+    );
+
+    let symbol_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-symbol",
+            "method": "tools/call",
+            "params": {"name": "symbol", "arguments": {"query": "AppController"}}
+        }),
+    );
+    let symbol = assert_tool_success(&symbol_response, json!("concurrent-symbol"));
+    assert_eq!(symbol["node"]["display_name"], json!("AppController"));
+    let symbol_result = assert_success_envelope(&symbol_response, json!("concurrent-symbol"));
+    assert_eq!(
+        symbol_result["_meta"]["codestory_publication"]["publication"]["generation"],
+        json!(generation)
+    );
+
+    let root_symbols_response = send_json(
+        &mut ground_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "concurrent-root-symbols",
+            "method": "resources/read",
+            "params": {"uri": "codestory://symbols/root"}
+        }),
+    );
+    let root_symbols = json_resource_content(
+        assert_success_envelope(&root_symbols_response, json!("concurrent-root-symbols")),
+        "codestory://symbols/root",
+    );
+    assert!(
+        root_symbols
+            .as_array()
+            .is_some_and(|symbols| symbols.iter().any(|symbol| {
+                symbol["display_name"] == json!("AppController")
+                    || symbol["label"] == json!("AppController")
+            })),
+        "root-symbol resource should stay readable during another client's refresh: {root_symbols}"
+    );
+}
+
+#[test]
+fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
+    let mut fixture = indexed_fixture();
+    fixture.local_refresh_timeout_ms = Some(0);
+    let mut warmup_client = spawn_stdio_server(&fixture);
+    let warmup_status = send_json(
+        &mut warmup_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "warmup-generation",
+            "method": "tools/call",
+            "params": {"name": "status", "arguments": {}}
+        }),
+    );
+    let old_generation = assert_tool_success(&warmup_status, json!("warmup-generation"))
+        ["index_publication"]["generation"]
+        .as_u64()
+        .expect("old complete generation");
+    drop(warmup_client);
+    thread::sleep(Duration::from_millis(25));
+    for index in 0..96 {
+        fs::write(
+            fixture
+                .workspace
+                .path()
+                .join("src")
+                .join(format!("concurrent_{index}.rs")),
+            format!("pub fn concurrent_{index}() -> usize {{ {index} }}\n"),
+        )
+        .expect("add source file for real refresh");
+    }
+
+    let mut reader_client = spawn_stdio_server(&fixture);
+    let mut writer_client = spawn_stdio_server(&fixture);
+    let writer = thread::spawn(move || {
+        let response = send_json(
+            &mut writer_client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "writer-start-refresh",
+                "method": "tools/call",
+                "params": {"name": "ground", "arguments": {"budget": "strict"}}
+            }),
+        );
+        (writer_client, response)
+    });
+
+    let lock_path = fixture.cache_dir.path().join("local-refresh.lock");
+    let lock_deadline = Instant::now() + Duration::from_secs(10);
+    while !lock_path.exists() {
+        if writer.is_finished() {
+            break;
+        }
+        assert!(
+            Instant::now() < lock_deadline,
+            "writer did not acquire the local refresh lock"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let concurrent_ground = send_json(
+        &mut reader_client,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "reader-ground-during-lock",
+            "method": "resources/read",
+            "params": {"uri": "codestory://grounding"}
+        }),
+    );
+    let concurrent_ground = json_resource_content(
+        assert_success_envelope(&concurrent_ground, json!("reader-ground-during-lock")),
+        "codestory://grounding",
+    );
+    assert!(
+        concurrent_ground["stats"]["file_count"]
+            .as_u64()
+            .is_some_and(|count| count == 5 || count == 101),
+        "concurrent resource read observed neither complete file set: {concurrent_ground}"
+    );
+
+    // Workspace-wide default-concurrency runs can heavily contend with the
+    // real indexer on smaller macOS runners. Keep the assertion bounded while
+    // allowing the background publication worker to finish under that load.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let new_generation = loop {
+        let status_response = send_json(
+            &mut reader_client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "reader-status",
+                "method": "tools/call",
+                "params": {"name": "status", "arguments": {}}
+            }),
+        );
+        let status = assert_tool_success(&status_response, json!("reader-status"));
+        let generation = status["index_publication"]["generation"]
+            .as_u64()
+            .expect("reader complete generation");
+        assert!(
+            generation == old_generation || generation == old_generation + 1,
+            "reader observed an unexpected publication generation: {status}"
+        );
+        let expected_status_file_count = if generation == old_generation { 5 } else { 101 };
+        assert_eq!(
+            status["index_freshness"]["indexed_file_count"],
+            json!(expected_status_file_count),
+            "status mixed publication metadata and summary contents: {status}"
+        );
+        let ground_response = send_json(
+            &mut reader_client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "reader-ground",
+                "method": "tools/call",
+                "params": {"name": "ground", "arguments": {"budget": "strict"}}
+            }),
+        );
+        let ground = assert_tool_success(&ground_response, json!("reader-ground"));
+        let ground_result = assert_success_envelope(&ground_response, json!("reader-ground"));
+        let ground_generation =
+            ground_result["_meta"]["codestory_publication"]["publication"]["generation"]
+                .as_u64()
+                .expect("ground response publication generation");
+        let expected_file_count = if ground_generation == old_generation {
+            5
+        } else if ground_generation == old_generation + 1 {
+            101
+        } else {
+            panic!("ground response identified an unexpected publication: {ground_result}");
+        };
+        assert!(
+            ground["stats"]["file_count"]
+                .as_u64()
+                .is_some_and(|count| count == expected_file_count),
+            "reader ground mixed publication metadata and file contents: {ground_result}"
+        );
+
+        if generation == old_generation + 1
+            && status["local_refresh"]["state"] != json!("refreshing")
+        {
+            break generation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "real refresh did not publish a new complete generation: {status}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    assert_eq!(new_generation, old_generation + 1);
+    let (_writer_client, writer_status) = writer.join().expect("join writer status client");
+    assert_tool_success(&writer_status, json!("writer-start-refresh"));
 }
 
 #[test]
@@ -4554,9 +5784,13 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     let status = json_resource_content(status_result, "codestory://status");
     assert_fresh_freshness_counts(&status, "codestory://status after local graph tool refresh");
     assert_eq!(
-        status["local_refresh"]["reason"],
+        status["local_refresh"]["state"],
         json!("refreshed"),
         "tool dispatch should have refreshed the long-lived server before status was reread: {status}"
+    );
+    assert!(
+        status["index_publication"]["generation"].as_u64().is_some(),
+        "refreshed status should identify the complete publication: {status}"
     );
     assert_eq!(
         status["readiness_lanes"]["agent_packet_search"]["status"],

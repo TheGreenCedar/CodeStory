@@ -2,11 +2,13 @@
 #![allow(clippy::items_after_test_module)]
 
 use super::citation::to_citation_from_hit;
+use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
 use super::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_citation_key,
     packet_citation_rank, packet_query_stop_term, packet_stage_citation_carry_limit,
     packet_subquery_hit_limit,
 };
+use super::packet_terms::packet_probe_terms;
 use super::packet_trace::{
     append_packet_query_timing_fields, merge_packet_lexical_subquery_batch,
     merge_packet_semantic_subquery_batch, packet_query_diagnostic, packet_query_duration_ms,
@@ -17,8 +19,8 @@ use crate::{AppController, clamp_u128_to_u32, query_has_symbol_or_literal_signal
 use codestory_contracts::api::{
     AgentAnswerDto, AgentHybridWeightsDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
     AgentRetrievalStepStatusDto, ApiError, NodeKind, PacketBudgetLimitsDto, PacketBudgetModeDto,
-    PacketPlanDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, SearchHit, SearchHitOrigin,
-    SearchMatchQualityDto, SemanticFallbackRecordDto,
+    PacketPlanDto, PacketPlanQueryDto, PacketSidecarQueryDiagnosticDto, PacketTaskClassDto,
+    SearchHit, SearchHitOrigin, SearchMatchQualityDto, SemanticFallbackRecordDto,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -633,6 +635,7 @@ fn packet_anchor_per_query_limit(
 }
 
 pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
+    let required_probes = packet_anchor_required_probe_keys(plan);
     let mut ranked = plan
         .queries
         .iter()
@@ -648,13 +651,13 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
         .collect::<Vec<_>>();
     ranked.sort_by_key(|(index, query)| {
         (
+            !required_probes.contains(&normalize_identifier(&query.query)),
             packet_anchor_probe_priority(query),
-            packet_anchor_probe_flow_hint_priority(&query.query),
             *index,
         )
     });
     let mut seen = HashSet::<String>::new();
-    ranked
+    let mut queries = ranked
         .into_iter()
         .filter_map(|(_, query)| {
             if is_packet_path_like_query(&query.query) {
@@ -667,6 +670,38 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
                 None
             }
         })
+        .collect::<Vec<_>>();
+    reserve_architecture_main_anchor_probe(plan, &required_probes, &mut queries);
+    queries
+}
+
+fn reserve_architecture_main_anchor_probe(
+    plan: &PacketPlanDto,
+    required_probes: &HashSet<String>,
+    queries: &mut Vec<String>,
+) {
+    if plan.task_class != PacketTaskClassDto::ArchitectureExplanation
+        || !required_probes.contains("searchentrypoint")
+    {
+        return;
+    }
+    queries.retain(|query| normalize_identifier(query) != "main");
+    let insert_at = queries
+        .iter()
+        .take_while(|query| required_probes.contains(&normalize_identifier(query)))
+        .count();
+    queries.insert(insert_at, "main".to_string());
+}
+
+fn packet_anchor_required_probe_keys(plan: &PacketPlanDto) -> HashSet<String> {
+    let Some(prompt) = plan.queries.first() else {
+        return HashSet::new();
+    };
+    let terms = packet_probe_terms(&prompt.query);
+    packet_sufficiency_required_probe_queries_from_terms(&terms, plan.task_class)
+        .into_iter()
+        .map(|query| normalize_identifier(&query))
+        .filter(|query| !query.is_empty())
         .collect()
 }
 
@@ -680,44 +715,6 @@ fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
     } else {
         3
     }
-}
-
-fn packet_anchor_probe_flow_hint_priority(query: &str) -> u8 {
-    if packet_anchor_probe_is_required_flow_hint(query) {
-        0
-    } else if packet_anchor_probe_has_strong_code_shape(query) {
-        1
-    } else {
-        2
-    }
-}
-
-fn packet_anchor_probe_is_required_flow_hint(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "execruntime"
-            | "execsession"
-            | "execcli"
-            | "jsoneventoutput"
-            | "jsonleventoutput"
-            | "eventoutputprocessor"
-            | "threadstart"
-            | "startthread"
-            | "eventloop"
-            | "eventdispatch"
-            | "networkinput"
-            | "commanddispatch"
-            | "commandhandler"
-            | "requestdispatch"
-            | "routehandler"
-            | "transportsend"
-            | "requestfinalization"
-            | "responsematerialization"
-            | "customvalidation"
-            | "customerrorrendering"
-            | "submitpreventdefault"
-            | "submitinvalidguard"
-    )
 }
 
 fn packet_task_seed_anchor_probe(query: &str) -> bool {
@@ -834,6 +831,7 @@ fn packet_lexical_subquery_needs_hybrid_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::packet_plan::build_packet_plan;
     use codestory_contracts::api::{PacketPlanDto, PacketPlanQueryDto, PacketTaskClassDto};
 
     #[test]
@@ -1135,6 +1133,71 @@ mod tests {
         assert!(queries.contains(&"run".to_string()));
         assert!(queries.contains(&"entrypoint".to_string()));
         assert!(!queries.contains(&"architecture entrypoint".to_string()));
+    }
+
+    #[test]
+    fn compact_search_flow_reserves_main_anchor_query() {
+        let plan = build_packet_plan(
+            "Explain how a search command parses CLI flags, walks candidate inputs, and executes sequential or parallel searches through matcher, searcher, and printer components.",
+            Some(PacketTaskClassDto::ArchitectureExplanation),
+            PacketBudgetModeDto::Compact,
+        );
+
+        assert_eq!(
+            plan.queries.len(),
+            32,
+            "fixture should exercise the plan cap"
+        );
+        let selected = packet_anchor_probe_queries(&plan)
+            .into_iter()
+            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
+            .collect::<Vec<_>>();
+
+        assert!(selected.iter().any(|query| query == "main"));
+    }
+
+    #[test]
+    fn compact_flow_anchor_window_prioritizes_roles_over_generated_variants() {
+        let mut queries = vec![PacketPlanQueryDto {
+            query: "Explain the command execution flow".to_string(),
+            purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                .to_string(),
+        }];
+        for query in [
+            "execution entrypoint",
+            "dispatch boundary",
+            "result rendering",
+        ] {
+            queries.push(PacketPlanQueryDto {
+                query: query.to_string(),
+                purpose: "symbol probe expanded from task wording".to_string(),
+            });
+        }
+        for index in 0..15 {
+            queries.push(PacketPlanQueryDto {
+                query: format!("GeneratedVariant{index}"),
+                purpose: "symbol probe expanded from task wording".to_string(),
+            });
+        }
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            inferred_task_class: false,
+            queries,
+            trace: Vec::new(),
+        };
+
+        let selected = packet_anchor_probe_queries(&plan)
+            .into_iter()
+            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected.len(), 12);
+        assert!(selected.starts_with(&[
+            "execution entrypoint".to_string(),
+            "dispatch boundary".to_string(),
+            "result rendering".to_string(),
+        ]));
+        assert!(!selected.contains(&"GeneratedVariant14".to_string()));
     }
 }
 

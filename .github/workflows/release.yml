@@ -7,14 +7,25 @@ on:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
         required: true
         type: string
+      source_run_id:
+        description: "Optional rejected release-evidence run to re-evaluate without measuring again"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       version:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
         required: true
         type: string
+      source_run_id:
+        description: "Optional rejected release-evidence run to re-evaluate without measuring again"
+        required: false
+        type: string
+        default: ""
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -30,7 +41,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Enforce third-party action pinning
+      - name: Install workflow policy dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Enforce workflow policy
         run: node .github/scripts/check-workflow-policy.mjs
 
   preflight:
@@ -66,6 +80,14 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
+      - name: Validate versioned changelog notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: >-
+          node .github/scripts/extract-codestory-release-notes.mjs
+          --version "$VERSION"
+          --output "$RUNNER_TEMP/codestory-release-notes.md"
+
       - name: Refuse existing tag or release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -81,17 +103,56 @@ jobs:
             exit 1
           fi
 
-  packaged-proof:
+  release-evidence:
     needs: preflight
+    uses: ./.github/workflows/release-candidate-evidence.yml
+    with:
+      ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      profile: codestory-release-evidence-linux-arm64-v1
+      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
+      embedding_model_dir: /srv/codestory-release-evidence/models
+      source_run_id: ${{ inputs.source_run_id }}
+
+  packaged-proof:
+    needs:
+      - preflight
+      - release-evidence
     uses: ./.github/workflows/packaged-platform-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ github.sha }}
+      scope: full
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      sign_macos: true
+    # Provision these names as environment secrets on macos-release-signing.
+    # That protected environment is selected by the called macOS matrix jobs,
+    # and its values take precedence over caller/repository secrets.
+    secrets:
+      APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+      APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+
+  macos-metal-proof:
+    needs:
+      - preflight
+      - packaged-proof
+    uses: ./.github/workflows/macos-metal-proof.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      use_packaged_cli_artifact: true
 
   publish:
     name: Publish GitHub release
     needs:
       - preflight
       - packaged-proof
+      - macos-metal-proof
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -116,6 +177,28 @@ jobs:
           test -s target/release-assets/SHA256SUMS.txt
           (cd target/release-assets && sha256sum -c SHA256SUMS.txt)
 
+      - name: Compose versioned GitHub release notes
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/extract-codestory-release-notes.mjs \
+            --version "$VERSION" \
+            --output target/release-assets/release-notes.md
+          cat >> target/release-assets/release-notes.md <<'EOF'
+
+          ## Platform proof boundaries
+
+          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS x64/arm64.
+
+          - Windows x64 managed install, local ground, and repair handoff are acceptance-smoked; this is not full sidecar or GPU proof.
+          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof.
+          - Intel macOS packaging is acceptance-smoked; it does not make Apple Silicon Metal claims.
+          - Windows arm64 ships a CLI asset but has no managed native accelerated embedding cell.
+          - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
+          - Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.
+          EOF
+
       - name: Refuse existing tag or release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -139,33 +222,23 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          # Release globs must expand into individual assets.
+          # shellcheck disable=SC2206
           assets=(
             target/release-assets/codestory-cli-v${VERSION}-*.tar.gz
             target/release-assets/codestory-cli-v${VERSION}-*.zip
             target/release-assets/SHA256SUMS.txt
           )
-          if [ "${#assets[@]}" -ne 6 ]; then
-            echo "::error::Expected five binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
+          if [ "${#assets[@]}" -ne 7 ]; then
+            echo "::error::Expected six binary archives plus SHA256SUMS.txt, found ${#assets[@]} assets."
             printf '%s\n' "${assets[@]}"
             exit 1
           fi
-          cat > target/release-assets/proof-boundaries.md <<'EOF'
-          ## Platform proof boundaries
-
-          This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS arm64.
-
-          - Windows x64 managed install, local ground, and repair handoff are acceptance-smoked; this is not full sidecar or GPU proof.
-          - Apple Silicon packaging is acceptance-smoked, while live managed Metal endpoint survival remains open in #887.
-          - Windows arm64 ships a CLI asset but has no managed native accelerated embedding cell.
-          - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
-          - Older-glibc compatibility is unproven; execution on the current hosted Ubuntu runner does not establish it.
-          EOF
           gh release create "$TAG" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "CodeStory $TAG" \
-            --notes-file target/release-assets/proof-boundaries.md \
-            --generate-notes
+            --notes-file target/release-assets/release-notes.md
 
   post-publish-smoke:
     name: Post-publish release asset smoke

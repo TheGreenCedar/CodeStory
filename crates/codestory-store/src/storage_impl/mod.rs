@@ -3,14 +3,17 @@ use codestory_contracts::graph::{
     EnumConversionError, Node, NodeId, NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty,
     TrailCallerScope, TrailConfig, TrailDirection, TrailMode, TrailResult,
 };
+use fs4::fs_std::FileExt;
 use parking_lot::RwLock;
 use rusqlite::{
-    Connection, MAIN_DB, OpenFlags, Result, Row, params, params_from_iter, types::Value,
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Result, Row, params, params_from_iter,
+    types::Value,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,7 +31,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 18;
+const SCHEMA_VERSION: u32 = 21;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -48,6 +51,11 @@ const EDGE_SELECT_BASE: &str = "SELECT e.id, e.source_node_id, e.target_node_id,
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
 const OCCURRENCE_LOOKUP_BATCH_SIZE: usize = 200;
+#[cfg(test)]
+const PROMOTION_ABORT_SENTINEL_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_SENTINEL";
+#[cfg(test)]
+const PROMOTION_ABORT_SENTINEL: &[u8] = b"after-live-restore-step\n";
+const PROMOTION_JOURNAL_VERSION: u32 = 1;
 
 fn clamp_i64_to_u32(value: i64) -> u32 {
     if value <= 0 {
@@ -151,15 +159,458 @@ fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 3] {
 fn cleanup_sqlite_sidecars(path: &Path) -> Result<(), StorageError> {
     for candidate in sqlite_sidecar_paths(path) {
         if candidate.exists() {
-            fs::remove_file(&candidate).map_err(|err| {
-                StorageError::Other(format!(
-                    "Failed to remove SQLite artifact {}: {err}",
-                    candidate.display()
-                ))
-            })?;
+            match fs::remove_file(&candidate) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(StorageError::Other(format!(
+                        "Failed to remove SQLite artifact {}: {err}",
+                        candidate.display()
+                    )));
+                }
+            }
         }
     }
     Ok(())
+}
+
+struct PromotionLock {
+    file: File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PromotionJournal {
+    version: u32,
+    previous: Option<IndexPublicationRecord>,
+    candidate: IndexPublicationRecord,
+}
+
+fn promotion_lock_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.promotion.lock", path.display()))
+}
+
+fn promotion_prepared_journal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.promotion.prepared.json", path.display()))
+}
+
+fn promotion_committed_journal_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.promotion.committed.json", path.display()))
+}
+
+#[cfg(test)]
+fn promotion_cleanup_failure_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.promotion.cleanup-blocked", path.display()))
+}
+
+fn promotion_artifacts_exist(path: &Path) -> bool {
+    path.with_extension("sqlite.backup").exists()
+        || promotion_prepared_journal_path(path).exists()
+        || promotion_committed_journal_path(path).exists()
+}
+
+fn promotion_error(message: impl Into<String>) -> StorageError {
+    StorageError::Other(message.into())
+}
+
+fn promotion_path_error(action: &str, path: &Path, error: impl std::fmt::Display) -> StorageError {
+    promotion_error(format!("Failed to {action} {}: {error}", path.display()))
+}
+
+fn has_incomplete_incremental_marker(conn: &Connection) -> Result<bool, StorageError> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'incomplete_index_run'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM incomplete_index_run WHERE id = 1)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn inspect_promotion_database(path: &Path) -> Result<Option<(Connection, u32)>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.busy_timeout(Duration::from_millis(2_500));
+    let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(promotion_error(format!(
+            "SQLite promotion artifact {} failed quick_check: {quick_check}",
+            path.display()
+        )));
+    }
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let schema_version = version.max(0) as u32;
+    Ok(Some((conn, schema_version)))
+}
+
+fn read_complete_promotion_database_identity(
+    path: &Path,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
+        return Ok(None);
+    };
+    if schema_version == 0 {
+        return Ok(None);
+    }
+    if schema_version != SCHEMA_VERSION {
+        return Err(promotion_error(format!(
+            "SQLite promotion artifact {} has schema version {schema_version}, expected {SCHEMA_VERSION}",
+            path.display()
+        )));
+    }
+    read_complete_index_publication(&conn)
+}
+
+fn read_recovery_database_identity(
+    path: &Path,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let Some((conn, schema_version)) = inspect_promotion_database(path)? else {
+        return Ok(None);
+    };
+    match schema_version {
+        0 => Ok(None),
+        SCHEMA_VERSION => read_complete_index_publication(&conn),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION if has_incomplete_incremental_marker(&conn)? => {
+            read_index_publication(&conn)
+        }
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION => Err(promotion_error(format!(
+            "SQLite recovery artifact {} uses the incomplete schema sentinel without its marker",
+            path.display()
+        ))),
+        _ => Err(promotion_error(format!(
+            "SQLite recovery artifact {} has unsupported schema version {schema_version}",
+            path.display()
+        ))),
+    }
+}
+
+fn require_complete_promotion_database_identity(
+    path: &Path,
+    role: &str,
+) -> Result<IndexPublicationRecord, StorageError> {
+    read_complete_promotion_database_identity(path)?.ok_or_else(|| {
+        promotion_error(format!(
+            "{role} {} has no complete publication identity",
+            path.display()
+        ))
+    })
+}
+
+fn require_recovery_database_identity(
+    path: &Path,
+    role: &str,
+) -> Result<IndexPublicationRecord, StorageError> {
+    read_recovery_database_identity(path)?.ok_or_else(|| {
+        promotion_error(format!(
+            "{role} {} has no complete publication identity",
+            path.display()
+        ))
+    })
+}
+
+fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError> {
+    let bytes = fs::read(path).map_err(|error| promotion_path_error("read", path, error))?;
+    let journal: PromotionJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| promotion_path_error("parse", path, error))?;
+    if journal.version != PROMOTION_JOURNAL_VERSION {
+        return Err(promotion_error(format!(
+            "Unsupported promotion journal {}: version={}",
+            path.display(),
+            journal.version
+        )));
+    }
+    Ok(journal)
+}
+
+fn sync_promotion_parent(path: &Path) -> Result<(), StorageError> {
+    #[cfg(not(windows))]
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| promotion_path_error("sync directory", parent, error))?;
+    }
+    #[cfg(windows)]
+    let _ = path;
+    Ok(())
+}
+
+fn write_promotion_journal(path: &Path, journal: &PromotionJournal) -> Result<(), StorageError> {
+    let bytes = serde_json::to_vec(journal)
+        .map_err(|error| promotion_path_error("serialize", path, error))?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| promotion_path_error("create", path, error))?;
+    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(path);
+        let _ = sync_promotion_parent(path);
+        return Err(promotion_path_error("persist", path, error));
+    }
+    if let Err(error) = sync_promotion_parent(path) {
+        let _ = fs::remove_file(path);
+        let _ = sync_promotion_parent(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn commit_promotion_journal(
+    prepared_path: &Path,
+    committed_path: &Path,
+) -> Result<(), StorageError> {
+    if committed_path.exists() {
+        return Err(promotion_error(format!(
+            "Cannot commit promotion while prior journal {} remains",
+            committed_path.display()
+        )));
+    }
+    fs::rename(prepared_path, committed_path)
+        .map_err(|error| promotion_path_error("commit journal as", committed_path, error))?;
+    sync_promotion_parent(committed_path)
+}
+
+fn remove_promotion_file(path: &Path) -> Result<(), StorageError> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_promotion_parent(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(promotion_path_error("remove", path, error)),
+    }
+}
+
+impl PromotionLock {
+    fn open(path: &Path) -> Result<File, StorageError> {
+        let lock_path = promotion_lock_path(path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                StorageError::Other(format!(
+                    "Failed to create promotion lock directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                StorageError::Other(format!(
+                    "Failed to open promotion lock {}: {error}",
+                    lock_path.display()
+                ))
+            })
+    }
+
+    fn acquire(path: &Path) -> Result<Self, StorageError> {
+        let file = Self::open(path)?;
+        FileExt::lock_exclusive(&file).map_err(|error| {
+            StorageError::Other(format!(
+                "Failed to acquire promotion lock for {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { file })
+    }
+
+    fn try_acquire(path: &Path) -> Result<Option<Self>, StorageError> {
+        let file = Self::open(path)?;
+        FileExt::try_lock_exclusive(&file)
+            .map(|locked| locked.then_some(Self { file }))
+            .map_err(|error| {
+                StorageError::Other(format!(
+                    "Failed to inspect promotion lock for {}: {error}",
+                    path.display()
+                ))
+            })
+    }
+}
+
+impl Drop for PromotionLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn recover_interrupted_promotion(path: &Path) -> Result<(), StorageError> {
+    if !promotion_artifacts_exist(path) {
+        return Ok(());
+    }
+    let Some(_lock) = PromotionLock::try_acquire(path)? else {
+        // A healthy promoter owns the lock. SQLite readers may wait for that
+        // transaction, but must never interpret its backup as crash evidence.
+        return Ok(());
+    };
+    recover_interrupted_promotion_locked(path)
+}
+
+fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError> {
+    let backup_path = path.with_extension("sqlite.backup");
+    let prepared_path = promotion_prepared_journal_path(path);
+    let committed_path = promotion_committed_journal_path(path);
+
+    if committed_path.exists() && prepared_path.exists() {
+        return Err(promotion_error(format!(
+            "Promotion has both prepared and committed journals for {}",
+            path.display()
+        )));
+    }
+
+    if committed_path.exists() {
+        let committed = read_promotion_journal(&committed_path)?;
+        let live_identity =
+            require_complete_promotion_database_identity(path, "Committed live database")?;
+        if live_identity != committed.candidate {
+            return Err(promotion_error(format!(
+                "Committed promotion identity does not match live database {}",
+                path.display()
+            )));
+        }
+        if let Err(error) = cleanup_committed_promotion_artifacts(path) {
+            tracing::warn!(
+                live_path = %path.display(),
+                error = %error,
+                "committed promotion retained recovery artifacts"
+            );
+        }
+        return Ok(());
+    }
+
+    if prepared_path.exists() {
+        let prepared = read_promotion_journal(&prepared_path)?;
+        return rollback_prepared_promotion(path, &prepared);
+    }
+
+    if backup_path.exists() {
+        return recover_legacy_promotion_backup(path, &backup_path);
+    }
+    Ok(())
+}
+
+fn restore_promotion_database(source_path: &Path, live_path: &Path) -> Result<(), StorageError> {
+    let mut live = Connection::open(live_path)?;
+    let _ = live.busy_timeout(Duration::from_millis(2_500));
+    live.restore(MAIN_DB, source_path, None::<fn(rusqlite::backup::Progress)>)?;
+    Ok(())
+}
+
+fn rollback_prepared_promotion(
+    live_path: &Path,
+    prepared: &PromotionJournal,
+) -> Result<(), StorageError> {
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let prepared_path = promotion_prepared_journal_path(live_path);
+    let live_identity = read_recovery_database_identity(live_path)?;
+    if live_identity
+        .as_ref()
+        .is_some_and(|live| live != &prepared.candidate && Some(live) != prepared.previous.as_ref())
+    {
+        return Err(promotion_error(format!(
+            "Prepared promotion for {} found an unrelated live publication",
+            live_path.display()
+        )));
+    }
+
+    match prepared.previous.as_ref() {
+        Some(expected_previous) => {
+            let backup_identity =
+                require_recovery_database_identity(&backup_path, "Prepared recovery backup")?;
+            if &backup_identity != expected_previous {
+                return Err(promotion_error(format!(
+                    "Prepared promotion backup identity does not match {}",
+                    live_path.display()
+                )));
+            }
+            if live_identity.as_ref() != Some(expected_previous) {
+                restore_promotion_database(&backup_path, live_path)?;
+            }
+            let restored = require_recovery_database_identity(live_path, "Restored live database")?;
+            if &restored != expected_previous {
+                return Err(promotion_error(format!(
+                    "Prepared promotion rollback did not restore the recorded identity for {}",
+                    live_path.display()
+                )));
+            }
+            remove_promotion_file(&prepared_path)?;
+            cleanup_sqlite_sidecars(&backup_path)
+        }
+        None => {
+            if backup_path.exists() {
+                return Err(promotion_error(format!(
+                    "Prepared first publication for {} unexpectedly has a backup",
+                    live_path.display()
+                )));
+            }
+            if live_identity.is_some() || live_path.exists() {
+                cleanup_sqlite_sidecars(live_path)?;
+            }
+            remove_promotion_file(&prepared_path)
+        }
+    }
+}
+
+fn recover_legacy_promotion_backup(
+    live_path: &Path,
+    backup_path: &Path,
+) -> Result<(), StorageError> {
+    let backup_identity =
+        require_recovery_database_identity(backup_path, "Legacy promotion backup")?;
+    let live_identity = read_recovery_database_identity(live_path);
+    let restore_backup = match live_identity {
+        Ok(None) => true,
+        Err(error) => {
+            return Err(promotion_error(format!(
+                "Cannot validate live database {} while a legacy promotion backup exists: {error}",
+                live_path.display()
+            )));
+        }
+        Ok(Some(ref live)) if live == &backup_identity => false,
+        Ok(Some(ref live)) if live.generation > backup_identity.generation => false,
+        Ok(Some(_)) => {
+            return Err(promotion_error(format!(
+                "Ambiguous legacy promotion backup for {}; refusing to overwrite the live database",
+                live_path.display()
+            )));
+        }
+    };
+    if restore_backup {
+        restore_promotion_database(backup_path, live_path)?;
+        let restored = require_recovery_database_identity(live_path, "Recovered live database")?;
+        if restored != backup_identity {
+            return Err(promotion_error(format!(
+                "Legacy promotion recovery produced an unexpected identity for {}",
+                live_path.display()
+            )));
+        }
+    }
+    cleanup_sqlite_sidecars(backup_path)
+}
+
+fn cleanup_committed_promotion_artifacts(live_path: &Path) -> Result<(), StorageError> {
+    #[cfg(test)]
+    if promotion_cleanup_failure_path(live_path).exists() {
+        return Err(promotion_error(
+            "injected committed promotion cleanup failure",
+        ));
+    }
+
+    let backup_path = live_path.with_extension("sqlite.backup");
+    cleanup_sqlite_sidecars(&backup_path)?;
+    let committed_path = promotion_committed_journal_path(live_path);
+    remove_promotion_file(&committed_path)
 }
 
 fn grounding_display_name_expr(alias: &str) -> String {
@@ -293,6 +744,65 @@ pub struct Storage {
     deferred_secondary_indexes: bool,
 }
 
+/// One coherent read view of a live SQLite store.
+///
+/// Publication replaces the live database in place. Grouping related reads in
+/// one transaction prevents a reader from combining rows from two generations.
+pub struct StorageReadSnapshot<'a> {
+    storage: &'a Storage,
+    active: bool,
+}
+
+/// One exclusive write view used when validation and publication must commit together.
+pub struct StorageWriteTransaction<'a> {
+    storage: &'a mut Storage,
+    active: bool,
+}
+
+impl StorageReadSnapshot<'_> {
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+
+    pub fn finish(mut self) -> Result<(), StorageError> {
+        self.storage.conn.execute_batch("COMMIT")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for StorageReadSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.storage.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+impl StorageWriteTransaction<'_> {
+    pub fn storage(&self) -> &Storage {
+        self.storage
+    }
+
+    pub fn storage_mut(&mut self) -> &mut Storage {
+        self.storage
+    }
+
+    pub fn finish(mut self) -> Result<(), StorageError> {
+        self.storage.conn.execute_batch("COMMIT")?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for StorageWriteTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.storage.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
 /// Opening mode for a SQLite store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageOpenMode {
@@ -315,6 +825,7 @@ pub struct ProjectionFlushBreakdown {
 
 pub struct ProjectionBatch<'a> {
     pub files: &'a [FileInfo],
+    pub file_content_hashes: &'a [FileContentHash],
     pub nodes: &'a [Node],
     pub edges: &'a [Edge],
     pub occurrences: &'a [Occurrence],
@@ -344,6 +855,13 @@ pub struct FileInfo {
     pub line_count: u32,
     #[serde(default)]
     pub file_role: FileRole,
+}
+
+/// Verified content identity for one parser-backed file projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileContentHash {
+    pub file_id: i64,
+    pub content_hash: String,
 }
 
 /// Heuristic role assigned to a file for ranking and summaries.
@@ -496,6 +1014,152 @@ pub struct StorageStats {
     pub file_count: i64,
     pub error_count: i64,
     pub fatal_error_count: i64,
+}
+
+/// Indexing mode that produced one durable core database generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPublicationMode {
+    Full,
+    Incremental,
+}
+
+impl IndexPublicationMode {
+    fn db_value(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "full" => Ok(Self::Full),
+            "incremental" => Ok(Self::Incremental),
+            _ => Err(StorageError::Other(format!(
+                "Unsupported index publication mode: {value}"
+            ))),
+        }
+    }
+}
+
+/// Durable identity of the complete core database generation at the live path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexPublicationRecord {
+    pub generation: u64,
+    pub generation_id: String,
+    pub run_id: String,
+    pub mode: IndexPublicationMode,
+    pub published_at_epoch_ms: i64,
+}
+
+fn index_publication_record_from_values(
+    generation: i64,
+    generation_id: String,
+    run_id: String,
+    mode: String,
+    published_at_epoch_ms: i64,
+) -> Result<IndexPublicationRecord, StorageError> {
+    let generation = u64::try_from(generation).map_err(|_| {
+        StorageError::Other(format!(
+            "Invalid index publication generation: {generation}"
+        ))
+    })?;
+    if generation == 0
+        || generation_id.trim().is_empty()
+        || run_id.trim().is_empty()
+        || published_at_epoch_ms < 0
+    {
+        return Err(StorageError::Other(
+            "Index publication identity contains an empty or zero field".to_string(),
+        ));
+    }
+    Ok(IndexPublicationRecord {
+        generation,
+        generation_id,
+        run_id,
+        mode: IndexPublicationMode::from_db(&mode)?,
+        published_at_epoch_ms,
+    })
+}
+
+fn read_index_publication(
+    conn: &Connection,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'index_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(None);
+    }
+    let values = conn.query_row(
+        "SELECT generation, generation_id, run_id, mode, published_at_epoch_ms
+         FROM index_publication WHERE id = 1",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    );
+    match values {
+        Ok((generation, generation_id, run_id, mode, published_at_epoch_ms)) => {
+            index_publication_record_from_values(
+                generation,
+                generation_id,
+                run_id,
+                mode,
+                published_at_epoch_ms,
+            )
+            .map(Some)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_complete_index_publication(
+    conn: &Connection,
+) -> Result<Option<IndexPublicationRecord>, StorageError> {
+    let values = conn.query_row(
+        "SELECT generation, generation_id, run_id, mode, published_at_epoch_ms
+         FROM index_publication
+         WHERE id = 1
+           AND NOT EXISTS (SELECT 1 FROM incomplete_index_run WHERE id = 1)",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    );
+    match values {
+        Ok((generation, generation_id, run_id, mode, published_at_epoch_ms)) => {
+            index_publication_record_from_values(
+                generation,
+                generation_id,
+                run_id,
+                mode,
+                published_at_epoch_ms,
+            )
+            .map(Some)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn is_framework_synthetic_node(node: &Node) -> bool {
@@ -856,6 +1520,47 @@ impl Storage {
         Self::open_with_mode(path, StorageOpenMode::Live)
     }
 
+    /// Open the current schema without migrations or write-oriented pragmas.
+    ///
+    /// Published snapshots are immutable from a reader's perspective, so
+    /// concurrent readers must not contend with a staged refresh merely by
+    /// opening the live database.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        recover_interrupted_promotion(path)?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_millis(2_500))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version = version.max(0) as u32;
+        if version != SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
+            )));
+        }
+        Ok(Self {
+            conn,
+            cache: StorageCache::default(),
+            deferred_secondary_indexes: false,
+        })
+    }
+
+    pub fn read_snapshot(&self) -> Result<StorageReadSnapshot<'_>, StorageError> {
+        self.conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        Ok(StorageReadSnapshot {
+            storage: self,
+            active: true,
+        })
+    }
+
+    pub fn write_transaction(&mut self) -> Result<StorageWriteTransaction<'_>, StorageError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        Ok(StorageWriteTransaction {
+            storage: self,
+            active: true,
+        })
+    }
+
     /// Open a build-mode store after removing stale SQLite sidecars.
     pub fn open_build<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path = path.as_ref();
@@ -869,6 +1574,9 @@ impl Storage {
         mode: StorageOpenMode,
     ) -> Result<Self, StorageError> {
         let path = path.as_ref();
+        if matches!(mode, StorageOpenMode::Live) {
+            recover_interrupted_promotion(path)?;
+        }
         let conn = Connection::open(path)?;
         // Allow concurrent reads while indexing writes, and avoid flaky "database is locked" errors
         // in app shells when users query mid-index.
@@ -893,6 +1601,7 @@ impl Storage {
     }
 
     pub fn database_schema_version(path: &Path) -> Result<u32, StorageError> {
+        recover_interrupted_promotion(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         Ok(version.max(0) as u32)
@@ -900,6 +1609,7 @@ impl Storage {
 
     /// Read the incomplete-run fence without migrating or otherwise mutating a live database.
     pub fn database_has_incomplete_incremental_run(path: &Path) -> Result<bool, StorageError> {
+        recover_interrupted_promotion(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
@@ -908,20 +1618,7 @@ impl Storage {
                 "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
             )));
         }
-        let table_exists: i64 = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'incomplete_index_run'
-            )",
-            [],
-            |row| row.get(0),
-        )?;
-        let marked = table_exists != 0
-            && conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM incomplete_index_run WHERE id = 1)",
-                [],
-                |row| row.get::<_, i64>(0),
-            )? != 0;
+        let marked = has_incomplete_incremental_marker(&conn)?;
         if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION && !marked {
             return Err(StorageError::Other(format!(
                 "Database schema version {version} is only valid while an incremental index run is marked incomplete"
@@ -930,10 +1627,30 @@ impl Storage {
         Ok(marked)
     }
 
+    /// Read the durable publication identity without migrating or mutating the database.
+    pub fn database_index_publication(
+        path: &Path,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        recover_interrupted_promotion(path)?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        read_index_publication(&conn)
+    }
+
+    /// Read the durable publication only when the same SQLite snapshot has no
+    /// incomplete-run fence.
+    pub fn database_complete_index_publication(
+        path: &Path,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        recover_interrupted_promotion(path)?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        read_complete_index_publication(&conn)
+    }
+
     pub fn copy_database_snapshot(
         source_path: &Path,
         target_path: &Path,
     ) -> Result<(), StorageError> {
+        recover_interrupted_promotion(source_path)?;
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 StorageError::Other(format!(
@@ -1293,7 +2010,58 @@ impl Storage {
         Ok(())
     }
 
-    pub fn update_file_metadata(&self, info: &FileInfo) -> Result<(), StorageError> {
+    /// Return the durable identity of the currently stored core generation.
+    pub fn get_index_publication(&self) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        read_index_publication(&self.conn)
+    }
+
+    pub fn get_complete_index_publication(
+        &self,
+    ) -> Result<Option<IndexPublicationRecord>, StorageError> {
+        read_complete_index_publication(&self.conn)
+    }
+
+    /// Store the identity that will describe this database once it is published.
+    pub fn put_index_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<(), StorageError> {
+        if publication.generation == 0
+            || publication.generation > i64::MAX as u64
+            || publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || publication.published_at_epoch_ms < 0
+        {
+            return Err(StorageError::Other(
+                "Index publication identity contains an invalid field".to_string(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO index_publication (
+                id, generation, generation_id, run_id, mode, published_at_epoch_ms
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                generation = excluded.generation,
+                generation_id = excluded.generation_id,
+                run_id = excluded.run_id,
+                mode = excluded.mode,
+                published_at_epoch_ms = excluded.published_at_epoch_ms",
+            params![
+                publication.generation as i64,
+                publication.generation_id.as_str(),
+                publication.run_id.as_str(),
+                publication.mode.db_value(),
+                publication.published_at_epoch_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_file_metadata(
+        &self,
+        info: &FileInfo,
+        content_hash: Option<&str>,
+    ) -> Result<(), StorageError> {
         self.conn.execute(
             "UPDATE file
              SET path = ?2,
@@ -1302,7 +2070,8 @@ impl Storage {
                  indexed = ?5,
                  complete = ?6,
                  line_count = ?7,
-                 file_role = ?8
+                 file_role = ?8,
+                 content_hash = ?9
              WHERE id = ?1",
             params![
                 info.id,
@@ -1313,10 +2082,33 @@ impl Storage {
                 i32::from(info.complete),
                 info.line_count,
                 info.file_role.as_str(),
+                content_hash,
             ],
         )?;
         self.mark_grounding_snapshots_dirty()?;
         Ok(())
+    }
+
+    /// Read the verified parser source hash stored with one file projection.
+    pub fn get_file_content_hash(&self, file_id: i64) -> Result<Option<String>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT content_hash FROM file WHERE id = ?1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(StorageError::from)
+    }
+
+    pub(crate) fn get_file_content_hashes(&self) -> Result<HashMap<i64, String>, StorageError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, content_hash FROM file WHERE content_hash IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn refresh_grounding_summary_snapshots(&self) -> Result<(), StorageError> {
@@ -1913,32 +2705,85 @@ impl Storage {
         staged_path: &Path,
         live_path: &Path,
     ) -> Result<(), StorageError> {
+        let _promotion_lock = PromotionLock::acquire(live_path)?;
+        recover_interrupted_promotion_locked(live_path)?;
+        if promotion_artifacts_exist(live_path) {
+            return Err(promotion_error(format!(
+                "Cannot start a new promotion while prior artifacts remain for {}",
+                live_path.display()
+            )));
+        }
         let backup_path = live_path.with_extension("sqlite.backup");
-        let live_exists = live_path.exists();
+        let prepared_path = promotion_prepared_journal_path(live_path);
+        let committed_path = promotion_committed_journal_path(live_path);
+        let candidate = require_complete_promotion_database_identity(
+            staged_path,
+            "Staged promotion candidate",
+        )?;
+        let previous = read_recovery_database_identity(live_path)?;
         cleanup_sqlite_sidecars(&backup_path)?;
-        let mut live_conn = Connection::open(live_path)?;
-        let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
 
-        if live_exists {
+        if previous.is_some() {
+            let live_conn = Connection::open(live_path)?;
+            let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
             live_conn.backup(
                 MAIN_DB,
                 &backup_path,
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
+            drop(live_conn);
+            let backup_identity =
+                require_recovery_database_identity(&backup_path, "Promotion backup")?;
+            if Some(&backup_identity) != previous.as_ref() {
+                return Err(promotion_error(format!(
+                    "Promotion backup identity does not match live database {}",
+                    live_path.display()
+                )));
+            }
         }
 
-        if let Err(err) =
-            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>)
-        {
-            if live_exists && backup_path.exists() {
-                let _ = live_conn.restore(
-                    MAIN_DB,
-                    &backup_path,
-                    None::<fn(rusqlite::backup::Progress)>,
-                );
-            } else {
-                let _ = cleanup_sqlite_sidecars(live_path);
+        let prepared = PromotionJournal {
+            version: PROMOTION_JOURNAL_VERSION,
+            previous: previous.clone(),
+            candidate: candidate.clone(),
+        };
+        if let Err(error) = write_promotion_journal(&prepared_path, &prepared) {
+            if !prepared_path.exists() {
+                let _ = cleanup_sqlite_sidecars(&backup_path);
             }
+            return Err(error);
+        }
+
+        let mut live_conn = Connection::open(live_path)?;
+        let _ = live_conn.busy_timeout(Duration::from_millis(2_500));
+
+        #[cfg(test)]
+        let restore_result = if let Some(sentinel_path) =
+            std::env::var_os(PROMOTION_ABORT_SENTINEL_ENV).map(PathBuf::from)
+        {
+            live_conn.restore(
+                MAIN_DB,
+                staged_path,
+                Some(move |_progress| {
+                    let mut sentinel = std::fs::File::create(&sentinel_path)
+                        .expect("create promotion abort sentinel");
+                    sentinel
+                        .write_all(PROMOTION_ABORT_SENTINEL)
+                        .expect("write promotion abort sentinel");
+                    sentinel.sync_all().expect("sync promotion abort sentinel");
+                    std::process::abort();
+                }),
+            )
+        } else {
+            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>)
+        };
+        #[cfg(not(test))]
+        let restore_result =
+            live_conn.restore(MAIN_DB, staged_path, None::<fn(rusqlite::backup::Progress)>);
+
+        if let Err(err) = restore_result {
+            drop(live_conn);
+            let _ = rollback_prepared_promotion(live_path, &prepared);
             return Err(StorageError::Other(format!(
                 "Failed to promote staged snapshot {} -> {}: {err}",
                 staged_path.display(),
@@ -1946,9 +2791,37 @@ impl Storage {
             )));
         }
         drop(live_conn);
-        cleanup_sqlite_sidecars(staged_path)?;
-        if backup_path.exists() {
-            let _ = cleanup_sqlite_sidecars(&backup_path);
+
+        let published =
+            require_complete_promotion_database_identity(live_path, "Promoted live database")?;
+        if published != candidate {
+            let _ = rollback_prepared_promotion(live_path, &prepared);
+            return Err(promotion_error(format!(
+                "Promoted live database identity does not match staged candidate {}",
+                staged_path.display()
+            )));
+        }
+
+        if let Err(error) = commit_promotion_journal(&prepared_path, &committed_path) {
+            if !committed_path.exists() {
+                let _ = rollback_prepared_promotion(live_path, &prepared);
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = cleanup_sqlite_sidecars(staged_path) {
+            tracing::warn!(
+                staged_path = %staged_path.display(),
+                error = %error,
+                "committed promotion left a staged cleanup artifact"
+            );
+        }
+        if let Err(error) = cleanup_committed_promotion_artifacts(live_path) {
+            tracing::warn!(
+                live_path = %live_path.display(),
+                error = %error,
+                "committed promotion retained recovery artifacts"
+            );
         }
         Ok(())
     }
@@ -2284,6 +3157,119 @@ impl Storage {
         }
 
         Ok(())
+    }
+
+    /// Remove stale generated retrieval artifacts and their semantic projections.
+    /// Returns the number of removed projection rows.
+    pub fn prune_retrieval_artifacts_to_node_ids(
+        &mut self,
+        keep_node_ids: &[NodeId],
+        keep_dense_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS retrieval_artifact_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.retrieval_artifact_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.retrieval_artifact_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS retrieval_artifact_dense_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.retrieval_artifact_dense_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.retrieval_artifact_dense_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_dense_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS retrieval_artifact_stale (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.retrieval_artifact_stale", [])?;
+        tx.execute(
+            "INSERT INTO temp.retrieval_artifact_stale (node_id)
+             SELECT id FROM node
+             WHERE (serialized_name LIKE 'component_report:%'
+                OR canonical_id LIKE 'codestory:component_report:%')
+               AND NOT EXISTS (
+                   SELECT 1 FROM temp.retrieval_artifact_keep keep
+                   WHERE keep.node_id = node.id
+               )",
+            [],
+        )?;
+        let stale_node_ids = {
+            let mut stmt = tx.prepare("SELECT node_id FROM temp.retrieval_artifact_stale")?;
+            stmt.query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let removed_dense = tx.execute(
+            "DELETE FROM llm_symbol_doc
+             WHERE node_id IN (
+                 SELECT id FROM node
+                 WHERE serialized_name LIKE 'component_report:%'
+                    OR canonical_id LIKE 'codestory:component_report:%'
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM temp.retrieval_artifact_dense_keep keep
+                   WHERE keep.node_id = llm_symbol_doc.node_id
+               )",
+            [],
+        )?;
+        let removed_symbol = tx.execute(
+            "DELETE FROM symbol_search_doc
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM search_symbol_projection
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM symbol_summary
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM bookmark_node
+             WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM node
+             WHERE id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
+            [],
+        )?;
+        tx.execute("DROP TABLE temp.retrieval_artifact_stale", [])?;
+        tx.execute("DROP TABLE temp.retrieval_artifact_dense_keep", [])?;
+        tx.execute("DROP TABLE temp.retrieval_artifact_keep", [])?;
+        tx.commit()?;
+
+        let mut cache = self.cache.nodes.write();
+        for node_id in stale_node_ids {
+            cache.remove(&NodeId(node_id));
+        }
+        drop(cache);
+        self.invalidate_grounding_snapshots()?;
+        Ok(removed_dense.saturating_add(removed_symbol))
     }
 
     pub fn copy_retrieval_artifact_nodes_from(
@@ -2636,6 +3622,7 @@ impl Storage {
     ) -> Result<ProjectionFlushBreakdown, StorageError> {
         let mut breakdown = ProjectionFlushBreakdown::default();
         if batch.files.is_empty()
+            && batch.file_content_hashes.is_empty()
             && batch.nodes.is_empty()
             && batch.edges.is_empty()
             && batch.occurrences.is_empty()
@@ -2657,6 +3644,11 @@ impl Storage {
             .collect::<HashMap<_, _>>();
         let nodes_prepare_ms = clamp_i64_to_u32(nodes_prepare_started.elapsed().as_millis() as i64);
 
+        let file_content_hashes = batch
+            .file_content_hashes
+            .iter()
+            .map(|identity| (identity.file_id, identity.content_hash.as_str()))
+            .collect::<HashMap<_, _>>();
         let tx = self.conn.transaction()?;
 
         if !batch.files.is_empty() {
@@ -2668,14 +3660,15 @@ impl Storage {
 
             let started = std::time::Instant::now();
             let mut stmt = tx.prepare(
-                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO file (id, path, language, modification_time, indexed, complete, line_count, file_role, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                     modification_time=excluded.modification_time,
                     indexed=excluded.indexed,
                     complete=excluded.complete,
                     line_count=excluded.line_count,
-                    file_role=excluded.file_role",
+                    file_role=excluded.file_role,
+                    content_hash=excluded.content_hash",
             )?;
             for info in batch.files {
                 stmt.execute(params![
@@ -2687,6 +3680,7 @@ impl Storage {
                     i32::from(info.complete),
                     info.line_count,
                     info.file_role.as_str(),
+                    file_content_hashes.get(&info.id).copied(),
                 ])?;
             }
             breakdown.files_ms = clamp_i64_to_u32(started.elapsed().as_millis() as i64);

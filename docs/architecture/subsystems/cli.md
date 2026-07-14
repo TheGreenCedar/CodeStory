@@ -38,7 +38,31 @@ index path when embedding assets are available.
 
 ## Configuration Files
 
-The CLI loads optional `.codestory.toml` defaults from the user home directory and then from the selected project root. Project config may override home config for project-safe preferences. Cache roots, network endpoints, model selectors for source-egress calls, credentials, and source-text egress settings must come from trusted user config, explicit environment variables, or CLI options; project files cannot set `cache_dir`, `summary_endpoint`, `summary_model`, or embedding endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set deliberately for that run. Explicit environment variables override both config files because config values are only applied when the matching runtime env var is absent.
+The CLI captures process environment defaults once, including the user config
+home, project-network opt-in, and multi-project stdio cache root, then loads
+optional `.codestory.toml` defaults from the captured user home directory and
+the selected project root. It merges those values into an immutable
+`SidecarRuntimeConfig` retained by that project runtime; it never publishes
+project choices back through the process environment. This is required for
+multi-project stdio: switching A/B/A
+must keep each project's endpoint, model, prefix, retrieval policy, and summary
+settings isolated. Cache roots, network endpoints, model selectors for
+source-egress calls, credentials, and source-text egress settings must come from
+trusted user config, explicit environment variables, or CLI options; project
+files cannot set `cache_dir`, `summary_endpoint`, `summary_model`, or embedding
+endpoint fields unless `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` is set
+deliberately for that process. Explicit environment values have highest
+precedence without being mutated or re-read when a stdio request switches
+projects.
+
+Plugin launchers start one projectless multi-project stdio process. Every tool
+or status request supplies its absolute project root; hook-written active-state
+files are diagnostics only and never select a runtime. The optional bootstrap
+diagnostic asks `cache identity` for the lossless schema-3 project and workspace
+ids, then accepts broker readiness only when those ids match. Existing
+executables and roots compare by filesystem identity; only missing paths use
+platform lexical rules (case-sensitive on Unix and case-insensitive on
+Windows).
 
 Embedding config keys map to the runtime env names:
 
@@ -48,8 +72,12 @@ Embedding config keys map to the runtime env names:
 | `embedding_model_id` | `CODESTORY_EMBED_MODEL_ID` | Overrides the resolved model id for the selected profile. |
 | `embedding_model` | `CODESTORY_EMBED_MODEL_ID` | Deprecated alias for `embedding_model_id`; prefer the explicit key in new config. |
 | `embedding_endpoint` | `CODESTORY_EMBED_LLAMACPP_URL` | Trusted-only endpoint for the product llama.cpp embedding sidecar. |
+| `embedding_query_prefix` | `CODESTORY_EMBED_QUERY_PREFIX` | Per-project query prefix retained with the embedding contract. |
+| `embedding_document_prefix` | `CODESTORY_EMBED_DOCUMENT_PREFIX` | Per-project document prefix retained with the embedding contract. |
 
-The CLI should not set stale embedding env aliases that the runtime does not read.
+Runtime status reports distinguish a managed sidecar endpoint from an explicit
+process, trusted-user, or trusted-project endpoint. The CLI must not set runtime
+environment variables after startup.
 
 Index output should expose:
 
@@ -75,10 +103,13 @@ page owns the adapter boundary:
 - keep mutating setup paths explicit so read commands do not download assets or
   change sidecar state.
 
-Broad question surfaces (`packet`, sidecar-backed `search`, and `drill`) should
-remain separate from exact target context (`context`, `symbol`, `trail`,
-`snippet`, and local graph exploration). Generated help is the source of truth
-for the current flags on each command.
+`packet` owns broad-question retrieval. `drill` executes that packet path once
+with its explicit anchors as extra probes, then adapts packet citations,
+sufficiency, gaps, and follow-up commands into durable drill reports. It must
+not assemble a second search, bridge, readiness, or claim-scoring system.
+Sidecar-backed `search` remains candidate discovery, while `context`, `symbol`,
+`trail`, `snippet`, and local graph exploration remain exact-target surfaces.
+Generated help is the source of truth for the current flags on each command.
 
 `task brief` is an owner-directed implementation workflow view over `packet`.
 It must keep the stable JSON and Markdown brief contracts in the CLI adapter,

@@ -11,7 +11,7 @@ Runtime status field glossary (agents): [status-contract](../../plugins/codestor
 Install: release binary from GitHub assets, or build from source:
 
 ```sh
-cargo build --release -p codestory-cli
+cargo build --release --locked -p codestory-cli
 ```
 
 Windows: `.\target\release\codestory-cli.exe`.
@@ -101,8 +101,20 @@ Team or user defaults: `.codestory.toml` at project root or user home. Home
 file loads first; project file overrides for project-safe preferences.
 Environment variables win over files.
 
-Project `.codestory.toml` cannot choose cache roots or network egress settings.
-Put `cache_dir` in user home `.codestory.toml` or pass `--cache-dir`.
+Configuration is resolved independently for each project and retained for the
+life of that project runtime. Multi-project stdio captures the user home,
+project-network opt-in, cache root, and runtime environment once; it neither
+rewrites nor re-reads them when requests switch repositories. Trusted project files
+may also set `embedding_query_prefix` and `embedding_document_prefix` as part of
+their per-project embedding contract.
+
+Project `.codestory.toml` cannot choose cache roots. It also cannot choose
+network egress settings by default. A trusted operator may set
+`CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` for the whole process to allow every
+project opened by that process to configure summary and embedding endpoints.
+That opt-in can redirect source or query text, so never enable it while opening
+untrusted repositories. Put `cache_dir` in user home `.codestory.toml` or pass
+`--cache-dir`.
 
 ## Command by situation
 
@@ -118,14 +130,6 @@ Put `cache_dir` in user home `.codestory.toml` or pass `--cache-dir`.
 
 Product sidecar setup: [Retrieval sidecars ops](../ops/retrieval-sidecars.md).
 
-Legacy managed embeddings (diagnostic only):
-
-```sh
-codestory-cli setup embeddings --project <repo> --dry-run --format json
-```
-
-Does not prove agent packet/search readiness.
-
 ## Environment overrides
 
 | Variable | Purpose |
@@ -135,6 +139,7 @@ Does not prove agent packet/search readiness.
 | `CODESTORY_NO_TUI` | Disable TUI for `explore` in CI or scripts |
 | `CODESTORY_SUMMARY_ENDPOINT` | Trusted summary endpoint |
 | `CODESTORY_EMBED_LLAMACPP_URL` | Trusted embedding endpoint |
+| `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` | Process-wide opt-in allowing trusted project files to configure network endpoints |
 
 ## Further reading
 

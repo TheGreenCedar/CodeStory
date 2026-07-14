@@ -83,6 +83,19 @@ impl ScipClient {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        Self::anchor_search_with_cancel(layout, project_id, query, limit, &|| false)
+    }
+
+    pub fn anchor_search_with_cancel(
+        layout: &SidecarLayout,
+        project_id: &str,
+        query: &str,
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        if cancelled() {
+            anyhow::bail!("SCIP anchor search cancelled");
+        }
         let probe = Self::health_probe(layout, project_id);
         let ScipAvailability::Ready { revision } = probe.availability else {
             return Ok(Vec::new());
@@ -96,11 +109,17 @@ impl ScipClient {
         };
         let profile = ScipQueryProfile::new(query);
         let mut hits = Vec::new();
-        for symbol in index.symbols {
+        for (index, symbol) in index.symbols.into_iter().enumerate() {
+            if index % 64 == 0 && cancelled() {
+                anyhow::bail!("SCIP anchor search cancelled");
+            }
             if symbol_matches_query(&symbol, &profile) {
                 let score = score_symbol_match(&symbol, &profile);
                 hits.push(symbol_to_hit(&symbol, score, 0, provenance));
             }
+        }
+        if cancelled() {
+            anyhow::bail!("SCIP anchor search cancelled");
         }
         hits.sort_by(|left, right| {
             right
@@ -121,6 +140,19 @@ impl ScipClient {
         anchors: &[super::CandidateHit],
         limit: usize,
     ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        Self::expand_graph_with_cancel(layout, project_id, anchors, limit, &|| false)
+    }
+
+    pub fn expand_graph_with_cancel(
+        layout: &SidecarLayout,
+        project_id: &str,
+        anchors: &[super::CandidateHit],
+        limit: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Vec<super::CandidateHit>> {
+        if cancelled() {
+            anyhow::bail!("SCIP graph expansion cancelled");
+        }
         let probe = Self::health_probe(layout, project_id);
         let ScipAvailability::Ready { revision } = probe.availability else {
             return Ok(Vec::new());
@@ -135,7 +167,10 @@ impl ScipClient {
         let mut hits = Vec::new();
         for anchor in anchors.iter().take(4) {
             let anchor_symbol = anchor.symbol_name.as_deref().unwrap_or("");
-            for symbol in &index.symbols {
+            for (index, symbol) in index.symbols.iter().enumerate() {
+                if index % 64 == 0 && cancelled() {
+                    anyhow::bail!("SCIP graph expansion cancelled");
+                }
                 if hits.len() >= limit {
                     break;
                 }
@@ -155,6 +190,9 @@ impl ScipClient {
                 }
             }
         }
+        if cancelled() {
+            anyhow::bail!("SCIP graph expansion cancelled");
+        }
         hits.truncate(limit);
         Ok(hits)
     }
@@ -168,7 +206,11 @@ fn symbol_to_hit(
 ) -> super::CandidateHit {
     use super::candidate::{CandidateHit, CandidateSource};
     CandidateHit {
-        node_id: None,
+        node_id: if provenance == SCIP_GRAPH_PROJECTION_PROVENANCE {
+            symbol.node_id.clone()
+        } else {
+            None
+        },
         file_path: symbol.path.clone(),
         symbol_name: Some(symbol.symbol.clone()),
         start_line: Some(symbol.start_line),
@@ -420,6 +462,7 @@ mod tests {
         SCIP_IMPORTED_PROOF_PROVENANCE, SCIP_PRECISE_SEMANTIC_IMPORT_PUBLIC_PROVENANCE,
         ScipPackageIdentity, ScipProofAdapterContract, ScipProofRecord, ScipSymbolsIndex,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tempfile::TempDir;
 
     fn write_scip_index(
@@ -465,6 +508,7 @@ mod tests {
 
     fn imported_symbol() -> ScipSymbolRecord {
         ScipSymbolRecord {
+            node_id: Some("forged-graph-node".into()),
             path: "src/lib.rs".into(),
             symbol: "fixture_package::run".into(),
             start_line: 3,
@@ -501,10 +545,9 @@ mod tests {
     fn anchor_search_scores_all_matches_before_truncating() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -516,6 +559,7 @@ mod tests {
         let mut symbols = Vec::new();
         for index in 0..12 {
             symbols.push(ScipSymbolRecord {
+                node_id: None,
                 path: format!("src/needle/noise_{index}.ts"),
                 symbol: format!("noise_{index}"),
                 start_line: index + 1,
@@ -523,6 +567,7 @@ mod tests {
             });
         }
         symbols.push(ScipSymbolRecord {
+            node_id: None,
             path: "src/needle/target.ts".to_string(),
             symbol: "needle".to_string(),
             start_line: 99,
@@ -547,13 +592,51 @@ mod tests {
     }
 
     #[test]
+    fn anchor_search_polls_cancellation_while_scanning_symbols() {
+        let root = TempDir::new().expect("root");
+        let layout = SidecarLayout {
+            qdrant_http_port: 2,
+            qdrant_grpc_port: 3,
+            lexical_data_dir: root.path().join("lexical"),
+            qdrant_data_dir: root.path().join("qdrant"),
+            scip_artifacts_root: root.path().join("scip"),
+            state_file: root.path().join("state.json"),
+        };
+        let project_dir = layout.scip_project_dir("project");
+        std::fs::create_dir_all(&project_dir).expect("scip dir");
+        write_scip_index(
+            &project_dir,
+            "graph-test",
+            ScipProofAdapterContract::graph_projection("graph-test"),
+            (0..256)
+                .map(|index| ScipSymbolRecord {
+                    node_id: None,
+                    path: format!("src/{index}.rs"),
+                    symbol: format!("symbol_{index}"),
+                    start_line: index + 1,
+                    end_line: index + 1,
+                })
+                .collect(),
+            Vec::new(),
+        );
+        let polls = AtomicUsize::new(0);
+
+        let error = ScipClient::anchor_search_with_cancel(&layout, "project", "symbol", 8, &|| {
+            polls.fetch_add(1, AtomicOrdering::Relaxed) > 0
+        })
+        .expect_err("scan should observe cancellation");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(polls.load(AtomicOrdering::Relaxed) >= 2);
+    }
+
+    #[test]
     fn qualified_anchor_search_admits_crate_matching_terminal_definition() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -568,18 +651,21 @@ mod tests {
             ScipProofAdapterContract::graph_projection("graph-test"),
             vec![
                 ScipSymbolRecord {
+                    node_id: None,
                     path: "workspace/app/src/main.rs".to_string(),
                     symbol: "workspace_app::Cli".to_string(),
                     start_line: 15,
                     end_line: 15,
                 },
                 ScipSymbolRecord {
+                    node_id: None,
                     path: "workspace/tools/src/cli.rs".to_string(),
                     symbol: "Cli".to_string(),
                     start_line: 1,
                     end_line: 1,
                 },
                 ScipSymbolRecord {
+                    node_id: None,
                     path: "workspace/app/src/cli.rs".to_string(),
                     symbol: "Cli".to_string(),
                     start_line: 42,
@@ -608,10 +694,9 @@ mod tests {
     fn health_rejects_marker_without_symbol_index() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -636,10 +721,9 @@ mod tests {
     fn imported_proof_contract_is_diagnostic_not_graph_health() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -673,6 +757,13 @@ mod tests {
         );
         assert_eq!(loaded.contract.freshness, "fresh");
         assert_eq!(loaded.proofs.len(), 2);
+        let hit = symbol_to_hit(
+            &loaded.symbols[0],
+            1.0,
+            0,
+            loaded.contract.provenance_label().expect("provenance"),
+        );
+        assert_eq!(hit.node_id, None);
 
         assert_eq!(
             loaded.contract.provenance_label(),
@@ -694,10 +785,9 @@ mod tests {
     fn imported_contract_without_proofs_fails_closed() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -730,10 +820,9 @@ mod tests {
     fn unknown_evidence_source_fails_closed() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),
@@ -768,10 +857,9 @@ mod tests {
     fn stale_scip_import_fails_closed_without_candidates() {
         let root = TempDir::new().expect("root");
         let layout = SidecarLayout {
-            zoekt_http_port: 1,
             qdrant_http_port: 2,
             qdrant_grpc_port: 3,
-            zoekt_data_dir: root.path().join("zoekt"),
+            lexical_data_dir: root.path().join("lexical"),
             qdrant_data_dir: root.path().join("qdrant"),
             scip_artifacts_root: root.path().join("scip"),
             state_file: root.path().join("state.json"),

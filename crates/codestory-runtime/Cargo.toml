@@ -1,7 +1,10 @@
 [package]
 name = "codestory-runtime"
-version = "0.14.3"
+version = "0.15.0"
 edition = "2024"
+
+[features]
+test-support = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -12,17 +15,15 @@ codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 crossbeam-channel = { workspace = true }
 fs4 = { workspace = true }
-ndarray = { workspace = true }
 nucleo-matcher = { workspace = true }
-ort = { workspace = true }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tantivy = { workspace = true }
-tokenizers = { workspace = true }
 tracing = { workspace = true }
 ureq = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 codestory-retrieval = { workspace = true, features = ["test-support"] }

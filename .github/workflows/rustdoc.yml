@@ -48,6 +48,7 @@ jobs:
         shell: bash
         run: |
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
 
       - name: Restore Cargo registry, git sources, and build output
         id: cargo-cache-restore
@@ -58,15 +59,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-doc-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-
-            ${{ runner.os }}-rustdoc-stable-
+            ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-doc-default-features-
 
       - name: Deny rustdoc warnings
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

@@ -91,15 +91,25 @@ The indexer does not know whether the store is staged or live.
 `crates/codestory-workspace/src/lib.rs` decides which files belong in the run:
 
 - `source_files` walks the configured source groups from the workspace manifest, follows directories, applies exclude globs, sorts the result, and removes duplicates
-- `build_refresh_plan` compares discovered files against stored inventory
+- `source_inventory` retains whether that walk was complete, partial, unreadable, or stopped by its candidate bound, plus any traversal failures
+- `build_refresh_plan` compares discovered files against stored inventory and only plans stored-file deletion from a complete inventory. Stored parser-backed rows carry the verified SHA-256 identity of the bytes that produced their projection, so matching millisecond mtimes do not hide changed content
 
 For incremental work, a file is reindexed when:
 
 - it is new
-- its modification time is newer than the stored row
+- its modification time differs from the stored row
+- its modification time matches but its verified parser content hash differs
 - it exists in the store but is marked as not indexed
 
-Files that disappeared from discovery are collected into `files_to_remove`.
+Legacy rows and collectors without a verified parser hash retain the metadata
+fallback. Content comparison reads only rows that already carry a verified
+source hash; it does not add hashing for structural, text-only, or oversized
+files that did not produce one.
+
+Files that disappeared from a complete discovery are collected into
+`files_to_remove`. Partial, unreadable, and bounded inventories retain observed
+files for safe reindexing but never infer deletion from absence. Runtime
+freshness reports those incomplete inventories as `not_checked`.
 
 ### 4. The indexer prepares file work
 
@@ -125,13 +135,20 @@ The cache key includes:
 - feature-flag values that affect graph shape
 - compilation metadata when present and root-relative enough to be portable
 
-A cache hit can reuse the serialized indexing artifact and turn it back into `IntermediateStorage`. A cache miss sends the file through parse and extract work.
+A cache hit can reuse the serialized indexing artifact and turn it back into
+`IntermediateStorage`. A cache miss sends the file through parse and extract
+work. Before either result is accepted, the indexer re-reads the source and
+compares its SHA-256 hash with the bytes used to build the cache key or parser
+input. A mismatch, including one hidden by a restored timestamp, becomes an
+incomplete file-level retry error; stale graph output and artifact-cache writes
+are discarded.
 
 ### 6. Parse and extract run in parallel
 
 Cache misses become `PreparedIndexInput` values and are parsed in parallel. Each file produces `IntermediateStorage`, which is the in-memory shape of a future store flush:
 
 - file metadata
+- verified parser source hashes
 - nodes
 - edges
 - occurrences
@@ -149,13 +166,18 @@ As file results are merged, `WorkspaceIndexer::run` flushes batches once file, n
 Projection flushes write more than the core graph:
 
 - files
+- nullable verified parser source hashes
 - nodes
 - edges
 - occurrences
 - component access tuples
 - callable projection state
 
-The store flush path invalidates grounding snapshots as part of persistence. Projection flush is both a write boundary and a derived-state invalidation boundary.
+The store flush path writes the verified hash beside the file row and clears it
+when a refreshed row has no verified parser content identity. Modification time
+is captured only after the verification read matches. The same flush invalidates
+grounding snapshots as part of persistence. Projection flush is both a write
+boundary and a derived-state invalidation boundary.
 
 ### 8. Resolution happens after flushes
 
@@ -223,8 +245,7 @@ Embedding throughput is optimized for the local embedding path:
 - product sidecar embeddings use `CODESTORY_EMBED_BACKEND=llamacpp` and the
   local `CODESTORY_EMBED_LLAMACPP_URL` endpoint; the manifest must record
   `llamacpp:bge-base-en-v1.5`
-- ONNX and hash embedding paths are historical or diagnostic lanes unless a
-  future spec promotes them with fresh sidecar-quality evidence
+- ONNX rows are historical records only; hash embeddings remain diagnostic
 
 Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md). Architecture explains the lifecycle; the testing log owns time-specific numbers because caches, backends, and workstation state drift.
 
@@ -315,6 +336,9 @@ remain the primary reference when you are learning the pipeline.
 If you change indexing behavior, review or run the suites that guard it:
 
 - `cargo test -p codestory-indexer --test fidelity_regression`
+- `cargo test -p codestory-indexer parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached`
+- `cargo test -p codestory-indexer artifact_cache_result_changed_with_restored_mtime_is_rejected`
+- `cargo test -p codestory-store projection_batch_round_trips_and_clears_file_content_hash`
 - `cargo test -p codestory-indexer --test tictactoe_language_coverage`
 - `cargo test -p codestory-indexer --test integration`
 - targeted resolution suites under `crates/codestory-indexer/tests/`

@@ -1,14 +1,17 @@
 use crate::cache::RetrievalCache;
+#[cfg(test)]
 use crate::cache::RetrievalCacheKey;
 use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embeddings::{EmbeddingDeviceReadiness, embedding_device_readiness_for_runtime};
-use crate::executor::{QueryExecutor, QueryResult, cancellation_flag};
-use crate::generation::manifest_unavailable_reason;
-use crate::health::probe_sidecar_health_with_embedding_device;
-use crate::index::{query_fingerprint, sidecar_project_id_for_root};
+use crate::executor::{
+    QueryExecutor, QueryResult, RetrievalPublicationIdentity, cancellation_flag,
+};
+use crate::generation::manifest_unavailable_reason_for_runtime;
+use crate::health::probe_sidecar_health_for_runtime;
+use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::query_features::classify_query;
-use crate::sidecar::validate_strict_sidecar_readiness;
+use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
 use crate::sidecar_search::LiveSidecarSearch;
 use crate::sidecar_search::SidecarSearch;
 use anyhow::{Context, Result, bail};
@@ -16,7 +19,7 @@ use codestory_store::{FileRole, RetrievalIndexManifest, Store};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const STRICT_BATCH_WORKER_CAP: usize = 4;
 
@@ -52,20 +55,35 @@ pub fn execute_retrieval_query_with_cache(
     request: QueryRequest<'_>,
     cache: &mut RetrievalCache,
 ) -> Result<QueryResult> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(request.project_root);
+    execute_retrieval_query_with_cache_for_runtime(request, cache, &runtime)
+}
+
+pub fn execute_retrieval_query_with_cache_for_runtime(
+    request: QueryRequest<'_>,
+    cache: &mut RetrievalCache,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<QueryResult> {
+    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval query cancelled before preflight");
+    }
     let QueryContext {
         layout,
         project_id,
         manifest,
         file_roles,
         embedding_device,
-    } = load_query_context(request.project_root, request.storage_path)?;
-    let sidecars = Arc::new(LiveSidecarSearch::new_with_embedding_device(
+        publication_identity,
+    } = load_query_context(request.project_root, request.storage_path, runtime)?;
+    cache.scope_to_publication(&publication_identity);
+    let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
+        runtime,
         layout,
         project_id,
         manifest.as_ref(),
         Some(embedding_device),
-    ));
-    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
+    )?);
     let mut executor = QueryExecutor {
         sidecars,
         cache,
@@ -74,15 +92,30 @@ pub fn execute_retrieval_query_with_cache(
         cancelled,
         mode_override: None,
     };
-    executor.execute(request.query, request.budget_ms)
+    executor
+        .execute(request.query, request.budget_ms)
+        .map(|result| result.with_publication_identity(&publication_identity))
 }
 
 pub fn execute_strict_retrieval_query_batch_with_cache(
     request: QueryBatchRequest<'_>,
     cache: &mut RetrievalCache,
 ) -> Result<Vec<QueryResult>> {
+    let runtime = SidecarRuntimeConfig::for_project_auto(request.project_root);
+    execute_strict_retrieval_query_batch_with_cache_for_runtime(request, cache, &runtime)
+}
+
+pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
+    request: QueryBatchRequest<'_>,
+    cache: &mut RetrievalCache,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<Vec<QueryResult>> {
     if request.queries.is_empty() {
         return Ok(Vec::new());
+    }
+    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval query batch cancelled before preflight");
     }
     let QueryContext {
         layout,
@@ -90,16 +123,22 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
         manifest,
         file_roles,
         embedding_device,
-    } = load_query_context(request.project_root, request.storage_path)?;
-    let sidecars = Arc::new(LiveSidecarSearch::new_with_embedding_device(
+        publication_identity,
+    } = load_query_context(request.project_root, request.storage_path, runtime)?;
+    cache.scope_to_publication(&publication_identity);
+    let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
+        runtime,
         layout,
         project_id,
         manifest.as_ref(),
         Some(embedding_device.clone()),
-    ));
-    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
-    let (mode, degraded_reason) =
-        resolve_batch_mode(sidecars.as_ref(), manifest.as_ref(), &embedding_device);
+    )?);
+    let (mode, degraded_reason) = resolve_batch_mode(
+        sidecars.as_ref(),
+        manifest.as_ref(),
+        &embedding_device,
+        runtime,
+    );
     if mode != RetrievalDegradedMode::Full {
         bail!(
             "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
@@ -107,7 +146,7 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
             degraded_reason.as_deref().unwrap_or("unknown")
         );
     }
-    execute_strict_retrieval_query_batch_against_sidecars(
+    let mut results = execute_strict_retrieval_query_batch_against_sidecars(
         sidecars,
         manifest,
         file_roles,
@@ -116,7 +155,11 @@ pub fn execute_strict_retrieval_query_batch_with_cache(
         request.queries,
         cache,
         strict_batch_worker_limit(request.queries.len()),
-    )
+    )?;
+    for result in &mut results {
+        result.publication_identity = Some(publication_identity.clone());
+    }
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -136,11 +179,19 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
             mode.as_str()
         );
     }
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval query batch cancelled before cache lookup");
+    }
 
     let mut results = vec![None; queries.len()];
     let mut misses = Vec::new();
     for (index, query) in queries.iter().enumerate() {
-        if let Some(result) = cached_batch_result(manifest.as_ref(), cache, query.query, mode) {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query batch cancelled during cache lookup");
+        }
+        if let Some(result) =
+            cached_batch_result(manifest.as_ref(), cache, query.query, mode, &cancelled)
+        {
             results[index] = Some(result);
         } else {
             misses.push((index, query.query.to_string(), query.budget_ms));
@@ -148,6 +199,9 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
     }
 
     for wave in misses.chunks(worker_limit.max(1)) {
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query batch cancelled before worker wave");
+        }
         let wave_results = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(wave.len());
             for (index, query, budget_ms) in wave {
@@ -180,7 +234,10 @@ fn execute_strict_retrieval_query_batch_against_sidecars(
 
         for (index, result) in wave_results {
             let result = result?;
-            cache_completed_batch_result(manifest.as_ref(), cache, &result);
+            if cancelled.load(Ordering::Acquire) {
+                bail!("retrieval query batch cancelled after worker wave");
+            }
+            cache_completed_batch_result(manifest.as_ref(), cache, &result, &cancelled);
             results[index] = Some(result);
         }
     }
@@ -196,14 +253,23 @@ fn cached_batch_result(
     cache: &RetrievalCache,
     query: &str,
     mode: RetrievalDegradedMode,
+    cancelled: &AtomicBool,
 ) -> Option<QueryResult> {
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
     let manifest = manifest?;
     let features = classify_query(query);
-    let key = RetrievalCacheKey::from_manifest(manifest, query_fingerprint(&features.raw_query));
-    cache.get(&key).map(|hits| QueryResult {
+    let key = cache.key_for_manifest(manifest, query_fingerprint(&features.raw_query));
+    let hits = cache.get(&key)?.to_vec();
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(QueryResult {
+        publication_identity: None,
         query: features.raw_query.clone(),
         features,
-        hits: hits.to_vec(),
+        hits,
         trace: crate::executor::QueryTrace {
             retrieval_mode: mode.as_str().into(),
             degraded_reason: None,
@@ -220,16 +286,19 @@ fn cache_completed_batch_result(
     manifest: Option<&RetrievalIndexManifest>,
     cache: &mut RetrievalCache,
     result: &QueryResult,
+    cancelled: &AtomicBool,
 ) {
-    if result.trace.cancel_reason.is_some() {
+    if result.trace.cancel_reason.is_some() || cancelled.load(Ordering::Acquire) {
         return;
     }
     if let Some(manifest) = manifest {
-        let key = RetrievalCacheKey::from_manifest(
-            manifest,
-            query_fingerprint(&result.features.raw_query),
-        );
-        cache.insert(key, result.hits.clone());
+        let key = cache.key_for_manifest(manifest, query_fingerprint(&result.features.raw_query));
+        if !cancelled.load(Ordering::Acquire) {
+            cache.insert(key.clone(), result.hits.clone());
+            if cancelled.load(Ordering::Acquire) {
+                cache.remove(&key);
+            }
+        }
     }
 }
 
@@ -250,28 +319,69 @@ struct QueryContext {
     manifest: Option<RetrievalIndexManifest>,
     file_roles: Arc<HashMap<String, FileRole>>,
     embedding_device: EmbeddingDeviceReadiness,
+    publication_identity: RetrievalPublicationIdentity,
 }
 
-fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryContext> {
-    let runtime = SidecarRuntimeConfig::for_project_auto(project_root);
-    runtime.activate_embed_url_default();
-    let embedding_device = embedding_device_readiness_for_runtime(&runtime);
+pub fn retrieval_publication_identity_from_storage(
+    storage: &Store,
+    project_id: &str,
+) -> Result<RetrievalPublicationIdentity> {
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication")?
+        .context("complete core publication is missing")?;
+    let manifest = storage
+        .get_retrieval_index_manifest(project_id)
+        .context("load retrieval manifest identity")?
+        .context("retrieval manifest is missing")?;
+    Ok(RetrievalPublicationIdentity {
+        core_generation_id: publication.generation_id,
+        core_run_id: publication.run_id,
+        sidecar_generation: manifest
+            .sidecar_generation
+            .filter(|value| !value.trim().is_empty())
+            .context("retrieval manifest sidecar generation is missing")?,
+        sidecar_input_hash: manifest
+            .sidecar_input_hash
+            .filter(|value| !value.trim().is_empty())
+            .context("retrieval manifest input hash is missing")?,
+        qdrant_collection: (!manifest.qdrant_collection.trim().is_empty())
+            .then_some(manifest.qdrant_collection)
+            .context("retrieval manifest Qdrant collection is missing")?,
+    })
+}
+
+fn load_query_context(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+) -> Result<QueryContext> {
+    let embedding_device = embedding_device_readiness_for_runtime(runtime);
     let layout = runtime.layout.clone();
-    let project_id = sidecar_project_id_for_root(project_root);
-    let (manifest, file_roles) = if storage_path.exists() {
-        let storage = Store::open(storage_path).context("open storage for query")?;
+    let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
+    let (manifest, file_roles, publication_identity) = if storage_path.exists() {
+        let storage = Store::open_read_only(storage_path).context("open storage for query")?;
+        let snapshot = storage
+            .read_snapshot()
+            .context("pin core publication for retrieval query")?;
+        let storage = snapshot.storage();
         let manifest = storage
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
         if let Some(manifest) = manifest.as_ref() {
-            if let Err(error) =
-                validate_strict_sidecar_readiness(project_root, storage_path, &storage)
-            {
+            if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
+                project_root,
+                storage_path,
+                storage,
+                runtime,
+            ) {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
                 );
             }
-            if let Some(reason) = manifest_unavailable_reason(&project_id, &storage, manifest) {
+            if let Some(reason) =
+                manifest_unavailable_reason_for_runtime(&project_id, storage, manifest, runtime)
+            {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
                 );
@@ -290,7 +400,12 @@ fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryC
                     .collect()
             })
             .unwrap_or_default();
-        (manifest, roles)
+        let publication_identity =
+            retrieval_publication_identity_from_storage(storage, &project_id)?;
+        snapshot
+            .finish()
+            .context("finish pinned retrieval query context")?;
+        (manifest, roles, publication_identity)
     } else {
         bail!("retrieval sidecar storage is missing; run retrieval index for project {project_id}");
     };
@@ -301,6 +416,7 @@ fn load_query_context(project_root: &Path, storage_path: &Path) -> Result<QueryC
         manifest,
         file_roles: Arc::new(file_roles),
         embedding_device,
+        publication_identity,
     })
 }
 
@@ -308,6 +424,7 @@ fn resolve_batch_mode(
     sidecars: &dyn SidecarSearch,
     manifest: Option<&RetrievalIndexManifest>,
     embedding_device: &EmbeddingDeviceReadiness,
+    runtime: &SidecarRuntimeConfig,
 ) -> (RetrievalDegradedMode, Option<String>) {
     if let Some(manifest) = manifest {
         let Some(layout) = sidecars.layout() else {
@@ -316,13 +433,14 @@ fn resolve_batch_mode(
                 Some("sidecar_layout_missing".into()),
             );
         };
-        let report = probe_sidecar_health_with_embedding_device(
+        let report = probe_sidecar_health_for_runtime(
             layout,
             &manifest.project_id,
             Some(manifest.clone()),
             embedding_device,
+            runtime,
         );
-        return derive_degraded_mode(&report.zoekt, &report.qdrant, &report.scip);
+        return derive_degraded_mode(&report.lexical, &report.qdrant, &report.scip);
     }
     (
         RetrievalDegradedMode::LexicalOnly,
@@ -337,7 +455,7 @@ mod tests {
     use crate::index::finalize_index;
     use crate::sidecar_search::SidecarSearch;
     use crate::test_support::retrieval_manifest_fixture;
-    use crate::{QdrantClient, SidecarLayout, ZoektClient};
+    use crate::{QdrantClient, SidecarLayout};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -383,12 +501,16 @@ mod tests {
         struct CountingSidecars {
             active: AtomicUsize,
             max_active: AtomicUsize,
+            first_wave: std::sync::Barrier,
         }
 
         impl CountingSidecars {
             fn record(&self, query: &str) -> Vec<CandidateHit> {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_active.fetch_max(active, Ordering::SeqCst);
+                if matches!(query, "slow" | "fast") {
+                    self.first_wave.wait();
+                }
                 if query == "slow" {
                     std::thread::sleep(Duration::from_millis(30));
                 } else {
@@ -400,7 +522,7 @@ mod tests {
         }
 
         impl SidecarSearch for CountingSidecars {
-            fn zoekt_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn lexical_search(&self, query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(self.record(query))
             }
 
@@ -424,6 +546,7 @@ mod tests {
         let sidecars = Arc::new(CountingSidecars {
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
+            first_wave: std::sync::Barrier::new(2),
         });
         let mut cache = RetrievalCache::new();
         let manifest = manifest_for("testproj", "cafebabedeadbeef", 3);
@@ -517,13 +640,42 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live Qdrant, Zoekt, and embedding sidecars; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
+    fn strict_batch_cancellation_preflight_rejects_cache_hits() {
+        let mut cache = RetrievalCache::new();
+        let manifest = manifest_for("testproj", "cafebabedeadbeef", 1);
+        cache.insert(
+            RetrievalCacheKey::from_manifest(&manifest, query_fingerprint("cached")),
+            vec![CandidateHit::lexical_stub("src/cached.rs", 1.0)],
+        );
+        let queries = [QueryBatchItem {
+            query: "cached",
+            budget_ms: Some(100),
+        }];
+        let cancelled = cancellation_flag();
+        cancelled.store(true, Ordering::Release);
+
+        let error = execute_strict_retrieval_query_batch_against_sidecars(
+            Arc::new(crate::sidecar_search::mock::MockSidecarSearch::default()),
+            Some(manifest),
+            Arc::new(HashMap::new()),
+            cancelled,
+            RetrievalDegradedMode::Full,
+            &queries,
+            &mut cache,
+            1,
+        )
+        .expect_err("cancelled batch must not serve cache");
+
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    #[ignore = "requires live Qdrant and embedding sidecars; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
     fn integration_query_against_fixture_manifest() {
         let layout = SidecarLayout::from_env();
         if !QdrantClient::new(&layout)
             .list_collections_probe()
             .reachable
-            || !ZoektClient::new(&layout).health_probe().reachable
         {
             return;
         }
@@ -648,7 +800,7 @@ mod tests {
             storage
                 .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                     project_id,
-                    zoekt_version: "zoekt-real-v1".into(),
+                    lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
                     qdrant_collection: "codestory_legacy".into(),
                     scip_revision: Some("graph-test".into()),
                     built_at_epoch_ms: 1,

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 const MANIFEST_SELECT: &str = "
     SELECT
         project_id,
-        zoekt_version,
+        lexical_version,
         qdrant_collection,
         scip_revision,
         built_at_epoch_ms,
@@ -37,7 +37,7 @@ const MANIFEST_SELECT: &str = "
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalIndexManifest {
     pub project_id: String,
-    pub zoekt_version: String,
+    pub lexical_version: String,
     pub qdrant_collection: String,
     pub scip_revision: Option<String>,
     pub built_at_epoch_ms: i64,
@@ -48,9 +48,9 @@ pub struct RetrievalIndexManifest {
     pub embedding_dim: Option<i32>,
     /// Version of the sidecar input hash/generation contract.
     pub sidecar_schema_version: Option<i32>,
-    /// Stable hash of all local inputs used to build Zoekt, Qdrant, and SCIP sidecars.
+    /// Stable hash of all local inputs used to build lexical, Qdrant, and SCIP artifacts.
     pub sidecar_input_hash: Option<String>,
-    /// Artifact generation id used for Zoekt/SCIP directories.
+    /// Artifact generation id used for lexical/SCIP directories.
     pub sidecar_generation: Option<String>,
     /// Number of symbol projection rows included in the sidecar input hash.
     pub projection_count: Option<i64>,
@@ -76,7 +76,7 @@ impl Storage {
         self.conn.execute(
             "INSERT INTO retrieval_index_manifest (
                 project_id,
-                zoekt_version,
+                lexical_version,
                 qdrant_collection,
                 scip_revision,
                 built_at_epoch_ms,
@@ -99,7 +99,7 @@ impl Storage {
                 precise_semantic_import_producer
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
             ON CONFLICT(project_id) DO UPDATE SET
-                zoekt_version = excluded.zoekt_version,
+                lexical_version = excluded.lexical_version,
                 qdrant_collection = excluded.qdrant_collection,
                 scip_revision = excluded.scip_revision,
                 built_at_epoch_ms = excluded.built_at_epoch_ms,
@@ -122,7 +122,7 @@ impl Storage {
                 precise_semantic_import_producer = excluded.precise_semantic_import_producer",
             rusqlite::params![
                 manifest.project_id,
-                manifest.zoekt_version,
+                manifest.lexical_version,
                 manifest.qdrant_collection,
                 manifest.scip_revision,
                 manifest.built_at_epoch_ms,
@@ -220,7 +220,7 @@ impl Storage {
 fn manifest_from_row(row: &Row<'_>) -> rusqlite::Result<RetrievalIndexManifest> {
     Ok(RetrievalIndexManifest {
         project_id: row.get(0)?,
-        zoekt_version: row.get(1)?,
+        lexical_version: row.get(1)?,
         qdrant_collection: row.get(2)?,
         scip_revision: row.get(3)?,
         built_at_epoch_ms: row.get(4)?,
@@ -263,7 +263,7 @@ mod tests {
             storage
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
                     project_id: project_id.into(),
-                    zoekt_version: "v1".into(),
+                    lexical_version: "v1".into(),
                     qdrant_collection: collection.into(),
                     scip_revision: None,
                     built_at_epoch_ms: built_at,
@@ -307,7 +307,7 @@ mod tests {
         let mut storage = Storage::open(&db_path).expect("open storage");
         let manifest = RetrievalIndexManifest {
             project_id: "proj".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_proj_deadbeef".into(),
             scip_revision: Some("graph-1234".into()),
             built_at_epoch_ms: 123,
@@ -353,7 +353,7 @@ mod tests {
             storage
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
                     project_id: project_id.into(),
-                    zoekt_version: "v1".into(),
+                    lexical_version: "v1".into(),
                     qdrant_collection: format!("codestory_{project_id}_{suffix}"),
                     scip_revision: Some(format!("graph-{suffix}")),
                     built_at_epoch_ms: 1,
@@ -409,7 +409,7 @@ mod tests {
             storage
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
                     project_id: project_id.into(),
-                    zoekt_version: "v1".into(),
+                    lexical_version: "v1".into(),
                     qdrant_collection: collection.into(),
                     scip_revision: None,
                     built_at_epoch_ms: 1,

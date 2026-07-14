@@ -10,6 +10,10 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/check-workflow-policy.test.mjs
+      - package.json
+      - package-lock.json
+      - .github/scripts/route-ci-proof.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
       - .github/workflows/rust-ci.yml
@@ -17,8 +21,15 @@ on:
       - .github/workflows/post-publish-release-smoke.yml
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
+      - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/source-proof.yml
+      - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
+      - scripts/codex-worktree-setup.*
+      - scripts/tests/codex-worktree-setup.test.mjs
+      - scripts/setup-retrieval-env.*
+      - .codex/environments/environment.toml
   push:
     branches:
       - main
@@ -31,6 +42,10 @@ on:
       - .github/scripts/check-packaged-agent-proof.py
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/check-workflow-policy.test.mjs
+      - package.json
+      - package-lock.json
+      - .github/scripts/route-ci-proof.mjs
       - .github/workflows/auto-release.yml
       - .github/workflows/main-branch-source-guard.yml
       - .github/workflows/rust-ci.yml
@@ -38,8 +53,15 @@ on:
       - .github/workflows/post-publish-release-smoke.yml
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
+      - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/source-proof.yml
+      - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
+      - scripts/codex-worktree-setup.*
+      - scripts/tests/codex-worktree-setup.test.mjs
+      - scripts/setup-retrieval-env.*
+      - .codex/environments/environment.toml
   workflow_dispatch:
 
 permissions:
@@ -57,11 +79,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install workflow policy dependencies
+        run: npm ci --ignore-scripts
+
       - name: Check plugin static wiring
         run: node --test plugins/codestory/tests/plugin-static.test.mjs
 
       - name: Check workflow policy
-        run: node .github/scripts/check-workflow-policy.mjs
+        run: |
+          node .github/scripts/check-workflow-policy.mjs
+          node --test .github/scripts/check-workflow-policy.test.mjs
+
+      - name: Check CI proof routing fixtures
+        run: node .github/scripts/route-ci-proof.mjs --self-test
 
       - name: Check packaged proof harness
         run: python .github/scripts/check-packaged-agent-proof.py --self-test

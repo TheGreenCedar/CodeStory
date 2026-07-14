@@ -10,26 +10,189 @@ use codestory_contracts::api::{
     RetrievalStageTimingDto, SearchHit,
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
+#[cfg(test)]
+use codestory_retrieval::SidecarRuntimeConfig;
 use codestory_retrieval::{
-    CandidateHit, CandidateSource, QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult,
-    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache,
-    execute_strict_retrieval_query_batch_with_cache, is_phantom_sidecar_hit,
-    sidecar_project_id_for_root, sidecar_runtime_auto, strict_sidecar_status_for_runtime,
+    CandidateHit, CandidateSource, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionLock,
+    QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult, QueryTrace,
+    RetrievalPublicationIdentity, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
+    execute_strict_retrieval_query_batch_with_cache_for_runtime, global_generation_gc_state_file,
+    is_phantom_sidecar_hit, retrieval_publication_identity_from_storage,
+    sidecar_project_id_for_root, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_000;
+const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_500;
 const DEFAULT_PACKET_BATCH_BUDGET_MS: u64 = 18_000;
 const MAX_PACKET_BATCH_BUDGET_MS: u64 = 120_000;
 const MAX_SHADOW_CANDIDATES: usize = 20;
 const MAX_SHADOW_WOULD_RANK: usize = 10;
+const RETRIEVAL_PUBLICATION_ATTEMPTS: usize = 2;
 pub(crate) const RETRIEVAL_VERSION_SIDECAR: &str = "sidecar";
 
 const RETRIEVAL_ENV: &str = "CODESTORY_RETRIEVAL";
 const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
+
+struct PinnedRetrievalRead {
+    storage: Store,
+    project_root: PathBuf,
+    storage_path: PathBuf,
+    project_id: String,
+    identity: RetrievalPublicationIdentity,
+    node_names: HashMap<CoreNodeId, String>,
+    _global_generation_lease: GenerationRetentionLock,
+    _project_generation_lease: GenerationRetentionLock,
+}
+
+impl PinnedRetrievalRead {
+    fn begin(controller: &AppController) -> Result<Self, ApiError> {
+        let project_root = controller.require_project_root()?;
+        let storage_path = controller.require_storage_path()?;
+        let project_id = sidecar_project_id_for_root(&project_root);
+        let global_generation_lease = GenerationRetentionLock::acquire_shared(
+            &global_generation_gc_state_file(&controller.runtime_config),
+            GLOBAL_GENERATION_GC_LOCK_SCOPE,
+        )
+        .map_err(|error| ApiError::new("cache_busy", format!("pin sidecar generation: {error}")))?;
+        let project_generation_lease = GenerationRetentionLock::acquire_shared(
+            &controller.runtime_config.layout.state_file,
+            &project_id,
+        )
+        .map_err(|error| {
+            ApiError::new(
+                "cache_busy",
+                format!("pin project sidecar generation: {error}"),
+            )
+        })?;
+        let storage = Store::open_read_only(&storage_path).map_err(|error| {
+            ApiError::internal(format!("open pinned retrieval storage: {error}"))
+        })?;
+        storage
+            .get_connection()
+            .execute_batch("BEGIN DEFERRED TRANSACTION")
+            .map_err(|error| {
+                ApiError::new(
+                    "cache_busy",
+                    format!("pin core retrieval snapshot: {error}"),
+                )
+            })?;
+        let identity = retrieval_publication_identity_from_storage(&storage, &project_id).map_err(
+            |error| ApiError::new("cache_busy", format!("pin retrieval publication: {error}")),
+        )?;
+        let node_names = crate::load_search_symbol_projection(&storage, 10_000)?.0;
+        Ok(Self {
+            storage,
+            project_root,
+            storage_path,
+            project_id,
+            identity,
+            node_names,
+            _global_generation_lease: global_generation_lease,
+            _project_generation_lease: project_generation_lease,
+        })
+    }
+
+    fn matches_query(&self, query: &QueryResult) -> bool {
+        query.publication_identity.as_ref() == Some(&self.identity)
+    }
+
+    fn revalidate(&self) -> Result<(), ApiError> {
+        let identity = read_retrieval_publication_identity(&self.storage_path, &self.project_id)?;
+        if identity != self.identity {
+            return Err(ApiError::new(
+                "cache_busy",
+                "retrieval publication changed while resolving candidates; retry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PinnedRetrievalRead {
+    fn drop(&mut self) {
+        let _ = self.storage.get_connection().execute_batch("ROLLBACK");
+    }
+}
+
+fn with_pinned_retrieval_read<T>(
+    controller: &AppController,
+    read: impl FnOnce(&PinnedRetrievalRead) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let pinned = PinnedRetrievalRead::begin(controller)?;
+    let value = read(&pinned)?;
+    pinned.revalidate()?;
+    Ok(value)
+}
+
+fn read_retrieval_publication_identity(
+    storage_path: &Path,
+    project_id: &str,
+) -> Result<RetrievalPublicationIdentity, ApiError> {
+    let storage = Store::open_read_only(storage_path).map_err(|error| {
+        ApiError::new("cache_busy", format!("open retrieval publication: {error}"))
+    })?;
+    let snapshot = storage.read_snapshot().map_err(|error| {
+        ApiError::new(
+            "cache_busy",
+            format!("pin retrieval publication identity: {error}"),
+        )
+    })?;
+    let identity = retrieval_publication_identity_from_storage(snapshot.storage(), project_id)
+        .map_err(|error| {
+            ApiError::new(
+                "cache_busy",
+                format!("read retrieval publication identity: {error}"),
+            )
+        })?;
+    snapshot.finish().map_err(|error| {
+        ApiError::new(
+            "cache_busy",
+            format!("finish retrieval publication identity: {error}"),
+        )
+    })?;
+    Ok(identity)
+}
+
+pub(crate) fn current_retrieval_publication_identity(
+    controller: &AppController,
+) -> Result<RetrievalPublicationIdentity, ApiError> {
+    let project_root = controller.require_project_root()?;
+    let storage_path = controller.require_storage_path()?;
+    let project_id = sidecar_project_id_for_root(&project_root);
+    read_retrieval_publication_identity(&storage_path, &project_id)
+}
+
+pub(crate) fn with_stable_retrieval_publication<T>(
+    controller: &AppController,
+    operation: &str,
+    mut build: impl FnMut() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    if !sidecar_retrieval_primary_enabled(controller) {
+        return build();
+    }
+    for attempt in 0..RETRIEVAL_PUBLICATION_ATTEMPTS {
+        let result = (|| {
+            let before = current_retrieval_publication_identity(controller)?;
+            let output = build()?;
+            if before != current_retrieval_publication_identity(controller)? {
+                return Err(ApiError::new(
+                    "cache_busy",
+                    format!("retrieval publication changed while building {operation}; retry"),
+                ));
+            }
+            Ok(output)
+        })();
+        match result {
+            Err(error)
+                if error.code == "cache_busy" && attempt + 1 < RETRIEVAL_PUBLICATION_ATTEMPTS => {}
+            result => return result,
+        }
+    }
+    unreachable!("bounded retrieval attempts always return")
+}
 
 fn env_flag_enabled(value: &str) -> bool {
     matches!(
@@ -107,7 +270,8 @@ pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -
     let Ok(storage_path) = controller.require_storage_path() else {
         return Some("sidecar retrieval primary requires an index storage path".into());
     };
-    let status = sidecar_mode_status_for_project(&project_root, &storage_path);
+    let status =
+        sidecar_mode_status_for_runtime(&project_root, &storage_path, &controller.runtime_config);
     let reason = status
         .degraded_reason
         .map(|reason| format!("; reason={reason}"))
@@ -130,13 +294,20 @@ pub(crate) fn sidecar_retrieval_unavailable_error(
         .unwrap_or_else(|| "<project>".to_string());
     let recovery_commands = project_root
         .as_deref()
-        .map(sidecar_retrieval_recovery_commands)
+        .map(|project_root| {
+            sidecar_retrieval_recovery_commands_for_runtime(
+                project_root,
+                &controller.runtime_config,
+            )
+        })
         .unwrap_or_else(|| sidecar_retrieval_recovery_commands_for_project(&project, None));
     ApiError::retrieval_unavailable(reason, project.clone(), recovery_commands)
 }
 
-fn sidecar_retrieval_recovery_commands(project_root: &Path) -> Vec<String> {
-    let runtime = sidecar_runtime_auto(project_root);
+fn sidecar_retrieval_recovery_commands_for_runtime(
+    project_root: &Path,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Vec<String> {
     let agent_run_id = (runtime.profile == SidecarProfile::Agent)
         .then_some(runtime.run_id.as_deref())
         .flatten();
@@ -243,9 +414,10 @@ fn sidecar_mode_is_required_full(controller: &AppController) -> bool {
     let Ok(storage_path) = controller.require_storage_path() else {
         return false;
     };
-    sidecar_status_can_serve_primary(&sidecar_mode_status_for_project(
+    sidecar_status_can_serve_primary(&sidecar_mode_status_for_runtime(
         &project_root,
         &storage_path,
+        &controller.runtime_config,
     ))
 }
 
@@ -254,7 +426,9 @@ fn sidecar_mode_can_serve_primary(mode: &str) -> bool {
 }
 
 fn sidecar_status_can_serve_primary(status: &SidecarModeStatus) -> bool {
-    status.profile.as_deref() == Some("agent") && sidecar_mode_can_serve_primary(&status.mode)
+    status.profile.as_deref() == Some("agent")
+        && sidecar_mode_can_serve_primary(&status.mode)
+        && status.degraded_reason.is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,9 +438,12 @@ struct SidecarModeStatus {
     degraded_reason: Option<String>,
 }
 
-fn sidecar_mode_status_for_project(project_root: &Path, storage_path: &Path) -> SidecarModeStatus {
-    let runtime = sidecar_runtime_auto(project_root);
-    match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime) {
+fn sidecar_mode_status_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> SidecarModeStatus {
+    match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime.clone()) {
         Ok(report) => SidecarModeStatus {
             profile: report
                 .ownership
@@ -306,7 +483,7 @@ pub(crate) fn sidecar_result_rejection_reason(
 
 fn sidecar_blocking_cancel_reason(query_result: &QueryResult) -> Option<&str> {
     match query_result.trace.cancel_reason.as_deref() {
-        Some("deadline" | "stage_deadline" | "stage_worker_limit" | "cancelled") => {
+        Some("deadline" | "stage_deadline" | "cancelled") => {
             query_result.trace.cancel_reason.as_deref()
         }
         _ => None,
@@ -356,7 +533,7 @@ pub(crate) fn run_sidecar_query(
         .require_storage_path()
         .map_err(|error| anyhow::anyhow!("storage path required: {}", error.message))?;
     with_detached_sidecar_query_cache(controller, |cache| {
-        execute_retrieval_query_with_cache(
+        execute_retrieval_query_with_cache_for_runtime(
             QueryRequest {
                 project_root: &project_root,
                 storage_path: &storage_path,
@@ -365,7 +542,34 @@ pub(crate) fn run_sidecar_query(
                 cancelled: None,
             },
             cache,
+            &controller.runtime_config,
         )
+    })
+}
+
+pub(crate) fn run_and_resolve_sidecar_query(
+    controller: &AppController,
+    query: &str,
+    max_results: usize,
+    latency_budget_ms: Option<u32>,
+) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
+    with_pinned_retrieval_read(controller, |pinned| {
+        let query_result =
+            run_sidecar_query(controller, query, latency_budget_ms).map_err(|error| {
+                sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!("sidecar retrieval query failed: {error}"),
+                )
+            })?;
+        if !pinned.matches_query(&query_result) {
+            return Err(ApiError::new(
+                "cache_busy",
+                "sidecar query and core publications differ",
+            ));
+        }
+        let resolution =
+            resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)?;
+        Ok((query_result, resolution))
     })
 }
 
@@ -387,7 +591,7 @@ pub(crate) fn run_sidecar_query_batch(
         })
         .collect::<Vec<_>>();
     with_detached_sidecar_query_cache(controller, |cache| {
-        execute_strict_retrieval_query_batch_with_cache(
+        execute_strict_retrieval_query_batch_with_cache_for_runtime(
             QueryBatchRequest {
                 project_root: &project_root,
                 storage_path: &storage_path,
@@ -395,6 +599,7 @@ pub(crate) fn run_sidecar_query_batch(
                 cancelled: None,
             },
             cache,
+            &controller.runtime_config,
         )
     })
 }
@@ -441,6 +646,9 @@ pub(crate) enum SidecarPrimarySearchOutcome {
     Unavailable {
         reason: String,
     },
+    Retryable {
+        error: ApiError,
+    },
     Served {
         hits: Vec<SearchHit>,
         scored_hits: Vec<HybridSearchScoredHit>,
@@ -454,69 +662,56 @@ pub(crate) fn try_sidecar_primary_search(
     max_results: usize,
     latency_budget_ms: Option<u32>,
 ) -> Option<SidecarPrimarySearchOutcome> {
-    try_sidecar_primary_search_inner_with_query(
-        controller,
-        prompt,
-        max_results,
-        latency_budget_ms,
-        run_sidecar_query,
-    )
-}
-
-fn try_sidecar_primary_search_inner_with_query(
-    controller: &AppController,
-    prompt: &str,
-    max_results: usize,
-    latency_budget_ms: Option<u32>,
-    mut run_query: impl FnMut(&AppController, &str, Option<u32>) -> Result<QueryResult, AnyhowError>,
-) -> Option<SidecarPrimarySearchOutcome> {
     if !sidecar_retrieval_primary_enabled(controller) {
         return sidecar_retrieval_unavailable_reason(controller)
             .map(|reason| SidecarPrimarySearchOutcome::Unavailable { reason });
     }
-
-    let query_result = match run_query(controller, prompt, latency_budget_ms) {
-        Ok(result) => result,
-        Err(error) => {
-            return Some(SidecarPrimarySearchOutcome::Unavailable {
-                reason: format!("sidecar retrieval primary unavailable: {error}"),
-            });
+    match run_and_resolve_sidecar_query(controller, prompt, max_results, latency_budget_ms) {
+        Ok((query_result, resolution)) => Some(sidecar_primary_search_outcome_from_resolution(
+            controller,
+            query_result,
+            resolution,
+        )),
+        Err(error) if error.code == "cache_busy" => {
+            Some(SidecarPrimarySearchOutcome::Retryable { error })
         }
-    };
-
-    Some(sidecar_primary_search_outcome_from_query_result(
-        controller,
-        query_result,
-        max_results,
-    ))
+        Err(error) => Some(SidecarPrimarySearchOutcome::Unavailable {
+            reason: format!("sidecar retrieval primary unavailable: {}", error.message),
+        }),
+    }
 }
 
+#[cfg(test)]
 fn sidecar_primary_search_outcome_from_query_result(
     controller: &AppController,
     query_result: QueryResult,
     max_results: usize,
 ) -> SidecarPrimarySearchOutcome {
-    let candidate_count = query_result.hits.len();
-    let resolved_hits = match resolve_sidecar_candidates_to_search_hits(
-        controller,
-        &query_result.hits,
-        max_results,
-    ) {
-        Ok(hits) => hits,
-        Err(error) => {
-            return SidecarPrimarySearchOutcome::Unavailable {
-                reason: format!(
-                    "sidecar retrieval primary unavailable: candidate resolution failed: {}",
-                    error.message
-                ),
-            };
-        }
-    };
+    let resolution =
+        match resolve_sidecar_candidates_for_test(controller, &query_result.hits, max_results) {
+            Ok(hits) => hits,
+            Err(error) => {
+                return SidecarPrimarySearchOutcome::Unavailable {
+                    reason: format!(
+                        "sidecar retrieval primary unavailable: candidate resolution failed: {}",
+                        error.message
+                    ),
+                };
+            }
+        };
+    sidecar_primary_search_outcome_from_resolution(controller, query_result, resolution)
+}
+
+fn sidecar_primary_search_outcome_from_resolution(
+    controller: &AppController,
+    query_result: QueryResult,
+    resolution: SidecarCandidateResolutionOutcome,
+) -> SidecarPrimarySearchOutcome {
+    let resolved_hits = resolution.resolved_hits.clone();
     let shadow = shadow_from_query_result_with_candidate_admission_diagnostics(
         controller,
         query_result.clone(),
-        candidate_count,
-        resolved_hits.len(),
+        &resolution,
         &resolved_hits,
         &resolved_hits,
     );
@@ -573,10 +768,11 @@ pub(crate) struct SidecarPacketBatchOutcome {
     pub diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
-struct SidecarCandidateResolutionOutcome {
-    resolved_hits: Vec<SearchHit>,
-    attempted_candidate_count: usize,
+pub(crate) struct SidecarCandidateResolutionOutcome {
+    pub(crate) resolved_hits: Vec<SearchHit>,
     unresolved_candidate_count: usize,
+    blocking_unresolved_candidate_count: usize,
+    attempted_candidate_indices: HashSet<usize>,
 }
 
 fn packet_sidecar_query_diagnostic(
@@ -601,10 +797,15 @@ fn packet_sidecar_query_diagnostic(
         sidecar_stage_count: u32::try_from(stage_timings.len()).unwrap_or(u32::MAX),
         sidecar_stage_total_ms: Some(sidecar_stage_total_ms),
         batch_query_wall_ms: Some(batch_query_wall_ms),
-        candidate_count: u32::try_from(resolution.attempted_candidate_count).unwrap_or(u32::MAX),
+        candidate_count: u32::try_from(resolution.attempted_candidate_indices.len())
+            .unwrap_or(u32::MAX),
         resolved_hit_count: u32::try_from(resolution.resolved_hits.len()).unwrap_or(u32::MAX),
         unresolved_candidate_count: u32::try_from(resolution.unresolved_candidate_count)
             .unwrap_or(u32::MAX),
+        blocking_unresolved_candidate_count: u32::try_from(
+            resolution.blocking_unresolved_candidate_count,
+        )
+        .unwrap_or(u32::MAX),
         diagnostic: sidecar_blocking_cancel_reason(query_result)
             .map(|reason| format!("sidecar query has blocking cancel reason `{reason}`"))
             .or_else(|| {
@@ -620,14 +821,45 @@ fn search_sidecar_packet_batch_inner(
     queries: &[(String, usize)],
     latency_budget_ms: Option<u32>,
 ) -> Result<SidecarPacketBatchOutcome, ApiError> {
-    search_sidecar_packet_batch_inner_with_query_batch(
-        controller,
-        queries,
-        latency_budget_ms,
-        run_sidecar_query_batch,
-    )
+    let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
+        .checked_div(queries.len().max(1) as u64)
+        .unwrap_or(100)
+        .max(100);
+    let batch_queries = queries
+        .iter()
+        .map(|(query, _)| (query.clone(), per_query_budget))
+        .collect::<Vec<_>>();
+    with_pinned_retrieval_read(controller, |pinned| {
+        let batch_started_at = Instant::now();
+        let query_results =
+            run_sidecar_query_batch(controller, &batch_queries).map_err(|error| {
+                sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!("sidecar retrieval batch query failed: {error}"),
+                )
+            })?;
+        if query_results
+            .iter()
+            .any(|result| !pinned.matches_query(result))
+        {
+            return Err(ApiError::new(
+                "cache_busy",
+                "sidecar retrieval batch and core publications differ",
+            ));
+        }
+        build_sidecar_packet_batch_outcome(
+            controller,
+            queries,
+            query_results,
+            clamp_elapsed_ms(batch_started_at),
+            |query_result, max_results| {
+                resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)
+            },
+        )
+    })
 }
 
+#[cfg(test)]
 fn search_sidecar_packet_batch_inner_with_query_batch(
     controller: &AppController,
     queries: &[(String, usize)],
@@ -653,6 +885,24 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         )
     })?;
     let batch_query_wall_ms = clamp_elapsed_ms(batch_started_at);
+    build_sidecar_packet_batch_outcome(
+        controller,
+        queries,
+        query_results,
+        batch_query_wall_ms,
+        |query_result, max_results| {
+            resolve_sidecar_candidates_for_test(controller, &query_result.hits, max_results)
+        },
+    )
+}
+
+fn build_sidecar_packet_batch_outcome(
+    controller: &AppController,
+    queries: &[(String, usize)],
+    query_results: Vec<QueryResult>,
+    batch_query_wall_ms: u32,
+    mut resolve: impl FnMut(&QueryResult, usize) -> Result<SidecarCandidateResolutionOutcome, ApiError>,
+) -> Result<SidecarPacketBatchOutcome, ApiError> {
     if query_results.len() != queries.len() {
         return Err(sidecar_retrieval_unavailable_error(
             controller,
@@ -678,17 +928,15 @@ fn search_sidecar_packet_batch_inner_with_query_batch(
         let sidecar_query_ms = u32::try_from(query_result.trace.elapsed_ms).unwrap_or(u32::MAX);
         let max_results = (*max_results).clamp(1, 50);
         let resolution_started_at = Instant::now();
-        let resolution =
-            resolve_sidecar_candidates_with_stats(controller, &query_result.hits, max_results)
-                .map_err(|error| {
-                    sidecar_retrieval_unavailable_error(
-                        controller,
-                        format!(
-                            "sidecar retrieval rejected packet batch query `{query}`: candidate resolution failed: {}",
-                            error.message
-                        ),
-                    )
-                })?;
+        let resolution = resolve(&query_result, max_results).map_err(|error| {
+            sidecar_retrieval_unavailable_error(
+                controller,
+                format!(
+                    "sidecar retrieval rejected packet batch query `{query}`: candidate resolution failed: {}",
+                    error.message
+                ),
+            )
+        })?;
         let candidate_resolution_ms = clamp_elapsed_ms(resolution_started_at);
         diagnostics.push(packet_sidecar_query_diagnostic(
             &query_result,
@@ -753,12 +1001,15 @@ pub(crate) fn shadow_from_query_result(result: QueryResult) -> RetrievalShadowDt
 pub(crate) fn shadow_from_query_result_with_candidate_admission_diagnostics(
     controller: &AppController,
     result: QueryResult,
-    candidate_count: usize,
-    resolved_hit_count: usize,
+    resolution: &SidecarCandidateResolutionOutcome,
     search_hits: &[SearchHit],
     final_hits: &[SearchHit],
 ) -> RetrievalShadowDto {
-    let resolution_labels = sidecar_candidate_resolution_labels(controller, &result.hits);
+    let resolution_labels = sidecar_candidate_resolution_labels(
+        controller,
+        &result.hits,
+        &resolution.attempted_candidate_indices,
+    );
     let admission_labels = sidecar_candidate_admission_labels(
         controller,
         &result.hits,
@@ -768,8 +1019,8 @@ pub(crate) fn shadow_from_query_result_with_candidate_admission_diagnostics(
     );
     shadow_from_query_result_with_counts_and_resolution_labels(
         result,
-        candidate_count,
-        resolved_hit_count,
+        resolution.attempted_candidate_indices.len(),
+        resolution.resolved_hits.len(),
         &resolution_labels,
         &admission_labels,
     )
@@ -847,13 +1098,18 @@ pub(crate) fn sidecar_rejection_diagnostic(
 fn sidecar_candidate_resolution_labels(
     controller: &AppController,
     candidates: &[CandidateHit],
+    attempted_candidate_indices: &HashSet<usize>,
 ) -> Vec<String> {
     let project_root = controller.require_project_root().ok();
     let storage = controller.open_storage().ok();
     let node_names = controller.state.lock().node_names.clone();
     candidates
         .iter()
-        .map(|candidate| {
+        .enumerate()
+        .map(|(index, candidate)| {
+            if !attempted_candidate_indices.contains(&index) {
+                return "not_attempted".to_string();
+            }
             candidate_resolution_label(
                 project_root.as_deref(),
                 storage.as_ref(),
@@ -904,6 +1160,15 @@ fn sidecar_candidate_admission_labels(
                 .map(String::as_str)
                 .unwrap_or("unlabeled");
             if resolution != "resolved" {
+                if resolution == "not_attempted" {
+                    return SidecarCandidateAdmissionLabel {
+                        admission_status: "rejected".to_string(),
+                        loss_reason: Some("not_in_resolution_window".to_string()),
+                        resolved_node_id: None,
+                        search_hit_rank: None,
+                        final_rank: None,
+                    };
+                }
                 return SidecarCandidateAdmissionLabel {
                     admission_status: "unresolved".to_string(),
                     loss_reason: Some(resolution.to_string()),
@@ -1057,34 +1322,34 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
     let trace = &result.trace;
     let stage_timings = retrieval_stage_timings(trace);
 
-    let candidates = result
-        .hits
-        .iter()
-        .take(MAX_SHADOW_CANDIDATES)
-        .enumerate()
-        .map(|(index, hit)| RetrievalCandidateSummaryDto {
-            rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
-            file_path: hit.file_path.clone(),
-            line: hit.start_line,
-            symbol_name: hit.symbol_name.clone(),
-            score: hit.score,
-            source: candidate_source_label(hit.source),
-            resolution: resolution_labels.get(index).cloned(),
-            admission_status: admission_labels
-                .get(index)
-                .map(|label| label.admission_status.clone()),
-            loss_reason: admission_labels
-                .get(index)
-                .and_then(|label| label.loss_reason.clone()),
-            resolved_node_id: admission_labels
-                .get(index)
-                .and_then(|label| label.resolved_node_id.clone()),
-            search_hit_rank: admission_labels
-                .get(index)
-                .and_then(|label| label.search_hit_rank),
-            final_rank: admission_labels
-                .get(index)
-                .and_then(|label| label.final_rank),
+    let candidates = shadow_candidate_indices(&result.hits, resolution_labels)
+        .into_iter()
+        .map(|index| {
+            let hit = &result.hits[index];
+            RetrievalCandidateSummaryDto {
+                rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                file_path: hit.file_path.clone(),
+                line: hit.start_line,
+                symbol_name: hit.symbol_name.clone(),
+                score: hit.score,
+                source: candidate_source_label(hit.source),
+                resolution: resolution_labels.get(index).cloned(),
+                admission_status: admission_labels
+                    .get(index)
+                    .map(|label| label.admission_status.clone()),
+                loss_reason: admission_labels
+                    .get(index)
+                    .and_then(|label| label.loss_reason.clone()),
+                resolved_node_id: admission_labels
+                    .get(index)
+                    .and_then(|label| label.resolved_node_id.clone()),
+                search_hit_rank: admission_labels
+                    .get(index)
+                    .and_then(|label| label.search_hit_rank),
+                final_rank: admission_labels
+                    .get(index)
+                    .and_then(|label| label.final_rank),
+            }
         })
         .collect();
 
@@ -1102,7 +1367,7 @@ fn shadow_from_query_result_with_counts_and_resolution_labels(
     } else {
         resolution_labels
             .iter()
-            .filter(|label| label.as_str() != "resolved")
+            .filter(|label| !matches!(label.as_str(), "resolved" | "not_attempted"))
             .count()
     };
     let diagnostic_only = unresolved_candidates_are_diagnostic_only(
@@ -1143,12 +1408,47 @@ fn unresolved_candidates_are_diagnostic_only(
         && candidates
             .iter()
             .zip(resolution_labels)
-            .filter(|(_, label)| label.as_str() != "resolved")
+            .filter(|(_, label)| !matches!(label.as_str(), "resolved" | "not_attempted"))
             .all(|(candidate, label)| {
-                bare_dense_anchor_unresolved(candidate, label)
-                    || (has_resolved_hit
-                        && non_source_markdown_candidate_unresolved(candidate, label))
+                unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
             })
+}
+
+fn shadow_candidate_indices(
+    candidates: &[CandidateHit],
+    resolution_labels: &[String],
+) -> Vec<usize> {
+    let mut indices = (0..candidates.len().min(MAX_SHADOW_CANDIDATES)).collect::<Vec<_>>();
+    let has_resolved_hit = resolution_labels
+        .iter()
+        .any(|label| label.as_str() == "resolved");
+    let blocking_index = candidates
+        .iter()
+        .zip(resolution_labels)
+        .enumerate()
+        .skip(MAX_SHADOW_CANDIDATES)
+        .find_map(|(index, (candidate, label))| {
+            (label != "resolved"
+                && label != "not_attempted"
+                && !unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit))
+            .then_some(index)
+        });
+    if let Some(blocking_index) = blocking_index
+        && let Some(last_index) = indices.last_mut()
+    {
+        *last_index = blocking_index;
+    }
+    indices
+}
+
+fn unresolved_candidate_is_diagnostic(
+    candidate: &CandidateHit,
+    resolution_label: &str,
+    has_resolved_hit: bool,
+) -> bool {
+    bare_dense_anchor_unresolved(candidate, resolution_label)
+        || (has_resolved_hit
+            && non_parser_backed_file_candidate_unresolved(candidate, resolution_label))
 }
 
 fn bare_dense_anchor_unresolved(candidate: &CandidateHit, resolution_label: &str) -> bool {
@@ -1167,14 +1467,29 @@ fn bare_dense_anchor_path(candidate: &CandidateHit) -> bool {
             .is_some_and(|symbol| symbol.trim().eq_ignore_ascii_case(file_path))
 }
 
-fn non_source_markdown_candidate_unresolved(
+fn non_parser_backed_file_candidate_unresolved(
     candidate: &CandidateHit,
     resolution_label: &str,
 ) -> bool {
+    // `node_unresolved` is assigned only after the candidate path resolves.
     resolution_label == "node_unresolved"
-        && candidate.source == CandidateSource::Zoekt
+        && candidate.source == CandidateSource::Lexical
         && candidate.symbol_name.is_none()
-        && candidate.file_path.to_ascii_lowercase().ends_with(".md")
+        && known_non_symbol_file_path(&candidate.file_path)
+}
+
+fn known_non_symbol_file_path(file_path: &str) -> bool {
+    let lower = file_path.to_ascii_lowercase();
+    let extension = lower.rsplit('.').next();
+    matches!(
+        extension,
+        Some("cfg" | "conf" | "def" | "ini" | "json" | "md" | "markdown" | "toml" | "yaml" | "yml")
+    ) || extension
+        .is_some_and(|value| value.len() == 1 && matches!(value.as_bytes()[0], b'1'..=b'9'))
+        || (extension == Some("zsh")
+            && lower
+                .split('/')
+                .any(|segment| matches!(segment, "complete" | "completion" | "completions")))
 }
 
 fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
@@ -1185,13 +1500,30 @@ fn retrieval_stage_timings(trace: &QueryTrace) -> Vec<RetrievalStageTimingDto> {
             stage: stage.stage.label().to_string(),
             deadline_ms: u32::try_from(stage.budget_ms).ok(),
             elapsed_ms: u32::try_from(stage.elapsed_ms).unwrap_or(u32::MAX),
+            admission_wait_ms: u32::try_from(stage.admission_wait_ms).ok(),
+            queue_wait_ms: stage.queue_wait_ms.and_then(|ms| u32::try_from(ms).ok()),
+            execution_ms: stage.execution_ms.and_then(|ms| u32::try_from(ms).ok()),
             candidates_added: u32::try_from(stage.candidates_added).unwrap_or(u32::MAX),
             marginal_gain: stage.marginal_gain,
             cancel_reason: stage.cancel_reason.clone(),
             cache_hit: stage.cache_hit,
-            sidecar_latency_ms: stage.stage.sidecar_latency_ms(stage.elapsed_ms),
+            sidecar_latency_ms: stage
+                .execution_ms
+                .and_then(|ms| stage.stage.sidecar_latency_ms(ms)),
             degraded: stage.degraded,
             stub_reason: stage.stub_reason.clone(),
+            completion_status: match stage.completion_status {
+                codestory_retrieval::StageCompletionStatus::Completed => "completed",
+                codestory_retrieval::StageCompletionStatus::PendingAfterDeadline => {
+                    "pending_after_deadline"
+                }
+                codestory_retrieval::StageCompletionStatus::CancelledBeforeStart => {
+                    "cancelled_before_start"
+                }
+                codestory_retrieval::StageCompletionStatus::CompletedLate => "completed_late",
+                codestory_retrieval::StageCompletionStatus::Skipped => "skipped",
+            }
+            .into(),
         })
         .collect()
 }
@@ -1221,50 +1553,10 @@ fn candidate_path_text_is_path_like(path: &str) -> bool {
 }
 
 fn normalize_repo_relative_path(project_root: &Path, file_path: &str) -> String {
-    if let Some(rel) = strip_project_prefix_from_normalized_path(project_root, file_path) {
-        return rel;
-    }
-    let path = PathBuf::from(file_path);
-    if path.is_absolute() {
-        path.strip_prefix(project_root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| file_path.replace('\\', "/"))
-    } else {
-        file_path.replace('\\', "/")
-    }
-}
-
-fn strip_project_prefix_from_normalized_path(
-    project_root: &Path,
-    file_path: &str,
-) -> Option<String> {
-    let candidate = normalize_storage_path_text(file_path);
-    let roots = [
-        normalize_storage_path_text(&project_root.to_string_lossy()),
-        std::fs::canonicalize(project_root)
-            .ok()
-            .map(|path| normalize_storage_path_text(&path.to_string_lossy()))
-            .unwrap_or_default(),
-    ];
-    roots
-        .into_iter()
-        .filter(|root| !root.is_empty())
-        .find_map(|root| {
-            if candidate.eq_ignore_ascii_case(&root) {
-                return Some(String::new());
-            }
-            let prefix = format!("{root}/");
-            candidate
-                .strip_prefix(&prefix)
-                .or_else(|| {
-                    let candidate_lower = candidate.to_ascii_lowercase();
-                    let prefix_lower = prefix.to_ascii_lowercase();
-                    candidate_lower
-                        .strip_prefix(&prefix_lower)
-                        .map(|_| &candidate[prefix.len()..])
-                })
-                .map(str::to_string)
-        })
+    let normalized = normalize_storage_path_text(file_path);
+    codestory_workspace::workspace_relative_path(project_root, Path::new(&normalized))
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or(normalized)
 }
 
 fn normalize_storage_path_text(path: &str) -> String {
@@ -1415,35 +1707,39 @@ fn resolve_candidate_node_id(
         .or(Some(file_node_id))
 }
 
-pub(crate) fn resolve_sidecar_candidates_to_search_hits(
-    controller: &AppController,
-    candidates: &[CandidateHit],
-    max_results: usize,
-) -> Result<Vec<SearchHit>, ApiError> {
-    resolve_sidecar_candidates_with_stats(controller, candidates, max_results)
-        .map(|outcome| outcome.resolved_hits)
-}
-
-fn resolve_sidecar_candidates_with_stats(
-    controller: &AppController,
+fn resolve_sidecar_candidates_in_read(
+    pinned: &PinnedRetrievalRead,
     candidates: &[CandidateHit],
     max_results: usize,
 ) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
-    controller.ensure_search_state()?;
-    let storage = controller.open_storage()?;
-    let project_root = controller.require_project_root()?;
-    let node_names = controller.state.lock().node_names.clone();
+    resolve_sidecar_candidates_in_storage(
+        &pinned.storage,
+        &pinned.node_names,
+        &pinned.project_root,
+        candidates,
+        max_results,
+    )
+}
+
+fn resolve_sidecar_candidates_in_storage(
+    storage: &Store,
+    node_names: &HashMap<CoreNodeId, String>,
+    project_root: &Path,
+    candidates: &[CandidateHit],
+    max_results: usize,
+) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
     let mut hits = Vec::new();
-    let mut attempted_candidate_count = 0;
-    let mut unresolved_candidate_count = 0;
-    let mut seen = HashMap::<String, ()>::new();
-    let mut ordered: Vec<&CandidateHit> = candidates
+    let mut unresolved_candidates = Vec::new();
+    let mut attempted_candidate_indices = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut ordered: Vec<(usize, &CandidateHit)> = candidates
         .iter()
-        .filter(|candidate| !is_phantom_sidecar_hit(candidate))
+        .enumerate()
+        .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
         .collect();
-    ordered.sort_by(|left, right| {
-        let left_resolvable = candidate_path_resolvable(&project_root, &left.file_path);
-        let right_resolvable = candidate_path_resolvable(&project_root, &right.file_path);
+    ordered.sort_by(|(_, left), (_, right)| {
+        let left_resolvable = candidate_path_resolvable(project_root, &left.file_path);
+        let right_resolvable = candidate_path_resolvable(project_root, &right.file_path);
         right_resolvable.cmp(&left_resolvable).then(
             right
                 .score
@@ -1452,27 +1748,31 @@ fn resolve_sidecar_candidates_with_stats(
         )
     });
 
-    for candidate in ordered {
+    for (candidate_index, candidate) in ordered {
         if hits.len() >= max_results {
             break;
         }
-        attempted_candidate_count += 1;
-        let rel_path = normalize_repo_relative_path(&project_root, &candidate.file_path);
+        attempted_candidate_indices.insert(candidate_index);
+        let rel_path = normalize_repo_relative_path(project_root, &candidate.file_path);
         let Some(node_id) =
-            resolve_candidate_node_id(&storage, &node_names, &project_root, &rel_path, candidate)
+            resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
         else {
-            unresolved_candidate_count += 1;
+            let label = if candidate_path_resolvable(project_root, &candidate.file_path) {
+                "node_unresolved"
+            } else {
+                "path_unresolvable"
+            };
+            unresolved_candidates.push((candidate, label));
             continue;
         };
         let dedupe_key = node_id.0.to_string();
-        if seen.contains_key(&dedupe_key) {
+        if !seen.insert(dedupe_key) {
             continue;
         }
-        seen.insert(dedupe_key, ());
         let Some(mut hit) =
-            AppController::build_search_hit(&storage, &node_names, node_id, candidate.score)
+            AppController::build_search_hit(storage, node_names, node_id, candidate.score)
         else {
-            unresolved_candidate_count += 1;
+            unresolved_candidates.push((candidate, "hit_build_failed"));
             continue;
         };
         hit.score_breakdown = Some(score_breakdown_for_candidate(candidate));
@@ -1480,11 +1780,44 @@ fn resolve_sidecar_candidates_with_stats(
         hits.push(hit);
     }
 
+    let has_resolved_hit = !hits.is_empty();
+    let unresolved_candidate_count = unresolved_candidates.len();
+    let blocking_unresolved_candidate_count = unresolved_candidates
+        .iter()
+        .filter(|(candidate, label)| {
+            !unresolved_candidate_is_diagnostic(candidate, label, has_resolved_hit)
+        })
+        .count();
+
     Ok(SidecarCandidateResolutionOutcome {
         resolved_hits: hits,
-        attempted_candidate_count,
         unresolved_candidate_count,
+        blocking_unresolved_candidate_count,
+        attempted_candidate_indices,
     })
+}
+
+#[cfg(test)]
+fn resolve_sidecar_candidates_for_test(
+    controller: &AppController,
+    candidates: &[CandidateHit],
+    max_results: usize,
+) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
+    let storage = controller.open_storage()?;
+    let project_root = controller.require_project_root()?;
+    let node_names = storage
+        .get_nodes()
+        .map_err(|error| ApiError::internal(format!("load test nodes: {error}")))?
+        .into_iter()
+        .map(|node| (node.id, crate::node_display_name(&node)))
+        .collect();
+    resolve_sidecar_candidates_in_storage(
+        &storage,
+        &node_names,
+        &project_root,
+        candidates,
+        max_results,
+    )
 }
 
 fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBreakdownDto {
@@ -1494,7 +1827,7 @@ fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBrea
         .as_ref()
         .map(|features| (features.lexical, features.semantic, features.scip_distance))
         .unwrap_or_else(|| match candidate.source {
-            CandidateSource::Zoekt => (candidate.score, 0.0, 0.0),
+            CandidateSource::Lexical => (candidate.score, 0.0, 0.0),
             CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
             CandidateSource::Scip => (0.0, 0.0, candidate.score),
             CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
@@ -1517,7 +1850,7 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
         return candidate.provenance.clone();
     }
     let label = match candidate.source {
-        CandidateSource::Zoekt => "lexical_source",
+        CandidateSource::Lexical => "lexical_source",
         CandidateSource::Qdrant => "dense_anchor",
         CandidateSource::Scip => "graph_neighbor",
         CandidateSource::Legacy => "legacy",
@@ -1566,8 +1899,10 @@ mod tests {
 
     fn retrieval_cache_key_for_test(query_fingerprint: &str) -> RetrievalCacheKey {
         RetrievalCacheKey {
+            core_generation_id: None,
+            core_run_id: None,
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -1676,6 +2011,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalize_repo_relative_path_strips_forward_slash_verbatim_prefix() {
         let project = Path::new("C:/workspaces/example");
@@ -1806,6 +2142,7 @@ mod tests {
     #[test]
     fn unresolved_sidecar_candidates_are_diagnostic_only() {
         let result = QueryResult {
+            publication_identity: None,
             query: "application use".into(),
             features: classify_query("application use"),
             hits: vec![CandidateHit::with_source(
@@ -1826,8 +2163,9 @@ mod tests {
         };
         let resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
-            attempted_candidate_count: 1,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
+            attempted_candidate_indices: HashSet::from([0]),
         };
 
         let diagnostic = packet_sidecar_query_diagnostic(&result, &resolution, 2, 1, 3);
@@ -1842,6 +2180,7 @@ mod tests {
     #[test]
     fn shadow_maps_unavailable_trace() {
         let shadow = shadow_from_query_result(QueryResult {
+            publication_identity: None,
             query: "extension".into(),
             features: classify_query("extension"),
             hits: Vec::new(),
@@ -1866,6 +2205,7 @@ mod tests {
     #[test]
     fn shadow_maps_stage_timings_and_would_rank() {
         let shadow = shadow_from_query_result(QueryResult {
+            publication_identity: None,
             query: "extension".into(),
             features: classify_query("ExtensionService"),
             hits: vec![
@@ -1880,21 +2220,25 @@ mod tests {
                 cancel_reason: None,
                 cache_hit: false,
                 stages: vec![StageTrace {
-                    stage: RetrievalStageKind::Stage1ZoektLexical,
+                    stage: RetrievalStageKind::Stage1Lexical,
                     budget_ms: 120,
                     elapsed_ms: 20,
+                    admission_wait_ms: 0,
+                    queue_wait_ms: Some(1),
+                    execution_ms: Some(19),
                     candidates_added: 2,
                     marginal_gain: 0.4,
                     cancel_reason: None,
                     cache_hit: false,
                     degraded: false,
                     stub_reason: None,
+                    completion_status: codestory_retrieval::StageCompletionStatus::Completed,
                 }],
             },
         });
         assert_eq!(shadow.retrieval_mode, "full");
         assert_eq!(shadow.stage_timings.len(), 1);
-        assert_eq!(shadow.stage_timings[0].stage, "stage1_zoekt_lexical");
+        assert_eq!(shadow.stage_timings[0].stage, "stage1_lexical");
         assert_eq!(shadow.candidates.len(), 2);
         assert_eq!(shadow.would_rank, vec!["src/a.rs", "src/b.rs"]);
     }
@@ -1905,7 +2249,7 @@ mod tests {
             "src/service.rs",
             Some("ExtensionService".into()),
             0.91,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         candidate.provenance = vec![
             "lexical_source".into(),
@@ -1942,7 +2286,7 @@ mod tests {
             "src/service.rs",
             Some("Service".into()),
             0.78,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         );
         candidate.provenance = vec!["lexical_source".into()];
         let ranked = rank_candidates(&classify_query("explain service startup"), vec![candidate]);
@@ -1987,6 +2331,7 @@ mod tests {
         candidate.start_line = Some(42);
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
             QueryResult {
+                publication_identity: None,
                 query: "handler".into(),
                 features: classify_query("handler"),
                 hits: vec![candidate],
@@ -2039,6 +2384,7 @@ mod tests {
     #[test]
     fn shadow_marks_only_bare_dense_anchors_as_diagnostic_only() {
         let dense_anchor = QueryResult {
+            publication_identity: None,
             query: "apii".into(),
             features: classify_query("apii"),
             hits: vec![CandidateHit::with_source(
@@ -2069,6 +2415,7 @@ mod tests {
         assert_eq!(value["diagnostic_only"], true);
 
         let missing_path = QueryResult {
+            publication_identity: None,
             query: "StringUtils".into(),
             features: classify_query("StringUtils"),
             hits: vec![CandidateHit::with_source(
@@ -2100,23 +2447,42 @@ mod tests {
     }
 
     #[test]
-    fn shadow_marks_non_source_markdown_candidates_diagnostic_only_with_source_hits() {
+    fn shadow_marks_non_parser_backed_file_candidates_diagnostic_only_with_source_hits() {
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
             QueryResult {
+                publication_identity: None,
                 query: "form validation".into(),
                 features: classify_query("form validation"),
                 hits: vec![
                     CandidateHit::with_source(
-                        "docs/tasks/form-validation/marking.md",
+                        "config/form-validation.json",
                         None,
                         0.9,
-                        CandidateSource::Zoekt,
+                        CandidateSource::Lexical,
                     ),
                     CandidateHit::with_source(
-                        "src/forms/validation.html",
+                        "docs/man/tool.1",
+                        None,
+                        0.85,
+                        CandidateSource::Lexical,
+                    ),
+                    CandidateHit::with_source(
+                        "scripts/completions/tool.zsh",
+                        None,
+                        0.825,
+                        CandidateSource::Lexical,
+                    ),
+                    CandidateHit::with_source(
+                        "src/forms/validation.rs",
                         Some("email".into()),
                         0.8,
-                        CandidateSource::Qdrant,
+                        CandidateSource::Scip,
+                    ),
+                    CandidateHit::with_source(
+                        "tests/support/harness.tcl",
+                        None,
+                        0.7,
+                        CandidateSource::Lexical,
                     ),
                 ],
                 trace: QueryTrace {
@@ -2129,20 +2495,71 @@ mod tests {
                     stages: Vec::new(),
                 },
             },
-            2,
+            4,
             1,
-            &["node_unresolved".to_string(), "resolved".to_string()],
+            &[
+                "node_unresolved".to_string(),
+                "node_unresolved".to_string(),
+                "node_unresolved".to_string(),
+                "resolved".to_string(),
+                "not_attempted".to_string(),
+            ],
             &[],
         );
         let value = serde_json::to_value(&shadow).expect("serialize shadow");
-        assert_eq!(shadow.unresolved_candidate_count, 1);
+        assert_eq!(shadow.unresolved_candidate_count, 3);
         assert_eq!(value["diagnostic_only"], true);
+    }
+
+    #[test]
+    fn shadow_keeps_blocking_unresolved_candidate_visible() {
+        let mut hits = vec![CandidateHit::with_source(
+            "config/application.json",
+            None,
+            0.9,
+            CandidateSource::Lexical,
+        )];
+        let mut resolution_labels = vec!["node_unresolved".to_string()];
+        for index in 1..MAX_SHADOW_CANDIDATES {
+            hits.push(CandidateHit::with_source(
+                format!("src/module_{index}.rs"),
+                Some(format!("module_{index}")),
+                0.8,
+                CandidateSource::Scip,
+            ));
+            resolution_labels.push("resolved".to_string());
+        }
+        hits.push(CandidateHit::with_source(
+            "missing/application.json",
+            None,
+            0.7,
+            CandidateSource::Lexical,
+        ));
+        resolution_labels.push("path_unresolvable".to_string());
+
+        let summary_indices = shadow_candidate_indices(&hits, &resolution_labels);
+        assert_eq!(summary_indices.len(), MAX_SHADOW_CANDIDATES);
+        assert_eq!(summary_indices.last(), Some(&MAX_SHADOW_CANDIDATES));
+        assert!(!unresolved_candidates_are_diagnostic_only(
+            &hits,
+            &resolution_labels,
+            2,
+        ));
+
+        let source_candidate =
+            CandidateHit::with_source("src/tool.zsh", None, 0.9, CandidateSource::Lexical);
+        assert!(!unresolved_candidate_is_diagnostic(
+            &source_candidate,
+            "node_unresolved",
+            true,
+        ));
     }
 
     #[test]
     fn shadow_candidate_summaries_include_admission_diagnostics() {
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
             QueryResult {
+                publication_identity: None,
                 query: "exec json flow".into(),
                 features: classify_query("exec json flow"),
                 hits: vec![
@@ -2156,7 +2573,7 @@ mod tests {
                         "src/noise.rs",
                         Some("CommandExec".into()),
                         0.8,
-                        CandidateSource::Zoekt,
+                        CandidateSource::Lexical,
                     ),
                 ],
                 trace: QueryTrace {
@@ -2218,8 +2635,8 @@ mod tests {
     #[test]
     fn sidecar_budget_respects_latency_cap() {
         assert_eq!(sidecar_budget_ms(Some(400)), 400);
-        assert_eq!(sidecar_budget_ms(Some(5_000)), DEFAULT_SIDECAR_BUDGET_MS);
-        assert_eq!(sidecar_budget_ms(None), DEFAULT_SIDECAR_BUDGET_MS);
+        assert_eq!(sidecar_budget_ms(Some(5_000)), 1_500);
+        assert_eq!(sidecar_budget_ms(None), 1_500);
     }
 
     #[test]
@@ -2315,12 +2732,18 @@ mod tests {
             mode: "full".into(),
             degraded_reason: None,
         };
+        let agent_full_but_dead = SidecarModeStatus {
+            profile: Some("agent".into()),
+            mode: "full".into(),
+            degraded_reason: Some("embedding_runtime_unavailable: connection refused".into()),
+        };
 
         assert!(
             !sidecar_status_can_serve_primary(&local_full),
             "local/default full sidecar must not serve packet/search/context primary retrieval"
         );
         assert!(sidecar_status_can_serve_primary(&agent_full));
+        assert!(!sidecar_status_can_serve_primary(&agent_full_but_dead));
         assert!(!sidecar_status_can_serve_primary(&missing_profile_full));
     }
 
@@ -2356,10 +2779,18 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_mode_status_rejects_stale_manifest_before_health_probe() {
+    fn sidecar_mode_status_reports_dead_endpoint_before_stale_manifest() {
         let project = tempfile::tempdir().expect("project");
         let storage_dir = tempfile::tempdir().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve dead port");
+        let dead_port = listener.local_addr().expect("dead port address").port();
+        drop(listener);
+        let mut runtime = SidecarRuntimeConfig::for_project_auto(project.path());
+        runtime.embed_http_port = dead_port;
+        runtime.embedding.endpoint = format!("http://127.0.0.1:{dead_port}/v1/embeddings");
+        runtime.embedding.endpoint_origin =
+            codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar;
         let project_id = project_id_for_root(project.path());
         let hash = "deadbeefcafebabe";
         let mut storage = Store::open(&storage_path).expect("open storage");
@@ -2369,17 +2800,13 @@ mod tests {
             .upsert_retrieval_index_manifest(&manifest)
             .expect("manifest");
 
-        let status = sidecar_mode_status_for_project(project.path(), &storage_path);
+        let status = sidecar_mode_status_for_runtime(project.path(), &storage_path, &runtime);
 
-        assert_eq!(status.mode, "unavailable");
-        let reason = status.degraded_reason.expect("stale reason");
+        assert_eq!(status.mode, "full");
+        let reason = status.degraded_reason.expect("unavailable reason");
         assert!(
-            reason.contains("sidecar_manifest_stale"),
-            "expected stale manifest reason, got: {reason}"
-        );
-        assert!(
-            reason.contains("sidecar_embedding_backend_changed"),
-            "expected embedding backend detail, got: {reason}"
+            reason.starts_with("embedding_runtime_unavailable:"),
+            "expected live endpoint failure to precede stale manifest classification, got: {reason}"
         );
     }
 
@@ -2395,7 +2822,7 @@ mod tests {
         storage
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: project_id.into(),
-                zoekt_version: "zoekt-real-v1".into(),
+                lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
                 qdrant_collection,
                 scip_revision: Some("graph-test".into()),
                 built_at_epoch_ms,
@@ -2418,6 +2845,122 @@ mod tests {
                 precise_semantic_import_producer: None,
             })
             .expect("manifest");
+    }
+
+    #[test]
+    fn pinned_read_resolves_the_original_generation_and_rejects_publication_drift() {
+        use codestory_retrieval::CandidateSource;
+        use codestory_store::{FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord};
+
+        let project = tempfile::tempdir().expect("project");
+        let source_path = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "fn original() {}\n").expect("write source");
+        let storage_path = project.path().join("cache/codestory.db");
+        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
+            .expect("create storage parent");
+        let project_id = sidecar_project_id_for_root(project.path());
+
+        let mut storage = Store::open(&storage_path).expect("open storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path.clone(),
+                language: "rust".into(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        let original_node = codestory_contracts::graph::Node {
+            id: CoreNodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "original".into(),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(1),
+            ..Default::default()
+        };
+        storage
+            .insert_nodes_batch(&[
+                codestory_contracts::graph::Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: source_path.to_string_lossy().into_owned(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+                original_node,
+            ])
+            .expect("insert nodes");
+        storage
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "run-one".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("publish first identity");
+        let first_manifest = retrieval_manifest_fixture(&project_id, "first");
+        storage
+            .upsert_retrieval_index_manifest(&first_manifest)
+            .expect("publish first manifest");
+        drop(storage);
+
+        let controller = AppController::new();
+        {
+            let mut state = controller.state.lock();
+            state.project_root = Some(project.path().to_path_buf());
+            state.storage_path = Some(storage_path.clone());
+        }
+        let pinned = PinnedRetrievalRead::begin(&controller).expect("pin first publication");
+
+        let mut writer = Store::open(&storage_path).expect("open publication writer");
+        writer
+            .insert_nodes_batch(&[codestory_contracts::graph::Node {
+                id: CoreNodeId(2),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "replacement".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(1),
+                ..Default::default()
+            }])
+            .expect("reuse numeric id in replacement generation");
+        writer
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 2,
+                generation_id: "22222222-2222-4222-8222-222222222222".into(),
+                run_id: "run-two".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            })
+            .expect("publish replacement identity");
+        let replacement_manifest = retrieval_manifest_fixture(&project_id, "second");
+        writer
+            .upsert_retrieval_index_manifest(&replacement_manifest)
+            .expect("publish replacement manifest");
+        drop(writer);
+
+        let mut candidate = CandidateHit::with_source(
+            "src/lib.rs",
+            Some("original".into()),
+            1.0,
+            CandidateSource::Scip,
+        );
+        candidate.node_id = Some("2".into());
+        let resolution = resolve_sidecar_candidates_in_read(&pinned, &[candidate], 1)
+            .expect("resolve against pinned snapshot");
+        assert_eq!(resolution.resolved_hits.len(), 1);
+        assert_eq!(resolution.resolved_hits[0].display_name, "original");
+
+        let error = pinned
+            .revalidate()
+            .expect_err("publication drift must reject the result");
+        assert_eq!(error.code, "cache_busy");
     }
 
     fn git_project() -> Option<tempfile::TempDir> {
@@ -2470,6 +3013,7 @@ mod tests {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let empty_full = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: Vec::new(),
@@ -2489,6 +3033,7 @@ mod tests {
         );
 
         let unresolved = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -2517,20 +3062,16 @@ mod tests {
     fn sidecar_result_rejects_blocking_cancel_reasons_even_with_resolved_hits() {
         use codestory_retrieval::{CandidateSource, classify_query};
 
-        for reason in [
-            "deadline",
-            "stage_deadline",
-            "stage_worker_limit",
-            "cancelled",
-        ] {
+        for reason in ["deadline", "stage_deadline", "cancelled"] {
             let candidate = CandidateHit::with_source(
                 "src/handler.rs",
                 Some("handler".into()),
                 0.9,
-                CandidateSource::Zoekt,
+                CandidateSource::Lexical,
             );
             let resolved_hit = search_hit_for_candidate(&candidate);
             let result = QueryResult {
+                publication_identity: None,
                 query: "handler".into(),
                 features: classify_query("handler"),
                 hits: vec![candidate],
@@ -2560,6 +3101,7 @@ mod tests {
 
         for mode in ["no_semantic", "no_scip", "lexical_only", "unavailable"] {
             let result = QueryResult {
+                publication_identity: None,
                 query: "handler".into(),
                 features: classify_query("handler"),
                 hits: Vec::new(),
@@ -2588,6 +3130,7 @@ mod tests {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let empty_full = QueryResult {
+            publication_identity: None,
             query: "unlikely symbol".into(),
             features: classify_query("unlikely symbol"),
             hits: Vec::new(),
@@ -2603,8 +3146,9 @@ mod tests {
         };
         let empty_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
-            attempted_candidate_count: 0,
             unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
+            attempted_candidate_indices: HashSet::new(),
         };
         let empty_diagnostic =
             packet_sidecar_query_diagnostic(&empty_full, &empty_resolution, 1, 0, 1);
@@ -2614,6 +3158,7 @@ mod tests {
         assert!(empty_diagnostic.diagnostic.is_none());
 
         let unresolved = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -2634,8 +3179,9 @@ mod tests {
         };
         let unresolved_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: Vec::new(),
-            attempted_candidate_count: 1,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
+            attempted_candidate_indices: HashSet::from([0]),
         };
         let unresolved_diagnostic =
             packet_sidecar_query_diagnostic(&unresolved, &unresolved_resolution, 1, 0, 1);
@@ -2650,13 +3196,14 @@ mod tests {
         );
 
         let cancelled = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
                 "src/handler.rs",
                 Some("handler".into()),
                 0.9,
-                CandidateSource::Zoekt,
+                CandidateSource::Lexical,
             )],
             trace: QueryTrace {
                 retrieval_mode: "full".into(),
@@ -2670,8 +3217,9 @@ mod tests {
         };
         let cancelled_resolution = SidecarCandidateResolutionOutcome {
             resolved_hits: vec![search_hit_for_candidate(&cancelled.hits[0])],
-            attempted_candidate_count: 1,
             unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
+            attempted_candidate_indices: HashSet::from([0]),
         };
         let cancelled_diagnostic =
             packet_sidecar_query_diagnostic(&cancelled, &cancelled_resolution, 100, 1, 101);
@@ -2744,6 +3292,7 @@ mod tests {
         );
         resolved_candidate.node_id = Some("2".to_string());
         let query_result = QueryResult {
+            publication_identity: None,
             query: "alpha".into(),
             features: classify_query("alpha"),
             hits: vec![
@@ -2766,9 +3315,9 @@ mod tests {
             },
         };
 
-        let resolution = resolve_sidecar_candidates_with_stats(&controller, &query_result.hits, 1)
+        let resolution = resolve_sidecar_candidates_for_test(&controller, &query_result.hits, 1)
             .expect("resolve sidecar candidates");
-        assert_eq!(resolution.attempted_candidate_count, 1);
+        assert_eq!(resolution.attempted_candidate_indices.len(), 1);
         assert_eq!(resolution.resolved_hits.len(), 1);
         assert_eq!(resolution.unresolved_candidate_count, 0);
 
@@ -2780,6 +3329,20 @@ mod tests {
             diagnostic.diagnostic.is_none(),
             "capped-away candidates should not create unresolved diagnostics: {diagnostic:?}"
         );
+
+        let mixed_resolution =
+            resolve_sidecar_candidates_for_test(&controller, &query_result.hits, 2)
+                .expect("resolve mixed sidecar candidates");
+        assert_eq!(mixed_resolution.attempted_candidate_indices.len(), 2);
+        assert_eq!(mixed_resolution.resolved_hits.len(), 1);
+        assert_eq!(mixed_resolution.unresolved_candidate_count, 1);
+        assert_eq!(mixed_resolution.blocking_unresolved_candidate_count, 1);
+
+        let mixed_diagnostic =
+            packet_sidecar_query_diagnostic(&query_result, &mixed_resolution, 1, 0, 1);
+        assert_eq!(mixed_diagnostic.resolved_hit_count, 1);
+        assert_eq!(mixed_diagnostic.unresolved_candidate_count, 1);
+        assert_eq!(mixed_diagnostic.blocking_unresolved_candidate_count, 1);
     }
 
     #[test]
@@ -2787,6 +3350,7 @@ mod tests {
         use codestory_retrieval::{CandidateSource, classify_query};
 
         let unavailable = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: Vec::new(),
@@ -2806,6 +3370,7 @@ mod tests {
         );
 
         let unresolved = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -2852,6 +3417,7 @@ mod tests {
             |_, batch| {
                 assert_eq!(batch, &[("helpers".to_string(), 500)]);
                 Ok(vec![QueryResult {
+                    publication_identity: None,
                     query: "helpers".into(),
                     features: classify_query("helpers"),
                     hits: vec![CandidateHit::with_source(
@@ -2927,6 +3493,7 @@ mod tests {
                 Ok(batch
                     .iter()
                     .map(|(query, budget)| QueryResult {
+                        publication_identity: None,
                         query: query.to_string(),
                         features: classify_query(query),
                         hits: Vec::new(),
@@ -2971,6 +3538,7 @@ mod tests {
             |_, batch| {
                 assert_eq!(batch, &[("handler".to_string(), 500)]);
                 Ok(vec![QueryResult {
+                    publication_identity: None,
                     query: "handler".into(),
                     features: classify_query("handler"),
                     hits: vec![CandidateHit::with_source(
@@ -3019,6 +3587,7 @@ mod tests {
             .expect("remove storage parent");
 
         let query_result = QueryResult {
+            publication_identity: None,
             query: "handler".into(),
             features: classify_query("handler"),
             hits: vec![CandidateHit::with_source(
@@ -3112,6 +3681,7 @@ mod tests {
         );
         candidate.node_id = Some("2".to_string());
         let query_result = QueryResult {
+            publication_identity: None,
             query: "Explain how CodeStory validates packaged agent readiness.".into(),
             features: classify_query("Explain how CodeStory validates packaged agent readiness."),
             hits: vec![candidate],
@@ -3140,6 +3710,9 @@ mod tests {
             }
             SidecarPrimarySearchOutcome::Unavailable { reason } => {
                 panic!("resolved cancelled packet primary trace should stay available: {reason}")
+            }
+            SidecarPrimarySearchOutcome::Retryable { error } => {
+                panic!("resolved cancelled packet primary trace should not retry: {error:?}")
             }
         }
     }

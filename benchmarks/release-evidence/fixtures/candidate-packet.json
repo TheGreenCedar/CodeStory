@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "modes": ["cold-cli"],
+  "repeats": 3,
+  "release_evidence": {
+    "commit": "2222222222222222222222222222222222222222",
+    "profile": "ci-contract-v1",
+    "evidence_identity": {
+      "corpus_id": "ci-contract-corpus-v1",
+      "cache_id": "cold-full-sidecar-v1",
+      "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
+    },
+    "publishable": true,
+    "repeats": 3,
+    "quality_gate_status": "pass",
+    "publishable_blockers": [],
+    "rows": [
+      {
+        "repo": "fixture",
+        "task_id": "quality-contract",
+        "mode": "cold_cli_packet",
+        "repeat": 1,
+        "status": "pass",
+        "quality": { "pass": true },
+        "sufficiency": { "status": "sufficient", "sufficient_quality_mismatch": false },
+        "packet_latency": { "sla_missed": false, "retrieval_shadow": { "retrieval_mode": "full" } },
+        "repo_provenance": {
+          "manifest_overridden_by_builtin": false,
+          "configured": { "url": "https://github.com/example/fixture.git", "ref": "9999999999999999999999999999999999999999" },
+          "manifest": { "url": "https://github.com/example/fixture.git", "ref": "9999999999999999999999999999999999999999" },
+          "git_head": "9999999999999999999999999999999999999999",
+          "git_origin": "https://github.com/example/fixture.git",
+          "git_dirty": false
+        },
+        "codestory_cache_provenance": {
+          "doctor_status": "pass", "storage_path": "fixture/codestory.db",
+          "cache_policy": "prepared-sidecar-cache-read-only", "retrieval_mode": "full",
+          "sidecar_generation": "fixture-generation", "manifest_embedding_backend": "llamacpp:bge-base-en-v1.5",
+          "semantic_backend": "llamacpp", "local_only": true, "locality_kind": "local_model_files",
+          "indexed": true, "freshness_status": "fresh", "semantic_ready": true, "indexing_in_timed_run": false
+        }
+      },
+      {
+        "repo": "fixture",
+        "task_id": "quality-contract",
+        "mode": "cold_cli_packet",
+        "repeat": 2,
+        "status": "pass",
+        "quality": { "pass": true },
+        "sufficiency": { "status": "sufficient", "sufficient_quality_mismatch": false },
+        "packet_latency": { "sla_missed": false, "retrieval_shadow": { "retrieval_mode": "full" } },
+        "repo_provenance": {
+          "manifest_overridden_by_builtin": false,
+          "configured": { "url": "https://github.com/example/fixture.git", "ref": "9999999999999999999999999999999999999999" },
+          "manifest": { "url": "https://github.com/example/fixture.git", "ref": "9999999999999999999999999999999999999999" },
+          "git_head": "9999999999999999999999999999999999999999",
+          "git_origin": "https://github.com/example/fixture.git",
+          "git_dirty": false
+        },
+        "codestory_cache_provenance": {
+          "doctor_status": "pass", "storage_path": "fixture/codestory.db",
+          "cache_policy": "prepared-sidecar-cache-read-only", "retrieval_mode": "full",
+          "sidecar_generation": "fixture-generation", "manifest_embedding_backend": "llamacpp:bge-base-en-v1.5",
+          "semantic_backend": "llamacpp", "local_only": true, "locality_kind": "local_model_files",
+          "indexed": true, "freshness_status": "fresh", "semantic_ready": true, "indexing_in_timed_run": false
+        }
+      },
+      {
+        "repo": "fixture",
+        "task_id": "quality-contract",
+        "mode": "cold_cli_packet",
+        "repeat": 3,
+        "status": "pass",
+        "quality": { "pass": true },
+        "sufficiency": { "status": "sufficient", "sufficient_quality_mismatch": false },
+        "packet_latency": { "sla_missed": false, "retrieval_shadow": { "retrieval_mode": "full" } },
+        "repo_provenance": {
+          "manifest_overridden_by_builtin": false,
+          "configured": { "url": "https://github.com/example/fixture.git", "ref": "9999999999999999999999999999999999999999" },
+          "manifest": { "url": "https://github.com/example/fixture.git", "ref": "9999999999999999999999999999999999999999" },
+          "git_head": "9999999999999999999999999999999999999999",
+          "git_origin": "https://github.com/example/fixture.git",
+          "git_dirty": false
+        },
+        "codestory_cache_provenance": {
+          "doctor_status": "pass", "storage_path": "fixture/codestory.db",
+          "cache_policy": "prepared-sidecar-cache-read-only", "retrieval_mode": "full",
+          "sidecar_generation": "fixture-generation", "manifest_embedding_backend": "llamacpp:bge-base-en-v1.5",
+          "semantic_backend": "llamacpp", "local_only": true, "locality_kind": "local_model_files",
+          "indexed": true, "freshness_status": "fresh", "semantic_ready": true, "indexing_in_timed_run": false
+        }
+      }
+    ]
+  },
+  "summary": [
+    { "task": "one", "mode": "cold_cli_packet", "median_e2e_wall_ms": 800 },
+    { "task": "two", "mode": "cold_cli_packet", "median_e2e_wall_ms": 900 }
+  ]
+}

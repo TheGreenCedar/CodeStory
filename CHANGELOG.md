@@ -1,6 +1,94 @@
 # Changelog
 
-## Unreleased
+## 0.15.0
+
+### Highlights
+
+- Agents now have one managed path from opening a project through indexing,
+  packet construction, and search. Fresh plugin sessions can show diagnostics
+  while the matching CLI is installed, then bring stale projects current
+  through normal grounding instead of a separate repair command.
+- Index and retrieval publication is atomic. Readers stay on one complete
+  generation, failed or interrupted refreshes leave the previous generation
+  usable, and source changes during a refresh cannot publish stale results.
+- Packet, search, and context now fail closed when their publication, sidecars,
+  embedding endpoint, process identity, or required accelerator proof is stale
+  or ambiguous. Local graph navigation remains available when only deep search
+  is warming or degraded.
+- Every plugin request selects its project explicitly. Switching repositories
+  cannot inherit another project's cache, endpoint, operation, or readiness
+  evidence, including on case-sensitive Unix filesystems.
+- Grounding is more precise for request flows, configuration files, framework
+  routes, and compact executable paths. Diagnostic file hits no longer hide
+  resolved graph evidence, while real source gaps still prevent an unsupported
+  sufficiency claim.
+
+### macOS
+
+- macOS 15 and newer is a supported native target. Apple Silicon uses the
+  checksum-pinned managed embedding server with Metal. CodeStory verifies the
+  selected endpoint, process identity, GPU offload, and a timed embedding
+  request before opening agent retrieval.
+- Intel Macs support the native CLI, managed plugin, local graph, and grounding.
+  Semantic retrieval requires explicit CPU/external policy; that policy may
+  select a trusted external embedding endpoint. Intel status and evidence never
+  claim Metal acceleration.
+- Managed readiness follows the selected dynamic endpoint, reuses one matching
+  live embedding process when projects switch, and blocks packet and search
+  with repair guidance if the endpoint or verified accelerator identity
+  disappears or changes.
+- Direct-download Mac artifacts are release-ready only after the exact arm64 and
+  x64 binaries pass Developer ID signing, notarization, quarantined extraction,
+  Gatekeeper, and native execution checks. Source or unsigned package checks do
+  not make that claim.
+
+### Reliability and operations
+
+- The legacy ONNX backend and its runtime, installer, setup, configuration, and
+  environment selections have been removed. Use managed llama.cpp under the
+  host's configured accelerator/CPU policy, or a trusted external endpoint
+  under explicit CPU/external policy. Stale ONNX settings now fail with
+  migration guidance instead of being silently ignored.
+- Existing retrieval rows migrate in place. Ambiguous legacy sidecar or broker
+  state is retained for bounded inventory and cleanup but is not reused; deep
+  search may require a managed repair or rebuild after upgrade.
+- Incremental indexing verifies file content rather than trusting modification
+  times alone. Retrieval reads remain pinned to one graph and sidecar
+  publication, and a concurrent publication change returns a bounded retry
+  instead of mixing evidence from different generations.
+- Lexical search avoids full-corpus validation on every query, and framework
+  route discovery handles multiline imports, aliases, comments, and shadowing
+  without repeatedly rescanning a module.
+- Status, doctor, and malformed MCP resource reads remain observational: they
+  do not refresh projects, start repair, or mutate sidecar state. Normal repair
+  guidance stays in the managed MCP flow, with CLI commands retained for
+  operator diagnostics.
+- Native processes, ports, generations, downloads, and cleanup are tied to
+  verified CodeStory ownership. Dead or reused processes, conflicting legacy
+  state, unsafe paths, oversized downloads, and ambiguous cleanup all fail
+  closed instead of being guessed through.
+- The packaged plugin launches the native CodeStory CLI without a shell. On
+  Windows, `CODESTORY_CLI` must name a native `.exe`; the supported `codex.cmd`
+  host shim is unchanged. Cross-platform worktree setup uses one
+  version-checked path on Windows, macOS, and Linux.
+- Linux x64 requires glibc 2.31 or newer. Both Linux architectures receive
+  packaged execution checks; accelerator and full-retrieval claims still
+  require live sidecar evidence for the selected host.
+- Repository-controlled network endpoints remain disabled by default. Setting
+  `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` is an explicit trust decision that
+  permits the repository to choose summary and embedding egress endpoints.
+- Release proof is staged by maturity: focused checks run during development,
+  while exact-head platform, protected hardware, signing, installation, and
+  live-runtime evidence run at their promotion or publication boundaries.
+
+### Release boundary
+
+- The repository version and release notes describe the candidate source.
+  Publication is complete only when the matching archives and checksums are
+  available and the required platform checks pass.
+- Marketplace availability, Gatekeeper acceptance, installed runtime/version
+  readback, and live full-retrieval behavior are separate post-publication
+  claims and require their own evidence.
 
 ## 0.14.3
 
@@ -11,6 +99,10 @@
   handoff, and installer ownership proof. Release notes and contributor
   guidance now preserve Apple Silicon, Windows arm64 acceleration,
   older-glibc, marketplace, and full-sidecar proof boundaries.
+- Declared glibc 2.31 as the minimum supported Linux x64 userspace and added a
+  pinned Debian Bullseye build plus Ubuntu 20.04 packaged-archive execution
+  gate for version, help, and stdio initialization with retained loader and
+  symbol diagnostics.
 - Kept strict sidecar readiness fail-closed on interrupted index-run markers
   without globally rejecting completed generations that contain parser-partial
   files or repeatedly refreshing unchanged parser-partial inputs; parser

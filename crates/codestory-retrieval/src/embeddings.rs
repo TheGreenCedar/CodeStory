@@ -4,7 +4,7 @@
 //! uses **BAAI/bge-base-en-v1.5** (768-dim) via llama.cpp `/v1/embeddings` for query vectors and
 //! semantic smoke checks.
 
-use crate::outbound_http::read_text;
+use crate::outbound_http::read_bytes;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -27,13 +27,7 @@ pub const BGE_QUERY_PREFIX_DEFAULT: &str =
     "Represent this sentence for searching relevant passages: ";
 pub const PRODUCT_EMBEDDING_RUNTIME_ID: &str = "llamacpp:bge-base-en-v1.5";
 
-const LLAMACPP_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
-const DEFAULT_LLAMACPP_URL: &str = "http://127.0.0.1:8080/v1/embeddings";
 const EMBEDDING_BACKEND_ENV: &str = "CODESTORY_EMBED_BACKEND";
-const QUERY_PREFIX_ENV: &str = "CODESTORY_EMBED_QUERY_PREFIX";
-const DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX";
-const LLAMACPP_BATCH_SIZE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_BATCH_SIZE";
-const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
 const ALLOW_REMOTE_EMBEDDINGS_ENV: &str = "CODESTORY_ALLOW_REMOTE_EMBEDDINGS";
 const DEVICE_POLICY_ENV: &str = "CODESTORY_EMBED_DEVICE_POLICY";
 const DEVICE_STATE_ENV: &str = "CODESTORY_EMBED_DEVICE_STATE";
@@ -44,21 +38,188 @@ const LLAMACPP_DEVICE_ENV: &str = "CODESTORY_EMBED_LLAMACPP_DEVICE";
 const LLAMACPP_N_GPU_LAYERS_ENV: &str = "CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS";
 const ALLOW_CPU_ENV: &str = "CODESTORY_EMBED_ALLOW_CPU";
 const NATIVE_LLAMA_LOG_START_MARKER: &str = "starting native llama.cpp embedding server:";
+const NATIVE_LLAMA_LOG_READ_START_BYTES: u64 = 512 * 1024;
 const NATIVE_LLAMA_LOG_READ_TAIL_BYTES: u64 = 512 * 1024;
 const NATIVE_LLAMA_PREVIOUS_LOG_TAIL_BYTES: u64 = 256 * 1024;
 const RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_EMBED_DEVICE_OBSERVATION_POLL: Duration = Duration::from_millis(250);
+const ACCELERATOR_SMOKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_LLAMACPP_BATCH_SIZE: usize = 128;
-const DEFAULT_LLAMACPP_REQUEST_COUNT: usize = 6;
+
+#[derive(Debug, Clone)]
+pub struct LlamaCppEmbeddingClient {
+    config: crate::config::EmbeddingRuntimeConfig,
+}
+
+impl LlamaCppEmbeddingClient {
+    pub fn new(config: &crate::config::EmbeddingRuntimeConfig) -> Result<Self> {
+        if let Some(error) = config.configuration_error.as_deref() {
+            bail!(error.to_string());
+        }
+        ensure_llamacpp_url_allowed_with_policy(&config.endpoint, config.allow_remote)?;
+        Ok(Self {
+            config: config.clone(),
+        })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
+    }
+
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_query_with_timeout(text, HTTP_TIMEOUT)
+    }
+
+    pub fn embed_query_with_timeout(&self, text: &str, timeout: Duration) -> Result<Vec<f32>> {
+        let prefix = self.config.query_prefix.as_deref().unwrap_or_else(|| {
+            if self.is_llamacpp() {
+                BGE_QUERY_PREFIX_DEFAULT
+            } else {
+                ""
+            }
+        });
+        self.embed_prepared_with_timeout(&format!("{prefix}{text}"), timeout)
+    }
+
+    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefix = self.config.document_prefix.as_deref().unwrap_or_default();
+        let prepared = texts
+            .iter()
+            .map(|text| format!("{prefix}{text}"))
+            .collect::<Vec<_>>();
+        if prepared.iter().any(|text| text.trim().is_empty()) {
+            bail!("cannot embed empty text");
+        }
+        if self.is_llamacpp() {
+            self.embed_llamacpp_batched(&prepared)
+        } else {
+            Ok(prepared
+                .iter()
+                .map(|text| hash_projection_embed(text, RETRIEVAL_EMBEDDING_DIM))
+                .collect())
+        }
+    }
+
+    pub fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.iter().any(|text| text.trim().is_empty()) {
+            bail!("cannot embed empty text");
+        }
+        if self.is_llamacpp() {
+            self.embed_llamacpp_batched(texts)
+        } else {
+            Ok(texts
+                .iter()
+                .map(|text| hash_projection_embed(text, RETRIEVAL_EMBEDDING_DIM))
+                .collect())
+        }
+    }
+
+    pub fn probe(&self) -> EmbeddingRuntimeProbe {
+        let started = Instant::now();
+        let result = self
+            .embed_query("codestory health probe")
+            .map(|embedding| vec![embedding]);
+        let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        match result {
+            Ok(vectors) => EmbeddingRuntimeProbe {
+                reachable: true,
+                detail: format!(
+                    "{} embeddings reachable dim={}",
+                    self.backend_label(),
+                    vectors.first().map(|vector| vector.len()).unwrap_or(0)
+                ),
+                elapsed_ms,
+            },
+            Err(error) => EmbeddingRuntimeProbe {
+                reachable: false,
+                detail: format!("{} embeddings unavailable: {error}", self.backend_label()),
+                elapsed_ms,
+            },
+        }
+    }
+
+    pub fn backend_label(&self) -> &'static str {
+        if self.is_llamacpp() {
+            "llamacpp"
+        } else {
+            "hash"
+        }
+    }
+
+    fn is_llamacpp(&self) -> bool {
+        matches!(
+            self.config.backend.trim().to_ascii_lowercase().as_str(),
+            "" | "auto" | "llamacpp" | "llama_cpp" | "llama.cpp" | "llama-cpp" | "gguf"
+        )
+    }
+
+    fn embed_prepared_with_timeout(&self, prepared: &str, timeout: Duration) -> Result<Vec<f32>> {
+        if prepared.trim().is_empty() {
+            bail!("cannot embed empty text");
+        }
+        if self.is_llamacpp() {
+            llamacpp_embed_with_timeout(&[prepared.to_string()], &self.config, timeout)?
+                .pop()
+                .ok_or_else(|| anyhow!("llama.cpp returned no embedding vector"))
+        } else {
+            Ok(hash_projection_embed(prepared, RETRIEVAL_EMBEDDING_DIM))
+        }
+    }
+
+    fn embed_llamacpp_batched(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.len() <= self.config.batch_size {
+            return llamacpp_embed_with_timeout(texts, &self.config, HTTP_TIMEOUT);
+        }
+        let batches = texts
+            .chunks(self.config.batch_size)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let mut output = Vec::with_capacity(texts.len());
+        for (wave_index, wave) in batches.chunks(self.config.request_count).enumerate() {
+            let mut wave_results = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(wave.len());
+                for (index, batch) in wave.iter().cloned().enumerate() {
+                    let config = self.config.clone();
+                    handles.push(scope.spawn(move || {
+                        llamacpp_embed_with_timeout(&batch, &config, HTTP_TIMEOUT)
+                            .map(|vectors| (index, vectors))
+                    }));
+                }
+                let mut joined = Vec::with_capacity(handles.len());
+                for handle in handles {
+                    joined.push(
+                        handle
+                            .join()
+                            .map_err(|_| anyhow!("llama.cpp embedding worker panicked"))??,
+                    );
+                }
+                Ok::<_, anyhow::Error>(joined)
+            })
+            .with_context(|| format!("embed llama.cpp request wave {wave_index}"))?;
+            wave_results.sort_by_key(|(index, _)| *index);
+            for (_, vectors) in wave_results {
+                output.extend(vectors);
+            }
+        }
+        Ok(output)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntimeProbe {
     pub reachable: bool,
     pub detail: String,
     pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingAcceleratorSmoke {
+    pub elapsed_ms: u64,
+    pub device: EmbeddingDeviceReadiness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,9 +255,28 @@ struct NativeEmbeddingDeviceLaunch {
     requested_device: Option<String>,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct ExactEmbeddingRuntimeState {
+    namespace: String,
+    embed_url: String,
+    embedding_accelerator_request_provider: Option<String>,
+    embedding_accelerator_request_device: Option<String>,
+    embedding_launch: Option<crate::health::EmbeddingLaunchMetadata>,
+    embedding_container_identity: Option<String>,
+}
+
 /// Stable id stored on retrieval manifest rows (backend + model family).
 pub fn embedding_runtime_id() -> String {
-    if llamacpp_backend_selected() {
+    embedding_runtime_id_for_runtime(&crate::config::SidecarRuntimeConfig::local())
+}
+
+pub fn embedding_runtime_id_for_runtime(runtime: &crate::config::SidecarRuntimeConfig) -> String {
+    if runtime
+        .embedding
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("llamacpp")
+    {
         PRODUCT_EMBEDDING_RUNTIME_ID.into()
     } else {
         "hash-projection:768".into()
@@ -114,7 +294,14 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
 pub fn ensure_product_embedding_backend_for_runtime(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Result<()> {
-    ensure_product_embedding_backend_static()?;
+    if !runtime
+        .embedding
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("llamacpp")
+    {
+        bail!("llama.cpp embedding sidecar is mandatory");
+    }
     let deadline = Instant::now() + RUNTIME_EMBED_DEVICE_OBSERVATION_TIMEOUT;
     let mut device = embedding_device_readiness_for_runtime(runtime);
     loop {
@@ -148,25 +335,40 @@ fn ensure_product_embedding_backend_static() -> Result<()> {
 }
 
 pub fn embedding_device_readiness() -> EmbeddingDeviceReadiness {
-    embedding_device_readiness_with_observed_state(None)
+    embedding_device_readiness_with_observed_state(None, None)
 }
 
 pub fn embedding_device_readiness_for_runtime(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> EmbeddingDeviceReadiness {
-    embedding_device_readiness_with_observed_state(observe_sidecar_embedding_device_state(runtime))
+    embedding_device_readiness_with_observed_state(
+        observe_sidecar_embedding_device_state(runtime),
+        Some(runtime),
+    )
 }
 
 fn embedding_device_readiness_with_observed_state(
     sidecar_observed_state: Option<EmbeddingDeviceObservation>,
+    runtime: Option<&crate::config::SidecarRuntimeConfig>,
 ) -> EmbeddingDeviceReadiness {
-    let cpu_allowed = explicit_cpu_allowed();
+    let cpu_allowed = runtime
+        .map(|runtime| {
+            runtime
+                .embedding
+                .device_policy
+                .eq_ignore_ascii_case("allow_cpu")
+        })
+        .unwrap_or_else(explicit_cpu_allowed);
     let detection = host_embedding_device_detection();
     let accelerator_request = (!cpu_allowed).then(default_embedding_accelerator_request);
     let accelerator_requested = accelerator_request.is_some();
     let observation = sidecar_observed_state
         .unwrap_or_else(|| observed_embedding_device_state(cpu_allowed, accelerator_requested));
     let observed_state = observation.state;
+    let detected_provider = detection
+        .as_ref()
+        .map(|gpu| gpu.provider.clone())
+        .or_else(|| observation.detected_provider.map(str::to_string));
     let accelerated = observed_state == "accelerated";
     let full_retrieval_allowed = accelerated || cpu_allowed;
     let requested_policy = if cpu_allowed {
@@ -187,7 +389,7 @@ fn embedding_device_readiness_with_observed_state(
         requested_policy,
         observed_state,
         observation_source: observation.source,
-        detected_provider: detection.as_ref().map(|gpu| gpu.provider.clone()),
+        detected_provider,
         detected_gpu: detection.map(|gpu| gpu.name),
         accelerator_requested,
         accelerator_request_provider: accelerator_request
@@ -205,12 +407,27 @@ fn embedding_device_readiness_with_observed_state(
 fn observe_sidecar_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    if crate::config::embedding_server_launch_mode()
-        .ok()
-        .is_some_and(|mode| mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned)
-    {
-        return observe_native_embedding_device_state(runtime);
+    let (text, source) =
+        match crate::config::embedding_server_launch_mode_for_runtime(runtime).ok()? {
+            crate::config::EmbeddingServerLaunchMode::NativeSpawned => {
+                return observe_native_embedding_device_state(runtime);
+            }
+            crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed => {
+                (read_container_embedding_log(runtime)?, "sidecar_log")
+            }
+            crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => return None,
+        };
+    match observed_embedding_device_state_from_text(&text) {
+        "unknown" => None,
+        state => Some(EmbeddingDeviceObservation {
+            state,
+            source,
+            detected_provider: observed_embedding_provider_from_text(&text),
+        }),
     }
+}
+
+fn read_container_embedding_log(runtime: &crate::config::SidecarRuntimeConfig) -> Option<String> {
     let output = Command::new("docker")
         .args([
             "logs",
@@ -220,38 +437,28 @@ fn observe_sidecar_embedding_device_state(
         ])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    match observed_embedding_device_state_from_text(&text) {
-        "unknown" => None,
-        state => Some(EmbeddingDeviceObservation {
-            state,
-            source: "sidecar_log",
-        }),
-    }
+    output.status.success().then(|| {
+        format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 fn observe_native_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    let text = read_native_embedding_log_tail(
-        &native_embedding_log_path(runtime),
-        NATIVE_LLAMA_LOG_READ_TAIL_BYTES,
-    )
-    .ok();
+    let text =
+        read_native_embedding_log_current_launch_evidence(&native_embedding_log_path(runtime)).ok();
     if let Some(text) = text.as_deref() {
-        match observed_embedding_device_state_from_text(native_embedding_log_current_launch(text)) {
+        match observed_embedding_device_state_from_text(text) {
             "unknown" => {}
             state => {
                 return Some(EmbeddingDeviceObservation {
                     state,
                     source: "native_log",
+                    detected_provider: observed_embedding_provider_from_text(text),
                 });
             }
         }
@@ -283,6 +490,7 @@ fn observe_native_embedding_device_state_from_device_list(
         Some(EmbeddingDeviceObservation {
             state: "accelerated",
             source: "native_device_list",
+            detected_provider: None,
         })
     } else {
         None
@@ -309,12 +517,50 @@ fn native_device_list_proves_accelerator(
 }
 
 pub(crate) fn native_embedding_log_path(runtime: &crate::config::SidecarRuntimeConfig) -> PathBuf {
-    runtime
+    let default = runtime
         .layout
         .state_file
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
-        .join("llama-server-native.log")
+        .join("llama-server-native.log");
+    let Some(state) = std::fs::read_to_string(&runtime.layout.state_file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<crate::sidecar::SidecarStateFile>(&text).ok())
+    else {
+        return default;
+    };
+    if !crate::sidecar::sidecar_state_matches_runtime(&state, runtime) {
+        return default;
+    }
+    let candidate = state
+        .embedding_launch
+        .and_then(|launch| launch.log_path)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "llama-server-native.log")
+        });
+    let Some(candidate) = candidate else {
+        return default;
+    };
+    let cache_root = match runtime.profile {
+        crate::config::SidecarProfile::Local => runtime.layout.state_file.parent(),
+        crate::config::SidecarProfile::Agent => runtime
+            .layout
+            .state_file
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent),
+    };
+    let Some(cache_root) = cache_root.and_then(|path| path.canonicalize().ok()) else {
+        return default;
+    };
+    candidate
+        .canonicalize()
+        .ok()
+        .filter(|path| path.starts_with(cache_root))
+        .unwrap_or(default)
 }
 
 pub(crate) fn prepare_native_embedding_log_for_launch(path: &Path) -> Result<()> {
@@ -343,13 +589,6 @@ pub(crate) fn prepare_native_embedding_log_for_launch(path: &Path) -> Result<()>
     Ok(())
 }
 
-fn read_native_embedding_log_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    Ok(
-        String::from_utf8_lossy(&read_native_embedding_log_tail_bytes(path, max_bytes)?)
-            .into_owned(),
-    )
-}
-
 fn read_native_embedding_log_tail_bytes(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
@@ -360,10 +599,329 @@ fn read_native_embedding_log_tail_bytes(path: &Path, max_bytes: u64) -> std::io:
     Ok(bytes)
 }
 
+fn read_native_embedding_log_current_launch_evidence(path: &Path) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let bounded_len = NATIVE_LLAMA_LOG_READ_START_BYTES + NATIVE_LLAMA_LOG_READ_TAIL_BYTES;
+    if len <= bounded_len {
+        let mut bytes = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes);
+        return text
+            .rfind(NATIVE_LLAMA_LOG_START_MARKER)
+            .map(|offset| text[offset..].to_string())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "native embedding log has no current-launch marker",
+                )
+            });
+    }
+
+    let mut start = Vec::with_capacity(NATIVE_LLAMA_LOG_READ_START_BYTES as usize);
+    file.by_ref()
+        .take(NATIVE_LLAMA_LOG_READ_START_BYTES)
+        .read_to_end(&mut start)?;
+    file.seek(SeekFrom::Start(
+        len.saturating_sub(NATIVE_LLAMA_LOG_READ_TAIL_BYTES),
+    ))?;
+    let mut tail = Vec::with_capacity(NATIVE_LLAMA_LOG_READ_TAIL_BYTES as usize);
+    file.take(NATIVE_LLAMA_LOG_READ_TAIL_BYTES)
+        .read_to_end(&mut tail)?;
+
+    let tail = String::from_utf8_lossy(&tail);
+    if let Some(offset) = tail.rfind(NATIVE_LLAMA_LOG_START_MARKER) {
+        return Ok(tail[offset..].to_string());
+    }
+
+    let start = String::from_utf8_lossy(&start);
+    let offset = start.rfind(NATIVE_LLAMA_LOG_START_MARKER).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native embedding log has no bounded current-launch marker",
+        )
+    })?;
+    let mut evidence = String::with_capacity(start.len() - offset + tail.len() + 1);
+    evidence.push_str(&start[offset..]);
+    if !evidence.ends_with('\n') {
+        evidence.push('\n');
+    }
+    evidence.push_str(&tail);
+    Ok(evidence)
+}
+
+#[cfg(test)]
 fn native_embedding_log_current_launch(text: &str) -> &str {
     text.rfind(NATIVE_LLAMA_LOG_START_MARKER)
         .map(|offset| &text[offset..])
         .unwrap_or(text)
+}
+
+pub fn ensure_embedding_accelerator_smoke_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<Option<EmbeddingAcceleratorSmoke>> {
+    let before = embedding_device_readiness_for_runtime(runtime);
+    if before.cpu_allowed {
+        return Ok(None);
+    }
+    let launch_mode = crate::config::embedding_server_launch_mode_for_runtime(runtime)?;
+    if launch_mode == crate::config::EmbeddingServerLaunchMode::ExternalEndpoint {
+        bail!(
+            "gpu_unverified: external embedding endpoints do not expose CodeStory-owned runtime log offload proof"
+        );
+    }
+    let state = exact_embedding_runtime_state(runtime)?;
+    let request = embedding_accelerator_request_from_runtime_state(&state)?;
+    let native_launch_before = match launch_mode {
+        crate::config::EmbeddingServerLaunchMode::NativeSpawned => {
+            let launch = state.embedding_launch.clone().ok_or_else(|| {
+                anyhow!("gpu_unverified: native embedding runtime state has no launch identity")
+            })?;
+            crate::sidecar::ensure_native_embedding_launch_identity(&launch)
+                .context("gpu_unverified: validate native embedding launch before smoke")?;
+            Some(launch)
+        }
+        crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed => None,
+        crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => unreachable!(),
+    };
+    let container_identity_before =
+        if launch_mode == crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed {
+            Some(ensure_persisted_running_embedding_container_identity_from_state(runtime, &state)?)
+        } else {
+            None
+        };
+    let probe = probe_product_embedding_runtime_with_timeout(runtime, ACCELERATOR_SMOKE_TIMEOUT);
+    let text = if launch_mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned {
+        let after_state = exact_embedding_runtime_state(runtime)?;
+        if after_state != state {
+            bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
+        }
+        let after = after_state.embedding_launch.ok_or_else(|| {
+            anyhow!("gpu_unverified: native embedding launch identity disappeared during smoke")
+        })?;
+        if native_launch_before.as_ref() != Some(&after) {
+            bail!("gpu_unverified: native embedding launch identity changed during smoke");
+        }
+        crate::sidecar::ensure_native_embedding_launch_identity(&after)
+            .context("gpu_unverified: validate native embedding launch after smoke")?;
+        read_native_embedding_log_current_launch_evidence(&native_embedding_log_path(runtime)).ok()
+    } else {
+        let after_state = exact_embedding_runtime_state(runtime)?;
+        if after_state != state {
+            bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
+        }
+        let after = ensure_persisted_running_embedding_container_identity_from_state(
+            runtime,
+            &after_state,
+        )?;
+        if container_identity_before.as_deref() != Some(after.as_str()) {
+            bail!("gpu_unverified: embedding container identity changed during accelerator smoke");
+        }
+        read_container_embedding_log(runtime)
+    };
+    let log_proven = text
+        .as_deref()
+        .is_some_and(|text| runtime_log_proves_requested_accelerator(text, &request));
+    let mut device = embedding_device_readiness_for_runtime(runtime);
+    if log_proven {
+        device.observed_state = "accelerated";
+        device.observation_source =
+            if launch_mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned {
+                "native_log"
+            } else {
+                "sidecar_log"
+            };
+        device.full_retrieval_allowed = true;
+        device.degraded_reason = None;
+    }
+    device.accelerator_requested = true;
+    device.accelerator_request_provider = Some(request.provider.clone());
+    device.accelerator_request_device = request.device.clone();
+    evaluate_embedding_accelerator_smoke(probe, device, log_proven)
+}
+
+fn probe_product_embedding_runtime_with_timeout(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    timeout: Duration,
+) -> EmbeddingRuntimeProbe {
+    let started = Instant::now();
+    let result = LlamaCppEmbeddingClient::new(&runtime.embedding)
+        .and_then(|client| client.embed_query_with_timeout("codestory accelerator smoke", timeout));
+    let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    match result {
+        Ok(vector) => EmbeddingRuntimeProbe {
+            reachable: true,
+            detail: format!("llamacpp embeddings reachable dim={}", vector.len()),
+            elapsed_ms,
+        },
+        Err(error) => EmbeddingRuntimeProbe {
+            reachable: false,
+            detail: format!("llamacpp embeddings unavailable: {error}"),
+            elapsed_ms,
+        },
+    }
+}
+
+pub(crate) fn running_embedding_container_identity(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<String> {
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}",
+            &format!("{}-embed", runtime.compose_project),
+        ])
+        .output()
+        .context("gpu_unverified: inspect embedding container identity")?;
+    if !output.status.success() {
+        bail!("gpu_unverified: embedding container identity is unavailable");
+    }
+    validate_running_embedding_container_identity(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub(crate) fn ensure_persisted_running_embedding_container_identity(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<String> {
+    let state = exact_embedding_runtime_state(runtime)?;
+    ensure_persisted_running_embedding_container_identity_from_state(runtime, &state)
+}
+
+fn ensure_persisted_running_embedding_container_identity_from_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    state: &ExactEmbeddingRuntimeState,
+) -> Result<String> {
+    let identity = running_embedding_container_identity(runtime)?;
+    validate_persisted_running_embedding_container_identity(
+        state.embedding_container_identity.as_deref(),
+        &identity,
+    )?;
+    Ok(identity)
+}
+
+fn validate_persisted_running_embedding_container_identity(
+    persisted: Option<&str>,
+    running: &str,
+) -> Result<()> {
+    if persisted != Some(running) {
+        bail!(
+            "gpu_unverified: running embedding container does not match persisted runtime identity"
+        );
+    }
+    Ok(())
+}
+
+fn validate_running_embedding_container_identity(output: &str) -> Result<String> {
+    let identity = output.trim().to_string();
+    if identity.is_empty() || !identity.ends_with("|true") {
+        bail!("gpu_unverified: embedding container is not running");
+    }
+    Ok(identity)
+}
+
+fn exact_embedding_runtime_state(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Result<ExactEmbeddingRuntimeState> {
+    let state: ExactEmbeddingRuntimeState =
+        serde_json::from_slice(&std::fs::read(&runtime.layout.state_file).with_context(|| {
+            format!(
+                "gpu_unverified: read exact embedding runtime state {}",
+                runtime.layout.state_file.display()
+            )
+        })?)
+        .context("gpu_unverified: parse exact embedding runtime state")?;
+    if state.namespace != runtime.namespace || state.embed_url != runtime.embedding.endpoint {
+        bail!(
+            "gpu_unverified: embedding runtime state does not match selected namespace and endpoint"
+        );
+    }
+    Ok(state)
+}
+
+fn embedding_accelerator_request_from_runtime_state(
+    state: &ExactEmbeddingRuntimeState,
+) -> Result<EmbeddingAcceleratorRequest> {
+    let provider = state
+        .embedding_accelerator_request_provider
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!("gpu_unverified: embedding runtime state has no requested provider")
+        })?;
+    let device = state
+        .embedding_accelerator_request_device
+        .clone()
+        .or_else(|| {
+            state
+                .embedding_launch
+                .as_ref()
+                .and_then(|launch| launch.requested_device.clone())
+        });
+    Ok(EmbeddingAcceleratorRequest {
+        provider,
+        device,
+        n_gpu_layers: String::new(),
+    })
+}
+
+fn evaluate_embedding_accelerator_smoke(
+    probe: EmbeddingRuntimeProbe,
+    device: EmbeddingDeviceReadiness,
+    log_proven: bool,
+) -> Result<Option<EmbeddingAcceleratorSmoke>> {
+    if device.cpu_allowed {
+        return Ok(None);
+    }
+    let elapsed_ms = probe.elapsed_ms.ok_or_else(|| {
+        anyhow!("gpu_unverified: embedding smoke produced no bounded timing evidence")
+    })?;
+    if !probe.reachable || !log_proven || device.observed_state != "accelerated" {
+        bail!(
+            "gpu_unverified: embedding smoke failed before long semantic indexing: reachable={} elapsed_ms={} runtime_log_offload={} requested_provider={} requested_device={}",
+            probe.reachable,
+            elapsed_ms,
+            log_proven,
+            device
+                .accelerator_request_provider
+                .as_deref()
+                .unwrap_or("none"),
+            device
+                .accelerator_request_device
+                .as_deref()
+                .unwrap_or("none")
+        );
+    }
+    Ok(Some(EmbeddingAcceleratorSmoke { elapsed_ms, device }))
+}
+
+fn runtime_log_proves_requested_accelerator(
+    text: &str,
+    request: &EmbeddingAcceleratorRequest,
+) -> bool {
+    let text = text.to_ascii_lowercase();
+    let provider = request.provider.to_ascii_lowercase();
+    let provider_offload_proven = if provider == "metal" {
+        observe_metal_runtime(&text).offload_proven
+    } else {
+        let provider_seen = text.contains(&provider)
+            || crate::config::selected_llama_sidecar_backend(&request.provider).is_some_and(
+                |backend| {
+                    backend
+                        .log_markers
+                        .iter()
+                        .any(|marker| text.contains(&marker.to_ascii_lowercase()))
+                },
+            );
+        provider_seen
+            && text
+                .lines()
+                .any(|line| line_reports_gpu_offload(line) == Some(true))
+    };
+    let device_seen = request
+        .device
+        .as_deref()
+        .is_none_or(|device| text.contains(&device.to_ascii_lowercase()));
+    provider_offload_proven && device_seen
 }
 
 pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
@@ -417,6 +975,7 @@ fn explicit_cpu_allowed() -> bool {
 struct EmbeddingDeviceObservation {
     state: &'static str,
     source: &'static str,
+    detected_provider: Option<&'static str>,
 }
 
 fn observed_embedding_device_state(
@@ -438,33 +997,47 @@ fn observed_embedding_device_state(
         return EmbeddingDeviceObservation {
             state,
             source: "manual_env",
+            detected_provider: None,
         };
     }
     if cpu_allowed {
         return EmbeddingDeviceObservation {
             state: "cpu",
             source: "cpu_policy",
+            detected_provider: None,
         };
     }
     if accelerator_requested {
         return EmbeddingDeviceObservation {
             state: "unknown",
             source: "accelerator_request_unobserved",
+            detected_provider: None,
         };
     }
     EmbeddingDeviceObservation {
         state: "unknown",
         source: "sidecar_unobserved",
+        detected_provider: None,
     }
+}
+
+fn observed_embedding_provider_from_text(text: &str) -> Option<&'static str> {
+    observe_metal_runtime(text)
+        .provider_observed
+        .then_some("metal")
 }
 
 fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     let mut saw_cpu = false;
     let mut saw_accelerated = false;
-    let mut saw_metal = false;
     let text = text.to_ascii_lowercase();
     let log_markers = selected_backend_log_markers();
     let metal_requested = log_markers.iter().any(|marker| marker == "metal");
+    let metal = if metal_requested {
+        observe_metal_runtime(&text)
+    } else {
+        MetalRuntimeObservation::default()
+    };
     for line in text.lines() {
         if line_reports_gpu_offload(line) == Some(true) {
             saw_accelerated = true;
@@ -476,9 +1049,6 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         {
             saw_accelerated = true;
         }
-        if metal_requested && line_reports_metal_evidence(line) {
-            saw_metal = true;
-        }
         saw_cpu |= line_reports_gpu_offload(line) == Some(false)
             || line.contains("n_gpu_layers = 0")
             || line.contains("using cpu")
@@ -489,8 +1059,9 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
         "accelerated"
     } else if saw_cpu {
         "cpu"
-    } else if saw_metal
-        || (!log_markers.is_empty()
+    } else if metal.provider_observed
+        || (!metal_requested
+            && !log_markers.is_empty()
             && log_markers
                 .iter()
                 .all(|marker| text.contains(&marker.to_ascii_lowercase())))
@@ -501,11 +1072,70 @@ fn observed_embedding_device_state_from_text(text: &str) -> &'static str {
     }
 }
 
-fn line_reports_metal_evidence(line: &str) -> bool {
-    line.contains("ggml_metal_init")
-        || line.contains("metal backend")
-        || line.trim_start().starts_with("mtl0")
-        || line.trim_start().starts_with("mtl :")
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MetalRuntimeObservation {
+    provider_observed: bool,
+    offload_proven: bool,
+}
+
+fn observe_metal_runtime(text: &str) -> MetalRuntimeObservation {
+    let mut observation = MetalRuntimeObservation::default();
+    let text = text.to_ascii_lowercase();
+    for line in text.lines() {
+        match metal_runtime_event(line) {
+            Some(true) => observation.provider_observed = true,
+            Some(false) => {
+                observation = MetalRuntimeObservation::default();
+                continue;
+            }
+            None => {}
+        }
+        if observation.provider_observed && line_reports_gpu_offload(line) == Some(true) {
+            observation.offload_proven = true;
+        }
+    }
+    observation
+}
+
+fn metal_runtime_event(line: &str) -> Option<bool> {
+    let line = line.trim_start();
+    let prefixed_mtl_device = line.contains("- mtl0") && line.contains(": apple");
+    let metal_line = line.starts_with("mtl0")
+        || line.starts_with("mtl :")
+        || prefixed_mtl_device
+        || line.contains("ggml_metal_init")
+        || line.contains("metal backend");
+    if !metal_line {
+        return None;
+    }
+    let rejected = [
+        "fail",
+        "error",
+        "unavailable",
+        "disabled",
+        "not ",
+        "unsupported",
+        "unable",
+        "could not",
+        "no metal",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker));
+    if rejected {
+        return Some(false);
+    }
+    let affirmative = [
+        "found device",
+        "picking default device",
+        "using embedded metal library",
+        "ready",
+        "initialized",
+        "registered",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker));
+    (line.starts_with("mtl0") || line.starts_with("mtl :") || prefixed_mtl_device || affirmative)
+        .then_some(true)
 }
 
 fn selected_backend_log_markers() -> Vec<String> {
@@ -636,8 +1266,15 @@ fn env_truthy(name: &str) -> bool {
 }
 
 pub fn embed_query(text: &str) -> Result<Vec<f32>> {
-    let prefix = query_prefix();
-    embed_prepared(&format!("{prefix}{text}"))
+    LlamaCppEmbeddingClient::new(&crate::config::SidecarRuntimeConfig::local().embedding)?
+        .embed_query(text)
+}
+
+pub fn embed_query_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    text: &str,
+) -> Result<Vec<f32>> {
+    LlamaCppEmbeddingClient::new(&runtime.embedding)?.embed_query(text)
 }
 
 /// Active embedding backend label for ops/status (`hash`, `llamacpp`).
@@ -649,51 +1286,36 @@ pub fn embedding_backend_label() -> &'static str {
     }
 }
 
-pub fn embed_documents(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    if texts.is_empty() {
-        return Ok(Vec::new());
-    }
-    let prefix = std::env::var(DOCUMENT_PREFIX_ENV).unwrap_or_default();
-    let prepared = texts
-        .iter()
-        .map(|text| format!("{prefix}{text}"))
-        .collect::<Vec<_>>();
-    if prepared.iter().any(|text| text.trim().is_empty()) {
-        bail!("cannot embed empty text");
-    }
-    if llamacpp_backend_selected() {
-        llamacpp_embed_batched(&prepared)
-    } else {
-        Ok(prepared
-            .iter()
-            .map(|text| hash_projection_embed(text, RETRIEVAL_EMBEDDING_DIM))
-            .collect())
-    }
-}
-
-fn query_prefix() -> String {
-    if let Ok(value) = std::env::var(QUERY_PREFIX_ENV)
-        && (!value.is_empty() || !llamacpp_backend_selected())
+pub fn embedding_backend_label_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> &'static str {
+    if runtime
+        .embedding
+        .backend
+        .trim()
+        .eq_ignore_ascii_case("llamacpp")
     {
-        return value;
+        "llamacpp"
+    } else {
+        "hash"
     }
-    if llamacpp_backend_selected() {
-        return BGE_QUERY_PREFIX_DEFAULT.to_string();
-    }
-    String::new()
 }
 
-fn embed_prepared(prepared: &str) -> Result<Vec<f32>> {
-    if prepared.trim().is_empty() {
-        bail!("cannot embed empty text");
-    }
-    if llamacpp_backend_selected() {
-        llamacpp_embed(&[prepared.to_string()])?
-            .pop()
-            .ok_or_else(|| anyhow!("llama.cpp returned no embedding vector"))
-    } else {
-        Ok(hash_projection_embed(prepared, RETRIEVAL_EMBEDDING_DIM))
-    }
+#[cfg(test)]
+pub fn embed_documents(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    let runtime = crate::config::test_sidecar_runtime_from_env(
+        None,
+        crate::config::SidecarProfile::Local,
+        None,
+    );
+    LlamaCppEmbeddingClient::new(&runtime.embedding)?.embed_documents(texts)
+}
+
+pub fn embed_documents_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+    texts: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    LlamaCppEmbeddingClient::new(&runtime.embedding)?.embed_documents(texts)
 }
 
 fn llamacpp_backend_selected() -> bool {
@@ -706,106 +1328,29 @@ fn llamacpp_backend_selected() -> bool {
     }
 }
 
-fn llamacpp_embed(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    let url = llamacpp_url()?;
-    llamacpp_embed_with_timeout(texts, &url, HTTP_TIMEOUT)
-}
-
-fn llamacpp_embed_batched(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    let batch_size = env_usize(
-        LLAMACPP_BATCH_SIZE_ENV,
-        DEFAULT_LLAMACPP_BATCH_SIZE,
-        1,
-        1024,
-    );
-    let request_count = env_usize(
-        LLAMACPP_REQUEST_COUNT_ENV,
-        DEFAULT_LLAMACPP_REQUEST_COUNT,
-        1,
-        16,
-    );
-    if texts.len() <= batch_size {
-        return llamacpp_embed(texts);
-    }
-
-    let url = llamacpp_url()?;
-    let batches = texts
-        .chunks(batch_size)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    let mut output = Vec::with_capacity(texts.len());
-    for (wave_index, wave) in batches.chunks(request_count).enumerate() {
-        let mut wave_results = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(wave.len());
-            for (index, batch) in wave.iter().cloned().enumerate() {
-                let url = url.clone();
-                handles.push(scope.spawn(move || {
-                    llamacpp_embed_with_timeout(&batch, &url, HTTP_TIMEOUT)
-                        .map(|vectors| (index, vectors))
-                }));
-            }
-            let mut joined = Vec::with_capacity(handles.len());
-            for handle in handles {
-                joined.push(
-                    handle
-                        .join()
-                        .map_err(|_| anyhow!("llama.cpp embedding worker panicked"))??,
-                );
-            }
-            Ok::<_, anyhow::Error>(joined)
-        })
-        .with_context(|| format!("embed llama.cpp request wave {wave_index}"))?;
-        wave_results.sort_by_key(|(index, _)| *index);
-        for (_, vectors) in wave_results {
-            output.extend(vectors);
-        }
-    }
-    Ok(output)
-}
-
-fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .map(|value| value.clamp(min, max))
-        .unwrap_or(default)
-}
-
 pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
-    let started = Instant::now();
-    let result = llamacpp_url().and_then(|url| {
-        llamacpp_embed_with_timeout(
-            &["codestory health probe".to_string()],
-            &url,
-            HEALTH_TIMEOUT,
-        )
-    });
-    let elapsed_ms = Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
-    match result {
-        Ok(vectors) => EmbeddingRuntimeProbe {
-            reachable: true,
-            detail: format!(
-                "llama.cpp embeddings reachable dim={}",
-                vectors.first().map(|vector| vector.len()).unwrap_or(0)
-            ),
-            elapsed_ms,
-        },
-        Err(error) => EmbeddingRuntimeProbe {
+    probe_product_embedding_runtime_for_runtime(&crate::config::SidecarRuntimeConfig::local())
+}
+
+pub fn probe_product_embedding_runtime_for_runtime(
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> EmbeddingRuntimeProbe {
+    LlamaCppEmbeddingClient::new(&runtime.embedding)
+        .map(|client| client.probe())
+        .unwrap_or_else(|error| EmbeddingRuntimeProbe {
             reachable: false,
             detail: format!("llama.cpp embeddings unavailable: {error}"),
-            elapsed_ms,
-        },
-    }
+            elapsed_ms: None,
+        })
 }
 
-fn llamacpp_url() -> Result<String> {
-    let url = std::env::var(LLAMACPP_URL_ENV).unwrap_or_else(|_| DEFAULT_LLAMACPP_URL.to_string());
-    ensure_llamacpp_url_allowed(&url)?;
-    Ok(url)
-}
-
+#[cfg(test)]
 fn ensure_llamacpp_url_allowed(url: &str) -> Result<()> {
-    if !allow_remote_embeddings() && !is_loopback_embedding_url(url) {
+    ensure_llamacpp_url_allowed_with_policy(url, allow_remote_embeddings())
+}
+
+fn ensure_llamacpp_url_allowed_with_policy(url: &str, allow_remote: bool) -> Result<()> {
+    if !allow_remote && !is_loopback_embedding_url(url) {
         bail!(
             "remote embedding URL is disabled; use a loopback URL or set {ALLOW_REMOTE_EMBEDDINGS_ENV}=1"
         );
@@ -813,6 +1358,7 @@ fn ensure_llamacpp_url_allowed(url: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn allow_remote_embeddings() -> bool {
     std::env::var(ALLOW_REMOTE_EMBEDDINGS_ENV)
         .ok()
@@ -849,26 +1395,42 @@ fn http_url_host(url: &str) -> Option<&str> {
 
 fn llamacpp_embed_with_timeout(
     texts: &[String],
-    url: &str,
+    config: &crate::config::EmbeddingRuntimeConfig,
     timeout: Duration,
 ) -> Result<Vec<Vec<f32>>> {
+    let model = config
+        .model_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&config.profile);
     let body = serde_json::json!({
         "input": texts,
-        "model": "bge-base-en-v1.5",
+        "model": model,
     });
     let payload = serde_json::to_string(&body).context("serialize embeddings request")?;
-    let response = read_text(
-        ureq::post(url)
+    let display_endpoint = crate::config::redacted_embedding_endpoint(&config.endpoint);
+    let agent = ureq::builder().redirects(0).build();
+    let response = read_bytes(
+        agent
+            .post(&config.endpoint)
             .timeout(timeout)
             .set("Content-Type", "application/json")
             .send_string(&payload),
     )
-    .map_err(|error| anyhow!("llama.cpp embeddings request failed: {error}"))?;
+    .map_err(|error| {
+        anyhow!(
+            "llama.cpp embeddings request to {display_endpoint} failed: {}",
+            redact_embedding_error(&config.endpoint, &error.to_string())
+        )
+    })?;
     let status = response.status;
     if !(200..300).contains(&status) {
-        bail!("llama.cpp embeddings http {status}");
+        bail!("llama.cpp embeddings endpoint {display_endpoint} returned HTTP {status}");
     }
-    parse_openai_embeddings(&response.body, true)
+    let response_body = std::str::from_utf8(&response.body)
+        .with_context(|| format!("decode UTF-8 JSON from llama.cpp endpoint {display_endpoint}"))?;
+    parse_openai_embeddings(response_body, texts.len(), expected_embedding_dim(config))
+        .with_context(|| format!("parse response from llama.cpp endpoint {display_endpoint}"))
 }
 
 #[derive(Deserialize)]
@@ -878,27 +1440,118 @@ struct OpenAiEmbeddingsResponse {
 
 #[derive(Deserialize)]
 struct OpenAiEmbeddingRow {
+    index: Option<usize>,
     embedding: Vec<f32>,
 }
 
-fn parse_openai_embeddings(body: &str, require_llamacpp_dim: bool) -> Result<Vec<Vec<f32>>> {
+fn parse_openai_embeddings(
+    body: &str,
+    expected_count: usize,
+    expected_dim: Option<usize>,
+) -> Result<Vec<Vec<f32>>> {
     let parsed: OpenAiEmbeddingsResponse =
         serde_json::from_str(body).context("parse llama.cpp embeddings json")?;
-    if parsed.data.is_empty() {
-        bail!("llama.cpp embeddings response had no data rows");
+    if parsed.data.len() != expected_count {
+        bail!(
+            "llama.cpp embeddings response returned {} vectors for {expected_count} inputs",
+            parsed.data.len()
+        );
     }
-    let mut vectors = Vec::with_capacity(parsed.data.len());
+    let mut indexed = Vec::with_capacity(parsed.data.len());
+    let mut seen = std::collections::BTreeSet::new();
     for row in parsed.data {
-        if require_llamacpp_dim && row.embedding.len() != RETRIEVAL_EMBEDDING_DIM {
+        let index = row
+            .index
+            .ok_or_else(|| anyhow!("llama.cpp embeddings response row missing `index`"))?;
+        if index >= expected_count {
+            bail!("llama.cpp embeddings response index {index} is outside 0..{expected_count}");
+        }
+        if !seen.insert(index) {
+            bail!("llama.cpp embeddings response duplicated index {index}");
+        }
+        if expected_dim.is_some_and(|expected| row.embedding.len() != expected) {
+            let expected_dim = expected_dim.expect("checked above");
             bail!(
-                "llama.cpp embedding dim {} != expected {} (bge-base-en-v1.5); check model GGUF and CODESTORY_EMBED_BACKEND",
+                "llama.cpp embedding dim {} != expected {}; check the configured model profile and GGUF",
                 row.embedding.len(),
-                RETRIEVAL_EMBEDDING_DIM
+                expected_dim
             );
         }
-        vectors.push(row.embedding);
+        indexed.push((index, row.embedding));
     }
-    Ok(vectors)
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, vector)| vector).collect())
+}
+
+fn expected_embedding_dim(config: &crate::config::EmbeddingRuntimeConfig) -> Option<usize> {
+    config
+        .expected_dim
+        .or(config.truncate_dim)
+        .or_else(|| named_embedding_profile_dim(&config.profile))
+}
+
+fn named_embedding_profile_dim(profile: &str) -> Option<usize> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "minilm" | "minilm-l6-v2" | "all-minilm-l6-v2" | "bge-small" | "bge-small-en-v1.5" => {
+            Some(384)
+        }
+        "bge-base"
+        | "bge-base-en-v1.5"
+        | "baai/bge-base-en-v1.5"
+        | "embeddinggemma"
+        | "embeddinggemma-300m"
+        | "gemma"
+        | "gemma-embedding-300m"
+        | "google/embeddinggemma-300m"
+        | "nomic"
+        | "nomic-v1.5"
+        | "nomic-embed-text-v1.5"
+        | "nomic-v2"
+        | "nomic-embed-text-v2"
+        | "nomic-embed-text-v2-moe" => Some(768),
+        "qwen" | "qwen3" | "qwen3-embedding-0.6b" | "qwen/qwen3-embedding-0.6b" => Some(1024),
+        _ => None,
+    }
+}
+
+fn redact_embedding_error(endpoint: &str, error: &str) -> String {
+    let display = crate::config::redacted_embedding_endpoint(endpoint);
+    let mut redacted = error.replace(endpoint, &display);
+    let rest = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if let Some((userinfo, host)) = authority.rsplit_once('@') {
+        redacted = redacted
+            .replace(authority, host)
+            .replace(userinfo, "[redacted]");
+        for secret in userinfo.split(':') {
+            if !secret.is_empty() {
+                redacted = redacted.replace(secret, "[redacted]");
+            }
+        }
+    }
+    if let Some(query) = endpoint.split_once('?').map(|(_, value)| value) {
+        let query = query.split('#').next().unwrap_or_default();
+        if !query.is_empty() {
+            redacted = redacted.replace(query, "[redacted]");
+        }
+        for value in query
+            .split('&')
+            .filter_map(|pair| pair.split_once('=').map(|(_, value)| value))
+            .filter(|value| !value.is_empty())
+        {
+            redacted = redacted.replace(value, "[redacted]");
+        }
+    }
+    if let Some(fragment) = endpoint.split_once('#').map(|(_, value)| value)
+        && !fragment.is_empty()
+    {
+        redacted = redacted.replace(fragment, "[redacted]");
+    }
+    redacted
 }
 
 /// Same algorithm as `codestory_runtime::search::engine::embed_text_with_hash_projection`.
@@ -952,6 +1605,299 @@ mod tests {
     use super::*;
     use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
     use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    fn runtime_from_env() -> SidecarRuntimeConfig {
+        crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
+    }
+
+    fn llama_client_config(endpoint: String) -> crate::config::EmbeddingRuntimeConfig {
+        crate::config::EmbeddingRuntimeConfig {
+            configuration_error: None,
+            backend: "llamacpp".into(),
+            endpoint,
+            endpoint_origin: crate::config::EmbeddingEndpointOrigin::TrustedProjectConfig,
+            profile: "custom".into(),
+            model_id: Some("retained-model-id".into()),
+            pooling: None,
+            query_prefix: None,
+            document_prefix: None,
+            layer_norm: None,
+            truncate_dim: None,
+            expected_dim: Some(3),
+            batch_size: 128,
+            request_count: 1,
+            allow_remote: false,
+            device_policy: "allow_cpu".into(),
+            server_launch: Some("external_endpoint".into()),
+        }
+    }
+
+    fn one_shot_embedding_server(
+        status: &str,
+        headers: &str,
+        body: String,
+    ) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
+        let url = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("embedding server address")
+        );
+        let status = status.to_string();
+        let headers = headers.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read embedding request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len().saturating_sub(header_end) >= content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write embedding response");
+            String::from_utf8(request).expect("embedding request utf8")
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn openai_embedding_rows_are_sorted_by_index() {
+        let body = serde_json::json!({"data": [
+            {"index": 1, "embedding": [0.0, 1.0, 0.0]},
+            {"index": 0, "embedding": [1.0, 0.0, 0.0]}
+        ]})
+        .to_string();
+
+        let vectors = parse_openai_embeddings(&body, 2, Some(3)).expect("parse rows");
+
+        assert_eq!(vectors[0], vec![1.0, 0.0, 0.0]);
+        assert_eq!(vectors[1], vec![0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn openai_embedding_rows_reject_invalid_index_sets_and_counts() {
+        for (body, expected_count, expected) in [
+            (
+                serde_json::json!({"data": [
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 0, "embedding": [2.0]}
+                ]})
+                .to_string(),
+                2,
+                "duplicated index 0",
+            ),
+            (
+                serde_json::json!({"data": [{"embedding": [1.0]}]}).to_string(),
+                1,
+                "missing `index`",
+            ),
+            (
+                serde_json::json!({"data": [{"index": 2, "embedding": [1.0]}]}).to_string(),
+                1,
+                "outside 0..1",
+            ),
+            (
+                serde_json::json!({"data": [{"index": 0, "embedding": [1.0]}]}).to_string(),
+                2,
+                "1 vectors for 2 inputs",
+            ),
+            (
+                serde_json::json!({"data": [
+                    {"index": 0, "embedding": [1.0]},
+                    {"index": 1, "embedding": [2.0]}
+                ]})
+                .to_string(),
+                1,
+                "2 vectors for 1 inputs",
+            ),
+        ] {
+            let error = parse_openai_embeddings(&body, expected_count, None)
+                .expect_err("invalid response must fail");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn named_embedding_profiles_supply_dimensions_with_explicit_precedence() {
+        let mut config = llama_client_config("http://127.0.0.1:8080/v1/embeddings".into());
+        config.expected_dim = None;
+        config.profile = "qwen3-embedding-0.6b".into();
+        assert_eq!(expected_embedding_dim(&config), Some(1024));
+        config.truncate_dim = Some(256);
+        assert_eq!(expected_embedding_dim(&config), Some(256));
+        config.expected_dim = Some(128);
+        assert_eq!(expected_embedding_dim(&config), Some(128));
+    }
+
+    #[test]
+    fn production_llamacpp_client_uses_retained_model_and_sorted_rows() -> Result<()> {
+        let response = serde_json::json!({"data": [
+            {"index": 1, "embedding": [0.0, 1.0, 0.0]},
+            {"index": 0, "embedding": [1.0, 0.0, 0.0]}
+        ]})
+        .to_string();
+        let (url, request) = one_shot_embedding_server("200 OK", "", response);
+        let client = LlamaCppEmbeddingClient::new(&llama_client_config(url))?;
+
+        let vectors = client.embed_prepared_texts(&["alpha".into(), "beta".into()])?;
+        let request = request.join().expect("embedding server thread");
+
+        assert_eq!(vectors[0], vec![1.0, 0.0, 0.0]);
+        assert_eq!(vectors[1], vec![0.0, 1.0, 0.0]);
+        assert!(request.contains("retained-model-id"), "{request}");
+        Ok(())
+    }
+
+    #[test]
+    fn query_embedding_honors_request_deadline_timeout() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!(
+            "http://{}/v1/embeddings",
+            listener.local_addr().expect("embedding server address")
+        );
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept embedding request");
+            thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+        let client = LlamaCppEmbeddingClient::new(&llama_client_config(url))?;
+        let started = Instant::now();
+
+        client
+            .embed_query_with_timeout("deadline", Duration::from_millis(20))
+            .expect_err("request deadline should stop a stalled embedding response");
+
+        assert!(started.elapsed() < Duration::from_millis(150));
+        server.join().expect("embedding server thread");
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_client_rejects_redirects_and_redacts_endpoint_secrets() -> Result<()> {
+        let (url, request) = one_shot_embedding_server(
+            "302 Found",
+            "Location: http://127.0.0.1:9/redirected\r\n",
+            "redirect".into(),
+        );
+        let secret_url = format!(
+            "{}?token=query-secret#fragment-secret",
+            url.replacen("http://", "http://username-secret:password-secret@", 1)
+        );
+        let error = LlamaCppEmbeddingClient::new(&llama_client_config(secret_url))?
+            .embed_prepared_texts(&["alpha".into()])
+            .expect_err("redirect must not be followed");
+        request.join().expect("embedding server thread");
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("302"), "{rendered}");
+        for secret in [
+            "username-secret",
+            "password-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_transport_errors_redact_endpoint_secrets() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        let endpoint = format!(
+            "http://username-secret:password-secret@{address}/v1/embeddings?token=query-secret#fragment-secret"
+        );
+        let error = LlamaCppEmbeddingClient::new(&llama_client_config(endpoint))?
+            .embed_prepared_texts(&["alpha".into()])
+            .expect_err("closed endpoint must fail");
+
+        let rendered = format!("{error:#}");
+        for secret in [
+            "username-secret",
+            "password-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_invalid_json_errors_redact_endpoint_secrets() -> Result<()> {
+        let (url, request) = one_shot_embedding_server("200 OK", "", "invalid".into());
+        let endpoint = format!(
+            "{}?token=query-secret#fragment-secret",
+            url.replacen("http://", "http://username-secret:password-secret@", 1)
+        );
+        let error = LlamaCppEmbeddingClient::new(&llama_client_config(endpoint))?
+            .embed_prepared_texts(&["alpha".into()])
+            .expect_err("invalid JSON must fail");
+        request.join().expect("embedding server thread");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("parse llama.cpp embeddings json"),
+            "{rendered}"
+        );
+        for secret in [
+            "username-secret",
+            "password-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_llamacpp_client_accepts_json_over_ten_mib() -> Result<()> {
+        let response = serde_json::json!({
+            "padding": "x".repeat(10 * 1024 * 1024 + 1),
+            "data": [{"index": 0, "embedding": [1.0, 0.0, 0.0]}]
+        })
+        .to_string();
+        let (url, request) = one_shot_embedding_server("200 OK", "", response);
+
+        let vectors = LlamaCppEmbeddingClient::new(&llama_client_config(url))?
+            .embed_prepared_texts(&["alpha".into()])?;
+        request.join().expect("embedding server thread");
+
+        assert_eq!(vectors, vec![vec![1.0, 0.0, 0.0]]);
+        Ok(())
+    }
 
     #[test]
     fn hash_projection_dim_matches_retrieval_embedding_dim() {
@@ -987,7 +1933,11 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::remove("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS");
         let _guard2 = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
-        assert_eq!(embedding_runtime_id(), PRODUCT_EMBEDDING_RUNTIME_ID);
+        let runtime = runtime_from_env();
+        assert_eq!(
+            embedding_runtime_id_for_runtime(&runtime),
+            PRODUCT_EMBEDDING_RUNTIME_ID
+        );
         assert_eq!(qdrant_vector_dim(), RETRIEVAL_EMBEDDING_DIM);
     }
 
@@ -996,7 +1946,11 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _guard2 = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
-        assert_eq!(embedding_runtime_id(), "llamacpp:bge-base-en-v1.5");
+        let runtime = runtime_from_env();
+        assert_eq!(
+            embedding_runtime_id_for_runtime(&runtime),
+            "llamacpp:bge-base-en-v1.5"
+        );
     }
 
     #[test]
@@ -1005,9 +1959,11 @@ mod tests {
         let _guard = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
         let _guard2 = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
 
-        assert_eq!(embedding_runtime_id(), "hash-projection:768");
+        let runtime = runtime_from_env();
+        let runtime_id = embedding_runtime_id_for_runtime(&runtime);
+        assert_eq!(runtime_id, "hash-projection:768");
         assert!(!manifest_embedding_backend_is_product(Some(
-            embedding_runtime_id().as_str()
+            runtime_id.as_str()
         )));
         let error = ensure_product_embedding_backend()
             .expect_err("explicit ONNX should not satisfy product sidecar indexing");
@@ -1153,6 +2109,7 @@ mod tests {
         );
         assert_eq!(request.provider, "vulkan");
         assert_eq!(request.device.as_deref(), Some("Vulkan0"));
+
         assert_eq!(request.n_gpu_layers, "99");
     }
 
@@ -1293,6 +2250,219 @@ mod tests {
     }
 
     #[test]
+    fn accelerator_smoke_requires_requested_device_offload_and_timing() {
+        let mut request = EmbeddingAcceleratorRequest {
+            provider: "vulkan".into(),
+            device: Some("Vulkan0".into()),
+            n_gpu_layers: "99".into(),
+        };
+        assert!(runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\nusing device Vulkan0\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\nusing device Vulkan1\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\nusing device Vulkan0\noffloaded 0/13 layers to GPU\n",
+            &request,
+        ));
+
+        request.provider = "metal".into();
+        request.device = None;
+        let metal_log =
+            "ggml_metal_init: found device Metal0: Apple M5\noffloaded 13/13 layers to GPU\n";
+        assert!(runtime_log_proves_requested_accelerator(
+            metal_log, &request
+        ));
+        assert!(runtime_log_proves_requested_accelerator(
+            "0.06 I common_param:   - MTL0 : Apple M5\n\
+             load_tensors: offloaded 13/13 layers to GPU\n\
+             ggml_metal_init: found device: Apple M5\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "vulkan backend ready\noffloaded 13/13 layers to GPU\n\
+             0.06 I common_param:   - MTL0 : Apple M5\n",
+            &request,
+        ));
+        assert_eq!(
+            observed_embedding_provider_from_text(metal_log),
+            Some("metal")
+        );
+        assert!(!runtime_log_proves_requested_accelerator(
+            "starting /tmp/macos-arm64-metal/llama-server\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        assert!(!runtime_log_proves_requested_accelerator(
+            "ggml_metal_init: failed to initialize Metal backend\nvulkan backend ready\noffloaded 13/13 layers to GPU\n",
+            &request,
+        ));
+        let invalidated_metal_log = "ggml_metal_init: found device Metal0: Apple M5\n\
+ggml_metal_init: failed to initialize Metal backend\n\
+vulkan backend ready\n\
+offloaded 13/13 layers to GPU\n";
+        assert!(!runtime_log_proves_requested_accelerator(
+            invalidated_metal_log,
+            &request,
+        ));
+        assert_eq!(
+            observed_embedding_provider_from_text(invalidated_metal_log),
+            None
+        );
+
+        let device = EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "native_log",
+            detected_provider: Some("amd".into()),
+            detected_gpu: Some("AMD GPU".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("vulkan".into()),
+            accelerator_request_device: Some("Vulkan0".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        };
+        let error = evaluate_embedding_accelerator_smoke(
+            EmbeddingRuntimeProbe {
+                reachable: true,
+                detail: "reachable".into(),
+                elapsed_ms: None,
+            },
+            device,
+            true,
+        )
+        .expect_err("missing timing must not verify accelerator work");
+        assert!(error.to_string().contains("gpu_unverified"));
+    }
+
+    #[test]
+    fn container_identity_requires_running_state() {
+        assert_eq!(
+            validate_running_embedding_container_identity("abc|2026-07-12T00:00:00Z|true\n")
+                .expect("running identity"),
+            "abc|2026-07-12T00:00:00Z|true"
+        );
+        assert!(
+            validate_running_embedding_container_identity("abc|2026-07-12T00:00:00Z|false")
+                .expect_err("stopped container must fail")
+                .to_string()
+                .contains("not running")
+        );
+    }
+
+    #[test]
+    fn running_container_identity_must_match_persisted_runtime_identity() {
+        let persisted = "container-a|2026-07-12T00:00:00Z|true";
+        validate_persisted_running_embedding_container_identity(Some(persisted), persisted)
+            .expect("exact persisted running identity");
+        assert!(
+            validate_persisted_running_embedding_container_identity(
+                Some(persisted),
+                "container-b|2026-07-12T00:01:00Z|true",
+            )
+            .expect_err("replacement container must fail persisted identity proof")
+            .to_string()
+            .contains("does not match persisted")
+        );
+        assert!(
+            validate_persisted_running_embedding_container_identity(None, persisted)
+                .expect_err("missing persisted identity must fail")
+                .to_string()
+                .contains("does not match persisted")
+        );
+    }
+
+    #[test]
+    fn accelerator_smoke_fails_closed_before_rebuild_when_log_is_unproven() {
+        let device = EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "native_device_list",
+            detected_provider: Some("amd".into()),
+            detected_gpu: Some("AMD GPU".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("vulkan".into()),
+            accelerator_request_device: Some("Vulkan0".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        };
+        let error = evaluate_embedding_accelerator_smoke(
+            EmbeddingRuntimeProbe {
+                reachable: true,
+                detail: "reachable".into(),
+                elapsed_ms: Some(12),
+            },
+            device,
+            false,
+        )
+        .expect_err("inventory plus a reachable endpoint is not GPU proof");
+        let message = error.to_string();
+        assert!(message.contains("gpu_unverified"));
+        assert!(message.contains("runtime_log_offload=false"));
+    }
+
+    #[test]
+    fn accelerator_smoke_request_is_bound_to_selected_runtime_state() {
+        let root = tempfile::tempdir().expect("runtime state dir");
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.namespace = "agent-proof".into();
+        runtime.layout.state_file = root.path().join("retrieval-sidecars.json");
+        runtime.embedding.endpoint = "http://127.0.0.1:39001/v1/embeddings".into();
+        std::fs::write(
+            &runtime.layout.state_file,
+            serde_json::json!({
+                "namespace": runtime.namespace,
+                "embed_url": runtime.embedding.endpoint,
+                "embedding_accelerator_request_provider": "vulkan",
+                "embedding_accelerator_request_device": "Vulkan0"
+            })
+            .to_string(),
+        )
+        .expect("write runtime state");
+
+        let state = exact_embedding_runtime_state(&runtime).expect("matching runtime state");
+        let request =
+            embedding_accelerator_request_from_runtime_state(&state).expect("persisted request");
+        assert_eq!(request.provider, "vulkan");
+        assert_eq!(request.device.as_deref(), Some("Vulkan0"));
+
+        let mut missing_provider = state;
+        missing_provider.embedding_accelerator_request_provider = None;
+        assert!(
+            embedding_accelerator_request_from_runtime_state(&missing_provider)
+                .expect_err("launch provider is not an accelerator request")
+                .to_string()
+                .contains("no requested provider")
+        );
+
+        runtime.namespace = "other-agent".into();
+        let error = exact_embedding_runtime_state(&runtime)
+            .expect_err("cross-namespace state must fail closed");
+        assert!(error.to_string().contains("gpu_unverified"));
+    }
+
+    #[test]
+    fn accelerator_smoke_reports_external_runtime_proof_boundary() {
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.embedding.server_launch = Some("external_endpoint".into());
+        runtime.embedding.endpoint = "http://127.0.0.1:39002/v1/embeddings".into();
+        runtime.embedding.endpoint_origin =
+            crate::config::EmbeddingEndpointOrigin::TrustedProjectConfig;
+        runtime.embedding.device_policy = "accelerator_required".into();
+
+        let error = ensure_embedding_accelerator_smoke_for_runtime(&runtime)
+            .expect_err("external endpoint has no CodeStory-owned runtime log proof");
+        let message = error.to_string();
+        assert!(message.contains("gpu_unverified"));
+        assert!(message.contains("external embedding endpoints"));
+        assert!(!message.contains("docker"));
+    }
+
+    #[test]
     fn sidecar_log_observed_acceleration_allows_default_vulkan_request() {
         let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
@@ -1306,11 +2476,14 @@ mod tests {
         let observed = observed_embedding_device_state_from_text(
             "llama_model_load: offloaded 33/33 layers to GPU\n",
         );
-        let readiness =
-            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+        let readiness = embedding_device_readiness_with_observed_state(
+            Some(EmbeddingDeviceObservation {
                 state: observed,
                 source: "sidecar_log",
-            }));
+                detected_provider: None,
+            }),
+            None,
+        );
 
         assert_eq!(observed, "accelerated");
         assert_eq!(readiness.requested_policy, "accelerator_required");
@@ -1345,7 +2518,7 @@ mod tests {
         let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
 
         let observed = observed_embedding_device_state_from_text("server listening on 0.0.0.0");
-        let readiness = embedding_device_readiness_with_observed_state(None);
+        let readiness = embedding_device_readiness_with_observed_state(None, None);
 
         assert_eq!(observed, "unknown");
         assert_eq!(readiness.requested_policy, "accelerator_required");
@@ -1369,11 +2542,14 @@ mod tests {
         let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
         let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
 
-        let readiness =
-            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+        let readiness = embedding_device_readiness_with_observed_state(
+            Some(EmbeddingDeviceObservation {
                 state: "accelerated",
                 source: "native_log",
-            }));
+                detected_provider: None,
+            }),
+            None,
+        );
 
         assert_eq!(readiness.observed_state, "accelerated");
         assert_eq!(readiness.observation_source, "native_log");
@@ -1411,11 +2587,14 @@ mod tests {
         let _name = EnvGuard::set(DEVICE_NAME_ENV, "AMD Radeon RX 7900 XT");
         let _host_detect = EnvGuard::remove(DISABLE_HOST_GPU_DETECT_ENV);
 
-        let readiness =
-            embedding_device_readiness_with_observed_state(Some(EmbeddingDeviceObservation {
+        let readiness = embedding_device_readiness_with_observed_state(
+            Some(EmbeddingDeviceObservation {
                 state: "accelerated",
                 source: "native_device_list",
-            }));
+                detected_provider: None,
+            }),
+            None,
+        );
 
         assert_eq!(readiness.observed_state, "accelerated");
         assert_eq!(readiness.observation_source, "native_device_list");
@@ -1490,7 +2669,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_native_log_read_ignores_stale_acceleration_outside_tail() {
+    fn bounded_native_log_evidence_ignores_stale_acceleration_before_current_launch() {
         let dir = tempfile::tempdir().expect("log dir");
         let path = dir.path().join("llama-server-native.log");
         let mut bytes =
@@ -1504,13 +2683,158 @@ mod tests {
         bytes.extend_from_slice(b" current\nn_gpu_layers = 0\n");
         std::fs::write(&path, bytes).expect("write multi-launch log");
 
-        let text = read_native_embedding_log_tail(&path, NATIVE_LLAMA_LOG_READ_TAIL_BYTES)
-            .expect("bounded tail");
-        let current = native_embedding_log_current_launch(&text);
+        let current = read_native_embedding_log_current_launch_evidence(&path)
+            .expect("bounded current-launch evidence");
 
         assert!(current.contains("current"));
         assert!(!current.contains("offloaded 33/33"));
-        assert_eq!(observed_embedding_device_state_from_text(current), "cpu");
+        assert_eq!(observed_embedding_device_state_from_text(&current), "cpu");
+    }
+
+    #[test]
+    fn bounded_native_log_evidence_retains_startup_offload_after_large_request_tail() {
+        let _lock = crate::test_support::env_lock();
+        let _device = EnvGuard::set(LLAMACPP_DEVICE_ENV, "Metal0");
+        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
+        let dir = tempfile::tempdir().expect("log dir");
+        let path = dir.path().join("llama-server-native.log");
+        let mut bytes = concat!(
+            "starting native llama.cpp embedding server: current --device Metal0\n",
+            "ggml_metal_init: found device Metal0: Apple M5\n",
+            "load_tensors: offloaded 13/13 layers to GPU\n",
+        )
+        .as_bytes()
+        .to_vec();
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            (NATIVE_LLAMA_LOG_READ_START_BYTES + NATIVE_LLAMA_LOG_READ_TAIL_BYTES + 37) as usize,
+        ));
+        bytes.extend_from_slice(b"\nrequest: POST /v1/embeddings 200\n");
+        std::fs::write(&path, bytes).expect("write noisy current-launch log");
+
+        let evidence = read_native_embedding_log_current_launch_evidence(&path)
+            .expect("bounded current-launch evidence");
+        let request = default_embedding_accelerator_request();
+
+        assert!(evidence.contains("offloaded 13/13 layers to GPU"));
+        assert!(evidence.contains("POST /v1/embeddings 200"));
+        assert_eq!(
+            observed_embedding_device_state_from_text(&evidence),
+            "accelerated"
+        );
+        assert!(runtime_log_proves_requested_accelerator(
+            &evidence, &request
+        ));
+    }
+
+    #[test]
+    fn reused_native_runtime_keeps_constrained_original_launch_log() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let owner_log = cache.path().join("llama-server-native.log");
+        std::fs::write(
+            &owner_log,
+            "starting native llama.cpp embedding server: current\noffloaded 13/13 layers to GPU\n",
+        )
+        .expect("owner log");
+        let mut runtime = crate::config::test_sidecar_runtime_in_cache(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("shared-agent"),
+            cache.path(),
+        );
+        let allocated_embed_port = runtime.embed_http_port;
+        let reused_embed_port = if allocated_embed_port == 18080 {
+            18081
+        } else {
+            18080
+        };
+        runtime
+            .use_broker_verified_native_embedding_endpoint(reused_embed_port)
+            .expect("retarget verified endpoint");
+        let launch = crate::health::EmbeddingLaunchMetadata {
+            provider: "llamacpp".into(),
+            launch_mode: crate::config::EmbeddingServerLaunchMode::NativeSpawned
+                .as_str()
+                .into(),
+            endpoint: runtime.embedding.endpoint.clone(),
+            pid: Some(std::process::id()),
+            spawned_at_epoch_ms: Some(123),
+            process_start_identity: None,
+            spawn_protocol: None,
+            launch_args: vec!["--port".into(), reused_embed_port.to_string()],
+            launch_fingerprint_sha256: Some("fingerprint".into()),
+            executable_source: Some("test".into()),
+            executable_path: Some("/tmp/llama-server".into()),
+            model_path: Some("/tmp/model.gguf".into()),
+            log_path: Some(owner_log.display().to_string()),
+            requested_device: Some("Metal0".into()),
+        };
+        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(
+            &runtime,
+            None,
+            Some(launch.clone()),
+        )
+        .expect("persist reused launch");
+
+        let state: crate::sidecar::SidecarStateFile = serde_json::from_slice(
+            &std::fs::read(&runtime.layout.state_file).expect("read reused state"),
+        )
+        .expect("parse reused state");
+        assert_eq!(state.embed_http_port, reused_embed_port);
+        assert_eq!(
+            state.embed_url,
+            SidecarLayout::embed_base_url(reused_embed_port)
+        );
+        assert_eq!(runtime.ownership().ports.embed_http, reused_embed_port);
+
+        let warm = crate::config::test_sidecar_runtime_in_cache(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("shared-agent"),
+            cache.path(),
+        );
+        assert_eq!(warm.embed_http_port, allocated_embed_port);
+        assert_eq!(warm.embedding.endpoint, runtime.embedding.endpoint);
+        assert!(crate::sidecar::sidecar_state_matches_runtime(&state, &warm));
+        warm.ensure_ports_allocated()
+            .expect("warm runtime renews the original isolated lease tuple");
+        let local = crate::config::test_sidecar_runtime_in_cache(
+            Some(project.path()),
+            SidecarProfile::Local,
+            None,
+            cache.path(),
+        );
+        let selected = local.with_profile_and_run_id(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some("shared-agent"),
+        );
+        assert_eq!(selected.embed_http_port, allocated_embed_port);
+        assert_eq!(selected.embedding.endpoint, runtime.embedding.endpoint);
+
+        assert_eq!(
+            native_embedding_log_path(&runtime),
+            owner_log.canonicalize().expect("canonical owner log")
+        );
+
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_log = outside.path().join("llama-server-native.log");
+        std::fs::write(&outside_log, "forged offloaded 99/99 layers to GPU\n")
+            .expect("outside log");
+        let mut forged = launch;
+        forged.log_path = Some(outside_log.display().to_string());
+        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(forged))
+            .expect("persist forged path");
+        assert_eq!(
+            native_embedding_log_path(&runtime),
+            runtime
+                .layout
+                .state_file
+                .parent()
+                .expect("state parent")
+                .join("llama-server-native.log")
+        );
     }
 
     #[test]
@@ -1597,10 +2921,9 @@ mod tests {
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.path().join("zoekt"),
+                lexical_data_dir: root.path().join("lexical"),
                 qdrant_data_dir: root.path().join("qdrant"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
@@ -1612,12 +2935,13 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
+            ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
             .expect("create state dir");
         std::fs::write(
             native_embedding_log_path(&runtime),
-            "llama_model_load: offloaded 33/33 layers to GPU\n",
+            "starting native llama.cpp embedding server: test --device Vulkan0\nllama_model_load: offloaded 33/33 layers to GPU\n",
         )
         .expect("write native log");
 
@@ -1647,10 +2971,9 @@ mod tests {
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 16070,
                 qdrant_http_port: 16333,
                 qdrant_grpc_port: 16334,
-                zoekt_data_dir: root.path().join("zoekt"),
+                lexical_data_dir: root.path().join("lexical"),
                 qdrant_data_dir: root.path().join("qdrant"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
@@ -1662,6 +2985,7 @@ mod tests {
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
             labels: BTreeMap::new(),
+            ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
             .expect("create state dir");

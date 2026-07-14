@@ -4,7 +4,12 @@ use std::sync::{Mutex, MutexGuard};
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn env_lock() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().expect("env lock")
+    // Environment guards restore their variables while unwinding. Recover the
+    // mutex after a failed assertion so one primary failure does not obscure
+    // the rest of the suite with poison errors.
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub fn retrieval_manifest_fixture(
@@ -13,7 +18,7 @@ pub fn retrieval_manifest_fixture(
 ) -> RetrievalIndexManifest {
     RetrievalIndexManifest {
         project_id: project_id.into(),
-        zoekt_version: "zoekt-real-v1".into(),
+        lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
         qdrant_collection: crate::generation::sidecar_qdrant_collection(
             project_id,
             sidecar_input_hash,

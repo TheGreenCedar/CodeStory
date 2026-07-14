@@ -22,7 +22,7 @@
             "command": "command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/codestory-activate.cjs\" || exit 0",
             "commandWindows": "if (Get-Command node -ErrorAction SilentlyContinue) { node \"$env:CLAUDE_PLUGIN_ROOT\\hooks\\codestory-activate.cjs\" }",
             "timeout": 300,
-            "statusMessage": "Preparing CodeStory packet..."
+            "statusMessage": "Routing CodeStory grounding..."
           }
         ]
       }

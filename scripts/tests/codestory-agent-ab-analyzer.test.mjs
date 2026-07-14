@@ -131,7 +131,7 @@ test("packet latency telemetry preserves retrieval shadow cache diagnostics", ()
           retrieval_total_ms: 7,
           cache_hit: true,
           stage_timings: [
-            { stage: "stage1_zoekt_lexical", elapsed_ms: 2, cache_hit: false },
+            { stage: "stage1_lexical", elapsed_ms: 2, cache_hit: false },
             { stage: "stage2_semantic_vector", elapsed_ms: 1, cache_hit: true },
           ],
           candidate_count: 4,
@@ -436,6 +436,18 @@ test("packet command keeps manifest-derived extra probes diagnostic-only", () =>
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
+  assert.deepEqual(args.slice(args.indexOf("--profile"), args.indexOf("--profile") + 2), [
+    "--profile",
+    "local",
+  ]);
+  const agentArgs = packetCommandArgs({ path: "C:\\repo" }, task, {
+    packetSidecarProfile: "agent",
+    packetSidecarRunId: "packet-runtime-test",
+  });
+  assert.deepEqual(
+    agentArgs.slice(agentArgs.indexOf("--profile"), agentArgs.indexOf("--profile") + 4),
+    ["--profile", "agent", "--run-id", "packet-runtime-test"],
+  );
 
   const diagnosticArgs = packetCommandArgs(
     { path: "C:\\repo" },
@@ -1694,9 +1706,9 @@ function localCacheProvenance(overrides = {}) {
     retrieval_mode: "full",
     sidecar_generation: "proj-current",
     manifest_embedding_backend: "llamacpp:bge-base-en-v1.5",
-    semantic_backend: "onnx",
+    semantic_backend: "llamacpp",
     local_only: true,
-    locality_kind: "local_model_files",
+    locality_kind: "loopback_endpoint",
     indexed: true,
     freshness_status: "fresh",
     semantic_ready: true,

@@ -8,8 +8,10 @@ use std::collections::{HashMap, VecDeque};
 /// reused after the manifest identity changes. The query fingerprint is not enough on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RetrievalCacheKey {
+    pub core_generation_id: Option<String>,
+    pub core_run_id: Option<String>,
     pub project_id: String,
-    pub zoekt_version: String,
+    pub lexical_version: String,
     pub qdrant_collection: String,
     pub scip_revision: Option<String>,
     pub sidecar_generation: Option<String>,
@@ -25,8 +27,10 @@ impl RetrievalCacheKey {
         query_fingerprint: impl Into<String>,
     ) -> Self {
         Self {
+            core_generation_id: None,
+            core_run_id: None,
             project_id: manifest.project_id.clone(),
-            zoekt_version: manifest.zoekt_version.clone(),
+            lexical_version: manifest.lexical_version.clone(),
             qdrant_collection: manifest.qdrant_collection.clone(),
             scip_revision: manifest.scip_revision.clone(),
             sidecar_generation: manifest.sidecar_generation.clone(),
@@ -50,6 +54,7 @@ pub struct RetrievalCache {
     entries: HashMap<RetrievalCacheKey, Vec<super::CandidateHit>>,
     order: VecDeque<RetrievalCacheKey>,
     capacity: usize,
+    publication_identity: Option<(String, String)>,
 }
 
 impl Default for RetrievalCache {
@@ -68,7 +73,32 @@ impl RetrievalCache {
             entries: HashMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
+            publication_identity: None,
         }
+    }
+
+    pub fn scope_to_publication(&mut self, identity: &super::RetrievalPublicationIdentity) {
+        let publication = (
+            identity.core_generation_id.clone(),
+            identity.core_run_id.clone(),
+        );
+        if self.publication_identity.as_ref() != Some(&publication) {
+            self.clear();
+            self.publication_identity = Some(publication);
+        }
+    }
+
+    pub fn key_for_manifest(
+        &self,
+        manifest: &RetrievalIndexManifest,
+        query_fingerprint: impl Into<String>,
+    ) -> RetrievalCacheKey {
+        let mut key = RetrievalCacheKey::from_manifest(manifest, query_fingerprint);
+        if let Some((generation_id, run_id)) = &self.publication_identity {
+            key.core_generation_id = Some(generation_id.clone());
+            key.core_run_id = Some(run_id.clone());
+        }
+        key
     }
 
     pub fn get(&self, key: &RetrievalCacheKey) -> Option<&[super::CandidateHit]> {
@@ -89,8 +119,32 @@ impl RetrievalCache {
         }
     }
 
+    pub fn remove(&mut self, key: &RetrievalCacheKey) {
+        self.entries.remove(key);
+        self.order.retain(|existing| existing != key);
+    }
+
     pub fn merge_delta_from(&mut self, baseline: &RetrievalCache, other: RetrievalCache) {
-        let RetrievalCache { entries, order, .. } = other;
+        let RetrievalCache {
+            entries,
+            order,
+            publication_identity,
+            ..
+        } = other;
+        if self.publication_identity != baseline.publication_identity
+            && self.publication_identity != publication_identity
+        {
+            return;
+        }
+        if self.publication_identity == baseline.publication_identity
+            && publication_identity != baseline.publication_identity
+        {
+            self.clear();
+            self.publication_identity = publication_identity.clone();
+        }
+        if self.publication_identity != publication_identity {
+            return;
+        }
         for key in order {
             let Some(hits) = entries.get(&key) else {
                 continue;
@@ -105,6 +159,7 @@ impl RetrievalCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.publication_identity = None;
     }
 
     pub fn len(&self) -> usize {
@@ -124,8 +179,10 @@ mod tests {
     fn cache_round_trip() {
         let mut cache = RetrievalCache::new();
         let key = RetrievalCacheKey {
+            core_generation_id: None,
+            core_run_id: None,
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -145,8 +202,10 @@ mod tests {
     fn cache_evicts_oldest_entry_when_capacity_is_reached() {
         let mut cache = RetrievalCache::with_capacity(1);
         let first = RetrievalCacheKey {
+            core_generation_id: None,
+            core_run_id: None,
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -184,8 +243,10 @@ mod tests {
     #[test]
     fn merge_delta_from_does_not_replay_snapshot_entries() {
         let first = RetrievalCacheKey {
+            core_generation_id: None,
+            core_run_id: None,
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
@@ -233,10 +294,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_tracks_sidecar_generation_contract() {
+    fn cache_key_tracks_core_and_sidecar_publications() {
         let base = RetrievalIndexManifest {
             project_id: "abc".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_abc_hash_a".into(),
             scip_revision: Some("scip-a".into()),
             built_at_epoch_ms: 0,
@@ -267,5 +328,39 @@ mod tests {
             RetrievalCacheKey::from_manifest(&base, "query"),
             RetrievalCacheKey::from_manifest(&changed, "query")
         );
+
+        let first = crate::executor::RetrievalPublicationIdentity {
+            core_generation_id: "core-a".into(),
+            core_run_id: "run-a".into(),
+            sidecar_generation: "abc-hash-a".into(),
+            sidecar_input_hash: "hash-a".into(),
+            qdrant_collection: base.qdrant_collection.clone(),
+        };
+        let second = crate::executor::RetrievalPublicationIdentity {
+            core_generation_id: "core-b".into(),
+            core_run_id: "run-b".into(),
+            ..first.clone()
+        };
+        let mut shared = RetrievalCache::new();
+        shared.scope_to_publication(&first);
+        let first_key = shared.key_for_manifest(&base, "query");
+        shared.insert(
+            first_key.clone(),
+            vec![super::super::CandidateHit::lexical_stub("src/old.rs", 1.0)],
+        );
+        let baseline = shared.clone();
+        let mut worker = baseline.clone();
+        worker.scope_to_publication(&second);
+        let second_key = worker.key_for_manifest(&base, "query");
+        worker.insert(
+            second_key.clone(),
+            vec![super::super::CandidateHit::lexical_stub("src/new.rs", 1.0)],
+        );
+        shared.merge_delta_from(&baseline, worker);
+
+        assert_ne!(first_key, second_key);
+        assert!(shared.get(&first_key).is_none());
+        assert_eq!(shared.key_for_manifest(&base, "query"), second_key);
+        assert!(shared.get(&second_key).is_some());
     }
 }

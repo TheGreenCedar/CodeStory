@@ -29,3 +29,22 @@ pub(crate) mod trace_export;
 
 pub(crate) use orchestrator::{agent_ask, agent_packet};
 pub use trace_export::packet_step_trace_json;
+
+/// Build the same bounded query plan used by `agent_packet` without executing retrieval.
+pub fn plan_packet(
+    request: &codestory_contracts::api::AgentPacketRequestDto,
+) -> Result<codestory_contracts::api::PacketPlanDto, codestory_contracts::api::ApiError> {
+    let question = request.question.trim();
+    if question.is_empty() {
+        return Err(codestory_contracts::api::ApiError::invalid_argument(
+            "Question cannot be empty.",
+        ));
+    }
+    let extra_probes = packet_plan::packet_request_extra_probes(request.extra_probes.clone());
+    Ok(packet_plan::build_packet_plan_with_extra(
+        question,
+        request.task_class,
+        request.budget,
+        &extra_probes,
+    ))
+}

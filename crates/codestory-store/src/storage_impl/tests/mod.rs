@@ -1,4 +1,5 @@
 use super::*;
+use rusqlite::OptionalExtension;
 
 #[test]
 fn file_role_classification_ignores_materialized_repo_cache_prefix() {
@@ -38,6 +39,49 @@ fn unique_temp_db_path(label: &str) -> PathBuf {
 }
 
 #[test]
+fn write_transaction_commits_or_rolls_back_as_one_unit() {
+    let path = unique_temp_db_path("write-transaction");
+    let mut storage = Storage::open(&path).expect("open storage");
+
+    {
+        let mut transaction = storage.write_transaction().expect("begin transaction");
+        transaction
+            .storage_mut()
+            .conn
+            .execute("CREATE TABLE publication_probe (value INTEGER)", [])
+            .expect("create rollback probe");
+    }
+    assert!(
+        storage
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'publication_probe'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .expect("query rollback probe")
+            .is_none()
+    );
+
+    let mut transaction = storage.write_transaction().expect("begin transaction");
+    transaction
+        .storage_mut()
+        .conn
+        .execute("CREATE TABLE publication_probe (value INTEGER)", [])
+        .expect("create commit probe");
+    transaction.finish().expect("commit transaction");
+    assert!(
+        storage
+            .conn
+            .execute("DROP TABLE publication_probe", [])
+            .is_ok()
+    );
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn incomplete_incremental_run_marker_survives_reopen_until_success() -> Result<(), StorageError> {
     let path = unique_temp_db_path("incomplete-incremental-run");
     {
@@ -64,6 +108,101 @@ fn incomplete_incremental_run_marker_survives_reopen_until_success() -> Result<(
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
+fn index_publication_identity_round_trips_through_typed_and_read_only_reads()
+-> Result<(), StorageError> {
+    let path = unique_temp_db_path("index-publication-round-trip");
+    let publication = IndexPublicationRecord {
+        generation: 7,
+        generation_id: "generation-7".to_string(),
+        run_id: "run-7".to_string(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 1234,
+    };
+    {
+        let storage = Storage::open(&path)?;
+        assert!(storage.get_index_publication()?.is_none());
+        storage.put_index_publication(&publication)?;
+        assert_eq!(storage.get_index_publication()?, Some(publication.clone()));
+    }
+    assert_eq!(
+        Storage::database_index_publication(&path)?,
+        Some(publication)
+    );
+
+    let _ = cleanup_sqlite_sidecars(&path);
+    Ok(())
+}
+
+#[test]
+fn index_publication_identity_rejects_negative_published_timestamp() {
+    assert!(
+        index_publication_record_from_values(
+            1,
+            "generation-1".to_string(),
+            "run-1".to_string(),
+            "full".to_string(),
+            -1,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn schema_18_migrates_to_empty_publication_identity_without_synthesis() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("index-publication-v18-migration");
+    {
+        let storage = Storage::open(&path)?;
+        storage
+            .get_connection()
+            .execute_batch("DROP TABLE index_publication;")?;
+        storage.set_schema_version(18)?;
+    }
+
+    assert!(Storage::database_index_publication(&path)?.is_none());
+    let storage = Storage::open(&path)?;
+    assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+    assert!(storage.get_index_publication()?.is_none());
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
+    Ok(())
+}
+
+#[test]
+fn schema_19_adds_nullable_file_content_hash_without_losing_rows() -> Result<(), StorageError> {
+    let path = unique_temp_db_path("file-content-hash-v19-migration");
+    {
+        let conn = rusqlite::Connection::open(&path)?;
+        conn.execute_batch(
+            "CREATE TABLE file (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                language TEXT,
+                modification_time INTEGER,
+                indexed INTEGER DEFAULT 0,
+                complete INTEGER DEFAULT 0,
+                line_count INTEGER DEFAULT 0,
+                file_role TEXT NOT NULL DEFAULT 'source'
+            );
+            INSERT INTO file (
+                id, path, language, modification_time, indexed, complete, line_count, file_role
+            ) VALUES (7, 'src/lib.rs', 'rust', 42, 1, 1, 3, 'source');
+            PRAGMA user_version = 19;",
+        )?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(storage.schema_version()?, 21);
+    assert_eq!(storage.get_files()?.len(), 1);
+    assert_eq!(storage.get_file_content_hash(7)?, None);
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
     Ok(())
 }
 
@@ -107,6 +246,40 @@ fn transient_incomplete_schema_fence_requires_marker() -> Result<(), StorageErro
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+    Ok(())
+}
+
+#[test]
+fn interrupted_v19_run_migrates_manifest_column_without_clearing_fence() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("interrupted-v19-manifest-migration");
+    {
+        let storage = Storage::open(&path)?;
+        storage.get_connection().execute(
+            "ALTER TABLE retrieval_index_manifest RENAME COLUMN lexical_version TO zoekt_version",
+            [],
+        )?;
+        storage.begin_incremental_run()?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(
+        Storage::database_schema_version(&path)?,
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(storage.has_incomplete_incremental_run()?);
+    let columns = storage
+        .conn
+        .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(columns.iter().any(|column| column == "lexical_version"));
+    assert!(!columns.iter().any(|column| column == "zoekt_version"));
+    storage.finish_incremental_run()?;
+    assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
     Ok(())
 }
 
@@ -358,6 +531,7 @@ fn projection_flush_prefers_framework_definition_over_usage() -> Result<(), Stor
 
     storage.flush_projection_batch(ProjectionBatch {
         files: &[],
+        file_content_hashes: &[],
         nodes: &[definition],
         edges: &[],
         occurrences: &[],
@@ -471,18 +645,66 @@ fn test_update_file_metadata_preserves_resolution_support_snapshot() -> Result<(
     })?;
     storage.put_resolution_support_snapshot(1, br#"{"hot":true}"#)?;
 
-    storage.update_file_metadata(&FileInfo {
-        id: 11,
-        path: PathBuf::from("src/lib.rs"),
-        language: "rust".to_string(),
-        modification_time: 2,
-        indexed: true,
-        complete: true,
-        line_count: 10,
-        file_role: FileRole::Source,
-    })?;
+    storage.update_file_metadata(
+        &FileInfo {
+            id: 11,
+            path: PathBuf::from("src/lib.rs"),
+            language: "rust".to_string(),
+            modification_time: 2,
+            indexed: true,
+            complete: true,
+            line_count: 10,
+            file_role: FileRole::Source,
+        },
+        None,
+    )?;
 
     assert!(storage.has_ready_resolution_support_snapshot(1)?);
+    Ok(())
+}
+
+#[test]
+fn projection_batch_round_trips_and_clears_file_content_hash() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    let files = [FileInfo {
+        id: 17,
+        path: PathBuf::from("src/snapshot.rs"),
+        language: "rust".to_string(),
+        modification_time: 9,
+        indexed: true,
+        complete: true,
+        line_count: 4,
+        file_role: FileRole::Source,
+    }];
+    let hashes = [FileContentHash {
+        file_id: 17,
+        content_hash: "sha256:first".to_string(),
+    }];
+
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &hashes,
+        nodes: &[],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+    assert_eq!(
+        storage.get_file_content_hash(17)?.as_deref(),
+        Some("sha256:first")
+    );
+
+    storage.flush_projection_batch(ProjectionBatch {
+        files: &files,
+        file_content_hashes: &[],
+        nodes: &[],
+        edges: &[],
+        occurrences: &[],
+        component_access: &[],
+        callable_projection_states: &[],
+    })?;
+    assert_eq!(storage.get_file_content_hash(17)?, None);
     Ok(())
 }
 
@@ -1592,7 +1814,8 @@ fn live_open_migrates_v17_llm_doc_columns_before_secondary_indexes() -> Result<(
 }
 
 #[test]
-fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), StorageError> {
+fn live_open_migrates_v18_manifest_to_lexical_schema_without_losing_rows()
+-> Result<(), StorageError> {
     let db_path = unique_temp_db_path("v18-precise-semantic-manifest-repair");
     let _ = std::fs::remove_file(&db_path);
     {
@@ -1627,7 +1850,7 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
                 qdrant_collection,
                 built_at_epoch_ms,
                 degraded_modes_json
-            ) VALUES ('proj', 'zoekt', 'collection', 1, '[]')",
+            ) VALUES ('proj', 'legacy-v1', 'collection', 1, '[]')",
             [],
         )?;
         conn.pragma_update(None, "user_version", 18)?;
@@ -1640,6 +1863,7 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     for column in [
+        "lexical_version",
         "precise_semantic_import_status",
         "precise_semantic_import_reason",
         "precise_semantic_import_revision",
@@ -1647,14 +1871,107 @@ fn live_open_repairs_v18_manifest_precise_semantic_columns() -> Result<(), Stora
     ] {
         assert!(columns.iter().any(|existing| existing == column));
     }
+    assert!(!columns.iter().any(|existing| existing == "zoekt_version"));
     let manifest = storage
         .get_retrieval_index_manifest("proj")?
         .expect("manifest survives repair");
     assert_eq!(manifest.project_id, "proj");
+    assert_eq!(manifest.lexical_version, "legacy-v1");
     assert_eq!(manifest.precise_semantic_import_status, None);
 
     drop(storage);
     let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn current_schema_uses_only_lexical_manifest_column() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v21-lexical-manifest-contract");
+    let _ = std::fs::remove_file(&db_path);
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, 21);
+    let columns = storage
+        .conn
+        .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(columns.iter().any(|column| column == "lexical_version"));
+    assert!(!columns.iter().any(|column| column == "zoekt_version"));
+
+    drop(storage);
+    let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_column()
+-> Result<(), StorageError> {
+    for source_version in [19, 20] {
+        let db_path = unique_temp_db_path(&format!("v{source_version}-lexical-manifest-migration"));
+        let _ = std::fs::remove_file(&db_path);
+        {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE retrieval_index_manifest (
+                project_id TEXT PRIMARY KEY,
+                zoekt_version TEXT NOT NULL,
+                qdrant_collection TEXT NOT NULL,
+                scip_revision TEXT,
+                built_at_epoch_ms INTEGER NOT NULL,
+                disk_bytes INTEGER,
+                degraded_modes_json TEXT NOT NULL DEFAULT '[]',
+                embedding_backend TEXT,
+                embedding_dim INTEGER,
+                sidecar_schema_version INTEGER,
+                sidecar_input_hash TEXT,
+                sidecar_generation TEXT,
+                projection_count INTEGER,
+                symbol_doc_count INTEGER,
+                dense_projection_count INTEGER,
+                semantic_policy_version TEXT,
+                graph_artifact_hash TEXT,
+                dense_reason_counts_json TEXT,
+                precise_semantic_import_status TEXT,
+                precise_semantic_import_reason TEXT,
+                precise_semantic_import_revision TEXT,
+                precise_semantic_import_producer TEXT
+            );
+            INSERT INTO retrieval_index_manifest (
+                project_id, zoekt_version, qdrant_collection,
+                built_at_epoch_ms, degraded_modes_json
+            ) VALUES ('proj', 'legacy-v1', 'collection', 1, '[]');",
+            )?;
+            conn.pragma_update(None, "user_version", source_version)?;
+        }
+
+        let mut storage = Storage::open(&db_path)?;
+        let mut manifest = storage
+            .get_retrieval_index_manifest("proj")?
+            .expect("legacy manifest row survives migration");
+        assert_eq!(manifest.lexical_version, "legacy-v1");
+        manifest.lexical_version = "sqlite-fts5-v1".into();
+        storage.upsert_retrieval_index_manifest(&manifest)?;
+        drop(storage);
+
+        let storage = Storage::open(&db_path)?;
+        let columns = storage
+            .conn
+            .prepare("PRAGMA table_info(retrieval_index_manifest)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(columns.iter().any(|column| column == "lexical_version"));
+        assert!(!columns.iter().any(|column| column == "zoekt_version"));
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")?
+                .expect("updated manifest")
+                .lexical_version,
+            "sqlite-fts5-v1"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&db_path);
+    }
     Ok(())
 }
 
@@ -1666,7 +1983,7 @@ fn live_open_preserves_correct_v18_manifest_precise_semantic_values() -> Result<
         let mut storage = Storage::open(&db_path)?;
         storage.upsert_retrieval_index_manifest(&RetrievalIndexManifest {
             project_id: "proj".into(),
-            zoekt_version: "zoekt".into(),
+            lexical_version: "legacy-v1".into(),
             qdrant_collection: "collection".into(),
             scip_revision: None,
             built_at_epoch_ms: 1,
@@ -1723,8 +2040,8 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
     let _ = cleanup_sqlite_sidecars(&backup_path);
 
     {
-        let mut live = Storage::open(&live_path)?;
-        live.insert_files_batch(&[FileInfo {
+        let mut seed = Storage::open(&live_path)?;
+        seed.insert_files_batch(&[FileInfo {
             id: 1,
             path: PathBuf::from("live.rs"),
             language: "rust".to_string(),
@@ -1734,6 +2051,15 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
             line_count: 10,
             file_role: FileRole::Source,
         }])?;
+        seed.put_index_publication(&IndexPublicationRecord {
+            generation: 1,
+            generation_id: "live-generation".to_string(),
+            run_id: "live-run".to_string(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        })?;
+        drop(seed);
+        let live = Storage::open_read_only(&live_path)?;
 
         {
             let mut staged = Storage::open_build(&staged_path)?;
@@ -1747,6 +2073,13 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
                 line_count: 20,
                 file_role: FileRole::Source,
             }])?;
+            staged.put_index_publication(&IndexPublicationRecord {
+                generation: 2,
+                generation_id: "staged-generation".to_string(),
+                run_id: "staged-run".to_string(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            })?;
             staged.finalize_staged_snapshot()?;
         }
 
@@ -1771,6 +2104,365 @@ fn test_promote_staged_snapshot_replaces_live_db_while_live_reader_is_open()
     let _ = cleanup_sqlite_sidecars(&staged_path);
     let _ = cleanup_sqlite_sidecars(&backup_path);
     Ok(())
+}
+
+#[test]
+fn reader_open_during_healthy_promotion_does_not_recover_active_backup() -> Result<(), StorageError>
+{
+    let live_path = unique_temp_db_path("active-promotion-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let lock_path = promotion_lock_path(&live_path);
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+
+    seed_promotion_file(&live_path, 2, "new.rs")?;
+    seed_promotion_file(&backup_path, 1, "old.rs")?;
+    let prepared_path = promotion_prepared_journal_path(&live_path);
+    write_promotion_journal(
+        &prepared_path,
+        &promotion_journal(&backup_path, &live_path)?,
+    )?;
+    let promotion_lock = PromotionLock::acquire(&live_path)?;
+
+    let during_promotion = Storage::open(&live_path)?;
+    assert_eq!(
+        during_promotion.get_files()?[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(during_promotion);
+    assert!(
+        backup_path.exists(),
+        "active promoter still owns its backup"
+    );
+
+    drop(promotion_lock);
+    let recovered = Storage::open(&live_path)?;
+    assert_eq!(recovered.get_files()?[0].path, PathBuf::from("old.rs"));
+    drop(recovered);
+    assert!(
+        !backup_path.exists(),
+        "recovery consumes the abandoned backup"
+    );
+    assert!(!prepared_path.exists(), "recovery consumes its journal");
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+    let _ = std::fs::remove_file(lock_path);
+    Ok(())
+}
+
+const PROMOTION_ABORT_LIVE_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_LIVE";
+const PROMOTION_ABORT_STAGED_ENV: &str = "CODESTORY_TEST_PROMOTION_ABORT_STAGED";
+
+fn seed_promotion_file_with_identity(
+    path: &Path,
+    id: i64,
+    name: &str,
+    publish: bool,
+) -> Result<(), StorageError> {
+    let mut storage = Storage::open(path)?;
+    storage.insert_files_batch(&[FileInfo {
+        id,
+        path: PathBuf::from(name),
+        language: "rust".to_string(),
+        modification_time: id,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    }])?;
+    if publish {
+        storage.put_index_publication(&IndexPublicationRecord {
+            generation: id.max(0) as u64,
+            generation_id: format!("generation-{id}"),
+            run_id: format!("run-{id}"),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: id.max(0),
+        })?;
+    }
+    storage.finalize_staged_snapshot()
+}
+
+fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
+    seed_promotion_file_with_identity(path, id, name, true)
+}
+
+fn seed_unpublished_file(path: &Path, id: i64, name: &str) -> Result<(), StorageError> {
+    seed_promotion_file_with_identity(path, id, name, false)
+}
+
+fn promotion_journal(
+    previous_path: &Path,
+    candidate_path: &Path,
+) -> Result<PromotionJournal, StorageError> {
+    Ok(PromotionJournal {
+        version: PROMOTION_JOURNAL_VERSION,
+        previous: read_recovery_database_identity(previous_path)?,
+        candidate: require_complete_promotion_database_identity(candidate_path, "Test candidate")?,
+    })
+}
+
+#[test]
+fn staged_promotion_abort_child() {
+    let Some(live_path) = std::env::var_os(PROMOTION_ABORT_LIVE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let staged_path =
+        PathBuf::from(std::env::var_os(PROMOTION_ABORT_STAGED_ENV).expect("child staged path"));
+    let result = Storage::promote_staged_snapshot(&staged_path, &live_path);
+    panic!("promotion abort hook returned: {result:?}");
+}
+
+#[test]
+fn staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts() {
+    let live_path = unique_temp_db_path("promotion-abort-live");
+    let staged_path = unique_temp_db_path("promotion-abort-staged");
+    let sentinel_path = unique_temp_db_path("promotion-abort-sentinel");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let prepared_path = promotion_prepared_journal_path(&live_path);
+    let committed_path = promotion_committed_journal_path(&live_path);
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
+
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("resolve store test executable"))
+            .arg("--exact")
+            .arg("storage_impl::tests::staged_promotion_abort_child")
+            .arg("--nocapture")
+            .env(PROMOTION_ABORT_LIVE_ENV, &live_path)
+            .env(PROMOTION_ABORT_STAGED_ENV, &staged_path)
+            .env(PROMOTION_ABORT_SENTINEL_ENV, &sentinel_path)
+            .status()
+            .expect("run promotion abort child");
+    assert!(
+        !status.success(),
+        "promotion abort child exited successfully"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_path).expect("read promotion abort sentinel"),
+        PROMOTION_ABORT_SENTINEL,
+        "ordinary child failure must not satisfy the crash proof"
+    );
+
+    let interrupted = Connection::open_with_flags(&live_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open interrupted live generation without recovery");
+    let interrupted_path: String = interrupted
+        .query_row("SELECT path FROM file ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read interrupted live generation");
+    assert_eq!(
+        interrupted_path, "new.rs",
+        "abort hook must run after the live database mutation"
+    );
+    drop(interrupted);
+
+    let live = Storage::open(&live_path).expect("open live generation after abort");
+    assert_eq!(
+        live.get_files().expect("read live generation")[0].path,
+        PathBuf::from("old.rs")
+    );
+    drop(live);
+    assert!(
+        staged_path.exists(),
+        "staged generation must remain retryable"
+    );
+    assert!(
+        !backup_path.exists(),
+        "opening live storage must consume the recovery backup"
+    );
+    assert!(!prepared_path.exists(), "rollback must consume its journal");
+    assert!(!committed_path.exists(), "aborted promotion cannot commit");
+
+    Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect("retry promotion after abort");
+    let live = Storage::open(&live_path).expect("open recovered live generation");
+    assert_eq!(
+        live.get_files().expect("read recovered generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(live);
+    for artifact in sqlite_sidecar_paths(&staged_path)
+        .into_iter()
+        .chain(sqlite_sidecar_paths(&backup_path))
+    {
+        assert!(
+            !artifact.exists(),
+            "successful retry left promotion artifact {}",
+            artifact.display()
+        );
+    }
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&staged_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+    let _ = std::fs::remove_file(prepared_path);
+    let _ = std::fs::remove_file(committed_path);
+    let _ = std::fs::remove_file(&sentinel_path);
+}
+
+#[test]
+fn retained_committed_promotion_stays_live_and_blocks_the_next_writer() {
+    let live_path = unique_temp_db_path("promotion-cleanup-failure-live");
+    let staged_path = unique_temp_db_path("promotion-cleanup-failure-staged");
+    let second_staged_path = unique_temp_db_path("promotion-cleanup-failure-second-staged");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let committed_path = promotion_committed_journal_path(&live_path);
+    let cleanup_failure_path = promotion_cleanup_failure_path(&live_path);
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live generation");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged generation");
+    seed_promotion_file(&second_staged_path, 3, "newer.rs").expect("seed second staged generation");
+    std::fs::write(&cleanup_failure_path, b"blocked").expect("inject cleanup failure");
+
+    Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect("committed promotion tolerates deferred cleanup");
+    let error = Storage::promote_staged_snapshot(&second_staged_path, &live_path)
+        .expect_err("retained committed artifacts must block the next promotion");
+    assert!(error.to_string().contains("prior artifacts remain"));
+    assert!(backup_path.exists() && committed_path.exists());
+    assert!(second_staged_path.exists());
+
+    std::fs::remove_file(&cleanup_failure_path).expect("restore cleanup");
+    let reopened = Storage::open(&live_path).expect("reopen committed live generation");
+    assert_eq!(
+        reopened.get_files().expect("read committed generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(reopened);
+    assert!(!backup_path.exists() && !committed_path.exists());
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&staged_path);
+    let _ = cleanup_sqlite_sidecars(&second_staged_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+}
+
+#[test]
+fn prepared_promotion_refuses_to_overwrite_an_unrelated_newer_live_publication() {
+    let live_path = unique_temp_db_path("prepared-newer-live");
+    let candidate_path = unique_temp_db_path("prepared-newer-candidate");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let prepared_path = promotion_prepared_journal_path(&live_path);
+    seed_promotion_file(&live_path, 3, "newer.rs").expect("seed unrelated newer live");
+    seed_promotion_file(&backup_path, 1, "old.rs").expect("seed previous backup");
+    seed_promotion_file(&candidate_path, 2, "candidate.rs").expect("seed candidate");
+    let journal = promotion_journal(&backup_path, &candidate_path).expect("build journal");
+    write_promotion_journal(&prepared_path, &journal).expect("write prepared journal");
+
+    let error = match Storage::open(&live_path) {
+        Ok(_) => panic!("prepared recovery must reject an unrelated live publication"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("unrelated live publication"),
+        "unexpected prepared recovery error: {error}"
+    );
+    assert!(
+        prepared_path.exists(),
+        "failed-closed recovery keeps its journal"
+    );
+    assert!(
+        backup_path.exists(),
+        "failed-closed recovery keeps its backup"
+    );
+
+    std::fs::remove_file(&prepared_path).expect("remove prepared journal");
+    cleanup_sqlite_sidecars(&backup_path).expect("remove previous backup");
+    let live = Storage::open(&live_path).expect("reopen untouched newer live");
+    assert_eq!(
+        live.get_files().expect("read newer live")[0].path,
+        PathBuf::from("newer.rs")
+    );
+    drop(live);
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&candidate_path);
+}
+
+#[test]
+fn publicationless_promotion_state_is_ambiguous_and_fails_closed() {
+    let live_path = unique_temp_db_path("publicationless-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    let staged_path = unique_temp_db_path("publicationless-staged");
+    seed_unpublished_file(&live_path, 1, "live.rs").expect("seed unpublished live");
+    seed_unpublished_file(&backup_path, 2, "backup.rs").expect("seed unpublished backup");
+
+    let error = match Storage::open(&live_path) {
+        Ok(_) => panic!("publicationless legacy backup cannot prove recovery identity"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("no complete publication identity"),
+        "unexpected publicationless recovery error: {error}"
+    );
+    assert!(backup_path.exists(), "ambiguous backup must be retained");
+
+    cleanup_sqlite_sidecars(&backup_path).expect("remove ambiguous backup");
+    seed_unpublished_file(&staged_path, 3, "staged.rs").expect("seed unpublished candidate");
+    let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect_err("promotion requires a complete candidate publication");
+    assert!(
+        error
+            .to_string()
+            .contains("no complete publication identity"),
+        "unexpected unpublished candidate error: {error}"
+    );
+    let live = Storage::open(&live_path).expect("reopen untouched unpublished live");
+    assert_eq!(
+        live.get_files().expect("read untouched live")[0].path,
+        PathBuf::from("live.rs")
+    );
+    drop(live);
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&staged_path);
+}
+
+#[test]
+fn legacy_backup_never_overwrites_a_newer_complete_publication() {
+    let live_path = unique_temp_db_path("newer-legacy-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&live_path, 2, "new.rs").expect("seed newer live generation");
+    seed_promotion_file(&backup_path, 1, "old.rs").expect("seed older backup generation");
+
+    let live = Storage::open(&live_path).expect("open newer live generation");
+    assert_eq!(
+        live.get_files().expect("read newer live generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+    drop(live);
+    assert!(!backup_path.exists(), "older backup should be cleaned");
+
+    let _ = cleanup_sqlite_sidecars(&live_path);
+    let _ = cleanup_sqlite_sidecars(&backup_path);
+}
+
+#[test]
+fn invalid_legacy_backup_fails_closed_without_overwriting_live() {
+    let live_path = unique_temp_db_path("invalid-legacy-backup-live");
+    let backup_path = live_path.with_extension("sqlite.backup");
+    seed_promotion_file(&live_path, 2, "new.rs").expect("seed live generation");
+    std::fs::write(&backup_path, b"not a sqlite database").expect("write invalid backup");
+
+    let error = match Storage::open(&live_path) {
+        Ok(_) => panic!("invalid backup must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("database") || error.to_string().contains("SQLite"),
+        "unexpected recovery error: {error}"
+    );
+    std::fs::remove_file(&backup_path).expect("remove invalid backup");
+    let live = Storage::open(&live_path).expect("reopen untouched live generation");
+    assert_eq!(
+        live.get_files().expect("read untouched live generation")[0].path,
+        PathBuf::from("new.rs")
+    );
+
+    drop(live);
+    let _ = cleanup_sqlite_sidecars(&live_path);
 }
 
 #[test]

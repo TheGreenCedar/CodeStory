@@ -593,7 +593,7 @@ impl AppController {
     ) -> Result<GroundingSnapshotDto, ApiError> {
         self.ensure_consistent_read_state("Grounding")?;
         let root = self.require_project_root()?;
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         if matches!(budget, GroundingBudgetDto::Max)
             && !storage.snapshots().has_ready_detail().map_err(|e| {
                 ApiError::internal(format!(
@@ -601,16 +601,10 @@ impl AppController {
                 ))
             })?
         {
-            let _guard = self.grounding_detail_refresh.lock();
-            if !storage.snapshots().has_ready_detail().map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to query grounding detail snapshot readiness: {e}"
-                ))
-            })? {
-                storage.snapshots().refresh_detail().map_err(|e| {
-                    ApiError::internal(format!("Failed to hydrate grounding detail snapshots: {e}"))
-                })?;
-            }
+            return Err(ApiError::new(
+                "cache_busy",
+                "The published index does not have a finalized grounding detail snapshot. Refresh the index before requesting max grounding.",
+            ));
         }
         let config = budget_config(budget);
 
@@ -848,7 +842,8 @@ impl AppController {
         }
 
         let total_file_count = dto_stats.file_count;
-        let retrieval = retrieval_state_from_storage(&storage).ok();
+        let retrieval =
+            retrieval_state_from_storage_for_runtime(&storage, &self.runtime_config).ok();
         if let Some(state) = retrieval.as_ref() {
             let mode = match state.mode {
                 codestory_contracts::api::RetrievalModeDto::Hybrid => "hybrid",
@@ -906,7 +901,7 @@ impl AppController {
     }
 
     pub fn symbol_context(&self, node_id: NodeId) -> Result<SymbolContextDto, ApiError> {
-        let storage = self.open_storage()?;
+        let storage = self.open_storage_read_only()?;
         let node = self.node_details(NodeDetailsRequest {
             id: node_id.clone(),
         })?;
@@ -1826,6 +1821,14 @@ mod tests {
                     ])
                     .expect("insert nodes");
             }
+            storage
+                .snapshots()
+                .refresh_summary()
+                .expect("refresh summary snapshot");
+            storage
+                .snapshots()
+                .refresh_detail()
+                .expect("refresh detail snapshot");
         }
 
         let controller = AppController::new();
@@ -2177,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    fn max_grounding_hydrates_detail_snapshots_when_unavailable() {
+    fn max_grounding_does_not_mutate_an_incomplete_publication() {
         let temp = tempdir().expect("temp dir");
         let db_path = temp.path().join("cache").join("codestory.db");
         std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
@@ -2250,17 +2253,18 @@ mod tests {
         controller
             .open_project_summary_with_storage_path(temp.path().to_path_buf(), db_path.clone())
             .expect("open project summary");
-        controller
+        let error = controller
             .grounding_snapshot(GroundingBudgetDto::Max)
-            .expect("max snapshot");
+            .expect_err("max snapshot should require a finalized detail publication");
+        assert_eq!(error.code, "cache_busy");
 
         let storage = Storage::open(&db_path).expect("reopen storage");
         assert!(
-            storage
+            !storage
                 .snapshots()
                 .has_ready_detail()
                 .expect("detail snapshot readiness"),
-            "max should hydrate detail snapshots when needed"
+            "a read must not hydrate the live publication"
         );
     }
 }

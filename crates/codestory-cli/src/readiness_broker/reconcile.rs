@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use codestory_retrieval::SidecarRuntimeConfig;
+
 use crate::{local_refresh_status, ready_repair_status};
 
 use super::operations::{
@@ -17,10 +19,36 @@ pub(crate) fn reconcile_before_enqueue(
 ) -> BrokerReconciliationSnapshot {
     #[cfg(test)]
     return super::paths::with_test_broker_root(|| {
-        reconcile_before_enqueue_inner(project_root, cache_root, run_id, cli_version)
+        reconcile_before_enqueue_inner(project_root, cache_root, run_id, cli_version, None)
     });
     #[cfg(not(test))]
-    reconcile_before_enqueue_inner(project_root, cache_root, run_id, cli_version)
+    reconcile_before_enqueue_inner(project_root, cache_root, run_id, cli_version, None)
+}
+
+pub(crate) fn reconcile_before_enqueue_for_sidecar(
+    project_root: &Path,
+    cache_root: &Path,
+    sidecar: &SidecarRuntimeConfig,
+    cli_version: &str,
+) -> BrokerReconciliationSnapshot {
+    #[cfg(test)]
+    return super::paths::with_test_broker_root(|| {
+        reconcile_before_enqueue_inner(
+            project_root,
+            cache_root,
+            sidecar.run_id.as_deref(),
+            cli_version,
+            Some(sidecar),
+        )
+    });
+    #[cfg(not(test))]
+    reconcile_before_enqueue_inner(
+        project_root,
+        cache_root,
+        sidecar.run_id.as_deref(),
+        cli_version,
+        Some(sidecar),
+    )
 }
 
 fn reconcile_before_enqueue_inner(
@@ -28,8 +56,15 @@ fn reconcile_before_enqueue_inner(
     cache_root: &Path,
     run_id: Option<&str>,
     cli_version: &str,
+    sidecar: Option<&SidecarRuntimeConfig>,
 ) -> BrokerReconciliationSnapshot {
-    if let Some(active) = ready_repair_status::active_ready_repair_status(project_root, run_id) {
+    let active = match sidecar {
+        Some(sidecar) => {
+            ready_repair_status::active_ready_repair_status_for_sidecar(project_root, sidecar)
+        }
+        None => ready_repair_status::active_ready_repair_status(project_root, run_id),
+    };
+    if let Some(active) = active {
         return BrokerReconciliationSnapshot {
             status: "active_repair".to_string(),
             cleanup_performed: false,
@@ -47,18 +82,29 @@ fn reconcile_before_enqueue_inner(
         };
     }
 
-    let cleanups = ready_repair_status::cleanup_abandoned_ready_repair_status(project_root, run_id);
+    let cleanups = match sidecar {
+        Some(sidecar) => ready_repair_status::cleanup_abandoned_ready_repair_status_for_sidecar(
+            project_root,
+            sidecar,
+        ),
+        None => ready_repair_status::cleanup_abandoned_ready_repair_status(project_root, run_id),
+    };
     let mut stale_status_paths_removed = Vec::new();
     let mut stale_lock_paths_removed = Vec::new();
     let mut abandoned_repairs = Vec::new();
     let mut local_refresh_cleanups = Vec::new();
-    let mut unresolved_orphan_reason =
-        ready_repair_status::stale_live_ready_repair_status(project_root, run_id).map(|status| {
-            format!(
-                "live_ready_repair_heartbeat_stale:pid={}:phase={}",
-                status.pid, status.phase
-            )
-        });
+    let stale_live = match sidecar {
+        Some(sidecar) => {
+            ready_repair_status::stale_live_ready_repair_status_for_sidecar(project_root, sidecar)
+        }
+        None => ready_repair_status::stale_live_ready_repair_status(project_root, run_id),
+    };
+    let mut unresolved_orphan_reason = stale_live.map(|status| {
+        format!(
+            "live_ready_repair_heartbeat_stale:pid={}:phase={}",
+            status.pid, status.phase
+        )
+    });
     for cleanup in cleanups {
         if cleanup.removed_status_path {
             stale_status_paths_removed.push(clean_path(&cleanup.status_path));

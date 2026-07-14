@@ -16,10 +16,9 @@ fn touch_collection(collections_dir: &std::path::Path, name: &str) {
 
 fn test_layout(qdrant_data: &tempfile::TempDir) -> SidecarLayout {
     SidecarLayout {
-        zoekt_http_port: 6070,
         qdrant_http_port: 1,
         qdrant_grpc_port: 1,
-        zoekt_data_dir: qdrant_data.path().join("zoekt"),
+        lexical_data_dir: qdrant_data.path().join("lexical"),
         qdrant_data_dir: qdrant_data.path().to_path_buf(),
         scip_artifacts_root: qdrant_data.path().join("scip"),
         state_file: qdrant_data.path().join("state.json"),
@@ -34,7 +33,7 @@ fn mixed_flat_and_hashed_cache_protects_both_manifest_collections() {
     flat_storage
         .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
             project_id: "flat".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_contract_flat".into(),
             scip_revision: None,
             built_at_epoch_ms: 1,
@@ -64,7 +63,7 @@ fn mixed_flat_and_hashed_cache_protects_both_manifest_collections() {
     hashed_storage
         .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
             project_id: "hashed".into(),
-            zoekt_version: "v1".into(),
+            lexical_version: "v1".into(),
             qdrant_collection: "codestory_contract_hashed".into(),
             scip_revision: None,
             built_at_epoch_ms: 1,

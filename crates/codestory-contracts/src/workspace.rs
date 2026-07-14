@@ -12,6 +12,7 @@ pub struct StoredFileState {
     pub id: i64,
     pub path: PathBuf,
     pub modification_time: i64,
+    pub content_hash: Option<String>,
     pub indexed: bool,
     pub complete: bool,
     pub retry_required: bool,
@@ -27,6 +28,7 @@ pub struct RefreshInputs {
 pub struct IndexedFileRecord {
     pub file_id: i64,
     pub modification_time: i64,
+    pub content_hash: Option<String>,
     pub indexed: bool,
     pub complete: bool,
     pub retry_required: bool,
@@ -67,6 +69,7 @@ impl RefreshInputs {
                         id: record.file_id,
                         path,
                         modification_time: record.modification_time,
+                        content_hash: record.content_hash,
                         indexed: record.indexed,
                         complete: record.complete,
                         retry_required: record.retry_required,

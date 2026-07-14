@@ -17,6 +17,10 @@ on:
 permissions:
   contents: read
 
+env:
+  RELEASE_RUST_TOOLCHAIN: "1.95.0"
+  APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"
+
 jobs:
   smoke:
     name: Published ${{ matrix.asset_target }} smoke
@@ -38,6 +42,9 @@ jobs:
           - os: windows-11-arm
             asset_target: windows-arm64
             extension: zip
+          - os: macos-15-intel
+            asset_target: macos-x64
+            extension: tar.gz
           - os: macos-15
             asset_target: macos-arm64
             extension: tar.gz
@@ -93,14 +100,69 @@ jobs:
           --version-only
           --out-dir "target/post-publish-version-proof/${{ matrix.asset_target }}"
 
+      - name: Prove published macOS signature, notarization, and Gatekeeper acceptance
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_dir="target/post-publish-macos-signing/${{ matrix.asset_target }}"
+          unpacked="$proof_dir/unpacked"
+          mkdir -p "$unpacked"
+          quarantine="0083;$(date +%s);CodeStory;"
+          xattr -w com.apple.quarantine "$quarantine" "${{ steps.asset.outputs.archive }}"
+          xattr -p com.apple.quarantine "${{ steps.asset.outputs.archive }}" \
+            > "$proof_dir/archive-quarantine.txt"
+          tar -xzf "${{ steps.asset.outputs.archive }}" -C "$unpacked"
+          bins="$(find "$unpacked" -type f -name codestory-cli -print)"
+          count="$(printf '%s\n' "$bins" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Expected one codestory-cli in the macOS archive, found $count"
+            exit 1
+          fi
+          bin="$bins"
+          chmod +x "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+          codesign -dv --verbose=4 "$bin" 2> "$proof_dir/codesign-details.txt"
+          codesign -d -r- "$bin" > "$proof_dir/designated-requirement.txt" 2>&1
+          grep -F "Authority=Developer ID Application:" "$proof_dir/codesign-details.txt"
+          grep -E "flags=.*runtime" "$proof_dir/codesign-details.txt"
+          grep -E "^TeamIdentifier=${APPLE_DEVELOPER_TEAM_ID}$" "$proof_dir/codesign-details.txt"
+          grep -E "certificate leaf\\[subject\\.OU\\] = \"?${APPLE_DEVELOPER_TEAM_ID}\"?([[:space:]]|$)" \
+            "$proof_dir/designated-requirement.txt"
+          # Command-line tar does not propagate the download quarantine xattr,
+          # so retain the archive evidence and explicitly transfer the same
+          # quarantine event to the extracted executable before assessment.
+          xattr -w com.apple.quarantine "$quarantine" "$bin"
+          xattr -p com.apple.quarantine "$bin" > "$proof_dir/extracted-binary-quarantine.txt"
+          accepted=false
+          for _attempt in $(seq 1 12); do
+            if spctl --assess --type execute --verbose=4 "$bin" > "$proof_dir/spctl.txt" 2>&1; then
+              accepted=true
+              break
+            fi
+            sleep 5
+          done
+          if [ "$accepted" != true ]; then
+            cat "$proof_dir/spctl.txt"
+            exit 1
+          fi
+          grep -F "source=Notarized Developer ID" "$proof_dir/spctl.txt"
+          "$bin" --version
+          "$bin" --help >/dev/null
+
       - name: Run Windows installer ownership self-test
         if: matrix.asset_target == 'windows-x64'
         shell: pwsh
         run: pwsh -File scripts/install-codestory.ps1 -SelfTest
 
-      - name: Prove Windows managed plugin handoff
-        if: matrix.asset_target == 'windows-x64'
+      - name: Install pinned Rust for Windows rollback proof
+        if: runner.os == 'Windows'
         shell: pwsh
+        run: |
+          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
+          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
+
+      - name: Prove managed plugin handoff
         run: >-
           python .github/scripts/check-packaged-agent-proof.py
           --archive "${{ steps.asset.outputs.archive }}"
@@ -110,6 +172,17 @@ jobs:
           --plugin-root plugins/codestory
           --managed-plugin-handoff
           --out-dir target/post-publish-managed-proof
+
+      - name: Prove published Intel macOS backend policy and explicit CPU/external operation
+        if: matrix.asset_target == 'macos-x64'
+        run: >-
+          python3 .github/scripts/check-packaged-agent-proof.py
+          --archive "${{ steps.asset.outputs.archive }}"
+          --checksum-file "${{ steps.asset.outputs.checksum }}"
+          --expected-version "${{ steps.release.outputs.version }}"
+          --project "${{ github.workspace }}"
+          --intel-runtime-policy
+          --out-dir target/post-publish-intel-policy-proof
 
       - name: Fetch retrieval embedding model
         if: matrix.asset_target == 'linux-x64'
@@ -137,4 +210,6 @@ jobs:
             target/post-publish-version-proof/${{ matrix.asset_target }}
             target/post-publish-managed-proof
             target/post-publish-agent-proof
+            target/post-publish-intel-policy-proof
+            target/post-publish-macos-signing/${{ matrix.asset_target }}
           if-no-files-found: warn

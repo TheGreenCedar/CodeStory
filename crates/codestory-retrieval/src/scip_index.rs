@@ -1,6 +1,7 @@
 //! Emit SCIP-shaped symbol artifacts from the CodeStory SQLite graph.
 
 use anyhow::{Context, Result};
+use codestory_contracts::graph::NodeKind;
 use codestory_store::Store;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,6 +18,8 @@ const STUB_MARKER: &str = "index.scip.stub";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScipSymbolRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub path: String,
     pub symbol: String,
     pub start_line: u32,
@@ -290,12 +293,16 @@ pub fn emit_scip_artifacts_from_store(
         }
         after = batch.last().map(|row| row.node_id);
         for row in batch {
+            if row.node_kind == Some(NodeKind::UNKNOWN as i64) {
+                continue;
+            }
             let Some(file_path) = row.file_path.as_deref().map(normalize_scip_path) else {
                 continue;
             };
             let start_line = row.start_line.unwrap_or(1);
             let end_line = row.end_line.unwrap_or(start_line).max(start_line);
             symbols.push(ScipSymbolRecord {
+                node_id: Some(row.node_id.0.to_string()),
                 path: file_path,
                 symbol: row.display_name,
                 start_line,
@@ -337,6 +344,10 @@ pub fn emit_scip_artifacts_from_store(
 fn scip_revision_for_symbols(symbols: &[ScipSymbolRecord]) -> String {
     let mut hasher = Sha256::new();
     for symbol in symbols {
+        if let Some(node_id) = &symbol.node_id {
+            hasher.update(node_id.as_bytes());
+        }
+        hasher.update([0]);
         hasher.update(symbol.path.as_bytes());
         hasher.update(symbol.symbol.as_bytes());
         hasher.update(symbol.start_line.to_le_bytes());
@@ -431,6 +442,23 @@ mod tests {
                 display_name: format!("symbol_{index:04}"),
             });
         }
+        let unknown_node_id = NodeId(5_000);
+        nodes.push(Node {
+            id: unknown_node_id,
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "import_alias".to_string(),
+            qualified_name: None,
+            canonical_id: None,
+            file_node_id: Some(file_node_id),
+            start_line: Some(4_101),
+            start_col: Some(0),
+            end_line: Some(4_101),
+            end_col: Some(10),
+        });
+        projections.push(SearchSymbolProjection {
+            node_id: unknown_node_id,
+            display_name: "import_alias".to_string(),
+        });
         storage.insert_nodes_batch(&nodes).expect("insert nodes");
         storage
             .upsert_search_symbol_projection_batch(&projections)
@@ -449,6 +477,20 @@ mod tests {
         );
         assert_eq!(symbols.contract.freshness, "fresh");
         assert_eq!(symbols.proofs.len(), symbols.symbols.len());
+        assert!(
+            symbols
+                .symbols
+                .iter()
+                .all(|symbol| symbol.node_id.is_some()),
+            "graph-projection SCIP symbols should preserve their exact node identity"
+        );
+        assert!(
+            symbols
+                .symbols
+                .iter()
+                .all(|symbol| symbol.node_id.as_deref() != Some("5000")),
+            "unresolvable UNKNOWN nodes should not enter the SCIP candidate lane"
+        );
         assert!(
             symbols.symbols.len() >= 4_100,
             "SCIP emit should not truncate at the old 4096-symbol smoke cap"
@@ -486,6 +528,7 @@ mod tests {
                 freshness: "fresh".into(),
             },
             symbols: vec![ScipSymbolRecord {
+                node_id: None,
                 path: "src/lib.rs".into(),
                 symbol: "fixture_package::run".into(),
                 start_line: 3,
@@ -558,6 +601,7 @@ mod tests {
                 freshness: "fresh".into(),
             },
             symbols: vec![ScipSymbolRecord {
+                node_id: None,
                 path: "src/lib.rs".into(),
                 symbol: "fixture_package::run".into(),
                 start_line: 3,

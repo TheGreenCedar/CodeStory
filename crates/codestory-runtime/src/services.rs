@@ -2,16 +2,17 @@ use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, BookmarkCategoryDto,
     BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto,
-    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexedFilesDto, IndexedFilesRequest,
-    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
-    NodeDetailsRequest, NodeId, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
-    RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto, SnippetContextDto,
-    SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto, SymbolContextDto,
-    SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
+    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexPublicationDto, IndexedFilesDto,
+    IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
+    NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
+    SnippetContextDto, SourceOccurrenceDto, StartIndexingRequest, SummaryGenerationDto,
+    SymbolContextDto, SymbolSummaryDto, SystemActionResponse, TrailConfigDto, TrailContextDto,
 };
 
 use crate::AppController;
 use codestory_indexer::CancellationToken;
+use codestory_store::IndexPublicationRecord;
 
 #[derive(Clone)]
 pub struct ProjectService {
@@ -43,6 +44,13 @@ impl ProjectService {
     ) -> Result<ProjectSummary, ApiError> {
         self.controller
             .open_project_summary_with_storage_path(root, storage_path)
+    }
+
+    pub fn complete_index_publication_at(
+        &self,
+        storage_path: &std::path::Path,
+    ) -> Result<Option<IndexPublicationDto>, ApiError> {
+        self.controller.complete_index_publication_at(storage_path)
     }
 
     pub fn start_indexing(&self, req: StartIndexingRequest) -> Result<(), ApiError> {
@@ -112,6 +120,10 @@ impl IndexService {
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.controller
             .run_indexing_blocking_without_runtime_refresh_with_cancel(mode, cancel_token)
+    }
+
+    pub fn complete_index_publication(&self) -> Result<Option<IndexPublicationRecord>, ApiError> {
+        self.controller.complete_index_publication()
     }
 
     pub fn dry_run_index(&self, mode: IndexMode) -> Result<IndexDryRunDto, ApiError> {

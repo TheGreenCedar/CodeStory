@@ -314,6 +314,7 @@ mod golden_tests {
             candidate_count: 1,
             resolved_hit_count: 1,
             unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
             diagnostic: None,
         }];
         let rank_terms = vec!["exec".to_string(), "events".to_string()];

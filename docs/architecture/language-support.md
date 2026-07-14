@@ -149,7 +149,38 @@ Framework route extraction has its own confidence labels in
 [framework-route-coverage.md](../testing/framework-route-coverage.md). A
 language can have parser-backed graph support while a framework remains partial
 or heuristic. A route claim needs fixture or real-repo route evidence, not just a
-language parser.
+language parser. FastAPI decorator routes are parser-backed only when a
+tree-sitter query captures a static string path and decorated handler on a
+single-target module-scope receiver whose latest preceding binding constructs
+an imported `FastAPI` or `APIRouter`. Later assignments, imports, functions,
+and classes invalidate shadowed ownership. Chained or multi-target constructor
+assignments are conservatively not promoted; unmatched, injected,
+factory-returned, and nested-scope receivers are not labeled as FastAPI.
+Error-local line-scan recovery remains structural evidence. Dynamic paths and
+ordinary escaped literals do not become exact route claims.
+
+Express registration calls are parser-backed only when a JavaScript,
+TypeScript, or TSX tree-sitter query captures a static path on a module-scope
+receiver whose latest source-ordered binding constructs an app or router from
+an explicit `express` import or `require("express")`. Reassignment and shadowing
+invalidate ownership. Substitution-free template literals are static; dynamic
+or escaped paths are not exact claims. Handler edges remain probable and are
+limited to direct names that graph resolution can match. Mounted prefixes,
+nested or injected receivers, factory returns, and runtime middleware behavior
+remain outside this claim tier; malformed-file line recovery is structural.
+
+Fastify direct verb calls, including `TRACE`, and
+`route({ method, url, handler })` registrations use the same JavaScript,
+TypeScript, and TSX parser-backed boundary when the
+module-scope receiver was constructed from an explicit `fastify` ESM or
+CommonJS binding. Source-ordered reassignment, shadowing, or unsupported
+construction invalidates receiver ownership. Exact claims require one static
+method and path; dynamic or escaped strings, method arrays, nested builders,
+and nested, injected, or factory-returned receivers are excluded. Direct
+identifier and member handlers can retain probable edges, while wrapped and
+inline handlers do not gain name-based edges. Plugin prefixes, schema behavior,
+and runtime middleware semantics remain heuristic; malformed-file recovery is
+structural and error-local.
 
 ## Expansion Checklist
 

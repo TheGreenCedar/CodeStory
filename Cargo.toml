@@ -44,14 +44,11 @@ tree-sitter-graph = "0.12"
 streaming-iterator = "0.1"
 
 # Storage
-rusqlite = { version = "0.38", features = ["backup", "bundled"] }
+rusqlite = { version = "0.38", features = ["backup", "bundled", "hooks"] }
 
 # Search
 nucleo-matcher = "0.3"
 tantivy = "0.26"
-ndarray = "0.17.2"
-ort = { version = "=2.0.0-rc.12", features = ["directml"] }
-tokenizers = { version = "0.23.1", default-features = false, features = ["onig"] }
 
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
@@ -73,6 +70,9 @@ crossbeam-channel = "0.5"
 crossterm = "0.28"
 parking_lot = "0.12"
 ratatui = "0.30"
+fs_at = "0.2.1"
+libc = "0.2"
+remove_dir_all = "1.0.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6.0.0"
@@ -80,8 +80,10 @@ glob = "0.3"
 tempfile = "3.10"
 toml = "0.8"
 sha2 = "0.10"
+ring = "0.17.14"
 ureq = "2.12"
 turbovec = "0.9.0"
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 criterion = "0.8.2"
 proptest = "1.5"

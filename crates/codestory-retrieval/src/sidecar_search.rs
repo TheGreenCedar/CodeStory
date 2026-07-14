@@ -1,11 +1,69 @@
 use crate::candidate::CandidateHit;
-use crate::config::SidecarLayout;
+use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embeddings::EmbeddingDeviceReadiness;
+use crate::lexical_client::LexicalClient;
 use crate::qdrant_client::QdrantClient;
 use crate::scip_client::ScipClient;
-use crate::zoekt_client::ZoektClient;
 use anyhow::Result;
 use codestory_store::RetrievalIndexManifest;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Request-scoped deadline and cancellation state shared by retrieval stages and sidecar I/O.
+#[derive(Debug, Clone)]
+pub struct SearchExecutionContext {
+    deadline: Instant,
+    request_cancelled: Arc<AtomicBool>,
+    stage_cancelled: Arc<AtomicBool>,
+}
+
+impl SearchExecutionContext {
+    pub(crate) fn new(
+        deadline: Instant,
+        request_cancelled: Arc<AtomicBool>,
+        stage_cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            deadline,
+            request_cancelled,
+            stage_cancelled,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.request_cancelled.load(Ordering::Acquire)
+            || self.stage_cancelled.load(Ordering::Acquire)
+            || Instant::now() >= self.deadline
+    }
+
+    pub fn check_cancelled(&self) -> Result<()> {
+        if self.is_cancelled() {
+            anyhow::bail!("retrieval stage cancelled or deadline exceeded");
+        }
+        Ok(())
+    }
+
+    pub fn timeout(&self, maximum: Duration) -> Result<Duration> {
+        self.check_cancelled()?;
+        let timeout = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(maximum);
+        if timeout.is_zero() {
+            anyhow::bail!("retrieval stage deadline exceeded");
+        }
+        Ok(timeout)
+    }
+
+    fn run<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.check_cancelled()?;
+        let value = operation()?;
+        self.check_cancelled()?;
+        Ok(value)
+    }
+}
+
 /// Sidecar search surface used by the executor (mockable in unit tests).
 pub trait SidecarSearch: Send + Sync {
     fn layout(&self) -> Option<&SidecarLayout> {
@@ -16,21 +74,62 @@ pub trait SidecarSearch: Send + Sync {
         None
     }
 
-    fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
+    fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
+        None
+    }
+
+    fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>>;
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>>;
+
+    fn lexical_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.lexical_search(query, limit))
+    }
+
+    fn qdrant_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.qdrant_search(query, limit))
+    }
+
+    fn scip_anchor_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.scip_anchor(query, limit))
+    }
+
+    fn scip_expand_with_context(
+        &self,
+        anchors: &[CandidateHit],
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        context.run(|| self.scip_expand(anchors, limit))
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct LiveSidecarSearch {
+    runtime: SidecarRuntimeConfig,
     layout: SidecarLayout,
     project_id: String,
     sidecar_generation: String,
     sidecar_input_hash: String,
     qdrant_collection: String,
     embedding_device: Option<EmbeddingDeviceReadiness>,
-    zoekt: ZoektClient,
+    lexical: LexicalClient,
     qdrant: QdrantClient,
 }
 
@@ -49,8 +148,29 @@ impl LiveSidecarSearch {
         manifest: Option<&RetrievalIndexManifest>,
         embedding_device: Option<EmbeddingDeviceReadiness>,
     ) -> Self {
-        let zoekt = ZoektClient::new(&layout);
-        let qdrant = QdrantClient::new(&layout);
+        let runtime = crate::config::SidecarRuntimeConfig::for_project_profile(
+            None,
+            crate::config::SidecarProfile::Local,
+        );
+        Self::new_for_runtime_with_embedding_device(
+            &runtime,
+            layout,
+            project_id,
+            manifest,
+            embedding_device,
+        )
+        .expect("default embedding runtime configuration must be valid")
+    }
+
+    pub fn new_for_runtime_with_embedding_device(
+        runtime: &crate::config::SidecarRuntimeConfig,
+        layout: SidecarLayout,
+        project_id: String,
+        manifest: Option<&RetrievalIndexManifest>,
+        embedding_device: Option<EmbeddingDeviceReadiness>,
+    ) -> Result<Self> {
+        let lexical = LexicalClient::new(&layout);
+        let qdrant = QdrantClient::for_runtime(runtime)?;
         let sidecar_generation = manifest
             .and_then(|manifest| manifest.sidecar_generation.clone())
             .unwrap_or_else(|| format!("{project_id}-missing-manifest"));
@@ -60,16 +180,17 @@ impl LiveSidecarSearch {
         let qdrant_collection = manifest
             .map(|manifest| manifest.qdrant_collection.clone())
             .unwrap_or_else(|| format!("codestory_{project_id}_missing_manifest"));
-        Self {
+        Ok(Self {
+            runtime: runtime.clone(),
             layout,
             project_id,
             sidecar_generation,
             sidecar_input_hash,
             qdrant_collection,
             embedding_device,
-            zoekt,
+            lexical,
             qdrant,
-        }
+        })
     }
 
     pub fn layout(&self) -> &SidecarLayout {
@@ -94,8 +215,12 @@ impl SidecarSearch for LiveSidecarSearch {
         self.embedding_device.as_ref()
     }
 
-    fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
-        self.zoekt.search(
+    fn runtime_config(&self) -> Option<&SidecarRuntimeConfig> {
+        Some(&self.runtime)
+    }
+
+    fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+        self.lexical.search(
             &self.layout,
             &self.sidecar_generation,
             &self.sidecar_input_hash,
@@ -104,16 +229,73 @@ impl SidecarSearch for LiveSidecarSearch {
         )
     }
 
+    fn lexical_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let context = context.clone();
+        self.lexical.search_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+            move || context.is_cancelled(),
+        )
+    }
+
     fn qdrant_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
         self.qdrant.search(&self.qdrant_collection, query, limit)
+    }
+
+    fn qdrant_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        self.qdrant
+            .search_with_context(&self.qdrant_collection, query, limit, context)
     }
 
     fn scip_anchor(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
         ScipClient::anchor_search(&self.layout, &self.sidecar_generation, query, limit)
     }
 
+    fn scip_anchor_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        ScipClient::anchor_search_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            query,
+            limit,
+            &|| context.is_cancelled(),
+        )
+    }
+
     fn scip_expand(&self, anchors: &[CandidateHit], limit: usize) -> Result<Vec<CandidateHit>> {
         ScipClient::expand_graph(&self.layout, &self.sidecar_generation, anchors, limit)
+    }
+
+    fn scip_expand_with_context(
+        &self,
+        anchors: &[CandidateHit],
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        ScipClient::expand_graph_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            anchors,
+            limit,
+            &|| context.is_cancelled(),
+        )
     }
 }
 
@@ -125,7 +307,7 @@ pub mod mock {
 
     #[derive(Debug, Default)]
     pub struct MockSidecarSearch {
-        pub zoekt: Mutex<HashMap<String, Vec<CandidateHit>>>,
+        pub lexical: Mutex<HashMap<String, Vec<CandidateHit>>>,
         pub qdrant: Mutex<HashMap<String, Vec<CandidateHit>>>,
         pub scip_anchor: Mutex<HashMap<String, Vec<CandidateHit>>>,
         pub scip_expand: Mutex<Vec<CandidateHit>>,
@@ -133,22 +315,22 @@ pub mod mock {
 
     impl MockSidecarSearch {
         #[allow(dead_code)]
-        pub fn with_zoekt(query: &str, hits: Vec<CandidateHit>) -> Self {
-            let mut zoekt = HashMap::new();
-            zoekt.insert(query.to_string(), hits);
+        pub fn with_lexical(query: &str, hits: Vec<CandidateHit>) -> Self {
+            let mut lexical = HashMap::new();
+            lexical.insert(query.to_string(), hits);
             Self {
-                zoekt: Mutex::new(zoekt),
+                lexical: Mutex::new(lexical),
                 ..Default::default()
             }
         }
     }
 
     impl SidecarSearch for MockSidecarSearch {
-        fn zoekt_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
+        fn lexical_search(&self, query: &str, limit: usize) -> Result<Vec<CandidateHit>> {
             Ok(self
-                .zoekt
+                .lexical
                 .lock()
-                .expect("zoekt lock")
+                .expect("lexical lock")
                 .get(query)
                 .cloned()
                 .unwrap_or_default()
@@ -207,10 +389,9 @@ mod tests {
     fn test_layout() -> SidecarLayout {
         let root = std::env::temp_dir().join("codestory-sidecar-search-test");
         SidecarLayout {
-            zoekt_http_port: 32101,
             qdrant_http_port: 32102,
             qdrant_grpc_port: 32103,
-            zoekt_data_dir: root.join("zoekt"),
+            lexical_data_dir: root.join("lexical"),
             qdrant_data_dir: root.join("qdrant"),
             scip_artifacts_root: root.join("scip"),
             state_file: root.join("retrieval-sidecars.json"),

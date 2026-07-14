@@ -2,7 +2,7 @@ use codestory_contracts::graph::NodeKind;
 use codestory_store::{LlmSymbolDoc, RetrievalIndexManifest, Store};
 use std::collections::BTreeMap;
 
-pub const SIDECAR_SCHEMA_VERSION: i32 = 2;
+pub const SIDECAR_SCHEMA_VERSION: i32 = 4;
 pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";
@@ -28,6 +28,7 @@ pub fn manifest_has_current_sidecar_contract(
     let expected_generation = sidecar_generation_id(project_id, hash);
     let expected_collection = sidecar_qdrant_collection(project_id, hash);
     !hash.trim().is_empty()
+        && manifest.lexical_version == crate::lexical_index::LEXICAL_INDEX_VERSION
         && manifest.sidecar_schema_version == Some(SIDECAR_SCHEMA_VERSION)
         && manifest.sidecar_generation.as_deref() == Some(expected_generation.as_str())
         && manifest.qdrant_collection == expected_collection
@@ -45,11 +46,24 @@ pub fn manifest_has_current_sidecar_contract(
         && manifest.dense_reason_counts_json.is_some()
 }
 
+#[cfg(test)]
 pub fn manifest_staleness_reason(
     storage: &Store,
     manifest: &RetrievalIndexManifest,
 ) -> Option<String> {
-    let embedding_backend = crate::embeddings::embedding_runtime_id();
+    manifest_staleness_reason_for_runtime(
+        storage,
+        manifest,
+        &crate::config::SidecarRuntimeConfig::local(),
+    )
+}
+
+pub fn manifest_staleness_reason_for_runtime(
+    storage: &Store,
+    manifest: &RetrievalIndexManifest,
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<String> {
+    let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     if manifest.embedding_backend.as_deref() != Some(embedding_backend.as_str()) {
         return Some(format!(
             "sidecar_embedding_backend_changed: manifest={} current={embedding_backend}",
@@ -156,15 +170,30 @@ pub fn manifest_staleness_reason(
     }
 }
 
+#[cfg(test)]
 pub fn manifest_unavailable_reason(
     project_id: &str,
     storage: &Store,
     manifest: &RetrievalIndexManifest,
 ) -> Option<String> {
+    manifest_unavailable_reason_for_runtime(
+        project_id,
+        storage,
+        manifest,
+        &crate::config::SidecarRuntimeConfig::local(),
+    )
+}
+
+pub fn manifest_unavailable_reason_for_runtime(
+    project_id: &str,
+    storage: &Store,
+    manifest: &RetrievalIndexManifest,
+    runtime: &crate::config::SidecarRuntimeConfig,
+) -> Option<String> {
     if !manifest_has_current_sidecar_contract(project_id, manifest) {
         return Some("sidecar_manifest_generation_contract_missing".into());
     }
-    manifest_staleness_reason(storage, manifest)
+    manifest_staleness_reason_for_runtime(storage, manifest, runtime)
         .map(|reason| format!("sidecar_manifest_stale: {reason}"))
 }
 
@@ -349,7 +378,7 @@ mod tests {
     fn manifest(project_id: &str, hash: &str) -> RetrievalIndexManifest {
         RetrievalIndexManifest {
             project_id: project_id.into(),
-            zoekt_version: "zoekt-real-v1".into(),
+            lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
             qdrant_collection: sidecar_qdrant_collection(project_id, hash),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 123,
@@ -395,7 +424,7 @@ mod tests {
         ));
 
         let mut legacy = current;
-        legacy.sidecar_schema_version = Some(1);
+        legacy.sidecar_schema_version = Some(SIDECAR_SCHEMA_VERSION - 1);
         assert!(!manifest_has_current_sidecar_contract(project_id, &legacy));
 
         let mut legacy = manifest(project_id, hash);

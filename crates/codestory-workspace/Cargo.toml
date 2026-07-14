@@ -1,16 +1,25 @@
 [package]
 name = "codestory-workspace"
-version = "0.14.3"
+version = "0.15.0"
 edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
 codestory-contracts = { workspace = true }
+fs_at = { workspace = true }
 glob = { workspace = true }
 ignore = { workspace = true }
+remove_dir_all = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }

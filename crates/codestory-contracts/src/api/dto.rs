@@ -49,6 +49,24 @@ pub struct ProjectSummary {
     pub retrieval: Option<RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub freshness: Option<IndexFreshnessDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<IndexPublicationDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct IndexPublicationDto {
+    pub generation: u64,
+    pub generation_id: String,
+    pub run_id: String,
+    pub mode: IndexPublicationModeDto,
+    pub published_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPublicationModeDto {
+    Full,
+    Incremental,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1674,6 +1692,12 @@ pub struct RetrievalStageTimingDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_ms: Option<u32>,
     pub elapsed_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_wait_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ms: Option<u32>,
     #[serde(default)]
     pub candidates_added: u32,
     #[serde(default)]
@@ -1688,6 +1712,12 @@ pub struct RetrievalStageTimingDto {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stub_reason: Option<String>,
+    #[serde(default = "completed_stage_status")]
+    pub completion_status: String,
+}
+
+fn completed_stage_status() -> String {
+    "completed".into()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1786,6 +1816,8 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub candidate_count: u32,
     pub resolved_hit_count: u32,
     pub unresolved_candidate_count: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub blocking_unresolved_candidate_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
 }
@@ -1828,23 +1860,6 @@ pub struct AgentAnswerDto {
     pub retrieval_trace: AgentRetrievalTraceDto,
 }
 
-/// Evidence item kind in a packet.
-///
-/// Variants identify where evidence came from. `Negative` records absence or a
-/// rejected path and must not be counted as supporting proof.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceTypeDto {
-    SearchHit,
-    SymbolContext,
-    Trail,
-    Snippet,
-    Explore,
-    Bridge,
-    RepoText,
-    Negative,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketBudgetModeDto {
@@ -1864,77 +1879,6 @@ pub enum ClaimReadinessDto {
     Inferred,
     NeedsSourceRead,
     ContradictedBySource,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct EvidenceSourceLocationDto {
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line_start: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line_end: Option<u32>,
-}
-
-/// One evidence row inside an evidence packet.
-///
-/// The row is auditable diagnostic/product evidence depending on
-/// `evidence_type`, `verification_status`, and optional source location. Artifact
-/// paths point to supporting files; they are not serialized source content.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct EvidenceItemDto {
-    pub id: String,
-    pub evidence_type: EvidenceTypeDto,
-    pub command: String,
-    pub status: String,
-    pub confidence: String,
-    pub verification_status: ClaimReadinessDto,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub match_quality: Option<SearchMatchQualityDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<EvidenceSourceLocationDto>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct SourceTruthCheckDto {
-    pub id: String,
-    pub reason: String,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-    pub required: bool,
-}
-
-/// Answer-readiness summary for packet consumers.
-///
-/// `safe_to_say` is supported output. `inferred_claims` and
-/// `needs_verification` are explicit non-claims until the listed checks pass.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct AnswerReadinessReportDto {
-    pub overall_status: ClaimReadinessDto,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub safe_to_say: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inferred_claims: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub needs_verification: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub next_commands: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_truth_checks: Vec<SourceTruthCheckDto>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct EvidencePacketDto {
-    pub packet_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub question: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<EvidenceItemDto>,
-    pub readiness: AnswerReadinessReportDto,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -2135,9 +2079,12 @@ mod packet_tests {
             cancel_reason: None,
             cache_hit: false,
             stage_timings: vec![RetrievalStageTimingDto {
-                stage: "stage1_zoekt_lexical".to_string(),
+                stage: "stage1_lexical".to_string(),
                 deadline_ms: Some(120),
                 elapsed_ms: 18,
+                admission_wait_ms: Some(1),
+                queue_wait_ms: Some(2),
+                execution_ms: Some(16),
                 candidates_added: 3,
                 marginal_gain: 0.25,
                 cancel_reason: None,
@@ -2145,6 +2092,7 @@ mod packet_tests {
                 sidecar_latency_ms: Some(18),
                 degraded: false,
                 stub_reason: None,
+                completion_status: "completed".into(),
             }],
             candidates: vec![RetrievalCandidateSummaryDto {
                 rank: 1,
@@ -2152,7 +2100,7 @@ mod packet_tests {
                 line: Some(12),
                 symbol_name: Some("extension_service".to_string()),
                 score: 0.9,
-                source: "zoekt".to_string(),
+                source: "lexical".to_string(),
                 resolution: Some("node_unresolved".to_string()),
                 admission_status: Some("unresolved".to_string()),
                 loss_reason: Some("node_unresolved".to_string()),
@@ -2174,8 +2122,8 @@ mod packet_tests {
         let value = serde_json::to_value(&shadow).expect("serialize");
         assert_eq!(value["retrieval_mode"], "full");
         assert_eq!(value["retrieval_total_ms"], 42);
-        assert_eq!(value["stage_timings"][0]["stage"], "stage1_zoekt_lexical");
-        assert_eq!(value["candidates"][0]["source"], "zoekt");
+        assert_eq!(value["stage_timings"][0]["stage"], "stage1_lexical");
+        assert_eq!(value["candidates"][0]["source"], "lexical");
         assert_eq!(value["candidates"][0]["line"], 12);
         assert_eq!(value["candidates"][0]["resolution"], "node_unresolved");
         assert_eq!(value["candidates"][0]["admission_status"], "unresolved");
@@ -2206,6 +2154,7 @@ mod packet_tests {
             candidate_count: 5,
             resolved_hit_count: 4,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
             diagnostic: Some("sidecar candidates did not all resolve".to_string()),
         };
 

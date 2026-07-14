@@ -5,6 +5,19 @@ is the first and canonical runtime truth. Call it before `ground`, `files`,
 `packet`, or `search`, and pass the same project to every tool. The server has no
 global workspace binding.
 
+Status is observational: it reports freshness, active ownership, policy, and
+proof without starting work. Calling a project tool such as `ground` activates
+the selected project, starts or attaches its local refresh, and may enqueue the
+existing broker-backed agent repair when sidecar policy is already enabled.
+Failed automatic repairs are cooldown-gated until the relevant project or
+sidecar state changes. A stale heartbeat from a still-live owner remains
+fail-closed because suspension or starvation is not proof of abandonment;
+CodeStory never terminates a repair process based only on heartbeat age.
+
+Reuse a status result until repository, runtime, or index state changes, or a
+tool reports stale evidence or a freshness failure. A blocked sidecar-backed
+surface does not invalidate an allowed local graph route.
+
 ## Status Fields
 
 | Status field | Meaning | Agent action |
@@ -18,7 +31,10 @@ global workspace binding.
 | `plugin_runtime` | Plugin launch source and managed CLI metadata, including `plugin_runtime.plugin_root`, `plugin_cache_version`, `build_source`, and `repo_ref` when provisioned. | Treat `managed` as installed plugin runtime, `local_dev_override` as source/dev override, and `managed_unavailable` as blocked managed setup. |
 | `runtime_truth` | Grouped runtime source, plugin root, managed CLI path, launcher source, and references to canonical readiness fields. | Use as the concise bounded runtime identity summary. Follow its `*_ref` fields into top-level status instead of expecting cloned readiness payloads. |
 | `sidecar_setup` | Plugin sidecar setup policy and last repair state. | Diagnostic sidecar policy detail. For agent repair, follow `recommended_next_calls` and prefer MCP `sidecar_setup` with `action=repair`. |
+| `sidecar_setup.stale_live_repair` | Read-only evidence for a repair whose heartbeat is stale while its recorded process is still live. | Treat it as unresolved ownership. Do not infer abandonment from age, start another repair, or terminate the owner. |
 | `readiness_broker` | Durable repair, local refresh, native embedding resource ownership, stale-lock reconciliation, persistence status, and GPU proof (`proof_status`, `embed_smoke_ok`, `embed_smoke_ms`). | Inspect before retrying repair. A foreign or unverifiable `native_embedding_runtime` busy state blocks repair; a same-project reusable native owner should be followed through `recommended_next_calls`. `gpu_proof.proof_status == "verified"` and `gpu_proof.meaningful_accelerator_work_proven == true` require observed acceleration plus a live timed embed smoke when accelerator is required. |
+| `index_publication` | Durable identity of the complete core database generation currently served at the live path. It is null when the live database is fenced by an incomplete legacy run. | Use its generation, generation ID, run ID, mode, and publication time to distinguish old-or-new complete reads during refresh. |
+| `local_refresh` | Single-flight local refresh state and owner metadata. While `state=refreshing`, `serving_publication` identifies the last complete generation that remains readable. | Continue using local surfaces whose allowed bit is true. Do not treat staged work as live. Read tool-call `_meta.codestory_publication` identifies the exact complete response generation; `served_from=last_complete_publication` means a writer was refreshing concurrently. |
 | `embedding_launch_metadata.launch_mode` | Embedding sidecar launch mode when available, such as `native_spawned` or Docker Compose embed. | On macOS arm64, expect `native_spawned` for accelerated Metal; Docker/Vulkan on Apple Silicon is stale or unrepaired. |
 | `embedding_accelerator_request_provider` / `embedding_accelerator_request_device` | Requested accelerator provider/device. These fields are intent, not proof. | Use them to diagnose mismatched requests, for example `metal` with no device on Apple Silicon versus `vulkan`/`Vulkan0` on Windows or Linux Vulkan paths. |
 | `embedding_device_state` / `embedding_device_observation_source` | Observed embedding device state and where the observation came from. | Treat these as proof inputs. `manual_env` and device-inventory observations remain diagnostic; complete accelerator proof requires the verified broker GPU proof above. Treat `accelerator_request_unobserved` as blocked unless CPU mode is explicitly allowed. |
@@ -41,8 +57,10 @@ provisions from `github_release` when needed, and records the launch source in
 `plugin_runtime`. If the managed runtime cannot spawn or be provisioned, the
 adapter stays up with `repair_setup` diagnostics instead of closing transport.
 
-If project-scoped `status` reports a repairable state, run the MCP
-`recommended_next_calls` loop: call `sidecar_setup` with the same `project` and
-`action=repair` when recommended, then call `status` again before local
-navigation, packet, search, or context. Do not ask the human to install the binary unless network,
+If project-scoped `status` reports a repairable state and the task requires the
+blocked surface, run the MCP `recommended_next_calls` loop: call
+`sidecar_setup` with the same `project` and `action=repair` when recommended,
+then call `status` again before using that surface. When an allowed local graph
+surface satisfies the task, use it without repairing packet/search/context and
+do not represent local navigation as full retrieval proof. Do not ask the human to install the binary unless network,
 permissions, host reload, or release assets block the repair.

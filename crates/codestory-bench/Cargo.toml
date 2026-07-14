@@ -1,6 +1,6 @@
 [package]
 name = "codestory-bench"
-version = "0.14.3"
+version = "0.15.0"
 edition = "2024"
 publish = false
 
@@ -13,6 +13,7 @@ codestory-workspace = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 

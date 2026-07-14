@@ -29,11 +29,6 @@ use crate::{
 };
 use crate::{display, output};
 
-pub(crate) struct ExploreArtifact {
-    pub(crate) json: serde_json::Value,
-    pub(crate) markdown: String,
-}
-
 pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "explore")?;
     preflight_output_file(cmd.output_file.as_deref())?;
@@ -158,93 +153,6 @@ fn env_flag_enabled(name: &str) -> bool {
             !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
         })
         .unwrap_or(false)
-}
-
-pub(crate) fn build_explore_artifact_for_target(
-    runtime: &RuntimeContext,
-    opened: &runtime::OpenedProject,
-    target: &runtime::ResolvedTarget,
-    refresh: args::RefreshMode,
-    profile: Option<ExploreProfile>,
-    depth: u32,
-    max_nodes: u32,
-) -> Result<ExploreArtifact> {
-    let profile = resolve_explore_profile(profile, depth, max_nodes);
-    let symbol = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-    let trail = runtime
-        .browser
-        .trail_context(TrailConfigDto {
-            root_id: target.selected.node_id.clone(),
-            mode: TrailMode::Neighborhood,
-            target_id: None,
-            depth: profile.output.depth,
-            direction: TrailDirection::Both,
-            caller_scope: profile.caller_scope,
-            edge_filter: Vec::new(),
-            show_utility_calls: false,
-            hide_speculative: false,
-            story: false,
-            node_filter: Vec::new(),
-            max_nodes: profile.output.max_nodes.clamp(1, 120),
-            layout_direction: LayoutDirection::Horizontal,
-        })
-        .map_err(map_api_error)?;
-    let snippet_result = runtime
-        .browser
-        .snippet_context(target.selected.node_id.clone(), 4);
-    let (snippet, snippet_layer_note) = match snippet_result {
-        Ok(snippet) => (Some(snippet), "snippet_context: available".to_string()),
-        Err(error) => (
-            None,
-            format!(
-                "snippet_context: unavailable: {}: {}",
-                error.code, error.message
-            ),
-        ),
-    };
-    let status =
-        build_explore_status_output(runtime, opened, target, refresh, None, &snippet_layer_note);
-    let search = build_explore_search_output(&runtime.project_root, target);
-    let navigation = build_navigation_output(&runtime.project_root, target, &trail);
-    let relationship_evidence =
-        build_explore_relationship_evidence(&profile.output, &trail, &navigation);
-    let route_context = symbol.node.route_endpoint.clone();
-    let source_packet =
-        build_explore_source_packet(runtime, opened, &symbol, &trail, &snippet, &profile.output);
-    let output = ExploreOutput {
-        profile: profile.output.clone(),
-        status,
-        search,
-        resolution: build_query_resolution_output(&runtime.project_root, target),
-        navigation,
-        relationship_evidence,
-        route_context,
-        source_packet,
-        symbol: &symbol,
-        trail: &trail,
-        snippet: snippet.as_ref(),
-    };
-    let render_context = ExploreRenderContext {
-        project_root: &runtime.project_root,
-        target,
-        profile: &output.profile,
-        status: &output.status,
-        search: &output.search,
-        navigation: &output.navigation,
-        relationship_evidence: &output.relationship_evidence,
-        route_context: output.route_context.as_ref(),
-        source_packet: &output.source_packet,
-        symbol: &symbol,
-        trail: &trail,
-        snippet: snippet.as_ref(),
-        snippet_layer_note: &snippet_layer_note,
-    };
-    let markdown = render_explore_markdown(&render_context);
-    let json = serde_json::to_value(&output)?;
-    Ok(ExploreArtifact { json, markdown })
 }
 
 struct ResolvedExploreProfile {

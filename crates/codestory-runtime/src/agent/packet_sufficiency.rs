@@ -1,6 +1,8 @@
 use crate::agent::packet_claims::{decorate_packet_claims_proof_metadata, packet_supported_claims};
 use crate::agent::packet_evidence::citation_sufficiency_eligible;
-use crate::agent::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
+use crate::agent::packet_evidence_roles::{
+    PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
+};
 use crate::agent::packet_flow_requirements::{
     CoverageMode, FlowRequirement, FlowRole, packet_flow_requirements_for_terms,
 };
@@ -401,10 +403,7 @@ fn unresolved_sidecar_queries(answer: &AgentAnswerDto) -> Vec<String> {
 }
 
 fn sidecar_diagnostic_blocks_sufficiency(diagnostic: &PacketSidecarQueryDiagnosticDto) -> bool {
-    if diagnostic.candidate_count > 0
-        && diagnostic.resolved_hit_count == 0
-        && diagnostic.unresolved_candidate_count > 0
-    {
+    if diagnostic.blocking_unresolved_candidate_count > 0 {
         return true;
     }
     diagnostic
@@ -1134,8 +1133,10 @@ impl PacketFlowContext {
         {
             return false;
         }
-        if StructuralLanguagePolicy::claim_satisfies_requirement(requirement, claim) {
-            return true;
+        let structural_match =
+            StructuralLanguagePolicy::claim_satisfies_requirement(requirement, claim);
+        if structural_match || StructuralLanguagePolicy::requires_cited_role(requirement) {
+            return structural_match;
         }
         if StructuralLanguagePolicy::requires_specific_proof(requirement) {
             return self.claim_declares_exact_requirement_id(claim, requirement);
@@ -1195,6 +1196,10 @@ impl PacketFlowContext {
 struct StructuralLanguagePolicy;
 
 impl StructuralLanguagePolicy {
+    fn requires_cited_role(requirement: &FlowRequirement) -> bool {
+        requirement.id == "request_interceptor_management"
+    }
+
     fn requires_specific_proof(requirement: &FlowRequirement) -> bool {
         matches!(
             requirement.id,
@@ -1226,6 +1231,14 @@ impl StructuralLanguagePolicy {
     fn claim_satisfies_requirement(requirement: &FlowRequirement, claim: &PacketClaimDto) -> bool {
         let normalized = normalize_identifier(&claim.claim);
         match requirement.id {
+            "request_interceptor_management" => {
+                normalize_identifier(claim.coverage_role.as_deref().unwrap_or_default())
+                    == "interceptormanagement"
+                    && claim
+                        .citations
+                        .iter()
+                        .any(packet_citation_owns_interceptor_management)
+            }
             "sql_tables" => claim.citations.iter().any(Self::citation_is_sql_table),
             "sql_relationships" => claim
                 .citations
@@ -2345,6 +2358,7 @@ mod tests {
             candidate_count: 1,
             resolved_hit_count: 0,
             unresolved_candidate_count: 1,
+            blocking_unresolved_candidate_count: 1,
             diagnostic: Some("unresolved test candidate".to_string()),
         }
     }
@@ -2362,6 +2376,7 @@ mod tests {
             candidate_count: 0,
             resolved_hit_count: 0,
             unresolved_candidate_count: 0,
+            blocking_unresolved_candidate_count: 0,
             diagnostic: Some(
                 "sidecar query has blocking cancel reason `stage_deadline`".to_string(),
             ),
@@ -3846,6 +3861,84 @@ mod tests {
     }
 
     #[test]
+    fn role_safe_sufficiency_requires_cited_requested_interceptor_evidence() {
+        let question = "Trace how a client creates a request, runs interceptors, dispatches it, and sends it through a transport.";
+        let answer = answer_fixture(question);
+        let budget = budget_fixture();
+        let mut claims = vec![
+            claim("The public client entrypoint creates a request before dispatch."),
+            claim("Request dispatch transforms config and invokes the selected handler."),
+            claim("The transport boundary sends the request and returns a response."),
+        ];
+
+        let assemble = |supported_claims| {
+            assemble_packet_sufficiency(PacketSufficiencyInput {
+                project_root: Path::new("C:/workspace/generic-client"),
+                question,
+                task_class: PacketTaskClassDto::RouteTracing,
+                answer: &answer,
+                budget: &budget,
+                supported_claims,
+                missing_required_probe_queries: Vec::new(),
+                targeted_follow_up_queries: Vec::new(),
+            })
+        };
+
+        let missing_role = assemble(claims.clone());
+        assert_eq!(missing_role.status, PacketSufficiencyStatusDto::Partial);
+        assert!(
+            missing_role
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report
+                    .missing
+                    .iter()
+                    .any(|gap| gap == "request_interceptor_management")),
+            "an explicitly requested role must remain missing without compatible cited evidence: {missing_role:?}"
+        );
+
+        let mut unrelated_helper = cited_anchor("requestInterceptorHandler");
+        unrelated_helper.kind = NodeKind::FIELD;
+        claims.push(cited_claim(
+            "requestInterceptorHandler stores request interceptor handler pairs for chained execution.",
+            Some("interceptor management"),
+            unrelated_helper,
+            Some(true),
+        ));
+        let unrelated_path = assemble(claims.clone());
+        assert_eq!(unrelated_path.status, PacketSufficiencyStatusDto::Partial);
+
+        let mut unrelated_type = cited_anchor("InterceptorOptions");
+        unrelated_type.kind = NodeKind::CLASS;
+        claims.push(cited_claim(
+            "InterceptorOptions stores request interceptor handler pairs for chained execution.",
+            Some("interceptor management"),
+            unrelated_type,
+            Some(true),
+        ));
+        let unrelated_type = assemble(claims.clone());
+        assert_eq!(unrelated_type.status, PacketSufficiencyStatusDto::Partial);
+
+        let mut interceptor_registry = cited_anchor("InterceptorRegistry");
+        interceptor_registry.kind = NodeKind::CLASS;
+        claims.push(cited_claim(
+            "InterceptorRegistry stores request interceptor handler pairs for chained execution.",
+            Some("interceptor management"),
+            interceptor_registry,
+            Some(true),
+        ));
+        let complete = assemble(claims);
+        assert_eq!(complete.status, PacketSufficiencyStatusDto::Sufficient);
+        assert!(
+            complete
+                .coverage_report
+                .as_ref()
+                .is_some_and(|report| report.missing.is_empty()),
+            "role-compatible cited evidence should complete the requested flow: {complete:?}"
+        );
+    }
+
+    #[test]
     fn unresolved_sidecar_diagnostics_do_not_block_when_required_roles_are_covered() {
         let question = "Trace how Express creates an application, registers middleware/routes, and handles an incoming request through the router and response helpers.";
         let mut answer = answer_fixture(question);
@@ -4012,11 +4105,13 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_sidecar_diagnostics_block_when_required_coverage_is_missing() {
+    fn mixed_sidecar_diagnostics_block_when_required_coverage_is_missing() {
         let question = "Trace how a server request enters route registration, reaches request handler dispatch, and finalizes a response.";
         let mut answer = answer_fixture(question);
-        answer.retrieval_trace.packet_sidecar_diagnostics =
-            vec![unresolved_sidecar_diagnostic("response finalization")];
+        let mut diagnostic = unresolved_sidecar_diagnostic("response finalization");
+        diagnostic.candidate_count = 2;
+        diagnostic.resolved_hit_count = 1;
+        answer.retrieval_trace.packet_sidecar_diagnostics = vec![diagnostic];
         let budget = budget_fixture();
         let claims = vec![
             claim(

@@ -157,7 +157,7 @@ if (-not $useLocalCheckout) {
     }
 }
 
-Invoke-Checked cargo @("build", "--release", "-p", "codestory-cli", "--manifest-path", (Join-Path $sourceDir "Cargo.toml"))
+Invoke-Checked cargo @("build", "--release", "--locked", "-p", "codestory-cli", "--manifest-path", (Join-Path $sourceDir "Cargo.toml"))
 
 $built = Join-Path (Join-Path (Join-Path $sourceDir "target") "release") $binaryName
 if (-not (Test-Path -LiteralPath $built)) {

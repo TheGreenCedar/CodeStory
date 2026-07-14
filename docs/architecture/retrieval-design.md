@@ -6,7 +6,7 @@ with `retrieval_mode=full`.
 
 `full` means all of the following are true for the same generation:
 
-- Zoekt lexical shard exists, matches the current lexical input hash, and
+- The project-local SQLite FTS lexical shard exists, matches the current lexical input hash, and
   answers smoke queries against source files plus generated graph-native symbol
   docs and component-report virtual docs.
 - Qdrant collection exists, has at least the manifest dense-anchor projection
@@ -16,15 +16,20 @@ with `retrieval_mode=full`.
   selects zero dense anchors, Qdrant is explicitly not required for that
   generation.
 - SCIP graph artifacts exist and are not stub markers.
-- The SQLite `retrieval_index_manifest` has the current schema version,
-  sidecar input hash, sidecar generation, Qdrant collection, embedding backend,
-  embedding dimension, symbol-doc count, dense-anchor count, semantic policy
-  version, graph artifact hash, and dense reason counts.
+- The SQLite `retrieval_index_manifest` has the current schema version and
+  canonical `lexical_version`, sidecar input hash, sidecar generation, Qdrant
+  collection, embedding backend, embedding dimension, symbol-doc count,
+  dense-anchor count, semantic policy version, graph artifact hash, and dense
+  reason counts.
 
 Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
 `unavailable`, stale manifests, stub markers, disabled sidecars, hash vectors,
-ONNX-only paths, old env aliases, and `CODESTORY_RETRIEVAL=0` fail closed for
-agent-facing packet/search.
+removed ONNX configuration, old env aliases, and `CODESTORY_RETRIEVAL=0` fail
+closed for agent-facing packet/search.
+
+Schema 21 renames the former lexical producer column in place, preserving every
+manifest row while removing the legacy column from both fresh and upgraded
+databases. Current code reads and writes only `lexical_version`.
 
 ## Ownership
 
@@ -38,7 +43,7 @@ agent-facing packet/search.
 
 ## Mode Matrix
 
-| Zoekt | Qdrant | SCIP | Dense anchors | Mode | Product behavior |
+| SQLite lexical | Qdrant | SCIP | Dense anchors | Mode | Product behavior |
 |-------|--------|------|---------------|------|------------------|
 | up | up | up | >0 | `full` | Serve packet/search evidence |
 | up | skipped by policy | up | 0 | `full` | Serve graph/lexical packet/search evidence; dense stage is explicitly skipped |
@@ -55,6 +60,14 @@ Runtime rules:
   an older retrieval path.
 - Repo-text, hash, stub, and old local search surfaces may be used only as
   explicitly labeled diagnostics.
+- Each opened project owns one immutable `SidecarRuntimeConfig`. Retrieval
+  indexing, query embedding, readiness/status, runtime search, and summary
+  generation consume that retained value. Managed sidecar endpoints are
+  derived from the selected profile/run ports; external endpoints retain their
+  trusted origin. Persisted state records that origin plus an install-keyed
+  HMAC-SHA256 fingerprint of the full endpoint while exposing only the redacted
+  endpoint. The key remains private in the trusted cache. Request handlers never
+  activate endpoints by mutating process environment variables.
 
 ## Generation And Reuse
 
@@ -63,17 +76,70 @@ hash. Identity is intentionally split: logical `project_id` is repository-wide,
 `workspace_id` owns local processes and state, and `artifact_scope_id` uses the
 logical repository only when portable reuse is eligible. Dirty workspaces fall
 back to `workspace_id`; `canonical_root_hash` is only a local broker snapshot
-locator. The 0.14 migration records these identities without renaming existing
-namespace or artifact paths.
+locator. Sidecar state, Agent namespaces, Compose labels, generation roots, and
+retention all use project identity schema 3.
+
+Repository identity schema 2 lowercases only the remote host, normalizes an
+omitted port to that scheme's effective default, and preserves the transport
+scheme, repository path case, and meaningful ports. SCP spellings normalize to
+SSH while preserving absolute versus home-relative paths; unqualified local
+remotes fail closed. HTTPS, SSH, Git, and unknown schemes remain distinct.
+Project identity schema 3 hashes canonical workspace paths from native OS
+bytes/code units rather than a lossy UTF-8 rendering. Existing paths are
+compared by filesystem file identity; only missing paths use platform lexical
+rules. On Windows that fallback normalizes separators and dot segments and uses
+ordinal Unicode ignore-case;
+because the target does not exist, it cannot observe a future directory's
+case-sensitivity flag. A schema-1 repository id is never inferred from the
+current remote spelling alone; migration requires persisted provenance.
+
+The schema-2/schema-3 contract is exposed through
+`inspect_repository_identity_v2` and `project_identity_v3`. Legacy
+project-identity-v2 sidecar state is discovered for inventory and
+provenance-aware operator cleanup, but never reused, attached to GPU proof, or
+destructively cleaned through a schema-3 runtime. Unknown, missing, mismatched,
+or ambiguous identity state rebuilds in the schema-3 scope. A retained runtime
+also aborts if re-observation changes its workspace or artifact scope.
 
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
-dense-anchor rows, semantic file-role metadata, sidecar schema version, Zoekt
-version pin, embedding backend, embedding dimension, semantic policy version,
-dense reason counts, and SCIP artifact contract inputs.
+dense-anchor rows, semantic file-role metadata, sidecar schema version, lexical
+version pin, embedding backend, configured profile/model/pooling/normalization
+contract, embedding dimension, semantic policy version, dense reason counts,
+and SCIP artifact contract inputs. Endpoint ports are deliberately excluded:
+they route the retained runtime but do not identify the model or its vectors.
 
 `retrieval index --refresh auto` should reuse an unchanged healthy generation.
 If inputs match but health is not `full`, CodeStory rebuilds the unhealthy
 component and persists the manifest only after the full stack is healthy.
+Generation fingerprint reads use one SQLite snapshot. Promotion hashes source
+files before taking the database lock, then takes an immediate SQLite write
+transaction to hash stored symbol/semantic inputs and update the current
+manifest together. Graph or semantic input drift during a build therefore
+leaves the previous current manifest untouched without holding the write lock
+during workspace discovery.
+
+The publication path has one mandatory validation gate immediately before its
+short input/pointer transaction. The candidate manifest must bind the expected
+SQLite lexical shard, SCIP revision and graph artifacts, Qdrant generation
+collection with an exact point count and semantic smoke, llama.cpp runtime
+identity and dimension, and the configured model/profile contract. Native
+managed launches must also expose a matching model path and launch fingerprint;
+Docker launches must retain the same persisted running-container identity
+across the final probes. Accelerator-required policy reruns a bounded embedding
+request at promotion and binds its timing and current runtime log to the exact
+requested provider and device; explicit CPU policy needs a CPU policy
+observation. External accelerator endpoints cannot borrow local runtime logs.
+Device inventory and manual assertions are diagnostic, not promotion proof. A
+failed component check or crash before pointer replacement leaves current and
+rollback unchanged.
+
+Generation cleanup is a reachability pass. Every canonical generation named by
+a readable current manifest or active/rollback retention marker in the shared
+cache scope is a root. GC obtains the exclusive publication/retention locks and
+may delete only generation artifacts outside that root set. Inventory uses a shared
+view when available; if a writer owns the lock, it does not wait or infer that
+new artifacts are garbage, and instead reports all unrooted bytes as building.
+Status exposes active, rollback, building, and reclaimable bytes separately.
 
 ## AST-First Semantic Contract
 

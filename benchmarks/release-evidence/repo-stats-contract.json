@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "repeat_graph_phase_seconds_max": 20,
+  "repeat_semantic_phase_seconds_max": 3,
+  "repeat_full_refresh_regression_factor": 1.25
+}

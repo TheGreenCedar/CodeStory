@@ -142,7 +142,12 @@ fn run_cli_with_embedding_env(
         .env_remove("CODESTORY_EMBED_MODEL_ID")
         .env_remove("CODESTORY_EMBED_TRUNCATE_DIM")
         .env_remove("CODESTORY_EMBED_EXPECTED_DIM")
-        .env_remove("CODESTORY_EMBED_LLAMACPP_URL");
+        .env_remove("CODESTORY_EMBED_LLAMACPP_URL")
+        .env_remove("CODESTORY_EMBED_ONNX_MODEL")
+        .env_remove("CODESTORY_EMBED_ONNX_TOKENIZER")
+        .env_remove("CODESTORY_EMBED_ONNX_PROVIDER")
+        .env_remove("CODESTORY_EMBED_ONNX_THREADS")
+        .env_remove("CODESTORY_EMBED_ONNX_BATCH_TOKENS");
     for (name, value) in envs {
         command.env(name, value);
     }
@@ -204,45 +209,6 @@ fn assert_no_agent_proof_commands(commands: &[&str], context: &str) {
             "{context} should stop before `{blocked}` proof/navigation commands: {joined}"
         );
     }
-}
-
-fn clean_test_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn install_fake_managed_embeddings(cache_dir: &Path) {
-    let root = cache_dir.join("managed-embeddings");
-    let model_path = root
-        .join("models")
-        .join("bge-base-en-v1.5-onnx-qdrant")
-        .join("model_optimized.onnx");
-    let runtime_model_path = root
-        .join("models")
-        .join("bge-base-en-v1.5-onnx-qdrant")
-        .join("model_optimized_cls_pool.onnx");
-    let tokenizer_path = root
-        .join("models")
-        .join("bge-base-en-v1.5-onnx-qdrant")
-        .join("tokenizer.json");
-    fs::create_dir_all(model_path.parent().expect("model parent")).expect("create model dir");
-    fs::write(&model_path, b"fake model").expect("write fake model");
-    fs::write(&runtime_model_path, b"fake pooled model").expect("write fake pooled model");
-    fs::write(&tokenizer_path, b"fake tokenizer").expect("write fake tokenizer");
-    fs::write(
-        root.join("manifest.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "backend": "onnx",
-            "provider": "directml",
-            "onnx_model_asset": "model_optimized.onnx",
-            "onnx_model_path": clean_test_path(&runtime_model_path),
-            "onnx_source_model_path": clean_test_path(&model_path),
-            "onnx_pooled_output": "sentence_embedding",
-            "onnx_tokenizer_asset": "tokenizer.json",
-            "onnx_tokenizer_path": clean_test_path(&tokenizer_path),
-        }))
-        .expect("manifest json"),
-    )
-    .expect("write fake managed manifest");
 }
 
 fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value {
@@ -329,6 +295,21 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .expect("storage file stem");
+    let generation_root = parent.join(format!("{stem}.search-generations"));
+    if generation_root.is_dir() {
+        let mut generations = fs::read_dir(&generation_root)
+            .expect("list persisted search generations")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generations.len(),
+            1,
+            "fresh CLI fixture should publish exactly one search generation"
+        );
+        return generations.pop().expect("published search generation");
+    }
     parent.join(format!("{stem}.search"))
 }
 
@@ -1217,6 +1198,33 @@ fn doctor_keeps_missing_llamacpp_endpoint_explicit() {
 }
 
 #[test]
+fn doctor_reports_removed_onnx_configuration_as_unsupported() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let doctor = run_cli_json_with_embedding_env(
+        workspace.path(),
+        cache_dir.path(),
+        &["doctor", "--format", "json"],
+        &[
+            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
+            ("CODESTORY_EMBED_ONNX_MODEL", "legacy.onnx"),
+        ],
+    );
+
+    assert_eq!(
+        doctor["retrieval"]["fallback_reason"],
+        "missing_embedding_runtime"
+    );
+    let message = doctor["retrieval"]["fallback_message"]
+        .as_str()
+        .expect("fallback message");
+    assert!(message.contains("CODESTORY_EMBED_ONNX_MODEL"), "{message}");
+    assert!(message.contains("no longer supported"), "{message}");
+}
+
+#[test]
 fn doctor_redacts_sensitive_llamacpp_url_output() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
@@ -1247,13 +1255,6 @@ fn doctor_redacts_sensitive_llamacpp_url_output() {
         );
     }
 
-    let managed = check_with_name(&doctor, "managed_embeddings");
-    assert!(
-        managed["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("https://example.test/v1/embeddings")),
-        "managed embedding status should use redacted endpoint display: {managed:#}"
-    );
     let env_row = doctor["environment"]
         .as_array()
         .expect("doctor environment")
@@ -1263,208 +1264,6 @@ fn doctor_redacts_sensitive_llamacpp_url_output() {
     assert_eq!(
         env_row["message"], "set to `https://example.test/v1/embeddings`",
         "doctor URL env row should redact userinfo, query, and fragment: {env_row:#}"
-    );
-}
-
-#[test]
-fn setup_embeddings_dry_run_reports_pinned_managed_assets() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let setup = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["setup", "embeddings", "--dry-run", "--format", "json"],
-        &[],
-    );
-
-    assert_eq!(
-        setup["dry_run"], true,
-        "setup should report dry-run mode: {setup:#}"
-    );
-    assert_eq!(
-        setup["backend"], "onnx",
-        "setup should report the diagnostic ONNX backend: {setup:#}"
-    );
-    assert!(
-        setup["status"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Diagnostic ONNX assets are not installed")),
-        "setup should label ONNX as diagnostic: {setup:#}"
-    );
-    assert!(
-        setup["model"]["url"]
-            .as_str()
-            .is_some_and(|value| value.contains("Qdrant/bge-base-en-v1.5-onnx-Q")),
-        "setup should pin the managed BGE-base ONNX model: {setup:#}"
-    );
-    assert_eq!(
-        setup["model"]["name"], "model_optimized.onnx",
-        "setup should report the pinned optimized ONNX graph: {setup:#}"
-    );
-    assert_eq!(
-        setup["runtime_model"]["name"], "model_optimized_cls_pool.onnx",
-        "setup should report the derived pooled ONNX runtime graph: {setup:#}"
-    );
-    assert!(
-        setup["tokenizer"]["url"]
-            .as_str()
-            .is_some_and(|value| value.contains("Qdrant/bge-base-en-v1.5-onnx-Q")),
-        "setup should pin the matching tokenizer: {setup:#}"
-    );
-    assert!(
-        !cache_dir
-            .path()
-            .join("managed-embeddings")
-            .join("downloads")
-            .exists(),
-        "dry-run setup must not create download artifacts"
-    );
-    let next_commands = setup["next_commands"]
-        .as_array()
-        .expect("setup next commands")
-        .iter()
-        .map(|value| value.as_str().expect("next command"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        next_commands,
-        vec![
-            format!(
-                "codestory-cli doctor --project \"{}\" --cache-dir \"{}\"",
-                clean_test_path(workspace.path()),
-                clean_test_path(cache_dir.path())
-            ),
-            format!(
-                "codestory-cli retrieval bootstrap --project \"{}\" --cache-dir \"{}\"",
-                clean_test_path(workspace.path()),
-                clean_test_path(cache_dir.path())
-            ),
-            format!(
-                "codestory-cli retrieval index --project \"{}\" --cache-dir \"{}\" --refresh full",
-                clean_test_path(workspace.path()),
-                clean_test_path(cache_dir.path())
-            ),
-        ],
-        "setup follow-up commands should preserve project and cache args: {setup:#}"
-    );
-}
-
-#[test]
-fn doctor_reports_managed_embedding_setup_state() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let doctor = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-        &[],
-    );
-
-    let managed = check_with_name(&doctor, "managed_embeddings");
-    let status = managed["status"].as_str().expect("managed status");
-    let message = managed["message"].as_str().expect("managed message");
-    match status {
-        "info" => assert!(
-            message.contains("Diagnostic ONNX") && message.contains("retrieval bootstrap"),
-            "doctor should label missing ONNX assets as diagnostic and name product sidecar repair: {doctor:#}"
-        ),
-        "ok" => assert!(
-            message.contains("Diagnostic ONNX embeddings are installed")
-                || message.contains("External llama.cpp endpoint"),
-            "doctor should label diagnostic ONNX assets or product endpoint readiness: {doctor:#}"
-        ),
-        "warn" => assert!(
-            message.contains("External llama.cpp endpoint"),
-            "doctor should report product llama.cpp endpoint warnings separately from ONNX setup: {doctor:#}"
-        ),
-        _ => panic!(
-            "managed setup state should be informational, installed, or endpoint warning: {doctor:#}"
-        ),
-    }
-}
-
-#[test]
-fn doctor_does_not_autostart_installed_managed_embeddings() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-    install_fake_managed_embeddings(cache_dir.path());
-
-    let doctor = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["doctor", "--format", "json"],
-        &[
-            ("CODESTORY_EMBED_BACKEND", "llamacpp"),
-            (
-                "CODESTORY_EMBED_LLAMACPP_URL",
-                "http://127.0.0.1:9/v1/embeddings",
-            ),
-        ],
-    );
-
-    let managed = check_with_name(&doctor, "managed_embeddings");
-    assert_eq!(
-        managed["status"], "warn",
-        "unreachable product llama.cpp endpoint should warn without promoting ONNX assets: {doctor:#}"
-    );
-    assert!(
-        managed["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("External llama.cpp endpoint")),
-        "managed status should report the product endpoint warning: {doctor:#}"
-    );
-    for name in [
-        "CODESTORY_EMBED_ONNX_MODEL",
-        "CODESTORY_EMBED_ONNX_TOKENIZER",
-        "CODESTORY_EMBED_ONNX_PROVIDER",
-    ] {
-        let env_row = doctor["environment"]
-            .as_array()
-            .expect("doctor environment")
-            .iter()
-            .find(|row| row["name"] == name)
-            .unwrap_or_else(|| panic!("missing env row {name}: {doctor:#}"));
-        assert_eq!(
-            env_row["message"], "not set; using runtime defaults",
-            "doctor must not set {name} from installed diagnostic assets: {env_row:#}"
-        );
-    }
-    assert!(
-        !cache_dir
-            .path()
-            .join("managed-embeddings")
-            .join("logs")
-            .exists(),
-        "doctor should not create managed embedding logs or start a server: {doctor:#}"
-    );
-}
-
-#[test]
-fn index_dry_run_does_not_autostart_installed_managed_embeddings() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-    install_fake_managed_embeddings(cache_dir.path());
-
-    let dry_run = run_cli_json_with_embedding_env(
-        workspace.path(),
-        cache_dir.path(),
-        &["index", "--dry-run", "--format", "json"],
-        &[],
-    );
-
-    assert_eq!(dry_run["dry_run"]["files_to_index"], 3);
-    assert!(
-        !cache_dir
-            .path()
-            .join("managed-embeddings")
-            .join("logs")
-            .exists(),
-        "index --dry-run should not create managed embedding logs or start a server: {dry_run:#}"
     );
 }
 

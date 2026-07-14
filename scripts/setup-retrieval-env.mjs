@@ -13,6 +13,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -185,6 +187,10 @@ function runChecked(label, file, args, env = process.env) {
   }
 }
 
+function cargoRunArgs(...args) {
+  return ["run", "--locked", ...args];
+}
+
 function printPrereqReport(opts) {
   const composeFile = path.join(repoRoot, "docker", "retrieval-compose.yml");
   const cacheRoot = codestoryCacheRoot();
@@ -231,7 +237,7 @@ function printPrereqReport(opts) {
   }
 
   console.log("\nAutomated:");
-  console.log("  - Docker Compose: Qdrant + Zoekt webserver + llama.cpp embed service");
+  console.log("  - Docker Compose: Qdrant + llama.cpp embed service");
   console.log("  - codestory retrieval bootstrap (cache dirs, sidecar state, health wait)");
   console.log("  - codestory retrieval status --project <path>");
   if (opts.withHoldoutClone) {
@@ -250,8 +256,7 @@ function printPrereqReport(opts) {
       `  docker run -d --name codestory-qdrant -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 ` +
         `-v "${path.join(cacheRoot, "qdrant")}:/qdrant/storage" qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae`,
     );
-    console.log("\nZoekt without compose:");
-    console.log("  run sourcegraph/zoekt-webserver on 127.0.0.1:6070 with the CodeStory shard directory mounted");
+    console.log("\nLexical search needs no service; CodeStory stores project-local SQLite FTS shards.");
   }
 
   return failed;
@@ -260,6 +265,7 @@ function printPrereqReport(opts) {
 const BGE_GGUF = "bge-base-en-v1.5.Q8_0.gguf";
 const BGE_GGUF_SHA256 = "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c";
 const BGE_GGUF_BYTES = 117_974_304;
+const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const BGE_URLS = [
   "https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf",
   "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf",
@@ -301,6 +307,74 @@ async function verifyEmbedModel(file) {
   return actual;
 }
 
+async function downloadFile(
+  url,
+  destination,
+  {
+    expectedBytes = null,
+    maxBytes = expectedBytes,
+    timeoutMs = DOWNLOAD_TIMEOUT_MS,
+    fetchImpl = fetch,
+  } = {},
+) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error(`download_size_limit_invalid:${maxBytes}`);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} from ${url}`);
+    }
+    if (!response.body) {
+      throw new Error(`download_body_missing:${url}`);
+    }
+    const contentLength = response.headers.get("content-length");
+    if (contentLength !== null) {
+      const announcedBytes = Number(contentLength);
+      if (!Number.isSafeInteger(announcedBytes) || announcedBytes < 0) {
+        throw new Error(`download_content_length_invalid:${contentLength}`);
+      }
+      if (announcedBytes > maxBytes) {
+        throw new Error(`download_size_limit_exceeded:${announcedBytes}>${maxBytes}`);
+      }
+      if (expectedBytes !== null && announcedBytes !== expectedBytes) {
+        throw new Error(`download_size_mismatch:${announcedBytes}!=${expectedBytes}`);
+      }
+    }
+
+    let receivedBytes = 0;
+    const limiter = new Transform({
+      transform(chunk, _encoding, callback) {
+        receivedBytes += chunk.length;
+        if (receivedBytes > maxBytes) {
+          callback(new Error(`download_size_limit_exceeded:${receivedBytes}>${maxBytes}`));
+          return;
+        }
+        callback(null, chunk);
+      },
+    });
+    await pipeline(
+      Readable.fromWeb(response.body),
+      limiter,
+      fs.createWriteStream(destination, { flags: "wx" }),
+    );
+    if (expectedBytes !== null && receivedBytes !== expectedBytes) {
+      throw new Error(`download_size_mismatch:${receivedBytes}!=${expectedBytes}`);
+    }
+    return receivedBytes;
+  } catch (error) {
+    fs.rmSync(destination, { force: true });
+    if (error?.name === "AbortError") {
+      throw new Error(`download_deadline_exceeded:${timeoutMs}ms:${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function fetchEmbedModel() {
   const dir = embedModelDir();
   fs.mkdirSync(dir, { recursive: true });
@@ -320,18 +394,15 @@ async function fetchEmbedModel() {
   let lastError = null;
   for (const url of BGE_URLS) {
     console.log(`Downloading ${BGE_GGUF} from ${url} to ${dest} ...`);
-    const response = await fetch(url);
-    if (!response.ok) {
-      lastError = `HTTP ${response.status} from ${url}`;
-      continue;
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
     const tempDest = `${dest}.tmp-${process.pid}`;
     try {
-      fs.writeFileSync(tempDest, buffer);
+      const downloadedBytes = await downloadFile(url, tempDest, {
+        expectedBytes: BGE_GGUF_BYTES,
+        maxBytes: BGE_GGUF_BYTES,
+      });
       const checksum = await verifyEmbedModel(tempDest);
       fs.renameSync(tempDest, dest);
-      console.log(`Wrote ${dest} (${buffer.length} bytes, sha256=${checksum})`);
+      console.log(`Wrote ${dest} (${downloadedBytes} bytes, sha256=${checksum})`);
       return dest;
     } catch (error) {
       fs.rmSync(tempDest, { force: true });
@@ -506,6 +577,7 @@ async function installExtractedLlamaServerPayload(backend, extracted, dest) {
       {
         backend: backend.id,
         artifact: backend.artifact,
+        artifact_bytes: backend.artifact_bytes,
         artifact_sha256: backend.sha256,
         executable_rel_path: backend.executable_rel_path,
         executable_sha256: backend.executable_sha256,
@@ -524,6 +596,7 @@ function printLlamaServerPlan(backend) {
   console.log("\nManaged llama-server:");
   console.log(`  backend: ${backend.id}`);
   console.log(`  artifact: ${backend.artifact}`);
+  console.log(`  artifact_bytes: ${backend.artifact_bytes}`);
   console.log(`  url: ${backend.url}`);
   console.log(`  sha256: ${backend.sha256}`);
   console.log(`  executable_archive_path: ${backend.executable_archive_path}`);
@@ -533,6 +606,9 @@ function printLlamaServerPlan(backend) {
 
 async function fetchLlamaServer(opts) {
   const backend = selectedLlamaBackend(opts);
+  if (!Number.isSafeInteger(backend.artifact_bytes) || backend.artifact_bytes <= 0) {
+    throw new Error(`Managed llama-server backend ${backend.id} is missing artifact_bytes`);
+  }
   const dest = managedLlamaServerPath(backend);
   printLlamaServerPlan(backend);
   if (opts.checkOnly) {
@@ -549,6 +625,7 @@ async function fetchLlamaServer(opts) {
     const executableSha = await sha256File(dest);
     if (
       manifest.artifact === backend.artifact &&
+      manifest.artifact_bytes === backend.artifact_bytes &&
       manifest.artifact_sha256?.toLowerCase() === backend.sha256.toLowerCase() &&
       manifest.executable_rel_path === backend.executable_rel_path &&
       manifest.executable_sha256?.toLowerCase() === backend.executable_sha256.toLowerCase() &&
@@ -566,11 +643,10 @@ async function fetchLlamaServer(opts) {
   fs.mkdirSync(extractDir);
   try {
     console.log(`Downloading ${backend.artifact} from ${backend.url} to ${archive} ...`);
-    const response = await fetch(backend.url);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} from ${backend.url}`);
-    }
-    fs.writeFileSync(archive, Buffer.from(await response.arrayBuffer()));
+    await downloadFile(backend.url, archive, {
+      expectedBytes: backend.artifact_bytes,
+      maxBytes: backend.artifact_bytes,
+    });
     await verifySha256(archive, backend.sha256, "llama-server artifact");
     const member = safeArchiveMemberPath(backend.executable_archive_path);
     const result = spawnSync(commandName("tar"), ["-xzf", archive, "-C", extractDir], {
@@ -605,6 +681,14 @@ async function runSelfTest() {
   }
   if (!winLegacy || !winLegacy.sha256 || !winLegacy.executable_sha256) {
     throw new Error("missing checksum-backed legacy Windows Vulkan managed-cache fallback");
+  }
+  if (
+    backends.some(
+      (backend) =>
+        backend.url && (!Number.isSafeInteger(backend.artifact_bytes) || backend.artifact_bytes <= 0),
+    )
+  ) {
+    throw new Error("downloadable llama-server backends must declare artifact_bytes");
   }
   if (backends.some((backend) => backend.os === "macos" && backend.arch !== "aarch64")) {
     throw new Error("macOS Intel llama-server backend must not be present");
@@ -642,6 +726,7 @@ async function runSelfTest() {
     const backend = {
       id: "self-test",
       artifact: "llama-test.tar.gz",
+      artifact_bytes: 8,
       sha256: "0".repeat(64),
       executable_archive_path: "llama-b9902/llama-server",
       executable_rel_path: "llama-server",
@@ -664,6 +749,29 @@ async function runSelfTest() {
     );
     if (manifest.artifact !== backend.artifact || manifest.executable_sha256 !== executableSha) {
       throw new Error("managed install self-test wrote stale manifest metadata");
+    }
+
+    const partial = path.join(tempRoot, "oversized.partial");
+    const oversizedResponse = new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("123"));
+          controller.enqueue(new TextEncoder().encode("456"));
+          controller.close();
+        },
+      }),
+    );
+    let rejectedOversize = false;
+    try {
+      await downloadFile("https://example.invalid/oversized", partial, {
+        maxBytes: 4,
+        fetchImpl: async () => oversizedResponse,
+      });
+    } catch (error) {
+      rejectedOversize = String(error).includes("download_size_limit_exceeded");
+    }
+    if (!rejectedOversize || fs.existsSync(partial)) {
+      throw new Error("bounded download self-test did not reject and clean an oversized stream");
     }
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -699,8 +807,7 @@ async function main() {
     return;
   }
 
-  const bootstrapArgs = [
-    "run",
+  const bootstrapArgs = cargoRunArgs(
     "-p",
     "codestory-cli",
     "--",
@@ -710,7 +817,7 @@ async function main() {
     opts.project,
     "--wait-secs",
     String(opts.waitSecs),
-  ];
+  );
   if (opts.skipCompose) {
     bootstrapArgs.push("--skip-compose");
   }
@@ -734,17 +841,20 @@ async function main() {
       const cli = cliPath(opts.release);
       runChecked("Retrieval status", cli, ["retrieval", "status", "--project", opts.project]);
     } else {
-      runChecked("Retrieval status", "cargo", [
-        "run",
-        "-p",
-        "codestory-cli",
-        ...(opts.release ? ["--release"] : []),
-        "--",
-        "retrieval",
-        "status",
-        "--project",
-        opts.project,
-      ]);
+      runChecked(
+        "Retrieval status",
+        "cargo",
+        cargoRunArgs(
+          "-p",
+          "codestory-cli",
+          ...(opts.release ? ["--release"] : []),
+          "--",
+          "retrieval",
+          "status",
+          "--project",
+          opts.project,
+        ),
+      );
     }
   }
 
@@ -757,7 +867,9 @@ async function main() {
   }
 
   console.log("\nSetup complete.");
-  console.log("Next: cargo run -p codestory-cli -- retrieval index --project <repo-root> --refresh auto");
+  console.log(
+    "Next: cargo run --locked -p codestory-cli -- retrieval index --project <repo-root> --refresh auto",
+  );
 }
 
 main().catch((error) => {

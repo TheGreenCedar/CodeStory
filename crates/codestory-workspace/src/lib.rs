@@ -5,9 +5,10 @@
 //! graph state; its contract is to decide which files are in scope, which
 //! stored file records are stale, and which projections should be removed.
 //!
-//! Freshness is path- and mtime-based. Callers must provide inventory from the
-//! same project root they are planning, and must treat unreadable files as
-//! needing reindexing rather than as clean.
+//! Freshness uses paths, mtimes, and verified parser content hashes when they
+//! are available. Callers must provide inventory from the same project root
+//! they are planning. Discovery completeness is explicit so an unreadable or
+//! bounded walk cannot be mistaken for file deletion.
 
 use anyhow::{Result, bail};
 pub use codestory_contracts::workspace::{
@@ -15,19 +16,24 @@ pub use codestory_contracts::workspace::{
     RefreshPlan, StoredFileRecord, StoredFileState, WorkspaceInventory,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub mod atomic_file;
+pub mod owned_deletion;
 mod repository_identity;
 pub use repository_identity::{
-    PROJECT_IDENTITY_SCHEMA_VERSION, ProjectIdentityV2, REPOSITORY_IDENTITY_SCHEMA_VERSION,
-    RepositoryIdentity, SidecarProjectIdentity, cached_project_identity_v2,
-    inspect_repository_identity, project_identity_v2, sidecar_project_identity,
-    workspace_id_for_root,
+    PROJECT_IDENTITY_SCHEMA_VERSION, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV2,
+    ProjectIdentityV3, REPOSITORY_IDENTITY_SCHEMA_VERSION, REPOSITORY_IDENTITY_V2_SCHEMA_VERSION,
+    RepositoryIdentity, RepositoryIdentityV2, SidecarProjectIdentity, cached_project_identity_v2,
+    cached_project_identity_v3, inspect_repository_identity, inspect_repository_identity_v2,
+    project_identity_v2, project_identity_v3, project_identity_v3_from_repository,
+    same_workspace_path, sidecar_project_identity, workspace_id_for_root, workspace_id_v3_for_root,
 };
 
 /// Source-group language selector used during workspace discovery.
@@ -162,10 +168,48 @@ pub struct WorkspaceMembersManifest {
 ///
 /// Use this when the caller already has a manifest and stored inventory. The
 /// methods are pure with respect to CodeStory storage: they inspect the
-/// filesystem, compare stored mtimes and ids, and return a plan for the caller
-/// to execute.
+/// filesystem, compare stored mtimes, content hashes, and ids, and return a
+/// plan for the caller to execute.
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceDiscovery;
+
+/// Whether discovery observed the entire configured workspace inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceInventoryOutcome {
+    Complete,
+    Partial,
+    Unreadable,
+    Bounded,
+}
+
+impl WorkspaceInventoryOutcome {
+    pub fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
+}
+
+/// One discovery failure retained instead of being treated as an absent file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceInventoryIssue {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// Current source candidates plus proof of inventory completeness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceFileInventory {
+    pub files: Vec<PathBuf>,
+    pub outcome: WorkspaceInventoryOutcome,
+    pub issues: Vec<WorkspaceInventoryIssue>,
+}
+
+/// Refresh plan paired with the inventory outcome that made deletion safe or unsafe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceRefreshOutcome {
+    pub plan: RefreshPlan,
+    pub inventory_outcome: WorkspaceInventoryOutcome,
+    pub inventory_issues: Vec<WorkspaceInventoryIssue>,
+}
 
 #[derive(Debug, Clone)]
 struct CompiledExcludePattern {
@@ -353,6 +397,11 @@ impl WorkspaceManifest {
         WorkspaceDiscovery.source_files_bounded(self, max_files)
     }
 
+    /// Discover source files while preserving completeness and failures.
+    pub fn source_inventory(&self) -> Result<WorkspaceFileInventory> {
+        WorkspaceDiscovery.source_inventory(self)
+    }
+
     /// Build a full-refresh plan that indexes every currently discovered file.
     pub fn full_refresh_plan(&self) -> Result<RefreshPlan> {
         Ok(RefreshPlan {
@@ -371,11 +420,20 @@ impl WorkspaceManifest {
     /// Build an incremental refresh plan from stored file inventory.
     ///
     /// A file is scheduled when it is new, unreadable, previously unindexed,
-    /// carries a retryable file-level error, or its filesystem mtime differs
-    /// from the stored millisecond timestamp.
+    /// carries a retryable file-level error, its filesystem mtime differs from
+    /// the stored millisecond timestamp, or its verified parser content hash
+    /// no longer matches.
     /// Stored file ids absent from current discovery are scheduled for removal.
     pub fn build_execution_plan(&self, inputs: &RefreshInputs) -> Result<RefreshPlan> {
         WorkspaceDiscovery.build_refresh_plan(self, inputs)
+    }
+
+    /// Build an incremental plan and retain the discovery outcome behind it.
+    pub fn build_execution_outcome(
+        &self,
+        inputs: &RefreshInputs,
+    ) -> Result<WorkspaceRefreshOutcome> {
+        WorkspaceDiscovery.build_refresh_outcome(self, inputs)
     }
 
     /// Build an incremental refresh plan with a current-file discovery bound.
@@ -388,13 +446,25 @@ impl WorkspaceManifest {
     ) -> Result<Option<RefreshPlan>> {
         WorkspaceDiscovery.build_refresh_plan_bounded(self, inputs, max_current_files)
     }
+
+    /// Build a bounded plan without discarding why the inventory was incomplete.
+    pub fn build_execution_outcome_bounded(
+        &self,
+        inputs: &RefreshInputs,
+        max_current_files: usize,
+    ) -> Result<WorkspaceRefreshOutcome> {
+        WorkspaceDiscovery.build_refresh_outcome_inner(self, inputs, Some(max_current_files))
+    }
 }
 
 impl WorkspaceDiscovery {
     /// Discover all source files for `manifest`.
     pub fn source_files(&self, manifest: &WorkspaceManifest) -> Result<Vec<PathBuf>> {
-        self.source_files_inner(manifest, None)
-            .map(|files| files.unwrap_or_default())
+        let inventory = self.source_inventory(manifest)?;
+        if !inventory.outcome.is_complete() {
+            bail!(inventory_failure_message(&inventory));
+        }
+        Ok(inventory.files)
     }
 
     /// Discover source files with a hard candidate-count bound.
@@ -403,17 +473,31 @@ impl WorkspaceDiscovery {
         manifest: &WorkspaceManifest,
         max_files: usize,
     ) -> Result<Option<Vec<PathBuf>>> {
-        self.source_files_inner(manifest, Some(max_files))
+        let inventory = self.source_inventory_inner(manifest, Some(max_files))?;
+        match inventory.outcome {
+            WorkspaceInventoryOutcome::Complete => Ok(Some(inventory.files)),
+            WorkspaceInventoryOutcome::Bounded => Ok(None),
+            WorkspaceInventoryOutcome::Partial | WorkspaceInventoryOutcome::Unreadable => {
+                bail!(inventory_failure_message(&inventory))
+            }
+        }
     }
 
-    fn source_files_inner(
+    /// Discover source files while retaining traversal failures.
+    pub fn source_inventory(&self, manifest: &WorkspaceManifest) -> Result<WorkspaceFileInventory> {
+        self.source_inventory_inner(manifest, None)
+    }
+
+    fn source_inventory_inner(
         &self,
         manifest: &WorkspaceManifest,
         max_files: Option<usize>,
-    ) -> Result<Option<Vec<PathBuf>>> {
+    ) -> Result<WorkspaceFileInventory> {
         let workspace_root = workspace_root(manifest);
         let mut all_files = Vec::new();
         let mut seen = HashSet::new();
+        let mut issues = Vec::new();
+        let mut inspected_source_roots = 0usize;
 
         for group in &manifest.settings.source_groups {
             let exclude_patterns = compile_exclude_patterns(&group.exclude_patterns)?;
@@ -422,7 +506,26 @@ impl WorkspaceDiscovery {
                 let full_path = resolve_manifest_source_path(manifest, source_path)?;
                 let source_root = discovery_root(&full_path);
 
-                if full_path.is_file() {
+                let metadata = match fs::metadata(&full_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        issues.push(WorkspaceInventoryIssue {
+                            path: full_path,
+                            message: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if !metadata.is_file() && !metadata.is_dir() {
+                    issues.push(WorkspaceInventoryIssue {
+                        path: full_path,
+                        message: "unsupported source root file type".to_string(),
+                    });
+                    continue;
+                }
+                inspected_source_roots += 1;
+
+                if metadata.is_file() {
                     if !should_include_discovered_path(
                         &full_path,
                         false,
@@ -441,11 +544,16 @@ impl WorkspaceDiscovery {
                         &workspace_root,
                         max_files,
                     ) {
-                        return Ok(None);
+                        all_files.sort();
+                        return Ok(WorkspaceFileInventory {
+                            files: all_files,
+                            outcome: WorkspaceInventoryOutcome::Bounded,
+                            issues,
+                        });
                     }
                     continue;
                 }
-                if full_path.is_dir() {
+                if metadata.is_dir() {
                     let mut builder = ignore::WalkBuilder::new(&full_path);
                     builder.follow_links(true);
                     builder.require_git(false);
@@ -465,7 +573,17 @@ impl WorkspaceDiscovery {
                             &exclude_patterns,
                         )
                     });
-                    for entry in builder.build().filter_map(|e| e.ok()) {
+                    for entry in builder.build() {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                record_walk_error(&mut issues, &full_path, &error);
+                                continue;
+                            }
+                        };
+                        if let Some(error) = entry.error() {
+                            record_walk_error(&mut issues, entry.path(), error);
+                        }
                         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                             continue;
                         }
@@ -476,7 +594,12 @@ impl WorkspaceDiscovery {
                             &workspace_root,
                             max_files,
                         ) {
-                            return Ok(None);
+                            all_files.sort();
+                            return Ok(WorkspaceFileInventory {
+                                files: all_files,
+                                outcome: WorkspaceInventoryOutcome::Bounded,
+                                issues,
+                            });
                         }
                     }
                 }
@@ -484,7 +607,18 @@ impl WorkspaceDiscovery {
         }
 
         all_files.sort();
-        Ok(Some(all_files))
+        let outcome = if issues.is_empty() {
+            WorkspaceInventoryOutcome::Complete
+        } else if inspected_source_roots == 0 {
+            WorkspaceInventoryOutcome::Unreadable
+        } else {
+            WorkspaceInventoryOutcome::Partial
+        };
+        Ok(WorkspaceFileInventory {
+            files: all_files,
+            outcome,
+            issues,
+        })
     }
 
     /// Compare current discovery with stored inventory and return an
@@ -494,8 +628,16 @@ impl WorkspaceDiscovery {
         manifest: &WorkspaceManifest,
         inputs: &RefreshInputs,
     ) -> Result<RefreshPlan> {
-        self.build_refresh_plan_inner(manifest, inputs, None)
-            .map(|plan| plan.unwrap_or_else(empty_incremental_plan))
+        Ok(self.build_refresh_outcome(manifest, inputs)?.plan)
+    }
+
+    /// Compare discovery with stored state and preserve inventory completeness.
+    pub fn build_refresh_outcome(
+        &self,
+        manifest: &WorkspaceManifest,
+        inputs: &RefreshInputs,
+    ) -> Result<WorkspaceRefreshOutcome> {
+        self.build_refresh_outcome_inner(manifest, inputs, None)
     }
 
     /// Compare current discovery with stored inventory unless discovery exceeds
@@ -506,18 +648,23 @@ impl WorkspaceDiscovery {
         inputs: &RefreshInputs,
         max_current_files: usize,
     ) -> Result<Option<RefreshPlan>> {
-        self.build_refresh_plan_inner(manifest, inputs, Some(max_current_files))
+        let outcome =
+            self.build_refresh_outcome_inner(manifest, inputs, Some(max_current_files))?;
+        if outcome.inventory_outcome == WorkspaceInventoryOutcome::Bounded {
+            Ok(None)
+        } else {
+            Ok(Some(outcome.plan))
+        }
     }
 
-    fn build_refresh_plan_inner(
+    fn build_refresh_outcome_inner(
         &self,
         manifest: &WorkspaceManifest,
         inputs: &RefreshInputs,
         max_current_files: Option<usize>,
-    ) -> Result<Option<RefreshPlan>> {
-        let Some(current_files) = self.source_files_inner(manifest, max_current_files)? else {
-            return Ok(None);
-        };
+    ) -> Result<WorkspaceRefreshOutcome> {
+        let inventory = self.source_inventory_inner(manifest, max_current_files)?;
+        let current_files = inventory.files;
         let workspace_root = manifest.root_dir();
         let stored_map = inputs.inventory_map();
         let normalized_stored_map = stored_map
@@ -536,12 +683,7 @@ impl WorkspaceDiscovery {
             let needs_index = match normalized_stored_map.get(&normalized_key) {
                 Some(file) => {
                     existing_file_ids.insert(path.clone(), file.id);
-                    match modification_time_millis(&path) {
-                        Ok(mtime) => {
-                            mtime != file.modification_time || !file.indexed || file.retry_required
-                        }
-                        Err(_) => true,
-                    }
+                    stored_file_needs_index(&path, file)
                 }
                 None => true,
             };
@@ -551,21 +693,50 @@ impl WorkspaceDiscovery {
             }
         }
 
-        for (normalized_key, stored) in normalized_stored_map {
-            if !current_file_keys.contains(&normalized_key) {
-                files_to_remove.push(stored.id);
+        if inventory.outcome.is_complete() {
+            for (normalized_key, stored) in normalized_stored_map {
+                if !current_file_keys.contains(&normalized_key) {
+                    files_to_remove.push(stored.id);
+                }
             }
         }
         files_to_remove.sort_unstable();
         files_to_remove.dedup();
 
-        Ok(Some(RefreshPlan {
-            mode: RefreshMode::Incremental,
-            files_to_index,
-            files_to_remove,
-            existing_file_ids,
-        }))
+        Ok(WorkspaceRefreshOutcome {
+            plan: RefreshPlan {
+                mode: RefreshMode::Incremental,
+                files_to_index,
+                files_to_remove,
+                existing_file_ids,
+            },
+            inventory_outcome: inventory.outcome,
+            inventory_issues: inventory.issues,
+        })
     }
+}
+
+fn record_walk_error(
+    issues: &mut Vec<WorkspaceInventoryIssue>,
+    source_root: &Path,
+    error: &ignore::Error,
+) {
+    issues.push(WorkspaceInventoryIssue {
+        path: source_root.to_path_buf(),
+        message: error.to_string(),
+    });
+}
+
+fn inventory_failure_message(inventory: &WorkspaceFileInventory) -> String {
+    let detail = inventory
+        .issues
+        .first()
+        .map(|issue| format!("{}: {}", issue.path.display(), issue.message))
+        .unwrap_or_else(|| "candidate limit exceeded".to_string());
+    format!(
+        "workspace inventory is {:?}; deletion safety cannot be proven ({detail})",
+        inventory.outcome
+    )
 }
 
 fn source_file_limit_exceeded(files: &[PathBuf], max_files: Option<usize>) -> bool {
@@ -583,15 +754,6 @@ fn push_discovered_file_within_limit(
     !source_file_limit_exceeded(files, max_files)
 }
 
-fn empty_incremental_plan() -> RefreshPlan {
-    RefreshPlan {
-        mode: RefreshMode::Incremental,
-        files_to_index: Vec::new(),
-        files_to_remove: Vec::new(),
-        existing_file_ids: HashMap::new(),
-    }
-}
-
 fn modification_time_millis(path: &Path) -> Result<i64> {
     let metadata = fs::metadata(path)?;
     let modified = metadata.modified()?;
@@ -599,11 +761,70 @@ fn modification_time_millis(path: &Path) -> Result<i64> {
     Ok(duration.as_millis().min(i64::MAX as u128) as i64)
 }
 
+fn stored_file_needs_index(path: &Path, file: &StoredFileState) -> bool {
+    if !file.indexed || file.retry_required {
+        return true;
+    }
+    let Ok(mtime) = modification_time_millis(path) else {
+        return true;
+    };
+    if mtime != file.modification_time {
+        return true;
+    }
+    let Some(expected_hash) = file.content_hash.as_deref() else {
+        return false;
+    };
+    match current_content_hash(path) {
+        Ok(actual_hash) => actual_hash != expected_hash,
+        Err(_) => true,
+    }
+}
+
+fn current_content_hash(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let before = file.metadata()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file.metadata()?;
+    if before.len() != after.len() || before.modified()? != after.modified()? {
+        bail!("source metadata changed while hashing {}", path.display());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn workspace_root(manifest: &WorkspaceManifest) -> PathBuf {
     manifest
         .root_dir()
         .canonicalize()
         .unwrap_or_else(|_| normalize_lexical_path(&manifest.root_dir()))
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = existing.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return normalize_lexical_path(&canonical);
+        }
+        let Some(name) = existing.file_name() else {
+            return normalize_lexical_path(path);
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return normalize_lexical_path(path);
+        };
+        existing = parent;
+    }
 }
 
 fn resolve_manifest_source_path(
@@ -629,10 +850,8 @@ fn resolve_manifest_source_path(
 
     let full_path = normalize_lexical_path(&root.join(source_path));
     let canonical_root = workspace_root(manifest);
-    let canonical_source = full_path
-        .canonicalize()
-        .unwrap_or_else(|_| normalize_lexical_path(&full_path));
-    if !canonical_source.starts_with(&canonical_root) {
+    let canonical_source = canonicalize_with_missing_tail(&full_path);
+    if relative_path_for_matching(&canonical_source, &canonical_root).is_none() {
         bail!(
             "repo-local manifest source path `{}` resolves outside manifest root `{}`",
             source_path.display(),
@@ -731,6 +950,12 @@ impl CompiledExcludePattern {
 
 fn relative_path_for_matching(path: &Path, root: &Path) -> Option<PathBuf> {
     if let Ok(relative) = path.strip_prefix(root) {
+        return Some(relative.to_path_buf());
+    }
+
+    if let (Ok(canonical_path), Ok(canonical_root)) = (path.canonicalize(), root.canonicalize())
+        && let Ok(relative) = canonical_path.strip_prefix(canonical_root)
+    {
         return Some(relative.to_path_buf());
     }
 
@@ -846,6 +1071,30 @@ fn normalized_compare_key(root: &Path, path: &Path) -> String {
     normalize_path_key(&stable)
 }
 
+/// Return `path` relative to `workspace_root` using native path identity.
+///
+/// Exact lexical prefixes are preferred. Alias spellings then compare each
+/// candidate ancestor with the workspace root using filesystem identity for
+/// existing paths and platform lexical rules only for missing paths.
+pub fn workspace_relative_path(workspace_root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = normalize_lexical_path(workspace_root);
+    let candidate = normalize_lexical_path(path);
+    if let Ok(relative) = candidate.strip_prefix(&root) {
+        return Some(relative.to_path_buf());
+    }
+    if !candidate.is_absolute() {
+        return Some(candidate);
+    }
+
+    let matching_root = candidate
+        .ancestors()
+        .find(|ancestor| same_workspace_path(&root, ancestor))?;
+    candidate
+        .strip_prefix(matching_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
 fn normalize_path_key(path: &Path) -> String {
     #[cfg(windows)]
     {
@@ -923,6 +1172,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time: 0,
+                    content_hash: None,
                     indexed: true,
                     complete: true,
                     retry_required: false,
@@ -953,6 +1203,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time: modification_time_millis(&file)?,
+                    content_hash: Some(current_content_hash(&file)?),
                     indexed: true,
                     complete: true,
                     retry_required: false,
@@ -966,6 +1217,37 @@ mod tests {
             "unchanged files should not look dirty when stored mtimes use file-table millisecond precision"
         );
         assert_eq!(plan.existing_file_ids.get(&file), Some(&7));
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_refresh_detects_changed_content_with_matching_mtime() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let file = root.join("main.rs");
+        fs::write(&file, "fn first() {}\n")?;
+        let indexed_hash = current_content_hash(&file)?;
+        fs::write(&file, "fn other() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let plan = WorkspaceDiscovery.build_refresh_plan(
+            &manifest,
+            &RefreshInputs {
+                stored_files: vec![StoredFileState {
+                    id: 7,
+                    path: file.clone(),
+                    modification_time: modification_time_millis(&file)?,
+                    content_hash: Some(indexed_hash),
+                    indexed: true,
+                    complete: true,
+                    retry_required: false,
+                }],
+                inventory: WorkspaceInventory::default(),
+            },
+        )?;
+
+        assert_eq!(plan.files_to_index, vec![file]);
         Ok(())
     }
 
@@ -985,6 +1267,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time,
+                    content_hash: None,
                     indexed: true,
                     complete: false,
                     retry_required: false,
@@ -998,6 +1281,7 @@ mod tests {
                     IndexedFileRecord {
                         file_id: 7,
                         modification_time,
+                        content_hash: None,
                         indexed: true,
                         complete: false,
                         retry_required: false,
@@ -1032,6 +1316,7 @@ mod tests {
                     id: 7,
                     path: file.clone(),
                     modification_time,
+                    content_hash: None,
                     indexed: true,
                     complete: false,
                     retry_required: true,
@@ -1045,6 +1330,7 @@ mod tests {
                     IndexedFileRecord {
                         file_id: 7,
                         modification_time,
+                        content_hash: None,
                         indexed: true,
                         complete: false,
                         retry_required: true,
@@ -1082,6 +1368,7 @@ mod tests {
                         IndexedFileRecord {
                             file_id: 11,
                             modification_time: modification_time_millis(&file)?,
+                            content_hash: None,
                             indexed: true,
                             complete: true,
                             retry_required: false,
@@ -1092,6 +1379,7 @@ mod tests {
                         IndexedFileRecord {
                             file_id: 19,
                             modification_time: 0,
+                            content_hash: None,
                             indexed: true,
                             complete: true,
                             retry_required: false,
@@ -1108,6 +1396,178 @@ mod tests {
         );
         assert_eq!(plan.existing_file_ids.get(&normalized_main), Some(&11));
         assert_eq!(plan.files_to_remove, vec![19]);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_inventory_indexes_observed_files_without_deleting_stored_files() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("src"))?;
+        let observed = root.join("src").join("lib.rs");
+        fs::write(&observed, "pub fn observed() {}\n")?;
+        write_repo_manifest(
+            &root,
+            vec![PathBuf::from("src"), PathBuf::from("unreadable")],
+        )?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let outcome = manifest.build_execution_outcome(&RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 19,
+                path: root.join("still-present.rs"),
+                modification_time: 0,
+                content_hash: None,
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            inventory: WorkspaceInventory::default(),
+        })?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Partial
+        );
+        assert_eq!(outcome.plan.files_to_index, vec![observed]);
+        assert!(outcome.plan.files_to_remove.is_empty());
+        assert_eq!(outcome.inventory_issues.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_source_root_is_unreadable_and_never_deletes() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        write_repo_manifest(&root, vec![PathBuf::from("unreadable")])?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let outcome = manifest.build_execution_outcome(&RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 19,
+                path: root.join("stored.rs"),
+                modification_time: 0,
+                content_hash: None,
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            inventory: WorkspaceInventory::default(),
+        })?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Unreadable
+        );
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert!(outcome.plan.files_to_remove.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_source_root_is_unreadable_and_never_deletes() -> Result<()> {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let socket_path = root.join("source.sock");
+        let _listener = UnixListener::bind(&socket_path)?;
+        write_repo_manifest(&root, vec![PathBuf::from("source.sock")])?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let outcome = manifest.build_execution_outcome(&RefreshInputs {
+            stored_files: vec![StoredFileState {
+                id: 19,
+                path: root.join("stored.rs"),
+                modification_time: 0,
+                content_hash: None,
+                indexed: true,
+                complete: true,
+                retry_required: false,
+            }],
+            inventory: WorkspaceInventory::default(),
+        })?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Unreadable
+        );
+        assert!(outcome.plan.files_to_index.is_empty());
+        assert!(outcome.plan.files_to_remove.is_empty());
+        assert_eq!(outcome.inventory_issues.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_empty_root_plus_unavailable_root_is_partial() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(root.join("empty"))?;
+        write_repo_manifest(
+            &root,
+            vec![PathBuf::from("empty"), PathBuf::from("unreadable")],
+        )?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
+        assert!(inventory.files.is_empty());
+        assert_eq!(inventory.issues.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_inventory_never_deletes() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("one.rs"), "pub fn one() {}\n")?;
+        fs::write(root.join("two.rs"), "pub fn two() {}\n")?;
+
+        let manifest = WorkspaceManifest::open(root.clone())?;
+        let outcome = manifest.build_execution_outcome_bounded(
+            &RefreshInputs {
+                stored_files: vec![StoredFileState {
+                    id: 19,
+                    path: root.join("stored.rs"),
+                    modification_time: 0,
+                    content_hash: None,
+                    indexed: true,
+                    complete: true,
+                    retry_required: false,
+                }],
+                inventory: WorkspaceInventory::default(),
+            },
+            1,
+        )?;
+
+        assert_eq!(
+            outcome.inventory_outcome,
+            WorkspaceInventoryOutcome::Bounded
+        );
+        assert!(outcome.plan.files_to_remove.is_empty());
+        assert!(outcome.plan.files_to_index.len() > 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ignore_processing_errors_make_the_real_walk_partial() -> Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("lib.rs"), "pub fn indexed() {}\n")?;
+        fs::write(root.join(".ignore"), "{a,b\n")?;
+
+        let manifest = WorkspaceManifest::open(root)?;
+        let inventory = manifest.source_inventory()?;
+
+        assert_eq!(inventory.outcome, WorkspaceInventoryOutcome::Partial);
+        assert!(inventory.files.iter().any(|path| path.ends_with("lib.rs")));
+        assert!(!inventory.issues.is_empty());
         Ok(())
     }
 
@@ -1393,6 +1853,25 @@ mod tests {
             error.to_string().contains("must be relative"),
             "absolute source path rejection should explain the trusted boundary: {error}"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_local_manifest_allows_missing_paths_beneath_a_symlinked_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir()?;
+        let actual = temp.path().join("actual");
+        let alias = temp.path().join("alias");
+        fs::create_dir_all(&actual)?;
+        symlink(&actual, &alias)?;
+        write_repo_manifest(&actual, vec![PathBuf::from("unreadable")])?;
+
+        let manifest = WorkspaceManifest::open(alias.clone())?;
+        let resolved = resolve_manifest_source_path(&manifest, Path::new("unreadable"))?;
+
+        assert_eq!(resolved, alias.join("unreadable"));
         Ok(())
     }
 

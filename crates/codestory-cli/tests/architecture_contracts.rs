@@ -75,36 +75,60 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
-fn direct_cli_and_stdio_agent_surfaces_share_runtime_constructor() {
-    let main = read("crates/codestory-cli/src/main.rs");
-    let helper = source_between(&main, "fn new_agent_surface_runtime", "fn run_cache");
+fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
+    let source_root = repo_root().join("crates/codestory-cli/src");
+    let gateway_path = source_root.join("sidecar_runtime.rs");
+    let gateway = fs::read_to_string(&gateway_path).expect("read sidecar runtime gateway");
+    let activation = gateway
+        .find("enable_automatic_test_cache_root_for_process")
+        .expect("gateway enables automatic unit-test cache isolation");
+    let first_cache_lookup = gateway
+        .find("codestory_retrieval::user_cache_root()")
+        .expect("gateway owns the platform cache lookup");
     assert!(
-        helper.contains("RuntimeContext::new_agent_sidecar(project)"),
-        "shared agent surface runtime must keep ready/direct CLI/stdio on the agent-sidecar constructor"
+        activation < first_cache_lookup,
+        "test cache isolation must be enabled before the first platform cache lookup"
     );
 
-    for (start, end, surface) in [
-        ("fn run_context", "fn run_packet", "context"),
-        ("fn run_packet", "fn run_task", "packet"),
-        (
-            "fn run_task_brief",
-            "fn render_packet_markdown",
-            "task brief",
-        ),
-        ("fn run_search", "fn search_request_from_command", "search"),
-        ("fn run_serve", "fn run_generate_completions", "stdio/serve"),
-    ] {
-        let body = source_between(&main, start, end);
-        assert!(
-            body.contains("new_agent_surface_runtime(&cmd.project)?"),
-            "{surface} must use the same agent-sidecar runtime constructor as stdio status/ready"
-        );
-    }
-
-    let ready = source_between(&main, "fn run_ready", "fn run_agent");
+    let config = read("crates/codestory-cli/src/config.rs");
+    let startup = source_between(
+        &config,
+        "pub(crate) fn from_process_env()",
+        "#[derive(Debug, Clone, Default, Deserialize)]",
+    );
     assert!(
-        ready.contains("new_agent_surface_runtime(&cmd.project)?"),
-        "ready --goal agent --repair must stay on the shared agent-sidecar runtime constructor"
+        startup.contains("crate::sidecar_runtime::prepare_cache_access();"),
+        "startup configuration must activate cache isolation before resolving its cache root"
+    );
+
+    let mut files = Vec::new();
+    collect_rs_files(&source_root, &mut files);
+    let forbidden = [
+        "SidecarRuntimeConfig::local(",
+        "SidecarRuntimeConfig::for_project_",
+        "sidecar_runtime_for_project(",
+        "sidecar_runtime_for_project_with_run_id(",
+        "strict_sidecar_status_for_profile(",
+        "codestory_retrieval::embedding_runtime_id()",
+        "codestory_retrieval::user_cache_root(",
+        "enable_automatic_test_cache_root_for_process",
+    ];
+    let mut violations = Vec::new();
+    for path in files {
+        if path == gateway_path {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read CLI source");
+        for needle in forbidden {
+            if source.contains(needle) {
+                violations.push(format!("{}: {needle}", path.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "CLI sidecar constructors must remain behind sidecar_runtime.rs:\n{}",
+        violations.join("\n")
     );
 }
 
@@ -402,14 +426,44 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
-        runtime.contains("store.snapshots().refresh_all_with_stats()"),
-        "incremental refresh should use the snapshot surface for summary/detail refresh"
+        runtime.contains("SnapshotStore::clone_live_to_staged(storage_path)")
+            && runtime.contains("staged.snapshots().finalize_staged()")
+            && runtime.contains("staged.snapshots().refresh_detail()"),
+        "incremental refresh should clone, finalize both snapshot tiers, and publish through the staged snapshot surface"
     );
     assert!(
         !runtime.contains("create_deferred_secondary_indexes()")
             && !runtime.contains("refresh_grounding_summary_snapshots()")
             && !runtime.contains("hydrate_grounding_detail_snapshots()"),
         "snapshot lifecycle should not be orchestrated directly outside the store snapshot surface"
+    );
+}
+
+#[test]
+fn staged_publication_identity_and_fence_are_complete_before_publication() {
+    let runtime = read("crates/codestory-runtime/src/lib.rs");
+    let store = read("crates/codestory-store/src/storage_impl/mod.rs");
+    let schema = read("crates/codestory-store/src/storage_impl/schema.rs");
+
+    assert!(
+        store.contains("pub struct IndexPublicationRecord")
+            && store.contains("pub fn database_index_publication")
+            && store.contains("pub fn put_index_publication"),
+        "publication identity should be a typed store contract with read-only and staged-write surfaces"
+    );
+    assert!(
+        schema.contains("CREATE TABLE IF NOT EXISTS index_publication"),
+        "publication identity should survive process restarts in the SQLite schema"
+    );
+    assert!(
+        runtime.contains("next_index_publication(")
+            && runtime.contains("staged.store_mut().put_index_publication(&publication)")
+            && runtime
+                .matches("staged.store_mut().finish_incremental_run()")
+                .count()
+                >= 2
+            && runtime.matches("staged.publish(storage_path)").count() >= 2,
+        "full and incremental staging should persist publication identity and clear compatibility fences before publishing"
     );
 }
 

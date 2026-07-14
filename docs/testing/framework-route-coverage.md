@@ -13,11 +13,20 @@ These bullets list extractor coverage or tracked fixture targets, not full
 framework parity; use `summary.framework_route_coverage` for per-framework
 status, confidence floor, handler-link support, known gaps, and promotability.
 
-- JavaScript/TypeScript: Express, React Router, SvelteKit, Next.js,
-  Remix, Fastify, Koa, Hono, NestJS.
+- JavaScript/TypeScript: Express module-scope route calls on source-ordered app
+  and router bindings constructed from explicit `express` imports or
+  `require("express")` use a tree-sitter query. Fastify direct verbs, including
+  `TRACE`, and static `route({ method, url, handler })` objects use parser-backed
+  source-ordered receiver provenance from explicit `fastify` imports. React Router, SvelteKit,
+  Next.js, Remix, Koa, Hono, and NestJS retain their existing collectors.
 - Astro/Vue: Astro and Nuxt file-convention routes, plus Vue Router object
   routes.
-- Python: Django, Flask, FastAPI.
+- Python: Django and Flask retain structural collectors. FastAPI decorators on
+  source-ordered module bindings constructed from imported
+  `FastAPI`/`APIRouter` constructors use a tree-sitter query for static string
+  paths and handler links. Later assignment, import, function, or class bindings
+  invalidate stale ownership. Error-local malformed-file recovery is explicitly
+  structural and low-confidence; unmatched receivers are not FastAPI claims.
 - Ruby/PHP/Java/C#: Rails, Laravel, Spring, ASP.NET.
 - Rust: Axum, Actix, Rocket.
 - Go: Gin, Chi, Echo, Fiber as text-only partial route extraction until Go
@@ -61,6 +70,45 @@ be checked with `files --path <fragment>` or a fresh index.
   annotation, C# attribute, or Rust attribute.
 - `heuristic`: route comes from text/tree-sitter pattern matching and needs
   source review before claiming handler parity.
+
+FastAPI route metadata records `claim_tier=parser_backed` with
+`extraction_provenance=tree_sitter_query`. Its syntax-error fallback records
+`claim_tier=structural`, `extraction_provenance=lexical_fallback`, and
+  `confidence=heuristic`. Keyword `path=` arguments, ordinary escaped string
+  literals, and `head`, `options`, `api_route`, and `websocket` decorators are not
+  exact route claims in this slice. Chained or multi-target constructor
+  assignments, including `app = router = FastAPI()`, are not promoted.
+  Factory-returned, injected, and nested-scope routers are not labeled as
+  FastAPI until receiver-specific provenance is resolved.
+
+Express route metadata records `claim_tier=parser_backed` with
+`extraction_provenance=tree_sitter_query` for static quoted paths and
+substitution-free template literals. The route remains `confidence=heuristic`:
+the parser proves the registration syntax and receiver construction, not
+mounted prefixes, middleware behavior, or runtime dispatch. Direct handler
+names can produce the existing probable graph edge when resolution succeeds;
+inline, nested-call, and middleware-array handlers do not produce handler
+claims. Dynamic and escaped paths, direct `require("express")()` construction,
+chained or multi-target bindings, and nested, injected, or factory-returned
+receivers are not promoted. Error-local lexical recovery stays
+`claim_tier=structural` and `extraction_provenance=lexical_fallback`.
+
+Fastify route metadata uses the same parser-backed and structural provenance
+labels. Direct verb calls accept static quoted paths and substitution-free
+template literals. Static `route(...)` objects require exactly one string
+method, URL, and handler property, independent of property order. Only direct
+identifier or member handlers retain probable name-based edges; wrapped and
+inline handlers remain routes without invented edges. Reassigned, shadowed,
+nested, injected, factory-returned, and unsupported constructed receivers are
+not promoted. Dynamic and escaped paths, method arrays, concatenation, and
+nested builders are excluded. Plugin-prefix propagation, schemas, and runtime
+middleware behavior remain outside the claim.
+
+The clean Fastify truth-set regression records the old line scanner at less
+than complete recall or precision and the parser query at TP=5, FP=0, FN=0.
+The same suite proves clean parses never restore lexical results and confines
+malformed-source recovery to an error-local, module-scope, owned receiver with
+a static path.
 
 ## Verification Playbook
 

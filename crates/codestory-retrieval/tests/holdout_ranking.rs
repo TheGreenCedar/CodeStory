@@ -8,16 +8,21 @@ fn holdout_candidates_ripgrep() -> Vec<CandidateHit> {
             "crates/core/search.rs",
             Some("SearchWorker".into()),
             0.82,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         ),
         CandidateHit::with_source(
             "crates/core/flags/mod.rs",
             Some("parse".into()),
             0.65,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         ),
-        CandidateHit::with_source("zoekt:search pipeline", None, 0.95, CandidateSource::Zoekt),
-        CandidateHit::with_source("README.md", None, 0.2, CandidateSource::Zoekt),
+        CandidateHit::with_source(
+            "lexical:search pipeline",
+            None,
+            0.95,
+            CandidateSource::Lexical,
+        ),
+        CandidateHit::with_source("README.md", None, 0.2, CandidateSource::Lexical),
     ]
 }
 
@@ -32,7 +37,7 @@ fn holdout_ripgrep_prompt_prefers_search_driver_files() {
     assert!(
         ranked
             .iter()
-            .all(|hit| !hit.file_path.starts_with("zoekt:")),
+            .all(|hit| !hit.file_path.starts_with("lexical:")),
         "phantom hits must be dropped"
     );
 }
@@ -47,9 +52,9 @@ fn holdout_axios_prompt_prefers_dispatch_path() {
             "lib/core/dispatchRequest.js",
             Some("dispatchRequest".into()),
             0.8,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         ),
-        CandidateHit::with_source("lib/defaults.js", None, 0.75, CandidateSource::Zoekt),
+        CandidateHit::with_source("lib/defaults.js", None, 0.75, CandidateSource::Lexical),
         CandidateHit::with_source("semantic:axios", None, 0.95, CandidateSource::Qdrant),
     ];
     let ranked = rank_candidates(&features, candidates);
@@ -66,15 +71,15 @@ fn holdout_redis_prompt_prefers_server_event_loop_files() {
             "src/server.c",
             Some("main".into()),
             0.82,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         ),
         CandidateHit::with_source(
             "src/ae.c",
             Some("aeMain".into()),
             0.78,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         ),
-        CandidateHit::with_source("README.md", None, 0.3, CandidateSource::Zoekt),
+        CandidateHit::with_source("README.md", None, 0.3, CandidateSource::Lexical),
     ];
     let ranked = rank_candidates(&features, candidates);
     assert_eq!(ranked[0].file_path, "src/server.c");

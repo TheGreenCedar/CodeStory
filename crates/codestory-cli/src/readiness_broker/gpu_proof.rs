@@ -10,7 +10,9 @@ pub(crate) fn gpu_proof(input: BrokerGpuProofInput) -> BrokerGpuProofSnapshot {
         Some("native_log" | "sidecar_log")
     );
     let smoke_ok = input.embed_smoke_ok == Some(true);
-    let proof_status = if accelerated && runtime_observed && !cpu_allowed && smoke_ok {
+    let smoke_timed = input.embed_smoke_ms.is_some();
+    let proof_status = if accelerated && runtime_observed && !cpu_allowed && smoke_ok && smoke_timed
+    {
         "verified"
     } else if (accelerated && !cpu_allowed) || requested {
         "gpu_unverified"
@@ -103,6 +105,9 @@ fn runtime_identity_supports_proof(
         || identity.namespace.is_empty()
         || identity.compose_project.is_empty()
         || identity.embed_url.is_empty()
+        || identity.embedding_endpoint_origin
+            != codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar
+        || identity.embedding_endpoint_fingerprint_sha256.is_empty()
         || identity.started_at_epoch_ms <= 0
     {
         return false;

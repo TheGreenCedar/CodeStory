@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum RetrievalStageKind {
     Stage0ScipAnchor,
-    Stage1ZoektLexical,
+    Stage1Lexical,
     Stage1bQdrantSemantic,
     Stage2ScipExpand,
     Stage3RepoTextFallback,
@@ -21,7 +21,7 @@ impl RetrievalStageKind {
     pub fn label(self) -> &'static str {
         match self {
             RetrievalStageKind::Stage0ScipAnchor => "stage0_scip_anchor",
-            RetrievalStageKind::Stage1ZoektLexical => "stage1_zoekt_lexical",
+            RetrievalStageKind::Stage1Lexical => "stage1_lexical",
             RetrievalStageKind::Stage1bQdrantSemantic => "stage1b_qdrant_semantic",
             RetrievalStageKind::Stage2ScipExpand => "stage2_scip_expand",
             RetrievalStageKind::Stage3RepoTextFallback => "stage3_repo_text_fallback",
@@ -31,7 +31,7 @@ impl RetrievalStageKind {
     pub fn provenance_label(self) -> Option<&'static str> {
         match self {
             RetrievalStageKind::Stage0ScipAnchor => Some("exact"),
-            RetrievalStageKind::Stage1ZoektLexical => Some("lexical_source"),
+            RetrievalStageKind::Stage1Lexical => Some("lexical_source"),
             RetrievalStageKind::Stage1bQdrantSemantic => Some("dense_anchor"),
             RetrievalStageKind::Stage2ScipExpand => Some("graph_neighbor"),
             RetrievalStageKind::Stage3RepoTextFallback => None,
@@ -41,7 +41,7 @@ impl RetrievalStageKind {
     pub fn sidecar_latency_ms(self, elapsed_ms: u64) -> Option<u32> {
         match self {
             RetrievalStageKind::Stage0ScipAnchor
-            | RetrievalStageKind::Stage1ZoektLexical
+            | RetrievalStageKind::Stage1Lexical
             | RetrievalStageKind::Stage1bQdrantSemantic
             | RetrievalStageKind::Stage2ScipExpand => u32::try_from(elapsed_ms).ok(),
             RetrievalStageKind::Stage3RepoTextFallback => None,
@@ -103,9 +103,9 @@ pub fn plan_query(features: &QueryFeatures, mode: RetrievalDegradedMode) -> Retr
         });
     }
 
-    if mode.runs_zoekt_stage() {
+    if mode.runs_lexical_stage() {
         stages.push(PlannedStage {
-            kind: RetrievalStageKind::Stage1ZoektLexical,
+            kind: RetrievalStageKind::Stage1Lexical,
             budget_ms: stage1_budget_ms(features.shape),
             top_k,
         });
@@ -215,7 +215,7 @@ mod tests {
         let plan = plan_query(&features, RetrievalDegradedMode::Full);
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
         assert!(kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1ZoektLexical));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1Lexical));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
         assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
         assert!(
@@ -233,7 +233,7 @@ mod tests {
         let cases = [
             (RetrievalStageKind::Stage0ScipAnchor, Some("exact"), true),
             (
-                RetrievalStageKind::Stage1ZoektLexical,
+                RetrievalStageKind::Stage1Lexical,
                 Some("lexical_source"),
                 true,
             ),
@@ -308,7 +308,7 @@ mod tests {
         let plan = plan_query(&features, RetrievalDegradedMode::Full);
         let kinds: Vec<_> = plan.stages.iter().map(|s| s.kind).collect();
         assert!(!kinds.contains(&RetrievalStageKind::Stage0ScipAnchor));
-        assert!(kinds.contains(&RetrievalStageKind::Stage1ZoektLexical));
+        assert!(kinds.contains(&RetrievalStageKind::Stage1Lexical));
         assert!(kinds.contains(&RetrievalStageKind::Stage2ScipExpand));
         assert!(kinds.contains(&RetrievalStageKind::Stage1bQdrantSemantic));
         assert!(

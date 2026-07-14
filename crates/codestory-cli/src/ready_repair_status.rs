@@ -1,8 +1,9 @@
 use anyhow::Result;
 use codestory_contracts::api::{ApiError, ApiErrorDetails, CommandFailureEnvelope};
+pub(crate) use codestory_retrieval::ProcessOwnerState;
 use codestory_retrieval::{
-    DEFAULT_AGENT_RUN_ID, SidecarProfile, SidecarRuntimeConfig,
-    sidecar_runtime_for_project_with_run_id,
+    DEFAULT_AGENT_RUN_ID, ProcessStartProbe, SidecarProfile, SidecarRuntimeConfig,
+    probe_process_start_identity, process_owner_state as classify_process_owner_state,
 };
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
@@ -10,9 +11,6 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,10 +25,6 @@ const READY_REPAIR_STATUS_TTL: Duration = Duration::from_secs(30);
 const READY_REPAIR_LOCK_STALE_TTL: Duration = Duration::from_secs(120);
 const READY_REPAIR_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const READY_REPAIR_COORDINATION_POLL: Duration = Duration::from_millis(10);
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-const READY_REPAIR_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-const READY_REPAIR_PROCESS_PROBE_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) const READY_REPAIR_ATTEMPT_ENV: &str = "CODESTORY_READY_REPAIR_ATTEMPT_ID";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +122,8 @@ pub(crate) struct ReadyRepairWorkerResult {
     pub(crate) started_at_epoch_ms: i64,
     pub(crate) finished_at_epoch_ms: i64,
     pub(crate) outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auto_retry_fingerprint: Option<String>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) wait_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -186,20 +182,6 @@ pub(crate) struct ReadyRepairCleanup {
 pub(crate) enum ReadyRepairLockAttempt {
     Acquired(ReadyRepairLock),
     Busy(Box<ReadyRepairBusy>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProcessOwnerState {
-    Matching,
-    GoneOrReused,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProcessProbe {
-    Running { start_identity: Option<String> },
-    NotRunning,
-    Unknown,
 }
 
 #[derive(Debug)]
@@ -329,6 +311,7 @@ pub(crate) fn try_reserve_ready_repair(
                 .unwrap_or(stale.started_at_epoch_ms),
             finished_at_epoch_ms: now_epoch_ms(),
             outcome: "abandoned".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: None,
             wait_error: Some(
                 "repair worker reservation owner exited before recording a terminal result"
@@ -369,7 +352,9 @@ pub(crate) fn adopt_ready_repair_reservation(
     attempt_id: &str,
 ) -> Result<ReadyRepairReservation> {
     let pid = std::process::id();
-    let process_start_identity = recorded_process_start_identity(pid);
+    let process_start_identity = recorded_process_start_identity(pid)
+        .filter(|identity| !identity.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("could not prove ready repair worker start identity"))?;
     let _coordination = acquire_ready_repair_coordination(sidecar)?;
     let path = ready_repair_reservation_path(sidecar);
     let mut reservation = read_ready_repair_reservation_file(&path)
@@ -391,7 +376,7 @@ pub(crate) fn adopt_ready_repair_reservation(
         anyhow::bail!("ready repair reservation parent is no longer the recorded process");
     }
     reservation.pid = pid;
-    reservation.process_start_identity = process_start_identity;
+    reservation.process_start_identity = Some(process_start_identity);
     reservation.started_at_epoch_ms = now_epoch_ms();
     reservation.adopted = true;
     crate::file_state::write_json_atomic(&path, "ready-repair-reservation", &reservation)?;
@@ -403,6 +388,57 @@ pub(crate) fn adopt_ready_repair_reservation(
             .unwrap_or(reservation.started_at_epoch_ms),
         armed: true,
     })
+}
+
+pub(crate) fn wait_for_ready_repair_reservation_adoption(
+    sidecar: &SidecarRuntimeConfig,
+    attempt_id: &str,
+    pid: u32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        {
+            let _coordination = acquire_ready_repair_coordination(sidecar)?;
+            let reservation =
+                read_ready_repair_reservation_file(&ready_repair_reservation_path(sidecar))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("ready repair reservation disappeared during handoff")
+                    })?;
+            if reservation.attempt_id != attempt_id {
+                anyhow::bail!("ready repair reservation changed attempt during handoff");
+            }
+            if reservation.adopted {
+                if reservation.pid != pid {
+                    anyhow::bail!("ready repair reservation adopted an invalid worker identity");
+                }
+                let expected_start_identity = reservation
+                    .process_start_identity
+                    .as_deref()
+                    .filter(|identity| !identity.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ready repair reservation adopted without a worker start identity"
+                        )
+                    })?;
+                match probe_process_start_identity(reservation.pid) {
+                    ProcessStartProbe::NotRunning => return Ok(()),
+                    ProcessStartProbe::Running {
+                        start_identity: actual,
+                    } if actual == expected_start_identity => return Ok(()),
+                    ProcessStartProbe::Running { .. } | ProcessStartProbe::Unknown { .. } => {
+                        anyhow::bail!(
+                            "ready repair reservation adopted an invalid worker identity"
+                        );
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for ready repair reservation adoption");
+        }
+        thread::sleep(READY_REPAIR_COORDINATION_POLL);
+    }
 }
 
 pub(crate) fn remove_ready_repair_reservation_if_attempt(
@@ -467,31 +503,38 @@ fn write_ready_repair_worker_result_locked(
     )
 }
 
-pub(crate) fn read_ready_repair_worker_result(
-    project_root: &Path,
-    run_id: Option<&str>,
+pub(crate) fn read_ready_repair_worker_result_for_sidecar(
+    sidecar: &SidecarRuntimeConfig,
 ) -> Option<ReadyRepairWorkerResult> {
-    let sidecar = sidecar_runtime_for_project_with_run_id(
-        project_root,
-        SidecarProfile::Agent,
-        run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
-    );
-    fs::read_to_string(ready_repair_result_path(&sidecar))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+    read_ready_repair_worker_results_for_sidecar(sidecar)
+        .into_iter()
+        .max_by_key(|result| result.finished_at_epoch_ms)
 }
 
 fn ready_repair_terminal_result_matches(sidecar: &SidecarRuntimeConfig, attempt_id: &str) -> bool {
-    fs::read_to_string(ready_repair_result_path(sidecar))
-        .ok()
-        .and_then(|text| serde_json::from_str::<ReadyRepairWorkerResult>(&text).ok())
-        .is_some_and(|result| {
+    read_ready_repair_worker_results_for_sidecar(sidecar)
+        .into_iter()
+        .any(|result| {
             result.attempt_id == attempt_id
                 && matches!(
                     result.outcome.as_str(),
                     "succeeded" | "failed" | "abandoned"
                 )
         })
+}
+
+fn read_ready_repair_worker_results_for_sidecar(
+    sidecar: &SidecarRuntimeConfig,
+) -> Vec<ReadyRepairWorkerResult> {
+    ready_repair_result_paths_for_sidecar(sidecar)
+        .into_iter()
+        .filter_map(|path| {
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .filter(|result| ready_repair_result_path_matches_sidecar(sidecar, &path, result))
+        })
+        .collect()
 }
 
 pub(crate) fn try_acquire_ready_repair_lock(
@@ -556,14 +599,17 @@ fn try_acquire_ready_repair_lock_at(
         Err(error) => return Err(error.into()),
     }
 
-    if let Some(status) = active_ready_repair_status(project_root, active_run_id) {
+    let scan_all_runs = active_run_id.is_none();
+    if let Some(status) = active_ready_repair_status_for_lock(project_root, sidecar, scan_all_runs)
+    {
         return Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
             status: Some(status),
             lock_path: path,
             reason: None,
         })));
     }
-    let stale_live_status = stale_live_ready_repair_status(project_root, active_run_id);
+    let stale_live_status =
+        stale_live_ready_repair_status_for_lock(project_root, sidecar, scan_all_runs);
 
     if !ready_repair_lock_file_is_stale(&path) {
         return Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
@@ -581,7 +627,7 @@ fn try_acquire_ready_repair_lock_at(
         })),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             Ok(ReadyRepairLockAttempt::Busy(Box::new(ReadyRepairBusy {
-                status: active_ready_repair_status(project_root, active_run_id),
+                status: active_ready_repair_status_for_lock(project_root, sidecar, scan_all_runs),
                 lock_path: path,
                 reason: Some("lock_contention".to_string()),
             })))
@@ -693,6 +739,41 @@ pub(crate) fn active_ready_repair_status(
         .max_by_key(|status| status.updated_at_epoch_ms)
 }
 
+pub(crate) fn active_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_sidecar(default_sidecar)
+        .into_iter()
+        .filter_map(|path| read_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+fn active_ready_repair_status_for_lock(
+    project_root: &Path,
+    sidecar: &SidecarRuntimeConfig,
+    scan_all_runs: bool,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_lock(sidecar, scan_all_runs)
+        .into_iter()
+        .filter_map(|path| read_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+fn stale_live_ready_repair_status_for_lock(
+    project_root: &Path,
+    sidecar: &SidecarRuntimeConfig,
+    scan_all_runs: bool,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_lock(sidecar, scan_all_runs)
+        .into_iter()
+        .filter_map(|path| read_stale_live_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
 pub(crate) fn abandoned_ready_repair_status(
     project_root: &Path,
     run_id: Option<&str>,
@@ -701,6 +782,28 @@ pub(crate) fn abandoned_ready_repair_status(
     ready_repair_status_paths(project_root, run_id)
         .into_iter()
         .filter_map(|path| read_abandoned_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+pub(crate) fn abandoned_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_sidecar(default_sidecar)
+        .into_iter()
+        .filter_map(|path| read_abandoned_ready_repair_status(&path, project_root, now))
+        .max_by_key(|status| status.updated_at_epoch_ms)
+}
+
+pub(crate) fn stale_live_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Option<ReadyRepairStatus> {
+    let now = now_epoch_ms();
+    ready_repair_status_paths_for_sidecar(default_sidecar)
+        .into_iter()
+        .filter_map(|path| read_stale_live_ready_repair_status(&path, project_root, now))
         .max_by_key(|status| status.updated_at_epoch_ms)
 }
 
@@ -719,18 +822,46 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
     project_root: &Path,
     run_id: Option<&str>,
 ) -> Vec<ReadyRepairCleanup> {
+    let default_sidecar = crate::sidecar_runtime::for_project_with_run_id(
+        project_root,
+        SidecarProfile::Agent,
+        run_id.or(Some(DEFAULT_AGENT_RUN_ID)),
+    );
+    cleanup_abandoned_ready_repair_status_from_paths(
+        project_root,
+        &default_sidecar,
+        ready_repair_status_paths(project_root, run_id),
+    )
+}
+
+pub(crate) fn cleanup_abandoned_ready_repair_status_for_sidecar(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+) -> Vec<ReadyRepairCleanup> {
+    cleanup_abandoned_ready_repair_status_from_paths(
+        project_root,
+        default_sidecar,
+        ready_repair_status_paths_for_sidecar(default_sidecar),
+    )
+}
+
+fn cleanup_abandoned_ready_repair_status_from_paths(
+    project_root: &Path,
+    default_sidecar: &SidecarRuntimeConfig,
+    paths: Vec<PathBuf>,
+) -> Vec<ReadyRepairCleanup> {
     let now = now_epoch_ms();
-    ready_repair_status_paths(project_root, run_id)
+    paths
         .into_iter()
         .filter_map(|path| {
             let observed = read_abandoned_ready_repair_status(&path, project_root, now)?;
             let run_id = observed.run_id.as_deref().unwrap_or(DEFAULT_AGENT_RUN_ID);
-            let sidecar = sidecar_runtime_for_project_with_run_id(
-                project_root,
+            let sidecar = default_sidecar.with_profile_and_run_id(
+                Some(project_root),
                 SidecarProfile::Agent,
                 Some(run_id),
             );
-            let observed_stale_locks = ready_repair_lock_paths_for_status(project_root, &observed)
+            let observed_stale_locks = ready_repair_lock_paths_for_sidecar(&sidecar)
                 .into_iter()
                 .filter_map(|lock_path| {
                     let lock = read_ready_repair_lock_file(&lock_path)?;
@@ -755,6 +886,7 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
                 started_at_epoch_ms: status.started_at_epoch_ms,
                 finished_at_epoch_ms: now,
                 outcome: "abandoned".to_string(),
+                auto_retry_fingerprint: None,
                 exit_code: None,
                 wait_error: Some(
                     "repair worker process exited without recording a terminal result".to_string(),
@@ -791,8 +923,34 @@ pub(crate) fn cleanup_abandoned_ready_repair_status(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn ready_repair_status_cache_fingerprint(project_root: &Path) -> String {
-    ready_repair_status_paths(project_root, None)
+    let sidecar = crate::sidecar_runtime::for_project_with_run_id(
+        project_root,
+        SidecarProfile::Agent,
+        Some(DEFAULT_AGENT_RUN_ID),
+    );
+    ready_repair_status_cache_fingerprint_for_sidecar(&sidecar)
+}
+
+pub(crate) fn ready_repair_status_cache_fingerprint_for_sidecar(
+    sidecar: &SidecarRuntimeConfig,
+) -> String {
+    let mut fingerprint = ready_repair_status_cache_fingerprint_for_paths(
+        ready_repair_status_paths_for_sidecar(sidecar),
+    );
+    let current_result_path = ready_repair_result_path(sidecar);
+    for path in ready_repair_result_paths_for_sidecar(sidecar) {
+        if path != current_result_path {
+            fingerprint.push(';');
+            fingerprint.push_str(&path_fingerprint(&path));
+        }
+    }
+    fingerprint
+}
+
+fn ready_repair_status_cache_fingerprint_for_paths(paths: Vec<PathBuf>) -> String {
+    paths
         .into_iter()
         .flat_map(|path| {
             [
@@ -848,6 +1006,41 @@ fn ready_repair_result_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
         .with_file_name(READY_REPAIR_RESULT_FILE)
 }
 
+fn ready_repair_result_paths_for_sidecar(sidecar: &SidecarRuntimeConfig) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::from([ready_repair_result_path(sidecar)]);
+    if let Some(legacy_state_path) = sidecar.legacy_state_path_for_compatibility() {
+        paths.insert(legacy_state_path.with_file_name(READY_REPAIR_RESULT_FILE));
+    }
+    paths.into_iter().collect()
+}
+
+fn ready_repair_result_path_matches_sidecar(
+    sidecar: &SidecarRuntimeConfig,
+    path: &Path,
+    result: &ReadyRepairWorkerResult,
+) -> bool {
+    if path == ready_repair_result_path(sidecar) {
+        return true;
+    }
+    let Some(legacy_state_path) = sidecar.legacy_state_path_for_compatibility() else {
+        return false;
+    };
+    let expected_namespace = legacy_state_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str());
+    let expected_project = sidecar
+        .labels
+        .get("dev.codestory.workspace_root")
+        .map(|project| clean_path_text(Path::new(project)));
+    path == legacy_state_path.with_file_name(READY_REPAIR_RESULT_FILE)
+        && result.schema_version == READY_REPAIR_STATUS_SCHEMA_VERSION
+        && expected_project.as_deref() == Some(result.project_root.as_str())
+        && result.profile == sidecar.profile.as_str()
+        && result.run_id == sidecar.run_id
+        && expected_namespace == Some(result.namespace.as_str())
+}
+
 fn ready_repair_reservation_path(sidecar: &SidecarRuntimeConfig) -> PathBuf {
     sidecar
         .layout
@@ -895,7 +1088,7 @@ fn read_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -920,7 +1113,7 @@ fn read_abandoned_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -941,7 +1134,7 @@ fn read_stale_live_ready_repair_status(
     if status.schema_version != READY_REPAIR_STATUS_SCHEMA_VERSION
         || status.status != "repairing"
         || status.profile != SidecarProfile::Agent.as_str()
-        || !same_path_text(Path::new(&status.project_root), project_root)
+        || !codestory_workspace::same_workspace_path(Path::new(&status.project_root), project_root)
     {
         return None;
     }
@@ -965,170 +1158,20 @@ pub(crate) fn process_owner_state(
     pid: u32,
     expected_start_identity: Option<&str>,
 ) -> ProcessOwnerState {
-    process_owner_state_with(pid, expected_start_identity, probe_process)
-}
-
-fn process_owner_state_with(
-    pid: u32,
-    expected_start_identity: Option<&str>,
-    probe: impl FnOnce(u32) -> ProcessProbe,
-) -> ProcessOwnerState {
-    match probe(pid) {
-        ProcessProbe::NotRunning => ProcessOwnerState::GoneOrReused,
-        ProcessProbe::Unknown => ProcessOwnerState::Unknown,
-        ProcessProbe::Running { start_identity } => match expected_start_identity {
-            None => ProcessOwnerState::Matching,
-            Some(expected) => match start_identity {
-                Some(actual) if actual == expected => ProcessOwnerState::Matching,
-                Some(_) => ProcessOwnerState::GoneOrReused,
-                None => ProcessOwnerState::Unknown,
-            },
-        },
-    }
+    classify_process_owner_state(&probe_process_start_identity(pid), expected_start_identity)
 }
 
 pub(crate) fn recorded_process_start_identity(pid: u32) -> Option<String> {
-    match probe_process(pid) {
-        ProcessProbe::Running { start_identity } => start_identity,
-        ProcessProbe::NotRunning | ProcessProbe::Unknown => None,
+    match probe_process_start_identity(pid) {
+        ProcessStartProbe::Running { start_identity } => Some(start_identity),
+        ProcessStartProbe::NotRunning | ProcessStartProbe::Unknown { .. } => None,
     }
 }
 
-fn probe_process(pid: u32) -> ProcessProbe {
-    static CURRENT_PROCESS_START_IDENTITY: OnceLock<String> = OnceLock::new();
-
-    if pid == std::process::id()
-        && let Some(identity) = CURRENT_PROCESS_START_IDENTITY.get()
-    {
-        return ProcessProbe::Running {
-            start_identity: Some(identity.clone()),
-        };
-    }
-
-    let probe = probe_process_platform(pid);
-    if pid == std::process::id()
-        && let ProcessProbe::Running {
-            start_identity: Some(identity),
-        } = &probe
-    {
-        let _ = CURRENT_PROCESS_START_IDENTITY.set(identity.clone());
-    }
-    probe
-}
-
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
-fn bounded_process_probe_output(command: &mut Command) -> Option<std::process::Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + READY_REPAIR_PROCESS_PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(READY_REPAIR_COORDINATION_POLL);
-            }
-            Ok(None) | Err(_) => {
-                if child.kill().is_ok() {
-                    let reap_deadline = Instant::now() + READY_REPAIR_PROCESS_PROBE_REAP_TIMEOUT;
-                    while Instant::now() < reap_deadline {
-                        if child.try_wait().ok().flatten().is_some() {
-                            break;
-                        }
-                        thread::sleep(READY_REPAIR_COORDINATION_POLL);
-                    }
-                }
-                return None;
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn probe_process_platform(pid: u32) -> ProcessProbe {
-    let script = format!(
-        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\" -ErrorAction Stop; if ($null -eq $p) {{ exit 2 }}; $p.CreationDate.ToUniversalTime().Ticks"
-    );
-    let mut command = Command::new("powershell");
-    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
-    let Some(output) = bounded_process_probe_output(&mut command) else {
-        return ProcessProbe::Unknown;
-    };
-    if output.status.code() == Some(2) {
-        return ProcessProbe::NotRunning;
-    }
-    if !output.status.success() {
-        return ProcessProbe::Unknown;
-    }
-    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if identity.is_empty() {
-        return ProcessProbe::Unknown;
-    }
-    ProcessProbe::Running {
-        start_identity: Some(format!("windows:{identity}")),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn probe_process_platform(pid: u32) -> ProcessProbe {
-    let path = Path::new("/proc").join(pid.to_string()).join("stat");
-    let stat = match fs::read_to_string(path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == ErrorKind::NotFound => return ProcessProbe::NotRunning,
-        Err(_) => return ProcessProbe::Unknown,
-    };
-    let Some((_, fields)) = stat.rsplit_once(") ") else {
-        return ProcessProbe::Unknown;
-    };
-    let Some(start_ticks) = fields.split_whitespace().nth(19) else {
-        return ProcessProbe::Unknown;
-    };
-    ProcessProbe::Running {
-        start_identity: Some(format!("linux:{start_ticks}")),
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn probe_process_platform(pid: u32) -> ProcessProbe {
-    let mut command = Command::new("ps");
-    command.args(["-o", "lstart=", "-p", &pid.to_string()]);
-    let Some(output) = bounded_process_probe_output(&mut command) else {
-        return ProcessProbe::Unknown;
-    };
-    if !output.status.success() {
-        return if output.status.code() == Some(1) {
-            ProcessProbe::NotRunning
-        } else {
-            ProcessProbe::Unknown
-        };
-    }
-    let identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if identity.is_empty() {
-        return ProcessProbe::Unknown;
-    }
-    ProcessProbe::Running {
-        start_identity: Some(format!("unix:{identity}")),
-    }
-}
-
-#[cfg(not(any(windows, unix)))]
-fn probe_process_platform(_pid: u32) -> ProcessProbe {
-    ProcessProbe::Unknown
-}
-
-fn ready_repair_lock_paths_for_status(
-    project_root: &Path,
-    status: &ReadyRepairStatus,
-) -> Vec<PathBuf> {
-    let run_id = status.run_id.as_deref().unwrap_or(DEFAULT_AGENT_RUN_ID);
-    let sidecar =
-        sidecar_runtime_for_project_with_run_id(project_root, SidecarProfile::Agent, Some(run_id));
+fn ready_repair_lock_paths_for_sidecar(sidecar: &SidecarRuntimeConfig) -> Vec<PathBuf> {
     vec![
-        ready_repair_lock_path(&sidecar),
-        project_ready_repair_lock_path(&sidecar),
+        ready_repair_lock_path(sidecar),
+        project_ready_repair_lock_path(sidecar),
     ]
 }
 
@@ -1145,7 +1188,7 @@ fn read_ready_repair_status_file(path: &Path) -> Option<ReadyRepairStatus> {
 fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<PathBuf> {
     let mut paths = BTreeSet::new();
     if let Some(run_id) = run_id {
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project_root,
             SidecarProfile::Agent,
             Some(run_id),
@@ -1154,14 +1197,19 @@ fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<P
         return paths.into_iter().collect();
     }
 
-    let default_sidecar = sidecar_runtime_for_project_with_run_id(
+    let default_sidecar = crate::sidecar_runtime::for_project_with_run_id(
         project_root,
         SidecarProfile::Agent,
         Some(DEFAULT_AGENT_RUN_ID),
     );
-    paths.insert(ready_repair_status_path(&default_sidecar));
+    ready_repair_status_paths_for_sidecar(&default_sidecar)
+}
 
-    if let Some((sidecars_root, namespace_prefix)) = agent_sidecars_scan_root(&default_sidecar)
+fn ready_repair_status_paths_for_sidecar(default_sidecar: &SidecarRuntimeConfig) -> Vec<PathBuf> {
+    let mut paths = BTreeSet::new();
+    paths.insert(ready_repair_status_path(default_sidecar));
+
+    if let Some((sidecars_root, namespace_prefix)) = agent_sidecars_scan_root(default_sidecar)
         && let Ok(entries) = fs::read_dir(sidecars_root)
     {
         for entry in entries.flatten() {
@@ -1181,6 +1229,17 @@ fn ready_repair_status_paths(project_root: &Path, run_id: Option<&str>) -> Vec<P
     paths.into_iter().collect()
 }
 
+fn ready_repair_status_paths_for_lock(
+    sidecar: &SidecarRuntimeConfig,
+    scan_all_runs: bool,
+) -> Vec<PathBuf> {
+    if scan_all_runs {
+        ready_repair_status_paths_for_sidecar(sidecar)
+    } else {
+        vec![ready_repair_status_path(sidecar)]
+    }
+}
+
 fn agent_sidecars_scan_root(sidecar: &SidecarRuntimeConfig) -> Option<(PathBuf, String)> {
     let namespace_prefix = sidecar.namespace.strip_suffix(DEFAULT_AGENT_RUN_ID)?;
     let namespace_dir = sidecar.layout.state_file.parent()?;
@@ -1195,11 +1254,7 @@ fn clean_path_text(path: &Path) -> String {
         .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn same_path_text(left: &Path, right: &Path) -> bool {
-    clean_path_text(left) == clean_path_text(right)
+        .to_string()
 }
 
 fn path_fingerprint(path: &Path) -> String {
@@ -1234,10 +1289,9 @@ mod tests {
         SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                zoekt_http_port: 6070,
                 qdrant_http_port: 6333,
                 qdrant_grpc_port: 6334,
-                zoekt_data_dir: root.join("zoekt"),
+                lexical_data_dir: root.join("lexical"),
                 qdrant_data_dir: root.join("qdrant"),
                 scip_artifacts_root: root.join("scip"),
                 state_file: root.join(&namespace).join("retrieval-sidecars.json"),
@@ -1249,48 +1303,8 @@ mod tests {
             embed_http_port: 8080,
             cleanup_command: "codestory-cli retrieval down".to_string(),
             labels: Default::default(),
+            ..crate::sidecar_runtime::local()
         }
-    }
-
-    #[test]
-    fn process_owner_probe_matches_live_process_identity() {
-        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
-            start_identity: Some("start-a".to_string()),
-        });
-
-        assert_eq!(state, ProcessOwnerState::Matching);
-    }
-
-    #[test]
-    fn process_owner_probe_detects_dead_process() {
-        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::NotRunning);
-
-        assert_eq!(state, ProcessOwnerState::GoneOrReused);
-    }
-
-    #[test]
-    fn process_owner_probe_detects_pid_reuse() {
-        let state = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
-            start_identity: Some("start-b".to_string()),
-        });
-
-        assert_eq!(state, ProcessOwnerState::GoneOrReused);
-    }
-
-    #[test]
-    fn process_owner_probe_uncertainty_preserves_ownership() {
-        let failed_probe = process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Unknown);
-        let missing_identity =
-            process_owner_state_with(42, Some("start-a"), |_| ProcessProbe::Running {
-                start_identity: None,
-            });
-        let legacy_live = process_owner_state_with(42, None, |_| ProcessProbe::Running {
-            start_identity: Some("start-b".to_string()),
-        });
-
-        assert_eq!(failed_probe, ProcessOwnerState::Unknown);
-        assert_eq!(missing_identity, ProcessOwnerState::Unknown);
-        assert_eq!(legacy_live, ProcessOwnerState::Matching);
     }
 
     #[test]
@@ -1316,6 +1330,13 @@ mod tests {
         assert_eq!(stored.attempt_id, attempt_id);
         assert!(stored.adopted);
         assert_eq!(stored.pid, std::process::id());
+        wait_for_ready_repair_reservation_adoption(
+            &sidecar,
+            &attempt_id,
+            std::process::id(),
+            Duration::ZERO,
+        )
+        .expect("parent observes exact adopted worker");
         drop(adopted);
         assert!(!ready_repair_reservation_path(&sidecar).exists());
     }
@@ -1401,6 +1422,7 @@ mod tests {
             started_at_epoch_ms: 100,
             finished_at_epoch_ms: 200,
             outcome: "succeeded".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(0),
             wait_error: None,
             terminal_envelope: None,
@@ -1501,8 +1523,9 @@ mod tests {
 
     #[test]
     fn ready_repair_worker_result_round_trips() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some(DEFAULT_AGENT_RUN_ID),
@@ -1518,6 +1541,7 @@ mod tests {
             started_at_epoch_ms: 100,
             finished_at_epoch_ms: 200,
             outcome: "failed".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(17),
             wait_error: None,
             terminal_envelope: Some(CommandFailureEnvelope::new(ApiError::internal(
@@ -1538,7 +1562,7 @@ mod tests {
             "terminal result should invalidate cached MCP status"
         );
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(result)
         );
         let _ = fs::remove_dir_all(
@@ -1551,9 +1575,76 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_terminal_write_and_abandoned_cleanup_preserve_terminal_result() {
+    fn current_runtime_reconciles_compatible_legacy_worker_result() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let cache = tempfile::tempdir().expect("cache");
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id_in_cache(
+            Some(project.path()),
+            SidecarProfile::Agent,
+            Some(DEFAULT_AGENT_RUN_ID),
+            cache.path(),
+        );
+        let legacy_state_path = sidecar
+            .legacy_state_path_for_compatibility()
+            .expect("legacy compatibility path");
+        let legacy_result_path = legacy_state_path.with_file_name(READY_REPAIR_RESULT_FILE);
+        fs::create_dir_all(legacy_result_path.parent().expect("legacy result parent"))
+            .expect("legacy result directory");
+        let result = ReadyRepairWorkerResult {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            attempt_id: "legacy-compatible-attempt".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some(DEFAULT_AGENT_RUN_ID.to_string()),
+            namespace: legacy_state_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .expect("legacy namespace")
+                .to_string(),
+            pid: 42,
+            started_at_epoch_ms: 100,
+            finished_at_epoch_ms: 200,
+            outcome: "succeeded".to_string(),
+            auto_retry_fingerprint: None,
+            exit_code: Some(0),
+            wait_error: None,
+            terminal_envelope: None,
+            stdout_tail: "done".to_string(),
+            stderr_tail: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let fingerprint_before = ready_repair_status_cache_fingerprint_for_sidecar(&sidecar);
+
+        crate::file_state::write_json_atomic(
+            &legacy_result_path,
+            "legacy-ready-repair-result",
+            &result,
+        )
+        .expect("legacy worker result");
+
+        assert_ne!(
+            ready_repair_status_cache_fingerprint_for_sidecar(&sidecar),
+            fingerprint_before,
+            "compatible terminal result should invalidate cached MCP status"
+        );
+        assert_eq!(
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
+            Some(result)
+        );
+        assert!(ready_repair_terminal_result_matches(
+            &sidecar,
+            "legacy-compatible-attempt"
+        ));
+    }
+
+    #[test]
+    fn concurrent_terminal_write_and_abandoned_cleanup_preserve_terminal_result() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let project = tempfile::tempdir().expect("project");
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some(DEFAULT_AGENT_RUN_ID),
@@ -1592,6 +1683,7 @@ mod tests {
             started_at_epoch_ms: status.started_at_epoch_ms,
             finished_at_epoch_ms: 200,
             outcome: "succeeded".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(0),
             wait_error: None,
             terminal_envelope: None,
@@ -1605,7 +1697,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             let sidecar = sidecar.clone();
             let terminal = terminal.clone();
-            thread::spawn(move || {
+            crate::sidecar_runtime::spawn_with_cache_access(move || {
                 barrier.wait();
                 write_ready_repair_worker_result(&sidecar, &terminal).expect("terminal write");
             })
@@ -1613,7 +1705,7 @@ mod tests {
         let cleaner = {
             let barrier = Arc::clone(&barrier);
             let project_root = project.path().to_path_buf();
-            thread::spawn(move || {
+            crate::sidecar_runtime::spawn_with_cache_access(move || {
                 barrier.wait();
                 cleanup_abandoned_ready_repair_status(&project_root, Some(DEFAULT_AGENT_RUN_ID));
             })
@@ -1623,7 +1715,7 @@ mod tests {
         cleaner.join().expect("abandoned cleaner");
 
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some(DEFAULT_AGENT_RUN_ID)),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(terminal),
             "terminal success must win regardless of cleanup ordering"
         );
@@ -1910,7 +2002,7 @@ mod tests {
     #[test]
     fn live_pid_stale_repair_status_is_preserved_and_reported_busy() {
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some("test-proof"),
@@ -1979,6 +2071,63 @@ mod tests {
     }
 
     #[test]
+    fn stale_live_repair_with_exact_identity_is_never_terminated_by_age() {
+        let project = tempfile::tempdir().expect("project");
+        let state = tempfile::tempdir().expect("state");
+        let sidecar = test_sidecar_with_run_id(state.path(), "shared-agent");
+        let status_path = ready_repair_status_path(&sidecar);
+        fs::create_dir_all(status_path.parent().expect("repair status parent")).expect("state dir");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .expect("long-lived child");
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("long-lived child");
+        let pid = child.id();
+        let process_start_identity =
+            recorded_process_start_identity(pid).expect("child process start identity");
+        let old = now_epoch_ms() - READY_REPAIR_LOCK_STALE_TTL.as_millis() as i64 - 60_000;
+        let status = ReadyRepairStatus {
+            schema_version: READY_REPAIR_STATUS_SCHEMA_VERSION,
+            status: "repairing".to_string(),
+            project_root: clean_path_text(project.path()),
+            profile: "agent".to_string(),
+            run_id: Some("shared-agent".to_string()),
+            namespace: sidecar.namespace.clone(),
+            compose_project: sidecar.compose_project.clone(),
+            phase: "Embedding documents".to_string(),
+            pid,
+            attempt_id: Some("stale-live-attempt".to_string()),
+            process_start_identity: Some(process_start_identity),
+            started_at_epoch_ms: old,
+            updated_at_epoch_ms: old,
+        };
+        fs::write(
+            &status_path,
+            serde_json::to_string(&status).expect("status json"),
+        )
+        .expect("write stale live status");
+
+        assert_eq!(
+            read_stale_live_ready_repair_status(&status_path, project.path(), now_epoch_ms()),
+            Some(status),
+            "heartbeat age must remain diagnostic while exact process ownership is live"
+        );
+        assert_eq!(
+            read_abandoned_ready_repair_status(&status_path, project.path(), now_epoch_ms()),
+            None,
+            "age alone must never abandon a live exact-identity owner"
+        );
+        assert!(child.try_wait().expect("probe child").is_none());
+        child.kill().expect("stop probe child");
+        child.wait().expect("reap probe child");
+    }
+
+    #[test]
     fn dead_pid_repair_lock_is_reclaimable_immediately() {
         let project = tempfile::tempdir().expect("project");
         let state = tempfile::tempdir().expect("state");
@@ -2041,8 +2190,9 @@ mod tests {
 
     #[test]
     fn cleanup_abandoned_ready_repair_status_removes_dead_pid_status_and_stale_locks() {
+        let _env_lock = crate::config::config_env_test_lock();
         let project = tempfile::tempdir().expect("project");
-        let sidecar = sidecar_runtime_for_project_with_run_id(
+        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
             project.path(),
             SidecarProfile::Agent,
             Some("shared-agent"),
@@ -2097,7 +2247,7 @@ mod tests {
         )
         .expect("write stale project lock");
 
-        let cleanups = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+        let cleanups = cleanup_abandoned_ready_repair_status_for_sidecar(project.path(), &sidecar);
 
         assert_eq!(cleanups.len(), 1);
         assert!(cleanups[0].removed_status_path);
@@ -2115,7 +2265,7 @@ mod tests {
             active_ready_repair_status(project.path(), Some("shared-agent")).is_none(),
             "abandoned cleanup must leave no active repair"
         );
-        let result = read_ready_repair_worker_result(project.path(), Some("shared-agent"))
+        let result = read_ready_repair_worker_result_for_sidecar(&sidecar)
             .expect("abandoned cleanup terminal result");
         assert_eq!(result.attempt_id, "abandoned-test");
         assert_eq!(result.outcome, "abandoned");
@@ -2131,6 +2281,7 @@ mod tests {
             started_at_epoch_ms: status.started_at_epoch_ms,
             finished_at_epoch_ms: now + 1,
             outcome: "failed".to_string(),
+            auto_retry_fingerprint: None,
             exit_code: Some(17),
             wait_error: None,
             terminal_envelope: None,
@@ -2146,13 +2297,22 @@ mod tests {
         )
         .expect("recreate abandoned status");
 
-        let repeated = cleanup_abandoned_ready_repair_status(project.path(), Some("shared-agent"));
+        let repeated = cleanup_abandoned_ready_repair_status_for_sidecar(project.path(), &sidecar);
 
         assert_eq!(repeated.len(), 1);
         assert_eq!(
-            read_ready_repair_worker_result(project.path(), Some("shared-agent")),
+            read_ready_repair_worker_result_for_sidecar(&sidecar),
             Some(terminal),
             "cleanup must preserve an existing matching terminal result"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_ready_repair_root_preserves_unix_case() {
+        let parent = tempfile::tempdir().expect("parent");
+        let project = parent.path().join("CaseSensitiveProject");
+        fs::create_dir_all(&project).expect("project");
+        assert!(clean_path_text(&project).ends_with("CaseSensitiveProject"));
     }
 }

@@ -7,6 +7,7 @@
       "provider": "metal",
       "launch_mode": "native_spawned",
       "artifact": "llama-b9902-bin-macos-arm64.tar.gz",
+      "artifact_bytes": 11138321,
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9902/llama-b9902-bin-macos-arm64.tar.gz",
       "sha256": "229db5607ffd2251cf836d76c36e8ff58de23dfba76e578e3a466235671bab0d",
       "executable_archive_path": "llama-b9902/llama-server",
@@ -36,6 +37,7 @@
       "provider": "vulkan",
       "launch_mode": "native_spawned",
       "artifact": "llama-b9902-bin-win-vulkan-x64.zip",
+      "artifact_bytes": 32165103,
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9902/llama-b9902-bin-win-vulkan-x64.zip",
       "sha256": "66d6c78a45663cf3818caf962371f5d557a74ab8cc47b419d6be4b005b8a9d17",
       "executable_archive_path": "llama-server.exe",
@@ -53,7 +55,9 @@
         "--n-gpu-layers",
         "{n_gpu_layers}",
         "--device",
-        "{device}"
+        "{device}",
+        "--log-verbosity",
+        "4"
       ],
       "device_arg_policy": "request_device",
       "log_markers": ["vulkan", "offloaded"]
@@ -65,6 +69,7 @@
       "provider": "vulkan",
       "launch_mode": "native_spawned",
       "artifact": "llama-b9058-bin-win-vulkan-x64.zip",
+      "artifact_bytes": 33677020,
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9058/llama-b9058-bin-win-vulkan-x64.zip",
       "sha256": "d0a52a50c021d80d49acfbdae38faafed2dd1e4923790bafb5e701f13548d893",
       "executable_archive_path": "llama-server.exe",
@@ -82,7 +87,9 @@
         "--n-gpu-layers",
         "{n_gpu_layers}",
         "--device",
-        "{device}"
+        "{device}",
+        "--log-verbosity",
+        "4"
       ],
       "device_arg_policy": "request_device",
       "log_markers": ["vulkan", "offloaded"]
@@ -94,6 +101,7 @@
       "provider": "vulkan",
       "launch_mode": "docker_compose_embed",
       "artifact": "llama-b9902-bin-ubuntu-vulkan-x64.tar.gz",
+      "artifact_bytes": 31220967,
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9902/llama-b9902-bin-ubuntu-vulkan-x64.tar.gz",
       "sha256": "7fe40b82a16915b5360d2f3db8fc50003ac054259d43c7ce1ec294f0427a018e",
       "executable_archive_path": "",
@@ -111,6 +119,7 @@
       "provider": "vulkan",
       "launch_mode": "docker_compose_embed",
       "artifact": "llama-b9902-bin-ubuntu-vulkan-arm64.tar.gz",
+      "artifact_bytes": 25509058,
       "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9902/llama-b9902-bin-ubuntu-vulkan-arm64.tar.gz",
       "sha256": "c93062ca3c55877a008a1a968155d9a42c7bc0cb4d0e62c3219698a68de76bd0",
       "executable_archive_path": "",

@@ -6,10 +6,10 @@ use codestory_retrieval::{CandidateHit, CandidateSource, QueryResult, QueryTrace
 fn phantom_only_candidates_are_detected() {
     let hits = vec![
         CandidateHit::with_source(
-            "zoekt:handler",
+            "lexical:handler",
             Some("handler".into()),
             0.5,
-            CandidateSource::Zoekt,
+            CandidateSource::Lexical,
         ),
         CandidateHit::with_source(
             "semantic:handler",
@@ -24,6 +24,7 @@ fn phantom_only_candidates_are_detected() {
     ]));
 
     let _query = QueryResult {
+        publication_identity: None,
         query: "handler".into(),
         features: classify_query("handler"),
         hits,

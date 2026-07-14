@@ -6,17 +6,15 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tempfile::tempdir;
 
-// Repo-scale smoke guard. Phase-specific assertions below carry the product
-// repeat-refresh contract; wall-clock process timing remains telemetry.
-const REPEAT_GRAPH_PHASE_SECONDS_BUDGET: f64 = 20.0;
-const REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET: f64 = 3.0;
-
 #[derive(Debug, Serialize)]
 struct RepoE2eStats {
+    commit: String,
+    evidence_identity: EvidenceIdentity,
     project_root: String,
     cache_dir: String,
     storage_path: String,
     search_dir: String,
+    storage_bytes: u64,
     proof_tier: String,
     warnings: Vec<String>,
     stats_baseline: StatsLogBaseline,
@@ -70,6 +68,13 @@ struct RepoE2eStats {
     trail: TrailStats,
     snippet: SnippetStats,
     report: ReportStats,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceIdentity {
+    corpus_id: String,
+    cache_id: String,
+    machine_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -477,7 +482,111 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .expect("storage file stem");
-    parent.join(format!("{stem}.search"))
+    parent.join(format!("{stem}.search-generations"))
+}
+
+struct ReleaseE2eSidecarCleanup {
+    binary: PathBuf,
+    project_root: PathBuf,
+    cache_dir: PathBuf,
+    sidecar_cache_root: PathBuf,
+    run_id: String,
+    armed: bool,
+}
+
+impl ReleaseE2eSidecarCleanup {
+    fn down(&self) -> std::io::Result<std::process::Output> {
+        test_support::command(&self.binary)
+            .current_dir(&self.project_root)
+            .args(["retrieval", "down", "--profile", "agent", "--run-id"])
+            .arg(&self.run_id)
+            .arg("--project")
+            .arg(&self.project_root)
+            .arg("--cache-dir")
+            .arg(&self.cache_dir)
+            .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+            .env_remove("CODESTORY_STDIO_CACHE_ROOT")
+            .env("CODESTORY_CACHE_ROOT", &self.sidecar_cache_root)
+            .env("CODESTORY_EMBED_BACKEND", "llamacpp")
+            .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
+            .output()
+    }
+
+    fn teardown(&mut self) {
+        let (_, status_json) = run_cli_json_with_sidecar_cache_root(
+            &self.binary,
+            &self.project_root,
+            &self.cache_dir,
+            &self.sidecar_cache_root,
+            &[
+                "retrieval".to_string(),
+                "status".to_string(),
+                "--profile".to_string(),
+                "agent".to_string(),
+                "--run-id".to_string(),
+                self.run_id.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+        let namespace = string_field(&status_json, &["ownership", "namespace"]).to_string();
+
+        let down = self.down().expect("tear down release evidence sidecar");
+        assert!(
+            down.status.success(),
+            "release evidence sidecar teardown failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&down.stdout),
+            String::from_utf8_lossy(&down.stderr)
+        );
+
+        let (_, inventory_json) = run_cli_json_with_sidecar_cache_root(
+            &self.binary,
+            &self.project_root,
+            &self.cache_dir,
+            &self.sidecar_cache_root,
+            &[
+                "retrieval".to_string(),
+                "inventory".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+        let namespaces = json_path(&inventory_json, &["namespaces"])
+            .as_array()
+            .expect("release evidence sidecar inventory namespaces");
+        if let Some(entry) = namespaces
+            .iter()
+            .find(|entry| entry["namespace"].as_str() == Some(namespace.as_str()))
+        {
+            assert_eq!(entry["state_exists"].as_bool(), Some(false));
+            assert_eq!(entry["containers"].as_array().map(Vec::len), Some(0));
+            assert_eq!(entry["networks"].as_array().map(Vec::len), Some(0));
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for ReleaseE2eSidecarCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.down();
+        }
+    }
+}
+
+fn path_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| path_bytes(&entry.path()))
+        .sum()
 }
 
 fn run_cli_json(
@@ -486,7 +595,23 @@ fn run_cli_json(
     cache_dir: &Path,
     args: &[String],
 ) -> (f64, Value) {
-    let (seconds, stdout) = run_cli_output(binary, project_root, cache_dir, args);
+    run_cli_json_with_sidecar_cache_root(binary, project_root, cache_dir, cache_dir, args)
+}
+
+fn run_cli_json_with_sidecar_cache_root(
+    binary: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
+    sidecar_cache_root: &Path,
+    args: &[String],
+) -> (f64, Value) {
+    let (seconds, stdout) = run_cli_output_with_sidecar_cache_root(
+        binary,
+        project_root,
+        cache_dir,
+        sidecar_cache_root,
+        args,
+    );
     (
         seconds,
         serde_json::from_slice(&stdout).expect("parse json output"),
@@ -499,6 +624,16 @@ fn run_cli_output(
     cache_dir: &Path,
     args: &[String],
 ) -> (f64, Vec<u8>) {
+    run_cli_output_with_sidecar_cache_root(binary, project_root, cache_dir, cache_dir, args)
+}
+
+fn run_cli_output_with_sidecar_cache_root(
+    binary: &Path,
+    project_root: &Path,
+    cache_dir: &Path,
+    sidecar_cache_root: &Path,
+    args: &[String],
+) -> (f64, Vec<u8>) {
     let started = Instant::now();
     let output = test_support::command(binary)
         .current_dir(project_root)
@@ -508,6 +643,8 @@ fn run_cli_output(
         .arg("--cache-dir")
         .arg(cache_dir)
         .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+        .env_remove("CODESTORY_STDIO_CACHE_ROOT")
+        .env("CODESTORY_CACHE_ROOT", sidecar_cache_root)
         .env("CODESTORY_EMBED_BACKEND", "llamacpp")
         .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
         .output()
@@ -607,14 +744,6 @@ fn array_len(value: &Value, path: &[&str]) -> usize {
         .len()
 }
 
-fn array_contains_command(value: &Value, path: &[&str], expected: &str) -> bool {
-    json_path(value, path)
-        .as_array()
-        .unwrap_or_else(|| panic!("expected array at path {:?}", path))
-        .iter()
-        .any(|item| item["command"].as_str() == Some(expected))
-}
-
 fn array_item_by_field<'a>(
     value: &'a Value,
     path: &[&str],
@@ -679,6 +808,14 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
 
     let cache_dir = tempdir().expect("cache dir");
+    let mut sidecar_cleanup = ReleaseE2eSidecarCleanup {
+        binary: binary.clone(),
+        project_root: project_root.clone(),
+        cache_dir: cache_dir.path().to_path_buf(),
+        sidecar_cache_root: cache_dir.path().to_path_buf(),
+        run_id: sidecar_run_id.to_string(),
+        armed: true,
+    };
 
     let (index_seconds, index_json) = run_cli_json(
         &binary,
@@ -718,6 +855,22 @@ fn codestory_repo_release_e2e_emits_stats() {
             "bootstrap".to_string(),
             "--profile".to_string(),
             "agent".to_string(),
+            "--run-id".to_string(),
+            sidecar_run_id.to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
+    );
+
+    let (_ready_repair_seconds, _ready_repair_json) = run_cli_json(
+        &binary,
+        project_root.as_path(),
+        cache_dir.path(),
+        &[
+            "ready".to_string(),
+            "--goal".to_string(),
+            "agent".to_string(),
+            "--repair".to_string(),
             "--run-id".to_string(),
             sidecar_run_id.to_string(),
             "--format".to_string(),
@@ -983,10 +1136,21 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
 
     let stats = RepoE2eStats {
+        commit: env::var("CODESTORY_RELEASE_EVIDENCE_COMMIT")
+            .unwrap_or_else(|_| "unbound-local-run".to_string()),
+        evidence_identity: EvidenceIdentity {
+            corpus_id: env::var("CODESTORY_RELEASE_EVIDENCE_CORPUS_ID")
+                .unwrap_or_else(|_| "unbound-local-run".to_string()),
+            cache_id: env::var("CODESTORY_RELEASE_EVIDENCE_CACHE_ID")
+                .unwrap_or_else(|_| "unbound-local-run".to_string()),
+            machine_fingerprint: env::var("CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT")
+                .unwrap_or_else(|_| "unbound-local-run".to_string()),
+        },
         project_root: project_root.display().to_string(),
         cache_dir: cache_dir.path().display().to_string(),
         storage_path: storage_path.display().to_string(),
         search_dir: search_dir.display().to_string(),
+        storage_bytes: path_bytes(cache_dir.path()),
         proof_tier,
         warnings,
         stats_baseline,
@@ -1154,10 +1318,16 @@ fn codestory_repo_release_e2e_emits_stats() {
         },
     };
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&stats).expect("serialize stats")
-    );
+    let stats_json = serde_json::to_string_pretty(&stats).expect("serialize stats");
+    println!("{stats_json}");
+    if let Ok(output_path) = env::var("CODESTORY_RELEASE_EVIDENCE_STATS_PATH") {
+        let output_path = PathBuf::from(output_path);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).expect("create release evidence stats parent");
+        }
+        fs::write(output_path, format!("{stats_json}\n"))
+            .expect("write release evidence stats artifact");
+    }
 
     assert_eq!(
         stats.index.error_count, 0,
@@ -1216,28 +1386,6 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.repeat_semantic_docs_embedded, 0,
         "repeat full refresh should embed zero unchanged dense docs"
     );
-    assert!(
-        stats.repeat_graph_phase_seconds < REPEAT_GRAPH_PHASE_SECONDS_BUDGET,
-        "repeat graph phase should stay under {:.0} seconds, got {:.2}s",
-        REPEAT_GRAPH_PHASE_SECONDS_BUDGET,
-        stats.repeat_graph_phase_seconds
-    );
-    assert!(
-        stats.repeat_semantic_phase_seconds < REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET,
-        "repeat semantic reuse phase should stay under {:.0} seconds, got {:.2}s",
-        REPEAT_SEMANTIC_PHASE_SECONDS_BUDGET,
-        stats.repeat_semantic_phase_seconds
-    );
-    let repeat_full_refresh_seconds_budget =
-        stats.stats_baseline.repeat_full_refresh_seconds * RELEASE_WARNING_REGRESSION_FACTOR;
-    assert!(
-        stats.repeat_full_refresh_seconds < repeat_full_refresh_seconds_budget,
-        "repeat full refresh process smoke cap should stay within 25% of latest stats-log baseline {} {}: threshold {:.2}s, got {:.2}s",
-        stats.stats_baseline.date,
-        stats.stats_baseline.commit,
-        repeat_full_refresh_seconds_budget,
-        stats.repeat_full_refresh_seconds
-    );
     assert_eq!(
         stats.search.top_symbol_name, "AppController",
         "exact symbol query should prefer the exact AppController symbol"
@@ -1263,16 +1411,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.search_dir_unchanged,
         "plain read commands should not recreate the persisted search dir"
     );
-    assert!(
-        stats.search_seconds < 10.0,
-        "cold search should stay under 10 seconds on the codestory repo, got {:.2}s",
-        stats.search_seconds
-    );
-    assert!(
-        stats.symbol_seconds < 10.0,
-        "cold symbol lookup should stay under 10 seconds on the codestory repo, got {:.2}s",
-        stats.symbol_seconds
-    );
+    sidecar_cleanup.teardown();
 }
 
 #[test]
@@ -1285,7 +1424,10 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         binary.display()
     );
 
-    let root_output = tempdir().expect("drill output dir");
+    let temporary_output = tempdir().expect("drill output dir");
+    let root_output = env::var_os("CODESTORY_RELEASE_EVIDENCE_DRILL_OUTPUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| temporary_output.path().to_path_buf());
     let cache_dir = tempdir().expect("drill cache dir");
     let Some(manifest_path) = env::var_os("CODESTORY_REAL_REPO_DRILL_CASES").map(PathBuf::from)
     else {
@@ -1324,10 +1466,41 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             missing.join(", ")
         );
     }
+    let mut sidecar_cleanup = cases
+        .iter()
+        .map(|case| ReleaseE2eSidecarCleanup {
+            binary: binary.clone(),
+            project_root: case.project_root.clone(),
+            cache_dir: cache_dir.path().join(&case.name),
+            sidecar_cache_root: cache_dir.path().to_path_buf(),
+            run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
+            armed: true,
+        })
+        .collect::<Vec<_>>();
 
-    let (_seconds, suite_json) = run_cli_json(
+    for cleanup in &sidecar_cleanup {
+        run_cli_json_with_sidecar_cache_root(
+            &binary,
+            &cleanup.project_root,
+            &cleanup.cache_dir,
+            &cleanup.sidecar_cache_root,
+            &[
+                "retrieval".to_string(),
+                "bootstrap".to_string(),
+                "--profile".to_string(),
+                "agent".to_string(),
+                "--run-id".to_string(),
+                cleanup.run_id.clone(),
+                "--format".to_string(),
+                "json".to_string(),
+            ],
+        );
+    }
+
+    let (_seconds, suite_json) = run_cli_json_with_sidecar_cache_root(
         &binary,
         repo_root().as_path(),
+        cache_dir.path(),
         cache_dir.path(),
         &[
             "drill-suite".to_string(),
@@ -1336,7 +1509,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "--format".to_string(),
             "json".to_string(),
             "--output-dir".to_string(),
-            root_output.path().display().to_string(),
+            root_output.display().to_string(),
             "--case-file".to_string(),
             manifest_path.display().to_string(),
         ],
@@ -1349,23 +1522,22 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
     );
     assert_eq!(u64_field(&suite_json, &["repo_count"]), cases.len() as u64);
     assert_eq!(
+        u64_field(&suite_json, &["blocked_count"]),
+        0,
+        "drill-suite should complete every configured repo before its evidence is evaluated: {suite_json:#}"
+    );
+    assert_eq!(
         array_len(&suite_json, &["repos"]),
         cases.len(),
         "suite should include exactly the manifest real-repo drill cases"
     );
     assert!(
-        root_output.path().join("suite-report.md").is_file(),
+        root_output.join("suite-report.md").is_file(),
         "drill-suite should write a markdown aggregate report"
     );
     assert!(
-        root_output.path().join("suite-report.json").is_file(),
+        root_output.join("suite-report.json").is_file(),
         "drill-suite should write a JSON aggregate report"
-    );
-    let suite_markdown = fs::read_to_string(root_output.path().join("suite-report.md"))
-        .expect("read suite markdown");
-    assert!(
-        suite_markdown.contains("targets / 0 verified /") && suite_markdown.contains("pending"),
-        "suite markdown should make pending source-truth verification visible instead of implying CodeStory-only proof"
     );
     for case in &cases {
         assert!(
@@ -1400,12 +1572,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             u64_field(repo_json, &["summary", "anchors", "unresolved"]),
             0,
             "{} suite summary should not leave seed anchors unresolved",
-            case.name
-        );
-        assert_ne!(
-            string_field(repo_json, &["summary", "verdict", "status"]),
-            "blocked",
-            "{} suite summary should remain usable even when degraded",
             case.name
         );
         assert!(
@@ -1447,15 +1613,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "{} suite open-gaps summary should preserve pending source-truth checks",
             case.name
         );
-        assert_eq!(
-            string_field(
-                repo_json,
-                &["summary", "open_gaps", "answer_quality_status"]
-            ),
-            "pending_source_verification",
-            "{} suite open-gaps status should not imply CodeStory-only answer quality is final",
-            case.name
-        );
         assert!(
             u64_field(
                 repo_json,
@@ -1489,54 +1646,19 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             case.name
         );
         assert_eq!(
-            string_field(&drill_json, &["question_search", "status"]),
-            "ok",
-            "{} drill should collect natural-language repo-text evidence",
+            string_field(&drill_json, &["question_search", "command"]),
+            "packet",
+            "{} drill should execute the packet path once",
             case.name
         );
-        assert_question_search_names_seed_anchors(case, &drill_json);
-        assert!(
-            array_len(&drill_json, &["verification_checklist"]) >= 4,
-            "{} drill should force source-truth verification structure",
-            case.name
-        );
-        assert!(
-            bool_field(
-                &drill_json,
-                &["answer_quality_contract", "code_story_only_draft_required"]
-            ),
-            "{} drill should require a CodeStory-only draft before source reads",
-            case.name
-        );
-        assert!(
-            bool_field(
-                &drill_json,
-                &[
-                    "answer_quality_contract",
-                    "source_truth_verification_required",
-                ]
-            ),
-            "{} drill should require source-truth verification after the draft",
-            case.name
-        );
-        assert!(
-            array_len(&drill_json, &["answer_quality_contract", "score_inputs"]) >= 5,
-            "{} drill should expose score inputs for answer-quality reporting",
-            case.name
-        );
-        assert!(
-            array_len(&drill_json, &["claim_ledger_template", "claims"]) >= case.anchors.len(),
-            "{} drill should emit a fillable claim ledger template",
-            case.name
-        );
+        assert_packet_plan_names_seed_anchors(case, &drill_json);
         assert_eq!(
-            array_len(&drill_json, &["bridges"]),
-            case.anchors.len().saturating_sub(1) * case.anchors.len() / 2,
-            "{} drill should emit pairwise cross-anchor bridge evidence",
+            string_field(&drill_json, &["question_search", "status"]),
+            string_field(&drill_json, &["evidence_packet", "sufficiency", "status"]),
+            "{} drill status should be the packet sufficiency decision",
             case.name
         );
         assert_compact_bridge_status_handoff(&case.name, repo_json);
-        assert!(array_len(&drill_json, &["execution_boundaries"]) >= 3);
 
         for anchor_index in 0..case.anchors.len() {
             let index = anchor_index.to_string();
@@ -1547,57 +1669,23 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
                 case.name
             );
             assert!(
-                array_len(&drill_json, &["anchors", index.as_str(), "commands"]) >= 1,
-                "{} drill anchor should record evidence command artifacts",
-                case.name
-            );
-            assert!(
                 u64_field(&drill_json, &["anchors", index.as_str(), "typed_hit_count"]) > 0,
                 "{} anchor {} should retain typed search hits",
                 case.name,
                 case.anchors[anchor_index]
             );
-            if !json_path(&drill_json, &["anchors", index.as_str(), "chosen_anchor"]).is_null() {
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "symbol"
-                    ),
-                    "{} drill should include symbol evidence for resolved anchors",
-                    case.name
-                );
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "trail"
-                    ),
-                    "{} drill should include trail evidence for resolved anchors",
-                    case.name
-                );
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "snippet"
-                    ),
-                    "{} drill should include snippet evidence for resolved anchors",
-                    case.name
-                );
-                assert!(
-                    array_contains_command(
-                        &drill_json,
-                        &["anchors", index.as_str(), "commands"],
-                        "explore"
-                    ),
-                    "{} drill should include an explore source-packet artifact for resolved anchors",
-                    case.name
-                );
-            }
+            assert_eq!(
+                array_len(&drill_json, &["anchors", index.as_str(), "commands"]),
+                0,
+                "{} drill anchors should adapt packet citations without rerunning commands",
+                case.name
+            );
         }
 
         assert_manifest_anchor_expectations(case, repo_json);
+    }
+    for cleanup in &mut sidecar_cleanup {
+        cleanup.teardown();
     }
 }
 
@@ -1606,27 +1694,16 @@ fn allow_skip_real_repo_drill_cases() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-fn assert_question_search_names_seed_anchors(case: &DrillRepoCase, drill_json: &Value) {
-    let artifact = PathBuf::from(string_field(drill_json, &["question_search", "artifact"]));
-    assert!(
-        artifact.is_file(),
-        "{} drill should write question-search artifact at {}",
-        case.name,
-        artifact.display()
-    );
-    let question_search: Value =
-        serde_json::from_slice(&fs::read(&artifact).expect("read question-search artifact"))
-            .expect("parse question-search artifact");
-    let subqueries = json_path(&question_search, &["search_plan", "subqueries"])
+fn assert_packet_plan_names_seed_anchors(case: &DrillRepoCase, drill_json: &Value) {
+    let subqueries = json_path(drill_json, &["evidence_packet", "plan", "queries"])
         .as_array()
-        .expect("question search plan subqueries");
+        .expect("packet plan queries");
     for anchor in &case.anchors {
         assert!(
-            subqueries.iter().any(|subquery| {
-                subquery["role"].as_str() == Some("named_anchor")
-                    && subquery["query"].as_str() == Some(anchor.as_str())
-            }),
-            "{} broad question Search Plan should preserve named-anchor subquery for {anchor}: {question_search:#}",
+            subqueries
+                .iter()
+                .any(|subquery| subquery["query"].as_str() == Some(anchor.as_str())),
+            "{} packet plan should preserve explicit anchor probe {anchor}: {drill_json:#}",
             case.name
         );
     }

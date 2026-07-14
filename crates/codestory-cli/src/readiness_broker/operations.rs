@@ -47,7 +47,7 @@ pub(crate) fn operation_from_local_refresh_status(
     operation_status: &str,
     degraded_reason: Option<String>,
 ) -> BrokerOperationSnapshot {
-    let identity = codestory_workspace::project_identity_v2(project_root);
+    let identity = codestory_workspace::project_identity_v3(project_root);
     let project_id = identity.project_id;
     let workspace_id = identity.workspace_id;
     BrokerOperationSnapshot {
@@ -76,7 +76,7 @@ pub(crate) fn operation_from_local_refresh_lock_cleanup(
     cli_version: &str,
     cleanup: local_refresh_status::LocalRefreshCleanup,
 ) -> BrokerOperationSnapshot {
-    let identity = codestory_workspace::project_identity_v2(project_root);
+    let identity = codestory_workspace::project_identity_v3(project_root);
     let project_id = identity.project_id;
     let workspace_id = identity.workspace_id;
     BrokerOperationSnapshot {

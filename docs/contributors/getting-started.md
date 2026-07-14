@@ -27,6 +27,23 @@ flowchart TD
 
 Replace `[TARGET_FEATURE]` and `[OWNING_CRATE]` with the specific feature and crate you are working on.
 
+## Host prerequisites
+
+Supported Mac development starts at macOS 15 on Apple Silicon or Intel. Install
+the Xcode Command Line Tools, Node.js 18+, and the Rust toolchain. Start Docker
+Desktop or another compatible Docker engine before running packet/search lanes;
+Qdrant uses Docker on both Mac architectures even though Apple Silicon runs the
+managed embedding server natively with Metal.
+
+The protected packaged-hardware proof also requires `python3`; use that
+versioned command in Mac automation because Command Line Tools does not promise
+an unversioned `python` shim.
+
+Apple Silicon is the managed accelerated Mac cell. Intel supports the native
+CLI/plugin and local graph; retrieval must use explicit degraded CPU allowance
+or a trusted external embedding endpoint under explicit operator policy, and
+must never be described as Metal.
+
 ## Choose The Verification Lane First
 
 Before running Cargo or setting up sidecars, answer two questions:
@@ -122,7 +139,6 @@ instead of `cargo run`:
 
 ```sh
 cargo build --release -p codestory-cli
-./target/release/codestory-cli setup embeddings --project . --dry-run
 ./target/release/codestory-cli index --project . --refresh auto
 ./target/release/codestory-cli ready --project . --goal local
 ./target/release/codestory-cli ground --project . --why
@@ -144,12 +160,6 @@ The plugin source-build setup fallback accepts `CODESTORY_REPO_URL` and
 `CODESTORY_REPO_REF` when you need a specific source artifact. Without an
 explicit ref, setup fetches and builds the remote default branch.
 
-This loop proves the local CLI and diagnostic ONNX asset path are wired, but
-it is not product packet/search sidecar setup. Treat `setup embeddings
---dry-run` as an asset-plan check only. It should not start an embedding server,
-write a product retrieval manifest, or make agent-facing retrieval evidence
-trustworthy by itself.
-
 Read commands default to `--refresh none`. If a read command says the cache is
 empty, either run `index --refresh full` first or rerun the read command with an
 explicit refresh mode. Agent-facing `packet` and `search` evidence require full
@@ -167,9 +177,8 @@ work. Prepare the managed full-sidecar path before debugging ranking quality:
 - default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
 - embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` and local llama.cpp sidecar settings
 
-Hash embeddings, ONNX-only flows, and lexical-only switches are diagnostic or
-historical comparison modes only; they are not valid agent-facing retrieval
-setup.
+Hash embeddings and lexical-only switches are diagnostic modes only; they are
+not valid agent-facing retrieval setup.
 
 After bootstrap, run a target-repo sidecar index before using packet/search:
 
@@ -185,8 +194,16 @@ After bootstrap, run a target-repo sidecar index before using packet/search:
 ## Delegated Worktree Proof Target
 
 Before a delegated CodeStory lane spends time on cache repair, readiness, or
-sidecar proof, verify the Git target. `scripts/codex-worktree-setup.ps1` prints
-this handoff surface first:
+sidecar proof, verify the Git target. The tracked Codex environment runs:
+
+```sh
+node scripts/codex-worktree-setup.mjs
+```
+
+The Node.js dispatcher owns the setup behavior on every platform.
+`scripts/codex-worktree-setup.ps1` and `scripts/codex-worktree-setup.sh` are
+thin compatibility adapters for callers that still invoke a platform script.
+The dispatcher prints this handoff surface first:
 
 ```text
 intended_base_ref
@@ -201,15 +218,31 @@ remote_tip_verification.<target>.result
 ```
 
 Defaults are intentionally narrow: `intended_base_ref` is
-`origin/dev/codestory-next`, and a PR lane with `CODESTORY_PR_HEAD_REF` or
-`-PrHeadRef` proves `base:origin/dev/codestory-next + pr-head:<ref>`. Use
-`-BranchHeadProof` or `CODESTORY_BRANCH_HEAD_PROOF=1` only when the lane is
-explicitly proving the branch head by itself.
+`origin/dev/codestory-next`, and a PR lane with `CODESTORY_PR_HEAD_REF`,
+`--pr-head-ref`, or `-PrHeadRef` proves
+`base:origin/dev/codestory-next + pr-head:<ref>`. Use `--branch-head-proof`,
+or `-BranchHeadProof` only when the lane is explicitly proving the branch head
+by itself.
 
-The setup script reports stale `main`, stale local `dev/codestory-next`, stale
-PR heads, unresolved refs, and the exact `git ls-remote origin ...` result
-before it runs index, retrieval, or doctor handoff work. Treat those warnings as
-Git proof-target blockers, not packet/search readiness blockers.
+The setup reports stale `main`, stale local `dev/codestory-next`, stale PR
+heads, unresolved refs, and the exact `git ls-remote origin ...` result before
+it runs index, retrieval, or doctor handoff work. It then resolves a
+version-matched CLI through `CODESTORY_CLI`, PATH, the CodeStory install
+directory, this worktree, and sibling worktrees; tries the matching release;
+and falls back to a locked release Cargo build with optional `sccache`. It best-effort
+rehydrates a compatible sibling cache, refreshes the local index, and reports
+agent sidecar readiness. Treat Git-target warnings as proof-target blockers,
+not packet/search readiness blockers.
+
+Exercise the shared dispatcher behavior and the current platform adapter without
+changing your real workspace state:
+
+```sh
+node --test scripts/tests/codex-worktree-setup.test.mjs
+```
+
+`node scripts/codex-worktree-setup.mjs --self-test` is a compatibility alias
+for that same suite, not a second implementation-specific test path.
 
 ## Recommended Reading Order
 
@@ -285,13 +318,18 @@ Read these pages first:
 
 - default cache layout: user cache root + hashed project path
 - explicit `--cache-dir`: use the exact directory you passed
-- `cache identity`: reports the root-derived project id, canonical repository id, Git remote/tree freshness input, cache schema version, and portable-reuse eligibility without changing cache files
+- `cache identity`: reports schema-3 project, workspace, and artifact-scope ids; the lossless canonical repository identity; explicit legacy-alias disposition; Git remote/tree freshness input; cache schema version; and portable-reuse eligibility without changing cache files
 - Child worktree bootstrap: run `codestory-cli cache rehydrate --from-project <main-or-parent-worktree> --project <child-worktree>` before the first child-thread index. The command copies a compatible cache only when both worktrees are clean, share the same `origin` URL, have the same Git tree, the source SQLite schema matches the running CLI, and the target cache directory is empty.
 - Rehydrated caches rebase copied path-bound SQLite graph/search/doc rows under the child worktree path, preserve portable v2 index artifact cache rows, and invalidate retrieval manifests. Run the printed `doctor` command to inspect freshness, then run `retrieval index --refresh full` before using sidecar-backed packet/search evidence.
 - If `cache rehydrate` reports `skipped`, use the printed rebuild commands. This is CodeStory SQLite graph/search/doc plus portable v2 index artifact cache reuse; retrieval sidecar reuse across path/root-derived identities remains future work. It does not configure Rust compilation caching such as `sccache`.
 - `index --refresh auto`: chooses full on an empty cache and incremental after that
 - `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
 - `drill`: defaults to `--refresh full` so report bundles are mechanically fresh
-- `drill --jobs N` and `drill-suite --jobs N`: only use workers with `--refresh none`; refresh/indexing runs stay serialized
+- `drill`: sends its question and explicit anchors through one packet batch and
+  writes packet-backed JSON, Markdown, and summary artifacts
+- claim/source-truth scoring is evaluation-only: run
+  `node scripts/score-drill-ledger.mjs <drill-or-suite-report.json> <ledger.json> [scored-report.json]`;
+  production drill commands do not own a second readiness or scoring contract
+- `drill-suite --jobs N`: only uses workers with `--refresh none`; refresh/indexing runs stay serialized
 - use `--refresh full` after deleting the cache directory, after schema-affecting changes, or when stale state is suspected
 - delegated child worktree lanes: verify the Git proof target in [Delegated Worktree Proof Target](#delegated-worktree-proof-target) before cache rehydrate, readiness, or sidecar proof

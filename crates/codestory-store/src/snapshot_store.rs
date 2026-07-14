@@ -1,4 +1,4 @@
-use crate::{GroundingSnapshotMetadata, StorageError, Store};
+use crate::{GroundingSnapshotMetadata, StorageError, StorageOpenMode, Store};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +55,16 @@ impl<'a> SnapshotStore<'a> {
     /// Open a fresh staged database in build mode.
     pub fn open_staged(live_path: &Path) -> Result<StagedSnapshot, StorageError> {
         StagedSnapshot::open(live_path)
+    }
+
+    /// Clone the live database into a unique staged database in build mode.
+    ///
+    /// The SQLite backup primitive captures a coherent source snapshot while
+    /// allowing existing live readers to remain open. Incremental writers can
+    /// then mutate and finalize the clone without exposing partial graph or
+    /// grounding-snapshot generations at the live path.
+    pub fn clone_live_to_staged(live_path: &Path) -> Result<StagedSnapshot, StorageError> {
+        StagedSnapshot::clone_live(live_path)
     }
 
     /// Remove a staged database and SQLite sidecars.
@@ -147,6 +157,22 @@ impl StagedSnapshot {
         Ok(Self { path, store })
     }
 
+    fn clone_live(live_path: &Path) -> Result<Self, StorageError> {
+        let path = SnapshotStore::staged_path(live_path);
+        Store::discard_staged_snapshot(&path)?;
+        if let Err(error) = Store::copy_database_snapshot(live_path, &path) {
+            let _ = Store::discard_staged_snapshot(&path);
+            return Err(error);
+        }
+        match Store::open_with_mode(&path, StorageOpenMode::Build) {
+            Ok(store) => Ok(Self { path, store }),
+            Err(error) => {
+                let _ = Store::discard_staged_snapshot(&path);
+                Err(error)
+            }
+        }
+    }
+
     /// Return the staged database path.
     pub fn path(&self) -> &Path {
         &self.path
@@ -194,6 +220,8 @@ mod tests {
     use super::*;
     use crate::GroundingSnapshotState;
     use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fresh_temp_root(label: &str) -> PathBuf {
@@ -251,12 +279,22 @@ mod tests {
     fn snapshot_store_can_prepare_and_promote_staged_publish() {
         let temp = fresh_temp_root("promote");
         let live_path = temp.join("live.sqlite");
-        let staged = SnapshotStore::open_staged(&live_path).expect("open staged");
+        let mut staged = SnapshotStore::open_staged(&live_path).expect("open staged");
 
         staged
             .snapshots()
             .finalize_staged()
             .expect("prepare staged publish");
+        staged
+            .store_mut()
+            .put_index_publication(&crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "prepared-generation".to_string(),
+                run_id: "prepared-run".to_string(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("identify staged publication");
         staged.publish(&live_path).expect("promote staged snapshot");
 
         let live = Store::open(&live_path).expect("open live store");
@@ -285,6 +323,303 @@ mod tests {
         staged.discard().expect("discard staged snapshot");
         assert!(!staged_path.exists(), "staged database should be removed");
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn snapshot_store_can_clone_live_without_mutating_it() {
+        let temp = fresh_temp_root("clone-live");
+        let live_path = temp.join("live.sqlite");
+        {
+            let mut live = Store::open(&live_path).expect("open live");
+            live.insert_files_batch(&[crate::FileInfo {
+                id: 1,
+                path: PathBuf::from("old.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed live file");
+        }
+
+        let mut staged =
+            SnapshotStore::clone_live_to_staged(&live_path).expect("clone live to staged");
+        assert_eq!(
+            staged.store_mut().get_files().expect("read staged files")[0].path,
+            PathBuf::from("old.rs")
+        );
+        staged
+            .store_mut()
+            .insert_files_batch(&[crate::FileInfo {
+                id: 2,
+                path: PathBuf::from("new.rs"),
+                language: "rust".to_string(),
+                modification_time: 2,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("mutate staged clone");
+
+        let live = Store::open(&live_path).expect("reopen live");
+        let live_paths = live
+            .get_files()
+            .expect("read live files")
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        assert_eq!(live_paths, vec![PathBuf::from("old.rs")]);
+
+        let staged_path = staged.path().to_path_buf();
+        staged.discard().expect("discard staged clone");
+        assert!(!staged_path.exists());
+        assert!(!PathBuf::from(format!("{}-wal", staged_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", staged_path.display())).exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn failed_live_clone_leaves_no_staged_artifacts() {
+        let temp = fresh_temp_root("clone-failure-cleanup");
+        let missing_live_path = temp.join("missing.sqlite");
+
+        assert!(
+            SnapshotStore::clone_live_to_staged(&missing_live_path).is_err(),
+            "missing live database must fail cloning"
+        );
+
+        let remaining = fs::read_dir(&temp)
+            .expect("list temp root")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read temp entries");
+        assert!(
+            remaining.is_empty(),
+            "unexpected staged debris: {remaining:?}"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn staged_clone_publish_is_old_or_new_for_concurrent_readers() {
+        let temp = fresh_temp_root("clone-publish-readers");
+        let live_path = temp.join("live.sqlite");
+        {
+            let mut live = Store::open(&live_path).expect("open live");
+            live.insert_files_batch(&[
+                crate::FileInfo {
+                    id: 1,
+                    path: PathBuf::from("old_a.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: crate::FileRole::Source,
+                },
+                crate::FileInfo {
+                    id: 2,
+                    path: PathBuf::from("old_b.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 1,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: crate::FileRole::Source,
+                },
+            ])
+            .expect("seed old generation");
+            live.put_index_publication(&crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "old-generation".to_string(),
+                run_id: "old-run".to_string(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("identify old generation");
+            live.snapshots()
+                .refresh_all()
+                .expect("finalize old snapshots");
+        }
+
+        let old_reader = Store::open(&live_path).expect("hold old reader");
+        old_reader
+            .get_connection()
+            .execute_batch("BEGIN;")
+            .expect("begin held read transaction");
+        assert_eq!(
+            old_reader.get_files().expect("establish old read snapshot")[0].path,
+            PathBuf::from("old_a.rs")
+        );
+        let mut staged =
+            SnapshotStore::clone_live_to_staged(&live_path).expect("clone old generation");
+        staged
+            .store_mut()
+            .delete_files_batch(&[1, 2])
+            .expect("remove old file in staged clone");
+        staged
+            .store_mut()
+            .insert_files_batch(&[
+                crate::FileInfo {
+                    id: 3,
+                    path: PathBuf::from("new_a.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 2,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: crate::FileRole::Source,
+                },
+                crate::FileInfo {
+                    id: 4,
+                    path: PathBuf::from("new_b.rs"),
+                    language: "rust".to_string(),
+                    modification_time: 2,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: crate::FileRole::Source,
+                },
+            ])
+            .expect("seed new generation");
+        staged
+            .snapshots()
+            .refresh_all()
+            .expect("finalize new snapshots");
+        staged
+            .store_mut()
+            .put_index_publication(&crate::IndexPublicationRecord {
+                generation: 2,
+                generation_id: "new-generation".to_string(),
+                run_id: "new-run".to_string(),
+                mode: crate::IndexPublicationMode::Incremental,
+                published_at_epoch_ms: 2,
+            })
+            .expect("identify new generation");
+        let staged_path = staged.path().to_path_buf();
+        let racing_live_path = live_path.clone();
+        let (old_observed_tx, old_observed_rx) = mpsc::channel();
+        let racing_reader = thread::spawn(move || {
+            let old_generation = vec![PathBuf::from("old_a.rs"), PathBuf::from("old_b.rs")];
+            let new_generation = vec![PathBuf::from("new_a.rs"), PathBuf::from("new_b.rs")];
+            let mut announced_old = false;
+            loop {
+                let reader = Store::open(&racing_live_path).expect("open racing reader");
+                reader
+                    .get_connection()
+                    .execute_batch("BEGIN;")
+                    .expect("begin racing read transaction");
+                let mut paths = reader
+                    .get_files()
+                    .expect("read racing generation")
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect::<Vec<_>>();
+                paths.sort();
+                let snapshots_ready = reader
+                    .snapshots()
+                    .has_ready_summary()
+                    .expect("racing summary readiness")
+                    && reader
+                        .snapshots()
+                        .has_ready_detail()
+                        .expect("racing detail readiness");
+                let publication = reader
+                    .get_index_publication()
+                    .expect("racing publication read")
+                    .expect("racing publication identity");
+                reader
+                    .get_connection()
+                    .execute_batch("COMMIT;")
+                    .expect("finish racing read transaction");
+                assert!(
+                    snapshots_ready,
+                    "racing reader observed unready snapshots for {paths:?}"
+                );
+                if paths == old_generation {
+                    assert_eq!(publication.generation, 1);
+                    if !announced_old {
+                        old_observed_tx.send(()).expect("announce old generation");
+                        announced_old = true;
+                    }
+                } else if paths == new_generation {
+                    assert_eq!(publication.generation, 2);
+                    assert!(announced_old, "racing reader must span publication");
+                    return;
+                } else {
+                    panic!("racing reader observed a mixed generation: {paths:?}");
+                }
+            }
+        });
+        old_observed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("racing reader observed old generation");
+        staged.publish(&live_path).expect("publish new generation");
+        racing_reader.join().expect("racing reader");
+
+        let old_paths = old_reader
+            .get_files()
+            .expect("read held old generation")
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            old_paths,
+            vec![PathBuf::from("old_a.rs"), PathBuf::from("old_b.rs")]
+        );
+        assert_eq!(
+            old_reader
+                .get_index_publication()
+                .expect("held reader publication")
+                .expect("held reader publication identity")
+                .generation,
+            1
+        );
+
+        let new_reader = Store::open(&live_path).expect("open fresh reader");
+        let new_paths = new_reader
+            .get_files()
+            .expect("read fresh generation")
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            new_paths,
+            vec![PathBuf::from("new_a.rs"), PathBuf::from("new_b.rs")]
+        );
+        assert_eq!(
+            new_reader
+                .get_index_publication()
+                .expect("new reader publication")
+                .expect("new reader publication identity")
+                .generation,
+            2
+        );
+        assert!(
+            new_reader
+                .snapshots()
+                .has_ready_summary()
+                .expect("new summary readiness")
+                && new_reader
+                    .snapshots()
+                    .has_ready_detail()
+                    .expect("new detail readiness")
+        );
+        assert!(!staged_path.exists());
+        assert!(!PathBuf::from(format!("{}-wal", staged_path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", staged_path.display())).exists());
+
+        old_reader
+            .get_connection()
+            .execute_batch("COMMIT;")
+            .expect("finish held read transaction");
+        drop(old_reader);
+        drop(new_reader);
         let _ = fs::remove_dir_all(&temp);
     }
 

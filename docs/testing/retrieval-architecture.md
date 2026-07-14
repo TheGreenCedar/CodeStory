@@ -2,7 +2,7 @@
 
 **Audience:** Evidence record — not an install guide.
 
-Sidecar-primary packet retrieval (Zoekt lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
+Sidecar-primary packet retrieval (project-local SQLite FTS lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
 `codestory-retrieval` and integrated in `codestory-runtime`. Production packet paths use
 generic symbol/path roles; benchmark-only probe catalogs remain behind test-only eval harness hooks.
 Sidecar retrieval is mandatory for current evidence; `CODESTORY_RETRIEVAL=0` is treated as a
@@ -152,13 +152,32 @@ Non-claims:
 
 | Layer | Location | Role |
 |-------|----------|------|
-| Sidecar clients | `crates/codestory-retrieval/` (`zoekt_client`, `qdrant_client`, `scip_client`, `health`) | HTTP probes, staged search, timeouts |
+| Retrieval clients | `crates/codestory-retrieval/` (`lexical_client`, `qdrant_client`, `scip_client`, `health`) | SQLite FTS candidate selection, HTTP probes, staged search, timeouts |
 | Planner / executor / ranker | `codestory-retrieval` (`planner`, `executor`, `ranker`, `query_features`, `mode`) | Repo-agnostic staged plan, deadlines, degraded modes |
-| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Version pins, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, mandatory real sidecar artifact paths, and derived status `manifest_contract` provenance |
+| Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Canonical `lexical_version`, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, mandatory real sidecar artifact paths, and derived status `manifest_contract` provenance |
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
 | Packet integration | `codestory-runtime/src/agent/retrieval_primary.rs` | Primary sidecar path, diagnostic traces, promotion warnings |
 | Nucleo policy | `codestory-runtime/src/agent/nucleo_policy.rs` | Suppresses Nucleo O(n) scan on sidecar primary; disabled sidecars are not valid product evidence |
-| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Derives banned identities, prompts, claims, paths, and query/probe phrases from benchmark manifests, script prompt/query catalogs, and the eval-only probe manifest/source, then scans Rust production retrieval trees after masking test-only items (CI via Rust guard test); missing, malformed, or partially parsed corpora fail closed |
+| Generalization lint | `scripts/lint-retrieval-generalization.mjs` | Derives banned identities, prompts, claims, paths, and query/probe phrases from benchmark manifests, script prompt/query catalogs, and the eval-only probe manifest/source. It scans Rust production retrieval trees after masking test-only items and structurally scans the inventoried non-Rust product/release-control boundary for direct or adjacent/split corpus dependencies (CI via the Rust guard test); missing protected paths and missing, malformed, or partially parsed corpora fail closed. |
+
+All planned retrieval stages use the same fixed-capacity worker pool, including
+symbol-like and natural-language queries. Each job carries the request deadline
+and cancellation flag into sidecar calls. Lexical and SCIP scans poll that
+context while iterating. Live query embedding and Qdrant requests clamp their
+transport timeout to the remaining deadline and use separate bounded reusable
+HTTP capacity, allowing the stage worker to return promptly when synchronous
+I/O cannot be interrupted in place. Stage traces report admission and queue
+wait separately, report execution duration only after completion, and classify
+completed, skipped, cancelled-before-start, pending-after-deadline, and
+observed-late work. Post-return completions are logged and discarded. Any cancelled or late
+result remains diagnostic and is never inserted into the retrieval cache.
+Each runnable stage may use elapsed request slack after reserving the planned budgets of later
+stages, and the final planned stage may use whatever request budget remains. This keeps every lane
+bounded without stranding time in static allowances. Traces report each effective deadline, and
+the primary single-query request window is capped at 1.5 seconds; the total request deadline still
+bounds cancellation and cache eligibility. Once a stage records
+a blocking deadline, later request-deadline or marginal-gain exits retain that first reason so
+partial results cannot become packet-eligible or cacheable.
 
 **Modes:** See the canonical
 [mode matrix](../architecture/retrieval-design.md#mode-matrix). Only `full` may

@@ -1,4 +1,4 @@
-name: rust ci
+name: Draft source checks
 
 on:
   pull_request:
@@ -6,20 +6,11 @@ on:
       - Cargo.lock
       - Cargo.toml
       - crates/**
-      - docs/contributors/testing-matrix.md
+      - .github/scripts/check-runtime-config-boundary.mjs
       - .github/scripts/check-workflow-policy.mjs
+      - .github/scripts/route-ci-proof.mjs
       - .github/workflows/rust-ci.yml
-  push:
-    branches:
-      - main
-      - dev/codestory-next
-    paths:
-      - Cargo.lock
-      - Cargo.toml
-      - crates/**
-      - docs/contributors/testing-matrix.md
-      - .github/scripts/check-workflow-policy.mjs
-      - .github/workflows/rust-ci.yml
+      - .github/workflows/source-proof.yml
   workflow_dispatch:
 
 permissions:
@@ -30,8 +21,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  workspace:
-    name: workspace cargo checks
+  linux-draft:
+    name: Ubuntu draft source checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -42,13 +33,14 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
-      - name: Capture Rust cache key
+      - name: Capture Rust cache identity
         id: rust-cache-key
         shell: bash
         run: |
           echo "version=$(rustc -Vv | sed -n 's/^release: //p')" >> "$GITHUB_OUTPUT"
+          echo "target=$(rustc -Vv | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
 
-      - name: Restore Cargo registry, git sources, and build output
+      - name: Restore Cargo inputs and output
         id: cargo-cache-restore
         uses: actions/cache/restore@v5
         continue-on-error: true
@@ -57,25 +49,29 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-rust-ci-stable-${{ steps.rust-cache-key.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-draft-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-rust-ci-stable-${{ steps.rust-cache-key.outputs.version }}-
-            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-
-            ${{ runner.os }}-cargo-stable-
+            ${{ runner.os }}-draft-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-
 
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Check workspace
+      - name: Check immutable runtime configuration boundary
+        run: node .github/scripts/check-runtime-config-boundary.mjs
+
+      - name: Check the workspace
         run: cargo check --workspace --locked
 
-      - name: Test workspace
-        run: cargo test --locked
+      - name: Lint workspace libraries
+        run: cargo clippy --workspace --lib --locked -- -D warnings
 
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Prove focused publication contracts
+        run: |
+          cargo test --locked -p codestory-cli --test stdio_protocol_contracts two_stdio_processes_observe_only_complete_generations_during_real_refresh -- --nocapture
+          cargo test --locked -p codestory-runtime publication_transitions_fail_or_cancel_atomically -- --nocapture
+          cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture
 
-      - name: Save Cargo registry, git sources, and build output
+      - name: Save Cargo inputs and output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true

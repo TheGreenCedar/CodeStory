@@ -8,7 +8,7 @@
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, EvidencePacketDto, GroundingBudgetDto,
+    AgentPacketDto, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, GroundingBudgetDto,
     IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
     NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto,
     ReadinessStatusDto, ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto,
@@ -16,7 +16,7 @@ use codestory_contracts::api::{
     SearchQueryAssessmentDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto,
     TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
 const INDEX_REFRESH_HELP: &str = "Index defaults to `auto`: it chooses `full` for an empty cache and `incremental` once the \
@@ -78,8 +78,6 @@ pub(crate) enum Command {
     Smoke(SmokeCommand),
     #[command(about = "Agent-facing readiness and repair helpers.")]
     Agent(AgentCommand),
-    #[command(about = "Install or check local setup assets.")]
-    Setup(SetupCommand),
     #[command(about = "Prepare or inspect local cache artifacts.")]
     Cache(CacheCommand),
     #[command(about = "Find symbols and repo text evidence.")]
@@ -122,6 +120,16 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(about = "Show retrieval sidecar status.")]
     Sidecar(SidecarCommand),
+    #[command(name = "internal-owned-delete", hide = true)]
+    InternalOwnedDelete(InternalOwnedDeleteCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalOwnedDeleteCommand {
+    #[arg(long, value_name = "DIR")]
+    pub(crate) root: PathBuf,
+    #[arg(long, value_name = "RELATIVE_PATH")]
+    pub(crate) relative: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -258,22 +266,6 @@ pub(crate) enum CompletionShell {
     Zsh,
     Fish,
     Powershell,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CliEmbeddingQuant {
-    #[value(name = "q8_0")]
-    Q8_0,
-    #[value(name = "q4_k_m")]
-    Q4KM,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum CliLlamaVariant {
-    Cpu,
-    Vulkan,
 }
 
 #[derive(Args, Debug)]
@@ -752,7 +744,7 @@ pub(crate) enum RetrievalAction {
     Up(RetrievalSidecarStateCommand),
     /// Remove local sidecar state file (does not stop external processes).
     Down(RetrievalSidecarStateCommand),
-    /// Probe Zoekt, Qdrant, and SCIP availability for the project.
+    /// Validate the lexical shard plus Qdrant and SCIP availability for the project.
     Status(RetrievalStatusCommand),
     /// List owned sidecar namespaces and dry-run cleanup eligibility.
     Inventory(RetrievalInventoryCommand),
@@ -830,7 +822,7 @@ pub(crate) struct RetrievalBootstrapCommand {
         long,
         value_name = "SECS",
         default_value_t = 90,
-        help = "Seconds to wait for Zoekt and Qdrant HTTP probes (0 = no wait)."
+        help = "Seconds to wait for Qdrant and embedding HTTP probes (0 = no wait)."
     )]
     pub(crate) wait_secs: u64,
     #[arg(
@@ -911,55 +903,6 @@ pub(crate) struct RetrievalIndexCommand {
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
-    pub(crate) output_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SetupCommand {
-    #[command(subcommand)]
-    pub(crate) action: SetupAction,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum SetupAction {
-    Embeddings(SetupEmbeddingsCommand),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct SetupEmbeddingsCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = CliEmbeddingQuant::Q8_0,
-        help = "Legacy compatibility selector; setup embeddings now installs diagnostic ONNX assets only."
-    )]
-    pub(crate) quant: CliEmbeddingQuant,
-    #[arg(
-        long,
-        value_enum,
-        default_value_t = CliLlamaVariant::Vulkan,
-        help = "Legacy compatibility selector; product embeddings use the llama.cpp retrieval sidecar."
-    )]
-    pub(crate) variant: CliLlamaVariant,
-    #[arg(
-        long,
-        help = "Show the diagnostic ONNX asset plan without downloading anything."
-    )]
-    pub(crate) dry_run: bool,
-    #[arg(
-        long,
-        help = "Compatibility flag; diagnostic ONNX setup never starts a server."
-    )]
-    pub(crate) no_start: bool,
-    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
-    pub(crate) format: OutputFormat,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Write command output to this file instead of stdout. The parent directory must already exist."
-    )]
     pub(crate) output_file: Option<PathBuf>,
 }
 
@@ -1053,6 +996,14 @@ pub(crate) struct DrillCommand {
         long_help = DRILL_REFRESH_HELP
     )]
     pub(crate) refresh: RefreshMode,
+    #[arg(long, value_enum)]
+    pub(crate) profile: Option<CliSidecarProfile>,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Agent profile run id to reuse for drill packet retrieval. Passing --run-id implies the agent profile."
+    )]
+    pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -1075,12 +1026,6 @@ pub(crate) struct DrillSuiteCommand {
         help = "JSON manifest describing the drill cases to run. Relative case project paths resolve from the manifest directory."
     )]
     pub(crate) case_file: PathBuf,
-    #[arg(
-        long,
-        value_name = "FILE",
-        help = "Optional source-truth ledger JSON to merge into the suite report after verification."
-    )]
-    pub(crate) ledger: Option<PathBuf>,
     #[arg(
         long,
         value_name = "DIR",
@@ -1975,56 +1920,6 @@ pub(crate) struct DrillAnchorOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillVerificationChecklistItemOutput {
-    pub(crate) item: String,
-    pub(crate) allowed_classifications: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillAnswerQualityContractOutput {
-    pub(crate) code_story_only_draft_required: bool,
-    pub(crate) source_truth_verification_required: bool,
-    pub(crate) pass_condition: String,
-    pub(crate) score_inputs: Vec<String>,
-    pub(crate) correction_buckets: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillClaimLedgerEntryOutput {
-    pub(crate) id: String,
-    pub(crate) claim: String,
-    pub(crate) expected_evidence: Vec<String>,
-    pub(crate) source_truth_files: Vec<String>,
-    pub(crate) pre_verification_confidence: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) classification: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) changed_after_source_read: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) correction_note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillClaimLedgerScoringOutput {
-    pub(crate) status: String,
-    pub(crate) pending_claim_count: u32,
-    pub(crate) correct: u32,
-    pub(crate) partial: u32,
-    pub(crate) misleading: u32,
-    pub(crate) unsupported: u32,
-    pub(crate) material_revision_count: u32,
-    pub(crate) score_formula: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillClaimLedgerOutput {
-    pub(crate) template_version: u32,
-    pub(crate) instructions: Vec<String>,
-    pub(crate) claims: Vec<DrillClaimLedgerEntryOutput>,
-    pub(crate) scoring: DrillClaimLedgerScoringOutput,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummaryStatsOutput {
     pub(crate) files: u32,
     pub(crate) nodes: u32,
@@ -2201,11 +2096,7 @@ pub(crate) struct DrillOutput {
     pub(crate) execution_boundaries: Vec<DrillExecutionBoundaryOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
-    pub(crate) evidence_packet: EvidencePacketDto,
-    pub(crate) answer_quality_contract: DrillAnswerQualityContractOutput,
-    pub(crate) claim_ledger_template: DrillClaimLedgerOutput,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) verification_checklist: Vec<DrillVerificationChecklistItemOutput>,
+    pub(crate) evidence_packet: AgentPacketDto,
     pub(crate) next_commands: Vec<String>,
 }
 
@@ -2219,7 +2110,6 @@ pub(crate) struct DrillSuiteRepoOutput {
     pub(crate) artifact_extension: String,
     pub(crate) summary: DrillSummaryOutput,
     pub(crate) expectations: DrillSuiteExpectationOutput,
-    pub(crate) answer_quality: DrillSuiteAnswerQualityOutput,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2232,42 +2122,6 @@ pub(crate) struct DrillSuiteExpectationOutput {
     pub(crate) min_anchor_resolution: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) allow_partial_bridges: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSuiteLayerFindingOutput {
-    pub(crate) layer: String,
-    pub(crate) status: String,
-    pub(crate) detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSuiteAnswerQualityOutput {
-    pub(crate) ledger_status: String,
-    pub(crate) final_answer_status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) draft_written: Option<bool>,
-    pub(crate) claim_count: usize,
-    pub(crate) claim_correct_count: usize,
-    pub(crate) claim_partial_count: usize,
-    pub(crate) claim_misleading_count: usize,
-    pub(crate) claim_unsupported_count: usize,
-    pub(crate) claim_unclassified_count: usize,
-    pub(crate) material_revision_count: usize,
-    pub(crate) expected_file_count: usize,
-    pub(crate) expected_file_found_count: usize,
-    pub(crate) expected_file_missing_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) expected_file_recall: Option<f32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) missing_expected_files: Vec<String>,
-    pub(crate) forbidden_claim_count: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) forbidden_claim_hits: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) layer_findings: Vec<DrillSuiteLayerFindingOutput>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2288,10 +2142,6 @@ pub(crate) struct DrillSuiteOutput {
     pub(crate) degraded_count: usize,
     pub(crate) blocked_count: usize,
     pub(crate) ready_count: usize,
-    pub(crate) answer_ready_count: usize,
-    pub(crate) answer_degraded_count: usize,
-    pub(crate) answer_failed_count: usize,
-    pub(crate) answer_pending_count: usize,
     pub(crate) repos: Vec<DrillSuiteRepoOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) retrieval_blockers: Vec<DrillSuiteRetrievalBlockerOutput>,
@@ -2758,17 +2608,18 @@ mod tests {
         assert!(help.contains("--label <LABEL>"));
         assert!(help.contains("--question <QUESTION>"));
         assert!(help.contains("--jobs <N>"));
+        assert!(help.contains("--profile <PROFILE>"));
+        assert!(help.contains("--run-id <ID>"));
         assert!(help.contains("Stored in the report only; it is not interpreted"));
         assert!(help.contains("Drill defaults to `full`"));
     }
 
     #[test]
-    fn drill_suite_help_exposes_source_truth_ledger() {
+    fn drill_suite_help_exposes_report_controls() {
         let help = render_subcommand_help("drill-suite");
         assert!(help.contains("--case-file <FILE>"));
-        assert!(help.contains("--ledger <FILE>"));
         assert!(help.contains("--jobs <N>"));
-        assert!(help.contains("source-truth ledger JSON"));
+        assert!(!help.contains("--ledger"));
     }
 
     #[test]
@@ -2963,18 +2814,6 @@ mod tests {
         let help = render_subcommand_help("doctor");
         assert!(help.contains("--format <FORMAT>"));
         assert!(help.contains("--output-file <PATH>"));
-    }
-
-    #[test]
-    fn setup_embeddings_keeps_legacy_variant_default_for_cli_compatibility() {
-        let cli = Cli::try_parse_from(["codestory-cli", "setup", "embeddings"])
-            .expect("setup embeddings should parse");
-        match cli.command {
-            Command::Setup(SetupCommand {
-                action: SetupAction::Embeddings(cmd),
-            }) => assert_eq!(cmd.variant, CliLlamaVariant::Vulkan),
-            _ => panic!("expected setup embeddings command"),
-        }
     }
 
     #[test]
