@@ -203,7 +203,7 @@ sudo -u codestory-runner jq -n --arg project "$drill_repo" '{
     slug: "serde-json-deserialization",
     project: $project,
     question: "Explain how serde_json turns an input reader into typed Rust values, from from_reader through Deserializer and the Value representation.",
-    anchors: ["from_reader", "Deserializer", "Value"],
+    anchors: ["from_reader", "Deserializer::from_reader", "Value"],
     expect: {
       source_truth_files: ["src/de.rs", "src/value/mod.rs"],
       false_claims: ["from_reader parses JSON without using Deserializer"],
