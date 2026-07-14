@@ -283,24 +283,23 @@ jobs:
 
           cp "$bin" "$work_dir/codestory-cli-quarantined"
           xattr -w com.apple.quarantine "0083;$(date +%s);CodeStory;" "$work_dir/codestory-cli-quarantined"
-          accepted=false
-          for _attempt in $(seq 1 12); do
-            if spctl --assess --type execute --verbose=4 "$work_dir/codestory-cli-quarantined" \
-              > "$proof_dir/spctl.txt" 2>&1
-            then
-              accepted=true
-              break
-            fi
-            sleep 5
-          done
-          if [ "$accepted" != true ]; then
-            cat "$proof_dir/spctl.txt"
-            echo "::error::Gatekeeper did not accept the signed and notarized CLI"
-            exit 1
+          xattr -p com.apple.quarantine "$work_dir/codestory-cli-quarantined" \
+            > "$proof_dir/executable-quarantine.txt"
+          set +e
+          spctl --assess --type execute --verbose=4 "$work_dir/codestory-cli-quarantined" \
+            > "$proof_dir/spctl-diagnostic.txt" 2>&1
+          spctl_status=$?
+          set -e
+          printf '%s\n' "$spctl_status" > "$proof_dir/spctl-status.txt"
+          if [ "$spctl_status" -eq 0 ]; then
+            grep -F "source=Notarized Developer ID" "$proof_dir/spctl-diagnostic.txt"
+          else
+            # spctl does not assess bare Mach-O tools as applications. Keep its
+            # diagnostic, then prove the quarantined executable in the next step.
+            grep -F "does not seem to be an app" "$proof_dir/spctl-diagnostic.txt"
           fi
-          grep -F "source=Notarized Developer ID" "$proof_dir/spctl.txt"
 
-      - name: Execute notarized macOS CLI without signing credentials
+      - name: Execute quarantined notarized macOS CLI without signing credentials
         if: runner.os == 'macOS' && inputs.sign_macos
         shell: bash
         run: |

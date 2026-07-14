@@ -252,10 +252,13 @@ blocks the release before any Mac asset is published.
 After publication, both Mac tarballs receive a download quarantine before
 extraction. Because command-line tar does not propagate that xattr, the proof
 records the archive quarantine and transfers the same event to the extracted
-binary before `codesign --verify`, online Gatekeeper `spctl` assessment,
-version, and help execution on each native architecture. Preserve the
+binary before `codesign --verify`, an `spctl` diagnostic, and native version
+and help execution on each architecture. `spctl` treats a bare Mach-O CLI as
+"not an app" even when Apple notarization is accepted, so quarantined native
+execution is the release gate; the diagnostic is retained without requiring
+application-bundle acceptance. Preserve the
 release-time `notarytool` result and post-publish quarantine,
-codesign/Gatekeeper artifacts. Signing/notary material is scoped to the
+codesign/execution artifacts. Signing/notary material is scoped to the
 protected `macos-release-signing` environment and written with owner-only
 permissions. Release-time and post-publish proof require both the reported
 `TeamIdentifier` and the designated-requirement certificate OU to match Apple
