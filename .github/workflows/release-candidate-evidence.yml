@@ -138,8 +138,11 @@ jobs:
           mkdir -p target/release-evidence
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" \
             > target/release-evidence/source-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/artifacts" \
+            > target/release-evidence/source-run-artifacts.json
           node scripts/codestory-release-evidence-gate.mjs validate-source-run \
             --run target/release-evidence/source-run.json \
+            --artifacts target/release-evidence/source-run-artifacts.json \
             --repo "$GITHUB_REPOSITORY" \
             --expected-sha "$EVIDENCE_SHA"
           gh run download "$SOURCE_RUN_ID" \

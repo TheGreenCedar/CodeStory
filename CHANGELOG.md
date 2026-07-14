@@ -70,7 +70,9 @@
   focused source checks; exact-head, platform, protected hardware, signing, and
   installation proof run only at their explicit promotion boundaries. The
   evidence gate reconciles packet selectors with their recorded transport modes
-  before enforcing exact raw-row coverage.
+  before enforcing exact raw-row coverage, and coordinator re-evaluation binds
+  retained evidence to the selected candidate artifact even when the dispatch
+  workflow itself runs from a different branch.
 
 ### Release boundary
 

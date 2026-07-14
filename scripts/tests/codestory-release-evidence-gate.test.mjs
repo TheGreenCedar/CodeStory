@@ -65,10 +65,12 @@ test("fingerprint prefers a validated provisioned machine identity", () => {
   assert.match(result.stderr, /observed identity attestation changed/);
 });
 
-test("prior-run reuse requires an exact failed trusted producer", () => {
+test("prior-run reuse binds selected evidence to a failed trusted producer", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "codestory-source-run-"));
   const runPath = path.join(dir, "run.json");
+  const artifactsPath = path.join(dir, "artifacts.json");
   const run = {
+    id: 42,
     path: ".github/workflows/packaged-platform-pr.yml",
     event: "workflow_dispatch",
     conclusion: "failure",
@@ -76,15 +78,25 @@ test("prior-run reuse requires an exact failed trusted producer", () => {
     repository: { full_name: "TheGreenCedar/CodeStory" },
     head_repository: { full_name: "TheGreenCedar/CodeStory" },
   };
+  const artifacts = {
+    artifacts: [{
+      name: `release-evidence-${candidateSha}`,
+      expired: false,
+      size_in_bytes: 1024,
+      workflow_run: { id: run.id, head_sha: run.head_sha },
+    }],
+  };
   const validate = () => spawnSync(process.execPath, [
     script,
     "validate-source-run",
     "--run", runPath,
+    "--artifacts", artifactsPath,
     "--repo", "TheGreenCedar/CodeStory",
     "--expected-sha", candidateSha,
   ], { encoding: "utf8" });
 
   writeFileSync(runPath, JSON.stringify(run));
+  writeFileSync(artifactsPath, JSON.stringify(artifacts));
   assert.equal(validate().status, 0);
 
   run.path = ".github/workflows/arbitrary-pr.yml";
@@ -93,8 +105,20 @@ test("prior-run reuse requires an exact failed trusted producer", () => {
 
   run.path = ".github/workflows/packaged-platform-pr.yml";
   run.head_sha = "3".repeat(40);
+  artifacts.artifacts[0].workflow_run.head_sha = run.head_sha;
+  writeFileSync(runPath, JSON.stringify(run));
+  writeFileSync(artifactsPath, JSON.stringify(artifacts));
+  assert.equal(validate().status, 0);
+
+  run.path = ".github/workflows/release.yml";
   writeFileSync(runPath, JSON.stringify(run));
   assert.match(validate().stderr, /does not match the evidence SHA/);
+
+  run.path = ".github/workflows/packaged-platform-pr.yml";
+  artifacts.artifacts[0].name = `release-evidence-${"4".repeat(40)}`;
+  writeFileSync(runPath, JSON.stringify(run));
+  writeFileSync(artifactsPath, JSON.stringify(artifacts));
+  assert.match(validate().stderr, /must contain exactly one release-evidence/);
 });
 
 test("checked-in candidate and report are deterministic and fully attested", () => {
