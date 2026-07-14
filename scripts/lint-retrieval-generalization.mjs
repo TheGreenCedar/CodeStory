@@ -131,6 +131,11 @@ const allowedHarnessReferences = [
     "uses: ./.github/workflows/release-candidate-evidence.yml",
   ],
   [
+    path.join(".github", "workflows", "release.yml"),
+    ".github/workflows/release-candidate-evidence.yml",
+    "uses: ./.github/workflows/release-candidate-evidence.yml",
+  ],
+  [
     path.join(".github", "scripts", "route-ci-proof.mjs"),
     ".github/workflows/retrieval-sidecar-smoke.yml",
     "\".github/workflows/retrieval-sidecar-smoke.yml\",",

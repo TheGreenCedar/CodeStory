@@ -19,6 +19,11 @@ const SHA = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const MACHINE_FINGERPRINT = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{2,199}$/;
+const SOURCE_RUN_PRODUCERS = new Map([
+  [".github/workflows/packaged-platform-pr.yml", new Set(["workflow_dispatch"])],
+  [".github/workflows/release.yml", new Set(["workflow_dispatch"])],
+  [".github/workflows/auto-release.yml", new Set(["push"])],
+]);
 
 function fail(message) { throw new Error(message); }
 function object(value, label) {
@@ -84,6 +89,25 @@ function machineFingerprint() {
   const cpu = os.cpus()[0]?.model?.trim() ?? "unknown";
   const memoryGiB = Math.round(os.totalmem() / 2 ** 30);
   return `${process.platform}/${process.arch}/${os.cpus().length}/${cpu}/${memoryGiB}GiB`;
+}
+
+export function validateSourceRunMetadata({ run, expectedRepo, expectedSha }) {
+  object(run, "source run");
+  const repo = text(expectedRepo, "expected repository");
+  const sha = fullSha(expectedSha, "expected SHA");
+  if (run.repository?.full_name !== repo || run.head_repository?.full_name !== repo) {
+    fail("source run must come from the current repository");
+  }
+  if (fullSha(run.head_sha, "source run head SHA") !== sha) {
+    fail("source run head SHA does not match the evidence SHA");
+  }
+  if (run.conclusion !== "failure") {
+    fail("source run must be a rejected failed evidence run");
+  }
+  const events = SOURCE_RUN_PRODUCERS.get(run.path);
+  if (!events?.has(run.event)) {
+    fail("source run workflow and event are not trusted evidence producers");
+  }
 }
 function profileFrom(document, name, mode, baselineDir) {
   if (document.schema_version !== 2) fail("baseline schema_version must be 2");
@@ -344,6 +368,14 @@ function main() {
     console.log(machineFingerprint());
     return;
   }
+  if (command === "validate-source-run") {
+    validateSourceRunMetadata({
+      run: readJson(values.run, "source run"),
+      expectedRepo: values.repo,
+      expectedSha: values["expected-sha"],
+    });
+    return;
+  }
   const repoRoot = path.resolve(values.repo ?? path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."));
   const baselineDocument = readJson(values.baseline, "baseline");
   const baselineDir = path.dirname(path.resolve(values.baseline));
@@ -352,7 +384,7 @@ function main() {
   else if (command === "evaluate") {
     const report = evaluateCandidate({ baselineDocument, baselineDir, candidatePath: values.candidate, approvalDocument: values.approval ? readJson(values.approval, "approval") : null, outPath: values.out, expectedSha: values["expected-sha"], mode, repoRoot });
     if (!report.decision.startsWith("accept_")) process.exitCode = 1;
-  } else fail("command must be produce or evaluate");
+  } else fail("command must be fingerprint, validate-source-run, produce, or evaluate");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main();

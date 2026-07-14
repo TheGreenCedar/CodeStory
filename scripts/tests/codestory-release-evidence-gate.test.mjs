@@ -65,6 +65,38 @@ test("fingerprint prefers a validated provisioned machine identity", () => {
   assert.match(result.stderr, /observed identity attestation changed/);
 });
 
+test("prior-run reuse requires an exact failed trusted producer", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "codestory-source-run-"));
+  const runPath = path.join(dir, "run.json");
+  const run = {
+    path: ".github/workflows/packaged-platform-pr.yml",
+    event: "workflow_dispatch",
+    conclusion: "failure",
+    head_sha: candidateSha,
+    repository: { full_name: "TheGreenCedar/CodeStory" },
+    head_repository: { full_name: "TheGreenCedar/CodeStory" },
+  };
+  const validate = () => spawnSync(process.execPath, [
+    script,
+    "validate-source-run",
+    "--run", runPath,
+    "--repo", "TheGreenCedar/CodeStory",
+    "--expected-sha", candidateSha,
+  ], { encoding: "utf8" });
+
+  writeFileSync(runPath, JSON.stringify(run));
+  assert.equal(validate().status, 0);
+
+  run.path = ".github/workflows/arbitrary-pr.yml";
+  writeFileSync(runPath, JSON.stringify(run));
+  assert.match(validate().stderr, /not trusted evidence producers/);
+
+  run.path = ".github/workflows/packaged-platform-pr.yml";
+  run.head_sha = "3".repeat(40);
+  writeFileSync(runPath, JSON.stringify(run));
+  assert.match(validate().stderr, /does not match the evidence SHA/);
+});
+
 test("checked-in candidate and report are deterministic and fully attested", () => {
   const dir = workspace();
   const out = path.join(dir, "report.json");

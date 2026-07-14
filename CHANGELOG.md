@@ -9,7 +9,7 @@
   search, indexing, and storage budgets.
 - Wired releases through protected Linux ARM64 release evidence after preflight
   and before packaged proof, with optional same-SHA prior-run re-evaluation and
-  auto-release routing for every release-evidence contract surface.
+  the same gate for manual and main-triggered releases.
 - GitHub releases now use the exact matching version section from this
   changelog before the existing platform proof-boundary appendix. Publication
   fails when that version section is missing, duplicated, or empty instead of

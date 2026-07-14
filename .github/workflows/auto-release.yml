@@ -11,20 +11,9 @@ on:
       - AGENTS.md
       - docs/contributors/testing-matrix.md
       - .github/workflows/auto-release.yml
-      - .github/workflows/release-candidate-evidence.yml
       - .github/workflows/release.yml
       - .github/scripts/**
-      - benchmarks/release-evidence/**
-      - benchmarks/tasks/manifest.schema.json
-      - benchmarks/tasks/holdout-retrieval/**
       - plugins/codestory/**
-      - scripts/codestory-agent-ab-benchmark.mjs
-      - scripts/codestory-agent-value-score.mjs
-      - scripts/codestory-benchmark-contract.mjs
-      - scripts/codestory-evidence-provenance.mjs
-      - scripts/codestory-release-evidence-gate.mjs
-      - scripts/codestory-release-evidence-runner.sh
-      - scripts/release-evidence/**
 
 permissions:
   contents: read

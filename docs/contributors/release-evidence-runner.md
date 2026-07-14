@@ -149,7 +149,9 @@ evidence with:
 If a measured candidate is rejected and receives an exact, expiring approval,
 manually dispatch `release.yml` on the same SHA and version with
 `source_run_id=<rejected-run-id>`. The reusable workflow downloads that run's
-artifact and evaluates it again without producing new measurements.
+artifact and evaluates it again without producing new measurements. Before the
+download, it requires a failed trusted evidence workflow from this repository
+whose head is the exact evidence SHA.
 
 The workflow uploads `release-evidence-<full SHA>` from
 `target/release-evidence`, including provisioning, raw stats, packet summary,
