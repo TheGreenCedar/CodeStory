@@ -2,11 +2,13 @@
 #![allow(clippy::items_after_test_module)]
 
 use super::citation::to_citation_from_hit;
+use super::packet_required_probes::packet_sufficiency_required_probe_queries_from_terms;
 use super::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_citation_key,
     packet_citation_rank, packet_query_stop_term, packet_stage_citation_carry_limit,
     packet_subquery_hit_limit,
 };
+use super::packet_terms::packet_probe_terms;
 use super::packet_trace::{
     append_packet_query_timing_fields, merge_packet_lexical_subquery_batch,
     merge_packet_semantic_subquery_batch, packet_query_diagnostic, packet_query_duration_ms,
@@ -633,6 +635,7 @@ fn packet_anchor_per_query_limit(
 }
 
 pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
+    let required_probes = packet_anchor_required_probe_keys(plan);
     let mut ranked = plan
         .queries
         .iter()
@@ -646,7 +649,13 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
                 || is_packet_code_like_term(&query.query)
         })
         .collect::<Vec<_>>();
-    ranked.sort_by_key(|(index, query)| (packet_anchor_probe_priority(query), *index));
+    ranked.sort_by_key(|(index, query)| {
+        (
+            !required_probes.contains(&normalize_identifier(&query.query)),
+            packet_anchor_probe_priority(query),
+            *index,
+        )
+    });
     let mut seen = HashSet::<String>::new();
     ranked
         .into_iter()
@@ -661,6 +670,18 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
                 None
             }
         })
+        .collect()
+}
+
+fn packet_anchor_required_probe_keys(plan: &PacketPlanDto) -> HashSet<String> {
+    let Some(prompt) = plan.queries.first() else {
+        return HashSet::new();
+    };
+    let terms = packet_probe_terms(&prompt.query);
+    packet_sufficiency_required_probe_queries_from_terms(&terms, plan.task_class)
+        .into_iter()
+        .map(|query| normalize_identifier(&query))
+        .filter(|query| !query.is_empty())
         .collect()
 }
 

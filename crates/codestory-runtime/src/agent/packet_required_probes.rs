@@ -420,7 +420,6 @@ pub(crate) fn packet_sufficiency_required_probe_queries_from_terms(
     #[cfg(test)]
     if eval_probes_enabled() {
         push_eval_required_probe_queries(terms, &mut queries);
-        return queries;
     }
 
     if has("exec") && has_any(&["runtime", "session"]) {

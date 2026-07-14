@@ -213,7 +213,6 @@ pub(crate) fn packet_symbol_probe_queries(
         &mut queries,
         &packet_command_role_probe_queries(question, task_class),
     );
-    push_prompt_derived_exact_flow_anchor_queries(&terms, &mut queries);
     push_unique_owned_terms(
         &mut queries,
         &packet_command_exact_probe_queries(question, task_class),
@@ -230,6 +229,7 @@ pub(crate) fn packet_symbol_probe_queries(
         &mut queries,
         &packet_flow_requirement_queries_for_terms(&terms, task_class),
     );
+    push_prompt_derived_exact_flow_anchor_queries(&terms, &mut queries);
     push_unique_owned_terms(
         &mut queries,
         &packet_sufficiency_required_probe_queries_from_terms(&terms, task_class),
