@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Release evidence now reconciles packet benchmark selector names with the
+  transport mode identifiers recorded by real packet rows.
 - Approved the first protected Linux ARM64 release-evidence baseline with
   pinned machine identity and explicit status, grounding, convergence, packet,
   search, indexing, and storage budgets.

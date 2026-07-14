@@ -18,7 +18,7 @@
       {
         "repo": "fixture",
         "task_id": "quality-contract",
-        "mode": "cold-cli",
+        "mode": "cold_cli_packet",
         "repeat": 1,
         "status": "pass",
         "quality": { "pass": true },
@@ -43,7 +43,7 @@
       {
         "repo": "fixture",
         "task_id": "quality-contract",
-        "mode": "cold-cli",
+        "mode": "cold_cli_packet",
         "repeat": 2,
         "status": "pass",
         "quality": { "pass": true },
@@ -68,7 +68,7 @@
       {
         "repo": "fixture",
         "task_id": "quality-contract",
-        "mode": "cold-cli",
+        "mode": "cold_cli_packet",
         "repeat": 3,
         "status": "pass",
         "quality": { "pass": true },
@@ -93,7 +93,7 @@
     ]
   },
   "summary": [
-    { "task": "one", "median_e2e_wall_ms": 800 },
-    { "task": "two", "median_e2e_wall_ms": 900 }
+    { "task": "one", "mode": "cold_cli_packet", "median_e2e_wall_ms": 800 },
+    { "task": "two", "mode": "cold_cli_packet", "median_e2e_wall_ms": 900 }
   ]
 }

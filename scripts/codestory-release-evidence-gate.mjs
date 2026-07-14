@@ -19,6 +19,10 @@ const SHA = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const MACHINE_FINGERPRINT = /^[A-Za-z0-9][A-Za-z0-9._:/+-]{2,199}$/;
+const PACKET_RUNTIME_MODES = new Map([
+  ["cold-cli", "cold_cli_packet"],
+  ["warm-stdio", "warm_stdio_packet"],
+]);
 const SOURCE_RUN_PRODUCERS = new Map([
   [".github/workflows/packaged-platform-pr.yml", new Set(["workflow_dispatch"])],
   [".github/workflows/release.yml", new Set(["workflow_dispatch"])],
@@ -172,6 +176,15 @@ function metricsFrom(stats, packet, profile) {
   return values;
 }
 
+function packetRuntimeModes(modes) {
+  return [...new Set(modes.map((mode, index) => {
+    const selected = text(mode, `packet.modes[${index}]`);
+    const runtime = PACKET_RUNTIME_MODES.get(selected);
+    if (!runtime) fail(`packet.modes[${index}] is not a supported packet runtime mode`);
+    return runtime;
+  }))].sort();
+}
+
 function statsContractFrom(repoRoot) {
   const contract = readJson(path.join(repoRoot, "benchmarks/release-evidence/repo-stats-contract.json"), "stats contract");
   if (contract.schema_version !== 1) fail("stats contract schema_version must be 1");
@@ -242,8 +255,8 @@ function validateRawProvenance(stats, packet, commit, profileName, identity, sta
     repeats.set(key, values);
   }
   if ([...repeats.values()].some((values) => values.size !== packetProvenance.repeats)) fail("raw packet rows do not exactly cover the declared repeat count");
-  const rowModes = [...new Set(rows.map((row) => row.mode))].sort();
-  if (JSON.stringify(rowModes) !== JSON.stringify([...packet.modes].sort())) fail("raw packet row modes do not match top-level modes");
+  const rowModes = [...new Set(rows.map((row, index) => text(row.mode, `packet row ${index} mode`)))].sort();
+  if (JSON.stringify(rowModes) !== JSON.stringify(packetRuntimeModes(packet.modes))) fail("raw packet row modes do not match top-level modes");
 }
 
 export function produceCandidate({ baselineDocument, baselineDir, profileName, statsPath, packetPath, outPath, expectedSha, mode, repoRoot }) {

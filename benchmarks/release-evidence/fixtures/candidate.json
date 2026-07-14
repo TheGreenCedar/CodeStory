@@ -18,8 +18,8 @@
     },
     "packet": {
       "path": "candidate-packet.json",
-      "sha256": "ff3bb834b3e473e2f099dbbf8a52651622039dddb60a2ce2b9b2e0bd40c21a0f",
-      "bytes": 4911
+      "sha256": "a541c576391fec8949a470c6de2920b8c9387fbdfcaad82cd42700dedae5956e",
+      "bytes": 4986
     }
   },
   "metrics": {
