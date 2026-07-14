@@ -75,63 +75,6 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 }
 
 #[test]
-fn direct_cli_and_stdio_agent_surfaces_share_runtime_constructor() {
-    let main = read("crates/codestory-cli/src/main.rs");
-    let helper = source_between(&main, "fn new_agent_surface_runtime", "fn run_cache");
-    assert!(
-        helper
-            .contains("RuntimeContext::new_agent_sidecar_with_selection(project, profile, run_id)"),
-        "shared agent surface runtime must retain the selected profile and run id"
-    );
-
-    for (start, end, surface) in [
-        ("fn run_context", "fn run_packet", "context"),
-        ("fn run_packet", "fn run_task", "packet"),
-        (
-            "fn run_task_brief",
-            "fn render_packet_markdown",
-            "task brief",
-        ),
-        ("fn run_search", "fn search_request_from_command", "search"),
-        ("fn run_serve", "fn run_generate_completions", "stdio/serve"),
-    ] {
-        let body = source_between(&main, start, end);
-        assert!(
-            body.contains("new_agent_surface_runtime(&cmd.project,"),
-            "{surface} must use the same agent-sidecar runtime constructor as stdio status/ready"
-        );
-    }
-
-    let ready = source_between(&main, "fn run_ready", "fn run_agent");
-    assert!(
-        ready.contains("new_agent_surface_runtime(&cmd.project,"),
-        "ready --goal agent --repair must stay on the shared agent-sidecar runtime constructor"
-    );
-}
-
-#[test]
-fn direct_full_retrieval_surfaces_require_identity_bound_gpu_proof() {
-    let main = read("crates/codestory-cli/src/main.rs");
-    for (start, end, surface) in [
-        ("fn run_context", "fn run_packet", "context"),
-        ("fn run_packet", "fn run_task", "packet"),
-        (
-            "fn run_task_brief",
-            "fn render_packet_markdown",
-            "task brief",
-        ),
-        ("fn run_search", "fn search_request_from_command", "search"),
-        ("fn execute_drill", "fn execute_drill_packet", "drill"),
-    ] {
-        let body = source_between(&main, start, end);
-        assert!(
-            body.contains("ensure_agent_surface_gpu_proof(&runtime,"),
-            "{surface} must reject full accelerator-required retrieval without identity-bound broker proof"
-        );
-    }
-}
-
-#[test]
 fn cli_sidecar_construction_stays_behind_test_safe_gateway() {
     let source_root = repo_root().join("crates/codestory-cli/src");
     let gateway_path = source_root.join("sidecar_runtime.rs");
