@@ -104,6 +104,9 @@
   rollback. The Codex worktree setup dispatcher now owns one version-checked,
   locked setup path for Windows, macOS, and Linux; the shell and PowerShell
   entrypoints are thin compatibility adapters.
+- Windows packaged upgrade proof now seeds rollback with a native executable
+  fixture, preserving direct-process verification after batch CLI overrides
+  became unsupported.
 - The packaged plugin now launches the CodeStory CLI directly without a shell
   and rejects Windows batch-file overrides. Managed CLI, model, and native
   backend downloads enforce declared byte limits while streaming and remove

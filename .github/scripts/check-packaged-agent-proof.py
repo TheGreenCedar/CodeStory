@@ -2463,12 +2463,46 @@ def plugin_stdio_handoff(
             f"could not derive release target from {archive.name}",
         )
         prior_dir = plugin_data / "codestory-cli" / prior_version
-        prior_bin = prior_dir / "bin" / ("codestory-cli.cmd" if os.name == "nt" else "codestory-cli")
+        prior_bin = prior_dir / "bin" / (
+            "codestory-cli.exe" if os.name == "nt" else "codestory-cli"
+        )
         prior_bin.parent.mkdir(parents=True)
         if os.name == "nt":
-            prior_bin.write_text(
-                f"@echo off\r\nif \"%1\"==\"--version\" (echo codestory-cli {prior_version}& exit /b 0)\r\nexit /b 90\r\n",
+            prior_source = prior_dir / "rollback-version.rs"
+            prior_source.write_text(
+                f'''fn main() {{
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.len() == 1 && args[0] == "--version" {{
+        println!("codestory-cli {prior_version}");
+        return;
+    }}
+    std::process::exit(90);
+}}
+''',
                 encoding="utf-8",
+            )
+            compiled = subprocess.run(
+                ["rustc", str(prior_source), "-o", str(prior_bin)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_secs,
+                check=False,
+            )
+            require(
+                compiled.returncode == 0 and prior_bin.is_file(),
+                "managed_plugin_convergence",
+                artifact,
+                f"could not compile native rollback fixture: {compiled.stderr}",
+            )
+            pe = prior_bin.read_bytes()
+            pe_offset = int.from_bytes(pe[0x3C:0x40], "little")
+            machine = int.from_bytes(pe[pe_offset + 4 : pe_offset + 6], "little")
+            require(
+                machine == {"windows-x64": 0x8664, "windows-arm64": 0xAA64}.get(target),
+                "managed_plugin_convergence",
+                artifact,
+                f"native rollback fixture machine 0x{machine:04x} did not match {target}",
             )
         else:
             prior_bin.write_text(
