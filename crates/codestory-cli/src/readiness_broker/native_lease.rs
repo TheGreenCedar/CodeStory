@@ -5,12 +5,13 @@ use std::time::{Duration, Instant};
 
 use super::machine_lock::{
     BrokerMachineResourceBusy, BrokerMachineResourceLock, BrokerMachineResourceLockAttempt,
-    NATIVE_EMBEDDING_RESOURCE, machine_lock_owner_state,
-    quarantine_machine_resource_lock_for_native_launch, read_machine_resource_lock_file,
+    BrokerMachineResourceReaperLock, NATIVE_EMBEDDING_RESOURCE, machine_lock_owner_state,
+    machine_resource_snapshot, quarantine_machine_resource_lock_for_native_launch,
+    read_machine_resource_lock_file, release_machine_resource_lock_for_native_launch_with_guard,
     release_owned_quarantined_machine_resource_lock,
     release_quarantined_machine_resource_lock_for_native_launch,
     reset_owned_quarantined_machine_resource_lock, transfer_machine_resource_lock_to_native_launch,
-    try_acquire_native_embedding_machine_resource_lock,
+    try_acquire_machine_resource_reaper_lock, try_acquire_native_embedding_machine_resource_lock,
 };
 use super::paths::machine_resource_lock_path;
 use super::types::{BrokerResourceSnapshot, BrokerScope};
@@ -23,6 +24,7 @@ pub(crate) enum BrokerNativeEmbeddingResourceLease {
     Reused {
         pid: u32,
         launch: Box<codestory_retrieval::EmbeddingLaunchMetadata>,
+        _handoff_guard: BrokerMachineResourceReaperLock,
     },
 }
 
@@ -258,14 +260,6 @@ pub(crate) fn cleanup_native_embedding_resource_lease_after_transfer_error_with_
         None,
         false,
     )
-}
-
-pub(crate) fn native_embedding_launch_from_sidecar_state_file(
-    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
-) -> Result<Option<codestory_retrieval::EmbeddingLaunchMetadata>> {
-    Ok(read_sidecar_state_file(sidecar)?
-        .filter(codestory_retrieval::SidecarStateFile::owns_embedding_launch)
-        .and_then(|state| native_embedding_launch_from_sidecar_state(&state).cloned()))
 }
 
 fn native_embedding_launch_from_sidecar_state(
@@ -541,6 +535,19 @@ pub(super) fn acquire_native_embedding_resource_lease_if_needed_with_validator(
                 if cleanup_quarantined_native_embedding_resource(&busy)? {
                     continue;
                 }
+                let Some(handoff_guard) = try_acquire_machine_resource_reaper_lock(resource)?
+                else {
+                    if Instant::now() >= deadline {
+                        return bail_native_embedding_busy(&busy);
+                    }
+                    std::thread::sleep(
+                        poll.min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    continue;
+                };
+                let busy = BrokerMachineResourceBusy {
+                    snapshot: machine_resource_snapshot(resource),
+                };
                 if let Some(launch) = reusable_native_embedding_resource_launch(
                     scope,
                     sidecar,
@@ -553,6 +560,7 @@ pub(super) fn acquire_native_embedding_resource_lease_if_needed_with_validator(
                     return Ok(Some(BrokerNativeEmbeddingResourceLease::Reused {
                         pid,
                         launch: Box::new(launch),
+                        _handoff_guard: handoff_guard,
                     }));
                 }
                 if Instant::now() >= deadline {
@@ -562,6 +570,41 @@ pub(super) fn acquire_native_embedding_resource_lease_if_needed_with_validator(
             }
         }
     }
+}
+
+pub(crate) fn sidecar_down_with_native_embedding_handoff(
+    cache_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> Result<()> {
+    let Some(state) = read_sidecar_state_file(sidecar)? else {
+        return codestory_retrieval::sidecar_down_for_runtime(sidecar);
+    };
+    let Some(launch) = state.embedding_launch.as_ref() else {
+        return codestory_retrieval::sidecar_down_for_runtime(sidecar);
+    };
+    let guard = try_acquire_machine_resource_reaper_lock(NATIVE_EMBEDDING_RESOURCE)?
+        .context("CodeStory repository search setup is finishing; retry shortly")?;
+    if state.owns_embedding_launch() {
+        let attachments = codestory_retrieval::attached_native_embedding_state_paths(
+            cache_root,
+            &sidecar.layout.state_file,
+            launch,
+        )?;
+        if !attachments.is_empty() {
+            bail!("CodeStory repository search is still in use by another project");
+        }
+    }
+    codestory_retrieval::sidecar_down_for_runtime(sidecar)?;
+    if state.owns_embedding_launch() {
+        if !release_machine_resource_lock_for_native_launch_with_guard(
+            NATIVE_EMBEDDING_RESOURCE,
+            launch,
+            &guard,
+        )? {
+            bail!("CodeStory repository search ownership changed during shutdown; retry shortly");
+        }
+    }
+    Ok(())
 }
 
 fn cleanup_quarantined_native_embedding_resource(busy: &BrokerMachineResourceBusy) -> Result<bool> {
@@ -678,7 +721,6 @@ fn reusable_native_embedding_resource_launch(
         |owner_scope, requested_runtime, launch| {
             reused_launch_matches_owner_and_requested_runtime(
                 owner_scope,
-                scope,
                 requested_runtime,
                 launch,
             )
@@ -832,43 +874,18 @@ fn adopt_reused_native_launch_endpoint(
     Ok(true)
 }
 
-fn reused_launch_matches_owner_and_requested_runtime(
+pub(super) fn reused_launch_matches_owner_and_requested_runtime(
     owner_scope: &BrokerScope,
-    requested_scope: &BrokerScope,
     requested_runtime: &codestory_retrieval::SidecarRuntimeConfig,
     launch: &codestory_retrieval::EmbeddingLaunchMetadata,
 ) -> Result<bool> {
-    let owner_profile = match owner_scope.profile.as_str() {
-        "local" => codestory_retrieval::SidecarProfile::Local,
-        "agent" => codestory_retrieval::SidecarProfile::Agent,
-        _ => return Ok(false),
-    };
-    let owner_root = std::path::Path::new(&owner_scope.workspace_root);
-    let owner_runtime = requested_runtime.with_profile_and_run_id(
-        Some(owner_root),
-        owner_profile,
-        owner_scope.run_id.as_deref(),
-    );
-    let Some(expected_owner) =
-        codestory_retrieval::expected_native_embedding_launch_metadata(owner_root, &owner_runtime)?
-    else {
-        return Ok(false);
-    };
-    if !same_native_launch_configuration(&expected_owner, launch, true) {
+    if !matches!(owner_scope.profile.as_str(), "local" | "agent") {
         return Ok(false);
     }
-    let Some(expected_requested) = codestory_retrieval::expected_native_embedding_launch_metadata(
-        std::path::Path::new(&requested_scope.workspace_root),
+    codestory_retrieval::native_embedding_launch_matches_runtime_for_reuse(
         requested_runtime,
-    )?
-    else {
-        return Ok(false);
-    };
-    Ok(same_native_launch_configuration(
-        &expected_requested,
         launch,
-        false,
-    ))
+    )
 }
 
 pub(super) fn same_native_launch_configuration(
@@ -883,6 +900,10 @@ pub(super) fn same_native_launch_configuration(
         && expected.launch_fingerprint_sha256 == actual.launch_fingerprint_sha256
         && expected.executable_path == actual.executable_path
         && expected.model_path == actual.model_path
+        && actual
+            .model_sha256
+            .as_ref()
+            .is_none_or(|digest| expected.model_sha256.as_ref() == Some(digest))
         && expected.requested_device == actual.requested_device
         && (!require_log_path
             || actual.log_path.is_none()

@@ -282,6 +282,7 @@ pub fn native_embedding_startup_cleanup_failure(
 struct NativeEmbeddingServerLaunch {
     executable: PathBuf,
     model_path: PathBuf,
+    model_sha256: Option<String>,
     args: Vec<String>,
     log_path: PathBuf,
 }
@@ -406,7 +407,13 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
         repair_qdrant_storage(&layout, &storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
     let launch_mode = crate::config::embedding_server_launch_mode_for_runtime(runtime)?;
     let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
-        .then(|| native_embedding_server_launch(repo_root, runtime))
+        .then(|| {
+            native_embedding_server_launch_for_bootstrap(
+                repo_root,
+                runtime,
+                reusable_native_embedding_launch.as_ref(),
+            )
+        })
         .transpose()?;
 
     let resolved_compose = if skip_compose {
@@ -1111,6 +1118,93 @@ fn native_embedding_server_launch(
     ))
 }
 
+fn native_embedding_server_launch_for_bootstrap(
+    repo_root: Option<&Path>,
+    runtime: &SidecarRuntimeConfig,
+    reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
+) -> Result<NativeEmbeddingServerLaunch> {
+    if let Some(reusable_launch) = reusable_launch {
+        return native_embedding_server_launch_from_verified_metadata(runtime, reusable_launch)
+            .context("restore verified native embedding launch contract for reuse");
+    }
+    native_embedding_server_launch(repo_root, runtime)
+}
+
+fn native_embedding_server_launch_from_verified_metadata(
+    runtime: &SidecarRuntimeConfig,
+    metadata: &crate::health::EmbeddingLaunchMetadata,
+) -> Result<NativeEmbeddingServerLaunch> {
+    let executable = metadata
+        .executable_path
+        .as_deref()
+        .map(PathBuf::from)
+        .context("verified native embedding launch is missing executable_path")?;
+    let model_path = metadata
+        .model_path
+        .as_deref()
+        .map(PathBuf::from)
+        .context("verified native embedding launch is missing model_path")?;
+    let mut launch = native_embedding_server_launch_from_paths(executable, model_path, runtime);
+    launch.model_sha256.clone_from(&metadata.model_sha256);
+    if !native_embedding_launch_matches_runtime_contract(runtime, metadata, &launch) {
+        bail!("verified native embedding launch does not match the requested runtime contract");
+    }
+    Ok(launch)
+}
+
+#[doc(hidden)]
+pub fn native_embedding_launch_matches_runtime_for_reuse(
+    runtime: &SidecarRuntimeConfig,
+    metadata: &crate::health::EmbeddingLaunchMetadata,
+) -> Result<bool> {
+    if crate::config::embedding_server_launch_mode_for_runtime(runtime)?
+        != EmbeddingServerLaunchMode::NativeSpawned
+    {
+        return Ok(false);
+    }
+    let Some(executable) = metadata.executable_path.as_deref().map(PathBuf::from) else {
+        return Ok(false);
+    };
+    let Some(model_path) = metadata.model_path.as_deref().map(PathBuf::from) else {
+        return Ok(false);
+    };
+    let mut launch = native_embedding_server_launch_from_paths(executable, model_path, runtime);
+    if metadata.model_sha256.is_none() {
+        launch.model_sha256 = None;
+    }
+    Ok(native_embedding_launch_matches_runtime_contract(
+        runtime, metadata, &launch,
+    ))
+}
+
+#[doc(hidden)]
+pub fn native_embedding_launch_contract_from_paths(
+    executable: PathBuf,
+    model_path: PathBuf,
+    runtime: &SidecarRuntimeConfig,
+) -> crate::health::EmbeddingLaunchMetadata {
+    let launch = native_embedding_server_launch_from_paths(executable, model_path, runtime);
+    embedding_launch_metadata(&launch, runtime, None, None)
+}
+
+fn native_embedding_launch_matches_runtime_contract(
+    runtime: &SidecarRuntimeConfig,
+    metadata: &crate::health::EmbeddingLaunchMetadata,
+    launch: &NativeEmbeddingServerLaunch,
+) -> bool {
+    metadata.provider == "llamacpp"
+        && metadata.launch_mode == EmbeddingServerLaunchMode::NativeSpawned.as_str()
+        && metadata.endpoint == runtime.embedding.endpoint
+        && metadata.launch_args == launch.args
+        && metadata.launch_fingerprint_sha256.as_deref()
+            == Some(native_embedding_launch_fingerprint(launch).as_str())
+        && metadata.executable_path.as_deref() == Some(launch.executable.to_string_lossy().as_ref())
+        && metadata.model_path.as_deref() == Some(launch.model_path.to_string_lossy().as_ref())
+        && metadata.model_sha256 == launch.model_sha256
+        && metadata.requested_device
+            == crate::embeddings::embedding_accelerator_request().and_then(|request| request.device)
+}
+
 pub fn expected_native_embedding_launch_metadata(
     repo_root: &Path,
     runtime: &SidecarRuntimeConfig,
@@ -1147,6 +1241,7 @@ fn native_embedding_server_launch_from_paths(
     }
     NativeEmbeddingServerLaunch {
         executable,
+        model_sha256: sha256_file(&model_path).ok(),
         model_path,
         args,
         log_path: crate::embeddings::native_embedding_log_path(runtime),
@@ -1234,6 +1329,7 @@ fn embedding_launch_metadata(
         )),
         executable_path: Some(native_launch.executable.display().to_string()),
         model_path: Some(native_launch.model_path.display().to_string()),
+        model_sha256: native_launch.model_sha256.clone(),
         log_path: Some(native_launch.log_path.display().to_string()),
         requested_device: crate::embeddings::embedding_accelerator_request()
             .and_then(|request| request.device),
@@ -2235,6 +2331,10 @@ fn reusable_native_embedding_spawn_from_metadata_with_identity(
     if metadata.launch_mode != EmbeddingServerLaunchMode::NativeSpawned.as_str()
         || metadata.endpoint != runtime.embedding.endpoint
         || metadata.launch_fingerprint_sha256.as_deref() != Some(launch_fingerprint.as_str())
+        || metadata
+            .model_sha256
+            .as_ref()
+            .is_some_and(|digest| launch.model_sha256.as_ref() != Some(digest))
     {
         return Ok(None);
     }
@@ -3850,6 +3950,51 @@ mod tests {
         assert_eq!(spawn.pid, 4321);
         assert_eq!(spawn.spawned_at_epoch_ms, 123);
         assert!(validator_called);
+    }
+
+    #[test]
+    fn native_embedding_reuse_bootstraps_from_owner_contract_without_borrower_model() {
+        let _lock = crate::test_support::env_lock();
+        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+
+        let owner = tempdir().expect("owner");
+        let borrower = tempdir().expect("borrower");
+        let executable = owner.path().join("llama-server");
+        let model = owner.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+        std::fs::write(&executable, b"owner executable").expect("owner executable");
+        std::fs::write(&model, b"owner model").expect("owner model");
+        let owner_runtime = compose_test_runtime(owner.path());
+        let mut borrower_runtime = compose_test_runtime(borrower.path());
+        borrower_runtime
+            .use_broker_verified_native_embedding_endpoint(
+                owner_runtime.ownership().ports.embed_http,
+            )
+            .expect("reuse owner endpoint");
+        let owner_contract = native_embedding_launch_contract_from_paths(
+            executable.clone(),
+            model.clone(),
+            &owner_runtime,
+        );
+        assert!(owner_contract.model_sha256.is_some());
+
+        let selected = native_embedding_server_launch_for_bootstrap(
+            Some(borrower.path()),
+            &borrower_runtime,
+            Some(&owner_contract),
+        )
+        .expect("select verified owner launch");
+
+        assert_eq!(selected.executable, executable);
+        assert_eq!(selected.model_path, model);
+        assert_eq!(selected.model_sha256, owner_contract.model_sha256);
+        assert!(
+            !borrower
+                .path()
+                .join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
+                .exists(),
+            "bootstrap must not require a borrower model copy"
+        );
     }
 
     #[test]

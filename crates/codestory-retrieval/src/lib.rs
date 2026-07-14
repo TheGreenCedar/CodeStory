@@ -52,6 +52,7 @@ pub use compose::{
     bootstrap_sidecars_with_runtime, bootstrap_sidecars_with_runtime_progress,
     bootstrap_sidecars_with_runtime_progress_and_native_launch_observer, docker_available,
     embed_model_inventory, expected_native_embedding_launch_metadata,
+    native_embedding_launch_contract_from_paths, native_embedding_launch_matches_runtime_for_reuse,
     native_embedding_startup_cleanup_failure, resolve_compose_file,
 };
 pub use config::{
@@ -132,7 +133,8 @@ pub use retention::{
 pub use scip_client::ScipClient;
 pub use sidecar::{
     EmbeddingLaunchOwnership, NativeEmbeddingLaunchIdentityStatus, SidecarStateFile,
-    ensure_native_embedding_launch_identity, native_embedding_launch_identity_status, sidecar_down,
+    attached_native_embedding_state_paths, ensure_native_embedding_launch_identity,
+    native_embedding_launch_identity_status, sidecar_down,
     sidecar_down_after_failed_bootstrap_for_runtime, sidecar_down_for_project,
     sidecar_down_for_runtime, sidecar_state_matches_runtime, sidecar_status, sidecar_up,
     sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch,

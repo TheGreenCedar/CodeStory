@@ -5,8 +5,8 @@ use std::time::Duration;
 use codestory_retrieval::{
     BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
     RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarProfile, SidecarRuntimeConfig, sidecar_down_for_runtime,
-    sidecar_up_with_runtime_preserving_launch, strict_sidecar_status_for_runtime,
+    SidecarProfile, SidecarRuntimeConfig, sidecar_up_with_runtime_preserving_launch,
+    strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
@@ -138,16 +138,11 @@ fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
-    let native_embedding_launch =
-        crate::readiness_broker::native_embedding_launch_from_sidecar_state_file(&sidecar)?;
-    sidecar_down_for_runtime(&sidecar).context("retrieval down")?;
-    if let Some(launch) = native_embedding_launch.as_ref() {
-        crate::readiness_broker::release_machine_resource_lock_for_native_launch(
-            crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
-            launch,
-        )
-        .context("release native embedding broker lock")?;
-    }
+    crate::readiness_broker::sidecar_down_with_native_embedding_handoff(
+        &runtime.cache_root,
+        &sidecar,
+    )
+    .context("retrieval down")?;
     println!("retrieval sidecar state cleared");
     Ok(())
 }

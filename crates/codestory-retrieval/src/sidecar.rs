@@ -28,7 +28,7 @@ use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
@@ -159,6 +159,56 @@ impl SidecarStateFile {
         self.embedding_launch.is_some()
             && self.embedding_launch_ownership == EmbeddingLaunchOwnership::Owner
     }
+}
+
+pub fn attached_native_embedding_state_paths(
+    cache_root: &Path,
+    owner_state_file: &Path,
+    launch: &EmbeddingLaunchMetadata,
+) -> Result<Vec<PathBuf>> {
+    let mut candidates = vec![cache_root.join(crate::config::SIDECAR_STATE_FILE_V3)];
+    let agent_root = cache_root.join("sidecars");
+    match std::fs::read_dir(&agent_root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("read {} entry", agent_root.display()))?;
+                if entry
+                    .file_type()
+                    .with_context(|| format!("inspect {}", entry.path().display()))?
+                    .is_dir()
+                {
+                    candidates.push(entry.path().join(crate::config::SIDECAR_STATE_FILE_V3));
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", agent_root.display()));
+        }
+    }
+    let mut attachments = Vec::new();
+    for path in candidates {
+        if codestory_workspace::same_workspace_path(&path, owner_state_file) {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", path.display()));
+            }
+        };
+        let state = serde_json::from_str::<SidecarStateFile>(&raw)
+            .with_context(|| format!("parse {}", path.display()))?;
+        if state.owner == "codestory"
+            && state.embedding_launch_ownership == EmbeddingLaunchOwnership::Attached
+            && state.embedding_launch.as_ref() == Some(launch)
+        {
+            attachments.push(path);
+        }
+    }
+    Ok(attachments)
 }
 
 pub fn sidecar_up() -> Result<SidecarStateFile> {
@@ -1722,6 +1772,7 @@ mod tests {
             executable_source: Some("managed_cache".to_string()),
             executable_path: Some("C:/cache/llama-server".to_string()),
             model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
+            model_sha256: None,
             log_path: Some("C:/cache/llama-server-native.log".to_string()),
             requested_device: None,
         };
@@ -2078,6 +2129,7 @@ mod tests {
             executable_source: Some("managed_cache".to_string()),
             executable_path: Some(executable),
             model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
+            model_sha256: None,
             log_path: Some("C:/cache/llama-server-native.log".to_string()),
             requested_device: None,
         }
