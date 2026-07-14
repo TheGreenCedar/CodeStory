@@ -279,12 +279,22 @@ mod tests {
     fn snapshot_store_can_prepare_and_promote_staged_publish() {
         let temp = fresh_temp_root("promote");
         let live_path = temp.join("live.sqlite");
-        let staged = SnapshotStore::open_staged(&live_path).expect("open staged");
+        let mut staged = SnapshotStore::open_staged(&live_path).expect("open staged");
 
         staged
             .snapshots()
             .finalize_staged()
             .expect("prepare staged publish");
+        staged
+            .store_mut()
+            .put_index_publication(&crate::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "prepared-generation".to_string(),
+                run_id: "prepared-run".to_string(),
+                mode: crate::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("identify staged publication");
         staged.publish(&live_path).expect("promote staged snapshot");
 
         let live = Store::open(&live_path).expect("open live store");
