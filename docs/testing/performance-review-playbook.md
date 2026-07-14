@@ -240,6 +240,26 @@ cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignore
 Appending those rows is never a release decision. Assemble the candidate
 artifact and run the release evidence gate after the raw producers complete.
 
+### SQLite lexical validation baseline
+
+The ignored lexical benchmark separates deep corpus validation from warm query
+execution. On 2026-07-14, the macOS arm64 debug test binary reported:
+
+| Documents | Deep validation median | SQLite warm query median | Legacy JSONL query median |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 3,292 us | 1,497 us | 2,447 us |
+| 10,000 | 31,193 us | 3,838 us | 24,447 us |
+
+Command:
+
+```sh
+cargo test -p codestory-retrieval --lib --locked report_jsonl_to_sqlite_corpus_and_query_delta -- --ignored --nocapture
+```
+
+These numbers are diagnostic, not unit-test thresholds. Query tests instead
+prove that the hot path performs only immutable metadata validation; build,
+publication, readiness, and explicit health checks own deep row validation.
+
 ## Parallelization Candidate Gate
 
 Parallel or async work is allowed only after the baseline shows the exact path
