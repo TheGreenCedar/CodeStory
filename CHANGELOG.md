@@ -20,6 +20,9 @@
   and retain credentials and VM state until remote deletion is confirmed. The
   evidence profile no longer becomes the host's active Docker context, and
   lifecycle and workflow preflights reject competing containers in its VM.
+- Added a Windows-x64-only promoted proof scope so coordinator runs can produce
+  the Vulkan package without starting Mac source, signing, notarization, or
+  Metal jobs.
 - Reduced the packaged macOS proof to one check per release boundary. The
   protected run still covers managed Metal cold/warm/recovery, exact process
   reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned
