@@ -1,6 +1,6 @@
 use super::FrameworkRoute;
 use anyhow::{Result, anyhow};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Node, Point, Query, QueryCursor, Tree};
@@ -70,10 +70,64 @@ struct FastApiBindings {
     receivers: HashSet<String>,
 }
 
-pub(super) fn collect_python_fastapi_routes(
+#[derive(Clone, Copy)]
+struct ReceiverOwnershipWrite {
+    statement_start_byte: usize,
+    owned: bool,
+}
+
+#[derive(Default)]
+struct ReceiverOwnershipTimeline {
+    writes: HashMap<String, Vec<ReceiverOwnershipWrite>>,
+}
+
+impl ReceiverOwnershipTimeline {
+    fn record_statement(
+        &mut self,
+        statement_start_byte: usize,
+        before: &HashSet<String>,
+        after: &HashSet<String>,
+    ) {
+        for receiver in before.symmetric_difference(after) {
+            self.writes
+                .entry(receiver.clone())
+                .or_default()
+                .push(ReceiverOwnershipWrite {
+                    statement_start_byte,
+                    owned: after.contains(receiver),
+                });
+        }
+    }
+
+    fn owns_at(&self, receiver: &str, before_byte: usize) -> bool {
+        let Some(writes) = self.writes.get(receiver) else {
+            return false;
+        };
+        let index = writes.partition_point(|write| write.statement_start_byte < before_byte);
+        index > 0 && writes[index - 1].owned
+    }
+}
+
+#[derive(Default)]
+pub(super) struct JavaScriptFrameworkTimeline {
+    express: ReceiverOwnershipTimeline,
+    fastify: ReceiverOwnershipTimeline,
+    #[cfg(test)]
+    statement_visits: usize,
+}
+
+#[derive(Default)]
+pub(super) struct FastApiBindingTimeline {
+    receivers: ReceiverOwnershipTimeline,
+    #[cfg(test)]
+    statement_visits: usize,
+}
+
+pub(super) fn collect_python_fastapi_routes_with_timeline(
     language: &Language,
     tree: &Tree,
     source: &str,
+    timeline: &FastApiBindingTimeline,
 ) -> Result<Vec<FrameworkRoute>> {
     let query = PYTHON_FASTAPI_COMPILED_QUERY
         .get_or_init(|| {
@@ -147,7 +201,7 @@ pub(super) fn collect_python_fastapi_routes(
             line,
             "decorator",
         );
-        if module_fastapi_receiver_owned_at(tree, source, &receiver, route_start_byte) {
+        if timeline.receivers.owns_at(&receiver, route_start_byte) {
             routes.push(route.with_claim_evidence("tree_sitter_query", "parser_backed"));
         }
     }
@@ -155,11 +209,12 @@ pub(super) fn collect_python_fastapi_routes(
     Ok(routes)
 }
 
-pub(super) fn collect_javascript_express_routes(
+pub(super) fn collect_javascript_express_routes_with_timeline(
     language: &Language,
     dialect: JavaScriptDialect,
     tree: &Tree,
     source: &str,
+    timeline: &JavaScriptFrameworkTimeline,
 ) -> Result<Vec<FrameworkRoute>> {
     let cache = match dialect {
         JavaScriptDialect::JavaScript => &JAVASCRIPT_EXPRESS_COMPILED_QUERY,
@@ -210,7 +265,7 @@ pub(super) fn collect_javascript_express_routes(
             method.as_str(),
             "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
         ) || !javascript_route_is_module_statement(route_node)
-            || !module_express_receiver_owned_at(tree, source, &receiver, route_node.start_byte())
+            || !timeline.express.owns_at(&receiver, route_node.start_byte())
         {
             continue;
         }
@@ -247,11 +302,12 @@ pub(super) fn collect_javascript_express_routes(
     Ok(routes)
 }
 
-pub(super) fn collect_javascript_fastify_routes(
+pub(super) fn collect_javascript_fastify_routes_with_timeline(
     language: &Language,
     dialect: JavaScriptDialect,
     tree: &Tree,
     source: &str,
+    timeline: &JavaScriptFrameworkTimeline,
 ) -> Result<Vec<FrameworkRoute>> {
     let cache = match dialect {
         JavaScriptDialect::JavaScript => &JAVASCRIPT_EXPRESS_COMPILED_QUERY,
@@ -300,7 +356,7 @@ pub(super) fn collect_javascript_fastify_routes(
         };
         if route_node.has_error()
             || !javascript_route_is_module_statement(route_node)
-            || !module_fastify_receiver_owned_at(tree, source, &receiver, route_node.start_byte())
+            || !timeline.fastify.owns_at(&receiver, route_node.start_byte())
         {
             continue;
         }
@@ -430,6 +486,7 @@ pub(super) fn allow_javascript_express_lexical_fallback(
     tree: &Tree,
     source: &str,
     route: &FrameworkRoute,
+    timeline: &JavaScriptFrameworkTimeline,
 ) -> bool {
     let Some(line) = source.lines().nth(route.line.saturating_sub(1) as usize) else {
         return false;
@@ -444,18 +501,16 @@ pub(super) fn allow_javascript_express_lexical_fallback(
     syntax_error_near_line(tree.root_node(), route.line)
         && javascript_line_is_module_scope(tree, line, route.line)
         && javascript_byte_is_code(source, source_byte_at_line(source, route.line))
-        && module_express_receiver_owned_at(
-            tree,
-            source,
-            receiver,
-            source_byte_at_line(source, route.line),
-        )
+        && timeline
+            .express
+            .owns_at(receiver, source_byte_at_line(source, route.line))
 }
 
 pub(super) fn allow_javascript_fastify_lexical_fallback(
     tree: &Tree,
     source: &str,
     route: &FrameworkRoute,
+    timeline: &JavaScriptFrameworkTimeline,
 ) -> bool {
     if !is_fastify_route_method(&route.method.to_ascii_lowercase()) {
         return false;
@@ -498,12 +553,9 @@ pub(super) fn allow_javascript_fastify_lexical_fallback(
         && syntax_error_near_line(tree.root_node(), route.line)
         && javascript_line_is_module_scope(tree, line, route.line)
         && javascript_byte_is_code(source, source_byte_at_line(source, route.line))
-        && module_fastify_receiver_owned_at(
-            tree,
-            source,
-            receiver,
-            source_byte_at_line(source, route.line),
-        )
+        && timeline
+            .fastify
+            .owns_at(receiver, source_byte_at_line(source, route.line))
 }
 
 fn javascript_fallback_static_string_remainder<'a>(
@@ -849,53 +901,47 @@ fn javascript_static_string(node: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-fn module_express_receiver_owned_at(
+pub(super) fn build_javascript_framework_timeline(
     tree: &Tree,
     source: &str,
-    receiver: &str,
-    before_byte: usize,
-) -> bool {
-    module_javascript_receiver_owned_at(
-        tree,
-        source,
-        receiver,
-        before_byte,
-        JavaScriptServerFramework::Express,
-    )
-}
-
-fn module_fastify_receiver_owned_at(
-    tree: &Tree,
-    source: &str,
-    receiver: &str,
-    before_byte: usize,
-) -> bool {
-    module_javascript_receiver_owned_at(
-        tree,
-        source,
-        receiver,
-        before_byte,
-        JavaScriptServerFramework::Fastify,
-    )
-}
-
-fn module_javascript_receiver_owned_at(
-    tree: &Tree,
-    source: &str,
-    receiver: &str,
-    before_byte: usize,
-    framework: JavaScriptServerFramework,
-) -> bool {
-    let mut bindings = JavaScriptFrameworkBindings::default();
+) -> JavaScriptFrameworkTimeline {
+    let mut timeline = JavaScriptFrameworkTimeline::default();
+    let mut express = JavaScriptFrameworkBindings::default();
+    let mut fastify = JavaScriptFrameworkBindings::default();
     let root = tree.root_node();
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
-        if statement.start_byte() >= before_byte {
-            break;
+        #[cfg(test)]
+        {
+            timeline.statement_visits += 1;
         }
-        apply_javascript_module_statement(statement, source, framework, &mut bindings);
+        let express_before = express.receivers.clone();
+        apply_javascript_module_statement(
+            statement,
+            source,
+            JavaScriptServerFramework::Express,
+            &mut express,
+        );
+        timeline.express.record_statement(
+            statement.start_byte(),
+            &express_before,
+            &express.receivers,
+        );
+
+        let fastify_before = fastify.receivers.clone();
+        apply_javascript_module_statement(
+            statement,
+            source,
+            JavaScriptServerFramework::Fastify,
+            &mut fastify,
+        );
+        timeline.fastify.record_statement(
+            statement.start_byte(),
+            &fastify_before,
+            &fastify.receivers,
+        );
     }
-    bindings.receivers.contains(receiver)
+    timeline
 }
 
 fn apply_javascript_module_statement(
@@ -1392,6 +1438,7 @@ pub(super) fn allow_python_fastapi_lexical_fallback(
     tree: &Tree,
     source: &str,
     route: &FrameworkRoute,
+    timeline: &FastApiBindingTimeline,
 ) -> bool {
     let Some(line) = source.lines().nth(route.line.saturating_sub(1) as usize) else {
         return false;
@@ -1407,12 +1454,9 @@ pub(super) fn allow_python_fastapi_lexical_fallback(
     let direct_static = raw || argument.starts_with('"') || argument.starts_with('\'');
     direct_static
         && (raw || !route.raw_path.contains('\\'))
-        && module_fastapi_receiver_owned_at(
-            tree,
-            source,
-            receiver,
-            source_byte_at_line(source, route.line),
-        )
+        && timeline
+            .receivers
+            .owns_at(receiver, source_byte_at_line(source, route.line))
         && syntax_error_near_line(tree.root_node(), route.line)
         && line_is_module_scope(tree, line, route.line)
         && !line_is_inside_python_string_or_comment(tree, line, route.line)
@@ -1427,41 +1471,18 @@ fn apply_fastapi_import(node: Node<'_>, source: &str, bindings: &mut FastApiBind
             if module
                 .as_deref()
                 .is_some_and(|module| module == "fastapi" || module.starts_with("fastapi."))
-                && let Some(statement) = node_text(node, source)
-                && let Some((_, imported)) = statement.rsplit_once(" import ")
             {
-                for spec in imported
-                    .trim_matches(|ch: char| ch == '(' || ch == ')' || ch.is_whitespace())
-                    .split(',')
-                {
-                    let mut parts = spec.split_whitespace();
-                    let Some(name) = parts.next() else {
-                        continue;
-                    };
-                    let alias = match (parts.next(), parts.next()) {
-                        (Some("as"), Some(alias)) => alias,
-                        _ => name,
-                    };
-                    if matches!(name, "FastAPI" | "APIRouter") {
-                        bindings.constructors.insert(alias.to_string());
+                for (imported, local) in python_import_bindings(node, source) {
+                    if matches!(imported.as_str(), "FastAPI" | "APIRouter") {
+                        bindings.constructors.insert(local);
                     }
                 }
             }
         }
         "import_statement" => {
-            if let Some(statement) = node_text(node, source)
-                && let Some(imported) = statement.strip_prefix("import ")
-            {
-                for spec in imported.split(',') {
-                    let mut parts = spec.split_whitespace();
-                    if parts.next() != Some("fastapi") {
-                        continue;
-                    }
-                    let alias = match (parts.next(), parts.next()) {
-                        (Some("as"), Some(alias)) => alias,
-                        _ => "fastapi",
-                    };
-                    bindings.modules.insert(alias.to_string());
+            for (imported, local) in python_import_bindings(node, source) {
+                if imported == "fastapi" {
+                    bindings.modules.insert(local);
                 }
             }
         }
@@ -1469,27 +1490,28 @@ fn apply_fastapi_import(node: Node<'_>, source: &str, bindings: &mut FastApiBind
     }
 }
 
-fn module_fastapi_receiver_owned_at(
-    tree: &Tree,
-    source: &str,
-    receiver: &str,
-    before_byte: usize,
-) -> bool {
+pub(super) fn build_fastapi_binding_timeline(tree: &Tree, source: &str) -> FastApiBindingTimeline {
+    let mut timeline = FastApiBindingTimeline::default();
     let mut bindings = FastApiBindings::default();
     let root = tree.root_node();
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
-        if statement.start_byte() >= before_byte {
-            break;
+        #[cfg(test)]
+        {
+            timeline.statement_visits += 1;
         }
+        let before = bindings.receivers.clone();
         if let Some(assignment) = module_assignment(statement) {
             apply_fastapi_assignment(assignment, source, &mut bindings);
         } else {
             invalidate_module_statement_bindings(statement, source, &mut bindings);
             apply_fastapi_import(statement, source, &mut bindings);
         }
+        timeline
+            .receivers
+            .record_statement(statement.start_byte(), &before, &bindings.receivers);
     }
-    bindings.receivers.contains(receiver)
+    timeline
 }
 
 fn invalidate_module_statement_bindings(
@@ -1497,7 +1519,7 @@ fn invalidate_module_statement_bindings(
     source: &str,
     bindings: &mut FastApiBindings,
 ) {
-    if node_is_star_import(statement, source) {
+    if node_is_star_import(statement) {
         bindings.receivers.clear();
         bindings.constructors.clear();
         bindings.modules.clear();
@@ -1512,13 +1534,49 @@ fn invalidate_module_statement_bindings(
     }
 }
 
-fn node_is_star_import(node: Node<'_>, source: &str) -> bool {
+fn node_is_star_import(node: Node<'_>) -> bool {
     node.kind() == "import_from_statement"
-        && node_text(node, source).is_some_and(|statement| {
-            statement
-                .rsplit_once(" import ")
-                .is_some_and(|(_, imported)| imported.trim() == "*")
-        })
+        && node
+            .named_children(&mut node.walk())
+            .any(|child| child.kind() == "wildcard_import")
+}
+
+fn python_import_bindings(node: Node<'_>, source: &str) -> Vec<(String, String)> {
+    let direct_import = node.kind() == "import_statement";
+    let module_node = node.child_by_field_name("module_name");
+    let mut bindings = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if module_node.is_some_and(|module| module.id() == child.id()) {
+            continue;
+        }
+        let binding = match child.kind() {
+            "aliased_import" => {
+                let imported = child
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(name, source));
+                let local = child
+                    .child_by_field_name("alias")
+                    .and_then(|alias| node_text(alias, source));
+                imported.zip(local)
+            }
+            "dotted_name" => node_text(child, source).map(|imported| {
+                let local = if direct_import {
+                    imported
+                        .split_once('.')
+                        .map_or_else(|| imported.clone(), |(root, _)| root.to_string())
+                } else {
+                    imported.clone()
+                };
+                (imported, local)
+            }),
+            _ => None,
+        };
+        if let Some(binding) = binding {
+            bindings.push(binding);
+        }
+    }
+    bindings
 }
 
 fn collect_module_bound_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
@@ -1599,49 +1657,19 @@ fn collect_python_binding_target(node: Node<'_>, source: &str, names: &mut HashS
 }
 
 fn collect_import_from_bound_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
-    let Some(statement) = node_text(node, source) else {
-        return;
-    };
-    let Some((_, imported)) = statement.rsplit_once(" import ") else {
-        return;
-    };
-    for spec in imported
-        .trim_matches(|ch: char| ch == '(' || ch == ')' || ch.is_whitespace())
-        .split(',')
-    {
-        let mut parts = spec.split_whitespace();
-        let Some(imported_name) = parts.next() else {
-            continue;
-        };
-        if imported_name == "*" {
-            continue;
-        }
-        let bound = match (parts.next(), parts.next()) {
-            (Some("as"), Some(alias)) => alias,
-            _ => imported_name,
-        };
-        names.insert(bound.to_string());
-    }
+    names.extend(
+        python_import_bindings(node, source)
+            .into_iter()
+            .map(|(_, local)| local),
+    );
 }
 
 fn collect_import_bound_names(node: Node<'_>, source: &str, names: &mut HashSet<String>) {
-    let Some(statement) = node_text(node, source) else {
-        return;
-    };
-    let Some(imported) = statement.strip_prefix("import ") else {
-        return;
-    };
-    for spec in imported.split(',') {
-        let mut parts = spec.split_whitespace();
-        let Some(module) = parts.next() else {
-            continue;
-        };
-        let bound = match (parts.next(), parts.next()) {
-            (Some("as"), Some(alias)) => alias,
-            _ => module.split('.').next().unwrap_or(module),
-        };
-        names.insert(bound.to_string());
-    }
+    names.extend(
+        python_import_bindings(node, source)
+            .into_iter()
+            .map(|(_, local)| local),
+    );
 }
 
 fn module_assignment(node: Node<'_>) -> Option<Node<'_>> {
@@ -1842,6 +1870,142 @@ mod tests {
         parser.parse(source, None).expect("javascript tree")
     }
 
+    fn collect_python_fastapi_routes(
+        language: &Language,
+        tree: &Tree,
+        source: &str,
+    ) -> Result<Vec<FrameworkRoute>> {
+        let timeline = build_fastapi_binding_timeline(tree, source);
+        collect_python_fastapi_routes_with_timeline(language, tree, source, &timeline)
+    }
+
+    fn collect_javascript_express_routes(
+        language: &Language,
+        dialect: JavaScriptDialect,
+        tree: &Tree,
+        source: &str,
+    ) -> Result<Vec<FrameworkRoute>> {
+        let timeline = build_javascript_framework_timeline(tree, source);
+        collect_javascript_express_routes_with_timeline(language, dialect, tree, source, &timeline)
+    }
+
+    fn collect_javascript_fastify_routes(
+        language: &Language,
+        dialect: JavaScriptDialect,
+        tree: &Tree,
+        source: &str,
+    ) -> Result<Vec<FrameworkRoute>> {
+        let timeline = build_javascript_framework_timeline(tree, source);
+        collect_javascript_fastify_routes_with_timeline(language, dialect, tree, source, &timeline)
+    }
+
+    #[test]
+    fn test_shared_javascript_timeline_visits_module_statements_once() -> Result<()> {
+        let source = r#"
+import express from "express";
+import Fastify from "fastify";
+const app = express();
+const api = Fastify();
+app.get("/express", expressHandler);
+api.get("/fastify", fastifyHandler);
+app = otherFramework();
+api = otherFramework();
+app.get("/shadowed-express", expressHandler);
+api.get("/shadowed-fastify", fastifyHandler);
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let timeline = build_javascript_framework_timeline(&tree, source);
+        assert_eq!(
+            timeline.statement_visits,
+            tree.root_node().named_child_count(),
+            "the shared timeline must visit each module statement exactly once"
+        );
+
+        let express = collect_javascript_express_routes_with_timeline(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+            &timeline,
+        )?;
+        let fastify = collect_javascript_fastify_routes_with_timeline(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+            &timeline,
+        )?;
+        assert_eq!(
+            express
+                .iter()
+                .map(|route| route.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/express"]
+        );
+        assert_eq!(
+            fastify
+                .iter()
+                .map(|route| route.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/fastify"]
+        );
+        assert_eq!(
+            timeline.statement_visits,
+            tree.root_node().named_child_count()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fastapi_timeline_parses_multiline_aliases_and_shadowing_from_nodes() -> Result<()> {
+        let source = r#"
+from fastapi import (
+    FastAPI as BuildApi,  # application factory
+    APIRouter as BuildRouter,
+)
+import fastapi as api_module
+
+app = BuildApi()
+router = BuildRouter()
+module_app = api_module.FastAPI()
+
+@app.get("/app")
+async def app_route(): pass
+
+@router.post("/router")
+async def router_route(): pass
+
+@module_app.put("/module")
+async def module_route(): pass
+
+BuildRouter = OtherRouter
+shadowed = BuildRouter()
+@shadowed.get("/shadowed")
+async def shadowed_route(): pass
+"#;
+        let tree = parse_python(source);
+        let timeline = build_fastapi_binding_timeline(&tree, source);
+        assert_eq!(
+            timeline.statement_visits,
+            tree.root_node().named_child_count()
+        );
+        let routes = collect_python_fastapi_routes_with_timeline(
+            &tree_sitter_python::LANGUAGE.into(),
+            &tree,
+            source,
+            &timeline,
+        )?;
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (route.method.as_str(), route.path.as_str()))
+                .collect::<HashSet<_>>(),
+            HashSet::from([("GET", "/app"), ("POST", "/router"), ("PUT", "/module")])
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_express_query_fixture_matrix_and_line_scan_comparison() -> Result<()> {
         let source = r#"
@@ -1920,36 +2084,6 @@ app.head("/string-only", documented);
             None,
             "nested handlers must not become name-based handler claims"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn test_express_query_uses_separate_javascript_typescript_and_tsx_grammars() -> Result<()> {
-        let cases = [
-            (
-                tree_sitter_javascript::LANGUAGE.into(),
-                JavaScriptDialect::JavaScript,
-            ),
-            (
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                JavaScriptDialect::TypeScript,
-            ),
-            (
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
-                JavaScriptDialect::Tsx,
-            ),
-        ];
-        for (language, dialect) in cases {
-            let source = r#"
-import express from "express";
-const app = express();
-app.get("/health", health);
-"#;
-            let tree = parse_javascript(&language, source);
-            let routes = collect_javascript_express_routes(&language, dialect, &tree, source)?;
-            assert_eq!(routes.len(), 1);
-            assert_eq!(routes[0].path, "/health");
-        }
         Ok(())
     }
 
@@ -2092,26 +2226,6 @@ app.get("/after-property-write", handler);
         )?;
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].path, "/after-property-write");
-        Ok(())
-    }
-
-    #[test]
-    fn test_express_declarator_initializer_write_invalidates_receiver() -> Result<()> {
-        let source = r#"
-import express from "express";
-const app = express();
-const assignmentResult = (app = otherFramework());
-app.get("/reassigned-in-initializer", handler);
-"#;
-        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        let tree = parse_javascript(&language, source);
-        let routes = collect_javascript_express_routes(
-            &language,
-            JavaScriptDialect::TypeScript,
-            &tree,
-            source,
-        )?;
-        assert!(routes.is_empty());
         Ok(())
     }
 
@@ -2262,29 +2376,6 @@ app.get("/commented-typeof-default", handler);
             )?;
             assert!(routes.is_empty());
         }
-        Ok(())
-    }
-
-    #[test]
-    fn test_express_named_import_invalidates_only_local_alias() -> Result<()> {
-        let source = r#"
-import express from "express";
-const app = express();
-import { app as externalApp } from "./external.js";
-app.get("/still-owned", handler);
-externalApp.get("/external", externalHandler);
-"#;
-        let language: Language = tree_sitter_javascript::LANGUAGE.into();
-        let tree = parse_javascript(&language, source);
-        assert!(!tree.root_node().has_error());
-        let routes = collect_javascript_express_routes(
-            &language,
-            JavaScriptDialect::JavaScript,
-            &tree,
-            source,
-        )?;
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].path, "/still-owned");
         Ok(())
     }
 
@@ -2599,26 +2690,6 @@ shadowed.get("/declaration-replaced", handler);
     }
 
     #[test]
-    fn test_fastify_declarator_initializer_write_invalidates_receiver() -> Result<()> {
-        let source = r#"
-import Fastify from "fastify";
-const app = Fastify();
-const assignmentResult = (app = otherFramework());
-app.get("/reassigned-in-initializer", handler);
-"#;
-        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        let tree = parse_javascript(&language, source);
-        let routes = collect_javascript_fastify_routes(
-            &language,
-            JavaScriptDialect::TypeScript,
-            &tree,
-            source,
-        )?;
-        assert!(routes.is_empty());
-        Ok(())
-    }
-
-    #[test]
     fn test_fastify_clean_and_malformed_files_keep_provenance_separate() -> Result<()> {
         let clean = r#"
 import Fastify from "fastify";
@@ -2784,53 +2855,6 @@ function directHandler() { return true; }
     }
 
     #[test]
-    fn test_fastify_indexes_javascript_jsx_typescript_and_tsx_surfaces() -> Result<()> {
-        for (path, extension, extra) in [
-            ("routes.js", "js", "const marker = 'js';"),
-            (
-                "routes.jsx",
-                "jsx",
-                "export const View = () => <main>jsx</main>;",
-            ),
-            ("routes.ts", "ts", "const marker: string = 'ts';"),
-            (
-                "routes.tsx",
-                "tsx",
-                "export const View = () => <main>tsx</main>;",
-            ),
-        ] {
-            let source = format!(
-                r#"
-import Fastify from "fastify";
-const api = Fastify();
-api.get("/health", health);
-function health() {{ return true; }}
-{extra}
-"#
-            );
-            let result = super::super::index_file(
-                Path::new(path),
-                &source,
-                &super::super::get_language_for_ext(extension).expect("language config"),
-                None,
-                None,
-            )?;
-            let metadata = result
-                .nodes
-                .iter()
-                .find_map(|node| {
-                    node.canonical_id
-                        .as_deref()
-                        .filter(|value| value.contains(r#""framework":"fastify""#))
-                })
-                .unwrap_or_else(|| panic!("missing Fastify route for {path}"));
-            assert!(metadata.contains(r#""extraction_provenance":"tree_sitter_query""#));
-            assert!(metadata.contains(r#""claim_tier":"parser_backed""#));
-        }
-        Ok(())
-    }
-
-    #[test]
     fn test_fastapi_query_fixture_matrix_and_line_scan_comparison() -> Result<()> {
         let source = r#"
 from fastapi import Depends, FastAPI
@@ -2972,50 +2996,6 @@ async def broken(
         let canonical_id = route.canonical_id.as_deref().expect("route metadata");
         assert!(canonical_id.contains(r#""extraction_provenance":"lexical_fallback""#));
         assert!(canonical_id.contains(r#""claim_tier":"structural""#));
-        Ok(())
-    }
-
-    #[test]
-    fn test_fastapi_unowned_receiver_and_unrelated_app_are_ignored() -> Result<()> {
-        let imported = r#"
-from fastapi import APIRouter
-
-@router.get("/factory-owned-elsewhere")
-async def external_router(): pass
-"#;
-        let imported_result = super::super::index_file(
-            Path::new("imported.py"),
-            imported,
-            &super::super::get_language_for_ext("py").expect("python config"),
-            None,
-            None,
-        )?;
-        assert!(imported_result.nodes.iter().all(|node| {
-            !node
-                .canonical_id
-                .as_deref()
-                .is_some_and(|value| value.contains(r#""framework":"fastapi""#))
-        }));
-
-        let unrelated = r#"
-app = OtherFramework()
-
-@app.get("/not-fastapi")
-async def unrelated_handler(): pass
-"#;
-        let unrelated_result = super::super::index_file(
-            Path::new("unrelated.py"),
-            unrelated,
-            &super::super::get_language_for_ext("py").expect("python config"),
-            None,
-            None,
-        )?;
-        assert!(unrelated_result.nodes.iter().all(|node| {
-            !node
-                .canonical_id
-                .as_deref()
-                .is_some_and(|value| value.contains(r#""framework":"fastapi""#))
-        }));
         Ok(())
     }
 

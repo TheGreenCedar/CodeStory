@@ -56,9 +56,10 @@
   unchanged, and parser-backed output is published only when the indexed bytes
   still match the file. Failed, cancelled, or concurrent refreshes preserve the
   previous usable generation.
-- Express and Fastify route extraction now share one module-binding ownership
-  tracker, including invalidation when a declarator initializer reassigns a
-  previously proven server receiver.
+- Express, Fastify, and FastAPI route extraction now builds one ordered
+  binding timeline per module. Route queries reuse that timeline instead of
+  rescanning prior statements, and FastAPI imports are resolved from parsed
+  nodes so multiline aliases, comments, and later shadowing remain accurate.
 - Native process reuse and cleanup now bind executable filesystem identity,
   arguments, endpoint, and one shared cross-platform process start identity.
   macOS and Windows process inspection is bounded, dead, reused, or unverified

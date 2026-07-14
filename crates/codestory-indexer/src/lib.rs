@@ -17074,13 +17074,15 @@ fn append_framework_routes(
         .collect::<Vec<_>>();
 
     if language_config.language_name == "python" {
+        let fastapi_timeline = framework_routes::build_fastapi_binding_timeline(tree, source);
         let lexical_fastapi = routes
             .extract_if(.., |route| route.framework == "fastapi")
             .collect::<Vec<_>>();
-        let parser_routes = framework_routes::collect_python_fastapi_routes(
+        let parser_routes = framework_routes::collect_python_fastapi_routes_with_timeline(
             &language_config.language,
             tree,
             source,
+            &fastapi_timeline,
         )?;
         let parser_keys = parser_routes
             .iter()
@@ -17095,7 +17097,10 @@ fn append_framework_routes(
                     .filter(|route| {
                         !parser_keys.contains(&(route.method.clone(), route.path.clone()))
                             && framework_routes::allow_python_fastapi_lexical_fallback(
-                                tree, source, route,
+                                tree,
+                                source,
+                                route,
+                                &fastapi_timeline,
                             )
                     })
                     .map(|route| {
@@ -17108,6 +17113,8 @@ fn append_framework_routes(
     }
 
     if matches!(language_config.language_name, "javascript" | "typescript") {
+        let framework_timeline =
+            framework_routes::build_javascript_framework_timeline(tree, source);
         let lexical_express = routes
             .extract_if(.., |route| route.framework == "express")
             .collect::<Vec<_>>();
@@ -17123,11 +17130,12 @@ fn append_framework_routes(
             }
             _ => framework_routes::JavaScriptDialect::JavaScript,
         };
-        let parser_routes = framework_routes::collect_javascript_express_routes(
+        let parser_routes = framework_routes::collect_javascript_express_routes_with_timeline(
             &language_config.language,
             dialect,
             tree,
             source,
+            &framework_timeline,
         )?;
         let parser_keys = parser_routes
             .iter()
@@ -17142,7 +17150,10 @@ fn append_framework_routes(
                     .filter(|route| {
                         !parser_keys.contains(&(route.method.clone(), route.path.clone()))
                             && framework_routes::allow_javascript_express_lexical_fallback(
-                                tree, source, route,
+                                tree,
+                                source,
+                                route,
+                                &framework_timeline,
                             )
                     })
                     .map(|route| {
@@ -17153,11 +17164,12 @@ fn append_framework_routes(
             );
         }
 
-        let parser_routes = framework_routes::collect_javascript_fastify_routes(
+        let parser_routes = framework_routes::collect_javascript_fastify_routes_with_timeline(
             &language_config.language,
             dialect,
             tree,
             source,
+            &framework_timeline,
         )?;
         let parser_keys = parser_routes
             .iter()
@@ -17172,7 +17184,10 @@ fn append_framework_routes(
                     .filter(|route| {
                         !parser_keys.contains(&(route.method.clone(), route.path.clone()))
                             && framework_routes::allow_javascript_fastify_lexical_fallback(
-                                tree, source, route,
+                                tree,
+                                source,
+                                route,
+                                &framework_timeline,
                             )
                     })
                     .map(|route| {
