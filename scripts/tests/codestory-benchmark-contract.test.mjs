@@ -13,14 +13,16 @@ import {
   unsupportedSidecarDisabledRequest,
 } from "../codestory-benchmark-contract.mjs";
 
-test("benchmark child env makes local sidecar-primary explicit in CI", () => {
+test("benchmark child env preserves an explicit agent sidecar selection", () => {
   const env = benchmarkChildEnv({
     GITHUB_ACTIONS: "true",
     CODESTORY_RETRIEVAL_PROFILE: "agent",
+    CODESTORY_SIDECAR_RUN_ID: "packet-runtime-test",
   });
 
   assert.equal(env.CODESTORY_RETRIEVAL, "1");
-  assert.equal(env.CODESTORY_RETRIEVAL_PROFILE, "local");
+  assert.equal(env.CODESTORY_RETRIEVAL_PROFILE, "agent");
+  assert.equal(env.CODESTORY_SIDECAR_RUN_ID, "packet-runtime-test");
   assert.equal(env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS, "1");
   assert.equal(env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE, "real");
   assert.equal(env.CODESTORY_EMBED_BACKEND, "llamacpp");
@@ -32,7 +34,7 @@ test("benchmark child env makes local sidecar-primary explicit in CI", () => {
     sidecar_primary: true,
     unsupported_sidecar_disabled_request: false,
     code_story_retrieval: "1",
-    runtime_profile: "local",
+    runtime_profile: "agent",
     embedding_backend: "llamacpp",
     compose_profile: "real",
   });

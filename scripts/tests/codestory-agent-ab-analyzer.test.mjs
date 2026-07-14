@@ -440,6 +440,14 @@ test("packet command keeps manifest-derived extra probes diagnostic-only", () =>
     "--profile",
     "local",
   ]);
+  const agentArgs = packetCommandArgs({ path: "C:\\repo" }, task, {
+    packetSidecarProfile: "agent",
+    packetSidecarRunId: "packet-runtime-test",
+  });
+  assert.deepEqual(
+    agentArgs.slice(agentArgs.indexOf("--profile"), agentArgs.indexOf("--profile") + 4),
+    ["--profile", "agent", "--run-id", "packet-runtime-test"],
+  );
 
   const diagnosticArgs = packetCommandArgs(
     { path: "C:\\repo" },

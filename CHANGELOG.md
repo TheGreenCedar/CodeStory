@@ -10,7 +10,8 @@
   substituting an automatically generated pull-request list.
 - Gated CPU-backed Linux ARM64 release evidence on protected exact-head approval
   while retaining raw repo-scale and drill output without weakening evaluation,
-  and pinned direct CLI benchmarks to their prepared local sidecar namespace.
+  and gave packet benchmarks one managed sidecar namespace that is reused across
+  bootstrap, indexing, status, packet calls, and exact cleanup.
 - Added reproducible provisioning for the repository-scoped Linux
   release-evidence runner. The runner uses a stable provisioned machine
   identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64

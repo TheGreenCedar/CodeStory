@@ -93,7 +93,9 @@ function benchmarkChildEnv(baseEnv = process.env, additions = {}) {
   if (env.CODESTORY_RETRIEVAL == null || env.CODESTORY_RETRIEVAL === "") {
     env.CODESTORY_RETRIEVAL = "1";
   }
-  env.CODESTORY_RETRIEVAL_PROFILE = "local";
+  if (env.CODESTORY_RETRIEVAL_PROFILE == null || env.CODESTORY_RETRIEVAL_PROFILE === "") {
+    env.CODESTORY_RETRIEVAL_PROFILE = "local";
+  }
   if (
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS == null ||
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === ""
