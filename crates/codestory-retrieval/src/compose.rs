@@ -1,21 +1,16 @@
 use crate::config::{
     EmbeddingServerLaunchMode, NATIVE_LLAMA_MANAGED_CACHE_REL_PATH,
     NATIVE_LLAMA_SOURCE_CACHE_REL_PATH, SidecarLayout, SidecarProfile, SidecarRuntimeConfig,
-    retrieval_compose_profile, user_cache_root,
+    user_cache_root,
 };
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
-use crate::qdrant_storage::{
-    BootstrapStorageScope, DEFAULT_QDRANT_COLLECTION_RETENTION, QdrantStorageRepairReport,
-    repair_qdrant_storage,
-};
 #[cfg(test)]
 use crate::sidecar::sidecar_up_with_runtime_and_launch_metadata;
 use crate::sidecar::{
     EmbeddingLaunchOwnership, SidecarStateFile,
-    sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_origin,
+    sidecar_up_with_runtime_and_launch_metadata_and_ownership,
 };
 use anyhow::{Context, Result, bail};
-use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -32,20 +27,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-/// Relative path from repository root to the retrieval compose file.
-pub const DEFAULT_COMPOSE_REL_PATH: &str = "docker/retrieval-compose.yml";
-const BUNDLED_RETRIEVAL_COMPOSE: &str = include_str!("../../../docker/retrieval-compose.yml");
-const DOCKER_ADDRESS_POOL_EXHAUSTED_REASON: &str = "docker_address_pool_exhausted";
-const DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE: &str =
-    "all predefined address pools have been fully subnetted";
 pub const NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON: &str = "native_embedding_port_bind_failed";
 pub const NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL: &str = "darwin_exec_gate_v1";
 const NATIVE_EMBEDDING_DARWIN_EXEC_GATE_TOKEN: &str = "codestory-native-launch-v1";
 #[cfg(target_os = "macos")]
 const NATIVE_EMBEDDING_DARWIN_EXEC_GATE_SCRIPT: &str = "IFS= read -r gate || exit 125; [ \"$gate\" = codestory-native-launch-v1 ] || exit 126; exec \"$@\"";
-const LINUX_VULKAN_RENDER_NODE: &str = "/dev/dri";
-const VULKAN_COMPOSE_OVERRIDE: &str =
-    "services:\n  embed:\n    devices:\n      - /dev/dri:/dev/dri\n";
 const MANAGED_LLAMA_EXTRACTED_MARKER: &str = ".codestory-extracted";
 #[cfg(windows)]
 const WINDOWS_DETACHED_PROCESS: u32 = 0x00000008;
@@ -179,76 +165,10 @@ pub struct ManagedAssetPrewarmReport {
 pub struct BootstrapReport {
     pub state: SidecarStateFile,
     pub infrastructure: InfrastructureHealth,
-    pub compose_started: bool,
-    pub compose_file: Option<PathBuf>,
-    pub storage_repair: QdrantStorageRepairReport,
-}
-
-#[derive(Debug, Error)]
-#[error("{source}")]
-struct ComposeBootstrapLockedError {
-    #[source]
-    source: anyhow::Error,
-    _lock: File,
-}
-
-fn compose_bootstrap_lock_path(compose_project: &str) -> PathBuf {
-    let key = format!("{:x}", Sha256::digest(compose_project.as_bytes()));
-    std::env::temp_dir()
-        .join("codestory-compose-bootstrap-locks")
-        .join(format!("{key}.lock"))
-}
-
-fn open_compose_bootstrap_lock(compose_project: &str) -> Result<File> {
-    let path = compose_bootstrap_lock_path(compose_project);
-    fs::create_dir_all(path.parent().expect("lock path has a parent"))
-        .with_context(|| format!("create Compose bootstrap lock dir for {compose_project}"))?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("open Compose bootstrap lock {}", path.display()))
-}
-
-fn acquire_compose_bootstrap_lock(compose_project: &str) -> Result<File> {
-    let file = open_compose_bootstrap_lock(compose_project)?;
-    FileExt::lock_exclusive(&file)
-        .with_context(|| format!("lock Compose project {compose_project} startup"))?;
-    Ok(file)
-}
-
-#[cfg(test)]
-fn try_acquire_compose_bootstrap_lock(compose_project: &str) -> Result<Option<File>> {
-    let file = open_compose_bootstrap_lock(compose_project)?;
-    match FileExt::try_lock_exclusive(&file) {
-        Ok(true) => Ok(Some(file)),
-        Ok(false) => Ok(None),
-        Err(error) => Err(error)
-            .with_context(|| format!("try lock Compose project {compose_project} startup")),
-    }
-}
-
-fn hold_compose_bootstrap_lock_on_error(
-    error: anyhow::Error,
-    lock: &mut Option<File>,
-) -> anyhow::Error {
-    match lock.take() {
-        Some(lock) => ComposeBootstrapLockedError {
-            source: error,
-            _lock: lock,
-        }
-        .into(),
-        None => error,
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct BootstrapSidecarsOptions {
-    pub storage_scope: BootstrapStorageScope,
-    pub compose_file: Option<PathBuf>,
-    pub skip_compose: bool,
     pub wait_timeout: Duration,
     pub allow_native_embedding_spawn: bool,
     /// A broker-verified native launch owned by this workspace. This permits a
@@ -318,68 +238,6 @@ struct NativeLlamaInstallManifest {
     executable_sha256: String,
 }
 
-/// Prepare cache dirs, optionally start Docker Compose, write sidecar state, wait for probes.
-pub fn bootstrap_sidecars(
-    repo_root: Option<&Path>,
-    storage_scope: &BootstrapStorageScope,
-    compose_file: Option<&Path>,
-    skip_compose: bool,
-    wait_timeout: Duration,
-) -> Result<BootstrapReport> {
-    bootstrap_sidecars_with_profile(
-        repo_root,
-        storage_scope,
-        compose_file,
-        skip_compose,
-        wait_timeout,
-        SidecarProfile::Local,
-    )
-}
-
-pub fn bootstrap_sidecars_with_profile(
-    repo_root: Option<&Path>,
-    storage_scope: &BootstrapStorageScope,
-    compose_file: Option<&Path>,
-    skip_compose: bool,
-    wait_timeout: Duration,
-    profile: SidecarProfile,
-) -> Result<BootstrapReport> {
-    let runtime = SidecarRuntimeConfig::for_project_profile(repo_root, profile);
-    bootstrap_sidecars_with_runtime(
-        &runtime,
-        repo_root,
-        storage_scope,
-        compose_file,
-        skip_compose,
-        wait_timeout,
-        true,
-    )
-}
-
-pub fn bootstrap_sidecars_with_runtime(
-    runtime: &SidecarRuntimeConfig,
-    repo_root: Option<&Path>,
-    storage_scope: &BootstrapStorageScope,
-    compose_file: Option<&Path>,
-    skip_compose: bool,
-    wait_timeout: Duration,
-    allow_native_embedding_spawn: bool,
-) -> Result<BootstrapReport> {
-    bootstrap_sidecars_with_runtime_progress(
-        runtime,
-        repo_root,
-        BootstrapSidecarsOptions {
-            storage_scope: storage_scope.clone(),
-            compose_file: compose_file.map(Path::to_path_buf),
-            skip_compose,
-            wait_timeout,
-            allow_native_embedding_spawn,
-            reusable_native_embedding_launch: None,
-        },
-        |_| {},
-    )
-}
-
 pub fn bootstrap_sidecars_with_runtime_progress(
     runtime: &SidecarRuntimeConfig,
     repo_root: Option<&Path>,
@@ -402,41 +260,16 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
     progress: impl FnMut(&'static str),
     observe_new_native_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
 ) -> Result<BootstrapReport> {
-    bootstrap_sidecars_with_transition_down(
-        runtime,
-        repo_root,
-        options,
-        progress,
-        observe_new_native_launch,
-        docker_compose_down_for_transition_state,
-    )
-}
-
-fn bootstrap_sidecars_with_transition_down(
-    runtime: &SidecarRuntimeConfig,
-    repo_root: Option<&Path>,
-    options: BootstrapSidecarsOptions,
-    mut progress: impl FnMut(&'static str),
-    mut observe_new_native_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
-    mut transition_down: impl FnMut(&SidecarStateFile) -> Result<()>,
-) -> Result<BootstrapReport> {
+    let mut progress = progress;
+    let mut observe_new_native_launch = observe_new_native_launch;
     let port_lease_heartbeat = runtime.start_port_lease_heartbeat()?;
     let BootstrapSidecarsOptions {
-        storage_scope,
-        compose_file,
-        skip_compose,
         wait_timeout,
         allow_native_embedding_spawn,
         reusable_native_embedding_launch,
     } = options;
     let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
-    let vector_backend = runtime.ensure_vector_backend_configured()?;
-    let storage_repair = if vector_backend == crate::config::VectorBackend::ExternalQdrant {
-        repair_qdrant_storage(&layout, &storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?
-    } else {
-        QdrantStorageRepairReport::default()
-    };
     let launch_mode = crate::config::embedding_server_launch_mode_for_runtime(runtime)?;
     let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
         .then(|| {
@@ -448,49 +281,6 @@ fn bootstrap_sidecars_with_transition_down(
         })
         .transpose()?;
 
-    let compose_required = launch_mode == EmbeddingServerLaunchMode::DockerComposeEmbed
-        || vector_backend == crate::config::VectorBackend::ExternalQdrant;
-    let resolved_compose = if skip_compose || !compose_required {
-        None
-    } else {
-        Some(resolve_compose_file(repo_root, compose_file.as_deref())?)
-    };
-    let embedded_transition_pending = vector_backend == crate::config::VectorBackend::Embedded
-        && embedded_qdrant_transition_state(runtime)?.is_some();
-    // Docker Compose project names are daemon-global. Keep the exact ownership probe, startup,
-    // and any caller-side failure cleanup serialized for this project.
-    let mut compose_bootstrap_lock = (resolved_compose.is_some() || embedded_transition_pending)
-        .then(|| acquire_compose_bootstrap_lock(&runtime.compose_project))
-        .transpose()?;
-    let mut hold_compose_lock =
-        |error| hold_compose_bootstrap_lock_on_error(error, &mut compose_bootstrap_lock);
-    if embedded_transition_pending && let Some(state) = embedded_qdrant_transition_state(runtime)? {
-        if state.compose_file.is_none() {
-            return Err(hold_compose_lock(anyhow::anyhow!(
-                "recorded Qdrant transition state has no exact Compose file; preserving it for repair"
-            )));
-        }
-        transition_down(&state).map_err(&mut hold_compose_lock)?;
-    }
-
-    let (compose_started, compose_owned_for_rollback) =
-        if let Some(path) = resolved_compose.as_ref() {
-            let compose_project_preexisting =
-                docker_compose_project_has_containers(runtime).map_err(&mut hold_compose_lock)?;
-            start_compose_with_rollback(
-                !compose_project_preexisting,
-                || {
-                    with_bootstrap_progress(&mut progress, "container startup", || {
-                        docker_compose_up(path, repo_root, runtime, launch_mode, false)
-                    })
-                },
-                || docker_compose_down_for_runtime(path, runtime),
-            )
-            .map_err(&mut hold_compose_lock)?;
-            (true, !compose_project_preexisting)
-        } else {
-            (false, false)
-        };
     let native_embedding_spawn = if let Some(launch) = native_embedding.as_ref() {
         match with_bootstrap_progress(&mut progress, "model/bootstrap", || {
             spawn_native_embedding_server(
@@ -504,18 +294,10 @@ fn bootstrap_sidecars_with_transition_down(
         }) {
             Ok(spawn) => spawn,
             Err(error) => {
-                cleanup_pre_state_startup_for_runtime(
-                    runtime,
-                    resolved_compose.as_deref(),
-                    compose_owned_for_rollback,
-                    None,
-                    None,
-                )
-                .with_context(|| {
+                cleanup_pre_state_startup_for_runtime(None, None).with_context(|| {
                     format!("rollback sidecar startup after native embedding spawn failed: {error}")
-                })
-                .map_err(&mut hold_compose_lock)?;
-                return Err(hold_compose_lock(error));
+                })?;
+                return Err(error);
             }
         }
     } else {
@@ -541,19 +323,15 @@ fn bootstrap_sidecars_with_transition_down(
         } else {
             EmbeddingLaunchOwnership::Owner
         };
-    let state = match sidecar_up_with_runtime_and_launch_metadata_ownership_and_compose_origin(
+    let state = match sidecar_up_with_runtime_and_launch_metadata_and_ownership(
         runtime,
-        resolved_compose.as_deref(),
+        None,
         embedding_launch.clone(),
         embedding_launch_ownership,
-        compose_owned_for_rollback,
     ) {
         Ok(state) => state,
         Err(error) => {
             if let Err(cleanup_error) = cleanup_pre_state_startup_for_runtime(
-                runtime,
-                resolved_compose.as_deref(),
-                compose_owned_for_rollback,
                 embedding_launch.as_ref(),
                 native_embedding_spawn,
             ) {
@@ -563,13 +341,14 @@ fn bootstrap_sidecars_with_transition_down(
                 if native_embedding_spawn.is_some_and(|spawn| spawn.newly_spawned)
                     && let Some(launch) = embedding_launch
                 {
-                    return Err(hold_compose_lock(error.context(
-                        NativeEmbeddingStartupCleanupFailure::new(launch, &cleanup_error),
+                    return Err(error.context(NativeEmbeddingStartupCleanupFailure::new(
+                        launch,
+                        &cleanup_error,
                     )));
                 }
-                return Err(hold_compose_lock(error));
+                return Err(error);
             }
-            return Err(hold_compose_lock(error));
+            return Err(error);
         }
     };
 
@@ -580,59 +359,22 @@ fn bootstrap_sidecars_with_transition_down(
                 wait_timeout,
                 newly_spawned_native_launch(embedding_launch.as_ref(), native_embedding_spawn),
             )
-        })
-        .map_err(&mut hold_compose_lock)?
+        })?
     } else {
         probe_infrastructure_health(runtime)
     };
-
-    if compose_started
-        && !infrastructure_ready(&infrastructure)
-        && let Some(path) = resolved_compose.as_ref()
-    {
-        with_bootstrap_progress(&mut progress, "container refresh", || {
-            docker_compose_up(path, repo_root, runtime, launch_mode, true)
-        })
-        .map_err(&mut hold_compose_lock)?;
-        if !wait_timeout.is_zero() {
-            let _ = with_bootstrap_progress(&mut progress, "model/bootstrap", || {
-                wait_for_infrastructure(
-                    runtime,
-                    wait_timeout,
-                    newly_spawned_native_launch(embedding_launch.as_ref(), native_embedding_spawn),
-                )
-            })
-            .map_err(&mut hold_compose_lock)?;
-        }
-    }
-
-    if compose_started && launch_mode == EmbeddingServerLaunchMode::DockerComposeEmbed {
-        let identity = crate::embeddings::running_embedding_container_identity(runtime)
-            .map_err(&mut hold_compose_lock)?;
-        crate::sidecar::persist_embedding_container_identity(&layout.state_file, &identity)
-            .map_err(&mut hold_compose_lock)?;
-    }
 
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
         runtime,
         &embedding_device,
     );
-    port_lease_heartbeat
-        .finish()
-        .map_err(&mut hold_compose_lock)?;
+    port_lease_heartbeat.finish()?;
 
     Ok(BootstrapReport {
         state,
         infrastructure,
-        compose_started,
-        compose_file: resolved_compose,
-        storage_repair,
     })
-}
-
-fn infrastructure_ready(health: &InfrastructureHealth) -> bool {
-    health.lexical_ready && health.qdrant_reachable && health.embed_reachable
 }
 
 fn with_bootstrap_progress<T>(
@@ -642,568 +384,6 @@ fn with_bootstrap_progress<T>(
 ) -> Result<T> {
     progress(phase);
     action()
-}
-
-fn start_compose_with_rollback(
-    rollback_owned: bool,
-    start: impl FnOnce() -> Result<()>,
-    rollback: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    match start() {
-        Ok(()) => Ok(()),
-        Err(start_error) if !rollback_owned => Err(start_error).context(
-            "preserved pre-existing exact Compose project after startup failure; automatic down would destroy infrastructure not created by this bootstrap",
-        ),
-        Err(start_error) => match rollback() {
-            Ok(()) => Err(start_error),
-            Err(rollback_error) => Err(start_error).context(format!(
-                "rollback exact Compose project after partial startup failed: {rollback_error:#}"
-            )),
-        },
-    }
-}
-
-pub fn resolve_compose_file(
-    repo_root: Option<&Path>,
-    override_path: Option<&Path>,
-) -> Result<PathBuf> {
-    if let Some(path) = override_path {
-        let path = path.to_path_buf();
-        if path.is_file() {
-            return Ok(path);
-        }
-        bail!("compose file not found: {}", path.display());
-    }
-    if let Ok(path) = std::env::var("CODESTORY_RETRIEVAL_COMPOSE_FILE") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        bail!(
-            "CODESTORY_RETRIEVAL_COMPOSE_FILE is set but not a file: {}",
-            path.display()
-        );
-    }
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(root) = repo_root {
-        roots.push(root.to_path_buf());
-    }
-    if let Ok(dir) = std::env::current_dir()
-        && !roots.iter().any(|existing| existing == &dir)
-    {
-        roots.push(dir);
-    }
-    for root in roots {
-        let candidate = root.join(DEFAULT_COMPOSE_REL_PATH);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    write_bundled_compose_file(&user_cache_root())
-}
-
-fn write_bundled_compose_file(cache_root: &Path) -> Result<PathBuf> {
-    let compose_path = cache_root.join("retrieval-compose.yml");
-    std::fs::create_dir_all(cache_root)
-        .with_context(|| format!("create CodeStory cache dir {}", cache_root.display()))?;
-    if compose_path.is_file()
-        && std::fs::read_to_string(&compose_path)
-            .map(|contents| contents == BUNDLED_RETRIEVAL_COMPOSE)
-            .unwrap_or(false)
-    {
-        return Ok(compose_path);
-    }
-    std::fs::write(&compose_path, BUNDLED_RETRIEVAL_COMPOSE)
-        .with_context(|| format!("write bundled retrieval compose {}", compose_path.display()))?;
-    Ok(compose_path)
-}
-
-pub fn docker_available() -> bool {
-    Command::new("docker")
-        .arg("version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn docker_compose_project_has_containers(runtime: &SidecarRuntimeConfig) -> Result<bool> {
-    if !docker_available() {
-        bail!(
-            "docker is not available on PATH. Install Docker Desktop (Windows) or Docker Engine, then re-run bootstrap"
-        );
-    }
-    let output = Command::new("docker")
-        .arg("ps")
-        .arg("--all")
-        .arg("--quiet")
-        .arg("--filter")
-        .arg(format!(
-            "label=com.docker.compose.project={}",
-            runtime.compose_project
-        ))
-        .output()
-        .context("inspect exact Compose project before sidecar startup")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "inspect exact Compose project {} before sidecar startup failed (exit {:?}):\n{stdout}{stderr}",
-            runtime.compose_project,
-            output.status.code()
-        );
-    }
-    Ok(!output.stdout.iter().all(u8::is_ascii_whitespace))
-}
-
-fn docker_compose_up(
-    compose_file: &Path,
-    repo_root: Option<&Path>,
-    runtime: &SidecarRuntimeConfig,
-    launch_mode: EmbeddingServerLaunchMode,
-    force_recreate: bool,
-) -> Result<()> {
-    let layout = &runtime.layout;
-    if !docker_available() {
-        bail!(
-            "docker is not available on PATH for the selected managed embedding backend. \
-             Install Docker Desktop or Docker Engine, configure a supported native embedding \
-             backend, or use a trusted external embedding endpoint, then retry"
-        );
-    }
-
-    std::fs::create_dir_all(&layout.qdrant_data_dir).with_context(|| {
-        format!(
-            "create Qdrant data dir {}",
-            layout.qdrant_data_dir.display()
-        )
-    })?;
-    std::fs::create_dir_all(&layout.lexical_data_dir).with_context(|| {
-        format!(
-            "create lexical data dir {}",
-            layout.lexical_data_dir.display()
-        )
-    })?;
-
-    let workdir = repo_root
-        .or_else(|| compose_file.parent().and_then(|p| p.parent()))
-        .unwrap_or_else(|| Path::new("."));
-
-    let mut command = docker_compose_command()?;
-    let compose_profile = retrieval_compose_profile();
-    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
-    let accelerator_request = crate::embeddings::embedding_accelerator_request();
-    let vulkan_override = maybe_write_vulkan_compose_override(
-        &user_cache_root(),
-        Path::new(LINUX_VULKAN_RENDER_NODE),
-        vulkan_compose_override_requested(launch_mode, accelerator_request.as_ref()),
-    )?;
-    append_docker_compose_up_args(
-        &mut command,
-        runtime,
-        compose_file,
-        vulkan_override.as_deref(),
-        launch_mode,
-        force_recreate,
-    );
-    command
-        .current_dir(workdir)
-        .env(
-            "CODESTORY_QDRANT_DATA_DIR",
-            docker_bind_path(&layout.qdrant_data_dir),
-        )
-        .env(
-            "CODESTORY_QDRANT_HTTP_PORT",
-            layout.qdrant_http_port.to_string(),
-        )
-        .env(
-            "CODESTORY_QDRANT_GRPC_PORT",
-            layout.qdrant_grpc_port.to_string(),
-        )
-        .env(
-            "CODESTORY_EMBED_MODEL_DIR",
-            docker_bind_path(&embed_model_dir(repo_root, layout)?),
-        )
-        .env(
-            "CODESTORY_EMBED_PORT",
-            native_embedding_endpoint_port(runtime).to_string(),
-        )
-        .env("CODESTORY_EMBED_LLAMACPP_URL", &runtime.embedding.endpoint)
-        .env(
-            "CODESTORY_EMBED_DEVICE_STATE",
-            embedding_device.observed_state,
-        )
-        .env("CODESTORY_SIDECAR_NAMESPACE", &runtime.namespace)
-        .env("CODESTORY_SIDECAR_PROFILE", runtime.profile.as_str())
-        .env("CODESTORY_SIDECAR_OWNER", "codestory")
-        .env("COMPOSE_PROFILES", compose_profile);
-    if let Some(identity) = runtime.project_identity.as_ref() {
-        command
-            .env("CODESTORY_PROJECT_ID", &identity.project_id)
-            .env("CODESTORY_WORKSPACE_ID", &identity.workspace_id)
-            .env("CODESTORY_ARTIFACT_SCOPE_ID", &identity.artifact_scope_id)
-            .env(
-                "CODESTORY_PROJECT_IDENTITY_SCHEMA_VERSION",
-                identity.project_identity_schema_version.to_string(),
-            );
-    }
-    if let Some(workspace_root) = runtime.labels.get("dev.codestory.workspace_root") {
-        command.env("CODESTORY_WORKSPACE_ROOT", workspace_root);
-    }
-    if let Some(provider) = embedding_device.detected_provider.as_deref() {
-        command.env("CODESTORY_EMBED_DEVICE_PROVIDER", provider);
-    }
-    if let Some(gpu) = embedding_device.detected_gpu.as_deref() {
-        command.env("CODESTORY_EMBED_DEVICE_NAME", gpu);
-    }
-    if let Some(request) = accelerator_request {
-        let device = request.device;
-        let n_gpu_layers = request.n_gpu_layers;
-        command
-            .env("CODESTORY_EMBED_LLAMACPP_N_GPU_LAYERS", &n_gpu_layers)
-            .env("LLAMA_ARG_N_GPU_LAYERS", n_gpu_layers);
-        if let Some(device) = device {
-            command
-                .env("CODESTORY_EMBED_LLAMACPP_DEVICE", &device)
-                .env("LLAMA_ARG_DEVICE", device);
-        } else {
-            command
-                .env_remove("CODESTORY_EMBED_LLAMACPP_DEVICE")
-                .env_remove("LLAMA_ARG_DEVICE");
-        }
-    } else {
-        command
-            .env_remove("CODESTORY_EMBED_LLAMACPP_DEVICE")
-            .env_remove("LLAMA_ARG_DEVICE")
-            .env_remove("LLAMA_ARG_N_GPU_LAYERS");
-    }
-    let output = command.output().context("spawn docker compose")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "{}",
-            docker_compose_up_failure_message(output.status.code(), &stdout, &stderr, repo_root)
-        );
-    }
-    Ok(())
-}
-
-fn append_docker_compose_up_args(
-    command: &mut Command,
-    runtime: &SidecarRuntimeConfig,
-    compose_file: &Path,
-    override_file: Option<&Path>,
-    launch_mode: EmbeddingServerLaunchMode,
-    force_recreate: bool,
-) {
-    command
-        .arg("compose")
-        .arg("-p")
-        .arg(&runtime.compose_project)
-        .arg("-f")
-        .arg(compose_file);
-    if let Some(override_file) = override_file {
-        command.arg("-f").arg(override_file);
-    }
-    command.arg("up").arg("-d").arg("--remove-orphans");
-    if force_recreate {
-        command.arg("--force-recreate");
-    }
-    command.args(docker_compose_services_for_runtime(runtime, launch_mode));
-}
-
-fn maybe_write_vulkan_compose_override(
-    cache_root: &Path,
-    host_render_node: &Path,
-    accelerator_requested: bool,
-) -> Result<Option<PathBuf>> {
-    if !accelerator_requested {
-        return Ok(None);
-    }
-    if !host_render_node.exists() {
-        bail!(
-            "linux_accelerator_device_missing: Vulkan acceleration was requested but {} is unavailable; expose a host render node, choose a proven non-Vulkan backend, or explicitly allow CPU fallback",
-            host_render_node.display()
-        );
-    }
-    std::fs::create_dir_all(cache_root)
-        .with_context(|| format!("create CodeStory cache dir {}", cache_root.display()))?;
-    let override_path = cache_root.join("retrieval-compose-vulkan.override.yml");
-    if override_path.is_file()
-        && std::fs::read_to_string(&override_path)
-            .map(|contents| contents == VULKAN_COMPOSE_OVERRIDE)
-            .unwrap_or(false)
-    {
-        return Ok(Some(override_path));
-    }
-    std::fs::write(&override_path, VULKAN_COMPOSE_OVERRIDE).with_context(|| {
-        format!(
-            "write Vulkan retrieval compose override {}",
-            override_path.display()
-        )
-    })?;
-    Ok(Some(override_path))
-}
-
-fn docker_compose_up_failure_message(
-    exit_code: Option<i32>,
-    stdout: &str,
-    stderr: &str,
-    repo_root: Option<&Path>,
-) -> String {
-    if docker_address_pool_exhausted(stdout) || docker_address_pool_exhausted(stderr) {
-        let project = repo_root
-            .map(|path| quoted_project_arg(&path.display().to_string()))
-            .unwrap_or_else(|| "<repo>".to_string());
-        return format!(
-            "docker compose up failed (exit {exit_code:?}): reason={DOCKER_ADDRESS_POOL_EXHAUSTED_REASON}\n\
-Docker's predefined address pools are exhausted. Run read-only inventory: \
-`codestory-cli sidecar inventory --project {project} --format markdown` \
-or `codestory-cli sidecar inventory --project {project} --format json`.\n\
-Raw docker compose output:\n{stdout}{stderr}"
-        );
-    }
-
-    format!("docker compose up failed (exit {exit_code:?}):\n{stdout}{stderr}")
-}
-
-fn quoted_project_arg(project: &str) -> String {
-    format!("\"{}\"", project.replace('"', "\\\""))
-}
-
-fn docker_address_pool_exhausted(details: &str) -> bool {
-    details
-        .to_ascii_lowercase()
-        .contains(DOCKER_ADDRESS_POOL_EXHAUSTED_NEEDLE)
-}
-
-pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
-    if state.owner != "codestory" || state.profile != SidecarProfile::Agent.as_str() {
-        return Ok(());
-    }
-    docker_compose_down_for_exact_state(state)
-}
-
-fn docker_compose_down_for_transition_state(state: &SidecarStateFile) -> Result<()> {
-    let known_profile = state.profile == SidecarProfile::Local.as_str()
-        || state.profile == SidecarProfile::Agent.as_str();
-    if state.owner != "codestory" || !known_profile {
-        bail!("refusing to stop an unowned retrieval transition state");
-    }
-    docker_compose_down_for_exact_state(state)
-}
-
-fn docker_compose_down_for_exact_state(state: &SidecarStateFile) -> Result<()> {
-    let Some(compose_file) = state.compose_file.as_ref().map(PathBuf::from) else {
-        // Legacy state may predate exact Compose-path publication. There is no owned path to
-        // retry, so retain the historical no-op behavior for that schema shape only.
-        return Ok(());
-    };
-    if !compose_file.is_file() {
-        bail!(
-            "recorded sidecar Compose file is unavailable; preserving state for exact cleanup retry: {}",
-            compose_file.display()
-        );
-    }
-    if !docker_available() {
-        bail!(
-            "docker is unavailable while stopping recorded sidecar Compose project {}; preserving state for exact cleanup retry",
-            state.compose_project
-        );
-    }
-    let mut command = docker_compose_command()?;
-    command
-        .arg("compose")
-        .arg("-p")
-        .arg(&state.compose_project)
-        .arg("-f")
-        .arg(&compose_file)
-        .arg("down")
-        .arg("--remove-orphans");
-    for (name, value) in compose_down_environment(state) {
-        command.env(name, value);
-    }
-    let output = command.output().context("spawn docker compose down")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "docker compose down failed for owned sidecar namespace {} (exit {:?}):\n{stdout}{stderr}",
-            state.namespace,
-            output.status.code()
-        );
-    }
-    Ok(())
-}
-
-fn embedded_qdrant_transition_state(
-    runtime: &SidecarRuntimeConfig,
-) -> Result<Option<SidecarStateFile>> {
-    let contents = match std::fs::read_to_string(&runtime.layout.state_file) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "read embedded backend transition state {}",
-                    runtime.layout.state_file.display()
-                )
-            });
-        }
-    };
-    let state: SidecarStateFile = serde_json::from_str(&contents).with_context(|| {
-        format!(
-            "parse embedded backend transition state {}",
-            runtime.layout.state_file.display()
-        )
-    })?;
-    if state.qdrant_http_port == 0 && state.qdrant_grpc_port == 0 {
-        return Ok(None);
-    }
-    if state.owner != "codestory"
-        || state.profile != runtime.profile.as_str()
-        || state.namespace != runtime.namespace
-        || state.compose_project != runtime.compose_project
-        || state.project_identity != runtime.project_identity
-        || state.run_id != runtime.run_id
-        || state.qdrant_http_port == 0
-        || state.qdrant_grpc_port == 0
-        || runtime.layout.qdrant_http_port != 0
-        || runtime.layout.qdrant_grpc_port != 0
-        || state.embed_http_port != runtime.embed_http_port
-    {
-        bail!(
-            "recorded Qdrant transition state does not exactly match embedded sidecar namespace {}; preserving it for repair",
-            runtime.namespace
-        );
-    }
-    Ok(Some(state))
-}
-
-fn docker_compose_down_for_runtime(
-    compose_file: &Path,
-    runtime: &SidecarRuntimeConfig,
-) -> Result<()> {
-    if !compose_file.is_file() {
-        bail!(
-            "compose rollback file is unavailable: {}",
-            compose_file.display()
-        );
-    }
-    if !docker_available() {
-        bail!("docker became unavailable before sidecar startup rollback");
-    }
-    let mut command = docker_compose_command()?;
-    command
-        .arg("compose")
-        .arg("-p")
-        .arg(&runtime.compose_project)
-        .arg("-f")
-        .arg(compose_file)
-        .arg("down")
-        .arg("--remove-orphans");
-    for (name, value) in compose_down_environment_for_parts(
-        &runtime.namespace,
-        &runtime.layout.qdrant_data_dir,
-        &runtime.layout.lexical_data_dir,
-        compose_file,
-    ) {
-        command.env(name, value);
-    }
-    let output = command
-        .output()
-        .context("spawn docker compose startup rollback")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "docker compose startup rollback failed for exact sidecar namespace {} (exit {:?}):\n{stdout}{stderr}",
-            runtime.namespace,
-            output.status.code()
-        );
-    }
-    Ok(())
-}
-
-fn compose_down_environment(state: &SidecarStateFile) -> Vec<(&'static str, String)> {
-    compose_down_environment_for_parts(
-        &state.namespace,
-        Path::new(&state.qdrant_data_dir),
-        Path::new(&state.lexical_data_dir),
-        state
-            .compose_file
-            .as_deref()
-            .map(Path::new)
-            .unwrap_or_else(|| Path::new("")),
-    )
-}
-
-fn compose_down_environment_for_parts(
-    namespace: &str,
-    qdrant_data_dir: &Path,
-    lexical_data_dir: &Path,
-    compose_file: &Path,
-) -> Vec<(&'static str, String)> {
-    let mut environment = vec![
-        ("CODESTORY_SIDECAR_NAMESPACE", namespace.to_string()),
-        (
-            "CODESTORY_QDRANT_DATA_DIR",
-            docker_bind_path(qdrant_data_dir),
-        ),
-        // Compose requires this variable while parsing the file. `down` does not
-        // access the model mount, so an existing owned data path is sufficient.
-        (
-            "CODESTORY_EMBED_MODEL_DIR",
-            docker_bind_path(qdrant_data_dir),
-        ),
-    ];
-    // Migration-only: emit the removed interpolation variable solely while parsing an
-    // owned legacy compose file that still references it. Current compose files never do.
-    if std::fs::read_to_string(compose_file)
-        .ok()
-        .is_some_and(|compose| compose.contains("CODESTORY_ZOEKT_DATA_DIR"))
-    {
-        environment.push((
-            "CODESTORY_ZOEKT_DATA_DIR",
-            docker_bind_path(lexical_data_dir),
-        ));
-    }
-    environment
-}
-
-fn docker_compose_command() -> Result<Command> {
-    Ok(Command::new("docker"))
-}
-
-fn docker_compose_services_for_runtime(
-    runtime: &SidecarRuntimeConfig,
-    mode: EmbeddingServerLaunchMode,
-) -> &'static [&'static str] {
-    match (runtime.vector_backend(), mode) {
-        (
-            crate::config::VectorBackend::ExternalQdrant,
-            EmbeddingServerLaunchMode::DockerComposeEmbed,
-        ) => &[],
-        (
-            crate::config::VectorBackend::ExternalQdrant,
-            EmbeddingServerLaunchMode::NativeSpawned | EmbeddingServerLaunchMode::ExternalEndpoint,
-        ) => &["qdrant"],
-        (_, EmbeddingServerLaunchMode::DockerComposeEmbed) => &["embed"],
-        (
-            _,
-            EmbeddingServerLaunchMode::NativeSpawned | EmbeddingServerLaunchMode::ExternalEndpoint,
-        ) => &[],
-    }
-}
-
-fn vulkan_compose_override_requested(
-    mode: EmbeddingServerLaunchMode,
-    request: Option<&crate::embeddings::EmbeddingAcceleratorRequest>,
-) -> bool {
-    mode == EmbeddingServerLaunchMode::DockerComposeEmbed
-        && request.is_some_and(|request| request.provider == "vulkan")
 }
 
 fn native_embedding_server_launch(
@@ -1624,7 +804,7 @@ fn ensure_native_launch_backend_supported(runtime: &SidecarRuntimeConfig) -> Res
         available
     };
     anyhow::bail!(
-        "CODESTORY_EMBED_SERVER_LAUNCH=native_spawned is unsupported for provider={} on {}/{}; available launch modes: {}; use docker_compose_embed or choose a provider with native_spawned metadata",
+        "CODESTORY_EMBED_SERVER_LAUNCH=native_spawned is unsupported for provider={} on {}/{}; available launch modes: {}; choose a provider with native_spawned metadata or configure a trusted external endpoint",
         request.provider,
         host.os,
         host.arch,
@@ -2534,45 +1714,14 @@ fn cleanup_native_embedding_after_state_write_error(
 }
 
 fn cleanup_pre_state_startup_for_runtime(
-    runtime: &SidecarRuntimeConfig,
-    compose_file: Option<&Path>,
-    compose_owned_for_rollback: bool,
     launch: Option<&crate::health::EmbeddingLaunchMetadata>,
     spawn: Option<NativeEmbeddingSpawn>,
 ) -> Result<()> {
-    cleanup_pre_state_startup_with(
-        compose_owned_for_rollback,
+    cleanup_native_embedding_after_state_write_error(
         launch,
         spawn,
         crate::sidecar::stop_native_embedding_process_for_launch,
-        || {
-            let compose_file = compose_file
-                .context("started Compose sidecar has no resolved compose file for rollback")?;
-            docker_compose_down_for_runtime(compose_file, runtime)
-        },
     )
-}
-
-fn cleanup_pre_state_startup_with(
-    compose_owned_for_rollback: bool,
-    launch: Option<&crate::health::EmbeddingLaunchMetadata>,
-    spawn: Option<NativeEmbeddingSpawn>,
-    stop_native: impl FnOnce(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
-    rollback_compose: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    if let Err(error) = cleanup_native_embedding_after_state_write_error(launch, spawn, stop_native)
-    {
-        failures.push(format!("native embedding cleanup failed: {error:#}"));
-    }
-    if compose_owned_for_rollback && let Err(error) = rollback_compose() {
-        failures.push(format!("Compose rollback failed: {error:#}"));
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!("{}", failures.join("; "))
-    }
 }
 
 fn configure_native_embedding_command(_command: &mut Command) {
@@ -2618,18 +1767,6 @@ fn native_embedding_breakaway_denied(error: &std::io::Error) -> bool {
         let _ = error;
         false
     }
-}
-
-fn docker_bind_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let without_verbatim = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        raw.to_string()
-    };
-    without_verbatim.replace('\\', "/")
 }
 
 fn embed_model_dir(_repo_root: Option<&Path>, _layout: &SidecarLayout) -> Result<PathBuf> {

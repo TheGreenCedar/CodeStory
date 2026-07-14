@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// bge-base-en-v1.5 vector width shared by stored vectors and the llama.cpp model.
 pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
 
-/// GGUF filename under `CODESTORY_EMBED_MODEL_DIR` (see docker/retrieval-compose.yml).
+/// GGUF filename under the managed embedding model directory.
 pub const BGE_BASE_EN_V1_5_GGUF: &str = "bge-base-en-v1.5.Q8_0.gguf";
 
 pub const BGE_QUERY_PREFIX_DEFAULT: &str =
@@ -262,7 +262,6 @@ struct ExactEmbeddingRuntimeState {
     embedding_accelerator_request_provider: Option<String>,
     embedding_accelerator_request_device: Option<String>,
     embedding_launch: Option<crate::health::EmbeddingLaunchMetadata>,
-    embedding_container_identity: Option<String>,
 }
 
 /// Stable id stored on retrieval manifest rows (backend + model family).
@@ -407,43 +406,12 @@ fn embedding_device_readiness_with_observed_state(
 fn observe_sidecar_embedding_device_state(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<EmbeddingDeviceObservation> {
-    let (text, source) =
-        match crate::config::embedding_server_launch_mode_for_runtime(runtime).ok()? {
-            crate::config::EmbeddingServerLaunchMode::NativeSpawned => {
-                return observe_native_embedding_device_state(runtime);
-            }
-            crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed => {
-                (read_container_embedding_log(runtime)?, "sidecar_log")
-            }
-            crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => return None,
-        };
-    match observed_embedding_device_state_from_text(&text) {
-        "unknown" => None,
-        state => Some(EmbeddingDeviceObservation {
-            state,
-            source,
-            detected_provider: observed_embedding_provider_from_text(&text),
-        }),
+    match crate::config::embedding_server_launch_mode_for_runtime(runtime).ok()? {
+        crate::config::EmbeddingServerLaunchMode::NativeSpawned => {
+            observe_native_embedding_device_state(runtime)
+        }
+        crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => None,
     }
-}
-
-fn read_container_embedding_log(runtime: &crate::config::SidecarRuntimeConfig) -> Option<String> {
-    let output = Command::new("docker")
-        .args([
-            "logs",
-            "--tail",
-            "200",
-            &format!("{}-embed", runtime.compose_project),
-        ])
-        .output()
-        .ok()?;
-    output.status.success().then(|| {
-        format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })
 }
 
 fn observe_native_embedding_device_state(
@@ -681,56 +649,30 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
                 .context("gpu_unverified: validate native embedding launch before smoke")?;
             Some(launch)
         }
-        crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed => None,
         crate::config::EmbeddingServerLaunchMode::ExternalEndpoint => unreachable!(),
     };
-    let container_identity_before =
-        if launch_mode == crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed {
-            Some(ensure_persisted_running_embedding_container_identity_from_state(runtime, &state)?)
-        } else {
-            None
-        };
     let probe = probe_product_embedding_runtime_with_timeout(runtime, ACCELERATOR_SMOKE_TIMEOUT);
-    let text = if launch_mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned {
-        let after_state = exact_embedding_runtime_state(runtime)?;
-        if after_state != state {
-            bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
-        }
-        let after = after_state.embedding_launch.ok_or_else(|| {
-            anyhow!("gpu_unverified: native embedding launch identity disappeared during smoke")
-        })?;
-        if native_launch_before.as_ref() != Some(&after) {
-            bail!("gpu_unverified: native embedding launch identity changed during smoke");
-        }
-        crate::sidecar::ensure_native_embedding_launch_identity(&after)
-            .context("gpu_unverified: validate native embedding launch after smoke")?;
-        read_native_embedding_log_current_launch_evidence(&native_embedding_log_path(runtime)).ok()
-    } else {
-        let after_state = exact_embedding_runtime_state(runtime)?;
-        if after_state != state {
-            bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
-        }
-        let after = ensure_persisted_running_embedding_container_identity_from_state(
-            runtime,
-            &after_state,
-        )?;
-        if container_identity_before.as_deref() != Some(after.as_str()) {
-            bail!("gpu_unverified: embedding container identity changed during accelerator smoke");
-        }
-        read_container_embedding_log(runtime)
-    };
+    let after_state = exact_embedding_runtime_state(runtime)?;
+    if after_state != state {
+        bail!("gpu_unverified: persisted embedding runtime identity changed during smoke");
+    }
+    let after = after_state.embedding_launch.ok_or_else(|| {
+        anyhow!("gpu_unverified: native embedding launch identity disappeared during smoke")
+    })?;
+    if native_launch_before.as_ref() != Some(&after) {
+        bail!("gpu_unverified: native embedding launch identity changed during smoke");
+    }
+    crate::sidecar::ensure_native_embedding_launch_identity(&after)
+        .context("gpu_unverified: validate native embedding launch after smoke")?;
+    let text =
+        read_native_embedding_log_current_launch_evidence(&native_embedding_log_path(runtime)).ok();
     let log_proven = text
         .as_deref()
         .is_some_and(|text| runtime_log_proves_requested_accelerator(text, &request));
     let mut device = embedding_device_readiness_for_runtime(runtime);
     if log_proven {
         device.observed_state = "accelerated";
-        device.observation_source =
-            if launch_mode == crate::config::EmbeddingServerLaunchMode::NativeSpawned {
-                "native_log"
-            } else {
-                "sidecar_log"
-            };
+        device.observation_source = "native_log";
         device.full_retrieval_allowed = true;
         device.degraded_reason = None;
     }
@@ -760,63 +702,6 @@ fn probe_product_embedding_runtime_with_timeout(
             elapsed_ms,
         },
     }
-}
-
-pub(crate) fn running_embedding_container_identity(
-    runtime: &crate::config::SidecarRuntimeConfig,
-) -> Result<String> {
-    let output = Command::new("docker")
-        .args([
-            "inspect",
-            "--format",
-            "{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}",
-            &format!("{}-embed", runtime.compose_project),
-        ])
-        .output()
-        .context("gpu_unverified: inspect embedding container identity")?;
-    if !output.status.success() {
-        bail!("gpu_unverified: embedding container identity is unavailable");
-    }
-    validate_running_embedding_container_identity(&String::from_utf8_lossy(&output.stdout))
-}
-
-pub(crate) fn ensure_persisted_running_embedding_container_identity(
-    runtime: &crate::config::SidecarRuntimeConfig,
-) -> Result<String> {
-    let state = exact_embedding_runtime_state(runtime)?;
-    ensure_persisted_running_embedding_container_identity_from_state(runtime, &state)
-}
-
-fn ensure_persisted_running_embedding_container_identity_from_state(
-    runtime: &crate::config::SidecarRuntimeConfig,
-    state: &ExactEmbeddingRuntimeState,
-) -> Result<String> {
-    let identity = running_embedding_container_identity(runtime)?;
-    validate_persisted_running_embedding_container_identity(
-        state.embedding_container_identity.as_deref(),
-        &identity,
-    )?;
-    Ok(identity)
-}
-
-fn validate_persisted_running_embedding_container_identity(
-    persisted: Option<&str>,
-    running: &str,
-) -> Result<()> {
-    if persisted != Some(running) {
-        bail!(
-            "gpu_unverified: running embedding container does not match persisted runtime identity"
-        );
-    }
-    Ok(())
-}
-
-fn validate_running_embedding_container_identity(output: &str) -> Result<String> {
-    let identity = output.trim().to_string();
-    if identity.is_empty() || !identity.ends_with("|true") {
-        bail!("gpu_unverified: embedding container is not running");
-    }
-    Ok(identity)
 }
 
 fn exact_embedding_runtime_state(
@@ -939,7 +824,8 @@ fn default_cpu_allowed_for_host() -> bool {
         return false;
     }
     let host = crate::config::embedding_host_platform();
-    host.os == "macos" && host.arch == "x86_64"
+    (host.os == "macos" && host.arch == "x86_64")
+        || (host.os == "windows" && host.arch == "aarch64")
 }
 
 fn default_embedding_accelerator_request() -> EmbeddingAcceleratorRequest {
@@ -2347,43 +2233,6 @@ offloaded 13/13 layers to GPU\n";
         )
         .expect_err("missing timing must not verify accelerator work");
         assert!(error.to_string().contains("gpu_unverified"));
-    }
-
-    #[test]
-    fn container_identity_requires_running_state() {
-        assert_eq!(
-            validate_running_embedding_container_identity("abc|2026-07-12T00:00:00Z|true\n")
-                .expect("running identity"),
-            "abc|2026-07-12T00:00:00Z|true"
-        );
-        assert!(
-            validate_running_embedding_container_identity("abc|2026-07-12T00:00:00Z|false")
-                .expect_err("stopped container must fail")
-                .to_string()
-                .contains("not running")
-        );
-    }
-
-    #[test]
-    fn running_container_identity_must_match_persisted_runtime_identity() {
-        let persisted = "container-a|2026-07-12T00:00:00Z|true";
-        validate_persisted_running_embedding_container_identity(Some(persisted), persisted)
-            .expect("exact persisted running identity");
-        assert!(
-            validate_persisted_running_embedding_container_identity(
-                Some(persisted),
-                "container-b|2026-07-12T00:01:00Z|true",
-            )
-            .expect_err("replacement container must fail persisted identity proof")
-            .to_string()
-            .contains("does not match persisted")
-        );
-        assert!(
-            validate_persisted_running_embedding_container_identity(None, persisted)
-                .expect_err("missing persisted identity must fail")
-                .to_string()
-                .contains("does not match persisted")
-        );
     }
 
     #[test]

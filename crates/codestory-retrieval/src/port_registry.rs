@@ -58,9 +58,7 @@ pub(crate) struct AgentPortAllocation {
 
 impl AgentPortAllocation {
     pub(crate) fn failed(&self) -> bool {
-        self.owner_id.is_empty()
-            || self.ports.embed_http == 0
-            || (self.ports.qdrant_http == 0) != (self.ports.qdrant_grpc == 0)
+        self.owner_id.is_empty() || self.ports.embed_http == 0
     }
 }
 
@@ -80,20 +78,18 @@ impl RegistryCleanup {
     }
 }
 
-pub(crate) fn allocate_agent_ports_for_backend(
+pub(crate) fn allocate_agent_embedding_port(
     base: &Path,
     namespace: &str,
-    configured: [Option<u16>; 3],
-    qdrant_required: bool,
+    configured: Option<u16>,
 ) -> Result<AgentPortAllocation> {
-    allocate_agent_ports_at(base, namespace, configured, qdrant_required, now_epoch_ms())
+    allocate_agent_port_at(base, namespace, configured, now_epoch_ms())
 }
 
-fn allocate_agent_ports_at(
+fn allocate_agent_port_at(
     base: &Path,
     namespace: &str,
-    configured: [Option<u16>; 3],
-    qdrant_required: bool,
+    configured: Option<u16>,
     now: i64,
 ) -> Result<AgentPortAllocation> {
     if !is_agent_namespace_path_component(namespace) {
@@ -109,85 +105,21 @@ fn allocate_agent_ports_at(
             None
         };
         let mut reserved = reserved_ports_excluding(&registry, namespace);
-        let qdrant_http = if qdrant_required {
-            select_port(
-                configured[0],
-                existing.as_ref().map(|lease| lease.ports.qdrant_http),
-                namespace,
-                "qdrant-http",
-                &mut reserved,
-                state_ports
-                    .as_ref()
-                    .is_some_and(|ports| Some(ports.qdrant_http) == configured[0]),
-            )?
-        } else {
-            0
-        };
-        let qdrant_grpc = if qdrant_required {
-            select_port(
-                configured[1],
-                existing.as_ref().map(|lease| lease.ports.qdrant_grpc),
-                namespace,
-                "qdrant-grpc",
-                &mut reserved,
-                state_ports
-                    .as_ref()
-                    .is_some_and(|ports| Some(ports.qdrant_grpc) == configured[1]),
-            )?
-        } else {
-            0
-        };
         let embed_http = select_port(
-            configured[2],
+            configured,
             existing.as_ref().map(|lease| lease.ports.embed_http),
             namespace,
             "embed",
             &mut reserved,
             state_ports
                 .as_ref()
-                .is_some_and(|ports| Some(ports.embed_http) == configured[2]),
+                .is_some_and(|ports| Some(ports.embed_http) == configured),
         )?;
         let ports = SidecarPorts {
-            qdrant_http,
-            qdrant_grpc,
             embed_http,
             embed_url: SidecarLayout::embed_base_url(embed_http),
         };
-        let embedded_transition = match existing.as_ref() {
-            Some(lease)
-                if !qdrant_required
-                    && lease.ports.qdrant_http != 0
-                    && lease.ports.qdrant_grpc != 0
-                    && ports.qdrant_http == 0
-                    && ports.qdrant_grpc == 0
-                    && ports.embed_http == lease.ports.embed_http =>
-            {
-                lease_is_live(root, lease, now)?
-            }
-            Some(_) | None => false,
-        };
-        if embedded_transition {
-            let lease = existing
-                .as_ref()
-                .context("embedded transition lost its live lease")?;
-            let owner = read_agent_port_owner(root, namespace)?
-                .context("embedded transition requires the current port owner")?;
-            if owner != lease.owner
-                || !sidecar_state_proves_qdrant_transition(root, namespace, &lease.ports)?
-            {
-                anyhow::bail!(
-                    "agent sidecar namespace {namespace} cannot rotate a live Qdrant lease without exact owner and sidecar-state proof"
-                );
-            }
-        }
-        let owner = select_owner(
-            root,
-            namespace,
-            existing.as_ref(),
-            &ports,
-            now,
-            embedded_transition,
-        )?;
+        let owner = select_owner(root, namespace, existing.as_ref(), &ports, now)?;
         let continued = existing
             .as_ref()
             .filter(|lease| lease.owner.id == owner.id && lease.ports == ports);
@@ -255,8 +187,6 @@ pub(crate) fn revalidate_agent_embedding_port(
         let mut selected = lease.ports.clone();
         if force_rotation || !local_port_available(selected.embed_http) {
             let mut reserved = reserved_ports_excluding(&registry, namespace);
-            reserved.insert(selected.qdrant_http);
-            reserved.insert(selected.qdrant_grpc);
             if force_rotation {
                 reserved.insert(selected.embed_http);
             }
@@ -382,17 +312,14 @@ fn load_registry(transaction: &Transaction<'_>) -> Result<BTreeMap<String, Agent
                 renewed_at_epoch_ms,
                 expires_at_epoch_ms,
                 ports: SidecarPorts {
-                    qdrant_http: 0,
-                    qdrant_grpc: 0,
                     embed_http: 0,
                     embed_url: String::new(),
                 },
             });
         match role.as_str() {
-            "qdrant_http" if lease.ports.qdrant_http == 0 => lease.ports.qdrant_http = port,
-            "qdrant_grpc" if lease.ports.qdrant_grpc == 0 => lease.ports.qdrant_grpc = port,
             "embed_http" if lease.ports.embed_http == 0 => lease.ports.embed_http = port,
-            "qdrant_http" | "qdrant_grpc" | "embed_http" => {
+            "qdrant_http" | "qdrant_grpc" => continue,
+            "embed_http" => {
                 anyhow::bail!("sidecar port registry contains a duplicate port role")
             }
             _ => anyhow::bail!("sidecar port registry contains an unknown port role"),
@@ -433,26 +360,17 @@ fn put_lease(transaction: &Transaction<'_>, lease: &AgentPortLease) -> Result<()
             lease.expires_at_epoch_ms,
         ],
     )?;
-    for (role, port) in [
-        ("qdrant_http", lease.ports.qdrant_http),
-        ("qdrant_grpc", lease.ports.qdrant_grpc),
-        ("embed_http", lease.ports.embed_http),
-    ] {
-        if port == 0 {
-            continue;
-        }
-        transaction
-            .execute(
-                "INSERT INTO lease_ports (namespace, role, port) VALUES (?1, ?2, ?3)",
-                params![lease.namespace, role, i64::from(port)],
+    transaction
+        .execute(
+            "INSERT INTO lease_ports (namespace, role, port) VALUES (?1, 'embed_http', ?2)",
+            params![lease.namespace, i64::from(lease.ports.embed_http)],
+        )
+        .with_context(|| {
+            format!(
+                "reserve agent embedding port {} for namespace {}",
+                lease.ports.embed_http, lease.namespace
             )
-            .with_context(|| {
-                format!(
-                    "reserve agent sidecar port {port} for namespace {}",
-                    lease.namespace
-                )
-            })?;
-    }
+        })?;
     Ok(())
 }
 
@@ -671,18 +589,13 @@ fn select_owner(
     existing: Option<&AgentPortLease>,
     ports: &SidecarPorts,
     now: i64,
-    allow_proven_embedded_transition: bool,
 ) -> Result<AgentPortOwner> {
     match existing {
         Some(lease) if lease.ports != *ports => {
-            if lease_is_live(root, lease, now)? && !allow_proven_embedded_transition {
+            if lease_is_live(root, lease, now)? {
                 anyhow::bail!("agent sidecar namespace {namespace} already has a live port lease");
             }
-            if allow_proven_embedded_transition {
-                Ok(lease.owner.clone())
-            } else {
-                Ok(new_agent_port_owner(now))
-            }
+            Ok(new_agent_port_owner(now))
         }
         Some(lease) => match read_agent_port_owner(root, namespace)? {
             Some(owner) if owner.id == lease.owner.id => Ok(owner),
@@ -732,19 +645,10 @@ fn validate_registry(registry: &BTreeMap<String, AgentPortLease>) -> Result<()> 
         {
             anyhow::bail!("sidecar port lease timestamps are invalid");
         }
-        if lease.ports.embed_http == 0
-            || (lease.ports.qdrant_http == 0) != (lease.ports.qdrant_grpc == 0)
-        {
+        if lease.ports.embed_http == 0 {
             anyhow::bail!("sidecar port registry contains an incomplete port set");
         }
-        for port in [
-            lease.ports.qdrant_http,
-            lease.ports.qdrant_grpc,
-            lease.ports.embed_http,
-        ]
-        .into_iter()
-        .filter(|port| *port != 0)
-        {
+        for port in [lease.ports.embed_http] {
             if !ports.insert(port) {
                 anyhow::bail!("sidecar port registry contains invalid or duplicate ports");
             }
@@ -791,33 +695,6 @@ fn sidecar_state_owns_ports(root: &Path, namespace: &str, ports: &SidecarPorts) 
     Ok(owned_sidecar_state_ports(root, namespace)?
         .as_ref()
         .is_some_and(|state_ports| same_port_numbers(state_ports, ports)))
-}
-
-fn sidecar_state_proves_qdrant_transition(
-    root: &Path,
-    namespace: &str,
-    ports: &SidecarPorts,
-) -> Result<bool> {
-    let path = root.join(namespace).join(SIDECAR_STATE_FILE_V3);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-    };
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-    Ok(
-        value.get("owner").and_then(serde_json::Value::as_str) == Some("codestory")
-            && value.get("profile").and_then(serde_json::Value::as_str) == Some("agent")
-            && value.get("namespace").and_then(serde_json::Value::as_str) == Some(namespace)
-            && value
-                .get("compose_project")
-                .and_then(serde_json::Value::as_str)
-                == Some(namespace)
-            && sidecar_ports_from_value(&value)
-                .as_ref()
-                .is_some_and(|state_ports| same_port_numbers(state_ports, ports)),
-    )
 }
 
 fn read_agent_port_owner(root: &Path, namespace: &str) -> Result<Option<AgentPortOwner>> {
@@ -926,16 +803,11 @@ fn is_agent_namespace_path_component(namespace: &str) -> bool {
 }
 
 fn sidecar_ports_are_bound(ports: &SidecarPorts) -> bool {
-    [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http]
-        .into_iter()
-        .filter(|port| *port != 0)
-        .any(|port| !local_port_available(port))
+    !local_port_available(ports.embed_http)
 }
 
 fn same_port_numbers(left: &SidecarPorts, right: &SidecarPorts) -> bool {
-    left.qdrant_http == right.qdrant_http
-        && left.qdrant_grpc == right.qdrant_grpc
-        && left.embed_http == right.embed_http
+    left.embed_http == right.embed_http
 }
 
 fn reserved_ports_excluding(
@@ -945,13 +817,7 @@ fn reserved_ports_excluding(
     registry
         .iter()
         .filter(|(candidate, _)| candidate.as_str() != namespace)
-        .flat_map(|(_, lease)| {
-            [
-                lease.ports.qdrant_http,
-                lease.ports.qdrant_grpc,
-                lease.ports.embed_http,
-            ]
-        })
+        .map(|(_, lease)| lease.ports.embed_http)
         .filter(|port| *port != 0)
         .collect()
 }
@@ -1043,16 +909,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn configured_ports(ports: &SidecarPorts) -> [Option<u16>; 3] {
-        [
-            Some(ports.qdrant_http),
-            Some(ports.qdrant_grpc),
-            Some(ports.embed_http),
-        ]
+    fn configured_port(ports: &SidecarPorts) -> Option<u16> {
+        Some(ports.embed_http)
     }
 
     fn bound_ports() -> (Vec<TcpListener>, SidecarPorts) {
-        let listeners: Vec<_> = (0..3)
+        let listeners: Vec<_> = (0..1)
             .map(|_| TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port"))
             .collect();
         let ports: Vec<_> = listeners
@@ -1062,10 +924,8 @@ mod tests {
         (
             listeners,
             SidecarPorts {
-                qdrant_http: ports[0],
-                qdrant_grpc: ports[1],
-                embed_http: ports[2],
-                embed_url: SidecarLayout::embed_base_url(ports[2]),
+                embed_http: ports[0],
+                embed_url: SidecarLayout::embed_base_url(ports[0]),
             },
         )
     }
@@ -1078,9 +938,6 @@ mod tests {
                 "owner": "codestory",
                 "profile": "agent",
                 "namespace": namespace,
-                "compose_project": namespace,
-                "qdrant_http_port": ports.qdrant_http,
-                "qdrant_grpc_port": ports.qdrant_grpc,
                 "embed_http_port": ports.embed_http,
                 "embed_url": ports.embed_url,
             }))
@@ -1100,7 +957,7 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    allocate_agent_ports_at(&base, &format!("worker-{index}"), [None; 3], true, 100)
+                    allocate_agent_port_at(&base, &format!("worker-{index}"), None, 100)
                         .expect("allocation")
                         .ports
                 })
@@ -1110,11 +967,8 @@ mod tests {
             .into_iter()
             .map(|handle| handle.join().expect("worker"))
             .collect();
-        let unique: BTreeSet<_> = allocations
-            .iter()
-            .flat_map(|ports| [ports.qdrant_http, ports.qdrant_grpc, ports.embed_http])
-            .collect();
-        assert_eq!(unique.len(), 24);
+        let unique: BTreeSet<_> = allocations.iter().map(|ports| ports.embed_http).collect();
+        assert_eq!(unique.len(), 8);
 
         let connection = Connection::open(cache.path().join("sidecars").join(SQLITE_REGISTRY_FILE))
             .expect("registry");
@@ -1125,13 +979,10 @@ mod tests {
     }
 
     #[test]
-    fn embedded_backend_leases_only_the_embedding_port() {
+    fn registry_leases_only_the_embedding_port() {
         let cache = tempdir().expect("cache");
-        let allocation =
-            allocate_agent_ports_for_backend(cache.path(), "embedded", [None; 3], false)
-                .expect("embedded allocation");
-        assert_eq!(allocation.ports.qdrant_http, 0);
-        assert_eq!(allocation.ports.qdrant_grpc, 0);
+        let allocation = allocate_agent_embedding_port(cache.path(), "embedded", None)
+            .expect("embedding allocation");
         assert_ne!(allocation.ports.embed_http, 0);
 
         let connection = Connection::open(cache.path().join("sidecars").join(SQLITE_REGISTRY_FILE))
@@ -1150,18 +1001,15 @@ mod tests {
     fn crashed_owner_is_reclaimed() {
         let cache = tempdir().expect("cache");
         let root = cache.path().join("sidecars");
-        let first =
-            allocate_agent_ports_at(cache.path(), "crashed", [None; 3], true, 100).expect("first");
-        let live =
-            allocate_agent_ports_at(cache.path(), "live", [None; 3], true, 100).expect("live");
+        let first = allocate_agent_port_at(cache.path(), "crashed", None, 100).expect("first");
+        let live = allocate_agent_port_at(cache.path(), "live", None, 100).expect("live");
         std::fs::remove_file(agent_port_owner_path(&root, "crashed")).expect("remove owner");
         renew_agent_port_lease(cache.path(), "live", &live.owner_id, &live.ports)
             .expect("renew unrelated lease");
-        let replacement = allocate_agent_ports_at(
+        let replacement = allocate_agent_port_at(
             cache.path(),
             "replacement",
-            configured_ports(&first.ports),
-            true,
+            configured_port(&first.ports),
             101,
         )
         .expect("replacement");
@@ -1174,28 +1022,21 @@ mod tests {
         let root = cache.path().join("sidecars");
         let (listeners, ports) = bound_ports();
         write_owned_state(&root, "live", &ports);
-        allocate_agent_ports_at(cache.path(), "live", configured_ports(&ports), true, 100)
+        allocate_agent_port_at(cache.path(), "live", configured_port(&ports), 100)
             .expect("owned allocation");
-        let error = allocate_agent_ports_at(
+        let error = allocate_agent_port_at(
             cache.path(),
             "other",
-            configured_ports(&ports),
-            true,
+            configured_port(&ports),
             lease_expiry(100) + 1,
         )
         .expect_err("bound ports remain reserved");
-        assert_eq!(listeners.len(), 3);
+        assert_eq!(listeners.len(), 1);
         assert!(format!("{error:#}").contains("already reserved"));
 
         let unowned = tempdir().expect("unowned cache");
-        let error = allocate_agent_ports_at(
-            unowned.path(),
-            "unowned",
-            configured_ports(&ports),
-            true,
-            100,
-        )
-        .expect_err("bound ports require matching state");
+        let error = allocate_agent_port_at(unowned.path(), "unowned", configured_port(&ports), 100)
+            .expect_err("bound ports require matching state");
         assert!(format!("{error:#}").contains("bound without matching ownership"));
     }
 
@@ -1203,11 +1044,9 @@ mod tests {
     fn stale_owner_token_cannot_renew_successor() {
         let cache = tempdir().expect("cache");
         let root = cache.path().join("sidecars");
-        let first =
-            allocate_agent_ports_at(cache.path(), "same", [None; 3], true, 100).expect("first");
+        let first = allocate_agent_port_at(cache.path(), "same", None, 100).expect("first");
         std::fs::remove_file(agent_port_owner_path(&root, "same")).expect("remove owner");
-        let successor =
-            allocate_agent_ports_at(cache.path(), "same", [None; 3], true, 101).expect("successor");
+        let successor = allocate_agent_port_at(cache.path(), "same", None, 101).expect("successor");
         assert_ne!(first.owner_id, successor.owner_id);
         let error = renew_agent_port_lease(cache.path(), "same", &first.owner_id, &first.ports)
             .expect_err("stale token");
@@ -1227,9 +1066,8 @@ mod tests {
                 .expect("legacy registry"),
         )
         .expect("legacy registry");
-        let migrated =
-            allocate_agent_ports_at(cache.path(), "legacy", configured_ports(&ports), true, 100)
-                .expect("migration");
+        let migrated = allocate_agent_port_at(cache.path(), "legacy", configured_port(&ports), 100)
+            .expect("migration");
         assert_eq!(migrated.ports, ports);
         assert!(root.join(SQLITE_REGISTRY_FILE).is_file());
         let projected: LegacyPortRegistry = serde_json::from_slice(
@@ -1244,7 +1082,7 @@ mod tests {
         std::fs::create_dir_all(&corrupt_root).expect("corrupt root");
         let corrupt_path = corrupt_root.join(LEGACY_REGISTRY_FILE);
         std::fs::write(&corrupt_path, b"{").expect("corrupt registry");
-        let error = allocate_agent_ports_at(corrupt.path(), "current", [None; 3], true, 100)
+        let error = allocate_agent_port_at(corrupt.path(), "current", None, 100)
             .expect_err("corruption must fail closed");
         assert!(error.to_string().contains("malformed legacy"));
         assert_eq!(std::fs::read(&corrupt_path).expect("preserved"), b"{");
