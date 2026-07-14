@@ -108,6 +108,20 @@ test("checked-in candidate and report are deterministic and fully attested", () 
   assert.ok(report.artifact_paths.every(({ sha256, bytes }) => /^[0-9a-f]{64}$/.test(sha256) && bytes > 0));
 });
 
+test("packet selectors normalize to production transport row modes", () => {
+  const dir = workspace();
+  const packet = JSON.parse(readFileSync(path.join(dir, "packet.json")));
+  assert.deepEqual(packet.modes, ["cold-cli"]);
+  assert.deepEqual([...new Set(packet.release_evidence.rows.map((row) => row.mode))], ["cold_cli_packet"]);
+  produce(dir);
+
+  for (const row of packet.release_evidence.rows) row.mode = "warm_stdio_packet";
+  writeFileSync(path.join(dir, "packet.json"), JSON.stringify(packet));
+  const result = run("produce", ["--profile", "ci-contract-v1", "--stats", path.join(dir, "stats.json"), "--packet", path.join(dir, "packet.json"), "--out", path.join(dir, "candidate-2.json")]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /row modes do not match top-level modes/);
+});
+
 test("missing and all-zero raw artifacts fail production", () => {
   const dir = workspace();
   let result = run("produce", ["--profile", "ci-contract-v1", "--stats", path.join(dir, "missing.json"), "--packet", path.join(dir, "packet.json"), "--out", path.join(dir, "candidate.json")]);
