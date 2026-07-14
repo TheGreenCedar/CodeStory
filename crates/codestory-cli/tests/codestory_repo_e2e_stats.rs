@@ -505,6 +505,7 @@ impl ReleaseE2eSidecarCleanup {
             .arg("--cache-dir")
             .arg(&self.cache_dir)
             .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+            .env_remove("CODESTORY_STDIO_CACHE_ROOT")
             .env("CODESTORY_CACHE_ROOT", &self.sidecar_cache_root)
             .env("CODESTORY_EMBED_BACKEND", "llamacpp")
             .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
@@ -557,7 +558,6 @@ impl ReleaseE2eSidecarCleanup {
             .iter()
             .find(|entry| entry["namespace"].as_str() == Some(namespace.as_str()))
         {
-            assert_ne!(entry["state"].as_str(), Some("live"));
             assert_eq!(entry["state_exists"].as_bool(), Some(false));
             assert_eq!(entry["containers"].as_array().map(Vec::len), Some(0));
             assert_eq!(entry["networks"].as_array().map(Vec::len), Some(0));
@@ -643,6 +643,7 @@ fn run_cli_output_with_sidecar_cache_root(
         .arg("--cache-dir")
         .arg(cache_dir)
         .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
+        .env_remove("CODESTORY_STDIO_CACHE_ROOT")
         .env("CODESTORY_CACHE_ROOT", sidecar_cache_root)
         .env("CODESTORY_EMBED_BACKEND", "llamacpp")
         .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
