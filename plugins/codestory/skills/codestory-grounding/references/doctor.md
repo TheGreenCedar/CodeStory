@@ -22,11 +22,11 @@ Reads project/cache/index/retrieval health without mutating the index. Use it fo
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> doctor --project <target-workspace>` | Reports project root, cache path, indexed stats, retrieval state, sidecar embedding setup, environment hints, and next commands. |
-| Failure path | In MCP, follow project-scoped `status` `recommended_next_calls`, normally `sidecar_setup` with the same project and `action=repair`, then another status call for that project. In CLI/debug transcripts, use `fix --project <target-workspace> --format json` or the specific setup/index command surfaced by `doctor`; use explicit `index --refresh full` only when the reported failure calls for a rebuild. If symbol docs, dense anchors, policy version, Qdrant counts, or semantic health report partial/stale/failed state, repair before trusting broad packet/search evidence. | Separates missing index, stale symbol docs, partial dense anchors, and mandatory retrieval setup failures. |
+| Failure path | In MCP, retry the intended tool after its reported delay; read project-scoped status only if automatic preparation stops converging. In CLI/debug transcripts, use `fix --project <target-workspace> --format json` or the specific setup/index command surfaced by `doctor`; use explicit `index --refresh full` only when the reported failure calls for a rebuild. If symbol docs, dense anchors, policy version, Qdrant counts, or semantic health report partial/stale/failed state, do not trust broad evidence until the managed path recovers. | Separates user-facing capability state from maintainer diagnostics. |
 | Integration edge | Use doctor before `ground`, `search --why`, `explore`, `context`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
 
 For MCP/runtime drift, collect binary evidence only after status is missing or
-suspect (see [status-contract.md](status-contract.md#runtime-repair)). Installed
+suspect (see [status-contract.md](status-contract.md#maintainer-recovery)). Installed
 plugin MCP runtime changes require managed status/reinstall/reload, or an
 explicit `CODESTORY_CLI` override for local development, before starting a fresh
 Codex host/app session.

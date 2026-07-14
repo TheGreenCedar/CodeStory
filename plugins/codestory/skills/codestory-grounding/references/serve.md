@@ -8,7 +8,10 @@ For direct MCP-style clients:
 codestory-cli serve --stdio --multi-project --refresh none
 ```
 
-The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap and `repair_setup` diagnostics when spawn fails). Once MCP is live, call `status` with the target repository's absolute path before any grounding, packet, or search call. Pass the same `project` to every tool.
+The installed plugin starts `scripts/codestory-mcp.cjs`, provisions the managed
+CLI when needed, and keeps diagnostic MCP available if startup fails. Once MCP
+is live, call the intended repository tool directly and pass the same absolute
+`project` path to every call.
 
 ## Usage
 
@@ -45,7 +48,7 @@ The installed plugin starts `scripts/codestory-mcp.cjs` (managed CLI bootstrap a
 | Path | Command | Expected result |
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> serve --project <target-workspace> --addr 127.0.0.1:3917` then `GET /health` | Local JSON service returns `{"ok": true}` and browser routes use the existing index. |
-| Failure path | If MCP status reports missing index, follow `recommended_next_calls`, normally `sidecar_setup repair` then a status reread. In CLI/debug transcripts, use `fix --project <target-workspace> --format json` or the specific command surfaced by `doctor`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. | Distinguishes cache readiness from port conflicts. |
+| Failure path | If a tool reports `preparing`, retry that same tool after `retry_after_ms`. Read status only if the managed path stops converging. In CLI/debug transcripts, use `fix --project <target-workspace> --format json` or the specific command surfaced by `doctor`; use explicit `index --refresh full` only when the health output calls for a rebuild. If bind fails, choose a free `--addr`. | Distinguishes managed preparation from cache or port failures. |
 | Integration edge | Use `serve --stdio --multi-project` for MCP-style clients; it exposes project-scoped `status`, `ground`, `files`, `affected`, `packet`, `search`, `symbol`, and graph/source tools. | One server safely routes interleaved requests from different repositories without mutable workspace state. |
 
 Stdio MCP status fields and allowed-surface rules: [status-contract.md](status-contract.md).

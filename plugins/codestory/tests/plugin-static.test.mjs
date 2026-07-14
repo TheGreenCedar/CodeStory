@@ -623,28 +623,13 @@ test("mcp launcher prefers a checksummed managed cli without PATH", async () => 
     assert.equal(observed.pluginRoot, pluginRoot);
     assert.equal(observed.pluginCacheVersion, "");
     assert.equal(observed.activeStatePath, undefined);
-    assert.equal(observed.sidecarPolicy, "ask");
-    assert.match(observed.sidecarEnable, /sidecar-policy enable/u);
-    assert.match(observed.sidecarEnable, /--policy-file/u);
+    assert.equal(observed.sidecarPolicy, undefined);
+    assert.equal(observed.sidecarEnable, undefined);
     assert.equal(observed.sidecarRepair, undefined);
     assert.equal(observed.dirtyMarkerRoot, undefined);
     assert.equal(observed.dirtyMarkerPath, undefined);
     assert.deepEqual(observed.args, ["serve", "--stdio", "--multi-project", "--refresh", "none"]);
-
-    const enable = spawnSync(observed.sidecarEnable, {
-      shell: true,
-      env: {
-        ...process.env,
-        PLUGIN_DATA: "",
-        COPILOT_PLUGIN_DATA: "",
-      },
-      encoding: "utf8",
-    });
-    assert.equal(enable.status, 0, enable.stderr);
-    const policy = JSON.parse(
-      await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
-    );
-    assert.equal(policy.state, "enabled");
+    await assert.rejects(access(join(dataDir, "sidecar-setup-policy.json")), /ENOENT/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -1536,20 +1521,12 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
   const binDir = await mkdtemp(join(tmpdir(), "codestory-delegated-stdio-bin-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const realRepoRoot = await realpath(repoRoot);
-  const input = [
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: "status",
-      method: "resources/read",
-      params: { uri: "codestory://status" },
-    }),
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: "sidecar-status",
-      method: "tools/call",
-      params: { name: "sidecar_setup", arguments: { action: "status" } },
-    }),
-  ].join("\n") + "\n";
+  const input = JSON.stringify({
+    jsonrpc: "2.0",
+    id: "status",
+    method: "resources/read",
+    params: { uri: "codestory://status" },
+  }) + "\n";
   const cliPath = await writeNodeCli(
     binDir,
     [
@@ -1570,26 +1547,6 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
       }),
       "utf8",
     );
-    const staleCliPath = join(
-      binDir,
-      version,
-      process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-    );
-    await writeFile(
-      join(dataDir, "sidecar-setup-policy.json"),
-      JSON.stringify({
-        state: "ask",
-        updated_at: "2026-07-09T00:00:00.000Z",
-        last_repair: {
-          state: "completed",
-          updated_at: "2026-07-09T00:00:00.000Z",
-          project_root: realRepoRoot,
-          command: `${JSON.stringify(staleCliPath)} ready --goal agent --repair`,
-        },
-      }),
-      "utf8",
-    );
-
     const result = spawnSync(process.execPath, [launcher], {
       cwd: pluginRoot,
       env: {
@@ -1606,7 +1563,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 2, result.stdout);
+    assert.equal(responses.length, 1, result.stdout);
     const status = JSON.parse(responses[0].result.contents[0].text);
     assert.equal(status.degraded_reason, "runtime_stdio_child_exit");
     assert.equal(status.project_root, null);
@@ -1616,13 +1573,7 @@ test("mcp launcher fails open when delegated stdio runtime exits", async () => {
       status.readiness[0].setup.probe_error,
       /codestory-cli serve --stdio exited with status 17/u,
     );
-    assert.equal(status.sidecar_setup.last_repair.current, false);
-    assert.equal(status.sidecar_setup.last_repair.stale_reason, "last_repair_cli_path_mismatch");
-    assert.equal(responses[1].result.structuredContent.last_repair.current, false);
-    assert.equal(
-      responses[1].result.structuredContent.last_repair.stale_reason,
-      "last_repair_cli_path_mismatch",
-    );
+    assert.equal(status.managed_retrieval.automatic, true);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
     await rm(binDir, { recursive: true, force: true });
@@ -2165,8 +2116,8 @@ test("projectless mcp hands off to stdio without active project state", async ()
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { serverInfo: { name: 'codestory' } } }) + '\\n');",
       "      } else if (request.method === 'tools/list') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
-      "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'sidecar_setup') {",
-      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { state: 'runtime-sidecar-setup' } } }) + '\\n');",
+      "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'ground') {",
+      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { structuredContent: { state: 'ready' } } }) + '\\n');",
       "      } else if (request.method === 'resources/read') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { contents: [{ uri: request.params.uri, mimeType: 'application/json', text: JSON.stringify({ project_root: process.env.CODESTORY_PLUGIN_PROJECT_ROOT, project_root_source: process.env.CODESTORY_PLUGIN_PROJECT_ROOT_SOURCE }) }] } }) + '\\n');",
       "      }",
@@ -2237,13 +2188,13 @@ test("projectless mcp hands off to stdio without active project state", async ()
     });
     assert.equal(init.result.serverInfo.name, "codestory");
 
-    const repaired = await sendRequest({
+    const grounded = await sendRequest({
       jsonrpc: "2.0",
-      id: "repair",
+      id: "ground",
       method: "tools/call",
-      params: { name: "sidecar_setup", arguments: { project: realRepoRoot, action: "repair" } },
+      params: { name: "ground", arguments: { project: realRepoRoot } },
     });
-    assert.equal(repaired.result.structuredContent.state, "runtime-sidecar-setup");
+    assert.equal(grounded.result.structuredContent.state, "ready");
 
     const tools = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/list" });
     assert.deepEqual(tools.result.tools.map((tool) => tool.name), ["ground"]);
@@ -2405,10 +2356,10 @@ test("bootstrap-status binds Rust readiness to request-scoped project identity",
     assert.equal(result.status, 0, result.stderr);
     const status = JSON.parse(result.stdout.trim());
     assert.equal(status.ready, true);
-    assert.equal(status.runtime_truth.sidecar_status_ref, "readiness_lanes.agent_packet_search");
+    assert.equal(status.runtime_truth.retrieval_status_ref, "readiness_lanes.agent_packet_search");
     assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
     assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
-    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "retrieval_status"), false);
     assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness_lanes.agent_packet_search.status, "ready");
     assert.equal(status.project_identity.project_identity_schema_version, 3);
@@ -2551,26 +2502,10 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
-    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "sidecar_setup", arguments: { action: "status" } } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "sidecar_setup", arguments: { action: "repair" } } }),
-    JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
   ].join("\n") + "\n";
 
   try {
-    await writeFile(
-      join(dataDir, "sidecar-setup-policy.json"),
-      JSON.stringify({
-        state: "ask",
-        updated_at: "2026-07-09T00:00:00.000Z",
-        last_repair: {
-          state: "completed",
-          updated_at: "2026-07-09T00:00:00.000Z",
-          project_root: repoRoot,
-          command: '"C:\\Users\\alber\\.codex\\plugins\\data\\codestory-TheGreenCedar\\codestory-cli\\0.12.3\\bin\\codestory-cli.exe" ready --goal agent --repair',
-        },
-      }),
-      "utf8",
-    );
     const result = spawnSync(process.execPath, [launcher], {
       env: {
         PLUGIN_DATA: "",
@@ -2588,7 +2523,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 6, result.stdout);
+    assert.equal(responses.length, 4, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.source_checkout_version, null);
@@ -2597,13 +2532,15 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(status.plugin_runtime.cli_path, null);
     assert.equal(status.runtime_truth.runtime_source, "managed_unavailable");
     assert.equal(status.runtime_truth.plugin_root, pluginRoot);
-    assert.equal(status.runtime_truth.sidecar_policy, "ask");
-    assert.equal(status.runtime_truth.sidecar_status_ref, null);
+    assert.equal(status.runtime_truth.managed_retrieval, "automatic");
+    assert.equal(status.retrieval_contract_version, null);
+    assert.equal(Object.hasOwn(status, "sidecar_contract_version"), false);
+    assert.equal(status.runtime_truth.retrieval_status_ref, null);
     assert.equal(status.runtime_truth.readiness_refs.local_graph, "readiness[goal=local_navigation]");
     assert.equal(status.runtime_truth.readiness_broker_ref, "readiness_broker");
     assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "local_default"), false);
     assert.equal(Object.hasOwn(status.runtime_truth.readiness_refs, "agent_packet_search"), false);
-    assert.equal(Object.hasOwn(status.runtime_truth, "sidecar_status"), false);
+    assert.equal(Object.hasOwn(status.runtime_truth, "retrieval_status"), false);
     assert.equal(Object.hasOwn(status.runtime_truth, "readiness_lanes"), false);
     assert.equal(status.readiness[0].status, "repair_setup");
     assert.equal(status.readiness[0].repair_reason, "managed_cli_unavailable");
@@ -2652,34 +2589,12 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(status.readiness_broker.gpu_proof.embed_smoke_ok, null);
     assert.equal(status.readiness_broker.gpu_proof.embed_smoke_ms, null);
     assert.equal(status.allowed_surfaces.ground.allowed, false);
-    assert.equal(status.allowed_surfaces.sidecar_setup.allowed, true);
-    assert.deepEqual(status.allowed_surfaces.sidecar_setup.allowed_actions, ["status", "enable", "disable", "ask"]);
-    assert.deepEqual(status.allowed_surfaces.sidecar_setup.canonical_arguments, { action: "status" });
-    assert.equal(status.sidecar_setup.last_repair.current, false);
-    assert.match(
-      status.sidecar_setup.last_repair.stale_reason,
-      /last_repair_cli_version_mismatch:0\.12\.3!=/,
-    );
-    assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
+    assert.equal(status.managed_retrieval.automatic, true);
     assert.match(status.readiness[0].minimum_next[0], /Refresh or reinstall the CodeStory plugin/u);
-    assert.deepEqual(responses[2].result.tools.map((tool) => tool.name), ["sidecar_setup"]);
-    assert.deepEqual(
-      responses[2].result.tools[0].inputSchema.properties.action.enum,
-      ["status", "enable", "disable", "ask"],
-    );
-    assert.equal(responses[3].result.structuredContent.last_repair.current, false);
-    assert.match(
-      responses[3].result.structuredContent.last_repair.stale_reason,
-      /last_repair_cli_version_mismatch:0\.12\.3!=/,
-    );
-    assert.equal(responses[4].result.isError, true);
-    assert.equal(
-      responses[4].result.structuredContent.code,
-      "repair_unavailable_diagnostic_fail_open",
-    );
-    assert.equal(responses[5].error.code, -32602);
-    assert.match(responses[5].error.message, /grounding tools are unavailable/u);
-    assert.match(responses[5].error.message, /restore a compatible stdio runtime/u);
+    assert.deepEqual(responses[2].result.tools, []);
+    assert.equal(responses[3].error.code, -32602);
+    assert.match(responses[3].error.message, /grounding tools are temporarily unavailable/u);
+    assert.match(responses[3].error.message, /Retry after the host reports that CodeStory is ready/u);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2797,9 +2712,7 @@ test("mcp launcher fails open when CODESTORY_CLI override cannot spawn", async (
     assert.equal(status.plugin_runtime.cli_source, "local_dev_override");
     assert.equal(status.readiness[0].repair_reason, "local_dev_override_cli_unspawnable");
     assert.equal(status.allowed_surfaces.ground.allowed, false);
-    assert.equal(status.allowed_surfaces.sidecar_setup.allowed, true);
-    assert.deepEqual(status.allowed_surfaces.sidecar_setup.allowed_actions, ["status", "enable", "disable", "ask"]);
-    assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
+    assert.equal(status.managed_retrieval.automatic, true);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2891,110 +2804,6 @@ test("mcp launcher fails open when managed cli probe fails", async () => {
       version,
     );
     assert.doesNotMatch(JSON.stringify(status.recommended_next_calls), /"tool":"repair_all"/u);
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("mcp launcher persists sidecar setup policy in plugin data", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-policy-"));
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-
-  try {
-    const enable = spawnSync(process.execPath, [launcher, "sidecar-policy", "enable"], {
-      env: { PLUGIN_DATA: dataDir },
-      encoding: "utf8",
-    });
-    assert.equal(enable.status, 0, enable.stderr);
-    assert.equal(JSON.parse(enable.stdout).state, "enabled");
-
-    const disable = spawnSync(process.execPath, [launcher, "sidecar-policy", "disable"], {
-      env: { PLUGIN_DATA: dataDir },
-      encoding: "utf8",
-    });
-    assert.equal(disable.status, 0, disable.stderr);
-    assert.equal(JSON.parse(disable.stdout).state, "disabled");
-
-    const repair = spawnSync(process.execPath, [launcher, "sidecar-policy", "repair"], {
-      env: { PLUGIN_DATA: dataDir },
-      encoding: "utf8",
-    });
-    assert.equal(repair.status, 0, repair.stderr);
-    assert.equal(JSON.parse(repair.stdout).state, "enabled");
-
-    const policy = JSON.parse(
-      await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"),
-    );
-    assert.equal(policy.state, "enabled");
-  } finally {
-    await rm(dataDir, { recursive: true, force: true });
-  }
-});
-
-test("enabled sidecar policy defers repair until after MCP startup", async () => {
-  const { spawnSync } = await import("node:child_process");
-  const version = await readPluginVersion();
-  const dataDir = await mkdtemp(join(tmpdir(), "codestory-sidecar-enabled-"));
-  const logFile = join(dataDir, "calls.jsonl");
-  const cliDir = join(dataDir, "codestory-cli", version);
-  const cliPath = join(
-    cliDir,
-    process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-  );
-  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
-
-  try {
-    await mkdir(cliDir, { recursive: true });
-    await writeRecordingCli(cliPath);
-    const sha256 = createHash("sha256")
-      .update(await readFile(cliPath))
-      .digest("hex");
-    await writeFile(
-      join(cliDir, "manifest.json"),
-      JSON.stringify(managedReleaseManifest(
-        version,
-        process.platform === "win32" ? "codestory-cli.cmd" : "codestory-cli",
-        sha256,
-      )),
-      "utf8",
-    );
-    await writeFile(
-      join(dataDir, "sidecar-setup-policy.json"),
-      JSON.stringify({ state: "enabled" }),
-      "utf8",
-    );
-
-    const result = spawnSync(process.execPath, [launcher], {
-      env: {
-        PLUGIN_DATA: dataDir,
-        TEST_LOG: logFile,
-        TEST_CODESTORY_VERSION: version,
-        PATH: "",
-        ComSpec: process.env.ComSpec || process.env.COMSPEC || "",
-      },
-      encoding: "utf8",
-    });
-    assert.equal(result.status, 0, result.stderr);
-
-    const text = await readFile(logFile, "utf8");
-    const calls = text.trim().split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
-    const repairCalls = calls.filter((call) => call.repair);
-    assert.equal(repairCalls.length, 0, text);
-    const serveCall = calls.find((call) => {
-      return JSON.stringify(call.args) === JSON.stringify([
-        "serve",
-        "--stdio",
-        "--multi-project",
-        "--refresh",
-        "none",
-      ]);
-    });
-    assert.ok(serveCall, text);
-    assert.equal(serveCall.policy, "enabled");
-    const policy = JSON.parse(await readFile(join(dataDir, "sidecar-setup-policy.json"), "utf8"));
-    assert.equal(policy.state, "enabled");
-    assert.equal(policy.last_repair, undefined);
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -4018,10 +3827,10 @@ test("hook emits MCP activation guidance without running CLI", async () => {
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
     assert.match(context, /CODESTORY REQUEST ROUTING ACTIVE/u);
     assert.match(context, /Route: Symbol ownership/u);
-    assert.match(context, /codestory mcp ground status packet search/u);
+    assert.match(context, /codestory mcp ground packet search symbol/u);
     assert.match(context, /absolute repository cwd/u);
-    assert.match(context, /local graph surfaces before source/u);
-    assert.match(context, /Repair only when packet\/search is required/u);
+    assert.match(context, /Call the CodeStory tool that matches the request directly/u);
+    assert.match(context, /If CodeStory is preparing, retry that same tool/u);
     assert.match(context, /Hook text routes; only live MCP or verified source is evidence/u);
     assert.doesNotMatch(context, /CodeStory hook output truncated/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
@@ -4071,7 +3880,7 @@ test("hook qualification compares executable policies with sourced MCP observati
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-hook-qualification-"));
   const toolVocabulary = new Set([
     "affected", "callees", "callers", "definition", "files", "ground", "packet",
-    "search", "sidecar_setup", "snippet", "status", "symbol", "trace", "trail",
+    "search", "snippet", "status", "symbol", "trace", "trail",
   ]);
   const record = (output) => {
     const context = output.hookSpecificOutput?.additionalContext || "";
@@ -4239,7 +4048,7 @@ test("compact and resume session starts re-inject complete bounded routing", asy
       const context = output.hookSpecificOutput.additionalContext;
       assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
       assert.match(context, /absolute repository cwd/u);
-      assert.match(context, /codestory mcp ground status packet search/u);
+      assert.match(context, /codestory mcp ground packet search symbol/u);
       assert.doesNotMatch(context, /truncated/u);
       assert.equal(context.endsWith("tools."), true);
     }

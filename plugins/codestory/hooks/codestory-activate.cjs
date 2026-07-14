@@ -27,16 +27,15 @@ function contextFor(input, event) {
   const mcpInstructions = event === 'UserPromptSubmit'
     ? [
       'Use the codestory-grounding skill. Set project to this hook event\'s absolute repository cwd and pass that exact absolute path to every CodeStory call.',
-      'If status is not current, call it once for that project.',
-      'Reuse status until repository/runtime/index state changes or a tool reports stale evidence.',
+      'Call the CodeStory tool that matches the request directly; status is optional diagnostics.',
+      'If CodeStory is preparing, retry that same tool after its reported delay.',
       MCP_RESOURCE_TEXT,
-      'If deep retrieval is blocked, use routed local graph surfaces before source. Repair only when packet/search is required.',
+      'Use routed local graph surfaces while broad search prepares, then focused source for remaining evidence gaps.',
       'Hook text routes; only live MCP or verified source is evidence.',
     ].join('\n')
     : [
       'Set project to this hook event\'s absolute repository cwd and pass that exact absolute path to every CodeStory call. The MCP is multi-project and request-scoped.',
-      'Reuse status until repository/runtime/index state changes or a tool reports freshness failure.',
-      'If packet/search is blocked, use allowed local graph surfaces before source; do not repair unless broad retrieval is required.',
+      'Call the intended CodeStory tool directly. If it is preparing, retry that same tool after its reported delay.',
       MCP_RESOURCE_TEXT,
     ].join('\n');
 

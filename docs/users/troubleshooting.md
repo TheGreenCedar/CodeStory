@@ -6,53 +6,32 @@ work through the steps in order.
 Trust boundaries: [Trust and readiness](trust-and-readiness.md). Terms:
 [Glossary](../glossary.md).
 
-**Need JSON field names?** Common status keys: `allowed_surfaces`,
-`retrieval_mode`, and `recommended_next_calls`. Full agent contract:
+**Need JSON field names?** Normal tools report their capability state and a
+retry delay when preparation is still running. Full agent contract:
 [status-contract](../../plugins/codestory/skills/codestory-grounding/references/status-contract.md).
 CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#readiness-and-repair).
 
-## Repair quick reference
+## Quick reference
 
-| Symptom | Supported action | Check in output |
+| Symptom | Supported action | Healthy result |
 | --- | --- | --- |
-| Repo map stale or blocked | Agent reads `codestory://status`, follows `recommended_next_calls`, then rereads status | Local graph surfaces are allowed after the reread |
-| Broad search blocked | Same MCP `sidecar_setup repair` loop | `packet`, `search`, or `context` allowed, `retrieval_mode` is `full`, and any required live accelerator proof is verified |
+| Repo map stale | Retry `ground`; CodeStory refreshes the map automatically | `ground` returns current files and symbols |
+| Broad search preparing | Retry the same `packet`, `search`, or `context` call after `retry_after_ms` | The requested tool returns cited evidence |
 | MCP down, need handoff | Reload/fix host MCP; CLI can collect a debug transcript only | `codestory://status` becomes visible in the agent host |
-| Sidecar health | MCP status first; CLI `retrieval status` only for maintainer evidence | `retrieval_mode` is `full` before trusting packet/search |
+| Managed runtime failed | Use `codestory://status` or CLI diagnostics only after automatic retries stop converging | The requested tool returns `ready` instead of `needs_environment` or `unavailable` |
 
 ## Decision tree
 
 ```mermaid
 flowchart TD
-  start([Session feels wrong]) --> q1{Can the agent read<br/>CodeStory status?}
-  q1 -->|No| mcp[MCP not connected]
-  q1 -->|Yes| qTools{Are mcp__codestory<br/>tools visible?}
-  qTools -->|No| toolsHidden[Resources only]
-  qTools -->|Yes| q2{Is the repo map ready?}
-  q2 -->|No| local[Local navigation lane]
-  q2 -->|Yes| q3{Need packet or search?}
-  q3 -->|No| ok[Local tools should work]
-  q3 -->|Yes| q4{Is broad search ready?}
-  q4 -->|No| sidecar[Packet/search lane]
-  q4 -->|Yes| ok2[Broad search should work]
-  mcp --> fix_mcp[MCP registration]
-  toolsHidden --> hostBlocker[Report host tool visibility]
-  local --> fix_local[Refresh or repair local index]
-  sidecar --> nativeBusy{Native embedding busy?}
-  nativeBusy -->|stale| fix_sidecar[Sidecar setup or repair]
-  nativeBusy -->|same project reusable| fix_sidecar
-  nativeBusy -->|foreign or unverifiable| waitBusy[Wait and reread status]
-  nativeBusy -->|no| fix_sidecar
-  fix_mcp --> host[Host guide]
-  hostBlocker --> host
-  fix_local --> reread
-  fix_sidecar --> mcp_repair
-  waitBusy --> reread
-  mcp_repair --> reread["Reread codestory://status"]
-  host --> codex[Codex guide]
-  host --> cursor[Cursor guide]
-  host --> claude[Claude Code guide]
-  host --> copilot[Copilot guide]
+  start([Call the intended CodeStory tool]) --> result{Result state}
+  result -->|ready| done[Use the cited evidence]
+  result -->|preparing or updating| retry[Wait for retry_after_ms]
+  retry --> start
+  result -->|working_locally| local[Use local navigation and retry broad search later]
+  result -->|needs_environment| host[Follow the one plain-language host requirement]
+  result -->|unavailable| fallback[Use source inspection and report the gap]
+  start -->|tool missing| mcp[Reload the plugin host]
 ```
 
 ## Host x symptom
@@ -60,8 +39,8 @@ flowchart TD
 | Symptom | Codex | Cursor | Claude Code | Copilot |
 | --- | --- | --- | --- | --- |
 | MCP missing | Fresh thread after `/plugins` install | Check `.cursor/mcp.json`; reload MCP server | MCP configured separately from hooks | MCP not auto-started; configure or use CLI |
-| Stale index / wrong symbols | Follow status repair guidance in the current thread | Run local repair; reload MCP only for transport or registration changes | Run local repair in the current session | Run [local repair](cli-reference.md#readiness-and-repair) |
-| Packet/search blocked | Agent calls MCP `sidecar_setup repair` when status says so | Same; verify retrieval mode | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
+| Stale index / wrong symbols | Retry `ground`; CodeStory refreshes automatically | Retry `ground` | Retry `ground` | Run [local repair](cli-reference.md#readiness-and-repair) |
+| Broad search preparing | Retry the same tool after its delay | Same | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
 | Version drift after update | Refresh marketplace, refresh plugin package, restart host, fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
 
 Host-specific steps: [Codex](codex.md#troubleshooting), [Cursor](cursor.md#troubleshooting), [Claude Code](claude-code.md#troubleshooting), [Copilot](copilot.md).
@@ -82,8 +61,8 @@ discovery to SQLite?" The agent says broad search is ready, returns a compact
 answer with multiple cited files, and each path exists.
 
 **Blocked (broad search).** The agent gives a long essay with no file citations,
-or says packet/search is unavailable. Do not treat the answer as proof; repair
-sidecars or ask narrower local questions.
+or says packet/search is unavailable. Do not treat the answer as proof; let
+CodeStory finish preparing or ask narrower local questions.
 
 ## Step 1 -- Is my repo map ready?
 
@@ -100,11 +79,11 @@ If yes, local navigation is likely good. If no, go to [Local navigation stale or
 Ask the agent:
 
 ```text
-Read codestory://status, report allowed_surfaces, and tell me what is blocked and the next repair action.
+Call the CodeStory tool needed for this task. If it does not converge, read codestory://status and report the capability state in plain language.
 ```
 
-The agent uses MCP status, `codestory://agent-guide`, and `sidecar_setup repair`
-when status recommends repair. Re-read status after any repair.
+The agent retries the intended tool while CodeStory prepares. It reads status
+only when that automatic path stops converging.
 
 </details>
 
@@ -130,8 +109,8 @@ source-built binary.
 
 Symptoms: missing symbols, old file list, `ground` or `files` not allowed.
 
-**Agent (MCP live):** Use allowed local graph tools only; request index refresh
-through status guidance.
+**Agent (MCP live):** Retry `ground`, `files`, or the requested local graph
+tool. CodeStory refreshes the repository map as part of the call.
 
 **You (CLI debug transcript):**
 
@@ -156,16 +135,14 @@ node plugins/codestory/hooks/codestory-dirty-hook.cjs install --project <repo> -
 Symptoms: `packet`, `search`, or `context` not allowed; retrieval mode not
 `full`.
 
-**Agent:** Call MCP `sidecar_setup repair` when status says so, then reread
-`codestory://status`. Before repairing, classify
-`readiness_broker.resources.native_embedding_runtime`: `stale` or same-project
-reusable `busy` can proceed; foreign/unverifiable `busy` means wait. If status
-resources are visible but tools are hidden, do not loop on `tools/call`
-recommendations. Do not treat degraded output as proof. See
-[Trust and readiness](trust-and-readiness.md#proof-vs-hint).
+**Agent:** Retry the same `packet`, `search`, or `context` request after the
+returned delay. Use local graph tools while the state is `working_locally`.
+If the result becomes `needs_environment`, report its single host requirement
+without exposing internal processes or services. Do not treat an unavailable
+or partial result as proof. See [Trust and readiness](trust-and-readiness.md#proof-vs-hint).
 
-**You:** Sidecar model download and lifecycle:
-[Retrieval sidecars ops](../ops/retrieval-sidecars.md).
+**Maintainer:** Runtime lifecycle details are kept in
+[retrieval operations](../ops/retrieval-sidecars.md).
 
 CLI check:
 
@@ -174,77 +151,22 @@ codestory-cli retrieval status --project <repo> --format json
 codestory-cli fix --project <repo> --format json
 ```
 
-Require `retrieval_mode: "full"` before trusting packet/search evidence. Under
-`accelerator_required`, also require a reachable selected embedding endpoint,
-matching native-process identity, and
-`readiness_broker.gpu_proof.proof_status=verified`; the persisted manifest does
-not override a dead or unverifiable runtime.
+Require `retrieval_mode: "full"` before trusting packet/search evidence.
 Command table: [CLI reference - readiness and repair](cli-reference.md#readiness-and-repair).
 
-### Apple Silicon acceleration
+### macOS broad search
 
-On macOS arm64, the supported accelerated embedding path is the native Metal
-sidecar. A healthy repaired status should report the embedding launch as
-`native_spawned`, request provider `metal`, runtime observation from native
-sidecar logs, and a successful live timed embed smoke. Request fields, device
-inventory, and operator assertions are diagnostic only. Require
-`readiness_broker.gpu_proof.proof_status=verified`,
-`meaningful_accelerator_work_proven=true`, allowed packet/search surfaces, and
-`retrieval_mode=full` before trusting acceleration-backed readiness.
+Apple Silicon uses managed Metal acceleration automatically. Retry the original
+broad-search tool while CodeStory reports `preparing`; local navigation remains
+available in the meantime.
 
-Agent repair now runs that proof before long semantic indexing. The timed smoke
-uses the same embedding endpoint and runtime configuration as the rebuild, and
-the current runtime log must show positive offload for the requested provider
-and device. A reachable endpoint or device inventory without both pieces stops
-with `gpu_unverified` instead of remaining in a long `repairing` state.
-Accelerator-required external endpoints intentionally remain unverified because
-CodeStory does not own their runtime log or process identity.
+Intel Macs support local navigation by default. If broad search needs an
+explicit CPU or trusted external configuration, CodeStory reports that as one
+plain `needs_environment` requirement. The agent should relay that requirement
+without process, service, model, or port details.
 
-If a previously healthy Metal endpoint exits, status retains
-`retrieval_mode=full` as the persisted-manifest classification but changes the
-agent lane to `repair_retrieval`, removes packet/search from allowed surfaces,
-and reports `gpu_unverified`. Follow the recommended repair call; do not delete
-the manifest or cache just to make the status field change.
-
-The old failure pattern is `accelerator_request_provider=vulkan`,
-`accelerator_request_device=Vulkan0`, Docker/Colima embed launch, and
-`accelerator_request_unobserved`. That is a stale or pre-release runtime for
-Apple Silicon, not a Colima tuning problem: the Linux Docker sidecar cannot
-observe macOS Metal and normally has no usable `/dev/dri`.
-
-**Agent:** Read `codestory://status`, follow `recommended_next_calls`, call MCP
-`sidecar_setup repair` when recommended, and reread status. Keep local navigation separate
-from packet/search: a ready local graph can answer source-navigation questions
-while packet/search remains blocked until `retrieval_mode` is `full`.
-
-**You:** For a maintainer transcript, prewarm the managed Metal binary and then
-rerun bootstrap/status:
-
-```sh
-node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only
-codestory-cli retrieval bootstrap --project <repo> --format json
-codestory-cli retrieval status --project <repo> --format json
-```
-
-CPU-backed embeddings are degraded and explicit. Use
-`CODESTORY_EMBED_ALLOW_CPU=1` or `CODESTORY_EMBED_DEVICE_POLICY=allow_cpu` only
-when CPU retrieval is acceptable for that machine; CPU opt-in is not the default
-Apple Silicon success path.
-
-### Intel macOS retrieval
-
-Intel macOS supports the signed native CLI, managed plugin provisioning, local
-index/ground, and cleanup, but has no managed Metal backend. Without a prepared
-embedding backend, agent status should fail with actionable acceleration
-guidance while local navigation remains available.
-
-For packet/search, either opt into degraded CPU execution explicitly or point
-`CODESTORY_EMBED_LLAMACPP_URL` at a trusted external llama.cpp-compatible
-endpoint and select an explicit CPU/external operator policy. Because CodeStory
-cannot bind provider-owned logs and PID identity to an external request, that
-endpoint cannot satisfy `accelerator_required`; use the explicit CPU allowance
-when accepting it. Status and evidence must label the path CPU/external and
-must never claim Metal on Intel.
+Maintainer-only acceleration evidence and recovery commands are in
+[retrieval operations](../ops/retrieval-sidecars.md).
 
 ## MCP visibility failure
 
@@ -252,7 +174,7 @@ Symptoms: skill or rule loads but no `codestory://status` or `mcp__codestory` to
 
 | Host | Check |
 | --- | --- |
-| Codex | Read `codestory://status` through live MCP resources. Inspect `readiness_broker` and follow `recommended_next_calls`; status reads do not start repair. If resources are visible but `mcp__codestory` tools are hidden, report the host tool-visibility blocker; reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
+| Codex | If resources are visible but `mcp__codestory` tools are hidden, report the host tool-visibility blocker; reload only after plugin install/config changes; see [Codex guide](codex.md#troubleshooting) |
 | Cursor | MCP config path to `plugins/codestory/scripts/codestory-mcp.cjs`; reload server |
 | Claude Code | MCP configured separately; hooks alone do not expose tools |
 | Copilot | MCP not auto-started; configure manually or use CLI |
@@ -304,4 +226,4 @@ active runtime through `codestory://status`, not only `codex.cmd plugin list`.
 - [Trust and readiness](trust-and-readiness.md) -- when to trust output
 - [CLI reference - command by situation](cli-reference.md#command-by-situation) for command-by-situation table
 - [Contributor debugging](../contributors/debugging.md) for crate-level investigation
-- [Retrieval sidecars ops](../ops/retrieval-sidecars.md) for embedding backend repair
+- [Managed search operations](../ops/retrieval-sidecars.md) for maintainer-only backend diagnostics
