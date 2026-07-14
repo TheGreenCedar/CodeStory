@@ -56,6 +56,9 @@
   unchanged, and parser-backed output is published only when the indexed bytes
   still match the file. Failed, cancelled, or concurrent refreshes preserve the
   previous usable generation.
+- Express and Fastify route extraction now share one module-binding ownership
+  tracker, including invalidation when a declarator initializer reassigns a
+  previously proven server receiver.
 - Native process reuse and cleanup now bind executable filesystem identity,
   arguments, endpoint, and process start identity. Cleanup remains limited to
   resources carrying CodeStory ownership proof.

@@ -39,18 +39,25 @@ pub(super) enum JavaScriptDialect {
     Tsx,
 }
 
-#[derive(Default)]
-struct ExpressBindings {
-    constructors: HashSet<String>,
-    router_constructors: HashSet<String>,
-    modules: HashSet<String>,
-    receivers: HashSet<String>,
-    require_shadowed: bool,
+#[derive(Clone, Copy)]
+enum JavaScriptServerFramework {
+    Express,
+    Fastify,
+}
+
+impl JavaScriptServerFramework {
+    fn module_name(self) -> &'static str {
+        match self {
+            Self::Express => "express",
+            Self::Fastify => "fastify",
+        }
+    }
 }
 
 #[derive(Default)]
-struct FastifyBindings {
+struct JavaScriptFrameworkBindings {
     constructors: HashSet<String>,
+    router_constructors: HashSet<String>,
     modules: HashSet<String>,
     receivers: HashSet<String>,
     require_shadowed: bool,
@@ -848,206 +855,13 @@ fn module_express_receiver_owned_at(
     receiver: &str,
     before_byte: usize,
 ) -> bool {
-    let mut bindings = ExpressBindings::default();
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    for statement in root.named_children(&mut cursor) {
-        if statement.start_byte() >= before_byte {
-            break;
-        }
-        apply_express_module_statement(statement, source, &mut bindings);
-    }
-    bindings.receivers.contains(receiver)
-}
-
-fn apply_express_module_statement(
-    statement: Node<'_>,
-    source: &str,
-    bindings: &mut ExpressBindings,
-) {
-    if statement.kind() == "import_statement" {
-        apply_express_import(statement, source, bindings);
-        return;
-    }
-
-    let mut declarators = Vec::new();
-    collect_nodes_of_kind(statement, "variable_declarator", &mut declarators);
-    if !declarators.is_empty() {
-        for declarator in declarators {
-            apply_express_declarator(declarator, source, bindings);
-        }
-        return;
-    }
-
-    if let Some(name) = javascript_runtime_declaration_name(statement, source) {
-        invalidate_express_binding(&name, bindings);
-        return;
-    }
-
-    let mut names = HashSet::new();
-    collect_javascript_written_names(statement, source, &mut names);
-    for name in names {
-        invalidate_express_binding(&name, bindings);
-    }
-}
-
-fn apply_express_import(node: Node<'_>, source: &str, bindings: &mut ExpressBindings) {
-    let source_module = node
-        .child_by_field_name("source")
-        .and_then(|node| javascript_static_string(node, source));
-    let Some(clause) = node
-        .named_children(&mut node.walk())
-        .find(|child| child.kind() == "import_clause")
-    else {
-        return;
-    };
-    if node_has_direct_anonymous_token(node, &["type", "typeof"])
-        || node_has_direct_anonymous_token(clause, &["type", "typeof"])
-    {
-        return;
-    }
-    let imported_bindings = javascript_import_local_bindings(clause, source);
-    for name in &imported_bindings {
-        invalidate_express_binding(name, bindings);
-    }
-    if source_module.as_deref() != Some("express") {
-        return;
-    }
-
-    let mut cursor = clause.walk();
-    for child in clause.named_children(&mut cursor) {
-        match child.kind() {
-            "identifier" => {
-                if let Some(name) = node_text(child, source) {
-                    bindings.constructors.insert(name);
-                }
-            }
-            "namespace_import" => {
-                if let Some(name) = last_identifier(child, source) {
-                    bindings.modules.insert(name);
-                }
-            }
-            "named_imports" => {
-                let mut import_cursor = child.walk();
-                for specifier in child.named_children(&mut import_cursor) {
-                    if specifier.kind() != "import_specifier" {
-                        continue;
-                    }
-                    if node_has_direct_anonymous_token(specifier, &["type", "typeof"]) {
-                        continue;
-                    }
-                    let imported = specifier
-                        .child_by_field_name("name")
-                        .and_then(|node| node_text(node, source));
-                    let local = specifier
-                        .child_by_field_name("alias")
-                        .and_then(|node| node_text(node, source))
-                        .or_else(|| imported.clone());
-                    if imported.as_deref() == Some("Router")
-                        && let Some(local) = local
-                    {
-                        bindings.router_constructors.insert(local);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn apply_express_declarator(node: Node<'_>, source: &str, bindings: &mut ExpressBindings) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-    let mut names = HashSet::new();
-    collect_javascript_binding_names(name_node, source, &mut names);
-    for name in &names {
-        invalidate_express_binding(name, bindings);
-    }
-    let Some(value) = node.child_by_field_name("value") else {
-        return;
-    };
-
-    if expression_is_express_require(value, source, bindings) {
-        if name_node.kind() == "identifier"
-            && let Some(name) = node_text(name_node, source)
-        {
-            bindings.constructors.insert(name);
-        } else if name_node.kind() == "object_pattern" {
-            bindings
-                .router_constructors
-                .extend(commonjs_router_bindings(name_node, source));
-        }
-        return;
-    }
-
-    if names.len() != 1 || name_node.kind() != "identifier" {
-        return;
-    }
-    let Some(name) = names.into_iter().next() else {
-        return;
-    };
-    if expression_constructs_express_receiver(value, source, bindings) {
-        bindings.receivers.insert(name);
-    }
-}
-
-fn expression_is_express_require(node: Node<'_>, source: &str, bindings: &ExpressBindings) -> bool {
-    let node = javascript_transparent_expression(node);
-    if bindings.require_shadowed || node.kind() != "call_expression" {
-        return false;
-    }
-    node.child_by_field_name("function")
-        .and_then(|node| node_text(node, source))
-        .as_deref()
-        == Some("require")
-        && node
-            .child_by_field_name("arguments")
-            .and_then(|arguments| arguments.named_child(0))
-            .and_then(|argument| javascript_static_string(argument, source))
-            .as_deref()
-            == Some("express")
-}
-
-fn expression_constructs_express_receiver(
-    node: Node<'_>,
-    source: &str,
-    bindings: &ExpressBindings,
-) -> bool {
-    let node = javascript_transparent_expression(node);
-    if node.kind() != "call_expression" {
-        return false;
-    }
-    let Some(function) = node.child_by_field_name("function") else {
-        return false;
-    };
-    match function.kind() {
-        "identifier" => node_text(function, source).is_some_and(|name| {
-            bindings.constructors.contains(&name) || bindings.router_constructors.contains(&name)
-        }),
-        "member_expression" => {
-            let object = function
-                .child_by_field_name("object")
-                .and_then(|node| node_text(node, source));
-            let property = function
-                .child_by_field_name("property")
-                .and_then(|node| node_text(node, source));
-            object.is_some_and(|name| {
-                bindings.constructors.contains(&name) || bindings.modules.contains(&name)
-            }) && property.as_deref() == Some("Router")
-        }
-        _ => false,
-    }
-}
-
-fn invalidate_express_binding(name: &str, bindings: &mut ExpressBindings) {
-    bindings.constructors.remove(name);
-    bindings.router_constructors.remove(name);
-    bindings.modules.remove(name);
-    bindings.receivers.remove(name);
-    if name == "require" {
-        bindings.require_shadowed = true;
-    }
+    module_javascript_receiver_owned_at(
+        tree,
+        source,
+        receiver,
+        before_byte,
+        JavaScriptServerFramework::Express,
+    )
 }
 
 fn module_fastify_receiver_owned_at(
@@ -1056,25 +870,42 @@ fn module_fastify_receiver_owned_at(
     receiver: &str,
     before_byte: usize,
 ) -> bool {
-    let mut bindings = FastifyBindings::default();
+    module_javascript_receiver_owned_at(
+        tree,
+        source,
+        receiver,
+        before_byte,
+        JavaScriptServerFramework::Fastify,
+    )
+}
+
+fn module_javascript_receiver_owned_at(
+    tree: &Tree,
+    source: &str,
+    receiver: &str,
+    before_byte: usize,
+    framework: JavaScriptServerFramework,
+) -> bool {
+    let mut bindings = JavaScriptFrameworkBindings::default();
     let root = tree.root_node();
     let mut cursor = root.walk();
     for statement in root.named_children(&mut cursor) {
         if statement.start_byte() >= before_byte {
             break;
         }
-        apply_fastify_module_statement(statement, source, &mut bindings);
+        apply_javascript_module_statement(statement, source, framework, &mut bindings);
     }
     bindings.receivers.contains(receiver)
 }
 
-fn apply_fastify_module_statement(
+fn apply_javascript_module_statement(
     statement: Node<'_>,
     source: &str,
-    bindings: &mut FastifyBindings,
+    framework: JavaScriptServerFramework,
+    bindings: &mut JavaScriptFrameworkBindings,
 ) {
     if statement.kind() == "import_statement" {
-        apply_fastify_import(statement, source, bindings);
+        apply_javascript_framework_import(statement, source, framework, bindings);
         return;
     }
 
@@ -1082,31 +913,40 @@ fn apply_fastify_module_statement(
     collect_nodes_of_kind(statement, "variable_declarator", &mut declarators);
     if !declarators.is_empty() {
         for declarator in declarators {
-            apply_fastify_declarator(declarator, source, bindings);
+            apply_javascript_framework_declarator(declarator, source, framework, bindings);
             if let Some(value) = declarator.child_by_field_name("value") {
-                let mut writes = HashSet::new();
-                collect_javascript_written_names(value, source, &mut writes);
-                for name in writes {
-                    invalidate_fastify_binding(&name, bindings);
-                }
+                invalidate_javascript_writes(value, source, bindings);
             }
         }
         return;
     }
 
     if let Some(name) = javascript_runtime_declaration_name(statement, source) {
-        invalidate_fastify_binding(&name, bindings);
+        invalidate_javascript_framework_binding(&name, bindings);
         return;
     }
 
+    invalidate_javascript_writes(statement, source, bindings);
+}
+
+fn invalidate_javascript_writes(
+    node: Node<'_>,
+    source: &str,
+    bindings: &mut JavaScriptFrameworkBindings,
+) {
     let mut names = HashSet::new();
-    collect_javascript_written_names(statement, source, &mut names);
+    collect_javascript_written_names(node, source, &mut names);
     for name in names {
-        invalidate_fastify_binding(&name, bindings);
+        invalidate_javascript_framework_binding(&name, bindings);
     }
 }
 
-fn apply_fastify_import(node: Node<'_>, source: &str, bindings: &mut FastifyBindings) {
+fn apply_javascript_framework_import(
+    node: Node<'_>,
+    source: &str,
+    framework: JavaScriptServerFramework,
+    bindings: &mut JavaScriptFrameworkBindings,
+) {
     let source_module = node
         .child_by_field_name("source")
         .and_then(|node| javascript_static_string(node, source));
@@ -1123,9 +963,9 @@ fn apply_fastify_import(node: Node<'_>, source: &str, bindings: &mut FastifyBind
     }
     let imported_bindings = javascript_import_local_bindings(clause, source);
     for name in &imported_bindings {
-        invalidate_fastify_binding(name, bindings);
+        invalidate_javascript_framework_binding(name, bindings);
     }
-    if source_module.as_deref() != Some("fastify") {
+    if source_module.as_deref() != Some(framework.module_name()) {
         return;
     }
 
@@ -1153,15 +993,25 @@ fn apply_fastify_import(node: Node<'_>, source: &str, bindings: &mut FastifyBind
                     let imported = specifier
                         .child_by_field_name("name")
                         .and_then(|node| node_text(node, source));
-                    if !matches!(imported.as_deref(), Some("fastify" | "default")) {
-                        continue;
-                    }
                     let local = specifier
                         .child_by_field_name("alias")
                         .and_then(|node| node_text(node, source))
-                        .or(imported);
-                    if let Some(local) = local {
-                        bindings.constructors.insert(local);
+                        .or_else(|| imported.clone());
+                    let Some(local) = local else {
+                        continue;
+                    };
+                    match framework {
+                        JavaScriptServerFramework::Express
+                            if imported.as_deref() == Some("Router") =>
+                        {
+                            bindings.router_constructors.insert(local);
+                        }
+                        JavaScriptServerFramework::Fastify
+                            if matches!(imported.as_deref(), Some("fastify" | "default")) =>
+                        {
+                            bindings.constructors.insert(local);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1170,28 +1020,38 @@ fn apply_fastify_import(node: Node<'_>, source: &str, bindings: &mut FastifyBind
     }
 }
 
-fn apply_fastify_declarator(node: Node<'_>, source: &str, bindings: &mut FastifyBindings) {
+fn apply_javascript_framework_declarator(
+    node: Node<'_>,
+    source: &str,
+    framework: JavaScriptServerFramework,
+    bindings: &mut JavaScriptFrameworkBindings,
+) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
     let mut names = HashSet::new();
     collect_javascript_binding_names(name_node, source, &mut names);
     for name in &names {
-        invalidate_fastify_binding(name, bindings);
+        invalidate_javascript_framework_binding(name, bindings);
     }
     let Some(value) = node.child_by_field_name("value") else {
         return;
     };
 
-    if expression_is_fastify_require(value, source, bindings) {
+    if expression_is_framework_require(value, source, framework, bindings) {
         if name_node.kind() == "identifier"
             && let Some(name) = node_text(name_node, source)
         {
             bindings.constructors.insert(name);
         } else if name_node.kind() == "object_pattern" {
-            bindings
-                .constructors
-                .extend(commonjs_fastify_bindings(name_node, source));
+            match framework {
+                JavaScriptServerFramework::Express => bindings
+                    .router_constructors
+                    .extend(commonjs_router_bindings(name_node, source)),
+                JavaScriptServerFramework::Fastify => bindings
+                    .constructors
+                    .extend(commonjs_fastify_bindings(name_node, source)),
+            }
         }
         return;
     }
@@ -1202,12 +1062,17 @@ fn apply_fastify_declarator(node: Node<'_>, source: &str, bindings: &mut Fastify
     let Some(name) = names.into_iter().next() else {
         return;
     };
-    if expression_constructs_fastify_receiver(value, source, bindings) {
+    if expression_constructs_framework_receiver(value, source, framework, bindings) {
         bindings.receivers.insert(name);
     }
 }
 
-fn expression_is_fastify_require(node: Node<'_>, source: &str, bindings: &FastifyBindings) -> bool {
+fn expression_is_framework_require(
+    node: Node<'_>,
+    source: &str,
+    framework: JavaScriptServerFramework,
+    bindings: &JavaScriptFrameworkBindings,
+) -> bool {
     let node = javascript_transparent_expression(node);
     if bindings.require_shadowed || node.kind() != "call_expression" {
         return false;
@@ -1221,13 +1086,14 @@ fn expression_is_fastify_require(node: Node<'_>, source: &str, bindings: &Fastif
             .and_then(|arguments| arguments.named_child(0))
             .and_then(|argument| javascript_static_string(argument, source))
             .as_deref()
-            == Some("fastify")
+            == Some(framework.module_name())
 }
 
-fn expression_constructs_fastify_receiver(
+fn expression_constructs_framework_receiver(
     node: Node<'_>,
     source: &str,
-    bindings: &FastifyBindings,
+    framework: JavaScriptServerFramework,
+    bindings: &JavaScriptFrameworkBindings,
 ) -> bool {
     let node = javascript_transparent_expression(node);
     if node.kind() != "call_expression" {
@@ -1237,9 +1103,13 @@ fn expression_constructs_fastify_receiver(
         return false;
     };
     match function.kind() {
-        "identifier" => {
-            node_text(function, source).is_some_and(|name| bindings.constructors.contains(&name))
-        }
+        "identifier" => node_text(function, source).is_some_and(|name| match framework {
+            JavaScriptServerFramework::Express => {
+                bindings.constructors.contains(&name)
+                    || bindings.router_constructors.contains(&name)
+            }
+            JavaScriptServerFramework::Fastify => bindings.constructors.contains(&name),
+        }),
         "member_expression" => {
             let object = function
                 .child_by_field_name("object")
@@ -1247,15 +1117,25 @@ fn expression_constructs_fastify_receiver(
             let property = function
                 .child_by_field_name("property")
                 .and_then(|node| node_text(node, source));
-            object.is_some_and(|name| bindings.modules.contains(&name))
-                && matches!(property.as_deref(), Some("fastify" | "default"))
+            match framework {
+                JavaScriptServerFramework::Express => {
+                    object.is_some_and(|name| {
+                        bindings.constructors.contains(&name) || bindings.modules.contains(&name)
+                    }) && property.as_deref() == Some("Router")
+                }
+                JavaScriptServerFramework::Fastify => {
+                    object.is_some_and(|name| bindings.modules.contains(&name))
+                        && matches!(property.as_deref(), Some("fastify" | "default"))
+                }
+            }
         }
         _ => false,
     }
 }
 
-fn invalidate_fastify_binding(name: &str, bindings: &mut FastifyBindings) {
+fn invalidate_javascript_framework_binding(name: &str, bindings: &mut JavaScriptFrameworkBindings) {
     bindings.constructors.remove(name);
+    bindings.router_constructors.remove(name);
     bindings.modules.remove(name);
     bindings.receivers.remove(name);
     if name == "require" {
@@ -2216,6 +2096,26 @@ app.get("/after-property-write", handler);
     }
 
     #[test]
+    fn test_express_declarator_initializer_write_invalidates_receiver() -> Result<()> {
+        let source = r#"
+import express from "express";
+const app = express();
+const assignmentResult = (app = otherFramework());
+app.get("/reassigned-in-initializer", handler);
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let routes = collect_javascript_express_routes(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+        )?;
+        assert!(routes.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn test_express_shadowed_commonjs_require_is_not_provenance() -> Result<()> {
         let source = r#"
 const require = fakeRequire;
@@ -2695,6 +2595,26 @@ shadowed.get("/declaration-replaced", handler);
                 .collect::<HashSet<_>>(),
             HashSet::from(["/owned", "/after-property-use"])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fastify_declarator_initializer_write_invalidates_receiver() -> Result<()> {
+        let source = r#"
+import Fastify from "fastify";
+const app = Fastify();
+const assignmentResult = (app = otherFramework());
+app.get("/reassigned-in-initializer", handler);
+"#;
+        let language: Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let tree = parse_javascript(&language, source);
+        let routes = collect_javascript_fastify_routes(
+            &language,
+            JavaScriptDialect::TypeScript,
+            &tree,
+            source,
+        )?;
+        assert!(routes.is_empty());
         Ok(())
     }
 
