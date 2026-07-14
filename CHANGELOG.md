@@ -75,6 +75,10 @@
 - Sidecar cache roots and runtime environment defaults are captured once per
   process and passed explicitly through test construction. Windows process
   probes also reject completed processes using both exit time and exit code.
+- `affected` now reads Git name-status and untracked paths through NUL-delimited
+  byte protocols, preserves valid UTF-8 pathname whitespace, and returns
+  `unsupported_non_utf8_path` instead of lossy DTO text. Workspace-relative
+  path stripping now follows native filesystem identity and case rules.
 - Managed installation and upgrade checks cover every shipped native platform,
   including upgrade from a verified older CLI with that version retained as the
   rollback. The Codex worktree setup dispatcher now provides equivalent native

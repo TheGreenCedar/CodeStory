@@ -1070,6 +1070,30 @@ fn normalized_compare_key(root: &Path, path: &Path) -> String {
     normalize_path_key(&stable)
 }
 
+/// Return `path` relative to `workspace_root` using native path identity.
+///
+/// Exact lexical prefixes are preferred. Alias spellings then compare each
+/// candidate ancestor with the workspace root using filesystem identity for
+/// existing paths and platform lexical rules only for missing paths.
+pub fn workspace_relative_path(workspace_root: &Path, path: &Path) -> Option<PathBuf> {
+    let root = normalize_lexical_path(workspace_root);
+    let candidate = normalize_lexical_path(path);
+    if let Ok(relative) = candidate.strip_prefix(&root) {
+        return Some(relative.to_path_buf());
+    }
+    if !candidate.is_absolute() {
+        return Some(candidate);
+    }
+
+    let matching_root = candidate
+        .ancestors()
+        .find(|ancestor| same_workspace_path(&root, ancestor))?;
+    candidate
+        .strip_prefix(matching_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
 fn normalize_path_key(path: &Path) -> String {
     #[cfg(windows)]
     {

@@ -1325,50 +1325,10 @@ fn candidate_path_text_is_path_like(path: &str) -> bool {
 }
 
 fn normalize_repo_relative_path(project_root: &Path, file_path: &str) -> String {
-    if let Some(rel) = strip_project_prefix_from_normalized_path(project_root, file_path) {
-        return rel;
-    }
-    let path = PathBuf::from(file_path);
-    if path.is_absolute() {
-        path.strip_prefix(project_root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| file_path.replace('\\', "/"))
-    } else {
-        file_path.replace('\\', "/")
-    }
-}
-
-fn strip_project_prefix_from_normalized_path(
-    project_root: &Path,
-    file_path: &str,
-) -> Option<String> {
-    let candidate = normalize_storage_path_text(file_path);
-    let roots = [
-        normalize_storage_path_text(&project_root.to_string_lossy()),
-        std::fs::canonicalize(project_root)
-            .ok()
-            .map(|path| normalize_storage_path_text(&path.to_string_lossy()))
-            .unwrap_or_default(),
-    ];
-    roots
-        .into_iter()
-        .filter(|root| !root.is_empty())
-        .find_map(|root| {
-            if candidate.eq_ignore_ascii_case(&root) {
-                return Some(String::new());
-            }
-            let prefix = format!("{root}/");
-            candidate
-                .strip_prefix(&prefix)
-                .or_else(|| {
-                    let candidate_lower = candidate.to_ascii_lowercase();
-                    let prefix_lower = prefix.to_ascii_lowercase();
-                    candidate_lower
-                        .strip_prefix(&prefix_lower)
-                        .map(|_| &candidate[prefix.len()..])
-                })
-                .map(str::to_string)
-        })
+    let normalized = normalize_storage_path_text(file_path);
+    codestory_workspace::workspace_relative_path(project_root, Path::new(&normalized))
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or(normalized)
 }
 
 fn normalize_storage_path_text(path: &str) -> String {
@@ -1786,6 +1746,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalize_repo_relative_path_strips_forward_slash_verbatim_prefix() {
         let project = Path::new("C:/workspaces/example");
