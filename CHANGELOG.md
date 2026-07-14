@@ -8,6 +8,9 @@
   without attempting full retrieval or printing backend repair instructions.
   Maintainers can request that separate proof explicitly with
   `--full-retrieval-proof` (or `-FullRetrievalProof` in PowerShell).
+- Cold and stale repositories now present `ground`, `files`, and `affected` as
+  direct activation paths. One grounding call builds or refreshes the local map;
+  agents no longer get sent through a status loop before repository navigation.
 
 ## 0.15.0
 

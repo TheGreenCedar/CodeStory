@@ -4627,6 +4627,19 @@ fn stdio_status_recommended_next_calls(
 ) -> serde_json::Value {
     let project = sidecar_setup["project"].clone();
     if let Some(non_ready) = crate::readiness::primary_non_ready(readiness) {
+        if non_ready.goal == ReadinessGoalDto::LocalNavigation
+            && non_ready.status == ReadinessStatusDto::RepairIndex
+        {
+            return serde_json::json!([{
+                "method": "tools/call",
+                "tool": "ground",
+                "arguments": {
+                    "project": project,
+                    "budget": "balanced"
+                },
+                "activation_required": true
+            }]);
+        }
         if non_ready.goal == ReadinessGoalDto::AgentPacketSearch {
             if stdio_sidecar_setup_has_active_repair(sidecar_setup) {
                 return stdio_status_repair_in_progress_next_calls(&project);
@@ -5938,7 +5951,7 @@ fn stdio_allowed_surfaces_with_policy(
         "snippet",
         "affected",
     ] {
-        surfaces.insert(surface.to_string(), stdio_allowed_surface(local));
+        surfaces.insert(surface.to_string(), stdio_local_surface(surface, local));
     }
     for surface in ["packet", "search", "context"] {
         surfaces.insert(surface.to_string(), stdio_allowed_surface(agent));
@@ -5952,6 +5965,17 @@ fn stdio_allowed_surfaces_with_policy(
         stdio_repair_all_surface(readiness, sidecar_setup, native_embedding_hard_busy),
     );
     serde_json::Value::Object(surfaces)
+}
+
+fn stdio_local_surface(surface: &str, verdict: Option<&ReadinessVerdictDto>) -> serde_json::Value {
+    let mut status = stdio_allowed_surface(verdict);
+    if matches!(surface, "ground" | "files" | "affected")
+        && verdict.is_some_and(|verdict| verdict.status == ReadinessStatusDto::RepairIndex)
+    {
+        status["allowed"] = serde_json::json!(true);
+        status["activation_required"] = serde_json::json!(true);
+    }
+    status
 }
 
 fn stdio_sidecar_setup_surface(

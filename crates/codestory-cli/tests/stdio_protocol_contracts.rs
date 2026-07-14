@@ -1245,6 +1245,37 @@ fn assert_allowed_surface(
     }
 }
 
+fn assert_activation_surface(status: &Value, surface: &str) {
+    let surface_status = status
+        .pointer(&format!("/allowed_surfaces/{surface}"))
+        .unwrap_or_else(|| panic!("status should include allowed_surfaces.{surface}: {status}"));
+    assert_eq!(surface_status["allowed"], json!(true));
+    assert_eq!(surface_status["activation_required"], json!(true));
+    assert_eq!(surface_status["readiness_goal"], json!("local_navigation"));
+    assert_eq!(surface_status["failed_layer"], json!("local_index"));
+    assert_eq!(
+        status["readiness"][0]["status"],
+        json!("repair_index"),
+        "callable bootstrap surfaces must not misreport the publication as ready: {status}"
+    );
+}
+
+fn assert_ground_activation_call(status: &Value) {
+    let calls = status["recommended_next_calls"]
+        .as_array()
+        .expect("status should include recommended next calls");
+    assert_eq!(
+        calls.len(),
+        1,
+        "local activation should require one call: {status}"
+    );
+    assert_eq!(calls[0]["method"], json!("tools/call"));
+    assert_eq!(calls[0]["tool"], json!("ground"));
+    assert_eq!(calls[0]["arguments"]["project"], status["project_root"]);
+    assert_eq!(calls[0]["arguments"]["budget"], json!("balanced"));
+    assert_eq!(calls[0]["activation_required"], json!(true));
+}
+
 fn string_values_recursive<'a>(value: &'a Value, strings: &mut Vec<&'a str>) {
     match value {
         Value::String(text) => strings.push(text),
@@ -1577,8 +1608,17 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     let status = json_resource_content(status_result, "codestory://status");
 
     assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
-    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    assert!(status["index_publication"].is_null());
+    assert_eq!(
+        status["readiness"][0]["index"]["indexed_file_count"],
+        json!(0)
+    );
+    for surface in ["ground", "files", "affected"] {
+        assert_activation_surface(&status, surface);
+    }
+    assert_allowed_surface(&status, "symbol", false, "local_navigation", "repair_index");
     assert_allowed_surface(&status, "search", false, "agent_packet_search", "blocked");
+    assert_ground_activation_call(&status);
 
     let ground = send_json(
         &mut server,
@@ -1589,7 +1629,13 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
             "params": {"name": "ground", "arguments": {"budget": "strict"}}
         }),
     );
-    assert_tool_success(&ground, json!("ground-unindexed"));
+    let grounding = assert_tool_success(&ground, json!("ground-unindexed"));
+    assert!(
+        grounding["stats"]["file_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "first ground call should return a non-empty repository map: {grounding}"
+    );
 
     let refreshed = send_json(
         &mut server,
@@ -4764,7 +4810,7 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
         json!(true)
     );
     assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
-    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    assert_activation_surface(&status, "ground");
     assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
 }
 
@@ -5192,6 +5238,11 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
         !fixture.cache_dir.path().join("local-refresh.lock").exists(),
         "status must not acquire refresh ownership"
     );
+    for surface in ["ground", "files", "affected"] {
+        assert_activation_surface(&stale, surface);
+    }
+    assert_allowed_surface(&stale, "symbol", false, "local_navigation", "repair_index");
+    assert_ground_activation_call(&stale);
 
     let activation = send_json(
         &mut server,
@@ -6128,7 +6179,7 @@ fn resources_read_status_keeps_dirty_marker_separate_from_full_sidecar_readiness
     let status = json_resource_content(status_result, "codestory://status");
 
     assert_eq!(status["dirty_marker"]["status"], json!("dirty_stale"));
-    assert_allowed_surface(&status, "ground", false, "local_navigation", "repair_index");
+    assert_activation_surface(&status, "ground");
     for surface in ["packet", "search", "context"] {
         assert_allowed_surface(&status, surface, true, "agent_packet_search", "ready");
     }

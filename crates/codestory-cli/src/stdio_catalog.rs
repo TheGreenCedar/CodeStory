@@ -1359,7 +1359,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "ground",
-        description: "Return a compact repository map for orientation after status and before packet/search; equivalent to codestory://grounding.",
+        description: "Return a compact repository map, activating one bounded local refresh first when the repository is cold or stale; equivalent to codestory://grounding.",
         input_schema: GROUND_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(GROUNDING_SNAPSHOT_SCHEMA)),
         safety: SafetyMetadata::read_only(),
