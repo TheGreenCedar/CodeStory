@@ -134,7 +134,14 @@ jobs:
           EVIDENCE_SHA: ${{ inputs.ref }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
+          set -euo pipefail
           mkdir -p target/release-evidence
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" \
+            > target/release-evidence/source-run.json
+          node scripts/codestory-release-evidence-gate.mjs validate-source-run \
+            --run target/release-evidence/source-run.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --expected-sha "$EVIDENCE_SHA"
           gh run download "$SOURCE_RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
             --name "release-evidence-$EVIDENCE_SHA" \

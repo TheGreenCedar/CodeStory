@@ -10,6 +10,7 @@ const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
 const closeDevIssues = path.join(workflowRoot, "close-dev-issues.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
+const autoRelease = path.join(workflowRoot, "auto-release.yml");
 const releaseWorkflow = path.join(workflowRoot, "release.yml");
 const releaseCandidateEvidence = path.join(workflowRoot, "release-candidate-evidence.yml");
 const releaseNotesExtractor = path.join(".github", "scripts", "extract-codestory-release-notes.mjs");
@@ -22,12 +23,18 @@ const sourceProof = path.join(workflowRoot, "source-proof.yml");
 const repoScaleStats = path.join(workflowRoot, "repo-scale-stats.yml");
 const retrievalSidecarSmoke = path.join(workflowRoot, "retrieval-sidecar-smoke.yml");
 
-function yamlJob(content, name) {
+function yamlMapping(content, name, indent) {
   const lines = content.split(/\r?\n/u);
-  const start = lines.indexOf(`  ${name}:`);
+  const padding = " ".repeat(indent);
+  const start = lines.indexOf(`${padding}${name}:`);
   if (start < 0) return [];
-  const end = lines.findIndex((line, index) => index > start && /^  \S/iu.test(line));
+  const sibling = new RegExp(`^${padding}\\S`, "u");
+  const end = lines.findIndex((line, index) => index > start && sibling.test(line));
   return lines.slice(start, end < 0 ? undefined : end);
+}
+
+function yamlJob(content, name) {
+  return yamlMapping(content, name, 2);
 }
 
 function namedStep(job, name) {
@@ -316,6 +323,7 @@ if (!fs.existsSync(releaseWorkflow)) {
     violations.push("release.yml release builds must not install floating stable Rust");
   }
   requireContent(content, [
+    "actions: read",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
     "sign_macos: true",
     "APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}",
@@ -338,6 +346,30 @@ if (!fs.existsSync(releaseWorkflow)) {
     "gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof",
     "Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.",
   ], snippet => `release.yml must include ${snippet}`);
+  const releaseEvidenceJob = yamlJob(content, "release-evidence");
+  requireContent(releaseEvidenceJob.join("\n"), [
+    "needs: preflight",
+    "ref: ${{ github.sha }}",
+    "proof_key: release-${{ needs.preflight.outputs.version }}",
+    "profile: codestory-release-evidence-linux-arm64-v1",
+    "drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
+    "embedding_model_dir: /srv/codestory-release-evidence/models",
+    "source_run_id: ${{ inputs.source_run_id }}",
+  ], snippet => `release.yml release-evidence job must include ${snippet}`);
+  const packagedProofJob = yamlJob(content, "packaged-proof");
+  if (!packagedProofJob.includes("      - release-evidence")) {
+    violations.push("release.yml packaged-proof must wait for release-evidence");
+  }
+  for (const trigger of ["workflow_call", "workflow_dispatch"]) {
+    const triggerBlock = yamlMapping(content, trigger, 2).join("\n");
+    const inputsBlock = yamlMapping(triggerBlock, "inputs", 4).join("\n");
+    const sourceRunInput = yamlMapping(inputsBlock, "source_run_id", 6).join("\n");
+    requireContent(
+      sourceRunInput,
+      ["required: false", "type: string", 'default: ""'],
+      field => `release.yml ${trigger} source_run_id input must include ${field}`,
+    );
+  }
   if (!fs.existsSync(releaseNotesExtractor)) {
     violations.push("release.yml must use the checked-in versioned changelog extractor");
   }
@@ -370,6 +402,16 @@ if (!fs.existsSync(releaseWorkflow)) {
     "needs:\n      - preflight\n      - packaged-proof\n      - macos-metal-proof\n    runs-on: ubuntu-latest",
     "needs:\n      - preflight\n      - publish\n    uses: ./.github/workflows/post-publish-release-smoke.yml",
   ], row => `release.yml must preserve release proof block ${row.split("\n")[0]}`);
+}
+
+if (!fs.existsSync(autoRelease)) {
+  violations.push("auto-release.yml must exist for main release detection");
+} else {
+  const content = fs.readFileSync(autoRelease, "utf8");
+  const releaseJob = yamlJob(content, "release");
+  if (!releaseJob.includes("      actions: read")) {
+    violations.push("auto-release.yml release job must allow prior-run evidence download");
+  }
 }
 
 if (!fs.existsSync(packagedPlatformProof)) {
@@ -651,6 +693,8 @@ if (!fs.existsSync(releaseCandidateEvidence)) {
     "environment: release-evidence",
     "runs-on: [self-hosted, Linux, ARM64, codestory-release-evidence]",
     "ref: ${{ inputs.ref }}",
+    "validate-source-run",
+    "actions/runs/$SOURCE_RUN_ID",
     "--test-threads=1",
     "release-evidence-${{ inputs.ref }}",
   ], snippet => `release evidence workflow must include ${snippet}`);

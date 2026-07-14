@@ -135,18 +135,27 @@ scripts/codestory-release-evidence-runner.sh destroy
 
 ## Release workflow handoff
 
-Dispatch `.github/workflows/release-candidate-evidence.yml` only from a trusted,
-exact release head. The first measurement uses:
+`release.yml` calls `release-candidate-evidence.yml` on the exact release head
+after preflight and before packaged proof. The automatic path measures fresh
+evidence with:
 
 | Input | Value |
 | --- | --- |
-| `profile` | the release-eligible profile created from the approved baseline |
+| `profile` | `codestory-release-evidence-linux-arm64-v1` |
 | `drill_manifest` | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
 | `embedding_model_dir` | `/srv/codestory-release-evidence/models` |
 | `source_run_id` | empty for measurement; a rejected run ID only for exact-artifact re-evaluation |
+
+If a measured candidate is rejected and receives an exact, expiring approval,
+manually dispatch `release.yml` on the same SHA and version with
+`source_run_id=<rejected-run-id>`. The reusable workflow downloads that run's
+artifact and evaluates it again without producing new measurements. Before the
+download, it requires a failed trusted evidence workflow from this repository
+whose head is the exact evidence SHA.
 
 The workflow uploads `release-evidence-<full SHA>` from
 `target/release-evidence`, including provisioning, raw stats, packet summary,
 candidate, approval when supplied, and report files that exist. Runner
 provisioning alone does not establish a baseline, execute the real-repo drill,
-or prove a candidate acceptable.
+or prove a candidate acceptable. The release remains blocked until the selected
+profile exists as an approved, release-eligible baseline.

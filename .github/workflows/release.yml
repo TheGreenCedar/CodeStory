@@ -7,14 +7,25 @@ on:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
         required: true
         type: string
+      source_run_id:
+        description: "Optional rejected release-evidence run to re-evaluate without measuring again"
+        required: false
+        type: string
+        default: ""
   workflow_dispatch:
     inputs:
       version:
         description: "Release version from crates/codestory-cli/Cargo.toml, for example 0.7.0"
         required: true
         type: string
+      source_run_id:
+        description: "Optional rejected release-evidence run to re-evaluate without measuring again"
+        required: false
+        type: string
+        default: ""
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -89,8 +100,21 @@ jobs:
             exit 1
           fi
 
-  packaged-proof:
+  release-evidence:
     needs: preflight
+    uses: ./.github/workflows/release-candidate-evidence.yml
+    with:
+      ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      profile: codestory-release-evidence-linux-arm64-v1
+      drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
+      embedding_model_dir: /srv/codestory-release-evidence/models
+      source_run_id: ${{ inputs.source_run_id }}
+
+  packaged-proof:
+    needs:
+      - preflight
+      - release-evidence
     uses: ./.github/workflows/packaged-platform-proof.yml
     with:
       version: ${{ needs.preflight.outputs.version }}

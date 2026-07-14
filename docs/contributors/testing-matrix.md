@@ -430,8 +430,8 @@ were `full`. The log is telemetry only and cannot become a release baseline by
 appending a row. Use the approved profile and release decision command in
 [`performance-review-playbook.md`](../testing/performance-review-playbook.md).
 The harness still emits its prior latest-row warnings and repeat-refresh
-blocker during the transition; release workflow authorization comes only from
-the attested gate below.
+blocker as diagnostics; release workflow authorization comes only from the
+attested gate below.
 
 Release-readiness evidence is tiered:
 
@@ -485,14 +485,14 @@ stats and packet-runtime artifacts into the seven-metric candidate described in
 the performance playbook, then run
 `scripts/codestory-release-evidence-gate.mjs`. The selected machine profile
 must be approved, release-eligible, pinned to attested raw evidence, and match
-the candidate's corpus, cache, and machine fingerprint. Candidate artifacts can
-be produced on the same clean full SHA by the explicit manual/reusable
-`release-candidate-evidence.yml` workflow. This infrastructure is not wired to
-the release workflow until a live eligible baseline exists. A rejected metric
-blocks the release unless a non-expired exception binds the exact candidate
-hash, baseline id/hash, profile, metric, measured value, threshold, owner, ISO
-date, and rationale. Preserve the emitted decision JSON; it carries status,
-metric, decision, commit, and artifact paths/hashes.
+the candidate's corpus, cache, and machine fingerprint. Candidate artifacts are
+produced on the same clean full SHA by the reusable
+`release-candidate-evidence.yml` workflow. `release.yml` calls it after
+preflight and requires it to pass before packaged proof starts. A rejected
+metric blocks the release unless a non-expired exception binds the exact
+candidate hash, baseline id/hash, profile, metric, measured value, threshold,
+owner, ISO date, and rationale. Preserve the emitted decision JSON; it carries
+status, metric, decision, commit, and artifact paths/hashes.
 
 The dedicated Linux ARM64 evidence profile explicitly allows CPU embeddings
 from its checksum-verified preseeded model. Fresh measurements retain the raw
@@ -500,13 +500,14 @@ repo-scale log, stats JSON, and complete real-repo drill tree. Before a distinct
 release-eligible baseline exists, artifact production succeeds but evaluation
 must reject the first run; retained output alone is not acceptance.
 
-Only the manual `release-evidence` mode of the registered platform-proof
-coordinator can reach that self-hosted runner. Its hosted resolver first requires
-a same-repository PR into `dev/codestory-next`, its exact expected head, the
-`review-accepted` label, and a successful exact-head source proof. It then calls
-the reusable evidence workflow with fixed profile and runner paths. The resolved
-SHA is checked out behind the protected `release-evidence` environment; the
-ambient dispatch ref is never measured. Runner groups are unavailable for this
+The main-triggered release and the manual `release-evidence` mode of the
+registered platform-proof coordinator can reach that self-hosted runner. The
+coordinator's hosted resolver first requires a same-repository PR into
+`dev/codestory-next`, its exact expected head, the `review-accepted` label, and
+a successful exact-head source proof. Both entry points call the reusable
+evidence workflow with fixed profile and runner paths. The selected SHA is
+checked out behind the protected `release-evidence` environment; an ambient
+dispatch ref is never substituted. Runner groups are unavailable for this
 personal-account repository, so environment approval is the allocation guard.
 The two live tests run serially and must prove their owned sidecars are gone
 before the packet benchmark starts.

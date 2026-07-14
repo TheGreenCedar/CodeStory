@@ -108,9 +108,8 @@ Do not hand-author candidate metrics. The provisioned
 publishable packet producers on the same clean SHA, records the corpus, cache,
 and machine fingerprint, hashes both non-empty raw artifacts, and derives the
 candidate. It refuses contract-only profiles during release runs. The release
-workflow is not yet activated; legacy warnings and blockers remain authoritative
-until the activation child has a provisioned release-eligible baseline and live
-candidate report.
+workflow calls this gate after preflight and does not start packaged proof until
+the evidence decision passes.
 
 Provision, verify, recover, and unregister the dedicated Linux host using the
 [release-evidence runner runbook](../contributors/release-evidence-runner.md).
@@ -161,15 +160,16 @@ artifact can become release-eligible.
 On rejection, the workflow uploads provisioning, raw, candidate, approval (when
 provided), and report files with `if: always()`. Author an exception against the
 reported hashes and values in the
-`CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON` secret, then dispatch the same SHA
-with `source_run_id=<rejected-run-id>`. That path downloads and re-evaluates the
+`CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON` secret, then dispatch the Release
+workflow on the same SHA and version with
+`source_run_id=<rejected-run-id>`. That path downloads and re-evaluates the
 exact candidate without re-running measurements; any SHA, hash, value, profile,
 baseline, threshold, date, or expiry drift still fails.
 
 The checked-in `ci-contract-v1` fixture and report exercise this trust chain in
-ordinary CI but are explicitly `release_eligible: false`. A product profile must
-be created from provisioned raw evidence and explicitly approved before a
-release workflow can adopt this gate.
+ordinary CI but are explicitly `release_eligible: false`. The release path uses
+only a product profile created from provisioned raw evidence and explicitly
+approved in the baseline document.
 
 The corpus boundary is deliberately precise. The generalization lint scans Rust
 production files in all non-benchmark crates for copied corpus content, direct
