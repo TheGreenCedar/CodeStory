@@ -9,12 +9,9 @@
  * SCIP language indexers are documented only — not installed by this script.
  */
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Readable, Transform } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -199,7 +196,7 @@ function printPrereqReport(opts) {
     [
       "cargo",
       commandExists("cargo"),
-      opts.skipBuild || opts.fetchOnly ? "optional" : "required",
+      opts.skipBuild ? "optional" : "required",
     ],
     [
       "docker",
@@ -269,8 +266,6 @@ const EMBED_MODELS_MANIFEST = path.join(
   "assets",
   "embedding-models.json",
 );
-const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
-
 function pinnedEmbedModel() {
   const models = JSON.parse(fs.readFileSync(EMBED_MODELS_MANIFEST, "utf8")).models ?? [];
   if (models.length !== 1) {
@@ -280,170 +275,8 @@ function pinnedEmbedModel() {
 }
 
 function embedModelDir() {
-  if (process.env.CODESTORY_EMBED_MODEL_DIR) {
-    return path.resolve(process.env.CODESTORY_EMBED_MODEL_DIR);
-  }
   const model = pinnedEmbedModel();
   return path.join(codestoryCacheRoot(), "managed-embeddings", "models", "sha256", model.sha256);
-}
-
-function sha256File(file) {
-  return new Promise((resolve, reject) => {
-    const hash = createHash("sha256");
-    const stream = fs.createReadStream(file);
-    stream.on("data", (chunk) => hash.update(chunk));
-    stream.on("error", reject);
-    stream.on("end", () => resolve(hash.digest("hex")));
-  });
-}
-
-async function verifyEmbedModel(file) {
-  const model = pinnedEmbedModel();
-  const stat = fs.statSync(file);
-  if (!stat.isFile()) {
-    throw new Error(`Embed model path is not a file: ${file}`);
-  }
-  if (stat.size !== model.artifact_bytes) {
-    throw new Error(
-      `Embed model size mismatch for ${file}: got ${stat.size} bytes, expected ${model.artifact_bytes}`,
-    );
-  }
-  const actual = await sha256File(file);
-  if (actual !== model.sha256) {
-    throw new Error(
-      `Embed model SHA-256 mismatch for ${file}: got ${actual}, expected ${model.sha256}`,
-    );
-  }
-  return actual;
-}
-
-async function downloadFile(
-  url,
-  destination,
-  {
-    expectedBytes = null,
-    maxBytes = expectedBytes,
-    timeoutMs = DOWNLOAD_TIMEOUT_MS,
-    fetchImpl = fetch,
-  } = {},
-) {
-  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
-    throw new Error(`download_size_limit_invalid:${maxBytes}`);
-  }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetchImpl(url, { signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} from ${url}`);
-    }
-    if (!response.body) {
-      throw new Error(`download_body_missing:${url}`);
-    }
-    const contentLength = response.headers.get("content-length");
-    if (contentLength !== null) {
-      const announcedBytes = Number(contentLength);
-      if (!Number.isSafeInteger(announcedBytes) || announcedBytes < 0) {
-        throw new Error(`download_content_length_invalid:${contentLength}`);
-      }
-      if (announcedBytes > maxBytes) {
-        throw new Error(`download_size_limit_exceeded:${announcedBytes}>${maxBytes}`);
-      }
-      if (expectedBytes !== null && announcedBytes !== expectedBytes) {
-        throw new Error(`download_size_mismatch:${announcedBytes}!=${expectedBytes}`);
-      }
-    }
-
-    let receivedBytes = 0;
-    const limiter = new Transform({
-      transform(chunk, _encoding, callback) {
-        receivedBytes += chunk.length;
-        if (receivedBytes > maxBytes) {
-          callback(new Error(`download_size_limit_exceeded:${receivedBytes}>${maxBytes}`));
-          return;
-        }
-        callback(null, chunk);
-      },
-    });
-    await pipeline(
-      Readable.fromWeb(response.body),
-      limiter,
-      fs.createWriteStream(destination, { flags: "wx" }),
-    );
-    if (expectedBytes !== null && receivedBytes !== expectedBytes) {
-      throw new Error(`download_size_mismatch:${receivedBytes}!=${expectedBytes}`);
-    }
-    return receivedBytes;
-  } catch (error) {
-    fs.rmSync(destination, { force: true });
-    if (error?.name === "AbortError") {
-      throw new Error(`download_deadline_exceeded:${timeoutMs}ms:${url}`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function fetchEmbedModel() {
-  const model = pinnedEmbedModel();
-  const dir = embedModelDir();
-  fs.mkdirSync(dir, { recursive: true });
-  const dest = path.join(dir, model.filename);
-  if (fs.existsSync(dest) && fs.statSync(dest).size > 1_000_000) {
-    let checksum;
-    try {
-      checksum = await verifyEmbedModel(dest);
-    } catch (error) {
-      const quarantine = path.join(
-        dir,
-        `.quarantine-${model.filename}-invalid-${process.pid}-${Date.now()}`,
-      );
-      fs.renameSync(dest, quarantine);
-      console.log(`Quarantined invalid managed model at ${quarantine}: ${error}`);
-    }
-    if (checksum) {
-      console.log(`Embed model already present and verified: ${dest} sha256=${checksum}`);
-      return dest;
-    }
-  }
-  let lastError = null;
-  for (const url of model.urls) {
-    console.log(`Downloading ${model.filename} from ${url} to ${dest} ...`);
-    const tempDest = path.join(dir, `.${model.filename}.partial-${process.pid}-${Date.now()}`);
-    try {
-      const downloadedBytes = await downloadFile(url, tempDest, {
-        expectedBytes: model.artifact_bytes,
-        maxBytes: model.artifact_bytes,
-      });
-      const checksum = await verifyEmbedModel(tempDest);
-      try {
-        fs.renameSync(tempDest, dest);
-      } catch (error) {
-        if (!fs.existsSync(dest)) throw error;
-        await verifyEmbedModel(dest);
-        fs.rmSync(tempDest, { force: true });
-        console.log(`Embed model was published concurrently and verified: ${dest}`);
-        return dest;
-      }
-      const manifestTemp = path.join(
-        dir,
-        `.install-manifest.json.partial-${process.pid}-${Date.now()}`,
-      );
-      fs.writeFileSync(
-        manifestTemp,
-        `${JSON.stringify({ ...model, source_url: url, urls: undefined }, null, 2)}\n`,
-        { flag: "wx" },
-      );
-      fs.renameSync(manifestTemp, path.join(dir, "install-manifest.json"));
-      console.log(`Wrote ${dest} (${downloadedBytes} bytes, sha256=${checksum})`);
-      return dest;
-    } catch (error) {
-      fs.rmSync(tempDest, { force: true });
-      lastError = `${error instanceof Error ? error.message : error} from ${url}`;
-    }
-  }
-  throw new Error(`Failed to download embed model: ${lastError ?? "no URLs configured"}`);
 }
 
 const LLAMA_BACKENDS_MANIFEST = path.join(
@@ -453,9 +286,6 @@ const LLAMA_BACKENDS_MANIFEST = path.join(
   "assets",
   "llama-sidecar-backends.json",
 );
-const LLAMA_INSTALL_MANIFEST = "install-manifest.json";
-const LLAMA_EXTRACTED_MARKER = ".codestory-extracted";
-
 function readLlamaBackends() {
   return JSON.parse(fs.readFileSync(LLAMA_BACKENDS_MANIFEST, "utf8")).backends ?? [];
 }
@@ -512,120 +342,6 @@ function managedLlamaServerPath(backend) {
   return path.join(codestoryCacheRoot(), backend.managed_cache_rel_dir, backend.executable_rel_path);
 }
 
-async function verifySha256(file, expected, label) {
-  const actual = await sha256File(file);
-  if (actual !== expected.toLowerCase()) {
-    throw new Error(`${label} SHA-256 mismatch for ${file}: got ${actual}, expected ${expected}`);
-  }
-  return actual;
-}
-
-function safeArchiveMemberPath(member) {
-  if (!member || member.trim() === "" || member.includes("\\") || /^[A-Za-z]:/.test(member)) {
-    throw new Error(`Managed llama-server archive path is not portable: ${member}`);
-  }
-  const normalized = path.posix.normalize(member);
-  if (
-    normalized === "." ||
-    normalized.startsWith("../") ||
-    normalized.includes("/../") ||
-    path.posix.isAbsolute(normalized)
-  ) {
-    throw new Error(`Managed llama-server archive path must be relative and contained: ${member}`);
-  }
-  return normalized;
-}
-
-async function validateExtractedExecutable(file, backend) {
-  const stat = fs.lstatSync(file);
-  if (stat.isSymbolicLink() || !stat.isFile()) {
-    throw new Error(`Managed llama-server archive member is not a regular file: ${file}`);
-  }
-  const executableSha = await sha256File(file);
-  if (executableSha !== backend.executable_sha256.toLowerCase()) {
-    throw new Error(
-      `llama-server executable SHA-256 mismatch for ${file}: got ${executableSha}, expected ${backend.executable_sha256}`,
-    );
-  }
-  return executableSha;
-}
-
-function pathIsInside(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function copyManagedPayloadSymlink(source, target, root) {
-  const linkTarget = fs.readlinkSync(source);
-  if (path.isAbsolute(linkTarget)) {
-    throw new Error(`Managed llama-server archive symlink must be relative: ${source} -> ${linkTarget}`);
-  }
-  const resolved = fs.realpathSync(path.resolve(path.dirname(source), linkTarget));
-  if (!pathIsInside(root, resolved)) {
-    throw new Error(`Managed llama-server archive symlink escapes payload: ${source} -> ${resolved}`);
-  }
-  if (!fs.statSync(resolved).isFile()) {
-    throw new Error(`Managed llama-server archive symlink target is not a regular file: ${source} -> ${resolved}`);
-  }
-  fs.copyFileSync(resolved, target);
-}
-
-function copyManagedPayload(source, target, root = fs.realpathSync(source)) {
-  fs.mkdirSync(target, { recursive: true });
-  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
-    const sourcePath = path.join(source, entry.name);
-    const targetPath = path.join(target, entry.name);
-    if (entry.isSymbolicLink()) {
-      copyManagedPayloadSymlink(sourcePath, targetPath, root);
-    } else if (entry.isDirectory()) {
-      copyManagedPayload(sourcePath, targetPath, root);
-    } else if (entry.isFile()) {
-      fs.copyFileSync(sourcePath, targetPath);
-    } else {
-      throw new Error(`Managed llama-server archive member is not a regular file or directory: ${sourcePath}`);
-    }
-  }
-}
-
-async function installExtractedLlamaServerPayload(backend, extracted, dest) {
-  await validateExtractedExecutable(extracted, backend);
-  const targetDir = path.dirname(dest);
-  const sourceDir = path.dirname(extracted);
-  const targetParent = path.dirname(targetDir);
-  fs.mkdirSync(targetParent, { recursive: true });
-  const stagingDir = `${targetDir}.download`;
-  fs.rmSync(stagingDir, { recursive: true, force: true });
-  copyManagedPayload(sourceDir, stagingDir);
-  const stagedExecutable = path.join(stagingDir, backend.executable_rel_path);
-  fs.chmodSync(stagedExecutable, 0o755);
-  const executableSha = await sha256File(stagedExecutable);
-  if (executableSha !== backend.executable_sha256.toLowerCase()) {
-    throw new Error(
-      `llama-server executable SHA-256 mismatch for ${stagedExecutable}: got ${executableSha}, expected ${backend.executable_sha256}`,
-    );
-  }
-  fs.writeFileSync(path.join(stagingDir, LLAMA_EXTRACTED_MARKER), "1");
-  fs.writeFileSync(
-    path.join(stagingDir, LLAMA_INSTALL_MANIFEST),
-    `${JSON.stringify(
-      {
-        backend: backend.id,
-        artifact: backend.artifact,
-        artifact_bytes: backend.artifact_bytes,
-        artifact_sha256: backend.sha256,
-        executable_rel_path: backend.executable_rel_path,
-        executable_sha256: backend.executable_sha256,
-        source_url: backend.url,
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  fs.rmSync(targetDir, { recursive: true, force: true });
-  fs.renameSync(stagingDir, targetDir);
-  return dest;
-}
-
 function printLlamaServerPlan(backend) {
   console.log("\nManaged llama-server:");
   console.log(`  backend: ${backend.id}`);
@@ -638,69 +354,34 @@ function printLlamaServerPlan(backend) {
   console.log(`  target: ${managedLlamaServerPath(backend)}`);
 }
 
-async function fetchLlamaServer(opts) {
-  const backend = selectedLlamaBackend(opts);
-  if (!Number.isSafeInteger(backend.artifact_bytes) || backend.artifact_bytes <= 0) {
-    throw new Error(`Managed llama-server backend ${backend.id} is missing artifact_bytes`);
+function managedAssetPrewarmArgs(opts) {
+  const args = ["retrieval", "prewarm-assets"];
+  if (opts.fetchEmbedModel) args.push("--model");
+  if (opts.fetchLlamaServer) args.push("--native-backend");
+  if (opts.fetchLlamaServer && opts.llamaBackend) {
+    args.push("--llama-backend", opts.llamaBackend);
   }
-  const dest = managedLlamaServerPath(backend);
-  printLlamaServerPlan(backend);
-  if (opts.checkOnly) {
-    return dest;
-  }
-  if (!commandExists("tar")) {
-    throw new Error("tar is required to extract the managed llama-server archive");
-  }
-  const targetDir = path.dirname(dest);
-  fs.mkdirSync(targetDir, { recursive: true });
-  const existingManifest = path.join(targetDir, LLAMA_INSTALL_MANIFEST);
-  if (fs.existsSync(dest) && fs.existsSync(existingManifest)) {
-    const manifest = JSON.parse(fs.readFileSync(existingManifest, "utf8"));
-    const executableSha = await sha256File(dest);
-    if (
-      manifest.artifact === backend.artifact &&
-      manifest.artifact_bytes === backend.artifact_bytes &&
-      manifest.artifact_sha256?.toLowerCase() === backend.sha256.toLowerCase() &&
-      manifest.executable_rel_path === backend.executable_rel_path &&
-      manifest.executable_sha256?.toLowerCase() === backend.executable_sha256.toLowerCase() &&
-      executableSha === backend.executable_sha256.toLowerCase()
-    ) {
-      console.log(`llama-server already present and verified: ${dest} sha256=${executableSha}`);
-      return dest;
-    }
-    console.log(`Managed llama-server install manifest is stale for ${dest}; redownloading.`);
-  }
-
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-llama-server-"));
-  const archive = path.join(tempRoot, backend.artifact);
-  const extractDir = path.join(tempRoot, "extract");
-  fs.mkdirSync(extractDir);
-  try {
-    console.log(`Downloading ${backend.artifact} from ${backend.url} to ${archive} ...`);
-    await downloadFile(backend.url, archive, {
-      expectedBytes: backend.artifact_bytes,
-      maxBytes: backend.artifact_bytes,
-    });
-    await verifySha256(archive, backend.sha256, "llama-server artifact");
-    const member = safeArchiveMemberPath(backend.executable_archive_path);
-    const result = spawnSync(commandName("tar"), ["-xzf", archive, "-C", extractDir], {
-      encoding: "utf8",
-      shell: false,
-    });
-    if (result.status !== 0) {
-      throw new Error(`tar failed extracting ${archive}: ${result.stderr || result.stdout}`);
-    }
-    const extracted = path.join(extractDir, ...member.split("/"));
-    await installExtractedLlamaServerPayload(backend, extracted, dest);
-    const executableSha = await sha256File(dest);
-    console.log(`Wrote ${dest} (sha256=${executableSha})`);
-    return dest;
-  } finally {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
-  }
+  return args;
 }
 
-async function runSelfTest() {
+function runManagedAssetPrewarm(opts) {
+  const args = managedAssetPrewarmArgs(opts);
+  if (opts.skipBuild) {
+    const cli = cliPath(opts.release);
+    if (!fs.existsSync(cli)) {
+      throw new Error(`CLI not found at ${cli}; drop --skip-build to build it.`);
+    }
+    runChecked("Prewarm managed retrieval assets", cli, args);
+    return;
+  }
+  runChecked(
+    "Prewarm managed retrieval assets",
+    "cargo",
+    cargoRunArgs(...(opts.release ? ["--release"] : []), "-p", "codestory-cli", "--", ...args),
+  );
+}
+
+function runSelfTest() {
   const model = pinnedEmbedModel();
   if (
     model.filename !== "bge-base-en-v1.5.Q8_0.gguf" ||
@@ -740,13 +421,13 @@ async function runSelfTest() {
   if (!macMetal.managed_cache_rel_dir.includes("/llama/b9902/")) {
     throw new Error(`unexpected managed cache version path: ${macMetal.managed_cache_rel_dir}`);
   }
-  if (safeArchiveMemberPath(macMetal.executable_archive_path) !== "llama-b9902/llama-server") {
+  if (macMetal.executable_archive_path !== "llama-b9902/llama-server") {
     throw new Error(`unexpected executable archive path: ${macMetal.executable_archive_path}`);
   }
   if (!/^[0-9a-f]{64}$/.test(macMetal.executable_sha256)) {
     throw new Error(`unexpected executable sha256: ${macMetal.executable_sha256}`);
   }
-  if (safeArchiveMemberPath(winVulkan.executable_archive_path) !== "llama-server.exe") {
+  if (winVulkan.executable_archive_path !== "llama-server.exe") {
     throw new Error(`unexpected Windows executable archive path: ${winVulkan.executable_archive_path}`);
   }
   if (!winVulkan.managed_cache_rel_dir.includes("/llama/b9902/")) {
@@ -759,66 +440,23 @@ async function runSelfTest() {
   if (managedLlamaServerPath(selected).split(path.sep).join("/").endsWith("llama-server") !== true) {
     throw new Error("managed llama-server target path should end in llama-server");
   }
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codestory-llama-self-test-"));
-  try {
-    const payloadDir = path.join(tempRoot, "extract", "llama-b9902");
-    fs.mkdirSync(payloadDir, { recursive: true });
-    const executable = path.join(payloadDir, "llama-server");
-    fs.writeFileSync(executable, "fake exe");
-    fs.writeFileSync(path.join(payloadDir, "libllama-test.dylib"), "fake dylib");
-    const executableSha = await sha256File(executable);
-    const backend = {
-      id: "self-test",
-      artifact: "llama-test.tar.gz",
-      artifact_bytes: 8,
-      sha256: "0".repeat(64),
-      executable_archive_path: "llama-b9902/llama-server",
-      executable_rel_path: "llama-server",
-      executable_sha256: executableSha,
-      url: "https://example.invalid/llama-test.tar.gz",
-    };
-    const dest = path.join(tempRoot, "managed", "llama-server");
-    await installExtractedLlamaServerPayload(backend, executable, dest);
-    if (fs.readFileSync(dest, "utf8") !== "fake exe") {
-      throw new Error("managed install self-test did not copy executable");
-    }
-    if (fs.readFileSync(path.join(path.dirname(dest), "libllama-test.dylib"), "utf8") !== "fake dylib") {
-      throw new Error("managed install self-test did not copy sibling payload");
-    }
-    if (!fs.existsSync(path.join(path.dirname(dest), LLAMA_EXTRACTED_MARKER))) {
-      throw new Error("managed install self-test did not write extraction marker");
-    }
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(path.dirname(dest), LLAMA_INSTALL_MANIFEST), "utf8"),
-    );
-    if (manifest.artifact !== backend.artifact || manifest.executable_sha256 !== executableSha) {
-      throw new Error("managed install self-test wrote stale manifest metadata");
-    }
-
-    const partial = path.join(tempRoot, "oversized.partial");
-    const oversizedResponse = new Response(
-      new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode("123"));
-          controller.enqueue(new TextEncoder().encode("456"));
-          controller.close();
-        },
-      }),
-    );
-    let rejectedOversize = false;
-    try {
-      await downloadFile("https://example.invalid/oversized", partial, {
-        maxBytes: 4,
-        fetchImpl: async () => oversizedResponse,
-      });
-    } catch (error) {
-      rejectedOversize = String(error).includes("download_size_limit_exceeded");
-    }
-    if (!rejectedOversize || fs.existsSync(partial)) {
-      throw new Error("bounded download self-test did not reject and clean an oversized stream");
-    }
-  } finally {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+  const prewarmArgs = managedAssetPrewarmArgs({
+    fetchEmbedModel: true,
+    fetchLlamaServer: true,
+    llamaBackend: "macos-aarch64-metal",
+  });
+  if (
+    JSON.stringify(prewarmArgs) !==
+    JSON.stringify([
+      "retrieval",
+      "prewarm-assets",
+      "--model",
+      "--native-backend",
+      "--llama-backend",
+      "macos-aarch64-metal",
+    ])
+  ) {
+    throw new Error(`managed asset prewarm command drifted: ${prewarmArgs.join(" ")}`);
   }
   console.log("setup-retrieval-env self-test passed");
 }
@@ -840,11 +478,8 @@ async function main() {
     throw new Error("Fix missing prerequisites (or use --skip-compose / --skip-build where applicable).");
   }
 
-  if (opts.fetchEmbedModel) {
-    await fetchEmbedModel();
-  }
-  if (opts.fetchLlamaServer) {
-    await fetchLlamaServer(opts);
+  if (opts.fetchEmbedModel || opts.fetchLlamaServer) {
+    runManagedAssetPrewarm(opts);
   }
   if (opts.fetchOnly) {
     console.log("\nFetch-only setup complete.");

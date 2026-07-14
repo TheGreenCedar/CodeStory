@@ -162,6 +162,13 @@ pub(crate) fn selected_llama_sidecar_backend(provider: &str) -> Option<LlamaSide
     llama_sidecar_backends(provider).into_iter().next()
 }
 
+pub(crate) fn llama_sidecar_backend_by_id(id: &str) -> Option<LlamaSidecarBackend> {
+    llama_sidecar_backend_manifest()
+        .backends
+        .into_iter()
+        .find(|backend| backend.id == id)
+}
+
 pub(crate) fn llama_sidecar_backends(provider: &str) -> Vec<LlamaSidecarBackend> {
     let platform = embedding_host_platform();
     llama_sidecar_backend_manifest()

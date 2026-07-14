@@ -16,7 +16,7 @@ use crate::sidecar::{
 };
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 #[cfg(windows)]
@@ -166,6 +166,15 @@ pub struct EmbedModelInventory {
     pub candidate_dirs: Vec<String>,
 }
 
+/// Machine-cache locations published while prewarming managed retrieval assets.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedAssetPrewarmReport {
+    pub cache_root: String,
+    pub model_dir: Option<String>,
+    pub native_backend: Option<String>,
+    pub native_executable: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct BootstrapReport {
     pub state: SidecarStateFile,
@@ -302,7 +311,8 @@ struct NativeLlamaCandidate {
 #[derive(Debug, Deserialize)]
 struct NativeLlamaInstallManifest {
     artifact: String,
-    artifact_bytes: u64,
+    #[serde(default)]
+    artifact_bytes: Option<u64>,
     artifact_sha256: String,
     executable_rel_path: String,
     executable_sha256: String,
@@ -1582,6 +1592,59 @@ fn ensure_managed_native_llama_server(backend: &crate::config::LlamaSidecarBacke
     install_result
 }
 
+/// Publish the requested managed retrieval assets through the shared asset boundary.
+pub fn prewarm_managed_assets(
+    include_model: bool,
+    include_native_backend: bool,
+    backend_id: Option<&str>,
+) -> Result<ManagedAssetPrewarmReport> {
+    if !include_model && !include_native_backend {
+        bail!("select --model, --native-backend, or both");
+    }
+    if backend_id.is_some() && !include_native_backend {
+        bail!("--llama-backend requires --native-backend");
+    }
+
+    let cache_root = user_cache_root();
+    let model_dir = include_model
+        .then(|| crate::managed_assets::ensure_managed_embedding_model(&cache_root))
+        .transpose()?
+        .map(|path| path.display().to_string());
+
+    let backend = if include_native_backend {
+        let backend = match backend_id {
+            Some(id) => crate::config::llama_sidecar_backend_by_id(id)
+                .with_context(|| format!("unknown managed llama-server backend {id}"))?,
+            None => selected_native_llama_backend().context(
+                "no managed native llama-server backend is available for this host and accelerator",
+            )?,
+        };
+        if backend.launch_mode != EmbeddingServerLaunchMode::NativeSpawned.as_str() {
+            bail!(
+                "managed llama-server backend {} is not a native backend",
+                backend.id
+            );
+        }
+        ensure_managed_native_llama_server(&backend)?;
+        Some(backend)
+    } else {
+        None
+    };
+    let native_executable = backend.as_ref().map(|backend| {
+        cache_root
+            .join(native_llama_backend_rel_path(backend))
+            .display()
+            .to_string()
+    });
+
+    Ok(ManagedAssetPrewarmReport {
+        cache_root: cache_root.display().to_string(),
+        model_dir,
+        native_backend: backend.map(|backend| backend.id),
+        native_executable,
+    })
+}
+
 fn managed_llama_temp_root() -> Result<PathBuf> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1865,12 +1928,14 @@ fn validate_managed_native_llama_server(
             manifest.artifact
         );
     }
-    if manifest.artifact_bytes != backend.artifact_bytes {
+    if let Some(artifact_bytes) = manifest.artifact_bytes
+        && artifact_bytes != backend.artifact_bytes
+    {
         bail!(
             "managed llama-server artifact size mismatch for {}: expected {}, got {}",
             executable.display(),
             backend.artifact_bytes,
-            manifest.artifact_bytes
+            artifact_bytes
         );
     }
     if !manifest
@@ -3246,7 +3311,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_windows_vulkan_cache_requires_matching_install_manifest() {
+    fn legacy_windows_vulkan_cache_accepts_the_original_install_manifest_shape() {
         let _lock = crate::test_support::env_lock();
         let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
         let legacy = crate::config::llama_sidecar_backends("vulkan")
@@ -3273,7 +3338,6 @@ mod tests {
         let manifest = serde_json::json!({
             "backend": legacy.id,
             "artifact": legacy.artifact,
-            "artifact_bytes": legacy.artifact_bytes,
             "artifact_sha256": legacy.sha256,
             "executable_rel_path": legacy.executable_rel_path,
             "executable_sha256": exe_sha,

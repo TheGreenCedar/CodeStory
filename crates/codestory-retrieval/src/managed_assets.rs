@@ -111,13 +111,7 @@ pub(crate) fn managed_embedding_model_is_published(cache_root: &Path) -> bool {
     let model = pinned_embedding_model();
     let dir = managed_embedding_model_dir(cache_root);
     let path = dir.join(&model.filename);
-    let Ok(metadata) = fs::symlink_metadata(&path) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() != model.artifact_bytes
-    {
+    if !file_matches(&path, model.artifact_bytes, &model.sha256) {
         return false;
     }
     let Ok(manifest) = fs::read(dir.join("install-manifest.json")) else {
@@ -384,7 +378,9 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::process::Command;
     use std::thread;
+    use std::time::Instant;
     use tempfile::tempdir;
 
     fn serve_once(body: Vec<u8>) -> (String, thread::JoinHandle<()>) {
@@ -425,8 +421,12 @@ mod tests {
     fn corrupt_and_interrupted_assets_are_quarantined_before_atomic_publication() {
         let cache = tempdir().expect("cache");
         let destination = cache.path().join("sha256/test/asset.bin");
+        let body = b"verified asset".to_vec();
+        let sha = format!("{:x}", Sha256::digest(&body));
         fs::create_dir_all(destination.parent().unwrap()).expect("asset dir");
-        fs::write(&destination, b"corrupt").expect("corrupt asset");
+        fs::write(&destination, b"corrupted data").expect("corrupt asset");
+        assert_eq!(fs::metadata(&destination).unwrap().len(), body.len() as u64);
+        assert!(!file_matches(&destination, body.len() as u64, &sha));
         fs::write(
             destination
                 .parent()
@@ -435,8 +435,6 @@ mod tests {
             b"partial",
         )
         .expect("partial asset");
-        let body = b"verified asset".to_vec();
-        let sha = format!("{:x}", Sha256::digest(&body));
         let (url, server) = serve_once(body.clone());
         let _lock = ManagedAssetLock::acquire(cache.path()).expect("asset lock");
 
@@ -456,5 +454,61 @@ mod tests {
             })
             .count();
         assert_eq!(quarantines, 2);
+    }
+
+    #[test]
+    fn managed_asset_lock_process_helper() {
+        let Ok(cache_root) = std::env::var("CODESTORY_TEST_ASSET_LOCK_CACHE") else {
+            return;
+        };
+        let cache_root = PathBuf::from(cache_root);
+        fs::write(cache_root.join("child-started"), b"1").expect("publish child start");
+        let _lock = ManagedAssetLock::acquire(&cache_root).expect("acquire child asset lock");
+        fs::write(cache_root.join("child-acquired"), b"1").expect("publish child acquisition");
+    }
+
+    #[test]
+    fn managed_asset_lock_serializes_processes() {
+        let cache = tempdir().expect("cache");
+        let lock = ManagedAssetLock::acquire(cache.path()).expect("acquire parent asset lock");
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("managed_assets::tests::managed_asset_lock_process_helper")
+            .arg("--nocapture")
+            .env("CODESTORY_TEST_ASSET_LOCK_CACHE", cache.path())
+            .spawn()
+            .expect("spawn asset lock helper");
+
+        let started = cache.path().join("child-started");
+        let acquired = cache.path().join("child-acquired");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.is_file(), "child did not reach the asset lock");
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !acquired.exists(),
+            "child crossed the machine asset lock while the parent held it"
+        );
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "child exited instead of waiting for the machine asset lock"
+        );
+
+        drop(lock);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll child after release") {
+                assert!(status.success(), "asset lock helper failed: {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not acquire the released machine asset lock"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(acquired.is_file());
     }
 }
