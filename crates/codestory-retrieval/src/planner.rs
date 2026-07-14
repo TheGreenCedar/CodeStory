@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum RetrievalStageKind {
     Stage0ScipAnchor,
     Stage1Lexical,
+    #[serde(rename = "stage1b_semantic", alias = "stage1b_qdrant_semantic")]
     Stage1bQdrantSemantic,
     Stage2ScipExpand,
     Stage3RepoTextFallback,
@@ -22,7 +23,7 @@ impl RetrievalStageKind {
         match self {
             RetrievalStageKind::Stage0ScipAnchor => "stage0_scip_anchor",
             RetrievalStageKind::Stage1Lexical => "stage1_lexical",
-            RetrievalStageKind::Stage1bQdrantSemantic => "stage1b_qdrant_semantic",
+            RetrievalStageKind::Stage1bQdrantSemantic => "stage1b_semantic",
             RetrievalStageKind::Stage2ScipExpand => "stage2_scip_expand",
             RetrievalStageKind::Stage3RepoTextFallback => "stage3_repo_text_fallback",
         }

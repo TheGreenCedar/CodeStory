@@ -1,4 +1,4 @@
-# Mandatory Sidecar Retrieval Design
+# Managed Retrieval Design
 
 CodeStory packet/search evidence is sidecar-primary. A product response may be
 served only when the current project has a manifest-backed sidecar generation
@@ -9,18 +9,22 @@ with `retrieval_mode=full`.
 - The project-local SQLite FTS lexical shard exists, matches the current lexical input hash, and
   answers smoke queries against source files plus generated graph-native symbol
   docs and component-report virtual docs.
-- Qdrant collection exists, has at least the manifest dense-anchor projection
-  count, matches the product-compatible BGE-base embedding contract, and answers
-  semantic smoke queries from the live llama.cpp sidecar when the active
-  semantic policy selects one or more dense anchors. If the active policy
-  selects zero dense anchors, Qdrant is explicitly not required for that
-  generation.
+- The immutable embedded SQLite vector generation exists, has the exact
+  manifest dense-anchor projection count, and matches the product-compatible
+  BGE-base embedding contract when the active semantic policy selects dense
+  anchors. A trusted operator may explicitly select external Qdrant instead;
+  it must satisfy the same generation and semantic-smoke contract. If the
+  policy selects zero dense anchors, no vector index is required.
 - SCIP graph artifacts exist and are not stub markers.
 - The SQLite `retrieval_index_manifest` has the current schema version and
-  canonical `lexical_version`, sidecar input hash, sidecar generation, Qdrant
-  collection, embedding backend, embedding dimension, symbol-doc count,
+  canonical `lexical_version`, sidecar input hash, sidecar generation, semantic
+  generation key, embedding backend, embedding dimension, symbol-doc count,
   dense-anchor count, semantic policy version, graph artifact hash, and dense
   reason counts.
+
+The persisted field is still named `qdrant_collection` for wire and database
+compatibility. Under the default embedded backend it names the immutable vector
+generation; it does not imply a Qdrant process, port, or container.
 
 Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
 `unavailable`, stale manifests, stub markers, disabled sidecars, hash vectors,
@@ -43,7 +47,7 @@ databases. Current code reads and writes only `lexical_version`.
 
 ## Mode Matrix
 
-| SQLite lexical | Qdrant | SCIP | Dense anchors | Mode | Product behavior |
+| SQLite lexical | Semantic vectors | SCIP | Dense anchors | Mode | Product behavior |
 |-------|--------|------|---------------|------|------------------|
 | up | up | up | >0 | `full` | Serve packet/search evidence |
 | up | skipped by policy | up | 0 | `full` | Serve graph/lexical packet/search evidence; dense stage is explicitly skipped |
@@ -62,7 +66,9 @@ Runtime rules:
   explicitly labeled diagnostics.
 - Each opened project owns one immutable `SidecarRuntimeConfig`. Retrieval
   indexing, query embedding, readiness/status, runtime search, and summary
-  generation consume that retained value. Managed sidecar endpoints are
+  generation consume that retained value. Embedded vectors are the default;
+  `CODESTORY_VECTOR_BACKEND=external_qdrant` is an explicit maintainer override.
+  Managed embedding endpoints are
   derived from the selected profile/run ports; external endpoints retain their
   trusted origin. Persisted state records that origin plus an install-keyed
   HMAC-SHA256 fingerprint of the full endpoint while exposing only the redacted
@@ -104,8 +110,8 @@ also aborts if re-observation changes its workspace or artifact scope.
 The hash includes local lexical input, graph-native `symbol_search_doc` rows,
 dense-anchor rows, semantic file-role metadata, sidecar schema version, lexical
 version pin, embedding backend, configured profile/model/pooling/normalization
-contract, embedding dimension, semantic policy version, dense reason counts,
-and SCIP artifact contract inputs. Endpoint ports are deliberately excluded:
+contract, embedding dimension, vector engine, semantic policy version, dense
+reason counts, and SCIP artifact contract inputs. Endpoint ports are deliberately excluded:
 they route the retained runtime but do not identify the model or its vectors.
 
 `retrieval index --refresh auto` should reuse an unchanged healthy generation.
@@ -120,9 +126,10 @@ during workspace discovery.
 
 The publication path has one mandatory validation gate immediately before its
 short input/pointer transaction. The candidate manifest must bind the expected
-SQLite lexical shard, SCIP revision and graph artifacts, Qdrant generation
-collection with an exact point count and semantic smoke, llama.cpp runtime
-identity and dimension, and the configured model/profile contract. Native
+SQLite lexical shard, SCIP revision and graph artifacts, embedded vector
+generation (or explicitly selected external Qdrant collection) with an exact
+point count, llama.cpp runtime identity and dimension, and the configured
+model/profile contract. Native
 managed launches must also expose a matching model path and launch fingerprint;
 Docker launches must retain the same persisted running-container identity
 across the final probes. Accelerator-required policy reruns a bounded embedding

@@ -1,5 +1,5 @@
 use crate::port_registry::{
-    AGENT_PORT_LEASE_TTL, AgentPortAllocation, allocate_agent_ports, free_local_port,
+    AGENT_PORT_LEASE_TTL, AgentPortAllocation, allocate_agent_ports_for_backend, free_local_port,
     renew_agent_port_lease, revalidate_agent_embedding_port,
 };
 use anyhow::{Context, Result, bail};
@@ -67,6 +67,7 @@ const RUNTIME_ENV_KEYS: &[&str] = &[
     "GITHUB_ACTIONS",
     "CODESTORY_QDRANT_HTTP_PORT",
     "CODESTORY_QDRANT_GRPC_PORT",
+    "CODESTORY_VECTOR_BACKEND",
     "CODESTORY_EMBED_PORT",
     "CODESTORY_EMBED_BACKEND",
     "CODESTORY_EMBED_RUNTIME_MODE",
@@ -219,6 +220,23 @@ pub enum EmbeddingServerLaunchMode {
     DockerComposeEmbed,
     NativeSpawned,
     ExternalEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorBackend {
+    #[default]
+    Embedded,
+    ExternalQdrant,
+}
+
+impl VectorBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::ExternalQdrant => "external_qdrant",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,17 +588,27 @@ impl SidecarRuntimeConfig {
             && stored_value
                 .as_ref()
                 .is_some_and(sidecar_state_uses_native_embedding);
+        let (vector_backend, vector_backend_error) = vector_backend_from_defaults(defaults);
+        let qdrant_required = vector_backend == VectorBackend::ExternalQdrant;
         let configured_ports = [
-            env_port(
-                defaults,
-                "CODESTORY_QDRANT_HTTP_PORT",
-                DEFAULT_QDRANT_HTTP_PORT,
-            ),
-            env_port(
-                defaults,
-                "CODESTORY_QDRANT_GRPC_PORT",
-                DEFAULT_QDRANT_GRPC_PORT,
-            ),
+            qdrant_required
+                .then(|| {
+                    env_port(
+                        defaults,
+                        "CODESTORY_QDRANT_HTTP_PORT",
+                        DEFAULT_QDRANT_HTTP_PORT,
+                    )
+                })
+                .flatten(),
+            qdrant_required
+                .then(|| {
+                    env_port(
+                        defaults,
+                        "CODESTORY_QDRANT_GRPC_PORT",
+                        DEFAULT_QDRANT_GRPC_PORT,
+                    )
+                })
+                .flatten(),
             env_port(defaults, "CODESTORY_EMBED_PORT", DEFAULT_EMBED_HTTP_PORT),
         ];
         let requested_ports = std::array::from_fn(|index| {
@@ -596,7 +624,7 @@ impl SidecarRuntimeConfig {
             })
         });
         let agent_allocation = (profile == SidecarProfile::Agent)
-            .then(|| dynamic_agent_ports(&base, &namespace, requested_ports));
+            .then(|| dynamic_agent_ports(&base, &namespace, requested_ports, qdrant_required));
         let dynamic_failed = agent_allocation
             .as_ref()
             .is_some_and(AgentPortAllocation::failed);
@@ -608,22 +636,30 @@ impl SidecarRuntimeConfig {
                     configured.or(stored).or(dynamic).unwrap_or(default)
                 }
             };
-        let qdrant_http_port = selected_port(
-            configured_ports[0],
-            stored.as_ref().map(|ports| ports.qdrant_http),
-            agent_allocation
-                .as_ref()
-                .map(|allocation| allocation.ports.qdrant_http),
-            DEFAULT_QDRANT_HTTP_PORT,
-        );
-        let qdrant_grpc_port = selected_port(
-            configured_ports[1],
-            stored.as_ref().map(|ports| ports.qdrant_grpc),
-            agent_allocation
-                .as_ref()
-                .map(|allocation| allocation.ports.qdrant_grpc),
-            DEFAULT_QDRANT_GRPC_PORT,
-        );
+        let qdrant_http_port = if qdrant_required {
+            selected_port(
+                configured_ports[0],
+                stored.as_ref().map(|ports| ports.qdrant_http),
+                agent_allocation
+                    .as_ref()
+                    .map(|allocation| allocation.ports.qdrant_http),
+                DEFAULT_QDRANT_HTTP_PORT,
+            )
+        } else {
+            0
+        };
+        let qdrant_grpc_port = if qdrant_required {
+            selected_port(
+                configured_ports[1],
+                stored.as_ref().map(|ports| ports.qdrant_grpc),
+                agent_allocation
+                    .as_ref()
+                    .map(|allocation| allocation.ports.qdrant_grpc),
+                DEFAULT_QDRANT_GRPC_PORT,
+            )
+        } else {
+            0
+        };
         let embed_http_port = selected_port(
             configured_ports[2],
             (!stored_native_embedding)
@@ -653,6 +689,13 @@ impl SidecarRuntimeConfig {
         labels.insert("dev.codestory.owner".into(), "codestory".into());
         labels.insert("dev.codestory.profile".into(), profile.as_str().into());
         labels.insert("dev.codestory.namespace".into(), namespace.clone());
+        labels.insert(
+            "dev.codestory.vector_backend".into(),
+            vector_backend.as_str().into(),
+        );
+        if let Some(error) = vector_backend_error {
+            labels.insert("dev.codestory.vector_backend_error".into(), error);
+        }
         if let Some(project_root) = project_root {
             if let Some(identity) = project_identity.as_ref() {
                 labels.insert(
@@ -744,6 +787,24 @@ impl SidecarRuntimeConfig {
         }
     }
 
+    pub fn vector_backend(&self) -> VectorBackend {
+        match self
+            .labels
+            .get("dev.codestory.vector_backend")
+            .map(String::as_str)
+        {
+            Some("external_qdrant") => VectorBackend::ExternalQdrant,
+            _ => VectorBackend::Embedded,
+        }
+    }
+
+    pub fn ensure_vector_backend_configured(&self) -> Result<VectorBackend> {
+        if let Some(error) = self.labels.get("dev.codestory.vector_backend_error") {
+            bail!("{error}");
+        }
+        Ok(self.vector_backend())
+    }
+
     #[doc(hidden)]
     pub fn legacy_state_path_for_compatibility(&self) -> Option<PathBuf> {
         legacy_state_path_for_runtime(self)
@@ -785,12 +846,9 @@ impl SidecarRuntimeConfig {
 
     pub(crate) fn ensure_ports_allocated(&self) -> Result<()> {
         if self.profile == SidecarProfile::Agent
-            && [
-                self.layout.qdrant_http_port,
-                self.layout.qdrant_grpc_port,
-                self.embed_http_port,
-            ]
-            .contains(&0)
+            && (self.embed_http_port == 0
+                || (self.vector_backend() == VectorBackend::ExternalQdrant
+                    && [self.layout.qdrant_http_port, self.layout.qdrant_grpc_port].contains(&0)))
         {
             anyhow::bail!(
                 "agent sidecar port allocation is unavailable; inspect sidecars/port-allocations.sqlite3 and retry"
@@ -1104,6 +1162,15 @@ fn embedding_runtime_config(
             server_launch = Some("external_endpoint".to_string());
         }
     }
+    let device_policy = if default_flag(defaults, "CODESTORY_EMBED_ALLOW_CPU", false) {
+        "allow_cpu".to_string()
+    } else if let Some(policy) = default_nonempty(defaults, "CODESTORY_EMBED_DEVICE_POLICY") {
+        policy
+    } else if managed_cpu_is_default_for_host() {
+        "allow_cpu".to_string()
+    } else {
+        "accelerator_required".to_string()
+    };
     EmbeddingRuntimeConfig {
         configuration_error,
         backend: configured_backend,
@@ -1148,14 +1215,14 @@ fn embedding_runtime_config(
                 .unwrap_or(1)
         }),
         allow_remote: default_flag(defaults, "CODESTORY_ALLOW_REMOTE_EMBEDDINGS", false),
-        device_policy: if default_flag(defaults, "CODESTORY_EMBED_ALLOW_CPU", false) {
-            "allow_cpu".to_string()
-        } else {
-            default_nonempty(defaults, "CODESTORY_EMBED_DEVICE_POLICY")
-                .unwrap_or_else(|| "accelerator_required".to_string())
-        },
+        device_policy,
         server_launch,
     }
+}
+
+fn managed_cpu_is_default_for_host() -> bool {
+    let host = embedding_host_platform();
+    host.os == "macos" && host.arch == "x86_64"
 }
 
 fn retrieval_runtime_config(
@@ -1267,6 +1334,28 @@ fn env_profile(defaults: &SidecarRuntimeDefaults) -> Option<SidecarProfile> {
             "local" | "dev" => Some(SidecarProfile::Local),
             _ => None,
         })
+}
+
+fn vector_backend_from_defaults(
+    defaults: &SidecarRuntimeDefaults,
+) -> (VectorBackend, Option<String>) {
+    let Some(raw) = defaults
+        .get("CODESTORY_VECTOR_BACKEND")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (VectorBackend::Embedded, None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "embedded" | "sqlite" | "local" => (VectorBackend::Embedded, None),
+        "qdrant" | "external_qdrant" | "external-qdrant" => (VectorBackend::ExternalQdrant, None),
+        _ => (
+            VectorBackend::Embedded,
+            Some(format!(
+                "CODESTORY_VECTOR_BACKEND must be embedded or external_qdrant, found {raw:?}"
+            )),
+        ),
+    }
 }
 
 fn env_agent_run_id(defaults: &SidecarRuntimeDefaults) -> Option<String> {
@@ -1785,8 +1874,10 @@ fn dynamic_agent_ports(
     base: &Path,
     namespace: &str,
     configured: [Option<u16>; 3],
+    qdrant_required: bool,
 ) -> AgentPortAllocation {
-    allocate_agent_ports(base, namespace, configured).unwrap_or_else(|error| {
+    allocate_agent_ports_for_backend(base, namespace, configured, qdrant_required).unwrap_or_else(
+        |error| {
         eprintln!(
             "CodeStory sidecar port allocation failed closed: namespace={namespace} error={error:#}"
         );
@@ -1799,7 +1890,8 @@ fn dynamic_agent_ports(
             },
             owner_id: String::new(),
         }
-    })
+    },
+    )
 }
 
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
@@ -2041,10 +2133,8 @@ pub fn embedding_server_launch_mode_for_runtime(
     if runtime.embedding.endpoint_origin != EmbeddingEndpointOrigin::ManagedSidecar {
         return Ok(EmbeddingServerLaunchMode::ExternalEndpoint);
     }
-    let request = crate::embeddings::embedding_accelerator_request();
     let host = embedding_host_platform();
-    if request.is_some() && ((host.os == "macos" && host.arch == "aarch64") || host.os == "windows")
-    {
+    if host.os == "macos" || host.os == "windows" {
         Ok(EmbeddingServerLaunchMode::NativeSpawned)
     } else {
         Ok(EmbeddingServerLaunchMode::DockerComposeEmbed)
@@ -2532,6 +2622,7 @@ mod tests {
         let poison_cache = tempdir().expect("poison cache");
         let _cache = EnvGuard::remove("CODESTORY_CACHE_ROOT");
         let _qdrant = EnvGuard::remove("CODESTORY_QDRANT_HTTP_PORT");
+        let _vector = EnvGuard::remove("CODESTORY_VECTOR_BACKEND");
         let _endpoint = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
         let retained =
             test_sidecar_runtime_in_cache(None, SidecarProfile::Local, None, cache.path());
@@ -2540,6 +2631,7 @@ mod tests {
             poison_cache.path().to_str().expect("utf8 poison cache"),
         );
         let _qdrant = EnvGuard::set("CODESTORY_QDRANT_HTTP_PORT", "39999");
+        let _vector = EnvGuard::set("CODESTORY_VECTOR_BACKEND", "external_qdrant");
         let _endpoint = EnvGuard::set(
             "CODESTORY_EMBED_LLAMACPP_URL",
             "http://127.0.0.1:39998/v1/embeddings",
@@ -2549,7 +2641,9 @@ mod tests {
         let selected = retained.with_profile_and_run_id(None, SidecarProfile::Local, None);
         let selected_agent = retained.with_profile_and_run_id(None, SidecarProfile::Agent, None);
 
-        assert_eq!(selected.layout.qdrant_http_port, DEFAULT_QDRANT_HTTP_PORT);
+        assert_eq!(selected.vector_backend(), VectorBackend::Embedded);
+        assert_eq!(selected.layout.qdrant_http_port, 0);
+        assert_eq!(selected_agent.layout.qdrant_http_port, 0);
         assert_eq!(
             selected.layout.state_file,
             cache.path().join(SIDECAR_STATE_FILE_V3)
@@ -2558,6 +2652,36 @@ mod tests {
         assert!(!selected.layout.state_file.starts_with(poison_cache.path()));
         assert_eq!(selected_agent.run_id.as_deref(), Some(DEFAULT_AGENT_RUN_ID));
         assert!(!selected_agent.namespace.contains("poison-run-id"));
+    }
+
+    #[test]
+    fn vector_backend_selection_controls_qdrant_ports_and_fails_closed() {
+        let _lock = crate::test_support::env_lock();
+        let cache = tempdir().expect("cache");
+        let _cache = EnvGuard::set(
+            "CODESTORY_CACHE_ROOT",
+            cache.path().to_str().expect("cache path"),
+        );
+        {
+            let _backend = EnvGuard::remove("CODESTORY_VECTOR_BACKEND");
+            let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
+            assert_eq!(runtime.vector_backend(), VectorBackend::Embedded);
+            assert_eq!(runtime.layout.qdrant_http_port, 0);
+            assert_eq!(runtime.layout.qdrant_grpc_port, 0);
+        }
+        {
+            let _backend = EnvGuard::set("CODESTORY_VECTOR_BACKEND", "external_qdrant");
+            let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
+            assert_eq!(runtime.vector_backend(), VectorBackend::ExternalQdrant);
+            assert_eq!(runtime.layout.qdrant_http_port, DEFAULT_QDRANT_HTTP_PORT);
+            assert_eq!(runtime.layout.qdrant_grpc_port, DEFAULT_QDRANT_GRPC_PORT);
+        }
+        {
+            let _backend = EnvGuard::set("CODESTORY_VECTOR_BACKEND", "unknown");
+            let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
+            assert!(runtime.ensure_vector_backend_configured().is_err());
+            assert_eq!(runtime.layout.qdrant_http_port, 0);
+        }
     }
 
     #[test]
@@ -2768,6 +2892,27 @@ mod tests {
             embedding_server_launch_mode_from_env().expect("launch mode"),
             EmbeddingServerLaunchMode::NativeSpawned
         );
+    }
+
+    #[test]
+    fn simulated_macos_x64_defaults_to_managed_native_cpu() {
+        let _lock = crate::test_support::env_lock();
+        let _host = EnvGuard::set(TEST_HOST_PLATFORM_ENV, "macos/x86_64");
+        let _mode = EnvGuard::remove("CODESTORY_EMBED_SERVER_LAUNCH");
+        let _url = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_URL");
+        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
+        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
+
+        let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Agent, None);
+        assert_eq!(runtime.embedding.device_policy, "allow_cpu");
+        assert_eq!(
+            embedding_server_launch_mode_for_runtime(&runtime).expect("launch mode"),
+            EmbeddingServerLaunchMode::NativeSpawned
+        );
+        let backend = selected_llama_sidecar_backend("cpu").expect("macOS Intel CPU backend");
+        assert_eq!(backend.id, "macos-x86_64-cpu");
+        assert_eq!(backend.launch_mode, "native_spawned");
+        assert_eq!(backend.executable_archive_path, "llama-b9902/llama-server");
     }
 
     #[test]

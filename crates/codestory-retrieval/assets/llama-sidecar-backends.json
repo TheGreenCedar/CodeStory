@@ -31,6 +31,36 @@
       "log_markers": ["metal", "offloaded"]
     },
     {
+      "id": "macos-x86_64-cpu",
+      "os": "macos",
+      "arch": "x86_64",
+      "provider": "cpu",
+      "launch_mode": "native_spawned",
+      "artifact": "llama-b9902-bin-macos-x64.tar.gz",
+      "artifact_bytes": 11452449,
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b9902/llama-b9902-bin-macos-x64.tar.gz",
+      "sha256": "df5d74c1d7046829f109a2f7e80d79c1398a86dcff2cfacfc9b44633c8b96abe",
+      "executable_archive_path": "llama-b9902/llama-server",
+      "executable_rel_path": "llama-server",
+      "executable_sha256": "7c1502821385a4fcdf1355b6fcb58729befdb6d199fc3b1fb54b5c838dbe7f5d",
+      "managed_cache_rel_dir": "managed-embeddings/llama/b9902/llama-b9902-bin-macos-x64-cpu",
+      "launch_args": [
+        "--embedding",
+        "--model",
+        "{model}",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "{port}",
+        "--n-gpu-layers",
+        "0",
+        "--log-verbosity",
+        "4"
+      ],
+      "device_arg_policy": "none_by_default",
+      "log_markers": ["cpu"]
+    },
+    {
       "id": "windows-x86_64-vulkan",
       "os": "windows",
       "arch": "x86_64",

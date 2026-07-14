@@ -925,10 +925,21 @@ fn runtime_log_proves_requested_accelerator(
 }
 
 pub fn embedding_accelerator_request() -> Option<EmbeddingAcceleratorRequest> {
-    if explicit_cpu_allowed() {
+    if explicit_cpu_allowed() || default_cpu_allowed_for_host() {
         return None;
     }
     Some(default_embedding_accelerator_request())
+}
+
+fn default_cpu_allowed_for_host() -> bool {
+    if std::env::var(DEVICE_POLICY_ENV)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return false;
+    }
+    let host = crate::config::embedding_host_platform();
+    host.os == "macos" && host.arch == "x86_64"
 }
 
 fn default_embedding_accelerator_request() -> EmbeddingAcceleratorRequest {

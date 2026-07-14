@@ -14,6 +14,7 @@ mod candidate;
 mod capabilities;
 mod compose;
 mod config;
+mod embedded_vector;
 mod embeddings;
 mod executor;
 mod generation;
@@ -63,7 +64,7 @@ pub use config::{
     EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN, RetrievalRuntimeConfig, SidecarImagePins,
     SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProcessDefaults, SidecarProfile,
     SidecarRuntimeConfig, SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
-    default_sidecar_image_pins, embedding_server_launch_mode,
+    VectorBackend, default_sidecar_image_pins, embedding_server_launch_mode,
     embedding_server_launch_mode_for_runtime, sidecar_process_defaults, user_cache_root,
 };
 #[cfg(feature = "test-support")]

@@ -399,8 +399,26 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
     runtime: &SidecarRuntimeConfig,
     repo_root: Option<&Path>,
     options: BootstrapSidecarsOptions,
+    progress: impl FnMut(&'static str),
+    observe_new_native_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
+) -> Result<BootstrapReport> {
+    bootstrap_sidecars_with_transition_down(
+        runtime,
+        repo_root,
+        options,
+        progress,
+        observe_new_native_launch,
+        docker_compose_down_for_transition_state,
+    )
+}
+
+fn bootstrap_sidecars_with_transition_down(
+    runtime: &SidecarRuntimeConfig,
+    repo_root: Option<&Path>,
+    options: BootstrapSidecarsOptions,
     mut progress: impl FnMut(&'static str),
     mut observe_new_native_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
+    mut transition_down: impl FnMut(&SidecarStateFile) -> Result<()>,
 ) -> Result<BootstrapReport> {
     let port_lease_heartbeat = runtime.start_port_lease_heartbeat()?;
     let BootstrapSidecarsOptions {
@@ -413,8 +431,12 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
     } = options;
     let layout = runtime.layout.clone();
     layout.ensure_data_dirs()?;
-    let storage_repair =
-        repair_qdrant_storage(&layout, &storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?;
+    let vector_backend = runtime.ensure_vector_backend_configured()?;
+    let storage_repair = if vector_backend == crate::config::VectorBackend::ExternalQdrant {
+        repair_qdrant_storage(&layout, &storage_scope, DEFAULT_QDRANT_COLLECTION_RETENTION)?
+    } else {
+        QdrantStorageRepairReport::default()
+    };
     let launch_mode = crate::config::embedding_server_launch_mode_for_runtime(runtime)?;
     let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
         .then(|| {
@@ -426,19 +448,30 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
         })
         .transpose()?;
 
-    let resolved_compose = if skip_compose {
+    let compose_required = launch_mode == EmbeddingServerLaunchMode::DockerComposeEmbed
+        || vector_backend == crate::config::VectorBackend::ExternalQdrant;
+    let resolved_compose = if skip_compose || !compose_required {
         None
     } else {
         Some(resolve_compose_file(repo_root, compose_file.as_deref())?)
     };
+    let embedded_transition_pending = vector_backend == crate::config::VectorBackend::Embedded
+        && embedded_qdrant_transition_state(runtime)?.is_some();
     // Docker Compose project names are daemon-global. Keep the exact ownership probe, startup,
     // and any caller-side failure cleanup serialized for this project.
-    let mut compose_bootstrap_lock = resolved_compose
-        .as_ref()
-        .map(|_| acquire_compose_bootstrap_lock(&runtime.compose_project))
+    let mut compose_bootstrap_lock = (resolved_compose.is_some() || embedded_transition_pending)
+        .then(|| acquire_compose_bootstrap_lock(&runtime.compose_project))
         .transpose()?;
     let mut hold_compose_lock =
         |error| hold_compose_bootstrap_lock_on_error(error, &mut compose_bootstrap_lock);
+    if embedded_transition_pending && let Some(state) = embedded_qdrant_transition_state(runtime)? {
+        if state.compose_file.is_none() {
+            return Err(hold_compose_lock(anyhow::anyhow!(
+                "recorded Qdrant transition state has no exact Compose file; preserving it for repair"
+            )));
+        }
+        transition_down(&state).map_err(&mut hold_compose_lock)?;
+    }
 
     let (compose_started, compose_owned_for_rollback) =
         if let Some(path) = resolved_compose.as_ref() {
@@ -734,11 +767,9 @@ fn docker_compose_up(
     let layout = &runtime.layout;
     if !docker_available() {
         bail!(
-            "docker is not available on PATH. Install Docker Desktop (Windows) or Docker Engine, \
-             then re-run bootstrap. Manual Qdrant: docker run -p 6333:6333 -p 6334:6334 \
-             -v \"{}:/qdrant/storage\" {}",
-            layout.qdrant_data_dir.display(),
-            crate::config::QDRANT_IMAGE_PIN
+            "docker is not available on PATH for the selected managed embedding backend. \
+             Install Docker Desktop or Docker Engine, configure a supported native embedding \
+             backend, or use a trusted external embedding endpoint, then retry"
         );
     }
 
@@ -880,7 +911,7 @@ fn append_docker_compose_up_args(
     if force_recreate {
         command.arg("--force-recreate");
     }
-    command.args(docker_compose_services_for_launch_mode(launch_mode));
+    command.args(docker_compose_services_for_runtime(runtime, launch_mode));
 }
 
 fn maybe_write_vulkan_compose_override(
@@ -952,6 +983,19 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
     if state.owner != "codestory" || state.profile != SidecarProfile::Agent.as_str() {
         return Ok(());
     }
+    docker_compose_down_for_exact_state(state)
+}
+
+fn docker_compose_down_for_transition_state(state: &SidecarStateFile) -> Result<()> {
+    let known_profile = state.profile == SidecarProfile::Local.as_str()
+        || state.profile == SidecarProfile::Agent.as_str();
+    if state.owner != "codestory" || !known_profile {
+        bail!("refusing to stop an unowned retrieval transition state");
+    }
+    docker_compose_down_for_exact_state(state)
+}
+
+fn docker_compose_down_for_exact_state(state: &SidecarStateFile) -> Result<()> {
     let Some(compose_file) = state.compose_file.as_ref().map(PathBuf::from) else {
         // Legacy state may predate exact Compose-path publication. There is no owned path to
         // retry, so retain the historical no-op behavior for that schema shape only.
@@ -992,6 +1036,50 @@ pub fn docker_compose_down_for_state(state: &SidecarStateFile) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn embedded_qdrant_transition_state(
+    runtime: &SidecarRuntimeConfig,
+) -> Result<Option<SidecarStateFile>> {
+    let contents = match std::fs::read_to_string(&runtime.layout.state_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "read embedded backend transition state {}",
+                    runtime.layout.state_file.display()
+                )
+            });
+        }
+    };
+    let state: SidecarStateFile = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "parse embedded backend transition state {}",
+            runtime.layout.state_file.display()
+        )
+    })?;
+    if state.qdrant_http_port == 0 && state.qdrant_grpc_port == 0 {
+        return Ok(None);
+    }
+    if state.owner != "codestory"
+        || state.profile != runtime.profile.as_str()
+        || state.namespace != runtime.namespace
+        || state.compose_project != runtime.compose_project
+        || state.project_identity != runtime.project_identity
+        || state.run_id != runtime.run_id
+        || state.qdrant_http_port == 0
+        || state.qdrant_grpc_port == 0
+        || runtime.layout.qdrant_http_port != 0
+        || runtime.layout.qdrant_grpc_port != 0
+        || state.embed_http_port != runtime.embed_http_port
+    {
+        bail!(
+            "recorded Qdrant transition state does not exactly match embedded sidecar namespace {}; preserving it for repair",
+            runtime.namespace
+        );
+    }
+    Ok(Some(state))
 }
 
 fn docker_compose_down_for_runtime(
@@ -1089,14 +1177,24 @@ fn docker_compose_command() -> Result<Command> {
     Ok(Command::new("docker"))
 }
 
-fn docker_compose_services_for_launch_mode(
+fn docker_compose_services_for_runtime(
+    runtime: &SidecarRuntimeConfig,
     mode: EmbeddingServerLaunchMode,
 ) -> &'static [&'static str] {
-    match mode {
-        EmbeddingServerLaunchMode::DockerComposeEmbed => &[],
-        EmbeddingServerLaunchMode::NativeSpawned | EmbeddingServerLaunchMode::ExternalEndpoint => {
-            &["qdrant"]
-        }
+    match (runtime.vector_backend(), mode) {
+        (
+            crate::config::VectorBackend::ExternalQdrant,
+            EmbeddingServerLaunchMode::DockerComposeEmbed,
+        ) => &[],
+        (
+            crate::config::VectorBackend::ExternalQdrant,
+            EmbeddingServerLaunchMode::NativeSpawned | EmbeddingServerLaunchMode::ExternalEndpoint,
+        ) => &["qdrant"],
+        (_, EmbeddingServerLaunchMode::DockerComposeEmbed) => &["embed"],
+        (
+            _,
+            EmbeddingServerLaunchMode::NativeSpawned | EmbeddingServerLaunchMode::ExternalEndpoint,
+        ) => &[],
     }
 }
 
@@ -1487,11 +1585,10 @@ fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<NativeLlamaCa
 }
 
 fn selected_native_llama_backend() -> Option<crate::config::LlamaSidecarBackend> {
-    crate::embeddings::embedding_accelerator_request().and_then(|request| {
-        matching_native_llama_backends(&request.provider)
-            .into_iter()
-            .next()
-    })
+    let provider = crate::embeddings::embedding_accelerator_request()
+        .map(|request| request.provider)
+        .unwrap_or_else(|| "cpu".to_string());
+    matching_native_llama_backends(&provider).into_iter().next()
 }
 
 fn matching_native_llama_backends(provider: &str) -> Vec<crate::config::LlamaSidecarBackend> {
@@ -2765,6 +2862,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_qdrant_transition_preserves_state_on_failure_then_publishes_embedded_state() {
+        let root = tempdir().expect("root");
+        let compose_file = root.path().join("retrieval-compose.yml");
+        std::fs::write(&compose_file, "services: {}\n").expect("compose file");
+        let mut runtime = compose_test_runtime(root.path());
+        runtime.layout.qdrant_http_port = 0;
+        runtime.layout.qdrant_grpc_port = 0;
+        runtime.embedding.endpoint_origin =
+            crate::config::EmbeddingEndpointOrigin::ProcessEnvironment;
+        runtime.embedding.endpoint = SidecarLayout::embed_base_url(runtime.embed_http_port);
+        runtime
+            .labels
+            .insert("dev.codestory.vector_backend".into(), "embedded".into());
+
+        let old_state: SidecarStateFile = serde_json::from_value(serde_json::json!({
+            "owner": "codestory",
+            "profile": "local",
+            "namespace": runtime.namespace,
+            "compose_project": runtime.compose_project,
+            "qdrant_http_port": 16333,
+            "qdrant_grpc_port": 16334,
+            "embed_http_port": runtime.embed_http_port,
+            "embed_url": SidecarLayout::embed_base_url(runtime.embed_http_port),
+            "lexical_data_dir": runtime.layout.lexical_data_dir,
+            "qdrant_data_dir": runtime.layout.qdrant_data_dir,
+            "scip_artifacts_root": runtime.layout.scip_artifacts_root,
+            "compose_file": compose_file,
+            "cleanup_command": "codestory-cli retrieval down",
+            "started_at_epoch_ms": 1
+        }))
+        .expect("old state");
+        let old_bytes = serde_json::to_vec_pretty(&old_state).expect("serialize old state");
+        std::fs::write(&runtime.layout.state_file, &old_bytes).expect("write old state");
+        let options = BootstrapSidecarsOptions {
+            storage_scope: BootstrapStorageScope {
+                repo_root: None,
+                active_storage_path: None,
+                active_cache_root: None,
+                global_cache_root: root.path().to_path_buf(),
+            },
+            compose_file: None,
+            skip_compose: true,
+            wait_timeout: Duration::ZERO,
+            allow_native_embedding_spawn: false,
+            reusable_native_embedding_launch: None,
+        };
+
+        let error = bootstrap_sidecars_with_transition_down(
+            &runtime,
+            None,
+            options.clone(),
+            |_| {},
+            |_| Ok(()),
+            |state| {
+                assert_eq!(state.qdrant_http_port, 16333);
+                assert_eq!(state.qdrant_grpc_port, 16334);
+                bail!("injected transition down failure")
+            },
+        )
+        .expect_err("transition failure");
+        assert!(format!("{error:#}").contains("injected transition down failure"));
+        assert_eq!(
+            std::fs::read(&runtime.layout.state_file).expect("preserved state"),
+            old_bytes
+        );
+        drop(error);
+
+        let report = bootstrap_sidecars_with_transition_down(
+            &runtime,
+            None,
+            options,
+            |_| {},
+            |_| Ok(()),
+            |state| {
+                assert_eq!(state.qdrant_http_port, 16333);
+                assert_eq!(state.qdrant_grpc_port, 16334);
+                assert_eq!(state.embed_http_port, runtime.embed_http_port);
+                Ok(())
+            },
+        )
+        .expect("retry transition");
+        assert_eq!(report.state.qdrant_http_port, 0);
+        assert_eq!(report.state.qdrant_grpc_port, 0);
+        assert_eq!(report.state.embed_http_port, runtime.embed_http_port);
+    }
+
     fn one_shot_json_server(body: serde_json::Value) -> (SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
         let address = listener.local_addr().expect("test HTTP server address");
@@ -2813,16 +2997,10 @@ mod tests {
     #[test]
     fn infrastructure_wait_uses_selected_runtime_embedding_endpoint() {
         let root = tempdir().expect("root");
-        let (qdrant_address, qdrant_server) = one_shot_json_server(serde_json::json!({
-            "result": { "collections": [] },
-            "status": "ok",
-            "time": 0.0
-        }));
         let (embedding_address, embedding_server) = one_shot_json_server(serde_json::json!({
             "data": [{ "index": 0, "embedding": [0.1, 0.2, 0.3] }]
         }));
         let mut runtime = compose_test_runtime(root.path());
-        runtime.layout.qdrant_http_port = qdrant_address.port();
         runtime.embed_http_port = embedding_address.port();
         runtime.embedding.configuration_error = None;
         runtime.embedding.backend = "llamacpp".to_string();
@@ -2841,7 +3019,6 @@ mod tests {
         assert!(health.lexical_ready);
         assert!(health.qdrant_reachable, "{}", health.qdrant_detail);
         assert!(health.embed_reachable, "{}", health.embed_detail);
-        qdrant_server.join().expect("qdrant test server");
         embedding_server.join().expect("embedding test server");
     }
 
@@ -3119,57 +3296,6 @@ mod tests {
         let written = written.expect("override path");
         let contents = std::fs::read_to_string(written).expect("override contents");
         assert!(contents.contains("/dev/dri:/dev/dri"));
-    }
-
-    #[test]
-    fn native_launch_mode_limits_compose_to_qdrant() {
-        assert_eq!(
-            docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::NativeSpawned),
-            &["qdrant"]
-        );
-        assert_eq!(
-            docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::ExternalEndpoint),
-            &["qdrant"]
-        );
-        assert!(
-            docker_compose_services_for_launch_mode(EmbeddingServerLaunchMode::DockerComposeEmbed)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn compose_up_removes_services_deleted_from_the_compose_file() {
-        let root = tempdir().expect("root");
-        let runtime = compose_test_runtime(root.path());
-        let mut command = Command::new("docker");
-
-        append_docker_compose_up_args(
-            &mut command,
-            &runtime,
-            Path::new("retrieval-compose.yml"),
-            None,
-            EmbeddingServerLaunchMode::NativeSpawned,
-            false,
-        );
-
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "compose",
-                "-p",
-                "test",
-                "-f",
-                "retrieval-compose.yml",
-                "up",
-                "-d",
-                "--remove-orphans",
-                "qdrant",
-            ]
-        );
     }
 
     #[test]

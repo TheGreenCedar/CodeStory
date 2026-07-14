@@ -1,9 +1,12 @@
 # Retrieval sidecars operations
 
-Project-local SQLite FTS, Qdrant, SCIP, and llama.cpp back agent `packet`, `search`,
-and `context`. They are required for `agent_packet_search` infrastructure
+Project-local SQLite FTS and embedded vectors, SCIP, and a managed llama.cpp
+embedding runtime back agent `packet`, `search`, and `context`. They are required for `agent_packet_search` infrastructure
 readiness: `retrieval status` must report `retrieval_mode: "full"` before those
 surfaces can claim full sidecar retrieval.
+
+Normal Mac operation does not run Docker or Qdrant. External Qdrant remains an
+explicit maintainer override for comparison and migration work.
 
 A healthy SQLite cache alone is not enough. A persisted full manifest also
 cannot override dead live infrastructure: under `accelerator_required`, agent
@@ -33,7 +36,7 @@ Promotion checks: [`retrieval-architecture.md`](../testing/retrieval-architectur
 ```mermaid
 flowchart LR
     cli[codestory-cli] --> lexical["Project-local SQLite FTS shard"]
-    cli --> qdrant["Qdrant at profile-selected localhost ports"]
+    cli --> vectors["Immutable embedded SQLite vectors"]
     cli --> scip[SCIP artifacts in user cache]
     cli --> embed[llama.cpp embedding endpoint]
 ```
@@ -79,7 +82,7 @@ Layer repair should follow the first failing layer, not a broad rebuild:
 | Active runtime or plugin adapter | `codestory://status` fields, `server_executable`, `cli_version`, `plugin_runtime`, `allowed_surfaces` | Reload or reinstall the active CLI/plugin runtime, then reread status |
 | Core SQLite graph | `doctor` cache/index checks and indexed file counts | Follow status `recommended_next_calls`; CLI transcript: `codestory-cli ready --goal local --repair --project <repo> --format json` |
 | SQLite lexical shard | `retrieval status` lexical coverage, generation/input binding, and shard health | Rerun `retrieval index --refresh full`; old JSONL shards are rebuilt, not queried |
-| Qdrant dense sidecar | Qdrant health, collection name, point count, dense-anchor count, backend/dimension fields | Fix Qdrant/model/backend state; move the Qdrant cache aside only if repeated health checks fail |
+| Semantic vector generation | Generation identity, point count, dense-anchor count, backend/dimension fields | Rerun retrieval indexing; inspect external Qdrant only when that override is explicitly selected |
 | SCIP graph artifacts | `scip_unavailable`, graph artifact hash/path, manifest contract | Rerun `retrieval index --refresh full`; inspect SCIP cache paths if it repeats |
 | Embedding endpoint | `CODESTORY_EMBED_LLAMACPP_URL`, sidecar health, model/backend/dimension fields | Start or reconfigure llama.cpp, then rerun retrieval index/status |
 | Manifest contract | `manifest_contract`, source root, input hash, generation, schema, graph hash, counts, lane provenance | Rerun `retrieval index --project <repo> --refresh full` |
@@ -113,21 +116,22 @@ Attach these artifacts to issues or PRs that claim readiness repair:
 - macOS 15 or later for supported Mac operation. Install the Xcode Command Line
   Tools and Node.js 18+; contributors building from source also need Rust.
 - Rust toolchain with `cargo`, or an already-built `codestory-cli` binary.
-- Docker Desktop or Docker Engine for automated Qdrant and llama.cpp
-  sidecars. On Apple Silicon the managed embedding server is native Metal, but
-  Qdrant still requires Docker. Confirm the Docker daemon is running.
+- Docker is not required on macOS. Apple Silicon uses the managed native Metal
+  runtime; Intel uses the checksum-pinned managed native CPU runtime. Linux
+  managed embedding and an explicit external-Qdrant comparison lane may still
+  require Docker.
 - Node.js 18+ is required only for the contributor setup wrapper. The CLI
   downloads and verifies missing managed assets during normal preparation.
-- For manual Local profile only, the default localhost ports are Qdrant HTTP
-  `6333`, Qdrant gRPC `6334`, and llama.cpp embeddings `8080`; lexical search
-  has no service port.
+- For manual Local profile only, llama.cpp embeddings default to localhost port
+  `8080`; lexical and embedded-vector search have no service ports. External
+  Qdrant uses HTTP `6333` and gRPC `6334` only when explicitly selected.
   Managed Agent profiles allocate or reuse namespace-specific ports; read them
   from status rather than assuming the Local defaults.
 - `CODESTORY_EMBED_MODEL_DIR` is an explicit developer override. Without it,
   CodeStory uses the pinned machine-wide model cache.
 
-Manual sidecar setup is allowed only when equivalent local Qdrant and
-llama.cpp services are already healthy. Agent-facing retrieval is invalid until
+Manual runtime setup is allowed only when an equivalent local llama.cpp
+endpoint, and external Qdrant when selected, are already healthy. Agent-facing retrieval is invalid until
 the CLI status proof below reports `full`.
 
 ### Minimum environment
@@ -146,8 +150,9 @@ explicit override or persisted Agent state selects a port.
 | `CODESTORY_EMBED_DEVICE_STATE` | Optional diagnostic assertion for observed device state: `accelerated`, `cpu`, or unset/unknown; it does not satisfy broker GPU proof |
 | `CODESTORY_EMBED_ALLOW_CPU` | Set to `1` only when intentional CPU-backed retrieval is acceptable on this machine |
 | `CODESTORY_EMBED_DEVICE_POLICY` | Optional policy alias; set `allow_cpu` instead of `CODESTORY_EMBED_ALLOW_CPU=1` when CPU mode is intentional |
-| `CODESTORY_QDRANT_HTTP_PORT` | Override Qdrant HTTP port when `6333` is unavailable |
-| `CODESTORY_QDRANT_GRPC_PORT` | Override Qdrant gRPC port when `6334` is unavailable |
+| `CODESTORY_VECTOR_BACKEND` | Leave unset for embedded vectors; `external_qdrant` enables the advanced compatibility lane |
+| `CODESTORY_QDRANT_HTTP_PORT` | External-Qdrant-only HTTP port override |
+| `CODESTORY_QDRANT_GRPC_PORT` | External-Qdrant-only gRPC port override |
 
 If CPU is not explicitly allowed, CodeStory asks the platform resolver for an
 accelerated llama.cpp backend. On macOS arm64, bootstrap/repair installs and
@@ -159,13 +164,11 @@ a `vulkan:Vulkan0` request on Apple Silicon. Use
 `CODESTORY_EMBED_NATIVE_LLAMA_SERVER` only when overriding the managed binary
 with an absolute path.
 
-On macOS x64, the CLI, managed plugin, local index, and grounding are supported,
-but there is no managed Metal cell. Packet/search requires an explicit degraded
-CPU opt-in or a trusted external llama.cpp-compatible endpoint under explicit
-operator policy. External endpoints cannot satisfy `accelerator_required`
-because CodeStory cannot bind their provider-owned logs and PID identity to the
-request; opt into CPU/external operation explicitly. Intel status and release
-evidence must never claim Metal.
+On macOS x64, CodeStory installs the checksum-pinned b9902 native x64 runtime
+and selects its CPU policy automatically. Packet/search therefore needs no
+Docker, Qdrant, or user configuration. Status labels the path `cpu_allowed` and
+Intel status and release evidence never claim Metal. A trusted external
+llama.cpp-compatible endpoint remains an advanced override.
 
 On Windows x64, the native llama.cpp resolver selects the manifest-backed b9902
 Vulkan cell by default and launches it with `Vulkan0`, `99` GPU layers, and
@@ -229,8 +232,10 @@ not match your machine. On Windows PowerShell, set them with `$env:NAME =
 "value"` and use `.\target\release\codestory-cli.exe` if you are running a
 built binary.
 
-`retrieval bootstrap` may start Docker Compose, create sidecar cache dirs, write
-`retrieval-sidecars-v3.json`, and repair CodeStory-owned local sidecar state. For a
+`retrieval bootstrap` creates retrieval cache dirs, prepares the managed native
+runtime on macOS, writes `retrieval-sidecars-v3.json`, and repairs
+CodeStory-owned local state. Linux or explicit compatibility overrides may
+start Docker Compose. For a
 no-change prerequisite check, run:
 
 ```sh
@@ -281,8 +286,8 @@ The proof is the final status JSON:
   count, and lane provenance.
 
 Under `graph_first_v1`, a generation can be full with zero dense anchors. In
-that case Qdrant is reported as policy-skipped instead of probing a missing
-collection. That is still full mode only when SQLite lexical, SCIP, and the manifest
+that case semantic vectors are policy-skipped. That is still full mode only
+when SQLite lexical, SCIP, and the manifest
 contract are complete.
 
 ### Non-full status actions
@@ -296,10 +301,10 @@ closed and must not claim sidecar-backed evidence.
 | `unavailable` or lexical shard invalid | SQLite lexical shard is missing, malformed, or stale | Rerun retrieval index, then inspect lexical coverage and generation/input binding in status |
 | `lexical_source_coverage_incomplete` | The indexed lexical subset remains usable, while oversized or unreadable paths are named diagnostically | Inspect the bounded path samples; fix file access or size only when the omitted paths matter |
 | `lexical_source_coverage_empty` | Files were discovered but every source was oversized or unreadable, so lexical retrieval is unavailable | Fix at least one relevant source input, then rerun retrieval index/status |
-| `no_semantic`, `lexical_only`, or Qdrant down when dense anchors are expected | Semantic sidecar is unavailable or stale | Fix Qdrant/model/backend, rerun bootstrap and retrieval index, then rerun status |
+| `no_semantic` or `lexical_only` when dense anchors are expected | Semantic vectors or the embedding runtime are unavailable or stale | Retry managed preparation and retrieval indexing; inspect external Qdrant only when explicitly selected |
 | `no_scip` | Graph artifacts are missing or stale | Rerun retrieval index; inspect SCIP artifact paths if it repeats |
 | Obsolete, stale, or partial manifest | Source, schema, graph, symbol-doc, dense-anchor, or backend contract drifted | Rerun `retrieval index --project <repo> --refresh full` |
-| `full` with dense anchors `0` | Valid graph-first policy skip | No Qdrant repair needed; verify SQLite lexical, SCIP, and manifest contract fields |
+| `full` with dense anchors `0` | Valid graph-first policy skip | No vector repair needed; verify SQLite lexical, SCIP, and manifest contract fields |
 
 Traces must include `retrieval_mode` and `degraded_reason`. A non-`full` mode is
 not an answer-quality claim and not a product packet/search success.
@@ -430,8 +435,8 @@ sidecar-layer symptoms during ops work:
 | SQLite lexical shard unavailable | Shard missing, malformed, or stale | Rerun retrieval index and inspect the lexical readiness detail |
 | `lexical_source_coverage_incomplete` with lexical capability present | Partial source coverage; indexed files remain queryable | Inspect the omitted/unreadable path samples and repair only relevant inputs |
 | `lexical_source_coverage_empty` | Every discovered source was omitted; the empty shard is diagnostic only | Fix source size/access and rebuild before claiming retrieval readiness |
-| Qdrant unhealthy | Wrong image tag, stale collection, volume permissions, or model/backend mismatch | Rerun bootstrap; if repeated, move the Qdrant cache aside and rebuild |
-| Qdrant unavailable while dense-anchor count is `0` | Expected graph-first policy skip | Verify SQLite lexical, SCIP, and manifest contract fields |
+| External Qdrant unhealthy | Wrong image tag, stale collection, volume permissions, or model/backend mismatch | Verify the explicit external-Qdrant configuration, then rerun bootstrap |
+| External Qdrant unavailable while dense-anchor count is `0` | Expected graph-first policy skip | Verify SQLite lexical, SCIP, and manifest contract fields |
 | SCIP `scip_unavailable` | Graph artifacts missing | Rerun retrieval index and inspect the SCIP cache path |
 | Smoke latency is high | Cold cache or oversized fixture | Retry once; then inspect tier envelope evidence |
 
@@ -445,14 +450,14 @@ sidecar implementation, CI policy, retention behavior, or promotion gates.
 | Dependency | Pin policy | Pinned identity | Notes |
 |------------|------------|-----------------|-------|
 | SQLite lexical | Bundled `rusqlite`/SQLite FTS5 | `sqlite-fts5-v1` | One immutable `lexical-index.sqlite3` per sidecar generation; no daemon |
-| Qdrant | Digest-pinned container image | `qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae` | HTTP `6333`, gRPC `6334` |
+| External Qdrant compatibility path | Digest-pinned container image | `qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae` | Used only when `CODESTORY_VECTOR_BACKEND=external_qdrant`; HTTP `6333`, gRPC `6334` |
 | llama.cpp embed | Digest-pinned container image | `ghcr.io/ggml-org/llama.cpp:server@sha256:f16ca66f3ba316b7a7a16003ddfa88d29c3404fbe86550da086736864c11574c` | Used only when the embedding launch mode is Docker Compose |
 | SCIP | CodeStory graph artifact emitter | `graph-<hash>` | Generated local graph artifacts under the sidecar generation |
 
 CI `retrieval-sidecar-smoke` should use the same pins as local development.
 `retrieval bootstrap --format json`, `retrieval status --format json`, and the
-sidecar state file expose `sidecar_images` so smoke artifacts record the exact
-image identities used for packet/search readiness.
+sidecar state file expose `sidecar_images` so container-backed smoke artifacts
+record the exact image identities used for packet/search readiness.
 
 To refresh an image pin safely:
 

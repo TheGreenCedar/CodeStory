@@ -521,7 +521,7 @@ pub trait GenerationRemover {
 }
 
 pub struct FsQdrantGenerationRemover {
-    qdrant: QdrantClient,
+    qdrant: Option<QdrantClient>,
     root: PathBuf,
     deletion: OwnedDeletionRoot,
     collections_dir: PathBuf,
@@ -529,6 +529,19 @@ pub struct FsQdrantGenerationRemover {
 
 impl FsQdrantGenerationRemover {
     pub fn new(layout: &SidecarLayout) -> Result<Self> {
+        Self::new_with_qdrant(layout, Some(QdrantClient::new(layout)))
+    }
+
+    pub fn new_for_runtime(
+        layout: &SidecarLayout,
+        runtime: &crate::config::SidecarRuntimeConfig,
+    ) -> Result<Self> {
+        let qdrant = (runtime.vector_backend() == crate::config::VectorBackend::ExternalQdrant)
+            .then(|| QdrantClient::new(layout));
+        Self::new_with_qdrant(layout, qdrant)
+    }
+
+    fn new_with_qdrant(layout: &SidecarLayout, qdrant: Option<QdrantClient>) -> Result<Self> {
         let root = layout
             .lexical_data_dir
             .parent()
@@ -541,7 +554,7 @@ impl FsQdrantGenerationRemover {
         let deletion = OwnedDeletionRoot::open(root)
             .with_context(|| format!("open owned sidecar root {}", root.display()))?;
         Ok(Self {
-            qdrant: QdrantClient::new(layout),
+            qdrant,
             root: root.to_path_buf(),
             deletion,
             collections_dir: layout.qdrant_data_dir.join("collections"),
@@ -575,8 +588,12 @@ impl GenerationRemover for FsQdrantGenerationRemover {
     }
 
     fn delete_qdrant_collection(&mut self, collection: &str) -> Result<bool> {
-        let outcome = self.qdrant.delete_collection_with_outcome(collection)?;
         let path = self.collections_dir.join(collection);
+        let Some(qdrant) = self.qdrant.as_ref() else {
+            self.remove_owned_path(&path)?;
+            return Ok(true);
+        };
+        let outcome = qdrant.delete_collection_with_outcome(collection)?;
         if outcome == QdrantDeleteOutcome::NotFound {
             self.remove_owned_path(&path)?;
             return Ok(true);

@@ -1495,7 +1495,7 @@ fn strict_readiness_unavailable_reason_for_runtime(
         project_id,
         &embedding_backend,
         embedding_dim,
-        &runtime.embedding,
+        runtime,
     )
     .context("compute strict sidecar input fingerprint")?;
     let stored_files = storage

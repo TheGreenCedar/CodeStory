@@ -1,8 +1,9 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
     QDRANT_HEALTH_BUDGET, SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarProfile,
-    SidecarRuntimeConfig, default_sidecar_image_pins, retrieval_command,
+    SidecarRuntimeConfig, VectorBackend, default_sidecar_image_pins, retrieval_command,
 };
+use crate::embedded_vector::EmbeddedVectorIndex;
 use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
 use crate::qdrant_client::QdrantClient;
@@ -455,12 +456,12 @@ pub fn probe_infrastructure_health_with_embedding_device(
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> InfrastructureHealth {
     let layout = &runtime.layout;
-    let qdrant_client = QdrantClient::new(layout);
-    let qdrant_probe = qdrant_client.list_collections_probe();
+    let qdrant_probe = (runtime.vector_backend() == VectorBackend::ExternalQdrant)
+        .then(|| QdrantClient::new(layout).list_collections_probe());
     let embed_probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
     InfrastructureHealth {
         lexical_ready: layout.lexical_data_dir.is_dir(),
-        qdrant_reachable: qdrant_probe.reachable,
+        qdrant_reachable: qdrant_probe.as_ref().is_none_or(|probe| probe.reachable),
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
@@ -477,7 +478,10 @@ pub fn probe_infrastructure_health_with_embedding_device(
             "project-local SQLite FTS root {}",
             layout.lexical_data_dir.display()
         ),
-        qdrant_detail: qdrant_probe.detail,
+        qdrant_detail: qdrant_probe.map_or_else(
+            || "embedded SQLite vectors require no external service".into(),
+            |probe| probe.detail,
+        ),
         embed_detail: embed_probe.detail,
     }
 }
@@ -732,8 +736,71 @@ pub fn probe_sidecar_health_for_runtime(
         .dense_projection_count
         .or(manifest.projection_count)
         .unwrap_or(0);
-    let qdrant = if dense_anchor_count == 0 {
+    let vector_backend = runtime.ensure_vector_backend_configured();
+    let qdrant = if let Err(error) = vector_backend {
+        ComponentHealth {
+            name: "semantic".into(),
+            status: ComponentStatus::Unavailable,
+            latency_ms: None,
+            detail: error.to_string(),
+            degraded_reason: Some("vector_backend_configuration_invalid".into()),
+            capabilities: SidecarCapabilities::NONE,
+        }
+    } else if dense_anchor_count == 0 {
         zero_dense_qdrant_health(embedding_device)
+    } else if runtime.vector_backend() == VectorBackend::Embedded {
+        let collection = manifest.qdrant_collection.clone();
+        let expected_points = u64::try_from(dense_anchor_count).unwrap_or(u64::MAX);
+        let embedded = EmbeddedVectorIndex::health(
+            layout,
+            &collection,
+            sidecar_generation,
+            sidecar_input_hash,
+            expected_points,
+            manifest.embedding_backend.as_deref().unwrap_or_default(),
+            usize::try_from(manifest.embedding_dim.unwrap_or_default()).unwrap_or_default(),
+        );
+        let embedding = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
+        let product_embedding_backend =
+            manifest_embedding_backend_is_product(manifest.embedding_backend.as_deref())
+                && manifest_embedding_backend_is_product(Some(current_embedding_backend.as_str()));
+        let degraded_reason = if !embedded.ready {
+            Some("embedded_vector_index_unavailable".into())
+        } else if !product_embedding_backend {
+            Some("semantic_embedding_contract_mismatch".into())
+        } else if !embedding.reachable {
+            Some("embedding_runtime_unavailable".into())
+        } else if !embedding_device.full_retrieval_allowed {
+            embedding_device.degraded_reason.clone()
+        } else {
+            None
+        };
+        ComponentHealth {
+            name: "semantic".into(),
+            status: if degraded_reason.is_none() {
+                ComponentStatus::Healthy
+            } else if embedded.ready {
+                ComponentStatus::Degraded
+            } else {
+                ComponentStatus::Unavailable
+            },
+            latency_ms: Some(embedded.latency_ms),
+            detail: format!("{}; {}", embedded.detail, embedding.detail),
+            degraded_reason,
+            capabilities: if embedded.ready
+                && product_embedding_backend
+                && embedding.reachable
+                && embedding_device.full_retrieval_allowed
+            {
+                SidecarCapabilities {
+                    lexical: false,
+                    semantic: true,
+                    graph: false,
+                }
+            } else {
+                SidecarCapabilities::NONE
+            },
+        }
     } else {
         let collection = manifest.qdrant_collection.clone();
         let qdrant_probe = QdrantClient::new(layout).health_probe(&collection);
@@ -762,7 +829,7 @@ pub fn probe_sidecar_health_for_runtime(
             && current_product_embedding_backend
             && !embedding_device.full_retrieval_allowed;
         ComponentHealth {
-            name: "qdrant".into(),
+            name: "semantic".into(),
             status: if !qdrant_probe.reachable {
                 ComponentStatus::Unavailable
             } else if !qdrant_probe.collection_exists
@@ -869,7 +936,7 @@ fn zero_dense_qdrant_health(
 ) -> ComponentHealth {
     if !embedding_device.full_retrieval_allowed {
         return ComponentHealth {
-            name: "qdrant".into(),
+            name: "semantic".into(),
             status: ComponentStatus::Degraded,
             latency_ms: None,
             detail: "graph_first_v1 selected zero dense anchors, but embedding device policy is not verified".into(),
@@ -879,7 +946,7 @@ fn zero_dense_qdrant_health(
     }
 
     ComponentHealth {
-        name: "qdrant".into(),
+        name: "semantic".into(),
         status: ComponentStatus::Healthy,
         latency_ms: None,
         detail: "graph_first_v1 selected zero dense anchors; semantic retrieval skipped by policy"
