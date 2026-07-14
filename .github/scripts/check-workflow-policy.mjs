@@ -429,7 +429,7 @@ if (!fs.existsSync(packagedPlatformProof)) {
     "ref:",
     "cancel-in-progress: true",
     "codestory-cli-default-features",
-    "matrix: ${{ fromJSON(inputs.scope == 'macos'",
+    "matrix: ${{ fromJSON(inputs.scope == 'windows'",
   ], snippet => `packaged-platform-proof.yml must include ${snippet}`);
   const macosSigningStep = namedStep(yamlJob(content, "build"), "Sign and notarize macOS CLI").join("\n");
   const blockingNotaryWait = /^\s+--wait(?:\s|\\|$)/mu;
@@ -455,7 +455,7 @@ if (!fs.existsSync(packagedPlatformProof)) {
     violations.push("packaged-platform-proof.yml must include SHA256SUMS.txt in each reusable package artifact");
   }
   const matrixMatch = content.match(
-    /^      matrix: \$\{\{ fromJSON\(inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\) \}\}$/mu,
+    /^      matrix: \$\{\{ fromJSON\(inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\) \}\}$/mu,
   );
   const expectedFullMatrix = {
     include: [
@@ -470,9 +470,16 @@ if (!fs.existsSync(packagedPlatformProof)) {
   const expectedMacMatrix = {
     include: expectedFullMatrix.include.filter(row => row.asset_target.startsWith("macos-")),
   };
+  const expectedWindowsMatrix = {
+    include: expectedFullMatrix.include.filter(row => row.asset_target === "windows-x64"),
+  };
   try {
-    const macMatrix = matrixMatch && JSON.parse(matrixMatch[1]);
-    const fullMatrix = matrixMatch && JSON.parse(matrixMatch[2]);
+    const windowsMatrix = matrixMatch && JSON.parse(matrixMatch[1]);
+    const macMatrix = matrixMatch && JSON.parse(matrixMatch[2]);
+    const fullMatrix = matrixMatch && JSON.parse(matrixMatch[3]);
+    if (JSON.stringify(windowsMatrix) !== JSON.stringify(expectedWindowsMatrix)) {
+      violations.push("packaged-platform-proof.yml windows scope must contain exactly the Windows x64 package row");
+    }
     if (JSON.stringify(macMatrix) !== JSON.stringify(expectedMacMatrix)) {
       violations.push("packaged-platform-proof.yml macos scope must contain exactly the two Mac package rows");
     }
@@ -557,6 +564,7 @@ if (!fs.existsSync(packagedPlatformPr)) {
     "platform-proof",
     "workflow_dispatch:",
     "options: [platform, integration]",
+    "options: [auto, windows, macos, full]",
     "expected_head_sha:",
     "actions: read",
     'test "$head_repo" = "$GITHUB_REPOSITORY"',

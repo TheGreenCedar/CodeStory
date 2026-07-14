@@ -155,8 +155,10 @@ same-repository `platform-proof` label or coordinator dispatch rechecks the
 exact PR head and requires a completed successful `full-source-gate` job for
 that SHA, then routes script/test-guard-only changes to `none`, Mac lifecycle
 changes to the two Mac targets, and cross-platform runtime or packaging changes
-to all six targets. Forks are rejected before checkout and no proof lane uses
-`pull_request_target` to execute PR code.
+to all six targets. A coordinator can explicitly select `windows` to build only
+the Windows x64 package for an external Windows proof; that scope skips Mac
+source and Metal jobs and receives no signing credentials. Forks are rejected
+before checkout and no proof lane uses `pull_request_target` to execute PR code.
 
 The `review-accepted` label runs the full Ubuntu source gate once for that exact
 head; the persistent label alone does not authorize later heads. After merge,

@@ -8,6 +8,9 @@
   changelog before the existing platform proof-boundary appendix. Publication
   fails when that version section is missing, duplicated, or empty instead of
   substituting an automatically generated pull-request list.
+- Added a Windows-x64-only promoted proof scope so coordinator runs can produce
+  the Vulkan package without starting Mac source, signing, notarization, or
+  Metal jobs.
 - Reduced the packaged macOS proof to one check per release boundary. The
   protected run still covers managed Metal cold/warm/recovery, exact process
   reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned
