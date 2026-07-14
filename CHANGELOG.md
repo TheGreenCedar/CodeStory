@@ -1,536 +1,82 @@
 # Changelog
 
-## Unreleased
+## 0.15.0
 
-### Changed
+### Highlights
 
-- Release evidence now reconciles packet benchmark selector names with the
-  transport mode identifiers recorded by real packet rows.
-- Approved the first protected Linux ARM64 release-evidence baseline with
-  pinned machine identity and explicit status, grounding, convergence, packet,
-  search, indexing, and storage budgets.
-- Wired releases through protected Linux ARM64 release evidence after preflight
-  and before packaged proof, with optional same-SHA prior-run re-evaluation and
-  the same gate for manual and main-triggered releases.
-- GitHub releases now use the exact matching version section from this
-  changelog before the existing platform proof-boundary appendix. Publication
-  fails when that version section is missing, duplicated, or empty instead of
-  substituting an automatically generated pull-request list.
-- Gated CPU-backed Linux ARM64 release evidence on protected exact-head approval
-  while retaining raw repo-scale and drill output without weakening evaluation,
-  and gave packet benchmarks one managed sidecar namespace that is reused across
-  bootstrap, indexing, status, packet calls, and exact cleanup.
-- Added reproducible provisioning for the repository-scoped Linux
-  release-evidence runner. The runner uses a stable provisioned machine
-  identity, checksum-pinned toolchain and model inputs, digest-pinned ARM64
-  sidecars, an exact real-repository drill, isolated proof state, and explicit
-  verification, recovery, unregister, and destruction paths. One checked-in
-  machine contract pins the Colima base image, Ubuntu package snapshot and
-  versions, runtime tools, model, images, and drill. Colima host mounts are
-  disabled, validation source is copied into the guest, lifecycle cleanup is
-  ownership-scoped, and release evidence rejects stale identity attestations,
-  host-home visibility, or any unexpected host-backed mount. Checksum-verified
-  model bytes can stream over SSH from the normal CodeStory cache when the
-  pinned upstream download is unavailable. Lifecycle mutations now require the
-  exact runner to be offline and idle, treat GitHub API failures as failures,
-  and retain credentials and VM state until remote deletion is confirmed. The
-  evidence profile no longer becomes the host's active Docker context, and
-  lifecycle and workflow preflights reject competing containers in its VM.
-- Added a Windows-x64-only promoted proof scope so coordinator runs can produce
-  the Vulkan package without starting Mac source, signing, notarization, or
-  Metal jobs.
-- Reduced the packaged macOS proof to one check per release boundary. The
-  protected run still covers managed Metal cold/warm/recovery, exact process
-  reuse, dead-endpoint blocking, Intel CPU/external labelling, and proof-owned
-  cleanup; duplicated doctor/context smoke and speculative corrupt-install
-  variants no longer lengthen every proof run.
-- Staged CI proof by pull-request maturity and changed surface. Draft pushes
-  now stay on one Ubuntu source lane, exact-head review promotion runs the full
-  workspace test and clippy gate once, and explicit platform promotion selects
-  no package matrix, the two Mac targets, or all six native targets. Promoted
-  heads run repo-scale stats once and reuse each selected unsigned package for
-  package and install checks, with the Mac arm64 candidate also used for
-  protected Metal proof. The main-triggered release signs and notarizes Mac
-  binaries once before packaging and publication, failing closed on any Apple
-  error. Per-proof concurrency cancels stale heads, and the integration
-  dispatcher proves the current `dev/codestory-next` merge result before
-  rechecking that dev did not move during the gate.
-- Rewrote the repository agent guide around the current request-scoped MCP
-  workflow, crate ownership, identity/publication invariants, isolated test
-  contract, maturity-routed verification, and claim-specific release proof.
-- Kept promoted repo-scale stats as a correctness gate while making its
-  wall-clock measurements telemetry. Hardware-bound timing limits remain in
-  the release-evidence gate, so shared hosted runners no longer fail a Mac
-  platform proof for crossing a local-machine threshold by scheduler noise.
+- CodeStory now gives agents one managed grounding path from project selection
+  through indexing, retrieval, packet construction, and search. Fresh plugin
+  sessions can open diagnostics immediately while the version-matched CLI is
+  provisioned in the background, then activate stale projects through normal
+  grounding without a separate repair workflow.
+- Retrieval publication is atomic and fail-closed. Readers stay on one complete
+  generation, source changes during indexing cannot publish stale graph data,
+  and packet or search remains closed when publications, sidecars, endpoints,
+  process identity, or required accelerator proof are stale or ambiguous.
+- Project, workspace, artifact, runtime, lease, and process identities are now
+  kept separate throughout managed state. Plugin requests select their project
+  explicitly, case-distinct Unix repositories no longer collide, and switching
+  repositories cannot inherit another project's cache, endpoint, or readiness
+  evidence.
+- Grounding quality is more precise for request flows, configuration files, and
+  compact executable paths. Resolved graph evidence no longer remains blocked
+  by diagnostic file hits, while genuine source misses, unresolved symbols, and
+  invalid paths still prevent a packet from claiming sufficient coverage.
 
-### Fixed
+### macOS
 
-- Kept packet claim attribution tied to behavior-owning citation identities and
-  require cited interceptor evidence before an interceptor-focused request flow
-  can report sufficient coverage.
-- Treated real file-level lexical hits for known config, data, and documentation
-  formats as diagnostic when the same retrieval has resolved graph evidence,
-  and limited unresolved counts to candidates the resolver actually attempted.
-  Graph-projection semantic hits now preserve exact node identities and omit
-  unresolvable unknown nodes; existing sidecar generations rebuild once for the
-  updated artifact schema.
-  Source misses, unresolved symbols, and invalid paths remain blocking, with
-  the first blocker retained in capped diagnostics.
-- Kept compact search-flow packets focused on executable symbols and preserved
-  planned execution-role probes ahead of generated variants without increasing
-  the packet budget.
-- Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
-  generation artifact scopes to project identity schema 3. Legacy schema-2
-  state is discovered for inventory but never reused or destructively cleaned;
-  new Local and Agent state uses explicit `v3` namespaces and filenames so it
-  cannot collide with unversioned state. Mismatched state fails closed. Runtime
-  state also binds the non-secret
-  endpoint origin and an install-keyed full-endpoint HMAC-SHA256 fingerprint,
-  whose key is initialized once under a private lock and atomically published
-  with owner-only permissions,
-  external endpoints cannot supply managed GPU proof, and identity drift aborts
-  publication and query instead of mixing artifact scopes. Managed native state
-  also binds its launch endpoint and port arguments before reuse or cleanup, and
-  failed bootstrap cleanup removes its exact schema-3 state before preserving
-  owned schema-2 inventory. Native executable ownership now uses filesystem
-  identity instead of case-folded path text, requires an exact persisted process
-  start identity, and reconciles terminal repair results from the compatible
-  schema-2 coordination path during migration.
-- Recognized current llama.cpp's logger-prefixed Metal device inventory so
-  native offload proof remains bound to the selected provider and current
-  launch even when `ggml_metal_init` reports later in startup.
-- Included the aggregate release checksum manifest in reusable package
-  artifacts so protected hardware and installation proofs can provision the
-  exact packaged CLI without falling back to a network release lookup.
-- Kept the protected Metal proof runnable when the platform-only source-call
-  job is intentionally skipped, while still requiring successful routing and
-  package production before protected hardware starts.
-- Made Mac notarization retain its submission ID and retry status queries
-  across transient Apple transport failures. Terminal rejection still fails
-  immediately with the notarization log retained, and polling now has an
-  explicit one-hour bound.
-- Replaced the Windows native embedding process-start identity CIM probe with
-  the native process creation time. Immediate identity reads and snapshot start
-  times no longer depend on CIM convergence and retain the existing serialized
-  identity format.
-- Raised the bounded primary sidecar query window to 1.5 seconds so cold SCIP
-  and lexical stages can borrow enough request slack to complete without
-  changing incomplete or cancelled trace eligibility.
-- Made incremental freshness compare verified parser source hashes when file
-  mtimes match. Same-timestamp edits now schedule reindexing instead of leaving
-  stale graph data current, while legacy and non-parser rows retain the
-  existing metadata fallback.
-- Made plugin project selection strictly request-scoped. Diagnostic bootstrap
-  no longer falls back to hook-written global or thread state, managed
-  executable comparison uses native file identity with platform-appropriate
-  missing-path rules, and the plugin rejects readiness evidence whose schema-3
-  project/workspace identity differs from the selected repository. `cache
-  identity` now exposes the lossless project, workspace, artifact, and safe
-  legacy-alias disposition used by that verification.
-- Separated release-evidence provenance validation from the benchmark corpus
-  loader and expanded the generalization guard across the repository-controlled
-  non-Rust product and release-control boundary. Direct and adjacent/split
-  evaluation-corpus dependencies now fail in plugin launch/setup surfaces,
-  worktree/install tooling, runtime configuration, release scripts/workflows,
-  and the release evaluator across native separators, case variants,
-  direct harness commands/configuration, comment-separated JavaScript imports,
-  unquoted shell continuations, workflow-embedded shell continuations, and
-  PowerShell continuations. Comment-only JavaScript and hash-commented
-  shell/config text is ignored, while Markdown prose stays outside evaluation
-  and dependency scanning. The CI trigger and focused regression contract cover
-  the full protected inventory, including local composite actions and shipped
-  agent instruction surfaces, and missing protected paths fail closed. Exact
-  release-policy references to the retrieval smoke workflow are allowed only
-  by file, literal, and use; every direct or constructed occurrence is checked,
-  and constructed dependencies must span the literals that form the matched
-  harness marker.
-- Added deterministic prior-version managed CLI upgrade proof to every native
-  managed-lifecycle cell. The gate now starts with a verified older install,
-  requires the requested packaged binary to serve status and grounding, and
-  retains the older version only as the verified rollback.
-- Migrated retrieval manifests to schema 21 with a canonical
-  `lexical_version` column. Existing schema-19 and schema-20 rows are renamed
-  in place, and all reads and writes now use the lexical column without
-  recreating the removed legacy field. Non-persistent response/cache aliases
-  were removed; only the v0.15 owned-state and legacy-compose cleanup window
-  remains.
-- Launched the managed Windows Vulkan llama.cpp cells with proof verbosity so
-  current-launch logs retain the requested device and positive layer-offload
-  evidence required by the accelerator smoke gate.
-- Made agent-facing commands select the Agent sidecar by default, and bound the
-  live packet/drill parity gate plus drill's packet execution to the same
-  explicit Agent run instead of preflighting an unrelated Local generation.
-- Prevented parser and artifact-cache results from publishing graph data for
-  source bytes that changed during indexing. Parser-backed projections now
-  persist the SHA-256 identity of the bytes actually indexed, stamp file
-  metadata only after a matching verification read, and leave an incomplete
-  retry error instead of accepting stale output even when the file's timestamp
-  is restored.
-- Migrated readiness-broker scopes, operation IDs, machine locks, snapshots,
-  and GPU-runtime binding to lossless project identity schema 3. Legacy broker
-  state is reused only when its workspace and repository provenance map
-  unambiguously; case-distinct Unix roots no longer collide, while Windows
-  aliases still share their existing workspace. Refresh/repair and stdio path
-  ownership now use the shared filesystem-aware path comparator, and new
-  refresh/repair state preserves native path case.
-- Made managed macOS readiness follow the selected Agent runtime end to end.
-  Bootstrap probes the allocated embedding endpoint instead of assuming port
-  `8080`, Darwin native-process identity uses the locale-stable process start
-  time together with executable and arguments, and a persisted `full` manifest
-  no longer permits agent packet/search after the live endpoint or verified
+- macOS 15 and newer is a supported native target. Apple Silicon uses the
+  checksum-pinned managed native embedding server with Metal; CodeStory verifies
+  the selected endpoint, launch identity, runtime initialization, positive
+  layer offload, and a timed embedding request before opening agent retrieval.
+- Intel Macs support the native CLI, managed plugin, local graph, and grounding.
+  Semantic retrieval requires either explicitly allowed CPU operation or a
+  trusted external embedding endpoint; Intel status and evidence never claim
+  Metal acceleration.
+- Managed macOS readiness follows the selected dynamic Agent endpoint instead
+  of assuming port 8080, reuses only a matching live native process, and blocks
+  packet and search with repair guidance if that endpoint or its verified
   accelerator identity disappears.
-- Serialized same-project Compose bootstraps through ownership probing,
-  startup, and failure cleanup so one concurrent attempt cannot roll back
-  containers created by another.
-- Centralized CLI sidecar construction behind an early test-isolation gateway.
-  Default-concurrency tests now select a process-unique cache root before any
-  user-cache lookup and an architecture contract prevents new direct
-  constructors from bypassing that boundary.
-- Replaced the Windows-only Codex worktree bootstrap entrypoint with a Node.js
-  dispatcher that preserves the PowerShell implementation on Windows and uses
-  the equivalent POSIX setup on macOS and Linux. The POSIX path validates CLI
-  versions, preserves CLI selection plus release/build fallback order,
-  optionally uses `sccache`, rehydrates compatible caches, refreshes the index,
-  and reports best-effort sidecar readiness.
-- Opened the diagnostic MCP immediately on fresh managed-plugin startup while
-  the existing single-flight installer provisions the exact CLI version in the
-  background. Status now reports the in-process provisioning state, and the
-  launcher hands the next request to the verified stdio runtime without a host
-  restart.
-- Changed six-platform managed acceptance from an explicit repair handoff to
-  the real grounding convergence path. The proof now seeds a complete local
-  publication, makes it stale with sidecars absent, proves status changes no
-  refresh or repair ownership, activates through `ground`, observes one
-  terminal `shared-agent` attempt and a newer complete local generation, and
-  keeps packet/search closed without verified accelerator smoke.
-- Changed the protected Apple Silicon cold lifecycle to reach its first full
-  Agent generation through the managed plugin's `ground` activation instead
-  of `ready --repair`. The exact packaged runtime must now move from a stale
-  local publication and absent sidecars to verified Metal, serve packet/search
-  through the same MCP session, and reuse the native process after MCP restart.
-  Managed repair now retains the grounding-owned local refresh lock through
-  its index open instead of racing a second refresh and failing `cache_busy` on
-  larger repositories. Runtime-log proof records Metal as the detected
-  provider before packet/search can open, but only when a Metal runtime-init
-  marker and positive offload agree; requested-provider text and package paths
-  do not count. MCP now waits for the child to adopt its cache-owned repair
-  reservation before publishing the handoff, and proof cleanup trusts that
-  reservation even when the grounding response or first status poll fails.
-  Release packaging remains compatible with the system Python shipped by
-  macOS 15, including Docker 29's nanosecond creation timestamps.
-- Expanded managed-plugin provisioning, local grounding, repair handoff, and
-  proof cleanup from Windows x64 to every shipped native release asset in both
-  pre-publish and post-publish matrices. Linux proof containers now write
-  bind-mounted Qdrant data as the proof owner, keep Qdrant snapshots inside that
-  owned mount, and capture Compose/Qdrant diagnostics before cleanup on failure.
-  Cleanup explicitly stops the proof-owned local Compose namespace before
-  verifying cache removal and preserves the original gate failure if cleanup
-  also fails.
-- Stopped new sidecar state from emitting removed Zoekt path, port, and image
-  keys. State now writes `lexical_data_dir`, accepts `zoekt_data_dir` only while
-  reading legacy state, and keeps legacy cleanup bounded to state that proves
-  ownership of the old Zoekt directory. Legacy retrieval state remains readable
-  and the next owned sidecar publication rewrites it in canonical form;
-  rebuilding remains the fail-closed recovery when legacy state does not match
-  the current cache.
-- Made agent sidecar rebuilds fail fast with `gpu_unverified` unless a tiny
-  embedding request against the selected runtime completes with bounded timing
-  and the current runtime log proves positive offload for the requested
-  accelerator provider and device. Device inventory alone no longer permits a
-  long semantic rebuild.
-- Made current-generation promotion validate the SQLite lexical shard, SCIP
-  revision and graph artifacts, exact Qdrant collection point count and
-  semantic smoke, configured/observed embedding-runtime identity, and either
-  a fresh timed embedding smoke with exact runtime/log-backed accelerator proof
-  or an explicit CPU policy against one candidate. Native and Docker identity
-  must remain live and unchanged across the smoke and final probes. Any
-  component failure or crash before pointer replacement now leaves both current
-  and rollback generations untouched.
-- Made sidecar generation GC root every current and rollback manifest across
-  the shared cache scope instead of collapsing rollback evidence to one latest
-  generation. Inventory now reports active, rollback, building, and reclaimable
-  bytes separately and treats unrooted artifacts as building while a
-  publication or cleanup writer owns the retention lock.
-- Made sidecar generation fingerprinting snapshot-coherent and current-manifest
-  promotion fail closed when any graph, semantic, or lexical input changes
-  during a build. Filesystem input is hashed before locking SQLite; final stored
-  input validation and pointer replacement commit in one immediate transaction.
-- Let each runnable retrieval stage consume unused request-budget time while
-  reserving planned time for later stages, so SCIP anchor, lexical, graph, and
-  dense evidence are not cut off by static allowances or query-shape ordering.
-  The first blocking stage deadline now also survives later deadline and
-  marginal-gain exits, keeping incomplete retrieval fail closed and uncached.
-- Made workspace inventory completeness explicit across complete, partial,
-  unreadable, and bounded discovery. Traversal failures are retained instead of
-  becoming apparent deletions; incremental planning removes stored projections
-  only after a complete inventory, while freshness and cache validation fail
-  closed when absence cannot be proven.
-- Made MCP status reads observational. Grounding and other project tools now
-  own local refresh activation and, when the installed sidecar policy is
-  enabled, attach or enqueue agent readiness through the existing
-  project-scoped broker. Automatic repair retries persist a state fingerprint
-  and cooldown across MCP runtimes. Stale heartbeats from a still-live owner
-  remain fail-closed diagnostics surfaced by canonical MCP status; age alone
-  never terminates the process.
-- Captured CLI user-home, project-network trust, stdio cache, and sidecar
-  defaults once at process startup so multi-project project selection cannot
-  drift through later process-environment reads. Repair status, terminal
-  results, lock arbitration, and broker overlays now consume that same retained
-  sidecar root instead of polling a second environment-derived cache tree.
-- Renewed live local-refresh ownership during long incremental indexing, with
-  token, PID, and process-start checks that prevent stale workers from
-  overwriting changed ownership or terminal status.
-- Replaced permanent Agent sidecar port reservations with renewable,
-  namespace-scoped owner leases. Allocation and renewal serialize under the
-  registry lock, reclaim expired or missing owners only when ports are free,
-  recover a malformed compact registry from atomic per-namespace lease records,
-  and prune inactive history plus empty namespace directories so long-running
-  caches remain bounded. Each immutable runtime retains its owner token and
-  must present it on renewal, while long bootstrap phases keep the lease alive
-  with a bounded heartbeat. Owner tokens, not PIDs alone, establish identity.
-- Kept packaged local-retrieval proof commands in the local default runtime
-  namespace so the cross-platform gate validates a real local handoff before
-  exercising agent readiness.
+- Direct-download Mac artifacts are release-ready only after the exact arm64 and
+  x64 binaries pass Developer ID signing, notarization, quarantined extraction,
+  Gatekeeper, and native execution checks. Source or unsigned package checks do
+  not make that claim.
 
-### Removed
+### Reliability and operations
 
-- Removed the legacy ONNX diagnostic runtime, asset installer, setup command,
-  comparison tooling, configuration, tests, and dependencies, and restored the
-  Intel macOS CLI package/proof lane that ONNX Runtime had blocked. Legacy ONNX
-  environment variables and backend selections now fail explicitly; product
-  packet/search readiness remains exclusively tied to the llama.cpp sidecar.
+- Managed state moves to project-identity schema 3 and retrieval manifests to
+  schema 21. Existing schema-19 and schema-20 retrieval rows migrate in place;
+  legacy schema-2 sidecar and broker state remains available for bounded
+  inventory and cleanup but is not trusted for runtime reuse.
+- The legacy ONNX backend and its runtime, installer, setup, configuration, and
+  environment selections have been removed. Upgrade automation must remove
+  those selections and use managed llama.cpp or a trusted external embedding
+  endpoint; stale ONNX settings now fail explicitly instead of being ignored.
+- Incremental indexing verifies source hashes even when modification times are
+  unchanged, and parser-backed output is published only when the indexed bytes
+  still match the file. Failed, cancelled, or concurrent refreshes preserve the
+  previous usable generation.
+- Native process reuse and cleanup now bind executable filesystem identity,
+  arguments, endpoint, and process start identity. Cleanup remains limited to
+  resources carrying CodeStory ownership proof.
+- Managed installation and upgrade checks cover every shipped native platform,
+  including upgrade from a verified older CLI with that version retained as the
+  rollback. The Codex worktree setup dispatcher now provides equivalent native
+  setup behavior on Windows, macOS, and Linux.
+- Release proof is staged by maturity and changed surface. Draft changes use
+  focused source checks; exact-head, platform, protected hardware, signing, and
+  installation proof run only at their explicit promotion boundaries. The
+  evidence gate reconciles packet selectors with their recorded transport modes
+  before enforcing exact raw-row coverage.
 
-### Added
+### Release boundary
 
-- Added macOS 15 workspace gates for both Apple Silicon and Intel, POSIX setup
-  self-tests, and a protected Apple Silicon packaged lifecycle proof covering
-  cold/warm managed Metal, PID reuse, endpoint death, readiness blocking,
-  recovery, packet/search, spaces/Unicode paths, corrupt model/server repair,
-  bounded native-log preservation, and marker-scoped cleanup that survives
-  interrupted hardware attempts. Mac release binaries are now Developer ID
-  signed from a protected environment with hardened runtime and a secure
-  timestamp, notarized before packaging, and checked after publication through
-  quarantined archive extraction, Gatekeeper, version, and help execution.
-  Signing and designated requirements are bound to Apple team `PKUJNR8D6F`,
-  while notarization proof is published separately so the binary artifact
-  layout remains stable.
-- Added one bounded reusable retrieval-stage scheduler for narrow and broad
-  queries. Request deadlines and cancellation now propagate into sidecar work
-  and query-embedding/Qdrant HTTP work; lexical and graph scans poll the shared
-  token, and synchronous HTTP runs on separate bounded reusable capacity so a
-  cancelled caller releases stage capacity promptly. Timed-out or cancelled
-  results are discarded instead of cached, while traces truthfully separate
-  admission, queue, completed execution, and pending/late completion state.
-
-- Added immutable per-project runtime configuration for multi-project CLI and
-  stdio operation. Embedding endpoint provenance, profile/model/prefix contract,
-  batching and device policy, retrieval policy, and summary configuration now
-  travel with retained project state instead of being published through process
-  environment mutation. Retrieval and runtime share the concrete llama.cpp HTTP
-  client, and a cross-platform A/B/A stdio contract proves two trusted projects
-  cannot cross-route embedding markers or vectors.
-
-- Added a table-driven full and incremental publication fault matrix covering
-  identity persistence, search build/validation/completion, catalog locking,
-  staged database replacement, incremental marker completion, and runtime cache
-  publication. Every boundary now has deterministic failure and cancellation
-  proof, including successful completion when cancellation arrives after the
-  database replacement point of no return. A store-level child process abort
-  after live mutation and before backup cleanup proves retry recovery and
-  artifact cleanup. Promotion-scoped locking prevents healthy backups from
-  being mistaken for abandoned crash recovery state by concurrent readers.
-- Added parser-backed Fastify route extraction for direct verbs, including
-  `TRACE`, and static `route({ method, url, handler })` objects on
-  source-ordered, module-scope
-  receivers constructed from explicit ESM or CommonJS `fastify` bindings.
-  JavaScript, TypeScript, and TSX accept ordinary static strings and
-  substitution-free templates, invalidate ownership after reassignment or
-  shadowing, and avoid handler edges for wrapped or inline handlers. Dynamic
-  paths and methods, method arrays, escaped literals, nested builders, and
-  nested, injected, factory-returned, or unsupported receivers are excluded;
-  malformed-file recovery remains error-local structural evidence.
-- Added parser-backed Express route extraction for static module-scope
-  registrations on source-ordered app and router bindings constructed from
-  explicit `express` imports or `require("express")`. JavaScript, TypeScript,
-  and TSX use grammar-specific tree-sitter query caches; multiline calls and
-  substitution-free template literals are supported. Bare, shadowed, nested,
-  injected, chained, multi-target, and factory-returned receivers are not
-  promoted, dynamic or escaped paths are excluded, and malformed-file lexical
-  recovery remains structural and low-confidence.
-- Added parser-backed FastAPI decorator route extraction for single-target,
-  module-scope receivers whose latest preceding assignment constructs an
-  imported `FastAPI` or `APIRouter`, including exact handler, method, path,
-  provenance, and claim-tier metadata. Later assignments, imports, functions,
-  and classes invalidate shadowed ownership; chained or multi-target
-  construction is conservatively not promoted. Multiline and raw string routes
-  are supported; unmatched or nested-scope receivers are not labeled as
-  FastAPI, while dynamic templates, nested path builders, ordinary escaped
-  literals, and unrelated-error lexical candidates do not become exact route
-  claims. Error-local syntax recovery stays explicitly structural and
-  low-confidence.
-- Added a fail-closed, machine-profiled release evidence gate with pinned
-  approved references and separate budgets for status, local grounding,
-  convergence, packet, search, indexing, and storage growth. Decision reports
-  retain metric status, release decision, full commits, rationale, and artifact
-  hashes; an appended telemetry row cannot become its own baseline. A
-  provisioned same-SHA manual/reusable workflow now produces raw repo/packet
-  evidence without changing the current release path before a live profile is
-  approved.
-- Added a schema-backed publication generation and run identity to every staged
-  full and incremental core database. Typed store and runtime reads now expose
-  the generation that owns the live graph, and cache finalization verifies that
-  identity before clearing the incomplete-run compatibility fence.
-- Published persisted symbol-search indexes into UUID-scoped generation
-  directories selected only by the live core publication identity. Writers
-  finish and validate each search generation before publishing its core
-  database; readers never rebuild missing or corrupt generations in place.
-  Retention keeps the active generation plus one verified rollback, skips locked
-  readers, and preserves the legacy path for databases without an identity.
-
-### Changed
-
-- Made drill a report adapter over one runtime packet execution. Explicit anchors
-  are packet probes; packet citations, covered claims, gaps, sufficiency, and
-  follow-up commands now populate the retained drill JSON, Markdown, summary, and
-  bridge fields. Removed the public legacy evidence-packet DTO and production
-  drill-only search, bridge, readiness, claim-scoring, and ledger assembly paths.
-- Moved drill-suite source-truth ledgers and answer-quality scoring out of the
-  production CLI into `scripts/score-drill-ledger.mjs`. The suite command now
-  emits mechanical evidence only; the versioned evaluator preserves the prior
-  scored JSON contract and can persist it to an explicit output path. The
-  standalone agent-quality evaluator and fixtures now live in `codestory-bench`.
-- Added deterministic retained-field fixtures and an executable full-sidecar
-  packet/drill parity gate covering artifact names, sufficiency, citations,
-  explicit probes, follow-up commands, and the single-packet execution boundary.
-- Added staged repository-v2/project-v3 identity contracts that preserve
-  transport schemes, effective and non-default remote ports, and case-sensitive
-  repository paths, distinguish absolute and home-relative SCP paths, reject
-  ambiguous local remotes, hash canonical workspace paths without lossy UTF-8
-  conversion, and never guess schema-1 ownership without persisted provenance.
-  A shared path comparator uses full filesystem identity for existing paths and
-  normalized platform lexical rules only for missing paths; current persisted
-  v1/v2 consumers stay unchanged until the coordinated identity migration.
-- Replaced the faux Zoekt JSONL full-corpus scan and health-only webserver with
-  one immutable, project-generation-local SQLite FTS5 shard. Queries now bound
-  candidate selection in SQLite before applying the existing lexical scorer;
-  one Unicode-aware CamelCase/acronym normalization feeds both stages, and
-  routine readiness/search opens verify document-to-FTS row binding;
-  canonical workspace discovery records oversized and unreadable coverage as
-  a diagnostic without disabling a non-empty indexed subset, while all-omitted
-  source sets fail closed. Legacy JSONL generations rebuild instead of serving
-  through a second engine, Compose removes orphaned Zoekt containers, and
-  status, telemetry, artifacts, and configuration now name the implementation
-  truthfully as lexical. Packaged proof now validates the SQLite lexical
-  manifest directly and force-terminates stuck Windows proof workers before
-  cleanup.
-- Grounding skill guidance now reuses current status, routes blocked deep
-  retrieval tasks through allowed project-scoped local graph surfaces, and
-  repairs sidecars only when the task actually requires the blocked surface.
-  Local navigation remains explicitly weaker than full packet/search proof.
-- Added a test-only hook qualification matrix for orientation, ownership, call
-  flow, change impact, broad retrieval, blocked-deep fallback, and non-repo
-  suppression. The former prompt-agnostic policy's first prompt emission and
-  current hook both run as processes; qualification scores structured route
-  categories and exact tool tokens. Separately sourced observed MCP drill
-  artifacts remain explicitly non-executable test evidence.
-- Replaced generic status-only lifecycle guidance with compact repository-task
-  routing for orientation, symbol ownership, call flow, change impact, and broad
-  questions. Prompt hooks no longer echo user text, suppress non-repository
-  chatter, prefer allowed local graph surfaces when deep retrieval is blocked,
-  and reserve sidecar repair for tasks that require packet/search. Routing is
-  stateless so concurrent and resumed agent tasks cannot suppress one another.
-
-### Fixed
-
-- Hardened project-scoped embedding requests by retaining the configured model
-  identity, validating and ordering OpenAI response rows by their explicit
-  indices, deriving named-profile dimensions, refusing redirects, and
-  redacting endpoint credentials and query secrets from failures. Ready,
-  report, drill, stdio cache/readiness, and profile-selection paths now reuse
-  the captured runtime instead of rebuilding configuration from changed
-  process environment state.
-- Isolated stdio unit-test sidecar and port-registry state from the real user
-  cache, fixed atomic JSON replacement for Windows paths beyond `MAX_PATH`, and
-  made stdio fixtures drain repair workers or fail while preserving timed-out
-  fixture state under default parallel execution.
-- Removed a plugin static test that froze exact grounding documentation copy;
-  documentation remains covered by the repository link and diff checks.
-- Pinned each status summary to one SQLite read transaction, accepted it only
-  when its complete publication stayed stable, and keyed the cache by durable
-  publication identity so concurrent publication cannot produce or retain a
-  mixed-generation response.
-- Completed the durable incremental marker before exposing prepared runtime
-  search state or reporting indexing idle. Marker failure now leaves runtime
-  state cleared and the new database generation fenced from readers.
-- Corrected the Codex managed-platform guide to list the restored macOS x64 CLI
-  while retaining its no-managed-accelerated-sidecar boundary.
-- Retried packaged-proof temporary directory removal after transient executable
-  locks while keeping persistent cleanup failures fail-closed, preventing a
-  successful Windows managed-plugin handoff from failing during teardown.
-- Made managed CLI provisioning cross-process single-flight: one publisher now
-  downloads, extracts, checksum-validates, probes, and atomically publishes a
-  release while waiters reuse the verified result. Lock ownership is published
-  atomically with process-start identity, acquisition fails closed when that
-  identity cannot be established, and incomplete initialization is
-  reclaimed only after its owner exits. Orphaned pending-owner files are
-  removed with the same process-identity checks, deferring expensive identity
-  probes until the stale threshold while live and young malformed artifacts
-  remain protected; malformed, wrong-version, or
-  checksum-mismatched installs are quarantined with bounded retention and
-  reprovisioned, while locked or unmovable targets fail closed. Publication
-  states are exposed as redacted plugin-runtime warnings, and native packaged
-  proof now includes macOS x64 alongside the existing five release targets.
-- Closed the remaining managed CLI publication gaps: waiters now cover both
-  assets' absolute total configured retry windows, staged binaries must answer
-  the exact MCP stdio `initialize` contract within bounded output and process
-  shutdown limits, stale initialization aliases are inode-and-token revalidated
-  across rename, and resource-capped ZIP/tar.gz extraction uses Node platform
-  APIs instead of an external `tar` executable.
-
-- Extended the retrieval generalization guard from derived query literals to
-  direct and split Rust string dependencies on eval/query corpus paths across
-  production crates, including benchmark manifests, query catalogs, packet
-  fixtures, agent-quality fixtures, and eval probes.
-
-- Kept project-scoped MCP reads available during a single-flight local refresh
-  by opening published SQLite generations read-only, serving the last complete
-  publication with explicit generation and refresh-owner metadata, retrying a
-  search-generation swap once at the publication boundary, and rechecking
-  freshness after acquiring the refresh lock so concurrent requests coalesce
-  instead of publishing duplicate generations. Read tool metadata is bound to
-  the exact complete publication used by the response, and max grounding no
-  longer writes missing detail snapshots into the live reader database. The
-  status tool also reads readiness directly instead of recursively preflighting
-  itself and starting a competing refresh worker. Incremental semantic
-  finalization now scopes itself to files materialized in the staged graph, so
-  changes to discovered files without graph collectors do not abort publication.
-- Closed packaged-proof stdio input before force-terminating the launcher so
-  delegated Windows CLI processes exit and release managed binaries before
-  temporary plugin data is removed. Managed repair-worker cleanup now also
-  waits on the Windows process handle after terminating its process tree before
-  deleting the provisioned executable.
-- Kept the cross-platform concurrent-publication proof independent of cached
-  build output so macOS runner image and Xcode updates cannot restore binaries
-  linked against vanished toolchain paths.
-- Replaced the runtime embedding client and managed-endpoint probe's duplicate
-  socket-level HTTP and chunked-body parsers with the existing shared `ureq`
-  response path. Embedding POSTs do not follow redirects, require an explicit
-  2xx response, read successful batch bodies beyond `ureq`'s 10 MiB text limit,
-  and redact endpoint userinfo, query values, and fragments from runtime
-  reachability, transport, status-body, and JSON diagnostics. Endpoint
-  validation, bounded error bodies, response counts, and embedding-dimension
-  checks remain intact. Removed the unused search snapshot harness and helpers
-  that were referenced only by that harness.
-- Finalized graph-native and dense semantic documents in staged full and
-  incremental databases before core publication. Post-publication cache loads
-  now hydrate semantic state without rewriting live rows, and an unavailable
-  embedding runtime clears the dense corpus instead of carrying an incomplete
-  generation that could later be reported ready.
-- Staged incremental graph projection, removed-file cleanup, resolution,
-  deferred indexes, and both grounding snapshot tiers in a coherent SQLite
-  clone before publishing the new core generation. Pre-publication failures
-  and cancellation now discard staged artifacts without changing the live
-  database, schema, snapshots, or incomplete-run marker.
+- The repository version and release notes describe the candidate source.
+  Publication is complete only when the matching archives and checksums are
+  available and the required platform checks pass.
+- Marketplace availability, Gatekeeper acceptance, installed runtime/version
+  readback, and live full-retrieval behavior are separate post-publication
+  claims and require their own evidence.
 
 ## 0.14.3
 
