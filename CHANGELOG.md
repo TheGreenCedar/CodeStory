@@ -71,8 +71,10 @@
   nodes so multiline aliases, comments, and later shadowing remain accurate.
 - Core snapshot promotion now records durable prepared and committed identities.
   A committed generation cannot be rolled back by a retained cleanup backup,
-  while interrupted and legacy recovery validates complete database identities
-  before replacing the live store.
+  while interrupted and legacy recovery validates database identities before
+  replacing the live store. Recovery accepts the incomplete-run schema sentinel
+  only for a previous live database or backup carrying its matching marker;
+  staged candidates and committed generations must remain complete.
 - Native process reuse and cleanup now bind executable filesystem identity,
   arguments, endpoint, and one shared cross-platform process start identity.
   macOS and Windows process inspection is bounded, dead, reused, or unverified
