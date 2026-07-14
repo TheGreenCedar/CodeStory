@@ -120,6 +120,16 @@ pub(crate) enum Command {
     Retrieval(RetrievalCommand),
     #[command(about = "Show retrieval sidecar status.")]
     Sidecar(SidecarCommand),
+    #[command(name = "internal-owned-delete", hide = true)]
+    InternalOwnedDelete(InternalOwnedDeleteCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct InternalOwnedDeleteCommand {
+    #[arg(long, value_name = "DIR")]
+    pub(crate) root: PathBuf,
+    #[arg(long, value_name = "RELATIVE_PATH")]
+    pub(crate) relative: PathBuf,
 }
 
 #[derive(Args, Debug, Clone)]

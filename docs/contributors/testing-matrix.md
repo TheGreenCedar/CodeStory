@@ -219,6 +219,13 @@ the following run also cleans a marker-owned prior attempt if cancellation
 prevented the prior `always()` step. Contract tests or hosted package smoke
 cannot replace this hardware evidence.
 
+Proof cleanup validates the marker and archive before invoking the packaged
+CLI's internal owned-deletion boundary. Cache and proof-root names are removed
+relative to a pinned runner-temp handle; Unix traversal is descriptor-relative
+and no-follow, while Windows rejects reparse ancestors and deletes by handle.
+The platform boundary test swaps the ambient ancestor after the trusted handle
+opens and must preserve an outside sentinel.
+
 An actual Mac host reboot remains a separate two-phase operator proof because a
 GitHub job cannot safely reboot its own self-hosted runner and resume the same
 job. Preserve the pre-reboot PID/launch/status bundle, reboot the protected host,
