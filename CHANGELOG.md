@@ -67,6 +67,9 @@
   verified CodeStory ownership. Dead or reused processes, conflicting legacy
   state, unsafe paths, oversized downloads, and ambiguous cleanup all fail
   closed instead of being guessed through.
+- Release-evidence re-evaluation reads exception approvals only from its
+  protected environment and fails before evaluation when that approval is
+  missing.
 - The packaged plugin launches the native CodeStory CLI without a shell. On
   Windows, `CODESTORY_CLI` must name a native `.exe`; the supported `codex.cmd`
   host shim is unchanged. Cross-platform worktree setup uses one
