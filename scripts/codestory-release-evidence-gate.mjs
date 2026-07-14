@@ -28,6 +28,9 @@ const SOURCE_RUN_PRODUCERS = new Map([
   [".github/workflows/release.yml", new Set(["workflow_dispatch"])],
   [".github/workflows/auto-release.yml", new Set(["push"])],
 ]);
+const SELECTED_REF_PRODUCERS = new Set([
+  ".github/workflows/packaged-platform-pr.yml",
+]);
 
 function fail(message) { throw new Error(message); }
 function object(value, label) {
@@ -95,15 +98,12 @@ function machineFingerprint() {
   return `${process.platform}/${process.arch}/${os.cpus().length}/${cpu}/${memoryGiB}GiB`;
 }
 
-export function validateSourceRunMetadata({ run, expectedRepo, expectedSha }) {
+export function validateSourceRunMetadata({ run, artifacts, expectedRepo, expectedSha }) {
   object(run, "source run");
   const repo = text(expectedRepo, "expected repository");
   const sha = fullSha(expectedSha, "expected SHA");
   if (run.repository?.full_name !== repo || run.head_repository?.full_name !== repo) {
     fail("source run must come from the current repository");
-  }
-  if (fullSha(run.head_sha, "source run head SHA") !== sha) {
-    fail("source run head SHA does not match the evidence SHA");
   }
   if (run.conclusion !== "failure") {
     fail("source run must be a rejected failed evidence run");
@@ -111,6 +111,30 @@ export function validateSourceRunMetadata({ run, expectedRepo, expectedSha }) {
   const events = SOURCE_RUN_PRODUCERS.get(run.path);
   if (!events?.has(run.event)) {
     fail("source run workflow and event are not trusted evidence producers");
+  }
+  const runId = number(run.id, "source run id");
+  const artifactList = object(artifacts, "source run artifacts");
+  if (!Array.isArray(artifactList.artifacts)) {
+    fail("source run artifacts.artifacts must be an array");
+  }
+  const artifactName = `release-evidence-${sha}`;
+  const matches = artifactList.artifacts.filter((artifact) => artifact?.name === artifactName);
+  if (matches.length !== 1) {
+    fail(`source run must contain exactly one ${artifactName} artifact`);
+  }
+  const artifact = object(matches[0], "source run evidence artifact");
+  if (artifact.expired !== false) fail("source run evidence artifact must not be expired");
+  number(artifact.size_in_bytes, "source run evidence artifact size");
+  const artifactRun = object(artifact.workflow_run, "source run evidence artifact workflow_run");
+  if (number(artifactRun.id, "source run evidence artifact workflow_run id") !== runId) {
+    fail("source run evidence artifact belongs to a different workflow run");
+  }
+  const headSha = fullSha(run.head_sha, "source run head SHA");
+  if (fullSha(artifactRun.head_sha, "source run evidence artifact head SHA") !== headSha) {
+    fail("source run evidence artifact head SHA does not match its workflow run");
+  }
+  if (headSha !== sha && !SELECTED_REF_PRODUCERS.has(run.path)) {
+    fail("source run head SHA does not match the evidence SHA");
   }
 }
 function profileFrom(document, name, mode, baselineDir) {
@@ -384,6 +408,7 @@ function main() {
   if (command === "validate-source-run") {
     validateSourceRunMetadata({
       run: readJson(values.run, "source run"),
+      artifacts: readJson(values.artifacts, "source run artifacts"),
       expectedRepo: values.repo,
       expectedSha: values["expected-sha"],
     });

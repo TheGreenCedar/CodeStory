@@ -695,6 +695,8 @@ if (!fs.existsSync(releaseCandidateEvidence)) {
     "ref: ${{ inputs.ref }}",
     "validate-source-run",
     "actions/runs/$SOURCE_RUN_ID",
+    "actions/runs/$SOURCE_RUN_ID/artifacts",
+    "--artifacts target/release-evidence/source-run-artifacts.json",
     "--test-threads=1",
     "release-evidence-${{ inputs.ref }}",
   ], snippet => `release evidence workflow must include ${snippet}`);
