@@ -4,6 +4,7 @@ use crate::config::{SidecarLayout, user_cache_root};
 use crate::qdrant_client::QdrantClient;
 use anyhow::{Context, Result};
 use codestory_store::Store;
+use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -283,6 +284,15 @@ fn collection_has_config(collection_dir: &Path) -> bool {
 }
 
 fn remove_invalid_collection_dirs(qdrant_data_dir: &Path) -> Result<usize> {
+    let deletion = match OwnedDeletionRoot::open(qdrant_data_dir) {
+        Ok(deletion) => deletion,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("open owned Qdrant data root {}", qdrant_data_dir.display())
+            });
+        }
+    };
     let collections_dir = qdrant_data_dir.join("collections");
     let Ok(entries) = std::fs::read_dir(&collections_dir) else {
         return Ok(0);
@@ -297,13 +307,16 @@ fn remove_invalid_collection_dirs(qdrant_data_dir: &Path) -> Result<usize> {
         if !name.starts_with("codestory_") {
             continue;
         }
-        if !collection_has_config(&collection_dir) {
-            std::fs::remove_dir_all(&collection_dir).with_context(|| {
-                format!(
-                    "remove invalid qdrant collection dir without config {}",
-                    collection_dir.display()
-                )
-            })?;
+        if !collection_has_config(&collection_dir)
+            && deletion
+                .remove(Path::new("collections").join(&name).as_path())
+                .with_context(|| {
+                    format!(
+                        "remove invalid qdrant collection dir without config {}",
+                        collection_dir.display()
+                    )
+                })?
+        {
             removed += 1;
         }
     }
@@ -480,29 +493,39 @@ fn execute_retention_on_disk(
     max_keep: usize,
     repair_errors: &mut Vec<String>,
 ) -> Result<(usize, usize, usize, bool)> {
+    let deletion = match OwnedDeletionRoot::open(qdrant_data_dir) {
+        Ok(deletion) => deletion,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, 0, 0, false));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("open owned Qdrant data root {}", qdrant_data_dir.display())
+            });
+        }
+    };
     let all = list_on_disk_codestory_collections(qdrant_data_dir, recency_by_collection)?;
     let collections_seen = all.len();
     let plan = plan_retention(&all, protected, max_keep);
     let prune_candidates = plan.to_prune.len();
     let mut removed = 0usize;
     for name in plan.to_prune {
-        let path = qdrant_data_dir.join("collections").join(&name);
-        if path.is_dir() {
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {
+        match deletion.remove(Path::new("collections").join(&name).as_path()) {
+            Ok(was_removed) => {
+                if was_removed {
                     QdrantClient::clear_stub_marker_files(qdrant_data_dir, &name);
                     removed += 1;
                 }
-                Err(error) => {
-                    warn!(
-                        collection = %name,
-                        %error,
-                        "failed to prune stale Qdrant collection dir; continuing bootstrap repair"
-                    );
-                    repair_errors.push(format!(
-                        "remove stale qdrant collection dir {name}: {error}"
-                    ));
-                }
+            }
+            Err(error) => {
+                warn!(
+                    collection = %name,
+                    %error,
+                    "failed to prune stale Qdrant collection dir; continuing bootstrap repair"
+                );
+                repair_errors.push(format!(
+                    "remove stale qdrant collection dir {name}: {error}"
+                ));
             }
         }
     }

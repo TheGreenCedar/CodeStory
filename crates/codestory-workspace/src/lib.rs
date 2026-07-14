@@ -25,6 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub mod atomic_file;
+pub mod owned_deletion;
 mod repository_identity;
 pub use repository_identity::{
     PROJECT_IDENTITY_SCHEMA_VERSION, PROJECT_IDENTITY_V3_SCHEMA_VERSION, ProjectIdentityV2,

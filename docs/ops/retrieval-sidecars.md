@@ -522,6 +522,10 @@ Before Compose starts, bootstrap may repair Qdrant storage:
    diagnostics.
 
 Non-`codestory_*` collection dirs are never deleted by this repair path.
+Deletion is resolved below an already open Qdrant data-directory handle. Each
+relative component is opened without following links or reparse points, and
+recursive removal remains handle-relative, so replacing an ambient ancestor
+cannot redirect retention into another directory tree.
 
 ### Query and embedding contracts
 

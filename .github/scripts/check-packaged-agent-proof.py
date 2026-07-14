@@ -130,6 +130,44 @@ def remove_tree_with_retry(path: Path, timeout_secs: float = 10.0, platform: str
             time.sleep(0.2)
 
 
+def remove_owned_tree_with_retry(
+    cli: Path,
+    root: Path,
+    relative: Path,
+    timeout_secs: float = 10.0,
+    platform: str = os.name,
+) -> None:
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError(f"owned cleanup requires a plain relative path: {relative}")
+    command = [
+        str(cli),
+        "internal-owned-delete",
+        "--root",
+        str(root),
+        "--relative",
+        str(relative),
+    ]
+    deadline = time.monotonic() + timeout_secs
+    while True:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        if platform != "nt" or time.monotonic() >= deadline:
+            detail = result.stderr.strip() or result.stdout.strip() or "no command output"
+            raise RuntimeError(f"owned cleanup exited {result.returncode}: {detail}")
+        time.sleep(0.2)
+
+
 @contextlib.contextmanager
 def temporary_directory_with_retry(prefix: str, directory: Path):
     path = Path(tempfile.mkdtemp(prefix=prefix, dir=directory))
@@ -1083,8 +1121,12 @@ def cleanup_proof_cache(
     *,
     registered_sidecars: list[dict] | None = None,
     direct_only: bool = False,
+    owned_delete: Callable[[Path, Path], None] | None = None,
 ) -> None:
-    del cli
+    if owned_delete is None:
+        if cli is None:
+            raise RuntimeError("proof cache cleanup requires the packaged CLI owned-deletion boundary")
+        owned_delete = lambda root, relative: remove_owned_tree_with_retry(cli, root, relative)
     env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
     results = []
     errors = []
@@ -1211,8 +1253,8 @@ def cleanup_proof_cache(
             + "; ".join(errors)
         )
     try:
-        remove_tree_with_retry(cache_root)
-    except OSError as exc:
+        owned_delete(canonical_cache.parent, Path(canonical_cache.name))
+    except (OSError, RuntimeError, ValueError) as exc:
         write_json(
             artifact,
             {"cache_root": str(cache_root), "commands": results, "removed": False, "error": str(exc)},
@@ -1728,6 +1770,18 @@ def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     if out_dir.is_relative_to(root):
         raise RuntimeError("proof cleanup artifacts must be outside the removable proof root")
+    owned_delete = getattr(args, "owned_delete", None)
+    cleanup_cli = None
+    if owned_delete is None:
+        cleanup_cli_dir = out_dir / "owned-delete-cli"
+        if cleanup_cli_dir.exists():
+            remove_tree_with_retry(cleanup_cli_dir)
+        cleanup_cli_dir.mkdir()
+        unpack_archive(owned_archive, cleanup_cli_dir)
+        cleanup_cli = find_cli(cleanup_cli_dir)
+        owned_delete = lambda boundary, relative: remove_owned_tree_with_retry(
+            cleanup_cli, boundary, relative
+        )
     project_value = ownership.get("project")
     project = (
         Path(project_value).resolve(strict=False)
@@ -1824,14 +1878,18 @@ def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
         artifact = out_dir / f"registered-cache-cleanup-{index}.json"
         try:
             preserve_native_embedding_evidence(cache, out_dir, f"registered-cache-{index}")
+            owned_relative = canonical.relative_to(root.parent)
             cleanup_proof_cache(
-                None,
+                cleanup_cli,
                 project,
                 cache,
                 artifact,
                 run=cleanup_run,
                 registered_sidecars=registered_sidecars,
                 direct_only=True,
+                owned_delete=lambda _cache_parent, _relative: owned_delete(
+                    root.parent, owned_relative
+                ),
             )
             results["cache_cleanup"].append({"cache_root": str(cache), "status": "removed"})
         except Exception as exc:
@@ -1849,7 +1907,7 @@ def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
             {"kind": "ports", "error": f"proof-owned ports remained reachable: {remaining_ports}"}
         )
     if not results["errors"]:
-        remove_tree_with_retry(root)
+        owned_delete(root.parent, Path(root.name))
         results["root_removed"] = not root.exists()
     else:
         results["root_removed"] = False
@@ -3873,6 +3931,9 @@ def self_test() -> None:
         runner_temp = os.environ.get("RUNNER_TEMP", "").strip()
         proof_root_parent = Path(runner_temp).resolve(strict=True) if runner_temp else root
 
+        def fake_owned_delete(boundary: Path, relative: Path) -> None:
+            remove_tree_with_retry(boundary / relative)
+
         assert docker_created_epoch_ms(
             "2026-07-13T14:08:36.245344828Z"
         ) == docker_created_epoch_ms("2026-07-13T14:08:36.245344Z")
@@ -4085,6 +4146,7 @@ def self_test() -> None:
             cleanup_artifact,
             fake_docker,
             registered_sidecars=[identity],
+            owned_delete=fake_owned_delete,
         )
         assert not compose_cache.exists()
         assert [command[1] for command in compose_calls if "rm" in command] == [
@@ -4098,7 +4160,11 @@ def self_test() -> None:
             write_json(global_cache / state_file_name, {"owner": "codestory"})
             try:
                 cleanup_proof_cache(
-                    None, root, global_cache, root / "global-local-cleanup.json"
+                    None,
+                    root,
+                    global_cache,
+                    root / "global-local-cleanup.json",
+                    owned_delete=fake_owned_delete,
                 )
             except RuntimeError as exc:
                 assert "global local-sidecar namespace" in str(exc)
@@ -4141,6 +4207,7 @@ def self_test() -> None:
                 project=str(project),
                 out_dir=str(cleanup_out),
                 cleanup_proof_temp_root=str(registered_root),
+                owned_delete=fake_owned_delete,
             )
         )
         assert not registered_root.exists()

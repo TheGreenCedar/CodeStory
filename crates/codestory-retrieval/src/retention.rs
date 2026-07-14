@@ -4,6 +4,7 @@ use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
 use crate::qdrant_client::{QdrantClient, QdrantDeleteOutcome};
 use anyhow::{Context, Result, bail};
 use codestory_store::{RetrievalIndexManifest, Store};
+use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -521,46 +522,64 @@ pub trait GenerationRemover {
 
 pub struct FsQdrantGenerationRemover {
     qdrant: QdrantClient,
+    root: PathBuf,
+    deletion: OwnedDeletionRoot,
     collections_dir: PathBuf,
 }
 
 impl FsQdrantGenerationRemover {
-    pub fn new(layout: &SidecarLayout) -> Self {
-        Self {
-            qdrant: QdrantClient::new(layout),
-            collections_dir: layout.qdrant_data_dir.join("collections"),
+    pub fn new(layout: &SidecarLayout) -> Result<Self> {
+        let root = layout
+            .lexical_data_dir
+            .parent()
+            .context("lexical data directory has no sidecar root")?;
+        if layout.qdrant_data_dir.parent() != Some(root)
+            || layout.scip_artifacts_root.parent() != Some(root)
+        {
+            bail!("retrieval generation roots do not share one owned sidecar root");
         }
+        let deletion = OwnedDeletionRoot::open(root)
+            .with_context(|| format!("open owned sidecar root {}", root.display()))?;
+        Ok(Self {
+            qdrant: QdrantClient::new(layout),
+            root: root.to_path_buf(),
+            deletion,
+            collections_dir: layout.qdrant_data_dir.join("collections"),
+        })
+    }
+
+    fn remove_owned_path(&self, path: &Path) -> Result<bool> {
+        let relative = path.strip_prefix(&self.root).with_context(|| {
+            format!(
+                "generation path {} is outside owned sidecar root {}",
+                path.display(),
+                self.root.display()
+            )
+        })?;
+        self.deletion
+            .remove(relative)
+            .with_context(|| format!("remove owned generation path {}", path.display()))
     }
 }
 
 impl GenerationRemover for FsQdrantGenerationRemover {
     fn remove_generation_dir(&mut self, path: &Path) -> Result<()> {
-        let metadata = std::fs::symlink_metadata(path)
-            .with_context(|| format!("inspect generation directory {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if self.remove_owned_path(path)? {
+            Ok(())
+        } else {
             bail!(
-                "refuse to remove non-direct generation directory {}",
+                "generation directory disappeared before removal: {}",
                 path.display()
-            );
+            )
         }
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove generation directory {}", path.display()))
     }
 
     fn delete_qdrant_collection(&mut self, collection: &str) -> Result<bool> {
         let outcome = self.qdrant.delete_collection_with_outcome(collection)?;
         let path = self.collections_dir.join(collection);
-        if outcome == QdrantDeleteOutcome::NotFound && path.exists() {
-            let metadata = std::fs::symlink_metadata(&path)
-                .with_context(|| format!("inspect orphan Qdrant collection {}", path.display()))?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                bail!(
-                    "refuse to remove non-direct orphan Qdrant collection {}",
-                    path.display()
-                );
-            }
-            std::fs::remove_dir_all(&path)
-                .with_context(|| format!("remove orphan Qdrant collection {}", path.display()))?;
+        if outcome == QdrantDeleteOutcome::NotFound {
+            self.remove_owned_path(&path)?;
+            return Ok(true);
         }
         Ok(!path.exists())
     }

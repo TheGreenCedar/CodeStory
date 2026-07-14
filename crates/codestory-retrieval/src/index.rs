@@ -917,7 +917,7 @@ fn persist_finalized_manifest(
     )?;
 
     let (generation_retention_plan, generation_retention) =
-        retain_published_generations(storage_path, retention_context, &project_id, &manifest);
+        retain_published_generations(storage_path, retention_context, &project_id, &manifest)?;
 
     info!(
         project_id = %project_id,
@@ -1254,7 +1254,7 @@ fn retain_published_generations(
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
     active: &RetrievalIndexManifest,
-) -> (GenerationRetentionPlan, GenerationRetentionApplyReport) {
+) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
     let now = Utc::now().timestamp_millis();
     let mut errors = Vec::new();
     let existing_marker =
@@ -1339,9 +1339,9 @@ fn retain_published_generations(
         &protection,
         &live_qdrant_collections,
     );
-    let mut remover = FsQdrantGenerationRemover::new(context.layout);
+    let mut remover = FsQdrantGenerationRemover::new(context.layout)?;
     let apply = apply_generation_retention(&plan, &mut remover);
-    (plan, apply)
+    Ok((plan, apply))
 }
 
 #[cfg(test)]

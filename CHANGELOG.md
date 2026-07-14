@@ -81,6 +81,10 @@
   byte protocols, preserves valid UTF-8 pathname whitespace, and returns
   `unsupported_non_utf8_path` instead of lossy DTO text. Workspace-relative
   path stripping now follows native filesystem identity and case rules.
+- Generation and packaged-proof deletion now stays relative to one pinned,
+  trusted directory handle. Unix cleanup uses no-follow descriptor traversal;
+  Windows rejects reparse traversal and deletes through the opened handle, so
+  an ancestor rename cannot redirect cleanup outside CodeStory-owned storage.
 - Managed installation and upgrade checks cover every shipped native platform,
   including upgrade from a verified older CLI with that version retained as the
   rollback. The Codex worktree setup dispatcher now owns one version-checked,

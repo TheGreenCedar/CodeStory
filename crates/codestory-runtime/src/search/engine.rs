@@ -3,6 +3,7 @@ use crate::symbol_query::RetrievalFileRole;
 use crate::symbol_query::query_mentions_non_primary_source;
 use anyhow::{Context, Result, anyhow, bail};
 use codestory_contracts::graph::NodeId;
+use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use fs4::fs_std::FileExt;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
@@ -1525,16 +1526,28 @@ fn symbol_candidate_rank(query: &str, name: &Utf32String, score: u32) -> SymbolC
 }
 
 fn recreate_search_storage_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        if path.is_dir() {
-            std::fs::remove_dir_all(path)
-                .with_context(|| format!("Failed to clear search index dir {}", path.display()))?;
-        } else {
-            std::fs::remove_file(path).with_context(|| {
-                format!("Failed to clear search index artifact {}", path.display())
-            })?;
-        }
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create search index parent directory {}",
+            parent.display()
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        anyhow!(
+            "Search index path has no owned relative name: {}",
+            path.display()
+        )
+    })?;
+    let deletion = OwnedDeletionRoot::open(parent).with_context(|| {
+        format!(
+            "Failed to open search index deletion root {}",
+            parent.display()
+        )
+    })?;
+    deletion
+        .remove(Path::new(name))
+        .with_context(|| format!("Failed to clear search index artifact {}", path.display()))?;
     std::fs::create_dir_all(path)
         .with_context(|| format!("Failed to create search index dir {}", path.display()))?;
     Ok(())

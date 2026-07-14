@@ -437,7 +437,7 @@ fn apply_generation_retention_for_storage(
         &project_id,
         GenerationRetentionState::Reclaimable,
     );
-    let mut remover = FsQdrantGenerationRemover::new(&runtime.layout);
+    let mut remover = FsQdrantGenerationRemover::new(&runtime.layout)?;
     Ok(apply_generation_retention(&plan, &mut remover))
 }
 

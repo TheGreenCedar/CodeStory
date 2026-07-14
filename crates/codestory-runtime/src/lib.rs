@@ -49,6 +49,7 @@ use codestory_store::{
     LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
     SymbolSummaryRecord,
 };
+use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use codestory_workspace::{
     RefreshExecutionPlan, RefreshInputs, WorkspaceInventoryOutcome, WorkspaceManifest,
 };
@@ -4378,7 +4379,11 @@ fn inspect_search_generation(path: &Path) -> Result<Option<bool>, ApiError> {
     Ok(Some(valid))
 }
 
-fn try_remove_search_generation(path: &Path) -> Result<bool, ApiError> {
+fn try_remove_search_generation(
+    deletion: &OwnedDeletionRoot,
+    relative: &Path,
+    path: &Path,
+) -> Result<bool, ApiError> {
     let lock_path = crate::search::engine::persisted_search_index_lock_path(path);
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -4400,21 +4405,15 @@ fn try_remove_search_generation(path: &Path) -> Result<bool, ApiError> {
     })? {
         return Ok(false);
     }
-    let removal = if path.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else if path.exists() {
-        std::fs::remove_file(path)
-    } else {
-        Ok(())
-    };
+    let removal = deletion.remove(relative);
     let _ = FileExt::unlock(&lock);
-    removal.map_err(|error| {
+    let removed = removal.map_err(|error| {
         ApiError::internal(format!(
             "Failed to remove persisted search generation {}: {error}",
             path.display()
         ))
     })?;
-    Ok(true)
+    Ok(removed)
 }
 
 fn prune_search_generations(
@@ -4425,6 +4424,19 @@ fn prune_search_generations(
     if !root.is_dir() {
         return Ok(());
     }
+    let parent = root.parent().unwrap_or_else(|| Path::new("."));
+    let deletion = OwnedDeletionRoot::open(parent).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to open persisted search generation deletion root {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let relative_root = root.file_name().ok_or_else(|| {
+        ApiError::internal(format!(
+            "Persisted search generation root has no owned relative name: {}",
+            root.display()
+        ))
+    })?;
     let mut generations = std::fs::read_dir(&root)
         .map_err(|error| {
             ApiError::internal(format!(
@@ -4460,7 +4472,8 @@ fn prune_search_generations(
         match inspection {
             Some(true) if !rollback_retained => rollback_retained = true,
             Some(_) => {
-                let _ = try_remove_search_generation(&path)?;
+                let relative = Path::new(relative_root).join(&name);
+                let _ = try_remove_search_generation(&deletion, &relative, &path)?;
             }
             None => {
                 tracing::debug!(
@@ -4484,7 +4497,16 @@ fn discard_unpublished_search_generation(
         return;
     }
     if let Ok(path) = search_index_path_for_publication(storage_path, Some(publication)) {
-        let _ = try_remove_search_generation(&path);
+        let root = search_index_generation_root(storage_path);
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        if let (Ok(deletion), Some(relative_root), Some(generation_name)) = (
+            OwnedDeletionRoot::open(parent),
+            root.file_name(),
+            path.file_name(),
+        ) {
+            let relative = Path::new(relative_root).join(generation_name);
+            let _ = try_remove_search_generation(&deletion, &relative, &path);
+        }
     }
 }
 

@@ -82,12 +82,13 @@ use args::{
     DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
     DrillSummarySourceTruthTargetOutput, DrillSummaryStatsOutput, DrillSummaryVerdictOutput,
     FilesCommand, FixCommand, FixOutput, GenerateCompletionsCommand, GroundCommand, IndexCommand,
-    IndexDryRunOutput, IndexOutput, PacketCommand, ProjectArgs, QueryCommand, QueryOutput,
-    QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput, ReadyCommand, ReadyOutput,
-    RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput, ServeCommand, SidecarAction,
-    SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand, SnippetJsonOutput, SymbolCommand,
-    SymbolJsonOutput, SymbolWorkflowCommand, TaskAction, TaskBriefCommand, TaskCommand,
-    TrailCommand, TrailJsonOutput, VerificationTargetOutput, build_trail_request,
+    IndexDryRunOutput, IndexOutput, InternalOwnedDeleteCommand, PacketCommand, ProjectArgs,
+    QueryCommand, QueryOutput, QueryResolutionOutput, QuerySelectorOutput, ReadinessLaneOutput,
+    ReadyCommand, ReadyOutput, RepoTextMode, SearchCommand, SearchHitOutput, SearchOutput,
+    ServeCommand, SidecarAction, SidecarCommand, SmokeCommand, SmokeProfile, SnippetCommand,
+    SnippetJsonOutput, SymbolCommand, SymbolJsonOutput, SymbolWorkflowCommand, TaskAction,
+    TaskBriefCommand, TaskCommand, TrailCommand, TrailJsonOutput, VerificationTargetOutput,
+    build_trail_request,
 };
 #[cfg(test)]
 use explore::{ExploreTuiAction, ExploreTuiState, explore_tui_action};
@@ -258,7 +259,21 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::GenerateCompletions(cmd) => run_generate_completions(cmd),
         Command::Retrieval(cmd) => retrieval::run_retrieval(cmd),
         Command::Sidecar(cmd) => run_sidecar(cmd),
+        Command::InternalOwnedDelete(cmd) => run_internal_owned_delete(cmd),
     }
+}
+
+fn run_internal_owned_delete(cmd: InternalOwnedDeleteCommand) -> Result<()> {
+    let deletion = codestory_workspace::owned_deletion::OwnedDeletionRoot::open(&cmd.root)
+        .with_context(|| format!("open owned deletion root {}", cmd.root.display()))?;
+    deletion.remove(&cmd.relative).with_context(|| {
+        format!(
+            "remove owned relative path {} below {}",
+            cmd.relative.display(),
+            cmd.root.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[derive(Debug)]
