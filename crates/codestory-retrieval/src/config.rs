@@ -125,6 +125,8 @@ pub(crate) struct LlamaSidecarBackend {
     pub provider: String,
     pub launch_mode: String,
     pub artifact: String,
+    #[serde(default)]
+    pub artifact_bytes: u64,
     pub url: String,
     pub sha256: String,
     pub executable_archive_path: String,
@@ -158,6 +160,13 @@ fn parse_test_host_platform(value: &str) -> Option<(String, String)> {
 
 pub(crate) fn selected_llama_sidecar_backend(provider: &str) -> Option<LlamaSidecarBackend> {
     llama_sidecar_backends(provider).into_iter().next()
+}
+
+pub(crate) fn llama_sidecar_backend_by_id(id: &str) -> Option<LlamaSidecarBackend> {
+    llama_sidecar_backend_manifest()
+        .backends
+        .into_iter()
+        .find(|backend| backend.id == id)
 }
 
 pub(crate) fn llama_sidecar_backends(provider: &str) -> Vec<LlamaSidecarBackend> {

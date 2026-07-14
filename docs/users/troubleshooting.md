@@ -157,7 +157,9 @@ Command table: [CLI reference - readiness and repair](cli-reference.md#readiness
 
 Apple Silicon uses managed Metal acceleration automatically. Retry the original
 broad-search tool while CodeStory reports `preparing`; local navigation remains
-available in the meantime.
+available in the meantime. The first broad search can take longer while
+CodeStory prepares its local search support once for the Mac; later repositories
+reuse it automatically.
 
 Intel Macs support local navigation by default. When broad search cannot use a
 supported local or trusted external backend, the tool returns `unavailable` and

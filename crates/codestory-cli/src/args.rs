@@ -740,6 +740,8 @@ pub(crate) struct RetrievalCommand {
 pub(crate) enum RetrievalAction {
     /// Start Docker Compose sidecars (when available), prepare cache dirs, and wait for health.
     Bootstrap(RetrievalBootstrapCommand),
+    #[command(name = "prewarm-assets", hide = true)]
+    PrewarmAssets(RetrievalPrewarmAssetsCommand),
     /// Prepare local sidecar data directories and write sidecar state (does not start Docker).
     Up(RetrievalSidecarStateCommand),
     /// Remove local sidecar state file (does not stop external processes).
@@ -752,6 +754,20 @@ pub(crate) enum RetrievalAction {
     Index(RetrievalIndexCommand),
     /// Execute a standalone sidecar retrieval query against indexed sidecar metadata.
     Query(RetrievalQueryCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RetrievalPrewarmAssetsCommand {
+    #[arg(long, help = "Prewarm the pinned machine-wide embedding model.")]
+    pub(crate) model: bool,
+    #[arg(long, help = "Prewarm the managed native llama-server for this host.")]
+    pub(crate) native_backend: bool,
+    #[arg(
+        long,
+        value_name = "ID",
+        help = "Select a specific managed native llama-server backend."
+    )]
+    pub(crate) llama_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

@@ -116,15 +116,15 @@ Attach these artifacts to issues or PRs that claim readiness repair:
 - Docker Desktop or Docker Engine for automated Qdrant and llama.cpp
   sidecars. On Apple Silicon the managed embedding server is native Metal, but
   Qdrant still requires Docker. Confirm the Docker daemon is running.
-- Node.js 18+ is also required by `scripts/setup-retrieval-env.mjs` to fetch or
-  verify the pinned GGUF and native `llama-server` payload.
+- Node.js 18+ is required only for the contributor setup wrapper. The CLI
+  downloads and verifies missing managed assets during normal preparation.
 - For manual Local profile only, the default localhost ports are Qdrant HTTP
   `6333`, Qdrant gRPC `6334`, and llama.cpp embeddings `8080`; lexical search
   has no service port.
   Managed Agent profiles allocate or reuse namespace-specific ports; read them
   from status rather than assuming the Local defaults.
-- GGUF embedding model available through `CODESTORY_EMBED_MODEL_DIR`, or fetched
-  with the setup wrapper.
+- `CODESTORY_EMBED_MODEL_DIR` is an explicit developer override. Without it,
+  CodeStory uses the pinned machine-wide model cache.
 
 Manual sidecar setup is allowed only when equivalent local Qdrant and
 llama.cpp services are already healthy. Agent-facing retrieval is invalid until
@@ -154,9 +154,10 @@ accelerated llama.cpp backend. On macOS arm64, bootstrap/repair installs and
 launches the managed native Metal `llama-server` with
 `launch_mode=native_spawned`; a Linux Docker/Colima embed service cannot satisfy
 a `vulkan:Vulkan0` request on Apple Silicon. Use
-`node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only` only to
-prewarm the managed Metal cache cell. Set `CODESTORY_EMBED_NATIVE_LLAMA_SERVER`
-only when overriding the managed binary with an absolute path.
+`node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-llama-server
+--fetch-only` only to prewarm the same machine cache. Set
+`CODESTORY_EMBED_NATIVE_LLAMA_SERVER` only when overriding the managed binary
+with an absolute path.
 
 On macOS x64, the CLI, managed plugin, local index, and grounding are supported,
 but there is no managed Metal cell. Packet/search requires an explicit degraded
@@ -213,10 +214,14 @@ opens. Prefer trusted user config, explicit CLI flags, or environment variables.
 From the CodeStory repository root:
 
 ```sh
-node scripts/setup-retrieval-env.mjs --fetch-embed-model
-# macOS arm64 Metal native sidecar only:
-node scripts/setup-retrieval-env.mjs --fetch-llama-server --fetch-only
 cargo run --locked -p codestory-cli -- retrieval bootstrap --project <repo> --format json
+```
+
+Bootstrap obtains missing pinned assets automatically. Contributors who need to
+prewarm a machine before going offline can run:
+
+```sh
+node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-llama-server --fetch-only
 ```
 
 Use the environment variables from the minimum table only when the defaults do
@@ -400,15 +405,18 @@ Cache-root and profile layout:
 | Local profile | `<cache>/{lexical,qdrant,scip,retrieval-sidecars-v3.json}` in namespace `codestory-v3`, with configurable Qdrant/embed ports |
 | Managed Agent profile | `<cache>/sidecars/codestory-agent-v3-<workspace>-<run>/{lexical,qdrant,scip,retrieval-sidecars-v3.json}` with dynamic or persisted Qdrant/embed ports |
 | Agent port registry | Authoritative `<cache>/sidecars/port-allocations.sqlite3`; v0.15 also imports/projects locked legacy JSON records for compatibility |
+| Managed model | `<cache>/managed-embeddings/models/sha256/<digest>/bge-base-en-v1.5.Q8_0.gguf` |
+| Managed backend archives | `<cache>/managed-embeddings/blobs/sha256/<digest>/...` before verified native payload publication |
 
 Unversioned `retrieval-sidecars.json` files and pre-v3 Agent namespaces remain
 visible to inventory, but current runtimes never select, overwrite, or clean
 them automatically.
 
-Downloaded model artifacts under `CODESTORY_EMBED_MODEL_DIR` or
-`target/retrieval-models` are accepted only after pinned size and SHA-256
-verification by the setup wrapper. Remove that model directory to uninstall the
-downloaded GGUF.
+Managed assets use one machine lock, exact byte limits, SHA-256 verification,
+and atomic publication. Invalid canonical files and interrupted partials are
+renamed inside their asset directory for diagnosis instead of becoming active.
+Project-local models are considered only when `CODESTORY_EMBED_MODEL_DIR`
+explicitly selects them.
 
 ## Operator troubleshooting
 

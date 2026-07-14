@@ -22,6 +22,7 @@ mod index;
 mod inventory;
 mod lexical_client;
 mod lexical_index;
+mod managed_assets;
 mod mode;
 pub mod outbound_http;
 mod planner;
@@ -47,13 +48,14 @@ pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
 pub use compose::{
     BootstrapReport, BootstrapSidecarsOptions, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory,
-    NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL, NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON,
-    NativeEmbeddingStartupCleanupFailure, bootstrap_sidecars, bootstrap_sidecars_with_profile,
-    bootstrap_sidecars_with_runtime, bootstrap_sidecars_with_runtime_progress,
+    ManagedAssetPrewarmReport, NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL,
+    NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON, NativeEmbeddingStartupCleanupFailure,
+    bootstrap_sidecars, bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime,
+    bootstrap_sidecars_with_runtime_progress,
     bootstrap_sidecars_with_runtime_progress_and_native_launch_observer, docker_available,
     embed_model_inventory, expected_native_embedding_launch_metadata,
     native_embedding_launch_contract_from_paths, native_embedding_launch_matches_runtime_for_reuse,
-    native_embedding_startup_cleanup_failure, resolve_compose_file,
+    native_embedding_startup_cleanup_failure, prewarm_managed_assets, resolve_compose_file,
 };
 pub use config::{
     DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,

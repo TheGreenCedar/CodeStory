@@ -11,8 +11,9 @@ use codestory_retrieval::{
 
 use crate::args::{
     CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalBootstrapCommand,
-    RetrievalCommand, RetrievalIndexCommand, RetrievalInventoryCommand, RetrievalQueryCommand,
-    RetrievalSidecarStateCommand, RetrievalStatusCommand,
+    RetrievalCommand, RetrievalIndexCommand, RetrievalInventoryCommand,
+    RetrievalPrewarmAssetsCommand, RetrievalQueryCommand, RetrievalSidecarStateCommand,
+    RetrievalStatusCommand,
 };
 use crate::output::{emit, validate_output_file_parent};
 use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error, resolve_refresh_request};
@@ -20,6 +21,7 @@ use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error, resolve_
 pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
     match cmd.action {
         RetrievalAction::Bootstrap(bootstrap_cmd) => run_retrieval_bootstrap(bootstrap_cmd),
+        RetrievalAction::PrewarmAssets(prewarm_cmd) => run_retrieval_prewarm_assets(prewarm_cmd),
         RetrievalAction::Up(up_cmd) => run_retrieval_up(up_cmd),
         RetrievalAction::Down(down_cmd) => run_retrieval_down(down_cmd),
         RetrievalAction::Status(status_cmd) => run_retrieval_status(status_cmd),
@@ -27,6 +29,16 @@ pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
         RetrievalAction::Index(index_cmd) => run_retrieval_index(index_cmd),
         RetrievalAction::Query(query_cmd) => run_retrieval_query(query_cmd),
     }
+}
+
+fn run_retrieval_prewarm_assets(cmd: RetrievalPrewarmAssetsCommand) -> Result<()> {
+    let report = codestory_retrieval::prewarm_managed_assets(
+        cmd.model,
+        cmd.native_backend,
+        cmd.llama_backend.as_deref(),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
