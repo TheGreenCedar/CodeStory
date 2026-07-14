@@ -100,7 +100,7 @@ jobs:
           --version-only
           --out-dir "target/post-publish-version-proof/${{ matrix.asset_target }}"
 
-      - name: Prove published macOS signature, notarization, and Gatekeeper acceptance
+      - name: Prove published macOS signature, notarization, and quarantined execution
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -134,19 +134,16 @@ jobs:
           # quarantine event to the extracted executable before assessment.
           xattr -w com.apple.quarantine "$quarantine" "$bin"
           xattr -p com.apple.quarantine "$bin" > "$proof_dir/extracted-binary-quarantine.txt"
-          accepted=false
-          for _attempt in $(seq 1 12); do
-            if spctl --assess --type execute --verbose=4 "$bin" > "$proof_dir/spctl.txt" 2>&1; then
-              accepted=true
-              break
-            fi
-            sleep 5
-          done
-          if [ "$accepted" != true ]; then
-            cat "$proof_dir/spctl.txt"
-            exit 1
+          set +e
+          spctl --assess --type execute --verbose=4 "$bin" > "$proof_dir/spctl-diagnostic.txt" 2>&1
+          spctl_status=$?
+          set -e
+          printf '%s\n' "$spctl_status" > "$proof_dir/spctl-status.txt"
+          if [ "$spctl_status" -eq 0 ]; then
+            grep -F "source=Notarized Developer ID" "$proof_dir/spctl-diagnostic.txt"
+          else
+            grep -F "does not seem to be an app" "$proof_dir/spctl-diagnostic.txt"
           fi
-          grep -F "source=Notarized Developer ID" "$proof_dir/spctl.txt"
           "$bin" --version
           "$bin" --help >/dev/null
 

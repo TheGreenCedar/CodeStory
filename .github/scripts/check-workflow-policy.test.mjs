@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   basicWorkflowViolations,
+  macosCliDistributionViolations,
   managedPluginViolations,
   notaryStepViolations,
   packagedPrSigningViolations,
@@ -204,4 +205,29 @@ test("notarization must use explicit polling", () => {
     notaryStepViolations({ run: "xcrun notarytool submit bundle.zip \\\n  --wait" }).join("\n"),
     /poll explicitly/u,
   );
+});
+
+test("bare macOS CLI proof uses quarantine execution instead of app assessment", () => {
+  const assessment = {
+    run: [
+      "xattr -w com.apple.quarantine quarantine codestory-cli",
+      "xattr -p com.apple.quarantine codestory-cli > quarantine.txt",
+      "spctl --assess --type execute --verbose=4 codestory-cli > spctl-diagnostic.txt 2>&1",
+      "spctl_status=$?",
+      "grep -F 'does not seem to be an app' spctl-diagnostic.txt",
+    ].join("\n"),
+  };
+  const execution = { run: "codestory-cli --version\ncodestory-cli --help" };
+  assert.deepEqual(macosCliDistributionViolations(assessment, execution, "codestory-cli"), []);
+
+  for (const mutate of [
+    candidate => { candidate.assessment.run = candidate.assessment.run.replace("xattr -w com.apple.quarantine quarantine codestory-cli", "true"); },
+    candidate => { candidate.assessment.run += "\naccepted=false"; },
+    candidate => { candidate.assessment.run = candidate.assessment.run.replace("spctl_status=$?", "true"); },
+    candidate => { candidate.execution.run = "original-cli --version\noriginal-cli --help"; },
+  ]) {
+    const candidate = { assessment: structuredClone(assessment), execution: structuredClone(execution) };
+    mutate(candidate);
+    assert.notDeepEqual(macosCliDistributionViolations(candidate.assessment, candidate.execution, "codestory-cli"), []);
+  }
 });

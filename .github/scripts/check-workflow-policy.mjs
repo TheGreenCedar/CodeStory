@@ -101,6 +101,23 @@ function requireJob(violations, file, workflow, name) {
 
 export const releaseEvidenceWorkflowRef = "./.github/workflows/release-candidate-evidence.yml";
 
+export function macosCliDistributionViolations(assessmentStep, executionStep, quarantinedPath) {
+  const violations = [];
+  const assessment = executableRunText(String(assessmentStep?.run ?? ""));
+  const execution = executableRunText(String(executionStep?.run ?? ""));
+  const assessmentLines = assessment.split("\n");
+  const executionLines = execution.split("\n");
+  const lineHas = (lines, ...fragments) => lines.some(line => fragments.every(fragment => line.includes(fragment)));
+  add(violations, lineHas(assessmentLines, "xattr -w com.apple.quarantine", quarantinedPath), "macOS CLI proof must quarantine the assessed executable");
+  add(violations, lineHas(assessmentLines, "xattr -p com.apple.quarantine", quarantinedPath), "macOS CLI proof must record the executable quarantine");
+  add(violations, lineHas(assessmentLines, "spctl --assess --type execute --verbose=4", quarantinedPath), "macOS CLI proof must retain the spctl diagnostic for that executable");
+  add(violations, assessment.includes("spctl_status=$?"), "macOS CLI proof must record the spctl diagnostic status");
+  add(violations, assessment.includes("does not seem to be an app"), "macOS CLI proof must recognize the bare-executable spctl result");
+  add(violations, !/(^|\n)\s*accepted=false\s*($|\n)/u.test(assessment), "macOS CLI proof must not require spctl application acceptance");
+  add(violations, lineHas(executionLines, quarantinedPath, "--version") && lineHas(executionLines, quarantinedPath, "--help"), "macOS CLI proof must execute that quarantined binary's version and help");
+  return violations;
+}
+
 export function releaseEvidenceApprovalViolations(callerJobs, calledWorkflow) {
   const violations = [];
   const file = releaseEvidenceWorkflowRef.slice(releaseEvidenceWorkflowRef.lastIndexOf("/") + 1);
@@ -615,6 +632,11 @@ function validatePackagedProof(workflows, violations) {
   ]) {
     add(violations, signingRun.includes(fragment), `${file} signing step must include ${fragment}`);
   }
+  violations.push(...macosCliDistributionViolations(
+    signing,
+    namedStep(job, "Execute quarantined notarized macOS CLI without signing credentials"),
+    '"$work_dir/codestory-cli-quarantined"',
+  ).map(message => `${file} ${message}`));
   requireStepRun(violations, file, job, "Run Windows installer ownership self-test", ["scripts/install-codestory.ps1 -SelfTest"]);
   requireStepRun(violations, file, job, "Prove Linux x64 glibc 2.31 baseline", ["bash .github/scripts/check-linux-glibc-baseline.sh"]);
   violations.push(...managedPluginViolations(
@@ -640,14 +662,15 @@ function validatePostPublish(workflows, violations) {
     job,
     '--archive "${{ steps.asset.outputs.archive }}"',
   ).map(message => `${file} ${message}`));
-  requireStepRun(violations, file, job, "Prove published macOS signature, notarization, and Gatekeeper acceptance", [
+  const macProof = namedStep(job, "Prove published macOS signature, notarization, and quarantined execution");
+  requireStepRun(violations, file, job, "Prove published macOS signature, notarization, and quarantined execution", [
     "archive-quarantine.txt",
     "extracted-binary-quarantine.txt",
     "Authority=Developer ID Application:",
-    "source=Notarized Developer ID",
     "TeamIdentifier=${APPLE_DEVELOPER_TEAM_ID}",
     "certificate leaf",
   ]);
+  violations.push(...macosCliDistributionViolations(macProof, macProof, '"$bin"').map(message => `${file} ${message}`));
   requireStepRun(violations, file, job, "Run Windows installer ownership self-test", ["scripts/install-codestory.ps1 -SelfTest"]);
   requireStepRun(violations, file, job, "Prove published Intel macOS backend policy and explicit CPU/external operation", ["--intel-runtime-policy"]);
   add(violations, !scalarStrings(workflow).some(value => value.includes("sha256sum")), `${file} must use the portable Python checksum gate`);
