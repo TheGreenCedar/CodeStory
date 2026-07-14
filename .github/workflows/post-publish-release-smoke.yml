@@ -18,6 +18,7 @@ permissions:
   contents: read
 
 env:
+  RELEASE_RUST_TOOLCHAIN: "1.95.0"
   APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"
 
 jobs:
@@ -153,6 +154,13 @@ jobs:
         if: matrix.asset_target == 'windows-x64'
         shell: pwsh
         run: pwsh -File scripts/install-codestory.ps1 -SelfTest
+
+      - name: Install pinned Rust for Windows rollback proof
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          rustup toolchain install "${{ env.RELEASE_RUST_TOOLCHAIN }}" --profile minimal
+          rustup default "${{ env.RELEASE_RUST_TOOLCHAIN }}"
 
       - name: Prove managed plugin handoff
         run: >-
