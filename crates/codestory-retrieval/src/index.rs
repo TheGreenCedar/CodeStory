@@ -2445,6 +2445,7 @@ mod tests {
             executable_source: None,
             executable_path: Some("llama-server".into()),
             model_path: Some("bge-base-en-v1.5.gguf".into()),
+            model_sha256: None,
             log_path: Some("llama-server-native.log".into()),
             requested_device: None,
         };

@@ -19,14 +19,14 @@ pub(crate) use machine_lock::try_acquire_machine_resource_lock;
 #[allow(unused_imports)]
 pub(crate) use machine_lock::{
     BrokerMachineResourceBusy, BrokerMachineResourceLock, BrokerMachineResourceLockAttempt,
-    NATIVE_EMBEDDING_RESOURCE, release_machine_resource_lock_for_native_launch,
+    NATIVE_EMBEDDING_RESOURCE,
 };
 #[allow(unused_imports)]
 pub(crate) use native_lease::{
     BrokerNativeEmbeddingResourceLease, NativeEmbeddingLeaseLifecycleParams,
     cleanup_native_embedding_resource_lease_after_transfer_error,
-    native_embedding_launch_from_sidecar_state_file, native_embedding_owner_down_command,
-    reusable_native_embedding_resource_pid_for_snapshot, run_with_native_embedding_lease_lifecycle,
+    native_embedding_owner_down_command, reusable_native_embedding_resource_pid_for_snapshot,
+    run_with_native_embedding_lease_lifecycle, sidecar_down_with_native_embedding_handoff,
     transfer_native_embedding_resource_lease,
 };
 pub(crate) use paths::machine_resource_cache_fingerprint;

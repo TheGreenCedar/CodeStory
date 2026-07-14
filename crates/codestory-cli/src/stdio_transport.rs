@@ -4792,33 +4792,13 @@ fn stdio_native_embedding_resource_hard_busy_with_classifier<'a>(
 }
 
 fn stdio_status_native_embedding_busy_next_calls(
-    busy: &crate::readiness_broker::BrokerResourceSnapshot,
-    project: &serde_json::Value,
+    _busy: &crate::readiness_broker::BrokerResourceSnapshot,
+    _project: &serde_json::Value,
 ) -> serde_json::Value {
-    let owner_workspace = busy.owner_workspace_root.as_deref().unwrap_or("unknown");
-    let owner_project = busy.owner_project_id.as_deref().unwrap_or("unknown");
-    let instruction = crate::readiness_broker::native_embedding_owner_down_command(busy)
-        .map(|command| {
-            format!(
-                "CodeStory could not reuse the full native embedding runtime owned by another operation. Stop the incompatible owner with `{command}`, then retry MCP repair. owner_project={owner_project} owner_workspace={owner_workspace} owner_pid={:?}",
-                busy.owner_pid
-            )
-        })
-        .unwrap_or_else(|| {
-            format!(
-                "CodeStory could not yet reuse the native embedding runtime owned by another operation. Wait for its active repair to finish, then retry MCP repair. owner_project={owner_project} owner_workspace={owner_workspace} owner_pid={:?}",
-                busy.owner_pid
-            )
-        });
     serde_json::json!([
         {
             "method": "host/instruction",
-            "instruction": instruction
-        },
-        {
-            "method": "tools/call",
-            "tool": "status",
-            "arguments": {"project": project}
+            "instruction": "CodeStory is preparing repository search. Retry the original CodeStory request shortly."
         }
     ])
 }
@@ -5712,12 +5692,9 @@ fn stdio_sidecar_repair_machine_busy_result(
     let project = &sidecar_setup["project"];
     serde_json::json!({
         "result": {
-            "status": "native_embedding_runtime_busy",
+            "status": "preparing",
             "mode": "background",
-            "message": "CodeStory native embedding runtime is already owned by another operation.",
-            "owner_pid": busy.owner_pid,
-            "owner_project_id": busy.owner_project_id,
-            "owner_workspace_root": busy.owner_workspace_root,
+            "message": "CodeStory is preparing repository search. Retry the original request shortly.",
             "sidecar_setup": sidecar_setup,
             "recommended_next_calls": stdio_status_native_embedding_busy_next_calls(busy, project)
         }
@@ -6003,16 +5980,13 @@ fn stdio_sidecar_setup_surface(
             "canonical_arguments": {"action": "status"},
         });
     }
-    if let Some(busy) = native_embedding_hard_busy {
+    if let Some(_busy) = native_embedding_hard_busy {
         return serde_json::json!({
             "allowed": true,
             "readiness_goal": "agent_packet_search",
-            "status": "busy",
+            "status": "preparing",
             "failed_layer": "native_embedding_runtime",
-            "summary": "sidecar_setup status is available; repair is blocked because CodeStory native embedding runtime is already owned by another operation.",
-            "owner_pid": busy.owner_pid,
-            "owner_project_id": busy.owner_project_id,
-            "owner_workspace_root": busy.owner_workspace_root,
+            "summary": "CodeStory is preparing repository search.",
             "allowed_actions": ["status"],
             "canonical_arguments": {"action": "status"},
         });
@@ -6061,18 +6035,15 @@ fn stdio_repair_all_surface(
             "full_repair": [],
         });
     }
-    if let Some(busy) = native_embedding_hard_busy {
+    if let Some(_busy) = native_embedding_hard_busy {
         return serde_json::json!({
             "allowed": false,
             "readiness_goal": "agent_packet_search",
-            "status": "busy",
+            "status": "preparing",
             "failed_layer": "native_embedding_runtime",
-            "summary": "CodeStory native embedding runtime is already owned by another operation.",
-            "repair_reason": "native_embedding_runtime_busy",
-            "blocked_reason": "native_embedding_runtime_busy",
-            "owner_pid": busy.owner_pid,
-            "owner_project_id": busy.owner_project_id,
-            "owner_workspace_root": busy.owner_workspace_root,
+            "summary": "CodeStory is preparing repository search.",
+            "repair_reason": "preparing",
+            "blocked_reason": "preparing",
             "minimum_next": [],
             "full_repair": [],
         });
@@ -7320,8 +7291,11 @@ mod tests {
 
         assert!(hard_busy.is_some());
         assert_eq!(calls[0]["method"], json!("host/instruction"));
+        assert_eq!(calls.as_array().map(Vec::len), Some(1));
+        assert!(!calls.to_string().contains("owner_"));
+        assert!(!calls.to_string().contains("pid"));
         assert_eq!(surfaces["sidecar_setup"]["allowed"], json!(true));
-        assert_eq!(surfaces["sidecar_setup"]["status"], json!("busy"));
+        assert_eq!(surfaces["sidecar_setup"]["status"], json!("preparing"));
         assert_eq!(
             surfaces["sidecar_setup"]["allowed_actions"],
             json!(["status"])
@@ -7330,11 +7304,10 @@ mod tests {
             surfaces["sidecar_setup"]["canonical_arguments"]["action"],
             json!("status")
         );
-        assert_eq!(surfaces["repair_all"]["status"], json!("busy"));
-        assert_eq!(
-            surfaces["repair_all"]["repair_reason"],
-            json!("native_embedding_runtime_busy")
-        );
+        assert_eq!(surfaces["repair_all"]["status"], json!("preparing"));
+        assert_eq!(surfaces["repair_all"]["repair_reason"], json!("preparing"));
+        assert!(!surfaces.to_string().contains("owner_"));
+        assert!(!surfaces.to_string().contains("pid"));
     }
 
     #[test]

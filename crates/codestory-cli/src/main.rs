@@ -9467,6 +9467,7 @@ mod tests {
                 executable_source: Some("managed".into()),
                 executable_path: Some("C:/cache/llama-server.exe".into()),
                 model_path: Some("C:/cache/model.gguf".into()),
+                model_sha256: None,
                 log_path: Some("C:/cache/llama-server-native.log".into()),
                 requested_device: Some("Vulkan0".into()),
             }),

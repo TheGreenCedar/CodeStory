@@ -195,6 +195,7 @@ fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval
             executable_source: Some("test".to_string()),
             executable_path: Some("C:/cache/llama-server.exe".to_string()),
             model_path: Some("C:/cache/bge-base-en-v1.5.Q8_0.gguf".to_string()),
+            model_sha256: None,
             log_path: Some("C:/cache/llama-server-native.log".to_string()),
             requested_device: Some("Vulkan0".to_string()),
         }),
@@ -566,14 +567,50 @@ fn native_embedding_busy_lock_reuses_matching_cross_project_owner() {
         codestory_retrieval::SidecarProfile::Local,
         None,
     );
-    let requested_sidecar = test_sidecar_runtime(
+    let mut requested_sidecar = test_sidecar_runtime(
         requested_project.path(),
         codestory_retrieval::SidecarProfile::Agent,
         Some("shared-agent"),
     );
+    requested_sidecar
+        .use_broker_verified_native_embedding_endpoint(owner_sidecar.ownership().ports.embed_http)
+        .expect("select owner endpoint for borrower");
+    let owner_executable = owner_project.path().join("llama-server");
+    let owner_model = owner_project
+        .path()
+        .join(codestory_retrieval::BGE_BASE_EN_V1_5_GGUF);
+    fs::write(&owner_executable, b"owner executable").expect("owner executable");
+    fs::write(&owner_model, b"owner model").expect("owner model");
+    assert!(
+        !requested_project
+            .path()
+            .join(codestory_retrieval::BGE_BASE_EN_V1_5_GGUF)
+            .exists(),
+        "borrower must not have a model copy"
+    );
     let owner_pid = std::process::id();
     let lock_path = write_machine_lock(&resource, &owner_scope, owner_pid);
-    write_matching_native_sidecar_state(&owner_sidecar, owner_pid);
+    let mut owner_state = matching_native_sidecar_state(&owner_sidecar, owner_pid);
+    let mut owner_launch = codestory_retrieval::native_embedding_launch_contract_from_paths(
+        owner_executable,
+        owner_model,
+        &owner_sidecar,
+    );
+    owner_launch.pid = Some(owner_pid);
+    owner_state.embedding_launch = Some(owner_launch);
+    fs::create_dir_all(
+        owner_sidecar
+            .layout
+            .state_file
+            .parent()
+            .expect("owner state parent"),
+    )
+    .expect("owner state directory");
+    fs::write(
+        &owner_sidecar.layout.state_file,
+        serde_json::to_vec_pretty(&owner_state).expect("serialize owner state"),
+    )
+    .expect("write owner state");
     attach_native_launch_to_machine_lock(&lock_path, &owner_sidecar);
     let mut snapshot = machine_resource_snapshot(&resource);
     snapshot.status = "busy".to_string();
@@ -602,46 +639,11 @@ fn native_embedding_busy_lock_reuses_matching_cross_project_owner() {
                 validator_called.get(),
                 "process identity must be exact before runtime configuration matching"
             );
-            let lexical_log = owner_project.path().join("llama-server-native.log");
-            fs::write(&lexical_log, "native launch proof\n").expect("write native log fixture");
-            let mut lexical_log_launch = launch.clone();
-            lexical_log_launch.log_path = Some(lexical_log.display().to_string());
-            let mut canonical_log_launch = lexical_log_launch.clone();
-            canonical_log_launch.log_path = Some(
-                lexical_log
-                    .canonicalize()
-                    .expect("canonical native log fixture")
-                    .display()
-                    .to_string(),
-            );
-            assert!(same_native_launch_configuration(
-                &canonical_log_launch,
-                &lexical_log_launch,
-                true
-            ));
             assert_eq!(scope.operation_kind, "retrieval_bootstrap");
             assert_eq!(scope.profile, "local");
             assert_ne!(scope.project_id, requested_scope.project_id);
-            assert_ne!(
-                scope.canonical_root_hash,
-                requested_scope.canonical_root_hash
-            );
-            assert_ne!(
-                broker_operation_id(scope),
-                broker_operation_id(&requested_scope)
-            );
-            assert_eq!(
-                retargeted.project_identity,
-                requested_sidecar.project_identity
-            );
-            assert_eq!(
-                retargeted.profile,
-                codestory_retrieval::SidecarProfile::Agent
-            );
-            assert_eq!(retargeted.run_id.as_deref(), Some("shared-agent"));
-            assert_ne!(retargeted.embed_http_port, owner_sidecar.embed_http_port);
             assert_eq!(retargeted.embedding.endpoint, launch.endpoint);
-            Ok(true)
+            reused_launch_matches_owner_and_requested_runtime(scope, retargeted, launch)
         },
     )
     .expect("reuse check");
@@ -812,9 +814,9 @@ fn warm_reused_agent_state_binds_exact_broker_runtime_identity() {
 }
 
 #[test]
-fn borrower_down_leaves_owner_native_process_and_machine_lock_intact() {
+fn borrower_attachment_blocks_owner_down_until_borrower_detaches() {
     let project = tempdir().expect("project");
-    let resource = unique_resource("native-borrower-down");
+    let resource = NATIVE_EMBEDDING_RESOURCE.to_string();
     cleanup_machine_resource(&resource);
     let owner_scope = test_scope(project.path(), "owner-agent");
     let mut owner_runtime = test_sidecar_runtime(
@@ -888,14 +890,16 @@ fn borrower_down_leaves_owner_native_process_and_machine_lock_intact() {
         .expect("write state");
     }
 
-    let borrower_owned_launch = native_embedding_launch_from_sidecar_state_file(&borrower_runtime)
-        .expect("read borrower state");
-    codestory_retrieval::sidecar_down_for_runtime(&borrower_runtime)
-        .expect("borrower down must not stop owner pid");
-    if let Some(launch) = borrower_owned_launch.as_ref() {
-        release_machine_resource_lock_for_native_launch(&resource, launch)
-            .expect("release borrower-owned launch");
-    }
+    let error = sidecar_down_with_native_embedding_handoff(&broker_cache_root(), &owner_runtime)
+        .expect_err("owner down must not stop a launch while a borrower is attached");
+    assert!(
+        error
+            .to_string()
+            .contains("repository search is still in use"),
+        "unexpected owner-down error: {error:#}"
+    );
+    sidecar_down_with_native_embedding_handoff(&broker_cache_root(), &borrower_runtime)
+        .expect("borrower detaches without stopping owner");
 
     assert_eq!(
         std::process::id(),

@@ -11,6 +11,11 @@
 - Cold and stale repositories now present `ground`, `files`, and `affected` as
   direct activation paths. One grounding call builds or refreshes the local map;
   agents no longer get sent through a status loop before repository navigation.
+- CodeStory now reuses a verified managed search runtime across projects and
+  worktrees without requiring a second project-local model copy. Borrower
+  handoff is serialized with owner shutdown, attached projects cannot stop the
+  shared process, and temporary contention is reported as background search
+  preparation without process or workspace details.
 
 ## 0.15.0
 

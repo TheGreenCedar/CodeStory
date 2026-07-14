@@ -2767,6 +2767,7 @@ offloaded 13/13 layers to GPU\n";
             executable_source: Some("test".into()),
             executable_path: Some("/tmp/llama-server".into()),
             model_path: Some("/tmp/model.gguf".into()),
+            model_sha256: None,
             log_path: Some(owner_log.display().to_string()),
             requested_device: Some("Metal0".into()),
         };

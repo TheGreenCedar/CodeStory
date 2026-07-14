@@ -93,6 +93,8 @@ pub struct EmbeddingLaunchMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_device: Option<String>,

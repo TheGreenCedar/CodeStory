@@ -393,23 +393,18 @@ fn replace_machine_resource_lock(temp_path: &Path, path: &Path) -> std::io::Resu
     fs::rename(temp_path, path)
 }
 
-pub(crate) fn release_machine_resource_lock_for_native_launch(
+pub(crate) fn release_machine_resource_lock_for_native_launch_with_guard(
     resource: &str,
     launch: &codestory_retrieval::EmbeddingLaunchMetadata,
+    guard: &BrokerMachineResourceReaperLock,
 ) -> Result<bool> {
-    let Some(pid) = launch.pid else {
+    if !guard.is_current() {
         return Ok(false);
-    };
+    }
     let path = machine_resource_lock_path(resource);
-    let Some(_release_guard) = try_acquire_machine_resource_reaper_lock(resource)? else {
-        return Ok(false);
-    };
     let Some(file_lock) = read_machine_resource_lock_file(&path) else {
         return Ok(false);
     };
-    if file_lock.pid != pid {
-        return Ok(false);
-    }
     if file_lock.native_embedding_launch.as_ref() != Some(launch) {
         return Ok(false);
     }
