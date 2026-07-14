@@ -1229,7 +1229,7 @@ fn embedding_launch_metadata(
         pid: spawn.map(|spawn| spawn.pid),
         spawned_at_epoch_ms: spawn.map(|spawn| spawn.spawned_at_epoch_ms),
         process_start_identity: spawn.and_then(|spawn| {
-            crate::sidecar::native_embedding_process_start_identity(spawn.pid)
+            crate::native_embedding_process_start_identity(spawn.pid)
                 .ok()
                 .flatten()
         }),

@@ -57,8 +57,10 @@
   still match the file. Failed, cancelled, or concurrent refreshes preserve the
   previous usable generation.
 - Native process reuse and cleanup now bind executable filesystem identity,
-  arguments, endpoint, and process start identity. Cleanup remains limited to
-  resources carrying CodeStory ownership proof.
+  arguments, endpoint, and one shared cross-platform process start identity.
+  macOS and Windows process inspection is bounded, dead, reused, or unverified
+  PIDs remain fail-closed, and cleanup stays limited to resources carrying
+  CodeStory ownership proof.
 - Managed installation and upgrade checks cover every shipped native platform,
   including upgrade from a verified older CLI with that version retained as the
   rollback. The Codex worktree setup dispatcher now provides equivalent native
