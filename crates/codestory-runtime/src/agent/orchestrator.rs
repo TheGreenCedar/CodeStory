@@ -69,7 +69,7 @@ use crate::agent::packet_terms::{
     packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
     packet_terms_indicate_form_validation_flow, packet_terms_indicate_hook_cache_flow,
     packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_runtime_formatting_flow,
+    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
     packet_terms_indicate_server_route_dispatch_flow, packet_terms_indicate_sql_schema_flow,
     packet_terms_indicate_stylesheet_animation_flow,
     packet_terms_indicate_url_session_request_flow, prompt_search_terms,
@@ -3719,15 +3719,7 @@ fn execute_retrieval(
         );
     }
 
-    let focus_node_id = req
-        .focus_node_id
-        .clone()
-        .or_else(|| investigation_focus_anchor(prompt, &hits))
-        .or_else(|| {
-            hits.iter()
-                .find(|hit| hit.resolvable)
-                .map(|hit| hit.node_id.clone())
-        });
+    let focus_node_id = investigation_focus_node(req, prompt, &hits);
 
     let filter_step = trace.start_step(
         AgentRetrievalStepKindDto::TrailFilterOptions,
@@ -4098,6 +4090,53 @@ fn investigation_focus_anchor(prompt: &str, hits: &[SearchHit]) -> Option<NodeId
     hits.iter()
         .find(|hit| {
             hit.resolvable && prompt_mentions_display_name(&prompt_terms, &hit.display_name)
+        })
+        .map(|hit| hit.node_id.clone())
+}
+
+fn investigation_focus_node(
+    req: &AgentAskRequest,
+    prompt: &str,
+    hits: &[SearchHit],
+) -> Option<NodeId> {
+    req.focus_node_id
+        .clone()
+        .or_else(|| investigation_focus_anchor(prompt, hits))
+        .or_else(|| compact_search_flow_executable_focus(req, prompt, hits))
+        .or_else(|| {
+            hits.iter()
+                .find(|hit| hit.resolvable)
+                .map(|hit| hit.node_id.clone())
+        })
+}
+
+fn compact_search_flow_executable_focus(
+    req: &AgentAskRequest,
+    prompt: &str,
+    hits: &[SearchHit],
+) -> Option<NodeId> {
+    if !matches!(
+        &req.retrieval_profile,
+        AgentRetrievalProfileSelectionDto::Custom { .. }
+    ) || !packet_terms_indicate_search_execution_flow(&packet_probe_terms(prompt))
+    {
+        return None;
+    }
+    let fallback = hits.iter().find(|hit| hit.resolvable)?;
+    if !matches!(
+        fallback.kind,
+        NodeKind::MODULE | NodeKind::NAMESPACE | NodeKind::PACKAGE
+    ) {
+        return None;
+    }
+    hits.iter()
+        .find(|hit| {
+            hit.resolvable
+                && hit.origin == SearchHitOrigin::IndexedSymbol
+                && matches!(
+                    hit.kind,
+                    NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+                )
         })
         .map(|hit| hit.node_id.clone())
 }
@@ -7284,6 +7323,52 @@ mod tests {
                 &[test_semantic_only_hit("exact_symbol_anchor", 0.90)]
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn compact_flow_focus_prefers_executable_hits_over_generic_modules() {
+        let mut generic_module = test_search_hit("cmp", 0.95);
+        generic_module.kind = NodeKind::MODULE;
+        let executable = test_search_hit("execute_request", 0.60);
+        let hits = [generic_module.clone(), executable];
+        let compact_request = AgentAskRequest {
+            prompt: "Explain how search walks candidate files through the execution flow"
+                .to_string(),
+            retrieval_profile: AgentRetrievalProfileSelectionDto::Custom {
+                config: AgentCustomRetrievalConfigDto::default(),
+            },
+            focus_node_id: None,
+            max_results: None,
+            response_mode: AgentResponseModeDto::Structured,
+            latency_budget_ms: None,
+            include_evidence: true,
+            hybrid_weights: None,
+        };
+
+        assert_eq!(
+            investigation_focus_node(&compact_request, &compact_request.prompt, &hits)
+                .expect("compact search flow should prefer executable evidence")
+                .0,
+            "execute_request"
+        );
+
+        let mut ordinary_request = compact_request.clone();
+        ordinary_request.retrieval_profile = AgentRetrievalProfileSelectionDto::Preset {
+            preset: AgentRetrievalPresetDto::Architecture,
+        };
+        assert_eq!(
+            investigation_focus_node(&ordinary_request, &ordinary_request.prompt, &hits)
+                .expect("ordinary asks retain ranked fallback")
+                .0,
+            "cmp"
+        );
+
+        let explicit = NodeId("explicit".to_string());
+        ordinary_request.focus_node_id = Some(explicit.clone());
+        assert_eq!(
+            investigation_focus_node(&ordinary_request, &ordinary_request.prompt, &hits),
+            Some(explicit)
         );
     }
 

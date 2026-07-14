@@ -646,13 +646,7 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
                 || is_packet_code_like_term(&query.query)
         })
         .collect::<Vec<_>>();
-    ranked.sort_by_key(|(index, query)| {
-        (
-            packet_anchor_probe_priority(query),
-            packet_anchor_probe_flow_hint_priority(&query.query),
-            *index,
-        )
-    });
+    ranked.sort_by_key(|(index, query)| (packet_anchor_probe_priority(query), *index));
     let mut seen = HashSet::<String>::new();
     ranked
         .into_iter()
@@ -680,44 +674,6 @@ fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
     } else {
         3
     }
-}
-
-fn packet_anchor_probe_flow_hint_priority(query: &str) -> u8 {
-    if packet_anchor_probe_is_required_flow_hint(query) {
-        0
-    } else if packet_anchor_probe_has_strong_code_shape(query) {
-        1
-    } else {
-        2
-    }
-}
-
-fn packet_anchor_probe_is_required_flow_hint(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "execruntime"
-            | "execsession"
-            | "execcli"
-            | "jsoneventoutput"
-            | "jsonleventoutput"
-            | "eventoutputprocessor"
-            | "threadstart"
-            | "startthread"
-            | "eventloop"
-            | "eventdispatch"
-            | "networkinput"
-            | "commanddispatch"
-            | "commandhandler"
-            | "requestdispatch"
-            | "routehandler"
-            | "transportsend"
-            | "requestfinalization"
-            | "responsematerialization"
-            | "customvalidation"
-            | "customerrorrendering"
-            | "submitpreventdefault"
-            | "submitinvalidguard"
-    )
 }
 
 fn packet_task_seed_anchor_probe(query: &str) -> bool {
@@ -1135,6 +1091,50 @@ mod tests {
         assert!(queries.contains(&"run".to_string()));
         assert!(queries.contains(&"entrypoint".to_string()));
         assert!(!queries.contains(&"architecture entrypoint".to_string()));
+    }
+
+    #[test]
+    fn compact_flow_anchor_window_prioritizes_roles_over_generated_variants() {
+        let mut queries = vec![PacketPlanQueryDto {
+            query: "Explain the command execution flow".to_string(),
+            purpose: "original task phrasing for sidecar-primary source-backed retrieval"
+                .to_string(),
+        }];
+        for query in [
+            "execution entrypoint",
+            "dispatch boundary",
+            "result rendering",
+        ] {
+            queries.push(PacketPlanQueryDto {
+                query: query.to_string(),
+                purpose: "symbol probe expanded from task wording".to_string(),
+            });
+        }
+        for index in 0..15 {
+            queries.push(PacketPlanQueryDto {
+                query: format!("GeneratedVariant{index}"),
+                purpose: "symbol probe expanded from task wording".to_string(),
+            });
+        }
+        let plan = PacketPlanDto {
+            task_class: PacketTaskClassDto::ArchitectureExplanation,
+            inferred_task_class: false,
+            queries,
+            trace: Vec::new(),
+        };
+
+        let selected = packet_anchor_probe_queries(&plan)
+            .into_iter()
+            .take(packet_anchor_probe_limit(PacketBudgetModeDto::Compact))
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected.len(), 12);
+        assert!(selected.starts_with(&[
+            "execution entrypoint".to_string(),
+            "dispatch boundary".to_string(),
+            "result rendering".to_string(),
+        ]));
+        assert!(!selected.contains(&"GeneratedVariant14".to_string()));
     }
 }
 

@@ -64,6 +64,9 @@
   formats as diagnostic when the same retrieval has resolved graph evidence,
   while keeping unknown source files, unresolved symbols, and invalid paths
   blocking and retaining the first blocker in capped diagnostics.
+- Kept compact search-flow packets focused on executable symbols and preserved
+  planned execution-role probes ahead of generated variants without increasing
+  the packet budget.
 - Migrated sidecar runtime ownership, persisted state, Agent namespaces, and
   generation artifact scopes to project identity schema 3. Legacy schema-2
   state is discovered for inventory but never reused or destructively cleaned;
