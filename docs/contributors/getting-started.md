@@ -194,7 +194,7 @@ After bootstrap, run a target-repo sidecar index before using packet/search:
 ## Delegated Worktree Proof Target
 
 Before a delegated CodeStory lane spends time on cache repair, readiness, or
-sidecar proof, verify the Git target. The tracked Codex environment runs:
+full-retrieval proof, verify the Git target. The tracked Codex environment runs:
 
 ```sh
 node scripts/codex-worktree-setup.mjs
@@ -226,13 +226,23 @@ by itself.
 
 The setup reports stale `main`, stale local `dev/codestory-next`, stale PR
 heads, unresolved refs, and the exact `git ls-remote origin ...` result before
-it runs index, retrieval, or doctor handoff work. It then resolves a
+it prepares the worktree. It then resolves a
 version-matched CLI through `CODESTORY_CLI`, PATH, the CodeStory install
 directory, this worktree, and sibling worktrees; tries the matching release;
 and falls back to a locked release Cargo build with optional `sccache`. It best-effort
-rehydrates a compatible sibling cache, refreshes the local index, and reports
-agent sidecar readiness. Treat Git-target warnings as proof-target blockers,
-not packet/search readiness blockers.
+rehydrates a compatible sibling cache, refreshes the local repository map, and
+reports a compact setup state. The default does not prepare or wait for full
+retrieval, so it works without a model, Docker, or another local service.
+
+Maintainers can opt into the full retrieval preparation lane when that evidence
+is part of the verification target:
+
+```sh
+node scripts/codex-worktree-setup.mjs --full-retrieval-proof
+```
+
+The PowerShell adapter accepts `-FullRetrievalProof`. Treat Git-target warnings
+as proof-target blockers, not broad-search readiness blockers.
 
 Exercise the shared dispatcher behavior and the current platform adapter without
 changing your real workspace state:

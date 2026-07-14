@@ -14,15 +14,14 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
-  agentRepairArguments,
   cliCandidates,
-  doctorSummaryLines,
   findCli,
   parseArguments,
   proofTarget,
   remoteHeadName,
   resolveSccache,
   runSetup,
+  setupSummaryLines,
 } from "../codex-worktree-setup.mjs";
 
 const scriptsDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -75,11 +74,13 @@ test("portable and PowerShell argument spellings share one parser", () => {
       prHeadRef: "origin/topic",
       branchHeadProof: true,
       resolveCliOnly: true,
+      fullRetrievalProof: false,
       selfTest: false,
       help: false,
     },
   );
   assert.equal(parseArguments([], { CODESTORY_BRANCH_HEAD_PROOF: "yes" }).branchHeadProof, true);
+  assert.equal(parseArguments(["-FullRetrievalProof"], {}).fullRetrievalProof, true);
 });
 
 test("only a hexadecimal 40-character ref is detached", () => {
@@ -153,7 +154,7 @@ test("sccache prefers the user Cargo installation", () => {
   assert.equal(resolveSccache({ env: { HOME: home, USERPROFILE: home, PATH: "" } }), expected);
 });
 
-test("shared orchestration rehydrates, indexes, repairs, and reports status in order", () => {
+test("default setup rehydrates, indexes, and reports a local result without full retrieval work", () => {
   const project = createProject();
   const source = temporaryRoot();
   writeFileSync(join(source, "Cargo.toml"), "[workspace]\n");
@@ -187,7 +188,7 @@ test("shared orchestration rehydrates, indexes, repairs, and reports status in o
       return result(1);
     },
   });
-  assert.deepEqual(calls.map(args => args[0]), ["cache", "index", "ready", "doctor"]);
+  assert.deepEqual(calls.map(args => args[0]), ["cache", "index", "doctor"]);
   assert.deepEqual(calls[0], [
     "cache",
     "rehydrate",
@@ -196,8 +197,10 @@ test("shared orchestration rehydrates, indexes, repairs, and reports status in o
     "--project",
     realpathSync(project),
   ]);
-  assert.ok(logs.includes("  agent_packet_search: ready"));
-  assert.ok(logs.includes("  retrieval_mode: full"));
+  assert.ok(logs.includes("CodeStory worktree setup complete"));
+  assert.ok(logs.includes("  cli_version: 0.15.0"));
+  assert.ok(logs.includes("  repository_map: ready"));
+  assert.ok(logs.includes("  background_preparation: ready"));
 });
 
 test("Cargo fallback is locked and still feeds the shared setup path", () => {
@@ -237,35 +240,55 @@ test("Cargo fallback is locked and still feeds the shared setup path", () => {
   assert.deepEqual(cargoArguments, ["build", "--release", "--locked", "-p", "codestory-cli"]);
 });
 
-test("readiness helpers preserve the agent repair and degraded handoff contracts", () => {
-  assert.deepEqual(agentRepairArguments("/repo"), [
+test("maintainer proof flag is the only setup path that prepares full retrieval", () => {
+  const project = createProject();
+  const cli = writeExecutable(join(temporaryRoot(), "codestory-cli"));
+  const calls = [];
+  const logs = [];
+  const doctor = {
+    retrieval_mode: "full",
+    readiness: [
+      { goal: "local_navigation", status: "ready" },
+      { goal: "agent_packet_search", status: "ready" },
+    ],
+  };
+  runSetup(parseArguments(["--project", project, "--full-retrieval-proof"]), {
+    env: { CODESTORY_CLI: cli, HOME: temporaryRoot(), PATH: "" },
+    log: line => logs.push(line),
+    warn: line => logs.push(`warning: ${line}`),
+    spawnSync(command, args) {
+      if (command === "git") return result(1);
+      if (command === cli && args[0] === "--version") return result(0, "codestory-cli 0.15.0\n");
+      if (command === cli) {
+        calls.push(args);
+        return args[0] === "doctor" ? result(0, JSON.stringify(doctor)) : result();
+      }
+      return result(1);
+    },
+  });
+  assert.deepEqual(calls.map(args => args[0]), ["index", "ready", "doctor"]);
+  assert.deepEqual(calls[1], [
     "ready",
     "--goal",
     "agent",
     "--repair",
     "--project",
-    "/repo",
+    realpathSync(project),
     "--format",
     "json",
     "--run-id",
     "shared-agent",
   ]);
-  const summary = doctorSummaryLines({
-    retrieval_mode: "lexical",
-    degraded_reason: "embedding unavailable",
-    readiness: [
-      { goal: "local_navigation", status: "ready" },
-      {
-        goal: "agent_packet_search",
-        status: "repair_retrieval",
-        minimum_next: ["codestory-cli ready --goal agent --repair"],
-      },
+  assert.ok(logs.includes("  background_preparation: ready"));
+  assert.deepEqual(
+    setupSummaryLines({ readiness: [{ goal: "local_navigation", status: "ready" }] }, "0.15.0", false),
+    [
+      "CodeStory worktree setup complete",
+      "  cli_version: 0.15.0",
+      "  repository_map: ready",
+      "  background_preparation: not_requested",
     ],
-  });
-  assert.ok(summary.includes("  agent_packet_search: repair_retrieval"));
-  assert.ok(summary.includes("  degraded_reason: embedding unavailable"));
-  assert.ok(summary.some(line => line.startsWith("  minimum_next:")));
-  assert.ok(summary.some(line => line.startsWith("  handoff:")));
+  );
 });
 
 test(`${process.platform === "win32" ? "PowerShell" : "POSIX"} adapter forwards to the Node help surface`, () => {
