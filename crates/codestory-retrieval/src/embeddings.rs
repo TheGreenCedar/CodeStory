@@ -1303,8 +1303,12 @@ pub fn embedding_backend_label_for_runtime(
 
 #[cfg(test)]
 pub fn embed_documents(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    LlamaCppEmbeddingClient::new(&crate::config::SidecarRuntimeConfig::local().embedding)?
-        .embed_documents(texts)
+    let runtime = crate::config::test_sidecar_runtime_from_env(
+        None,
+        crate::config::SidecarProfile::Local,
+        None,
+    );
+    LlamaCppEmbeddingClient::new(&runtime.embedding)?.embed_documents(texts)
 }
 
 pub fn embed_documents_for_runtime(
@@ -1603,6 +1607,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::net::TcpListener;
+
+    fn runtime_from_env() -> SidecarRuntimeConfig {
+        crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
+    }
 
     fn llama_client_config(endpoint: String) -> crate::config::EmbeddingRuntimeConfig {
         crate::config::EmbeddingRuntimeConfig {
@@ -1925,7 +1933,11 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::remove("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS");
         let _guard2 = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
-        assert_eq!(embedding_runtime_id(), PRODUCT_EMBEDDING_RUNTIME_ID);
+        let runtime = runtime_from_env();
+        assert_eq!(
+            embedding_runtime_id_for_runtime(&runtime),
+            PRODUCT_EMBEDDING_RUNTIME_ID
+        );
         assert_eq!(qdrant_vector_dim(), RETRIEVAL_EMBEDDING_DIM);
     }
 
@@ -1934,7 +1946,11 @@ mod tests {
         let _lock = crate::test_support::env_lock();
         let _guard = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
         let _guard2 = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
-        assert_eq!(embedding_runtime_id(), "llamacpp:bge-base-en-v1.5");
+        let runtime = runtime_from_env();
+        assert_eq!(
+            embedding_runtime_id_for_runtime(&runtime),
+            "llamacpp:bge-base-en-v1.5"
+        );
     }
 
     #[test]
@@ -1943,9 +1959,11 @@ mod tests {
         let _guard = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
         let _guard2 = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
 
-        assert_eq!(embedding_runtime_id(), "hash-projection:768");
+        let runtime = runtime_from_env();
+        let runtime_id = embedding_runtime_id_for_runtime(&runtime);
+        assert_eq!(runtime_id, "hash-projection:768");
         assert!(!manifest_embedding_backend_is_product(Some(
-            embedding_runtime_id().as_str()
+            runtime_id.as_str()
         )));
         let error = ensure_product_embedding_backend()
             .expect_err("explicit ONNX should not satisfy product sidecar indexing");
