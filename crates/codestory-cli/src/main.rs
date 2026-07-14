@@ -5976,15 +5976,9 @@ fn symbol_workflow_seed_path(project_root: &Path, path: &str) -> String {
         .strip_prefix(r"\\?\")
         .unwrap_or(path)
         .replace('\\', "/");
-    let root_lossy = project_root.to_string_lossy();
-    let root = root_lossy
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&root_lossy)
-        .replace('\\', "/");
-    clean_path
-        .strip_prefix(&format!("{root}/"))
-        .unwrap_or(&clean_path)
-        .to_string()
+    codestory_workspace::workspace_relative_path(project_root, Path::new(&clean_path))
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or(clean_path)
 }
 
 fn symbol_workflow_impacted_files(
@@ -6523,7 +6517,8 @@ fn run_affected(cmd: AffectedCommand) -> Result<()> {
     let runtime = RuntimeContext::new(&cmd.project)?;
     let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "affected")?;
-    let change_records = affected_change_records(&cmd)?;
+    let change_records =
+        affected_change_records(&cmd).map_err(|error| affected_discovery_error(&cmd, error))?;
     let changed_paths = change_records
         .iter()
         .map(|record| record.path.clone())
@@ -6548,20 +6543,17 @@ fn affected_change_records(cmd: &AffectedCommand) -> Result<Vec<AffectedChangeRe
         .map(|path| affected_path_record(path, AffectedChangeKindDto::Unknown, "path"))
         .collect::<Vec<_>>();
     if cmd.stdin {
-        let mut input = String::new();
+        let mut input = Vec::new();
         std::io::stdin()
-            .read_to_string(&mut input)
+            .read_to_end(&mut input)
             .context("Failed to read changed paths from stdin")?;
+        let input = path_text_from_bytes(&input, "stdin")?;
         match cmd.stdin_format {
-            AffectedStdinFormat::Path => records.extend(
-                input
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(|path| {
-                        affected_path_record(path, AffectedChangeKindDto::Unknown, "stdin")
-                    }),
-            ),
+            AffectedStdinFormat::Path => {
+                records.extend(input.lines().filter(|line| !line.is_empty()).map(|path| {
+                    affected_path_record(path, AffectedChangeKindDto::Unknown, "stdin")
+                }))
+            }
             AffectedStdinFormat::NameStatus => {
                 records.extend(parse_git_name_status_records(&input)?);
             }
@@ -6578,17 +6570,16 @@ fn affected_change_records(cmd: &AffectedCommand) -> Result<Vec<AffectedChangeRe
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut records = match cmd.changes {
-        AffectedChangeSource::Untracked => stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|path| affected_path_record(path, AffectedChangeKindDto::Untracked, "??"))
-            .collect::<Vec<_>>(),
+        AffectedChangeSource::Untracked => parse_git_nul_path_records(
+            &output.stdout,
+            AffectedChangeKindDto::Untracked,
+            "??",
+            "git_ls_files",
+        )?,
         AffectedChangeSource::Head
         | AffectedChangeSource::Staged
-        | AffectedChangeSource::Unstaged => parse_git_name_status_records(&stdout)?,
+        | AffectedChangeSource::Unstaged => parse_git_name_status_records_z(&output.stdout)?,
     };
     dedupe_affected_change_records(&mut records);
     Ok(records)
@@ -6599,17 +6590,26 @@ fn affected_git_change_output(cmd: &AffectedCommand) -> Result<std::process::Out
     command.arg("-C").arg(&cmd.project.project);
     match cmd.changes {
         AffectedChangeSource::Head => {
-            command.arg("diff").arg("--name-status").arg("HEAD");
+            command
+                .arg("diff")
+                .arg("--name-status")
+                .arg("-z")
+                .arg("HEAD");
         }
         AffectedChangeSource::Staged => {
-            command.arg("diff").arg("--cached").arg("--name-status");
+            command
+                .arg("diff")
+                .arg("--cached")
+                .arg("--name-status")
+                .arg("-z");
         }
         AffectedChangeSource::Unstaged => {
-            command.arg("diff").arg("--name-status");
+            command.arg("diff").arg("--name-status").arg("-z");
         }
         AffectedChangeSource::Untracked => {
             command
                 .arg("ls-files")
+                .arg("-z")
                 .arg("--others")
                 .arg("--exclude-standard");
         }
@@ -6619,10 +6619,119 @@ fn affected_git_change_output(cmd: &AffectedCommand) -> Result<std::process::Out
         .context("Failed to run git change discovery")
 }
 
+#[derive(Debug)]
+struct UnsupportedNonUtf8Path {
+    source: &'static str,
+}
+
+impl std::fmt::Display for UnsupportedNonUtf8Path {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported_non_utf8_path: {} returned a path that cannot be represented in UTF-8",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedNonUtf8Path {}
+
+fn affected_discovery_error(cmd: &AffectedCommand, error: anyhow::Error) -> anyhow::Error {
+    let Some(unsupported) = error.downcast_ref::<UnsupportedNonUtf8Path>() else {
+        return error;
+    };
+    StructuredCommandFailure {
+        envelope: unsupported_non_utf8_path_envelope(unsupported),
+        output_file: cmd.output_file.clone(),
+        markdown: None,
+    }
+    .into()
+}
+
+fn unsupported_non_utf8_path_envelope(error: &UnsupportedNonUtf8Path) -> CommandFailureEnvelope {
+    command_failure_envelope(
+        "unsupported_non_utf8_path",
+        "git_change_discovery",
+        error.to_string(),
+        serde_json::json!({"source": error.source}),
+    )
+}
+
+fn nul_delimited_git_fields(input: &[u8]) -> Result<Vec<&[u8]>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    if input.last() != Some(&0) {
+        bail!("git NUL-delimited path output is missing its terminator");
+    }
+    let fields = input[..input.len() - 1]
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>();
+    if fields.iter().any(|field| field.is_empty()) {
+        bail!("git NUL-delimited path output contains an empty field");
+    }
+    Ok(fields)
+}
+
+fn path_text_from_bytes(bytes: &[u8], source: &'static str) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| anyhow::Error::new(UnsupportedNonUtf8Path { source }))
+}
+
+fn parse_git_nul_path_records(
+    input: &[u8],
+    kind: AffectedChangeKindDto,
+    status: &str,
+    source: &'static str,
+) -> Result<Vec<AffectedChangeRecordDto>> {
+    nul_delimited_git_fields(input)?
+        .into_iter()
+        .map(|field| {
+            path_text_from_bytes(field, source)
+                .map(|path| affected_path_record(&path, kind.clone(), status))
+        })
+        .collect()
+}
+
+fn parse_git_name_status_records_z(input: &[u8]) -> Result<Vec<AffectedChangeRecordDto>> {
+    let fields = nul_delimited_git_fields(input)?;
+    let mut records = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let status = std::str::from_utf8(fields[index])
+            .context("git name-status status is not valid UTF-8")?;
+        index += 1;
+        let kind = affected_change_kind_from_status(status);
+        let previous_path = if matches!(
+            kind,
+            AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied
+        ) {
+            let field = fields
+                .get(index)
+                .context("git name-status rename/copy record is missing the previous path")?;
+            index += 1;
+            Some(path_text_from_bytes(field, "git_name_status")?)
+        } else {
+            None
+        };
+        let field = fields
+            .get(index)
+            .context("git name-status record is missing the path")?;
+        index += 1;
+        records.push(AffectedChangeRecordDto {
+            path: path_text_from_bytes(field, "git_name_status")?,
+            kind,
+            status: status.to_string(),
+            previous_path,
+        });
+    }
+    Ok(records)
+}
+
 fn parse_git_name_status_records(input: &str) -> Result<Vec<AffectedChangeRecordDto>> {
     input
         .lines()
-        .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(parse_git_name_status_record)
         .collect()
@@ -6637,7 +6746,7 @@ fn parse_git_name_status_record(line: &str) -> Result<AffectedChangeRecordDto> {
             "path",
         ));
     }
-    let status = parts[0].trim();
+    let status = parts[0];
     let kind = affected_change_kind_from_status(status);
     let (previous_path, path) = if matches!(
         kind,
@@ -6645,19 +6754,19 @@ fn parse_git_name_status_record(line: &str) -> Result<AffectedChangeRecordDto> {
     ) {
         let previous = parts
             .get(1)
-            .map(|path| path.trim())
+            .copied()
             .filter(|path| !path.is_empty())
             .context("git name-status rename/copy row is missing the previous path")?;
         let current = parts
             .get(2)
-            .map(|path| path.trim())
+            .copied()
             .filter(|path| !path.is_empty())
             .context("git name-status rename/copy row is missing the current path")?;
         (Some(previous.to_string()), current)
     } else {
         let path = parts
             .get(1)
-            .map(|path| path.trim())
+            .copied()
             .filter(|path| !path.is_empty())
             .context("git name-status row is missing the path")?;
         (None, path)
@@ -6676,7 +6785,7 @@ fn affected_path_record(
     status: &str,
 ) -> AffectedChangeRecordDto {
     AffectedChangeRecordDto {
-        path: path.trim().to_string(),
+        path: path.to_string(),
         kind,
         status: status.to_string(),
         previous_path: None,
@@ -6696,7 +6805,7 @@ fn affected_change_kind_from_status(status: &str) -> AffectedChangeKindDto {
 }
 
 fn dedupe_affected_change_records(records: &mut Vec<AffectedChangeRecordDto>) {
-    records.retain(|record| !record.path.trim().is_empty());
+    records.retain(|record| !record.path.is_empty());
     records.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -10620,20 +10729,42 @@ mod tests {
     }
 
     #[test]
-    fn affected_name_status_parser_preserves_status_and_renames() {
-        let records = parse_git_name_status_records(
-            "M\tcrates/codestory-cli/src/main.rs\nD\tsrc/old.ts\nR100\tsrc/before.ts\tsrc/after.ts\nC75\tsrc/base.ts\tsrc/copy.ts\n",
+    fn affected_name_status_parser_preserves_nul_delimited_special_paths() {
+        let records = parse_git_name_status_records_z(
+            b"M\0 leading and trailing \t\n \0D\0src/old.ts\0R100\0 before.ts \0after\nname.ts\0C75\0src/base.ts\0src/copy.ts\0",
         )
-        .expect("parse name-status");
+        .expect("parse NUL-delimited name-status");
 
         assert_eq!(records[0].kind, AffectedChangeKindDto::Modified);
         assert_eq!(records[0].status, "M");
+        assert_eq!(records[0].path, " leading and trailing \t\n ");
         assert_eq!(records[1].kind, AffectedChangeKindDto::Deleted);
         assert_eq!(records[2].kind, AffectedChangeKindDto::Renamed);
-        assert_eq!(records[2].previous_path.as_deref(), Some("src/before.ts"));
-        assert_eq!(records[2].path, "src/after.ts");
+        assert_eq!(records[2].previous_path.as_deref(), Some(" before.ts "));
+        assert_eq!(records[2].path, "after\nname.ts");
         assert_eq!(records[3].kind, AffectedChangeKindDto::Copied);
         assert_eq!(records[3].previous_path.as_deref(), Some("src/base.ts"));
+    }
+
+    #[test]
+    fn affected_non_utf8_git_path_has_a_typed_failure_envelope() {
+        let error = parse_git_name_status_records_z(b"M\0src/invalid-\xff.rs\0")
+            .expect_err("non-UTF-8 Git paths cannot enter string DTOs");
+        let unsupported = error
+            .downcast_ref::<UnsupportedNonUtf8Path>()
+            .expect("typed non-UTF-8 path error");
+        let envelope = unsupported_non_utf8_path_envelope(unsupported);
+
+        assert_eq!(envelope.error.code, "unsupported_non_utf8_path");
+        assert_eq!(
+            envelope
+                .error
+                .details
+                .as_deref()
+                .and_then(|details| details.failed_layer.as_deref()),
+            Some("git_change_discovery")
+        );
+        assert!(!unsupported.to_string().contains('\u{fffd}'));
     }
 
     fn sample_retrieval() -> RetrievalStateDto {

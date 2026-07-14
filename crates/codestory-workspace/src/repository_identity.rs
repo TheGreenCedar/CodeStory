@@ -1222,6 +1222,11 @@ mod tests {
         match fs::create_dir(&lower) {
             Ok(()) => {
                 assert!(!same_workspace_path(&upper, &lower));
+                assert_eq!(
+                    crate::workspace_relative_path(&upper, &lower.join("src/lib.rs")),
+                    None,
+                    "case-distinct Unix roots must not be stripped as aliases"
+                );
                 assert_ne!(
                     workspace_id_v3_for_root(&upper),
                     workspace_id_v3_for_root(&lower)
@@ -1231,6 +1236,10 @@ mod tests {
                 assert!(
                     same_workspace_path(&upper, &lower),
                     "case-insensitive filesystems must identify case aliases as the same path"
+                );
+                assert_eq!(
+                    crate::workspace_relative_path(&upper, &lower.join("src/lib.rs")),
+                    Some(PathBuf::from("src/lib.rs"))
                 );
             }
             Err(error) => panic!("lower-case path: {error}"),
@@ -1266,6 +1275,10 @@ mod tests {
         fs::create_dir(&existing).expect("mixed-case path");
         let existing_alias = project.path().join("codestory");
         assert!(same_workspace_path(&existing, &existing_alias));
+        assert_eq!(
+            crate::workspace_relative_path(&existing, &existing_alias.join("src/lib.rs")),
+            Some(PathBuf::from("src/lib.rs"))
+        );
 
         let missing = project.path().join("Missing");
         let missing_alias = project.path().join("missing");
