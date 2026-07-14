@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Approved the first protected Linux ARM64 release-evidence baseline with
+  pinned machine identity and explicit status, grounding, convergence, packet,
+  search, indexing, and storage budgets.
 - GitHub releases now use the exact matching version section from this
   changelog before the existing platform proof-boundary appendix. Publication
   fails when that version section is missing, duplicated, or empty instead of

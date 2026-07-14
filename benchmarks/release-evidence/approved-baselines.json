@@ -32,6 +32,38 @@
         "indexing_seconds": { "reference": 10, "threshold": 12.5, "unit": "seconds", "aggregation": "cold full-refresh wall time", "direction": "max", "source": "baseline-raw.json" },
         "storage_growth_ratio": { "reference": 1, "threshold": 1.1, "reference_bytes": 1000, "unit": "ratio", "aggregation": "candidate bytes divided by approved same-corpus bytes", "direction": "max", "source": "baseline-raw.json" }
       }
+    },
+    "codestory-release-evidence-linux-arm64-v1": {
+      "baseline_id": "codestory-release-evidence-linux-arm64-v1@b09b8c44dc38472e67fc01de81edc66eef38a9be",
+      "status": "approved",
+      "release_eligible": true,
+      "commit": "b09b8c44dc38472e67fc01de81edc66eef38a9be",
+      "git_state": "clean",
+      "identity": {
+        "corpus_id": "codestory-release-corpus-v1",
+        "cache_id": "cold-full-sidecar-v1",
+        "machine_fingerprint": "codestory-release-evidence-linux-arm64-v1/b5d4b3f7512ab242f9ed506a8c50d38a8382d07b3d78959287a6981ca84b9156"
+      },
+      "approval": {
+        "owner": "Albert Najjar",
+        "approved_at": "2026-07-14",
+        "rationale": "Protected run 29313560991 on the provisioned Linux ARM64 profile passed full-sidecar stats, resolved all 3 Serde anchors with no blockers, and passed all 9 publishable Axios, Redis, and Ripgrep packet runs. Thresholds use the attested baseline's documented multipliers and rounding rule."
+      },
+      "artifacts": [
+        {
+          "path": "baselines/linux-arm64-v1-b09b8c44.json",
+          "sha256": "e272b1d08805a7f0f8d6b8189df17eb1fbdfce4c1a47cc75a829be72d18b90e9"
+        }
+      ],
+      "metrics": {
+        "status_seconds": { "reference": 0.507090389, "threshold": 0.64, "unit": "seconds", "aggregation": "full-sidecar command wall time", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" },
+        "local_grounding_seconds": { "reference": 0.056711914, "threshold": 0.08, "unit": "seconds", "aggregation": "full-sidecar command wall time", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" },
+        "convergence_seconds": { "reference": 14.428549947, "threshold": 16.6, "unit": "seconds", "aggregation": "unchanged-corpus repeat full-refresh wall time", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" },
+        "packet_seconds": { "reference": 5.658959, "threshold": 6.23, "unit": "seconds", "aggregation": "worst quality-gated packet median wall time", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" },
+        "search_seconds": { "reference": 1.51831238, "threshold": 1.9, "unit": "seconds", "aggregation": "full-sidecar command wall time", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" },
+        "indexing_seconds": { "reference": 14.496289933, "threshold": 18.13, "unit": "seconds", "aggregation": "cold full-refresh wall time", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" },
+        "storage_growth_ratio": { "reference": 1, "threshold": 1.1, "reference_bytes": 617172808, "unit": "ratio", "aggregation": "candidate bytes divided by approved same-corpus bytes", "direction": "max", "source": "linux-arm64-v1-b09b8c44.json" }
+      }
     }
   }
 }

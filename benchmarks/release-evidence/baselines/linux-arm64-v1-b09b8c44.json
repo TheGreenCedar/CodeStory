@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "commit": "b09b8c44dc38472e67fc01de81edc66eef38a9be",
+  "evidence_identity": {
+    "corpus_id": "codestory-release-corpus-v1",
+    "cache_id": "cold-full-sidecar-v1",
+    "machine_fingerprint": "codestory-release-evidence-linux-arm64-v1/b5d4b3f7512ab242f9ed506a8c50d38a8382d07b3d78959287a6981ca84b9156"
+  },
+  "source_artifacts": {
+    "workflow_run_id": 29313560991,
+    "hosted_artifact": {
+      "id": 8303155154,
+      "name": "release-evidence-b09b8c44dc38472e67fc01de81edc66eef38a9be",
+      "sha256": "ea21bb3a3109d56f7ed26e934c0ba788f3af6f31b3ab67737adf427d60c09460",
+      "bytes": 198122,
+      "expires_at": "2026-10-12T07:08:18Z"
+    },
+    "stats": {
+      "path": "stats.json",
+      "sha256": "cd759db3e7709aef3eeaf26c804f237b6fb92e9c1095bd50b4f4f37c7417bc34",
+      "bytes": 5045
+    },
+    "packet": {
+      "path": "packet/packet-runtime-summary.json",
+      "sha256": "b23a9740870c3e3b230fc25a8339edd538d27506d29f2f1f66b6360560bbf773",
+      "bytes": 281628
+    }
+  },
+  "budget_policy": {
+    "command_seconds_multiplier": 1.25,
+    "convergence_seconds_multiplier": 1.15,
+    "packet_seconds_multiplier": 1.1,
+    "storage_growth_ratio": 1.1,
+    "seconds_rounding": "ceil to the next 0.01 seconds"
+  },
+  "metrics": {
+    "status_seconds": 0.507090389,
+    "local_grounding_seconds": 0.056711914,
+    "convergence_seconds": 14.428549947,
+    "packet_seconds": 5.658959,
+    "search_seconds": 1.51831238,
+    "indexing_seconds": 14.496289933,
+    "storage_bytes": 617172808
+  }
+}
