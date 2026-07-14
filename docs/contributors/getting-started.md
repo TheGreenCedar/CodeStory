@@ -30,9 +30,9 @@ Replace `[TARGET_FEATURE]` and `[OWNING_CRATE]` with the specific feature and cr
 ## Host prerequisites
 
 Supported Mac development starts at macOS 15 on Apple Silicon or Intel. Install
-the Xcode Command Line Tools, Node.js 18+, and the Rust toolchain. Docker is not
-part of the default Mac packet/search path: vectors are embedded in SQLite,
-Apple Silicon runs managed Metal, and Intel runs the managed native CPU backend.
+the Xcode Command Line Tools, Node.js 18+, and the Rust toolchain. Vectors are
+embedded in SQLite; Apple Silicon runs managed Metal and Intel runs the managed
+native CPU backend.
 
 The protected packaged-hardware proof also requires `python3`; use that
 versioned command in Mac automation because Command Line Tools does not promise

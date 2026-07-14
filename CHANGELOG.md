@@ -4,12 +4,11 @@
 
 ### Changed
 
-- Managed retrieval now stores generation-bound dense vectors in embedded
-  SQLite by default, so macOS packet/search no longer starts or requires
-  Qdrant or Docker. Apple Silicon keeps managed Metal; Intel now installs a
-  checksum-pinned native CPU runtime automatically and never claims Metal.
-  Search traces describe this lane as semantic instead of exposing the storage
-  engine. External Qdrant remains an explicit advanced compatibility override.
+- Managed retrieval stores generation-bound dense vectors in embedded SQLite
+  and uses the checksum-pinned native llama.cpp runtime on every supported
+  platform. Apple Silicon uses Metal; Intel installs the managed CPU runtime
+  automatically and never claims Metal. Search traces describe the semantic
+  capability without exposing its storage engine.
 - Delegated worktree setup now prepares and reports the local repository map
   without attempting full retrieval or printing backend repair instructions.
   Maintainers can request that separate proof explicitly with

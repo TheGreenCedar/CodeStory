@@ -55,7 +55,7 @@ hash and other in-process embedding paths remain diagnostic. Current benchmark f
 [embedding-backend-benchmarks.md](../../testing/embedding-backend-benchmarks.md).
 
 The CLI owns managed embedding setup. `codestory-cli retrieval bootstrap` starts
-the local llama.cpp sidecar when Docker Compose is available; `retrieval index`
+the managed native llama.cpp runtime; `retrieval index`
 then writes generation-bound sidecar artifacts and manifest metadata. Missing
 or non-product embedding state fails closed for agent-facing retrieval.
 

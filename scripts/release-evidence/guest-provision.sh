@@ -43,8 +43,6 @@ model_name=$(get '.assets.model.name')
 model_sha=$(get '.assets.model.sha256')
 drill_repository=$(get '.drill.repository')
 drill_commit=$(get '.drill.commit')
-qdrant_image=$(get '.assets.qdrant_image')
-llama_image=$(get '.assets.llama_image')
 
 test "$snapshot" = "$bootstrap_snapshot"
 test "$(get '.guest.apt_packages.jq')" = "$bootstrap_jq_version"
@@ -63,7 +61,7 @@ if ! id codestory-runner >/dev/null 2>&1; then
   sudo useradd --system --create-home --home-dir "$runner_root/home" \
     --shell /bin/bash codestory-runner
 fi
-sudo usermod -aG docker -d "$runner_root/home" codestory-runner
+sudo usermod -d "$runner_root/home" codestory-runner
 sudo install -d -m 0750 -o root -g codestory-runner "$data_root"
 sudo install -d -m 0755 "$runner_root"
 if ! mountpoint -q "$runner_root"; then
@@ -212,9 +210,6 @@ sudo -u codestory-runner jq -n --arg project "$drill_repo" '{
     }
   }]
 }' | sudo -u codestory-runner tee "$manifest" >/dev/null
-
-sudo -u codestory-runner docker pull "$qdrant_image"
-sudo -u codestory-runner docker pull "$llama_image"
 
 test "$(sudo -u codestory-runner sed -n '1p' "$runner_root/validation/source-sha")" = "$source_sha"
 sudo -u codestory-runner env \

@@ -13,8 +13,6 @@ runner_root=$(get '.runner.root')
 model_name=$(get '.assets.model.name')
 model_sha=$(get '.assets.model.sha256')
 drill_commit=$(get '.drill.commit')
-qdrant_image=$(get '.assets.qdrant_image')
-llama_image=$(get '.assets.llama_image')
 
 mount_table=$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | sort)
 printf '%s\n' "$mount_table"
@@ -33,12 +31,6 @@ for host_path in /Users /Users/albert; do
     exit 1
   fi
 done
-running_containers=$(docker ps --format '{{.ID}} {{.Names}} {{.Image}}')
-if test -n "$running_containers"; then
-  echo "dedicated evidence VM has running containers:" >&2
-  printf '%s\n' "$running_containers" >&2
-  exit 1
-fi
 mountpoint -q "$runner_root"
 echo "host_mounts=none host_home_visible=false"
 
@@ -123,11 +115,6 @@ test ! -e "$runner_root/validation/codestory/.git"
 source_sha=$(sed -n '1p' "$runner_root/validation/source-sha")
 printf '%s\n' "$source_sha" | grep -Eq '^[0-9a-f]{40}$'
 
-qdrant_id=$(docker image inspect "$qdrant_image" --format '{{.Id}}')
-llama_id=$(docker image inspect "$llama_image" --format '{{.Id}}')
-test "$(docker image inspect "$qdrant_image" --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
-test "$(docker image inspect "$llama_image" --format '{{.Os}}/{{.Architecture}}')" = linux/arm64
-
 memory_bytes=$(awk '/MemTotal/{printf "%.0f", $2 * 1024}' /proc/meminfo)
 workspace_free_bytes=$(df --output=avail -B1 "$runner_root" | tail -1 | tr -d ' ')
 model_bytes=$(stat -c %s "$runner_root/models/$model_name")
@@ -138,8 +125,6 @@ cargo_version=$(cargo --version)
 rustc_version=$(rustc --version)
 python_version=$(python3 --version)
 gh_version=$(gh --version | head -1)
-docker_version=$(docker version --format '{{.Server.Version}}')
-compose_version=$(docker compose version --short)
 verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 fingerprint="$profile_id/$contract_sha"
 
@@ -148,12 +133,10 @@ jq -n --slurpfile host "$host_attestation" \
   --arg boot_id "$boot_id" --arg package_manifest_sha "$package_manifest_sha" \
   --arg node "$node_version" --arg cargo "$cargo_version" --arg rustc "$rustc_version" \
   --arg python "$python_version" --arg gh "$gh_version" \
-  --arg docker "$docker_version" --arg compose "$compose_version" \
   '{host: $host[0].host, vm: $host[0].vm,
     guest: {os:$os,kernel:$kernel,arch:$arch,boot_id:$boot_id,
       native_package_manifest_sha256:$package_manifest_sha},
-    toolchain:{node:$node,cargo:$cargo,rustc:$rustc,python:$python,
-      gh:$gh,docker:$docker,docker_compose:$compose}}' >"$observed_identity"
+    toolchain:{node:$node,cargo:$cargo,rustc:$rustc,python:$python,gh:$gh}}' >"$observed_identity"
 observed_identity_sha=$(jq -cS . "$observed_identity" | sha256sum | awk '{print $1}')
 
 jq -n --slurpfile observed "$observed_identity" \
@@ -163,8 +146,7 @@ jq -n --slurpfile observed "$observed_identity" \
   --arg repository "$repository" --arg runner_name "$runner_name" \
   --arg runner_version "$runner_version" --argjson runner_id "$agent_id" \
   --arg model_name "$model_name" --arg model_sha "$model_sha" \
-  --argjson model_bytes "$model_bytes" --arg qdrant "$qdrant_image" \
-  --arg qdrant_id "$qdrant_id" --arg llama "$llama_image" --arg llama_id "$llama_id" \
+  --argjson model_bytes "$model_bytes" \
   --arg drill_commit "$drill_commit" --arg manifest_sha "$manifest_sha" \
   --arg source_sha "$source_sha" --argjson memory_bytes "$memory_bytes" \
   --argjson workspace_free_bytes "$workspace_free_bytes" '
@@ -175,9 +157,7 @@ jq -n --slurpfile observed "$observed_identity" \
     runner:{repository:$repository,name:$runner_name,id:$runner_id,version:$runner_version,
       labels:["self-hosted","Linux","ARM64","codestory-release-evidence"],automatic_updates:false},
     capacity:{observed_memory_bytes:$memory_bytes,observed_workspace_free_bytes:$workspace_free_bytes},
-    assets:{model:{name:$model_name,sha256:$model_sha,bytes:$model_bytes},
-      qdrant:{reference:$qdrant,image_id:$qdrant_id,platform:"linux/arm64"},
-      llama_server:{reference:$llama,image_id:$llama_id,platform:"linux/arm64"}},
+    assets:{model:{name:$model_name,sha256:$model_sha,bytes:$model_bytes}},
     drill:{repository:"https://github.com/serde-rs/json.git",commit:$drill_commit,
       manifest:"/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
       manifest_sha256:$manifest_sha},

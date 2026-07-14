@@ -55,10 +55,6 @@
       "cmake": "3.28.3-1build7",
       "containerd.io": "2.2.4-1~ubuntu.24.04~noble",
       "curl": "8.5.0-2ubuntu10.11",
-      "docker-buildx-plugin": "0.34.1-1~ubuntu.24.04~noble",
-      "docker-ce": "5:29.5.2-1~ubuntu.24.04~noble",
-      "docker-ce-cli": "5:29.5.2-1~ubuntu.24.04~noble",
-      "docker-compose-plugin": "5.1.4-1~ubuntu.24.04~noble",
       "git": "1:2.43.0-1ubuntu7.3",
       "jq": "1.7.1-3ubuntu0.24.04.2",
       "libclang-dev": "1:18.0-59~exp2",
@@ -91,9 +87,7 @@
     "model": {
       "name": "bge-base-en-v1.5.Q8_0.gguf",
       "sha256": "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c"
-    },
-    "qdrant_image": "qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae",
-    "llama_image": "ghcr.io/ggml-org/llama.cpp:server@sha256:f16ca66f3ba316b7a7a16003ddfa88d29c3404fbe86550da086736864c11574c"
+    }
   },
   "drill": {
     "repository": "https://github.com/serde-rs/json.git",

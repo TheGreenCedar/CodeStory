@@ -2,7 +2,8 @@
 
 **Audience:** Evidence record — not an install guide.
 
-Sidecar-primary packet retrieval (project-local SQLite FTS lexical, optional Qdrant dense anchors, SCIP graph) orchestrated by
+Sidecar-primary packet retrieval (project-local SQLite FTS lexical and vectors,
+SCIP graph, and managed native llama.cpp embeddings) orchestrated by
 `codestory-retrieval` and integrated in `codestory-runtime`. Production packet paths use
 generic symbol/path roles; benchmark-only probe catalogs remain behind test-only eval harness hooks.
 Sidecar retrieval is mandatory for current evidence; `CODESTORY_RETRIEVAL=0` is treated as a
@@ -152,7 +153,7 @@ Non-claims:
 
 | Layer | Location | Role |
 |-------|----------|------|
-| Retrieval clients | `crates/codestory-retrieval/` (`lexical_client`, `qdrant_client`, `scip_client`, `health`) | SQLite FTS candidate selection, HTTP probes, staged search, timeouts |
+| Retrieval clients | `crates/codestory-retrieval/` (`lexical_client`, embedded-vector storage, `scip_client`, `health`) | SQLite lexical/vector candidate selection, embedding probes, staged search, timeouts |
 | Planner / executor / ranker | `codestory-retrieval` (`planner`, `executor`, `ranker`, `query_features`, `mode`) | Repo-agnostic staged plan, deadlines, degraded modes |
 | Index manifest | `codestory-store` `retrieval_index_manifest` + `codestory-retrieval::index` | Canonical `lexical_version`, sidecar input hash, generation id, symbol-doc count, dense-anchor count, semantic policy version, graph artifact hash, dense reason counts, mandatory real sidecar artifact paths, and derived status `manifest_contract` provenance |
 | CLI lifecycle | `codestory-cli` `retrieval up\|down\|status\|index\|query` | Local data dirs, health JSON, standalone query |
@@ -163,10 +164,10 @@ Non-claims:
 All planned retrieval stages use the same fixed-capacity worker pool, including
 symbol-like and natural-language queries. Each job carries the request deadline
 and cancellation flag into sidecar calls. Lexical and SCIP scans poll that
-context while iterating. Live query embedding and Qdrant requests clamp their
-transport timeout to the remaining deadline and use separate bounded reusable
-HTTP capacity, allowing the stage worker to return promptly when synchronous
-I/O cannot be interrupted in place. Stage traces report admission and queue
+context while iterating. Live query embedding clamps its transport timeout to
+the remaining deadline and uses bounded reusable HTTP capacity, allowing the
+stage worker to return promptly when synchronous I/O cannot be interrupted in
+place. Stage traces report admission and queue
 wait separately, report execution duration only after completion, and classify
 completed, skipped, cancelled-before-start, pending-after-deadline, and
 observed-late work. Post-return completions are logged and discarded. Any cancelled or late
@@ -329,9 +330,8 @@ benchmark artifacts:
 2. Confirm packet/search evidence reports `retrieval_mode=full`.
 3. Compare the run against the guard thresholds in `docs/architecture/retrieval-rollback.json`; the file stores promotion guard thresholds, not runtime rollback behavior.
 
-**Promotion note:** Local `retrieval status` can report `full` after Qdrant
-re-index. Sidecar-primary is the intended product path, but product promotion
-still requires fresh benchmark evidence.
+**Promotion note:** Local `retrieval status` can report `full` after a vector
+generation rebuild. Product promotion still requires fresh benchmark evidence.
 
 ---
 

@@ -42,7 +42,6 @@ const protectedNonRustDirs = [
   path.join(repoRoot, ".github"),
   path.join(repoRoot, ".cursor", "rules"),
   path.join(repoRoot, "plugins", "codestory"),
-  path.join(repoRoot, "docker"),
   path.join(repoRoot, "crates", "codestory-retrieval", "assets"),
 ];
 
@@ -98,7 +97,7 @@ const allowedHarnessReferences = [
   [
     path.join("plugins", "codestory", "skills", "codestory-grounding", "references", "retrieval-rollout.md"),
     ".github/workflows/retrieval-sidecar-smoke.yml",
-    "| Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/ops/retrieval-sidecars.md#preflight-smoke-contract` pass criteria | PRs touching retrieval crate, runtime/stdio/search wiring, indexer retrieval hooks, retrieval docs, scripts, Docker sidecar config, or the workflow | Full sidecar readiness. CI smoke uses `--skip-compose --wait-secs 0` and proves manifest-missing fail-closed shape only |",
+    "| Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/ops/retrieval-sidecars.md#preflight-smoke-contract` pass criteria | PRs touching retrieval, runtime/stdio/search wiring, indexer retrieval hooks, managed-backend metadata, docs, scripts, or the workflow | Full sidecar readiness. Hosted smoke proves the manifest-missing fail-closed shape only |",
   ],
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),

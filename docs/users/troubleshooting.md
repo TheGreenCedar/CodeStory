@@ -162,8 +162,8 @@ CodeStory prepares its local search support once for the Mac; later repositories
 reuse it automatically.
 
 Intel Macs use the managed native CPU path automatically. Broad search should
-move through `preparing` to ready without Docker, Qdrant, or user configuration,
-and must report CPU operation rather than Metal. A `needs_environment` result
+move through `preparing` to ready without user configuration and must report
+CPU operation rather than Metal. A `needs_environment` result
 means automatic preparation failed; relay only the plain host requirement.
 
 Maintainer-only acceleration evidence and recovery commands are in

@@ -12,19 +12,14 @@ with `retrieval_mode=full`.
 - The immutable embedded SQLite vector generation exists, has the exact
   manifest dense-anchor projection count, and matches the product-compatible
   BGE-base embedding contract when the active semantic policy selects dense
-  anchors. A trusted operator may explicitly select external Qdrant instead;
-  it must satisfy the same generation and semantic-smoke contract. If the
-  policy selects zero dense anchors, no vector index is required.
+  anchors. If the policy selects zero dense anchors, no vector index is
+  required.
 - SCIP graph artifacts exist and are not stub markers.
 - The SQLite `retrieval_index_manifest` has the current schema version and
   canonical `lexical_version`, sidecar input hash, sidecar generation, semantic
   generation key, embedding backend, embedding dimension, symbol-doc count,
   dense-anchor count, semantic policy version, graph artifact hash, and dense
   reason counts.
-
-The persisted field is still named `qdrant_collection` for wire and database
-compatibility. Under the default embedded backend it names the immutable vector
-generation; it does not imply a Qdrant process, port, or container.
 
 Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
 `unavailable`, stale manifests, stub markers, disabled sidecars, hash vectors,
@@ -66,9 +61,7 @@ Runtime rules:
   explicitly labeled diagnostics.
 - Each opened project owns one immutable `SidecarRuntimeConfig`. Retrieval
   indexing, query embedding, readiness/status, runtime search, and summary
-  generation consume that retained value. Embedded vectors are the default;
-  `CODESTORY_VECTOR_BACKEND=external_qdrant` is an explicit maintainer override.
-  Managed embedding endpoints are
+  generation consume that retained value. Managed embedding endpoints are
   derived from the selected profile/run ports; external endpoints retain their
   trusted origin. Persisted state records that origin plus an install-keyed
   HMAC-SHA256 fingerprint of the full endpoint while exposing only the redacted
@@ -82,7 +75,7 @@ hash. Identity is intentionally split: logical `project_id` is repository-wide,
 `workspace_id` owns local processes and state, and `artifact_scope_id` uses the
 logical repository only when portable reuse is eligible. Dirty workspaces fall
 back to `workspace_id`; `canonical_root_hash` is only a local broker snapshot
-locator. Sidecar state, Agent namespaces, Compose labels, generation roots, and
+locator. Sidecar state, Agent namespaces, generation roots, and
 retention all use project identity schema 3.
 
 Repository identity schema 2 lowercases only the remote host, normalizes an
@@ -127,12 +120,10 @@ during workspace discovery.
 The publication path has one mandatory validation gate immediately before its
 short input/pointer transaction. The candidate manifest must bind the expected
 SQLite lexical shard, SCIP revision and graph artifacts, embedded vector
-generation (or explicitly selected external Qdrant collection) with an exact
-point count, llama.cpp runtime identity and dimension, and the configured
-model/profile contract. Native
-managed launches must also expose a matching model path and launch fingerprint;
-Docker launches must retain the same persisted running-container identity
-across the final probes. Accelerator-required policy reruns a bounded embedding
+generation with an exact point count, llama.cpp runtime identity and dimension,
+and the configured model/profile contract. Native managed launches must also
+expose a matching model path and launch fingerprint. Accelerator-required
+policy reruns a bounded embedding
 request at promotion and binds its timing and current runtime log to the exact
 requested provider and device; explicit CPU policy needs a CPU policy
 observation. External accelerator endpoints cannot borrow local runtime logs.
