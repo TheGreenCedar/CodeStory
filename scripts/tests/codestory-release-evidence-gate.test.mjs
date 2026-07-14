@@ -147,6 +147,12 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
   assert.equal(result.status, 0, result.stderr);
+  approval.metrics.status_seconds.expires_at = "2026-07-12";
+  writeFileSync(approvalPath, JSON.stringify(approval));
+  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /approval is expired/);
+  approval.metrics.status_seconds.expires_at = "2099-07-11";
   approval.metrics.status_seconds.measured_value = 1.9;
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);

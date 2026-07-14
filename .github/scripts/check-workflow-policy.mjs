@@ -10,6 +10,7 @@ const sagaIssueLinkGuard = path.join(workflowRoot, "saga-issue-link-guard.yml");
 const closeDevIssues = path.join(workflowRoot, "close-dev-issues.yml");
 const pluginStatic = path.join(workflowRoot, "plugin-static.yml");
 const rustCi = path.join(workflowRoot, "rust-ci.yml");
+const autoRelease = path.join(workflowRoot, "auto-release.yml");
 const releaseWorkflow = path.join(workflowRoot, "release.yml");
 const releaseCandidateEvidence = path.join(workflowRoot, "release-candidate-evidence.yml");
 const releaseNotesExtractor = path.join(".github", "scripts", "extract-codestory-release-notes.mjs");
@@ -316,6 +317,8 @@ if (!fs.existsSync(releaseWorkflow)) {
     violations.push("release.yml release builds must not install floating stable Rust");
   }
   requireContent(content, [
+    "actions: read",
+    "uses: ./.github/workflows/release-candidate-evidence.yml",
     "uses: ./.github/workflows/packaged-platform-proof.yml",
     "sign_macos: true",
     "APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}",
@@ -338,6 +341,25 @@ if (!fs.existsSync(releaseWorkflow)) {
     "gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof",
     "Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.",
   ], snippet => `release.yml must include ${snippet}`);
+  const releaseEvidenceJob = yamlJob(content, "release-evidence");
+  requireContent(releaseEvidenceJob.join("\n"), [
+    "needs: preflight",
+    "ref: ${{ github.sha }}",
+    "proof_key: release-${{ needs.preflight.outputs.version }}",
+    "profile: codestory-release-evidence-linux-arm64-v1",
+    "drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
+    "embedding_model_dir: /srv/codestory-release-evidence/models",
+    "source_run_id: ${{ inputs.source_run_id }}",
+  ], snippet => `release.yml release-evidence job must include ${snippet}`);
+  const packagedProofJob = yamlJob(content, "packaged-proof");
+  if (!packagedProofJob.includes("      - release-evidence")) {
+    violations.push("release.yml packaged-proof must wait for release-evidence");
+  }
+  const sourceRunInputDescription =
+    'description: "Optional rejected release-evidence run to re-evaluate without measuring again"';
+  if ((content.match(new RegExp(sourceRunInputDescription, "gu")) ?? []).length !== 2) {
+    violations.push("release.yml must expose optional source_run_id inputs for calls and dispatches");
+  }
   if (!fs.existsSync(releaseNotesExtractor)) {
     violations.push("release.yml must use the checked-in versioned changelog extractor");
   }
@@ -370,6 +392,29 @@ if (!fs.existsSync(releaseWorkflow)) {
     "needs:\n      - preflight\n      - packaged-proof\n      - macos-metal-proof\n    runs-on: ubuntu-latest",
     "needs:\n      - preflight\n      - publish\n    uses: ./.github/workflows/post-publish-release-smoke.yml",
   ], row => `release.yml must preserve release proof block ${row.split("\n")[0]}`);
+}
+
+if (!fs.existsSync(autoRelease)) {
+  violations.push("auto-release.yml must exist for main release detection");
+} else {
+  const content = fs.readFileSync(autoRelease, "utf8");
+  requireContent(content, [
+    ".github/workflows/release-candidate-evidence.yml",
+    "benchmarks/release-evidence/**",
+    "benchmarks/tasks/manifest.schema.json",
+    "benchmarks/tasks/holdout-retrieval/**",
+    "scripts/codestory-agent-ab-benchmark.mjs",
+    "scripts/codestory-agent-value-score.mjs",
+    "scripts/codestory-benchmark-contract.mjs",
+    "scripts/codestory-evidence-provenance.mjs",
+    "scripts/codestory-release-evidence-gate.mjs",
+    "scripts/codestory-release-evidence-runner.sh",
+    "scripts/release-evidence/**",
+  ], snippet => `auto-release.yml must trigger for ${snippet}`);
+  const releaseJob = yamlJob(content, "release");
+  if (!releaseJob.includes("      actions: read")) {
+    violations.push("auto-release.yml release job must allow prior-run evidence download");
+  }
 }
 
 if (!fs.existsSync(packagedPlatformProof)) {
