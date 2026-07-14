@@ -4,6 +4,10 @@
 
 ### Changed
 
+- GitHub releases now use the exact matching version section from this
+  changelog before the existing platform proof-boundary appendix. Publication
+  fails when that version section is missing, duplicated, or empty instead of
+  substituting an automatically generated pull-request list.
 - Retained raw repo-scale and real-repository drill evidence from the explicit
   CPU-backed Linux ARM64 release profile without weakening baseline evaluation.
 - Added reproducible provisioning for the repository-scoped Linux
