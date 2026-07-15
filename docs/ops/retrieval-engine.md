@@ -1,102 +1,165 @@
 # In-process retrieval engine
 
-CodeStory ships one executable. The executable contains the checksum-pinned
-BGE-base-en-v1.5 Q8 GGUF model and statically linked llama.cpp/ggml runtime.
-There is no embedding service to install, download, start, repair, or stop.
+CodeStory ships semantic retrieval inside the native CLI. The release
+executable contains the checksum-pinned CodeRankEmbed Q8 model and links the
+llama.cpp/ggml engine. There is no embedding server, network endpoint, backend
+download, port lease, PID supervisor, or user-controlled repair lifecycle.
 
-The first semantic request in a process initializes one embedding engine. Every
-repository opened by that process shares the same model and accelerator
-context. When llama.cpp needs a filesystem path for mmap, CodeStory publishes
-the embedded model atomically into a disposable content-addressed cache. A
-restart may reuse that verified materialization; it never fetches runtime
-assets from the network.
+This page is for maintainers collecting diagnostics or changing retrieval. The
+normal plugin contract is simpler: call the intended repository tool and retry
+that same tool while it reports `preparing`.
 
-`retrieval_mode: "full"` means the current lexical, vector, and SCIP
-generations agree with the source publication and the in-process engine
-identity. It is an infrastructure gate, not an answer-quality claim.
+## Runtime shape
 
 ```mermaid
 flowchart LR
-    host["CodeStory process"] --> engine["One in-process embedding engine"]
-    engine --> a["Repository A vector generation"]
-    engine --> b["Repository B vector generation"]
-    host --> lexical["SQLite lexical generations"]
-    host --> scip["SCIP artifacts"]
+  host["One CodeStory CLI process"] --> engine["Process-wide embedding engine"]
+  engine --> model["Verified embedded model"]
+  host --> a["Repository A publication"]
+  host --> b["Repository B publication"]
+  a --> a1["Core SQLite + lexical/vector generation + SCIP"]
+  b --> b1["Core SQLite + lexical/vector generation + SCIP"]
 ```
 
-## Normal operation
+The engine initializes lazily on the first semantic operation. All repositories
+opened by that CLI process share its model and accelerator context. Repository
+configuration, caches, generations, and publication leases remain isolated.
+Every MCP request carries an absolute `project` root; no global active-project
+file routes requests.
 
-Call the intended CodeStory tool. Project activation, indexing, and embedding
-initialization are automatic. A cold request may return a bounded same-tool
-retry while preparation completes. The plugin never asks the user to approve
-retrieval infrastructure.
+When llama.cpp needs a path for memory mapping, CodeStory verifies the embedded
+bytes and atomically materializes them under a content-addressed cache name. A
+later process may reuse that file after verifying its digest and size. This is
+cache materialization, not a runtime download.
 
-Normal plugin output reports whether retrieval is ready. Backend, adapter, model
-digest, ggml build identity, and smoke timing stay in the explicit live-process
-maintainer diagnostic:
+## First-use state machine
 
-```sh
-resources/read codestory://diagnostics/retrieval-engine
+```mermaid
+stateDiagram-v2
+  [*] --> Uninitialized
+  Uninitialized --> Initializing: first semantic request
+  Initializing --> Ready: model, backend, adapter, smoke verified
+  Initializing --> Unavailable: policy or engine proof fails
+  Ready --> Ready: later repository reuses engine
+  Ready --> [*]: process exits
 ```
 
-`doctor` and `retrieval status` remain observational one-shot checks. They do
-not initialize an engine merely to populate diagnostics.
+Repository activation and engine initialization are separate:
+
+1. Local discovery and indexing publish a complete core database.
+2. The process-wide engine verifies its model and execution policy.
+3. Retrieval builds lexical, vector, and SCIP artifacts for that repository.
+4. The writer validates a complete candidate and atomically publishes its
+   manifest.
+5. Packet/search readers pin one coherent core and retrieval publication.
+
+A cold request can return a bounded same-tool retry while these steps run. An
+existing complete publication remains readable during refresh. Concurrent
+publication drift returns `cache_busy` and permits one bounded retry rather
+than mixing generations.
+
+## Readiness contract
+
+Engine readiness binds:
+
+- the exact model digest and size;
+- the linked llama.cpp/ggml build identity;
+- the selected backend and physical adapter;
+- `accelerated` or explicit `cpu_explicit` policy;
+- a timed live embedding smoke; and
+- the process engine identity and model-load count.
+
+`retrieval_mode: "full"` additionally means the current core, lexical, vector,
+and SCIP generations agree with the source and engine producer identity. It is
+an infrastructure gate. Answer sufficiency and citation resolution remain
+separate result-level checks.
+
+An older semantic generation with a different producer identity is rebuilt once
+through normal activation. CodeStory does not serve it through a compatibility
+branch.
 
 ## Execution policy
 
-| Host | Default production backend | Required evidence |
+| Platform | Production path | Release claim |
 | --- | --- | --- |
-| macOS | Metal | Physical Apple adapter, full model offload, timed live embedding smoke |
-| Windows | Vulkan | Physical adapter, software-adapter rejection, timed live embedding smoke |
-| Linux | Vulkan | Physical adapter, software-adapter rejection, timed live embedding smoke |
+| macOS Apple Silicon | Metal | Physical Apple adapter, full layer offload, timed live smoke |
+| macOS Intel | No Metal claim | Explicit CPU is maintainer/CI only |
+| Windows | Vulkan | Physical adapter, software-adapter rejection, full layer offload, timed live smoke |
+| Linux | Vulkan-capable package | No GPU claim without protected real-hardware evidence |
 
-CodeStory rejects WARP, llvmpipe, lavapipe, and other software adapters for an
-accelerated claim. Production never silently falls back to CPU. Hosted CI may
-set `CODESTORY_EMBED_ALLOW_CPU=1`; diagnostics then report `cpu_explicit`
-instead of `accelerated`.
-
-Engine readiness requires:
-
-- the exact embedded model digest;
-- the linked ggml build identity;
-- the selected backend and physical adapter identity;
-- a timed live embedding smoke; and
-- an explicit `accelerated` or `cpu_explicit` policy.
-
-Changing the model or ggml producer identity invalidates the semantic
-generation. CodeStory rebuilds an older generation once through the normal
-activation path; it does not retain compatibility branches.
-
-## Publication and cleanup
-
-The retrieval manifest binds project/workspace identity, the core publication,
-the lexical and vector SQLite generations, the in-process embedding producer,
-and the SCIP graph artifact. Writers validate a complete candidate before
-publication. Readers pin one coherent publication; a concurrent change returns
-`cache_busy` and permits one bounded retry.
-
-Use the read-only inventory before deleting generations:
+WARP, llvmpipe, lavapipe, and other software adapters cannot satisfy an
+accelerated policy. Production never silently falls back to CPU. Hosted CI may
+set:
 
 ```sh
+CODESTORY_EMBED_ALLOW_CPU=1
+```
+
+That path must report `cpu_explicit` and carries no Metal or Vulkan claim.
+
+## Diagnostics
+
+`doctor`, `retrieval status`, and MCP status are observational. They do not
+initialize the model or start a retrieval build merely to fill diagnostic
+fields.
+
+```sh
+codestory-cli doctor --project <repo> --format json
+codestory-cli retrieval status --project <repo> --format json
 codestory-cli retrieval inventory --project <repo> --format markdown
 ```
 
-Apply only its CodeStory-owned plan:
+For a live MCP process that has initialized the engine, issue an MCP
+`resources/read` request with URI:
+
+```text
+codestory://diagnostics/retrieval-engine
+```
+
+The resource is intentionally omitted from ordinary user routing. It reports
+backend, adapter, model/build identity, policy, smoke timing, layer offload,
+model loads, and materialization reuse.
+
+## Failure isolation
+
+| Failure | Product behavior | Maintainer action |
+| --- | --- | --- |
+| Engine still initializing | Same tool returns `preparing` with a retry delay | Let the owner finish; do not start another engine |
+| Unsupported or software adapter | Broad search returns unavailable; local map remains usable | Capture diagnostics and verify the packaged platform policy |
+| Model materialization mismatch | Engine fails closed before use | Preserve the path and digest evidence; let the next verified materialization replace only owned state |
+| Retrieval producer changed | Old semantic generation is not admitted | Run normal full retrieval publication and verify the new identity |
+| Core or retrieval publication changes during query | Query returns `cache_busy` | Retry once against the new complete publication |
+| Persisted generation is corrupt or incomplete | Broad search is blocked; prior complete generation remains eligible | Inspect status and rebuild only the named repository generation |
+
+Do not diagnose an acceleration failure by enabling CPU. Do not delete the
+entire user cache, kill unrelated processes, or infer ownership from a path
+name alone.
+
+## Publication and cleanup
+
+The retrieval manifest binds project/workspace identity, the core generation,
+the lexical/vector SQLite generation, the in-process producer, and the SCIP
+artifact. Writers stage and validate a full candidate before changing the live
+pointer. Readers hold publication and generation leases for the duration of a
+query.
+
+Inventory cleanup before applying it:
 
 ```sh
+codestory-cli retrieval inventory --project <repo> --format markdown
 codestory-cli retrieval inventory --project <repo> --apply --format markdown
 ```
 
-Cleanup remains generation- and ownership-scoped. Do not delete a user cache
-or broadly kill processes.
+Deletion is root-handle-relative and generation-scoped. Apply only plans whose
+ownership identity is current and unambiguous.
 
 ## Proof boundary
 
-Hosted proof may use explicit CPU operation. Platform acceleration claims need
-the packaged executable on real hardware. Acceptance separates cold engine
-initialization, warm query latency, bulk indexing throughput, process RSS, GPU
-memory, vector parity, retrieval quality, multi-repository reuse, and restart
-materialization reuse.
+Hosted CPU proof validates source, package, and protocol behavior. An
+acceleration claim requires the packaged executable on physical hardware.
+Measure cold initialization, warm query latency, bulk embedding throughput,
+process RSS, GPU memory, vector parity, retrieval quality, multi-repository
+reuse, and restart materialization reuse separately.
 
 See [retrieval architecture](../testing/retrieval-architecture.md),
 [retrieval design](../architecture/retrieval-design.md), and the

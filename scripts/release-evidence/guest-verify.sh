@@ -10,6 +10,7 @@ repository=$(get '.repository')
 runner_name=$(get '.runner.name')
 runner_version=$(get '.runner.version')
 runner_root=$(get '.runner.root')
+data_root=$(get '.runner.data_root')
 drill_commit=$(get '.drill.commit')
 
 mount_table=$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | sort)
@@ -30,6 +31,7 @@ for host_path in /Users /Users/albert; do
   fi
 done
 mountpoint -q "$runner_root"
+test "$(findmnt -rn -o TARGET -T "$data_root")" = "$(get '.vm.data_disk_mount')"
 echo "host_mounts=none host_home_visible=false"
 
 test "$(sed -n 's/^ID=//p' /etc/os-release)" = "$(get '.guest.os_id')"
@@ -38,12 +40,15 @@ test "$(uname -m)" = "$(get '.guest.architecture')"
 test "$(nproc)" = "$(get '.vm.cpus')"
 test "$(sed -n 's/^serial: //p' /etc/cloud/build.info)" = "$(get '.vm.base_image.guest_build_serial')"
 
-python3 - "$runner_root" <<'PY'
-import os, shutil, sys
+python3 - "$runner_root" "$(get '.vm.memory_gib')" <<'PY'
+import shutil, sys
 root = sys.argv[1]
-memory_gib = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+configured_memory_gib = int(sys.argv[2])
+with open("/proc/meminfo", encoding="utf-8") as meminfo:
+    memory_kib = int(next(line.split()[1] for line in meminfo if line.startswith("MemTotal:")))
+memory_gib = memory_kib * 1024 / 2**30
 disk_gib = shutil.disk_usage(root).free / 2**30
-assert memory_gib >= 16, memory_gib
+assert memory_gib >= configured_memory_gib - 1, memory_gib
 assert disk_gib >= 20, disk_gib
 print(f"memory_gib={memory_gib:.4f} workspace_free_gib={disk_gib:.2f}")
 PY
@@ -66,7 +71,7 @@ jq -e --arg profile_id "$profile_id" --arg contract_sha "$contract_sha" \
   .host.lima_version == $contract[0].host.lima_version and
   .vm.profile == $contract[0].vm.profile and .vm.type == $contract[0].vm.type and
   .vm.architecture == $contract[0].vm.architecture and
-  .vm.runtime == $contract[0].vm.runtime and
+  .vm.runtime == $contract[0].vm.runtime and .vm.binfmt == $contract[0].vm.binfmt and
   .vm.mount_type == $contract[0].vm.mount_type and .vm.host_mounts == [] and
   .vm.cpus == $contract[0].vm.cpus and .vm.memory_gib == $contract[0].vm.memory_gib and
   .vm.data_disk_gib == $contract[0].vm.data_disk_gib and

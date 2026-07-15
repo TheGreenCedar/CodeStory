@@ -7,7 +7,11 @@ from an indexed workspace, use contributor CLI commands in
 [getting-started.md](../contributors/getting-started.md) or operator repair
 paths in [users/troubleshooting.md](../users/troubleshooting.md).
 
-Default `index` includes graph-native symbol docs and selected dense anchors. A successful run returns only after graph indexing, snapshots, lexical search projection, deterministic `symbol_search_doc` rows, component reports, and persisted dense-anchor docs are synchronized. Semantic work is measured separately in the phase timings instead of being hidden behind a later read command.
+Default `index` includes graph-native symbol docs and selected dense anchors. A
+successful run returns only after graph indexing, snapshots, lexical search
+projection, deterministic `symbol_search_doc` rows, component reports, and
+persisted dense-anchor inputs are synchronized. This is the core publication
+contract. Immutable retrieval generation finalization is a separate fence.
 
 ## End-To-End Command Path
 
@@ -43,6 +47,34 @@ sequenceDiagram
 - `codestory-runtime` owns the runtime search engine, symbol doc and dense-anchor sync, retrieval readiness, and timing surface.
 
 That split is intentional: the runtime orchestrates the run, the indexer performs indexing work, and the store owns persistence mechanics.
+
+## Two publication fences
+
+```mermaid
+flowchart LR
+    Files["source inventory"] --> CoreBuild["index and resolve graph"]
+    CoreBuild --> Core["publish codestory.db"]
+    Core --> Inputs["symbol docs, reports, reusable dense rows"]
+    Files --> RetrievalBuild["build immutable retrieval generation"]
+    Inputs --> RetrievalBuild
+    Engine["process-wide embedding engine"] --> RetrievalBuild
+    RetrievalBuild --> Retrieval["publish lexical + vectors + SCIP + manifest"]
+```
+
+Core indexing and retrieval publication deliberately do not share one commit:
+
+1. runtime and store publish a coherent core graph generation;
+2. runtime synchronizes deterministic search documents and reusable dense inputs
+   in that core generation;
+3. a broad activating call or explicit retrieval-index operation builds and
+   validates immutable `lexical-index.sqlite3`, `vectors.sqlite3`, and SCIP
+   artifacts;
+4. retrieval publishes a manifest that binds those artifacts to the exact core
+   generation/run, source input, and embedding producer.
+
+Local graph navigation can use a current core publication while retrieval is
+still preparing. Packet/search requires both publications plus a live
+policy-compliant engine. See [retrieval design](retrieval-design.md).
 
 ## Indexer Phases
 
@@ -215,7 +247,7 @@ The last step belongs to runtime plus store:
 
 Full and incremental snapshot behavior are intentionally not symmetric.
 
-### 11. Runtime synchronizes search, symbol docs, and dense anchors
+### 11. Runtime synchronizes core search inputs
 
 After graph and snapshot work, runtime rebuilds the search-symbol projection, opens or refreshes the persisted Tantivy search directory, writes graph-native symbol docs, writes deterministic component reports, and synchronizes selected dense-anchor docs. This is part of the default `index` contract.
 
@@ -238,17 +270,10 @@ The dense-anchor policy version is `graph_first_v1`. Dense reasons are `public_a
 
 The default semantic text alias policy is `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`. It keeps compact language, terminal-name, owner-name, and symbol-role hints, but leaves out the noisier full name-alias and path-alias lists from the earlier `current_alias` research variant. Use `no_alias` for baseline research rows and `current_alias` only when reproducing older alias-enriched runs.
 
-Embedding throughput is optimized inside the CodeStory process:
-
-- pending dense-anchor docs are sorted by generated text length before embedding, which keeps batches close to uniform length
-- the default semantic embedding batch size is `128`, with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` available for profiling
-- one process-wide model and accelerator context serves every open repository
-- the checksum-pinned BGE-base Q8 model, tokenizer contract, CLS pooling, and
-  normalization are compiled into the executable
-- Metal or Vulkan is required for production; CPU is accepted only when
-  `CODESTORY_EMBED_ALLOW_CPU=1` was set explicitly
-- old producer identities are rejected and rebuilt rather than retained behind
-  compatibility branches
+Dense input generation remains part of core indexing. Model execution,
+query-versus-bulk scheduling, platform policy, and immutable vector publication
+belong to [retrieval design](retrieval-design.md) and the
+[llama-sys subsystem](subsystems/llama-sys.md).
 
 Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md). Architecture explains the lifecycle; the testing log owns time-specific numbers because caches, backends, and workstation state drift.
 
@@ -281,6 +306,10 @@ Files, nodes, edges, occurrences, component access, and callable projection stat
 ### What full refresh publishes that incremental refresh does not
 
 Full refresh builds a staged database and publishes it only after staged finalization succeeds. Incremental refresh never publishes a staged build; it updates the live store and refreshes live snapshots in place.
+
+Neither core path alone publishes the immutable retrieval generation.
+Retrieval finalization binds its candidate to the resulting core generation and
+leaves the prior retrieval publication active if source or core identity drifts.
 
 ### How symbol docs and dense anchors are kept fast
 
@@ -338,10 +367,10 @@ remain the primary reference when you are learning the pipeline.
 
 If you change indexing behavior, review or run the suites that guard it:
 
-- `cargo test -p codestory-indexer --test fidelity_regression`
-- `cargo test -p codestory-indexer parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached`
-- `cargo test -p codestory-indexer artifact_cache_result_changed_with_restored_mtime_is_rejected`
-- `cargo test -p codestory-store projection_batch_round_trips_and_clears_file_content_hash`
-- `cargo test -p codestory-indexer --test tictactoe_language_coverage`
-- `cargo test -p codestory-indexer --test integration`
+- `cargo test -p codestory-indexer --locked --test fidelity_regression`
+- `cargo test -p codestory-indexer --locked parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached`
+- `cargo test -p codestory-indexer --locked artifact_cache_result_changed_with_restored_mtime_is_rejected`
+- `cargo test -p codestory-store --locked projection_batch_round_trips_and_clears_file_content_hash`
+- `cargo test -p codestory-indexer --locked --test tictactoe_language_coverage`
+- `cargo test -p codestory-indexer --locked --test integration`
 - targeted resolution suites under `crates/codestory-indexer/tests/`

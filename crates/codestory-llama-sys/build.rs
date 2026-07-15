@@ -4,10 +4,10 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-const MODEL_FILE_NAME: &str = "bge-base-en-v1.5.Q8_0.gguf";
-const MODEL_SIZE: u64 = 117_974_304;
-const MODEL_SHA256: &str = "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c";
-const PRODUCT_EMBEDDING_RUNTIME_FAMILY: &str = "inprocess:bge-base-en-v1.5:q8_0";
+const MODEL_FILE_NAME: &str = "coderankembed.Q8_0.gguf";
+const MODEL_SIZE: u64 = 146_029_792;
+const MODEL_SHA256: &str = "666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa";
+const PRODUCT_EMBEDDING_RUNTIME_FAMILY: &str = "inprocess:coderank-embed:q8_0";
 const LLAMA_CPP_CRATE_VERSION: &str = "0.1.151";
 const LLAMA_CPP_SOURCE_COMMIT: &str = "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66";
 

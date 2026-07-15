@@ -2,41 +2,69 @@
 
 ## Unreleased
 
-### Changed
+## 0.16.0
 
-- CodeStory now links llama.cpp/ggml into the CLI and embeds the checksum-pinned
-  BGE-base-en-v1.5 Q8 model in the release executable. Retrieval performs no
-  model or backend download and starts no helper process.
-- One lazily initialized engine and accelerator context is shared by every
-  repository in a multi-project process. Apple Silicon uses Metal; Windows and
-  supported Linux hardware use Vulkan. CPU requires the explicit
-  `CODESTORY_EMBED_ALLOW_CPU=1` policy and is never a silent fallback.
-- Retrieval health now binds the exact model digest and ggml build, backend and
-  physical adapter, live embedding smoke, policy, process engine identity,
-  model load count, materialization reuse, and accelerator layer-offload proof.
-  Ordinary plugin UX reports only whether retrieval is ready.
-- Existing semantic generations from another producer rebuild once under the
-  in-process identity. Endpoint configuration, downloads, port leases, PID
-  ownership, server logs, repair workers, shutdown supervision, and interactive
-  approval language have been removed.
-- Windows vector publication now flushes a writable durability handle, and
-  model hashing uses heap storage instead of depending on an enlarged build
-  script stack.
-- Packaged proof runs offline from one executable, verifies Metal or Vulkan on
-  protected hardware, exercises two repositories through one warm engine, and
-  proves content-addressed model reuse after restart. Hosted jobs install the
-  pinned Vulkan build contract, use the explicit CPU policy, and make no
-  acceleration claim; Linux x64 proof retains the glibc 2.31 baseline.
-- Delegated worktree setup uses `retrieval index` for its optional full proof
-  and no longer enters an embedding repair lifecycle.
-- A first `ground` request now initializes the in-process engine before
-  indexing. While the first complete publication is still being built, ground
-  and broad-search tools return a short same-tool retry instead of an empty
-  success or terminal unavailable result.
-- Installed-host semantic migrations now keep packet, search, and context in a
-  same-tool preparing state while a refresh owns publication. Successful MCP
-  search reports only that retrieval is ready, and grounding no longer exposes
-  obsolete server-era semantic counters or backend details.
+### Highlights
+
+- CodeStory search now lives inside the CodeStory executable. The release ships
+  with its model and embedding engine already included, so there is no helper
+  server, Docker service, model download, endpoint, port, or repair process to
+  manage.
+- First use is automatic. Ask a repository question and CodeStory prepares the
+  map and search index itself. If a large project needs more time, the agent
+  retries the same tool; users are never asked to approve or repair an internal
+  retrieval component.
+- One warm embedding engine can serve several open repositories while every
+  repository keeps its own cache, publication, and readiness state. Switching
+  projects no longer means loading the model again.
+- Apple Silicon uses Metal. Windows and supported Linux hardware use Vulkan.
+  Production never silently falls back to CPU; hosted CI can opt into the
+  clearly labelled CPU path without making an acceleration claim.
+- Search readiness now proves the exact model and engine build, physical
+  adapter, full accelerator offload, a live embedding smoke, and one coherent
+  graph/search publication before returning broad evidence.
+
+### Better first use and recovery
+
+- A first `ground`, `packet`, or `search` call can finish managed preparation
+  without a separate setup command. While a new semantic generation is being
+  published, the same call returns a short retry instead of an empty answer or
+  a dead-end error.
+- Existing semantic indexes rebuild once under the new in-process producer
+  identity. The previous complete publication remains usable during safe
+  refreshes, and mixed-generation results still fail closed.
+- Normal plugin output now says whether retrieval is ready, preparing, or
+  unavailable. Model, backend, adapter, and timing details stay in maintainer
+  diagnostics instead of leaking into everyday agent conversations.
+- The user, contributor, operations, and architecture documentation has been
+  rebuilt around the actual single-executable lifecycle, multi-repository
+  routing, publication boundaries, and the shortest recovery path.
+
+### Performance and release confidence
+
+- CodeRankEmbed Q8 replaces BGE-base-en-v1.5 after a same-machine Metal
+  comparison. On the frozen dense-retrieval slice it improved MRR@10 by 36%
+  and Hit@1 by 55%. It is a larger, slower model, but the quality gain was worth
+  the measured throughput and memory cost. Existing semantic generations
+  rebuild once; no experimental selector or compatibility branch ships.
+- Offline package proof now starts from one executable, exercises multiple
+  repositories through one engine, verifies restart cache reuse, and rejects
+  software adapters such as WARP, llvmpipe, and lavapipe.
+- Windows vector publication now flushes a writable durability handle, and the
+  release model hash no longer depends on an enlarged build-script stack.
+- Release evidence is routed through the in-process Linux ARM64 machine profile.
+  Its pinned VM image supplies containerd directly, without retaining a Docker
+  repository package dependency. The one-shot proof VM is capped at 8 GiB, its
+  workspace is mounted only after the dedicated data disk is ready, unused
+  cross-architecture emulation is disabled, and the VM is stopped after the
+  final proof. Mac signing and notarization remain publication-only gates, not
+  PR blockers.
+
+### Upgrade note
+
+Install the updated plugin package and start a fresh host session. The first
+broad-search call may take longer while CodeStory rebuilds the semantic
+generation once; no manual cleanup or migration command is required.
 
 ## 0.15.0
 
@@ -83,10 +111,10 @@
 
 ### Reliability and operations
 
-- The legacy ONNX backend and its runtime, installer, setup, configuration, and
+- The legacy embedding backend and its runtime, installer, setup, configuration, and
   environment selections have been removed. Use managed llama.cpp under the
   host's configured accelerator/CPU policy, or a trusted external endpoint
-  under explicit CPU/external policy. Stale ONNX settings now fail with
+  under explicit CPU/external policy. Stale retired-backend settings now fail with
   migration guidance instead of being silently ignored.
 - Existing retrieval rows migrate in place. Ambiguous legacy sidecar or broker
   state is retained for bounded inventory and cleanup but is not reused; deep
@@ -665,7 +693,7 @@ report managed CLI state, repair sidecar onboarding when allowed, and avoid
 falling back to stale ambient PATH binaries when Codex launches the installed
 adapter without plugin data environment variables.
 
-This release also removes the ONNX product embedding runtime, tightens agent
+This release also removes the previous product embedding runtime, tightens agent
 repair progress/status reporting, adds handoff proof-target status, and trims
 Codex starter prompts so installed plugin manifests load without overlong
 default-prompt warnings.

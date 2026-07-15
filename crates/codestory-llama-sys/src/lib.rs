@@ -320,7 +320,7 @@ fn run_engine_owner(
         &model,
         &mut context,
         &[
-            "Represent this sentence for searching relevant passages: codestory embedding smoke"
+            "Represent this query for searching relevant code: codestory embedding smoke"
                 .to_string(),
         ],
         RequestPriority::Query,

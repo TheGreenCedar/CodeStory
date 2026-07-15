@@ -10,7 +10,7 @@ benchmarks, packaging, or accelerator claims. Match the proof to the claim.
 | Runtime | Runtime library, generalization, and retrieval-eval lanes | Packet/search admission and result behavior |
 | CLI and plugin | Focused CLI protocol tests plus plugin static tests | Transport and user-facing capability state |
 | Performance | Same-build incumbent/candidate rows for cold initialization, warm search, bulk indexing, RSS, GPU memory, vector parity, quality, and multi-repository reuse | Promotion only when no repeatable regression exceeds the 5% noise allowance |
-| Hosted engine smoke | `.github/workflows/retrieval-engine-smoke.yml` | Retrieval, runtime, stdio, indexing, engine identity, docs, scripts, or workflow changes | Explicit CPU policy only; no Metal or Vulkan claim |
+| Hosted engine smoke | Managed CI with explicit CPU policy | Source and protocol behavior only; no Metal or Vulkan claim |
 | Packaged hardware | Protected Metal or Vulkan workflow using the packaged executable offline | Only the exact backend and adapter exercised by that artifact |
 
 Normal plugin calls prepare retrieval automatically. They expose `ready`,
@@ -38,12 +38,13 @@ without real Vulkan hardware evidence.
 
 ## Quality and performance gate
 
-The accepted historical BGE-base Q8 baseline is about 368-372 embedded
-documents/sec, 84.7 ms cross-repository search p95, MRR@10 0.9824, Hit@10 1.0,
-Hit@1 0.973, and 829-1,020 MB peak working set. Compare old and new paths in the
-same release build on the same machine. A result outside the 5% measurement
-noise allowance blocks deletion or promotion unless the difference is proved
-non-repeatable. Do not merge an A/B switch or the legacy implementation.
+CodeRankEmbed Q8 is the current product model. It was selected over BGE by the
+#1164 same-machine Metal study because the frozen dense-retrieval slice improved
+MRR@10 by 36% and Hit@1 by 55%. For a future model change, compare the current
+path and candidate in the same release build and machine. Treat quality as the
+primary gate; report throughput, warm latency, RSS, and GPU memory separately
+so an accepted tradeoff remains explicit. Do not merge a temporary A/B selector
+or displaced implementation.
 
 Run repo-scale stats once on the final merge-ready head when the testing matrix
 requires it. The stats log is telemetry, not release authorization.

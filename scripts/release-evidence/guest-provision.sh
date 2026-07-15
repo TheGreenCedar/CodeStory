@@ -63,10 +63,6 @@ sudo install -d -m 0755 "$runner_root"
 if ! mountpoint -q "$runner_root"; then
   sudo mount --bind "$data_root" "$runner_root"
 fi
-fstab_line="$data_root $runner_root none bind,nofail 0 0"
-if ! grep -Fqx "$fstab_line" /etc/fstab; then
-  printf '%s\n' "$fstab_line" | sudo tee -a /etc/fstab >/dev/null
-fi
 sudo install -d -o codestory-runner -g codestory-runner -m 0750 \
   "$runner_root/actions-runner" "$runner_root/cache" \
   "$runner_root/cargo" "$runner_root/rustup" "$runner_root/sccache" \

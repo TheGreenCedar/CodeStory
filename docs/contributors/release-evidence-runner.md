@@ -6,7 +6,7 @@ stable between candidates. Ordinary pull requests must not target this runner.
 
 ## Machine contract
 
-The approved host shape for the first v0.15 baseline is:
+The approved host shape for the 0.16 in-process retrieval baseline is:
 
 | Field | Value |
 | --- | --- |
@@ -15,13 +15,12 @@ The approved host shape for the first v0.15 baseline is:
 | Physical host | `Mac17,4`, Apple M5, 24 GiB, macOS 26.5.2 |
 | VM | Colima VZ profile `codestory-release-evidence`, Ubuntu 24.04 ARM64 |
 | Colima | 0.10.3 |
-| Capacity | 4 vCPU, 17 GiB configured memory, 80 GiB data disk |
+| Capacity | 4 vCPU, 8 GiB maximum memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
-| Guest container runtime | containerd; the host context is never activated |
+| Guest container runtime | containerd from the checksum-pinned Colima image; foreign-architecture emulation is disabled and the host context is never activated |
 | Stable profile ID | `codestory-release-evidence-linux-arm64-v2` |
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
-| Model directory | `/srv/codestory-release-evidence/models` |
 | Drill manifest | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
 
 The profile ID is a stable comparison key, not evidence about the current
@@ -34,9 +33,9 @@ boot is rejected.
 ## Provision and verify
 
 The host needs macOS, Colima, and an authenticated `gh` with repository
-administration access. A 24 GiB Mac cannot safely run this 17 GiB profile beside
-the normal 8 GiB Colima profile; stop the normal profile first after confirming
-it has no active work.
+administration access. The proof VM is capped at 8 GiB and should run only for
+an accepted release head. Stop it immediately after collecting the final
+evidence; it is not a development service.
 
 From a clean trusted CodeStory checkout:
 
@@ -53,16 +52,22 @@ Provisioning is idempotent. It:
 - verifies the checksum-pinned Colima base image before VM creation;
 - installs native packages from a fixed Ubuntu archive snapshot at exact
   versions, then records the complete native package manifest;
+- uses the containerd runtime already owned by the checksum-pinned VM image;
+- binds the runner workspace from the dedicated 80 GiB data disk only after
+  Colima reports that disk ready, and verifies the single mount before accepting
+  evidence;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
-- verifies that the exact candidate contains its checksum-pinned BGE model and
+- verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and
   linked embedding engine without provisioning either one;
 - prepares a source-backed `serde_json` drill at an exact commit;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
 - keeps Cargo, Rust, temp, XDG, CodeStory, drill, work, and artifact state
   under the proof-owned volume.
 
-The tracked CodeStory source used by provisioning checks is streamed into the
+The runner workspace is mounted by the owned host lifecycle instead of guest
+`fstab`; this avoids boot-order races between the root disk and Colima's data
+disk. The tracked CodeStory source used by provisioning checks is streamed into the
 guest over SSH. It replaces the previous validation tree atomically enough for
 the stopped runner, so untracked or modified validation files cannot survive a
 provisioning pass. No source or tool is executed through a host mount. `verify`
@@ -134,9 +139,8 @@ evidence with:
 
 | Input | Value |
 | --- | --- |
-| `profile` | `codestory-release-evidence-linux-arm64-v1` |
+| `profile` | `codestory-release-evidence-linux-arm64-v2` |
 | `drill_manifest` | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
-| `embedding_model_dir` | `/srv/codestory-release-evidence/models` |
 | `source_run_id` | empty for measurement; a rejected run ID only for exact-artifact re-evaluation |
 
 If a measured candidate is rejected and receives an exact, expiring approval,

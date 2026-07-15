@@ -1,6 +1,6 @@
 # CLI reference
 
-Power-user and debug commands for `codestory-cli`. You should not need this page
+Maintainer and automation commands for `codestory-cli`. You should not need this page
 for first install — start with [user guides](README.md), then
 [Trust and readiness](trust-and-readiness.md) and
 [Troubleshooting](troubleshooting.md) if a session is blocked.
@@ -16,6 +16,10 @@ cargo build --release --locked -p codestory-cli
 
 Windows: `.\target\release\codestory-cli.exe`.
 
+Generated `codestory-cli --help` and subcommand help are the source of truth for
+flags. This page groups stable workflows and trust boundaries rather than
+copying every option.
+
 ## Readiness and retrieval
 
 | Situation | Command |
@@ -25,7 +29,7 @@ Windows: `.\target\release\codestory-cli.exe`.
 | Build packet/search retrieval | `codestory-cli retrieval index --project <repo> --refresh full --format json` |
 | Health summary | `codestory-cli doctor --project <repo>` |
 | Managed search status | `codestory-cli retrieval status --project <repo> --format json` |
-| Direct stdio MCP (debug) | `codestory-cli serve --project <repo> --stdio --refresh none` |
+| Direct single-project stdio MCP (debug) | `codestory-cli serve --project <repo> --stdio --refresh none` |
 
 Preflight exposes `safe_surfaces`, `blocked_surfaces`, and the next normal retrieval action.
 `ready --format json` returns `verdicts[]` with per-goal `status`, `summary`,
@@ -73,7 +77,7 @@ Read commands default to `--refresh none`. Use `--refresh incremental` when a
 read should refresh an existing cache first.
 
 Reserve `index --refresh full` or moving a cache aside for maintainer-directed
-recovery after status/`doctor` identifies that exact cache and coordinated local
+recovery after status or `doctor` identifies that exact cache and coordinated
 refresh cannot converge. Verify the path is under the active CodeStory cache
 root, preserve the old directory until the replacement is healthy, and never
 clean a user cache merely to make tests pass.

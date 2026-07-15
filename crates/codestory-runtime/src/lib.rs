@@ -17021,7 +17021,7 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("semantic docs after repair");
         assert!(
             repaired_docs.iter().all(|doc| {
-                doc.embedding_profile.as_deref() == Some("bge-base-en-v1.5")
+                doc.embedding_profile.as_deref() == Some("coderank-embed")
                     && doc.embedding_backend.as_deref() == Some("inprocess")
                     && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
             }),

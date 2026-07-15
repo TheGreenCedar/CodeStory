@@ -1,114 +1,156 @@
 # Retrieval Design
 
-CodeStory serves agent packet/search evidence only from a current, complete
-publication. The graph database, lexical shard, semantic vectors, SCIP data,
-and embedding producer identity are one fail-closed contract.
+CodeStory serves packet/search evidence only when one current core publication,
+one complete retrieval generation, and one live embedding engine agree.
+Artifact completeness, producer identity, and live execution are separate
+proofs; none can substitute for another.
 
-## Runtime shape
+## Engine scope
 
-The release contains one CodeStory executable. A small internal sys crate links
-llama.cpp and ggml into it, and the checksum-pinned BGE-base-en-v1.5 Q8 GGUF is
-embedded as release data. When mmap is required, the process atomically
-materializes those bytes to a content-addressed file below the CodeStory cache.
-The file is disposable and verified before use. Retrieval never downloads a
-model or helper executable.
+Release executables contain the checksum-pinned CodeRankEmbed Q8 GGUF model and
+statically linked llama.cpp/ggml implementation. The process materializes
+the model atomically to a verified content-addressed cache file when mmap is
+required. Retrieval performs no runtime model, backend, or helper download.
+Development builds may deliberately omit the embedded model; they cannot claim
+product retrieval readiness.
 
-One lazily initialized model and accelerator context is shared process-wide by
-every repository opened through multi-project stdio. One-shot CLI commands pay
-their own initialization cost; CodeStory does not use a daemon to conceal it.
+One lazily initialized engine serves every project in a multi-project stdio
+process. Initialization freezes process-level cache-root and CPU-policy
+compatibility; a later project cannot silently reconfigure the shared engine.
+One-shot CLI processes pay cold initialization themselves.
 
-| Platform | Production backend | Policy |
-| --- | --- | --- |
-| macOS Apple Silicon | Metal | Required and live-verified |
-| Windows | Vulkan | Required and live-verified |
-| Linux | Vulkan | Claimed only with protected hardware evidence |
-| Hosted CI / maintainer diagnostic | CPU | Only with `CODESTORY_EMBED_ALLOW_CPU=1` |
+The engine has one model worker with bounded interactive-query and bulk queues.
+Interactive queries take priority, including between bulk batches. Embedding
+uses the pinned CodeRank tokenizer, the
+`Represent this query for searching relevant code: ` query prefix, no document
+prefix, CLS pooling, L2 normalization, 768-dimensional vectors, and the product
+batching contract.
+
+| Environment | Backend policy |
+| --- | --- |
+| Apple Silicon macOS | verified Metal acceleration |
+| Windows | verified Vulkan acceleration |
+| Linux | verified Vulkan only where protected hardware evidence exists |
+| Hosted CI or maintainer diagnostic | CPU only with `CODESTORY_EMBED_ALLOW_CPU=1` |
 
 There is no silent GPU-to-CPU fallback. Software adapters such as llvmpipe,
-lavapipe, WARP, and SwiftShader are rejected for accelerated policy.
+lavapipe, WARP, and SwiftShader do not satisfy accelerated policy.
 
-## Embedding contract
+## Per-project artifact layout
 
-The product contract remains BGE-base-en-v1.5 Q8 GGUF with the pinned tokenizer,
-query and document prefixes, CLS pooling, normalization, dimensions, batching,
-and vector persistence format. These values participate in the producer and
-manifest identity. A change requires a new identity and rebuild.
+Each project cache contains a core `codestory.db` and immutable retrieval
+generations:
 
-Maintainer health evidence includes:
+- lexical source and virtual-document data in `lexical-index.sqlite3`;
+- semantic vectors and metadata in `vectors.sqlite3`;
+- a generation-bound SCIP artifact;
+- a manifest binding those artifacts to core, source, schema, and producer
+  identities.
 
-- exact model SHA-256 and linked ggml build identity;
-- backend and physical adapter identity;
-- `accelerated` or `cpu_explicit` policy;
-- timed live embedding smoke and initialization time;
-- process engine instance and model load count;
-- materialized model path/reuse state;
-- model and offloaded layer counts plus live accelerator verification.
+The core database also retains graph-native symbol documents, component reports,
+and reusable dense-anchor rows. Those rows are inputs to retrieval publication,
+not a replacement for the published vector generation.
 
-Normal plugin UX reduces that detail to whether retrieval is ready.
+```mermaid
+flowchart LR
+    Engine["one process-wide CodeRankEmbed engine"] --> BuildA["build generation A"]
+    Engine --> BuildB["build generation B"]
+    SourceA["repository A"] --> BuildA
+    SourceB["repository B"] --> BuildB
+    BuildA --> PublishA["immutable publication A"]
+    BuildB --> PublishB["immutable publication B"]
+```
+
+Model state is shared for efficiency; source, vectors, manifests, identities,
+and retention remain project-owned.
 
 ## Publication identity
 
-Each published retrieval generation binds:
+`RetrievalPublicationIdentity` carries:
 
-- core graph `generation_id` and `run_id`;
-- lexical version and source/input fingerprint;
-- semantic generation and Qdrant collection;
-- graph artifact hash, symbol-document count, and dense-anchor count;
-- embedding producer identity and schema/policy versions.
+- core `generation_id` and `run_id`;
+- retrieval generation and input hash;
+- semantic generation.
 
-Readers pin the core SQLite snapshot and semantic-generation lease together.
-Candidate resolution never reopens the current database halfway through a
-query. Before returning packet/search output, runtime revalidates both identities
-and returns `cache_busy` for one bounded retry when publication changed.
+The manifest additionally records lexical/source fingerprints, graph artifact
+identity, counts, schema and policy versions, and the embedding producer
+identity. Producer identity covers the model digest, ggml build, backend policy,
+prefix/pooling/normalization contract, and vector format. A changed producer
+causes one transparent generation rebuild; it does not select a legacy engine.
 
-Writers stage and validate a complete candidate, rescan source inside the
-publication fence, then publish atomically. Failure or drift leaves the prior
-generation live. Old semantic generations with the former producer identity
-are rebuilt once; there is no legacy execution branch.
+Some stable DTOs and internal types still use `sidecar` or
+`sidecar_generation` names. These are compatibility vocabulary for the
+project-local retrieval publication, not evidence of an external service.
 
-## Query path
+## Writer protocol
 
-1. Validate cheap immutable generation/schema metadata.
-2. Pin one complete retrieval publication.
-3. Generate the query vector with the shared in-process engine.
-4. Combine lexical, semantic, SCIP, and graph candidates under runtime policy.
-5. Resolve evidence through the pinned core snapshot.
-6. Revalidate publication and engine identity before returning.
+1. Read the current core publication and complete source inventory.
+2. Build lexical, vector, and SCIP artifacts in a candidate generation.
+3. Deep-validate schemas, row relationships, vectors, source identity, and
+   producer identity.
+4. Enter the publication fence and rescan the lexical source/input fingerprint.
+5. Reject drift and leave the previous generation active, or atomically publish
+   the complete candidate and manifest.
 
-Deep corpus validation runs at build, promotion, readiness, or explicit health
-boundaries, never before every query.
+Failure, cancellation, incomplete discovery, or source drift never authorizes a
+partial publication or deletion inferred from absence. Retention removes only
+proved CodeStory-owned generations through the shared handle-relative deletion
+boundary.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Previous: current publication
+    Previous --> Candidate: stage next generation
+    Candidate --> Validate: deep validation and source rescan
+    Validate --> Published: candidate is coherent
+    Validate --> Previous: failure or drift
+    Published --> [*]: atomic pointer update
+```
+
+Until the final pointer update, readers continue to use `Previous`. A rejected
+candidate never weakens the last known-good publication.
+
+## Reader protocol
+
+1. Cheaply validate immutable manifest and generation metadata.
+2. Execute lexical, vector, SCIP, and graph candidate work against the recorded
+   publication identity.
+3. Return hits with that identity.
+4. Open a matching core SQLite read transaction and retain the referenced
+   generation leases while resolving files, roles, and node IDs.
+5. Revalidate current core, retrieval, and engine identities before returning.
+
+Query and resolution are identity-coherent across separately pinned reads.
+They do not reopen “whatever is current” for numeric candidate resolution. A
+publication change yields `cache_busy` and permits one bounded runtime retry.
+Deep corpus validation belongs at build, promotion, readiness, or explicit
+health boundaries, not on every query.
 
 ## Readiness
 
-`retrieval_mode=full` remains the agent-facing classification. Full mode
-requires a current manifest, coherent graph/lexical/semantic identities, and a
-live engine satisfying its explicit policy. Missing, stale, partial, ambiguous,
-or mismatched evidence blocks packet/search while local graph navigation can
-remain available.
+`retrieval_mode=full` means the persisted retrieval artifacts form a complete
+publication. Broad agent surfaces additionally require:
 
-Status and doctor are observational. A product tool call may initialize the
-embedded engine and build missing retrieval state automatically; it never asks
-the user to approve an internal subsystem.
+- a current core and source identity;
+- the exact in-process producer identity;
+- a live timed embedding smoke;
+- `accelerated` or explicitly permitted `cpu_explicit` policy;
+- an allowed packet/search/context surface.
 
-## Ownership and cleanup
+This preserves the wire contract while preventing a full manifest from
+overriding unavailable live execution. Normal plugin output reports that
+retrieval is ready, preparing, or unavailable. Backend, adapter, model, and
+timing details stay in maintainer diagnostics.
 
-Retrieval artifacts live below the project cache and are removed only through
-the shared owned-deletion boundary using a trusted root handle and relative
-generation path. Cleanup never follows a previously validated pathname and
-never removes resources outside a proved CodeStory ownership token.
+Status and doctor observe this state. A broad product call may initialize the
+engine and build a missing generation automatically; it never asks the user to
+approve or repair an internal subsystem.
 
-There are no embedding endpoints, ports, leases, PIDs, repair workers, server
-logs, or process shutdown records in this architecture.
+## Ownership and evidence
 
-## Performance gate
-
-Changes to the engine compare incumbent and candidate inside the same release
-build on the same machine. Measure cold initialization, warm queries, bulk
-indexing, RSS, GPU memory, vector parity, quality, and multi-repository reuse
-separately. The accepted historical reference is roughly 368-372 embedded
-documents/sec, 84.7 ms cross-repository search p95, MRR@10 0.9824, Hit@10 1.0,
-Hit@1 0.973, and 829-1,020 MB peak working set. Five percent is measurement
-noise, not an allowed repeatable regression.
-
-See [retrieval engine operations](../ops/retrieval-engine.md) and the
-[testing architecture](../testing/retrieval-architecture.md).
+`codestory-retrieval` owns artifact construction, manifest health, query
+execution, retention, and engine integration. `codestory-runtime` owns when to
+prepare retrieval and how to assemble product evidence. See
+[retrieval subsystem](subsystems/retrieval.md),
+[llama-sys subsystem](subsystems/llama-sys.md), and
+[retrieval verification](../testing/retrieval-architecture.md).

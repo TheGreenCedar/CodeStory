@@ -128,13 +128,13 @@ pub fn manifest_staleness_reason_for_runtime(
                         || stats.mixed_semantic_policy_versions
                         || stats.semantic_policy_version.as_deref()
                             != Some(SEMANTIC_POLICY_VERSION)
-                        || stats.embedding_profile.as_deref() != Some("bge-base-en-v1.5")
+                        || stats.embedding_profile.as_deref() != Some("coderank-embed")
                         || stats.embedding_dim
                             != Some(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32)
                         || !stats
                             .embedding_model
                             .as_deref()
-                            .is_some_and(|model| model.contains("bge-base-en-v1.5")))
+                            .is_some_and(|model| model.contains("coderank-embed")))
                 {
                     return Some(SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED.into());
                 }
@@ -222,10 +222,10 @@ fn sidecar_stored_embedding_is_product_compatible(doc: &LlmSymbolDoc) -> bool {
     {
         return false;
     }
-    if doc.embedding_profile.as_deref() != Some("bge-base-en-v1.5") {
+    if doc.embedding_profile.as_deref() != Some("coderank-embed") {
         return false;
     }
-    if !doc.embedding_model.contains("bge-base-en-v1.5") {
+    if !doc.embedding_model.contains("coderank-embed") {
         return false;
     }
     doc.embedding_backend.as_deref() == Some("inprocess")
@@ -413,18 +413,18 @@ mod tests {
     }
 
     #[test]
-    fn manifest_staleness_rejects_old_onnx_embedding_contract() {
+    fn manifest_staleness_rejects_wrong_embedding_contract() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");
         let storage = Store::open(&storage_path).expect("open store");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
-        manifest.embedding_backend = Some("onnx:bge".into());
+        manifest.embedding_backend = Some("inprocess:unexpected-model:q8_0".into());
 
         let reason = manifest_staleness_reason(&storage, &manifest)
             .expect("embedding backend drift should stale manifest");
 
         assert!(reason.contains("sidecar_embedding_backend_changed"));
-        assert!(reason.contains("manifest=onnx:bge"));
+        assert!(reason.contains("manifest=inprocess:unexpected-model:q8_0"));
     }
 
     #[test]
@@ -525,7 +525,7 @@ mod tests {
             doc_text: "semantic_doc_version: 4\nsymbol_kind: FUNCTION\nname: do_work".into(),
             doc_version: 4,
             doc_hash: format!("hash-{node_id}"),
-            embedding_profile: Some("bge-base-en-v1.5".into()),
+            embedding_profile: Some("coderank-embed".into()),
             embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
             embedding_backend: Some("inprocess".into()),
             embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,

@@ -1,70 +1,48 @@
 # Runtime Subsystem
 
-`codestory-runtime` is the only orchestration layer.
+`codestory-runtime` is the only product orchestration layer. It decides which
+owning service to call and assembles cited product results; it does not own
+adapter syntax, SQLite mechanics, parsers, or model execution.
 
 ## Ownership
 
-- project open and summary flows
-- full and incremental indexing orchestration
-- runtime-owned search engine state and ranking
-- symbol-doc synchronization, dense-anchor reuse, and retrieval readiness reporting
-- grounding, trail, symbol, and snippet assembly
-- agent-oriented retrieval and answer flows
+- project open, summary, and refresh orchestration;
+- full and incremental indexing across workspace, indexer, and store;
+- graph-native symbol-document and dense-anchor synchronization;
+- grounding, trails, symbol workflows, target context, search, and packet
+  assembly;
+- managed retrieval preparation and user-facing gap mapping;
+- generation-coherent candidate resolution and one bounded publication retry.
 
-## Entry Points
+## Main paths
 
-- `crates/codestory-runtime/src/lib.rs`
-- `crates/codestory-runtime/src/services.rs`
-- `crates/codestory-runtime/src/search/`
-- `crates/codestory-runtime/src/grounding.rs`
-- `crates/codestory-runtime/src/support.rs`
+- `src/lib.rs` and `src/services.rs`: project/index services and retained state
+- `src/grounding.rs` and `src/support.rs`: grounding and support assembly
+- `src/search/`: runtime search state and graph-native documents
+- `src/agent/`: packet, retrieval-primary, planning, and evidence workflows
 
-## Call Chain
+## Publication contract
 
-1. CLI builds a runtime context.
-2. Runtime opens the workspace and store.
-3. Runtime calls into indexer and store as needed.
-4. Runtime maps persisted data into contract DTOs.
-5. CLI renders results.
+Runtime publishes the core index through store, then asks retrieval to finalize
+immutable lexical/vector/SCIP state when a broad operation needs it. On reads it
+requires query hits and candidate resolution to share one
+`RetrievalPublicationIdentity`, holds the core read and generation leases, and
+revalidates before returning. Publication drift permits one bounded retry.
 
-## Extension Points
+The process-wide engine belongs to retrieval/llama-sys. Runtime may cause its
+lazy initialization, but cannot reconfigure it per project or infer readiness
+from `retrieval_mode` alone.
 
-- add new public services in `services.rs`
-- add new retrieval logic under `src/search/`
-- add new grounding or agent flows under runtime modules, not CLI
+## Extension rules
 
-## Search And Semantic Sync
+- put reusable product workflows here and expose typed contract DTOs;
+- keep command parsing/rendering in CLI and persistence in store;
+- extend packet/search through the existing retrieval-primary path rather than
+  creating a second scoring or readiness system.
 
-Runtime owns the default semantic-sync path after graph indexing completes. The store owns persisted rows, but runtime decides when to build graph-native symbol docs, when to build component reports, when to classify dense anchors under `graph_first_v1`, when to reuse or embed selected dense anchors, when to reload them into the search engine, and how to report readiness to CLI callers.
+## Failure signatures
 
-Important tuning surfaces:
-
-- `CODESTORY_SEMANTIC_DOC_SCOPE`: default durable symbol-doc scope; use `all` only for diagnostics that need the older broad symbol set
-- `CODESTORY_SEMANTIC_DOC_ALIAS_MODE`: default `alias_variant`; use `no_alias` for baseline research rows or `current_alias` for the older full alias text
-- `CODESTORY_SEMANTIC_DOC_MAX_TOKENS`: generated symbol-doc and dense-anchor text token budget.
-- `CODESTORY_EMBED_ALLOW_CPU`: explicit CPU permission for hosted CI and maintainer diagnostics; production never falls back silently.
-- `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE`: semantic doc embedding batch size, default `128`.
-
-Product packet/search evidence uses one process-wide in-process embedding
-engine shared by every open repository. The release executable contains the
-checksum-pinned BGE-base Q8 model and linked llama.cpp/ggml implementation.
-Metal is required on supported macOS production hosts; Vulkan is required on
-supported Windows and Linux production hosts. Health must report
-`retrieval_mode=full`, the exact model and build identity, the physical adapter,
-and a timed live embedding smoke. Stored generations from another producer fail
-closed and rebuild once. Current benchmark findings live in
-[embedding-backend-benchmarks.md](../../testing/embedding-backend-benchmarks.md).
-
-`retrieval index` initializes the engine when needed and writes generation-bound
-artifacts and manifest metadata. There is no runtime download, endpoint, daemon,
-port, or user setup. Missing or non-product embedding state fails closed for
-agent-facing retrieval.
-
-Timing fields for this path are in `IndexingPhaseTimings`: `search_projection_rebuild_ms`, `search_symbol_index_ms`, `runtime_cache_publish_ms`, `semantic_doc_build_ms`, `semantic_embedding_ms`, `semantic_db_upsert_ms`, `semantic_reload_ms`, `semantic_prune_ms`, `symbol_search_docs_written`, `semantic_dense_docs_skipped`, dense reason counters, `semantic_docs_reused`, `semantic_docs_embedded`, `semantic_docs_pending`, and `semantic_docs_stale`.
-
-## Failure Signatures
-
-- runtime regains direct persistence logic
-- search engine internals become public API
-- CLI formatting concerns start driving runtime behavior
-- symbol docs or dense anchors become an implicit background side effect instead of an explicit index phase
+- CLI or MCP adapter composes product semantics;
+- candidate IDs resolve against whatever core database is current;
+- core indexing success is reported as full retrieval readiness;
+- a project operation mutates process-wide defaults.

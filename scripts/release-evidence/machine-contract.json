@@ -13,7 +13,7 @@
       "codestory-release-evidence"
     ],
     "root": "/srv/codestory-release-evidence",
-    "data_root": "/var/lib/codestory-release-evidence"
+    "data_root": "/mnt/lima-colima-codestory-release-evidence/codestory-release-evidence"
   },
   "host": {
     "architecture": "arm64",
@@ -30,12 +30,14 @@
     "type": "vz",
     "architecture": "aarch64",
     "runtime": "containerd",
+    "binfmt": false,
     "activate_host_context": false,
     "mount_type": "virtiofs",
     "host_mounts": [],
     "cpus": 4,
-    "memory_gib": 17,
+    "memory_gib": 8,
     "data_disk_gib": 80,
+    "data_disk_mount": "/mnt/lima-colima-codestory-release-evidence",
     "root_disk_gib": 20,
     "base_image": {
       "url": "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-containerd.raw.gz",
@@ -53,12 +55,12 @@
       "ca-certificates": "20260601~24.04.1",
       "clang": "1:18.0-59~exp2",
       "cmake": "3.28.3-1build7",
-      "containerd.io": "2.2.4-1~ubuntu.24.04~noble",
       "curl": "8.5.0-2ubuntu10.11",
       "git": "1:2.43.0-1ubuntu7.3",
       "glslc": "2023.8-1build1",
       "jq": "1.7.1-3ubuntu0.24.04.2",
       "libclang-dev": "1:18.0-59~exp2",
+      "libpopt0": "1.19+dfsg-1build1",
       "libsqlite3-dev": "3.45.1-1ubuntu2.6",
       "libssl-dev": "3.0.13-0ubuntu3.11",
       "libvulkan-dev": "1.3.275.0-1build1",
@@ -67,6 +69,7 @@
       "procps": "2:4.0.4-4ubuntu3.2",
       "python3": "3.12.3-0ubuntu2.1",
       "python3-venv": "3.12.3-0ubuntu2.1",
+      "rsync": "3.2.7-1ubuntu1.5",
       "spirv-headers": "1.6.1+1.4.309.0-1~ubuntu0.24.04.2",
       "tar": "1.35+dfsg-3ubuntu0.2",
       "unzip": "6.0-28ubuntu4.1",

@@ -1,37 +1,48 @@
 # Store Subsystem
 
-`codestory-store` is the only persistence crate.
+`codestory-store` is the only SQLite persistence layer. It owns durable core
+publication and read consistency; callers own neither raw SQL nor database-file
+recovery.
 
-## Ownership
+## Durable state
 
-- SQLite open/build lifecycle
-- schema setup and migrations
-- graph rows, file rows, occurrence rows, and projection state
-- search-doc persistence
-- bookmarks and trail queries
-- summary/detail grounding snapshots and staged publish lifecycle
+- file, node, edge, occurrence, component, callable, bookmark, and trail rows;
+- grounding snapshots and search projections;
+- graph-native symbol documents, component reports, and reusable dense anchors;
+- core `generation_id`/`run_id` and retrieval-manifest records;
+- schema migrations and a versioned promotion journal.
 
-## Entry Points
+## Publication and reads
 
-- `crates/codestory-store/src/lib.rs`
-- `crates/codestory-store/src/storage_impl/mod.rs`
-- `crates/codestory-store/src/storage_impl/trail.rs`
-- `crates/codestory-store/src/snapshot_store.rs`
-- `crates/codestory-store/src/file_store.rs`
+Full refresh builds and validates a staged database. Promotion durably records a
+prepared journal with previous and candidate identities, installs and validates
+the candidate, records committed, then performs best-effort cleanup. Recovery
+may restore only a valid recorded prepared backup; a committed publication is
+never rolled back merely because a backup remains.
 
-`GraphStore`, `TrailStore`, and `SearchDocStore` wrapper facades were removed;
-callers should use the direct `Store` methods or the surviving focused stores
-listed above.
+Incremental refresh updates the live database and refreshes derived snapshots
+in place. Readers that need publication coherence use store read snapshots and
+compare the recorded generation/run identity; retrieval runtime combines those
+reads with generation leases before returning evidence.
 
-## Extension Points
+## Entry points
 
-- add new read/write surfaces as focused sub-stores only when they own behavior
-  beyond forwarding to `Store`
-- keep snapshot lifecycle changes inside `snapshot_store.rs`
-- keep SQL-heavy persistence logic inside `storage_impl/`
+- `src/storage_impl/mod.rs`: schema lifecycle, reads/writes, publication journal,
+  recovery, and staged promotion
+- `src/snapshot_store.rs`: staged and live grounding snapshots
+- `src/file_store.rs`: focused file persistence
+- `src/storage_impl/trail.rs`: trail queries
 
-## Failure Signatures
+## Extension rules
 
-- callers try to reach a raw storage object instead of `Store`
-- snapshot promotion or invalidation is reimplemented outside the store
-- runtime or CLI starts owning SQL or SQLite file management
+- add SQL and recovery behavior here, with fault coverage at the durable fence;
+- expose typed store methods rather than raw connections;
+- keep retrieval artifact files in `codestory-retrieval` and product
+  orchestration in runtime.
+
+## Failure signatures
+
+- backup existence alone authorizes rollback;
+- callers reopen current storage during a pinned publication read;
+- runtime or CLI manages SQLite files or writes SQL;
+- a partial promotion can be reported as successful.

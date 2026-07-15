@@ -90,11 +90,6 @@ const allowedHarnessReferences = [
     "`node scripts/score-drill-ledger.mjs <suite-report.json> <ledger.json> [scored-report.json]`.",
   ],
   [
-    path.join("plugins", "codestory", "skills", "codestory-grounding", "references", "retrieval-rollout.md"),
-    ".github/workflows/retrieval-engine-smoke.yml",
-    "| Hosted engine smoke | `.github/workflows/retrieval-engine-smoke.yml` | Retrieval, runtime, stdio, indexing, engine identity, docs, scripts, or workflow changes | Explicit CPU policy only; no Metal or Vulkan claim |",
-  ],
-  [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
     "retrieval-engine-smoke.yml",
     'const retrievalFile = "retrieval-engine-smoke.yml";',

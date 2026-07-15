@@ -5,12 +5,12 @@ import { appendFile, copyFile, mkdir, open, rename, rm, stat } from "node:fs/pro
 import { Readable } from "node:stream";
 import { dirname, resolve } from "node:path";
 
-const FILE_NAME = "bge-base-en-v1.5.Q8_0.gguf";
-const SIZE = 117_974_304;
-const SHA256 = "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c";
+const FILE_NAME = "coderankembed.Q8_0.gguf";
+const SIZE = 146_029_792;
+const SHA256 = "666db8df27c88570cdc07adca28646260038b8ca65354911d57b936ebf56efaa";
 const URLS = [
-  "https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf",
-  "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf",
+  "https://huggingface.co/brandtcormorant/CodeRankEmbed-Q8_0-GGUF/resolve/33bd774d16ed49b07e79e89c192751d11f47fec0/coderankembed-q8_0.gguf",
+  "https://huggingface.co/limcheekin/CodeRankEmbed-GGUF/resolve/c61af36e919a038f84e320e43523e8982f820c94/coderankembed.Q8_0.gguf",
 ];
 
 function argument(name) {
