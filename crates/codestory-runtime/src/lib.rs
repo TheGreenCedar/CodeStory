@@ -17064,11 +17064,36 @@ fn build_llm_symbol_doc_text() -> String {
         );
     }
 
+    fn make_source_exceed_default_index_byte_cap(path: &Path, reason: &str) {
+        const DEFAULT_INDEX_SOURCE_FILE_BYTE_CAP: usize = 1_000_000;
+
+        let mut source = fs::read_to_string(path).expect("read source");
+        source.push_str("\n// ");
+        source.push_str(reason);
+        source.push_str("\n// ");
+        let padding = DEFAULT_INDEX_SOURCE_FILE_BYTE_CAP
+            .saturating_sub(source.len())
+            .saturating_add(1);
+        source.push_str(&"x".repeat(padding));
+        source.push('\n');
+        fs::write(path, source).expect("write oversized source");
+
+        let size = fs::metadata(path).expect("oversized source metadata").len();
+        assert!(
+            size > DEFAULT_INDEX_SOURCE_FILE_BYTE_CAP as u64,
+            "fixture source must exceed the default index byte cap: {size}"
+        );
+    }
+
     #[test]
     fn incomplete_first_full_refresh_creates_no_core_or_dense_publication() {
-        let mut env = hybrid_test_env();
+        let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
+        make_source_exceed_default_index_byte_cap(
+            &workspace.path().join("rust_tictactoe.rs"),
+            "first full-refresh candidate is deliberately oversized",
+        );
         let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
         controller
             .open_project_summary_with_storage_path(
@@ -17076,8 +17101,6 @@ fn build_llm_symbol_doc_text() -> String {
                 storage_path.clone(),
             )
             .expect("open project summary");
-        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
-
         let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("an incomplete first full refresh must not publish");
@@ -17114,7 +17137,7 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[test]
     fn incomplete_incremental_source_preserves_last_verified_dense_anchors() {
-        let mut env = hybrid_test_env();
+        let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let source_path = workspace.path().join("rust_tictactoe.rs");
@@ -17155,10 +17178,10 @@ fn build_llm_symbol_doc_text() -> String {
         );
         drop(first_storage);
 
-        let mut source = fs::read_to_string(&source_path).expect("read source");
-        source.push_str("\n// scheduled but deliberately unreadable to this index run\n");
-        fs::write(&source_path, source).expect("change source");
-        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "scheduled but deliberately oversized for this index run",
+        );
         controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("incomplete incremental index");
@@ -17189,7 +17212,7 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[test]
     fn incomplete_full_refresh_preserves_the_previous_live_publication() {
-        let mut env = hybrid_test_env();
+        let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let source_path = workspace.path().join("rust_tictactoe.rs");
@@ -17230,10 +17253,10 @@ fn build_llm_symbol_doc_text() -> String {
         );
         drop(first_storage);
 
-        let mut source = fs::read_to_string(&source_path).expect("read source");
-        source.push_str("\n// scheduled but deliberately unreadable to this index run\n");
-        fs::write(&source_path, source).expect("change source");
-        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "scheduled but deliberately oversized for this full refresh",
+        );
         let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("incomplete full refresh must not replace the live publication");
@@ -17275,7 +17298,7 @@ fn build_llm_symbol_doc_text() -> String {
 
     #[test]
     fn incomplete_full_recovery_preserves_prior_anchors_and_recovery_fence() {
-        let mut env = hybrid_test_env();
+        let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
         let source_path = workspace.path().join("rust_tictactoe.rs");
@@ -17307,10 +17330,10 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("mark interrupted incremental run");
         drop(first_storage);
 
-        let mut source = fs::read_to_string(&source_path).expect("read source");
-        source.push_str("\n// recovery candidate is deliberately unreadable\n");
-        fs::write(&source_path, source).expect("change source");
-        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
+        make_source_exceed_default_index_byte_cap(
+            &source_path,
+            "recovery candidate is deliberately oversized",
+        );
         let error = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect_err("incomplete recovery must preserve the fenced live index");
