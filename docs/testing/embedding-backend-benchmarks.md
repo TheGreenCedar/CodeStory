@@ -81,5 +81,6 @@ embedded-model digest, ggml build identity, physical adapter identity, timed
 smoke, full layer offload under accelerated policy, multi-repository reuse, and
 restart reuse. See [retrieval-architecture.md](retrieval-architecture.md).
 
-Historical ONNX, hash projection, external endpoint, and helper-process rows
-remain useful only in archived evidence. They are not supported product paths.
+Historical retired-backend, hash-projection, external-endpoint, and
+helper-process rows remain useful only in archived evidence. They are not
+supported product paths.

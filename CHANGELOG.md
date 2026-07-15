@@ -108,10 +108,10 @@ generation once; no manual cleanup or migration command is required.
 
 ### Reliability and operations
 
-- The legacy ONNX backend and its runtime, installer, setup, configuration, and
+- The legacy embedding backend and its runtime, installer, setup, configuration, and
   environment selections have been removed. Use managed llama.cpp under the
   host's configured accelerator/CPU policy, or a trusted external endpoint
-  under explicit CPU/external policy. Stale ONNX settings now fail with
+  under explicit CPU/external policy. Stale retired-backend settings now fail with
   migration guidance instead of being silently ignored.
 - Existing retrieval rows migrate in place. Ambiguous legacy sidecar or broker
   state is retained for bounded inventory and cleanup but is not reused; deep
@@ -690,7 +690,7 @@ report managed CLI state, repair sidecar onboarding when allowed, and avoid
 falling back to stale ambient PATH binaries when Codex launches the installed
 adapter without plugin data environment variables.
 
-This release also removes the ONNX product embedding runtime, tightens agent
+This release also removes the previous product embedding runtime, tightens agent
 repair progress/status reporting, adds handoff proof-target status, and trims
 Codex starter prompts so installed plugin manifests load without overlong
 default-prompt warnings.

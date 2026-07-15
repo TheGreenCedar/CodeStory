@@ -8308,8 +8308,8 @@ mod tests {
         retrieval.stored_embedding =
             Some(codestory_contracts::api::StoredSemanticDocsContractDto {
                 doc_count: 1,
-                embedding_profile: Some("coderank-embed".to_string()),
-                embedding_backend: Some("onnx".to_string()),
+                embedding_profile: Some("unexpected-profile".to_string()),
+                embedding_backend: Some("inprocess".to_string()),
                 cache_key: Some("old".to_string()),
                 dimension: Some(768),
                 doc_version: Some(5),

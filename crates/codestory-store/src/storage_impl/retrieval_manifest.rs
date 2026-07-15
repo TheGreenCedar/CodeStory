@@ -313,7 +313,7 @@ mod tests {
             built_at_epoch_ms: 123,
             disk_bytes: Some(456),
             degraded_modes_json: "[]".into(),
-            embedding_backend: Some("onnx:bge".into()),
+            embedding_backend: Some("inprocess:coderank-embed:q8_0:sha256-fixture".into()),
             embedding_dim: Some(768),
             sidecar_schema_version: Some(1),
             sidecar_input_hash: Some("deadbeefcafebabe".into()),

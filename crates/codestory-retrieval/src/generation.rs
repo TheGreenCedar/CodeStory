@@ -413,18 +413,18 @@ mod tests {
     }
 
     #[test]
-    fn manifest_staleness_rejects_old_onnx_embedding_contract() {
+    fn manifest_staleness_rejects_wrong_embedding_contract() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");
         let storage = Store::open(&storage_path).expect("open store");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
-        manifest.embedding_backend = Some("onnx:bge".into());
+        manifest.embedding_backend = Some("inprocess:unexpected-model:q8_0".into());
 
         let reason = manifest_staleness_reason(&storage, &manifest)
             .expect("embedding backend drift should stale manifest");
 
         assert!(reason.contains("sidecar_embedding_backend_changed"));
-        assert!(reason.contains("manifest=onnx:bge"));
+        assert!(reason.contains("manifest=inprocess:unexpected-model:q8_0"));
     }
 
     #[test]
