@@ -333,17 +333,6 @@ guest_verify() {
     "$runner_root/validation/codestory/scripts/release-evidence/machine-contract.json"
 }
 
-assert_guest_idle() {
-  local containers
-  containers=$(colima ssh --profile "$profile" -- docker ps \
-    --format '{{.ID}} {{.Names}} {{.Image}}')
-  if test -n "$containers"; then
-    echo "dedicated evidence VM has running containers; refusing to continue:" >&2
-    printf '%s\n' "$containers" >&2
-    return 1
-  fi
-}
-
 start_runner() {
   colima ssh --profile "$profile" -- sudo bash \
     "$runner_root/validation/codestory/scripts/release-evidence/guest-runner.sh" start \
@@ -389,7 +378,6 @@ verify_runner() {
   owner_json >/dev/null
   profile_running
   assert_not_busy
-  assert_guest_idle
   quiesce_runner
   write_host_attestation
   guest_verify
@@ -497,7 +485,6 @@ case "$command" in
     ensure_base_image
     assert_not_busy
     start_profile
-    assert_guest_idle
     quiesce_runner
     source_sha=$(sync_validation_source)
     model_seed=$(sync_model_seed)
@@ -517,7 +504,6 @@ case "$command" in
     ensure_base_image
     start_profile
     assert_not_busy
-    assert_guest_idle
     quiesce_runner
     write_host_attestation
     guest_verify

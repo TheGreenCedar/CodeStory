@@ -1,7 +1,7 @@
 # Release-evidence runner
 
 CodeStory release-candidate measurements run on one repository-scoped Linux
-runner so baseline identity, cache state, model bytes, and sidecar images remain
+runner so baseline identity, cache state, model bytes, and toolchain remain
 stable between candidates. Ordinary pull requests must not target this runner.
 
 ## Machine contract
@@ -17,8 +17,8 @@ The approved host shape for the first v0.15 baseline is:
 | Colima | 0.10.3 |
 | Capacity | 4 vCPU, 17 GiB configured memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
-| Host Docker context | never activated by the evidence profile |
-| Stable profile ID | `codestory-release-evidence-linux-arm64-v1` |
+| Guest container runtime | containerd; the host context is never activated |
+| Stable profile ID | `codestory-release-evidence-linux-arm64-v2` |
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
 | Model directory | `/srv/codestory-release-evidence/models` |
@@ -49,7 +49,7 @@ Provisioning is idempotent. It:
 
 - creates the dedicated VM and service account;
 - disables Colima's default writable host-home mount;
-- leaves the caller's active Docker context unchanged;
+- leaves the caller's active container context unchanged;
 - verifies the checksum-pinned Colima base image before VM creation;
 - installs native packages from a fixed Ubuntu archive snapshot at exact
   versions, then records the complete native package manifest;
@@ -59,7 +59,6 @@ Provisioning is idempotent. It:
   present, otherwise downloads it, then verifies the contract checksum again
   inside the guest;
 - prepares a source-backed `serde_json` drill at an exact commit;
-- pulls the digest-pinned ARM64 Qdrant and llama-server images;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
 - keeps Cargo, Rust, temp, XDG, CodeStory, model, drill, work, and artifact state
   under the proof-owned volume.
@@ -70,9 +69,8 @@ the stopped runner, so untracked or modified validation files cannot survive a
 provisioning pass. No source or tool is executed through a host mount. `verify`
 prints the guest mount table and fails if it finds a host-backed VirtioFS, 9p,
 SSHFS, Lima, osxfs, or gRPC FUSE mount; any `/Users` visibility is also a hard
-failure. Provision, verify, start, and the workflow preflight also require the
-dedicated VM to have no running containers. CodeStory sidecars may start only
-after that preflight as part of the active evidence job.
+failure. Provisioning pins the model; the exact candidate under test owns
+managed native llama-server selection and checksum verification.
 
 The model seed also crosses SSH rather than a host mount. Its default source is
 `~/Library/Caches/dev.codestory.codestory/retrieval/models/`; set
@@ -101,12 +99,12 @@ scripts/codestory-release-evidence-runner.sh verify
 ```
 
 After a host restart, use the script's `start` command rather than `colima
-start`. Require `verify` to show the runner online, both pinned images present
-as Linux ARM64, the exact model checksum, the clean drill commit, a current-boot
+start`. Require `verify` to show the runner online, the exact model checksum,
+the clean drill commit, a current-boot
 host attestation, the contract-derived fingerprint, and sufficient guest
 capacity.
 
-When intentionally changing the toolchain, runner, model, sidecar image, VM
+When intentionally changing the toolchain, runner, model, VM
 shape, or drill commit, update the pinned constants in the provisioning script
 and create a new approved baseline. Do not compare results across the identity
 change as though they came from the same machine profile.

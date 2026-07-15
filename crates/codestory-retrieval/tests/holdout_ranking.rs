@@ -55,7 +55,7 @@ fn holdout_axios_prompt_prefers_dispatch_path() {
             CandidateSource::Lexical,
         ),
         CandidateHit::with_source("lib/defaults.js", None, 0.75, CandidateSource::Lexical),
-        CandidateHit::with_source("semantic:axios", None, 0.95, CandidateSource::Qdrant),
+        CandidateHit::with_source("semantic:axios", None, 0.95, CandidateSource::Semantic),
     ];
     let ranked = rank_candidates(&features, candidates);
     assert_eq!(ranked[0].file_path, "lib/core/dispatchRequest.js");

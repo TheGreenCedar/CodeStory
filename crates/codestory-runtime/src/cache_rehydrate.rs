@@ -548,7 +548,7 @@ fn retrieval_rehydrate_status(dry_run: bool) -> String {
 }
 
 fn retrieval_rehydrate_reason() -> String {
-    "cache rehydrate copies SQLite graph/search/doc state only; sidecar manifests and Lexical/Qdrant/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
+    "cache rehydrate copies SQLite graph/search/doc state only; sidecar manifests and Lexical/Semantic/SCIP artifacts must be rebuilt or revalidated for the target worktree".into()
 }
 
 fn retrieval_rehydrate_policy(dry_run: bool) -> String {
@@ -558,7 +558,7 @@ fn retrieval_rehydrate_policy(dry_run: bool) -> String {
         "invalidated"
     };
     format!(
-        "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests {action} because cache rehydrate copies SQLite cache state only; Lexical/Qdrant/SCIP sidecar directories live outside the copied cache and must be revalidated by retrieval index before reuse"
+        "path-bound SQLite graph/search/doc rows rebased; portable v2 index artifact rows preserved; retrieval manifests {action} because cache rehydrate copies SQLite cache state only; Lexical/Semantic/SCIP sidecar directories live outside the copied cache and must be revalidated by retrieval index before reuse"
     )
 }
 
@@ -646,7 +646,7 @@ mod tests {
         let storage = Store::open(target_cache_path.join("codestory.db")).expect("open target");
         assert!(
             storage
-                .list_retrieval_qdrant_collections()
+                .list_retrieval_semantic_generations()
                 .expect("list manifests")
                 .is_empty()
         );
@@ -1093,7 +1093,7 @@ mod tests {
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: codestory_retrieval::project_id_for_root(project),
                 lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
-                qdrant_collection: "codestory_old".into(),
+                semantic_generation: "codestory_old".into(),
                 scip_revision: None,
                 built_at_epoch_ms: 1,
                 disk_bytes: None,

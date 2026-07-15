@@ -310,7 +310,7 @@ test("packet gate retries only transient sidecar packet failures", async () => {
     };
     await writeFile(
       packetGateStderrPath(dir, retryable),
-      "Error: retrieval_unavailable: project is not in full mode (mode=no_semantic, reason=qdrant_unreachable)\n",
+      "Error: retrieval_unavailable: project is not in full mode (mode=no_semantic, reason=embedded_vector_index_unavailable)\n",
       "utf8",
     );
     await writeFile(packetGateStderrPath(dir, qualityFailure), "manifest quality failed\n", "utf8");

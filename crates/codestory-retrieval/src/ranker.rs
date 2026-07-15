@@ -153,7 +153,7 @@ fn build_rank_features(candidate: &CandidateHit, query_tokens: &[String]) -> Ran
 
     let has_lexical = matches!(candidate.source, CandidateSource::Lexical)
         || candidate_has_provenance(candidate, "lexical_source");
-    let has_semantic = matches!(candidate.source, CandidateSource::Qdrant)
+    let has_semantic = matches!(candidate.source, CandidateSource::Semantic)
         || candidate_has_provenance(candidate, "dense_anchor")
         || candidate_has_provenance(candidate, "component_report");
     let has_graph = candidate_has_graph_provenance(candidate);
@@ -349,7 +349,7 @@ fn source_sort_rank(candidate: &CandidateHit) -> u8 {
     match candidate.source {
         CandidateSource::Lexical => 0,
         CandidateSource::Scip => 1,
-        CandidateSource::Qdrant => 2,
+        CandidateSource::Semantic => 2,
         CandidateSource::Legacy => 3,
     }
 }
@@ -435,7 +435,7 @@ fn cap_dense_below_strong_lexical_source(candidates: &mut [CandidateHit], query_
     };
 
     for candidate in candidates {
-        if candidate.source == CandidateSource::Qdrant
+        if candidate.source == CandidateSource::Semantic
             && strong_query_token_hits(candidate, query_tokens) < anchor_hits
             && candidate.score >= anchor_score
         {
@@ -464,7 +464,7 @@ fn apply_exact_code_evidence_anchor(
         return;
     };
     for candidate in candidates.iter_mut() {
-        if matches!(candidate.source, CandidateSource::Qdrant)
+        if matches!(candidate.source, CandidateSource::Semantic)
             && !is_exact_code_evidence(candidate, query_tokens)
             && candidate.score >= top_exact_code_score
         {
@@ -476,7 +476,7 @@ fn apply_exact_code_evidence_anchor(
 fn is_exact_code_evidence(candidate: &CandidateHit, query_tokens: &[String]) -> bool {
     if matches!(
         candidate.source,
-        CandidateSource::Qdrant | CandidateSource::Legacy
+        CandidateSource::Semantic | CandidateSource::Legacy
     ) {
         return false;
     }
@@ -611,7 +611,7 @@ mod tests {
             "src/search.rs",
             Some("SearchService".into()),
             0.9,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
 
         let ranked = rank_candidates(&features, vec![lexical, dense]);
@@ -704,7 +704,7 @@ mod tests {
             "docs/retrieval.md",
             Some("manifest overview".into()),
             0.99,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
         semantic.file_role = Some(FileRole::Docs);
 
@@ -722,13 +722,13 @@ mod tests {
             "workspace/app/tests/event_processor_with_json_output.rs",
             Some("event processor json output".into()),
             0.99,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
         let colocated_test = CandidateHit::with_source(
             "workspace/app/src/event_processor_with_jsonl_output_tests.rs",
             Some("jsonl event test output".into()),
             0.98,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
         let source = CandidateHit::with_source(
             "workspace/app/src/event_processor.rs",
@@ -784,7 +784,7 @@ mod tests {
             "workspace/app/tests/event_processor_with_json_output.rs",
             Some("event processor json output".into()),
             0.99,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
         let source = CandidateHit::with_source(
             "workspace/app/src/event_processor.rs",
@@ -818,7 +818,7 @@ mod tests {
             "crates/codestory-contracts/src/api/dto.rs",
             Some("PacketRetrievalTraceSummaryDto".into()),
             0.99,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
         dense_dto.file_role = Some(FileRole::Source);
 
@@ -866,8 +866,12 @@ mod tests {
         ]
         .into_iter()
         .map(|(symbol, path)| {
-            let mut hit =
-                CandidateHit::with_source(path, Some(symbol.into()), 0.99, CandidateSource::Qdrant);
+            let mut hit = CandidateHit::with_source(
+                path,
+                Some(symbol.into()),
+                0.99,
+                CandidateSource::Semantic,
+            );
             hit.file_role = Some(FileRole::Source);
             hit
         });

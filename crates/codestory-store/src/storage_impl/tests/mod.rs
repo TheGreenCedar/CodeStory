@@ -1824,7 +1824,7 @@ fn live_open_migrates_v18_manifest_to_lexical_schema_without_losing_rows()
             "CREATE TABLE retrieval_index_manifest (
                 project_id TEXT PRIMARY KEY,
                 zoekt_version TEXT NOT NULL,
-                qdrant_collection TEXT NOT NULL,
+                semantic_generation TEXT NOT NULL,
                 scip_revision TEXT,
                 built_at_epoch_ms INTEGER NOT NULL,
                 disk_bytes INTEGER,
@@ -1847,7 +1847,7 @@ fn live_open_migrates_v18_manifest_to_lexical_schema_without_losing_rows()
             "INSERT INTO retrieval_index_manifest (
                 project_id,
                 zoekt_version,
-                qdrant_collection,
+                semantic_generation,
                 built_at_epoch_ms,
                 degraded_modes_json
             ) VALUES ('proj', 'legacy-v1', 'collection', 1, '[]')",
@@ -1915,7 +1915,7 @@ fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_colu
                 "CREATE TABLE retrieval_index_manifest (
                 project_id TEXT PRIMARY KEY,
                 zoekt_version TEXT NOT NULL,
-                qdrant_collection TEXT NOT NULL,
+                semantic_generation TEXT NOT NULL,
                 scip_revision TEXT,
                 built_at_epoch_ms INTEGER NOT NULL,
                 disk_bytes INTEGER,
@@ -1937,7 +1937,7 @@ fn v19_and_v20_manifests_migrate_once_and_new_writes_do_not_recreate_legacy_colu
                 precise_semantic_import_producer TEXT
             );
             INSERT INTO retrieval_index_manifest (
-                project_id, zoekt_version, qdrant_collection,
+                project_id, zoekt_version, semantic_generation,
                 built_at_epoch_ms, degraded_modes_json
             ) VALUES ('proj', 'legacy-v1', 'collection', 1, '[]');",
             )?;
@@ -1984,7 +1984,7 @@ fn live_open_preserves_correct_v18_manifest_precise_semantic_values() -> Result<
         storage.upsert_retrieval_index_manifest(&RetrievalIndexManifest {
             project_id: "proj".into(),
             lexical_version: "legacy-v1".into(),
-            qdrant_collection: "collection".into(),
+            semantic_generation: "collection".into(),
             scip_revision: None,
             built_at_epoch_ms: 1,
             disk_bytes: None,

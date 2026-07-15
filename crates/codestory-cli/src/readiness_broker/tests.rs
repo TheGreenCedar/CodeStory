@@ -161,10 +161,7 @@ fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval
         owner: "codestory".to_string(),
         profile: "agent".to_string(),
         namespace: "codestory-test".to_string(),
-        compose_project: "codestory-test".to_string(),
         run_id: Some("shared-agent".to_string()),
-        qdrant_http_port: 37032,
-        qdrant_grpc_port: 37033,
         embed_http_port: 37040,
         embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
         embedding_endpoint_origin: Some(
@@ -200,12 +197,9 @@ fn native_sidecar_state(spawned_at_epoch_ms: Option<i64>) -> codestory_retrieval
             requested_device: Some("Vulkan0".to_string()),
         }),
         embedding_launch_ownership: codestory_retrieval::EmbeddingLaunchOwnership::Owner,
-        sidecar_images: codestory_retrieval::default_sidecar_image_pins(),
         lexical_data_dir: "C:/cache/lexical".to_string(),
-        qdrant_data_dir: "C:/cache/qdrant".to_string(),
+        semantic_data_dir: "C:/cache/semantic".to_string(),
         scip_artifacts_root: "C:/cache/scip".to_string(),
-        compose_file: None,
-        compose_started_by_bootstrap: true,
         cleanup_command: "codestory-cli retrieval down".to_string(),
         started_at_epoch_ms: 100,
     }
@@ -277,7 +271,6 @@ fn gpu_runtime_identity(project: &Path, started_at_epoch_ms: i64) -> BrokerGpuRu
         profile: "agent".to_string(),
         run_id: Some("shared-agent".to_string()),
         namespace: "codestory-test".to_string(),
-        compose_project: "codestory-test".to_string(),
         embed_url: "http://127.0.0.1:37040/v1/embeddings".to_string(),
         embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
         embedding_endpoint_fingerprint_sha256: "hmac-sha256:fixture".to_string(),
@@ -309,10 +302,7 @@ fn matching_native_sidecar_state(
     state.project_identity = sidecar.project_identity.clone();
     state.profile = sidecar.profile.as_str().to_string();
     state.namespace = sidecar.namespace.clone();
-    state.compose_project = sidecar.compose_project.clone();
     state.run_id = sidecar.run_id.clone();
-    state.qdrant_http_port = sidecar.layout.qdrant_http_port;
-    state.qdrant_grpc_port = sidecar.layout.qdrant_grpc_port;
     state.embed_http_port = sidecar.ownership().ports.embed_http;
     state.embed_url = sidecar.embedding.endpoint.clone();
     state.embedding_endpoint_origin = Some(sidecar.embedding.endpoint_origin);
@@ -750,10 +740,7 @@ fn warm_reused_agent_state_binds_exact_broker_runtime_identity() {
     state.project_identity = initial.project_identity.clone();
     state.profile = initial.profile.as_str().to_string();
     state.namespace = initial.namespace.clone();
-    state.compose_project = initial.compose_project.clone();
     state.run_id = initial.run_id.clone();
-    state.qdrant_http_port = initial.layout.qdrant_http_port;
-    state.qdrant_grpc_port = initial.layout.qdrant_grpc_port;
     state.embed_http_port = shared_embed_port;
     state.embed_url = initial.embedding.endpoint.clone();
     state.embedding_endpoint_origin = Some(initial.embedding.endpoint_origin);
@@ -871,10 +858,7 @@ fn borrower_attachment_blocks_owner_down_until_borrower_detaches() {
                 project_identity: borrower_runtime.project_identity.clone(),
                 profile: borrower_runtime.profile.as_str().to_string(),
                 namespace: borrower_runtime.namespace.clone(),
-                compose_project: borrower_runtime.compose_project.clone(),
                 run_id: borrower_runtime.run_id.clone(),
-                qdrant_http_port: borrower_runtime.layout.qdrant_http_port,
-                qdrant_grpc_port: borrower_runtime.layout.qdrant_grpc_port,
                 embed_http_port: owner_state.embed_http_port,
                 embed_url: owner_state.embed_url.clone(),
                 embedding_launch_ownership: codestory_retrieval::EmbeddingLaunchOwnership::Attached,
@@ -1313,7 +1297,6 @@ fn write_ready_repair_status_file(
         "profile": "agent",
         "run_id": run_id,
         "namespace": sidecar.namespace,
-        "compose_project": sidecar.compose_project,
         "phase": phase,
         "pid": pid,
         "started_at_epoch_ms": updated_at_epoch_ms,
@@ -1397,7 +1380,7 @@ fn reconcile_before_enqueue_returns_active_repair_when_live() {
         run_id,
         std::process::id(),
         now_epoch_ms(),
-        "Qdrant finalize",
+        "Semantic finalize",
     );
 
     let reconciliation =
@@ -1409,7 +1392,7 @@ fn reconcile_before_enqueue_returns_active_repair_when_live() {
         .active_repair
         .expect("active repair operation");
     assert_eq!(active.status, "running");
-    assert_eq!(active.phase.as_deref(), Some("Qdrant finalize"));
+    assert_eq!(active.phase.as_deref(), Some("Semantic finalize"));
     assert!(reconciliation.abandoned_repairs.is_empty());
 }
 
@@ -1475,7 +1458,6 @@ fn reconcile_before_enqueue_for_sidecar_keeps_abandoned_cleanup_in_retained_root
             "profile": "agent",
             "run_id": run_id,
             "namespace": retained_sidecar.namespace,
-            "compose_project": retained_sidecar.compose_project,
             "phase": "graph artifact",
             "pid": exited_process_id(),
             "started_at_epoch_ms": now_epoch_ms(),

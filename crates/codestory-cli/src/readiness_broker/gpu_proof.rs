@@ -103,7 +103,6 @@ fn runtime_identity_supports_proof(
 ) -> bool {
     if identity.workspace_id.is_empty()
         || identity.namespace.is_empty()
-        || identity.compose_project.is_empty()
         || identity.embed_url.is_empty()
         || identity.embedding_endpoint_origin
             != codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar

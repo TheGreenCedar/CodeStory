@@ -36,7 +36,6 @@ PROOF_TEMP_OWNER_FILE = ".codestory-macos-metal-proof-owner.json"
 PROOF_LOCAL_RUN_ID = "shared-agent"
 PROOF_AGENT_RUN_IDS = (PROOF_LOCAL_RUN_ID,)
 SIDECAR_STATE_FILE_V3 = "retrieval-sidecars-v3.json"
-LEGACY_SIDECAR_STATE_FILE = "retrieval-sidecars.json"
 
 
 class GateFailure(Exception):
@@ -306,14 +305,6 @@ def verify_archive_checksum(archive: Path, checksum_file: Path, artifact: Path) 
     require(actual == expected, "checksum", artifact, f"checksum mismatch for {archive.name}")
 
 
-def proof_environment(base: dict[str, str]) -> dict[str, str]:
-    env = dict(base)
-    if sys.platform.startswith("linux") and hasattr(os, "getuid") and hasattr(os, "getgid"):
-        env["CODESTORY_QDRANT_USER"] = f"{os.getuid()}:{os.getgid()}"
-        env["CODESTORY_QDRANT_SNAPSHOTS_PATH"] = "/qdrant/storage/snapshots"
-    return env
-
-
 def write_managed_convergence_fixture(project: Path) -> None:
     (project / "src").mkdir(parents=True)
     (project / "Cargo.toml").write_text(
@@ -374,10 +365,6 @@ def fnv1a_bytes(value: bytes) -> str:
     return f"{digest:016x}"
 
 
-def fnv1a_hex(value: str) -> str:
-    return fnv1a_bytes(os.fsencode(value))
-
-
 def workspace_id_v3_for_path(path: Path) -> str:
     encoded = str(path).encode("utf-16le") if os.name == "nt" else os.fsencode(path)
     return fnv1a_bytes(encoded)
@@ -395,9 +382,7 @@ def proof_agent_identity(cache_root: Path, project: Path, run_id: str) -> dict[s
         "profile": "agent",
         "run_id": run_id,
         "namespace": namespace,
-        "compose_project": namespace,
         "state_file": str(state_root / SIDECAR_STATE_FILE_V3),
-        "qdrant_data_dir": str(state_root / "qdrant"),
         "lexical_data_dir": str(state_root / "lexical"),
         "scip_artifacts_root": str(state_root / "scip"),
     }
@@ -410,311 +395,6 @@ def proof_agent_identities(cache_roots: list[Path], project: Path) -> list[dict[
         for run_id in PROOF_AGENT_RUN_IDS
     ]
 
-
-def run_docker_json(
-    command: list[str],
-    run=subprocess.run,
-    env: dict[str, str] | None = None,
-) -> object:
-    try:
-        result = run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20,
-            check=False,
-            text=True,
-            env=env,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"could not inspect Docker proof resources: {exc}") from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Docker proof resource inspection exited {result.returncode}: "
-            f"{captured_text(result.stderr).strip()}"
-        )
-    body = captured_text(result.stdout).strip()
-    if not body:
-        return []
-    try:
-        return json.loads(body)
-    except json.JSONDecodeError as aggregate_error:
-        try:
-            return [json.loads(line) for line in body.splitlines() if line.strip()]
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Docker proof resource inspection returned invalid JSON: {aggregate_error}; {exc}"
-            ) from exc
-
-
-def docker_created_epoch_ms(value: object) -> int | None:
-    if not isinstance(value, str) or not value:
-        return None
-    candidate = value.strip()
-    if "." in candidate:
-        prefix, fraction_and_zone = candidate.rsplit(".", 1)
-        fraction_length = next(
-            (
-                index
-                for index, character in enumerate(fraction_and_zone)
-                if not character.isdigit()
-            ),
-            len(fraction_and_zone),
-        )
-        candidate = (
-            f"{prefix}.{fraction_and_zone[:6]}"
-            f"{fraction_and_zone[fraction_length:]}"
-        )
-    if candidate.endswith("Z"):
-        candidate = candidate[:-1] + "+00:00"
-    try:
-        parsed = datetime.datetime.fromisoformat(candidate)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return int(parsed.timestamp() * 1000)
-
-
-def docker_compose_resource_snapshot(state: dict, run=subprocess.run) -> dict:
-    compose_project = state.get("compose_project")
-    if not isinstance(compose_project, str) or not compose_project:
-        raise RuntimeError("proof sidecar state has no Compose project for Docker inspection")
-    inspect_env = {
-        **os.environ,
-        "CODESTORY_SIDECAR_NAMESPACE": str(state.get("namespace", "")),
-        "CODESTORY_QDRANT_DATA_DIR": str(state.get("qdrant_data_dir", "")),
-    }
-
-    def matching_ids(kind: str) -> list[str]:
-        payload = run_docker_json(
-            [
-                "docker",
-                kind,
-                "ls",
-                "--all" if kind == "container" else "--filter",
-                *(
-                    ["--filter", f"label=com.docker.compose.project={compose_project}"]
-                    if kind == "container"
-                    else [f"label=com.docker.compose.project={compose_project}"]
-                ),
-                "--format",
-                "{{json .}}",
-            ],
-            run,
-            inspect_env,
-        )
-        # Docker 29 emits a single JSON object (not an array) when `ls --format
-        # json` has exactly one match. Multiple matches remain newline-delimited
-        # objects and are normalized by `run_docker_json`.
-        if isinstance(payload, dict):
-            payload = [payload]
-        if not isinstance(payload, list):
-            raise RuntimeError(f"Docker {kind} listing was not a JSON array")
-        ids = []
-        for item in payload:
-            if not isinstance(item, dict):
-                raise RuntimeError(f"Docker {kind} listing contained a non-object")
-            value = item.get("ID")
-            if not isinstance(value, str) or not value:
-                raise RuntimeError(f"Docker {kind} listing contained no ID")
-            ids.append(value)
-        return sorted(set(ids))
-
-    container_ids = matching_ids("container")
-    network_ids = matching_ids("network")
-    container_inspect = (
-        run_docker_json(["docker", "container", "inspect", *container_ids], run, inspect_env)
-        if container_ids
-        else []
-    )
-    network_inspect = (
-        run_docker_json(["docker", "network", "inspect", *network_ids], run, inspect_env)
-        if network_ids
-        else []
-    )
-    if not isinstance(container_inspect, list) or not isinstance(network_inspect, list):
-        raise RuntimeError("Docker proof resource inspect output was not an array")
-
-    containers = []
-    for item in container_inspect:
-        if not isinstance(item, dict):
-            raise RuntimeError("Docker container inspect contained a non-object")
-        config = item.get("Config") if isinstance(item.get("Config"), dict) else {}
-        labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
-        mounts = item.get("Mounts") if isinstance(item.get("Mounts"), list) else []
-        containers.append(
-            {
-                "id": item.get("Id"),
-                "name": str(item.get("Name", "")).lstrip("/"),
-                "created": item.get("Created"),
-                "labels": {str(key): str(value) for key, value in sorted(labels.items())},
-                "mounts": sorted(
-                    [
-                        {
-                            "type": mount.get("Type"),
-                            "source": mount.get("Source"),
-                            "destination": mount.get("Destination"),
-                        }
-                        for mount in mounts
-                        if isinstance(mount, dict)
-                    ],
-                    key=lambda mount: (
-                        str(mount.get("destination")),
-                        str(mount.get("source")),
-                    ),
-                ),
-            }
-        )
-    networks = []
-    for item in network_inspect:
-        if not isinstance(item, dict):
-            raise RuntimeError("Docker network inspect contained a non-object")
-        labels = item.get("Labels") if isinstance(item.get("Labels"), dict) else {}
-        attached = item.get("Containers") if isinstance(item.get("Containers"), dict) else {}
-        networks.append(
-            {
-                "id": item.get("Id"),
-                "name": item.get("Name"),
-                "created": item.get("Created"),
-                "labels": {str(key): str(value) for key, value in sorted(labels.items())},
-                "attached_container_ids": sorted(str(value) for value in attached),
-            }
-        )
-    return {
-        "compose_project": compose_project,
-        "containers": sorted(containers, key=lambda item: (str(item.get("id")), str(item.get("name")))),
-        "networks": sorted(networks, key=lambda item: (str(item.get("id")), str(item.get("name")))),
-    }
-
-
-def validate_proof_docker_resources(
-    state: dict,
-    observed: dict,
-    registered: dict | None = None,
-) -> None:
-    if registered is not None:
-        if registered.get("compose_project") != observed.get("compose_project"):
-            raise RuntimeError("Docker resources changed their registered Compose project")
-        for kind in ("containers", "networks"):
-            registered_items = registered.get(kind)
-            observed_items = observed.get(kind)
-            if not isinstance(registered_items, list) or not isinstance(observed_items, list):
-                raise RuntimeError("registered Docker resource snapshot is malformed")
-            registered_by_id = {
-                item.get("id"): item
-                for item in registered_items
-                if isinstance(item, dict) and isinstance(item.get("id"), str)
-            }
-            observed_by_id = {
-                item.get("id"): item
-                for item in observed_items
-                if isinstance(item, dict) and isinstance(item.get("id"), str)
-            }
-            if len(registered_by_id) != len(registered_items) or len(observed_by_id) != len(
-                observed_items
-            ):
-                raise RuntimeError("Docker resource snapshot contains duplicate or invalid IDs")
-            if not set(observed_by_id).issubset(registered_by_id):
-                raise RuntimeError("Docker resources include IDs absent from proof registration")
-            for resource_id, item in observed_by_id.items():
-                registered_item = registered_by_id[resource_id]
-                if kind == "containers" and item != registered_item:
-                    raise RuntimeError(
-                        f"Docker container {resource_id} changed after proof ownership registration"
-                    )
-                if kind == "networks" and any(
-                    item.get(field) != registered_item.get(field)
-                    for field in ("id", "name", "created", "labels")
-                ):
-                    raise RuntimeError(
-                        f"Docker network {resource_id} changed after proof ownership registration"
-                    )
-    compose_project = state["compose_project"]
-    if observed.get("compose_project") != compose_project:
-        raise RuntimeError("Docker resource snapshot changed the Compose project")
-    containers = observed.get("containers")
-    networks = observed.get("networks")
-    if not isinstance(containers, list) or not isinstance(networks, list):
-        raise RuntimeError("Docker resource snapshot is malformed")
-    if not containers and networks and registered is None:
-        raise RuntimeError("cannot prove an unregistered Compose network without its containers")
-    expected_container_ids = set()
-    services = set()
-    qdrant_created = None
-    for container in containers:
-        if not isinstance(container, dict):
-            raise RuntimeError("Docker resource snapshot contains a malformed container")
-        container_id = container.get("id")
-        labels = container.get("labels")
-        if not isinstance(container_id, str) or not container_id or not isinstance(labels, dict):
-            raise RuntimeError("Docker resource snapshot contains an unidentified container")
-        expected_labels = {
-            "com.docker.compose.project": compose_project,
-            "dev.codestory.owner": "codestory",
-            "dev.codestory.profile": "agent",
-            "dev.codestory.namespace": state["namespace"],
-        }
-        if any(labels.get(name) != value for name, value in expected_labels.items()):
-            raise RuntimeError(f"Docker container {container_id} has foreign ownership labels")
-        service = labels.get("com.docker.compose.service")
-        if service not in {"qdrant", "embed"} or service in services:
-            raise RuntimeError(f"Docker container {container_id} has an unexpected Compose service")
-        if container.get("name") != f"{state['namespace']}-{service}":
-            raise RuntimeError(f"Docker container {container_id} has a foreign resource name")
-        services.add(service)
-        expected_container_ids.add(container_id)
-        created = docker_created_epoch_ms(container.get("created"))
-        if created is None:
-            raise RuntimeError(f"Docker container {container_id} has no creation identity")
-        if service == "qdrant":
-            qdrant_created = created
-            expected_qdrant = Path(state["qdrant_data_dir"]).resolve(strict=False)
-            matching_mount = any(
-                isinstance(mount, dict)
-                and mount.get("type") == "bind"
-                and mount.get("destination") == "/qdrant/storage"
-                and isinstance(mount.get("source"), str)
-                and Path(mount["source"]).resolve(strict=False) == expected_qdrant
-                for mount in container.get("mounts", [])
-            )
-            if not matching_mount:
-                raise RuntimeError(
-                    f"Docker qdrant container {container_id} is mounted from a foreign cache"
-                )
-    if containers and "qdrant" not in services:
-        raise RuntimeError("Docker proof resources have no cache-bound qdrant container")
-    if qdrant_created is not None:
-        started = state.get("started_at_epoch_ms")
-        if isinstance(started, int) and not (qdrant_created - 5_000 <= started <= qdrant_created + 1_800_000):
-            raise RuntimeError("Docker qdrant creation does not match the sidecar state lifetime")
-        for container in containers:
-            created = docker_created_epoch_ms(container.get("created"))
-            if created is None or abs(created - qdrant_created) > 300_000:
-                raise RuntimeError("Docker containers do not share the registered creation lifetime")
-    if len(networks) > 1:
-        raise RuntimeError("Docker proof resources contain multiple Compose networks")
-    for network in networks:
-        if not isinstance(network, dict):
-            raise RuntimeError("Docker resource snapshot contains a malformed network")
-        network_id = network.get("id")
-        labels = network.get("labels")
-        if not isinstance(network_id, str) or not network_id or not isinstance(labels, dict):
-            raise RuntimeError("Docker resource snapshot contains an unidentified network")
-        if (
-            labels.get("com.docker.compose.project") != compose_project
-            or labels.get("com.docker.compose.network") != "default"
-            or network.get("name") != f"{compose_project}_default"
-        ):
-            raise RuntimeError(f"Docker network {network_id} has foreign ownership labels")
-        attached = network.get("attached_container_ids")
-        if not isinstance(attached, list) or not set(attached).issubset(expected_container_ids):
-            raise RuntimeError(f"Docker network {network_id} has foreign attached containers")
-        network_created = docker_created_epoch_ms(network.get("created"))
-        if network_created is None:
-            raise RuntimeError(f"Docker network {network_id} has no creation identity")
-        if qdrant_created is not None and abs(network_created - qdrant_created) > 300_000:
-            raise RuntimeError(f"Docker network {network_id} has a foreign creation lifetime")
 
 
 def proof_temp_root_from_environment() -> Path | None:
@@ -806,7 +486,7 @@ def register_current_proof_runtime(cache_root: Path) -> None:
             raise RuntimeError(f"proof temp owner marker has invalid sidecar identity: {marker}")
         if Path(str(identity.get("cache_root", ""))).resolve(strict=False) != cache_root.resolve(strict=True):
             continue
-        validated = validated_proof_compose_state(
+        validated = validated_proof_sidecar_state(
             cache_root,
             Path(identity.get("project", payload.get("project", "."))),
             read_json_file,
@@ -816,23 +496,10 @@ def register_current_proof_runtime(cache_root: Path) -> None:
         if validated is None:
             continue
         _, state = validated
-        if state.get("compose_file") is not None:
-            snapshot = docker_compose_resource_snapshot(state)
-            registered_resources = identity.get("docker_resources")
-            validate_proof_docker_resources(
-                state,
-                snapshot,
-                registered_resources if isinstance(registered_resources, dict) else None,
-            )
-            identity["docker_resources"] = snapshot
         record_proof_runtime_identity(
             payload,
             state.get("embedding_launch"),
-            (
-                state.get("qdrant_http_port"),
-                state.get("qdrant_grpc_port"),
-                state.get("embed_http_port"),
-            ),
+            (state.get("embed_http_port"),),
         )
     write_json(marker, payload)
 
@@ -846,27 +513,23 @@ def register_proof_launch(launch: dict | None, ports: list[object] | None = None
     write_json(marker, payload)
 
 
-def validated_proof_compose_state(
+def validated_proof_sidecar_state(
     cache_root: Path,
     project: Path,
     read_state,
     *,
     run_id: str = PROOF_LOCAL_RUN_ID,
     registered_identity: dict | None = None,
-    allow_missing_compose_file: bool = False,
 ) -> tuple[Path, dict] | None:
     if cache_root.is_symlink() or project.is_symlink():
         raise RuntimeError("proof cache and project roots must not be symlinks")
     cache_root = cache_root.resolve(strict=True)
     project = project.resolve(strict=registered_identity is None)
-    for local_state in (
-        cache_root / SIDECAR_STATE_FILE_V3,
-        cache_root / LEGACY_SIDECAR_STATE_FILE,
-    ):
-        if local_state.exists() or local_state.is_symlink():
-            raise RuntimeError(
-                f"proof cleanup refuses the global local-sidecar namespace: {local_state}"
-            )
+    local_state = cache_root / SIDECAR_STATE_FILE_V3
+    if local_state.exists() or local_state.is_symlink():
+        raise RuntimeError(
+            f"proof cleanup refuses the global local-sidecar namespace: {local_state}"
+        )
     expected = registered_identity or proof_agent_identity(cache_root, project, run_id)
     required_identity = proof_agent_identity(cache_root, Path(expected.get("project", project)), run_id)
     for name in (
@@ -875,9 +538,7 @@ def validated_proof_compose_state(
         "profile",
         "run_id",
         "namespace",
-        "compose_project",
         "state_file",
-        "qdrant_data_dir",
         "lexical_data_dir",
         "scip_artifacts_root",
     ):
@@ -907,7 +568,6 @@ def validated_proof_compose_state(
         "profile": "agent",
         "run_id": run_id,
         "namespace": expected["namespace"],
-        "compose_project": expected["compose_project"],
     }
     for name, expected_value in expected_identity.items():
         if state.get(name) != expected_value:
@@ -916,7 +576,6 @@ def validated_proof_compose_state(
             )
     state = dict(state)
     for name, expected_path in (
-        ("qdrant_data_dir", Path(expected["qdrant_data_dir"])),
         ("scip_artifacts_root", Path(expected["scip_artifacts_root"])),
     ):
         value = state.get(name)
@@ -939,176 +598,15 @@ def validated_proof_compose_state(
     ):
         raise RuntimeError(f"proof sidecar lexical_data_dir escaped its cache root: {state_file}")
     lexical_value = state.get("lexical_data_dir")
-    if lexical_value is None:
-        lexical_value = state.get("zoekt_data_dir")
     if not isinstance(lexical_value, str) or not lexical_value:
-        raise TypeError(f"proof sidecar state canonical or legacy lexical data directory is not a path string: {state_file}")
+        raise TypeError(f"proof sidecar state lexical data directory is not a path string: {state_file}")
     observed = Path(lexical_value)
     if observed.is_symlink() or observed.resolve(strict=False) != canonical_lexical_expected:
         raise RuntimeError(f"proof sidecar state lexical_data_dir escaped its cache root: {state_file}")
     state["lexical_data_dir"] = str(lexical_expected)
     state["proof_identity"] = expected
-    compose_value = state.get("compose_file")
-    if compose_value is None:
-        state["compose_file"] = None
-        return state_file, state
-    if not isinstance(compose_value, str) or not compose_value:
-        raise TypeError(f"proof sidecar compose_file is not a path string: {state_file}")
-    compose_file = Path(compose_value)
-    if compose_file.is_symlink():
-        raise RuntimeError(f"proof sidecar compose file is not a regular canonical file: {compose_file}")
-    allowed_compose_paths = {
-        candidate.resolve(strict=False)
-        for candidate in (
-            Path(expected["project"]) / "docker" / "retrieval-compose.yml",
-            cache_root / "retrieval-compose.yml",
-        )
-    }
-    if not compose_file.is_file():
-        if (
-            allow_missing_compose_file
-            and compose_file.resolve(strict=False) in allowed_compose_paths
-        ):
-            state["compose_file_missing"] = True
-            return state_file, state
-        raise RuntimeError(f"proof sidecar compose file is not a regular canonical file: {compose_file}")
-    allowed_compose_files = set()
-    for candidate in (
-        Path(expected["project"]) / "docker" / "retrieval-compose.yml",
-        cache_root / "retrieval-compose.yml",
-    ):
-        if not candidate.is_file() or candidate.is_symlink():
-            continue
-        canonical_candidate = candidate.resolve(strict=True)
-        if candidate == canonical_candidate:
-            allowed_compose_files.add(canonical_candidate)
-    canonical_compose_file = compose_file.resolve(strict=True)
-    if canonical_compose_file not in allowed_compose_files:
-        raise RuntimeError(f"proof sidecar compose file is outside the allowed roots: {compose_file}")
     return state_file, state
 
-
-def cleanup_proof_compose(
-    cache_root: Path,
-    project: Path,
-    env: dict[str, str],
-    results: list[dict],
-    run,
-    read_state,
-    *,
-    run_id: str = PROOF_LOCAL_RUN_ID,
-    registered_identity: dict | None = None,
-) -> None:
-    try:
-        validated = validated_proof_compose_state(
-            cache_root,
-            project,
-            read_state,
-            run_id=run_id,
-            registered_identity=registered_identity,
-            allow_missing_compose_file=True,
-        )
-    except Exception as exc:
-        results.append(
-            {
-                "kind": "compose_state_validation",
-                "state_file": str(
-                    registered_identity.get("state_file")
-                    if isinstance(registered_identity, dict)
-                    else proof_agent_identity(cache_root, project, run_id)["state_file"]
-                ),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        raise RuntimeError(f"proof-owned Compose state validation failed: {exc}") from exc
-    if validated is None:
-        return
-    state_file, state = validated
-    if state.get("compose_file") is None:
-        results.append(
-            {
-                "kind": "compose_down_skipped",
-                "state_file": str(state_file),
-                "proof_identity": state["proof_identity"],
-                "reason": "sidecar_state_has_no_compose_file",
-            }
-        )
-        return
-    try:
-        observed = docker_compose_resource_snapshot(state, run)
-        registered_resources = (
-            registered_identity.get("docker_resources")
-            if isinstance(registered_identity, dict)
-            else None
-        )
-        validate_proof_docker_resources(
-            state,
-            observed,
-            registered_resources if isinstance(registered_resources, dict) else None,
-        )
-    except Exception as exc:
-        results.append(
-            {
-                "kind": "docker_resource_validation",
-                "state_file": str(state_file),
-                "proof_identity": state["proof_identity"],
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        raise RuntimeError(f"proof-owned Docker resource validation failed: {exc}") from exc
-    containers = [item["id"] for item in observed["containers"]]
-    networks = [item["id"] for item in observed["networks"]]
-    resource_env = {
-        **env,
-        "CODESTORY_SIDECAR_NAMESPACE": state["namespace"],
-        "CODESTORY_QDRANT_DATA_DIR": state["qdrant_data_dir"],
-    }
-    for kind, ids in (("container", containers), ("network", networks)):
-        if not ids:
-            continue
-        command = [
-            "docker",
-            kind,
-            "rm",
-            *(("-f",) if kind == "container" else ()),
-            *ids,
-        ]
-        try:
-            result = run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=30,
-                check=False,
-                env=resource_env,
-                text=True,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            results.append(
-                {"kind": f"docker_{kind}_remove", "state_file": str(state_file), "error": str(exc)}
-            )
-            raise RuntimeError(f"could not remove exact proof-owned Docker {kind}s: {exc}") from exc
-        results.append(
-            {
-                "kind": f"docker_{kind}_remove",
-                "state_file": str(state_file),
-                "proof_identity": state["proof_identity"],
-                "resource_ids": ids,
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"proof-owned Docker {kind} cleanup exited {result.returncode}")
-    if not containers and not networks:
-        results.append(
-            {
-                "kind": "docker_resources_absent",
-                "state_file": str(state_file),
-                "proof_identity": state["proof_identity"],
-            }
-        )
 
 
 def cleanup_proof_cache(
@@ -1116,7 +614,6 @@ def cleanup_proof_cache(
     project: Path,
     cache_root: Path,
     artifact: Path,
-    run=subprocess.run,
     read_state=read_json_file,
     *,
     registered_sidecars: list[dict] | None = None,
@@ -1127,7 +624,6 @@ def cleanup_proof_cache(
         if cli is None:
             raise RuntimeError("proof cache cleanup requires the packaged CLI owned-deletion boundary")
         owned_delete = lambda root, relative: remove_owned_tree_with_retry(cli, root, relative)
-    env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
     results = []
     errors = []
     canonical_cache = cache_root.resolve(strict=True)
@@ -1154,7 +650,7 @@ def cleanup_proof_cache(
     unexpected = sorted(str(path) for path in discovered_state_files - expected_state_files)
     if unexpected:
         error = f"proof cache contains unregistered sidecar state: {unexpected}"
-        results.append({"kind": "compose_state_validation", "error": error})
+        results.append({"kind": "sidecar_state_validation", "error": error})
         errors.append(error)
     worker_cleanup, worker_errors = cleanup_proof_owned_repair_workers(
         canonical_cache,
@@ -1169,34 +665,23 @@ def cleanup_proof_cache(
             run_id = identity.get("run_id")
             if run_id not in PROOF_AGENT_RUN_IDS:
                 raise RuntimeError(f"unapproved proof sidecar run id: {run_id!r}")
-            validated = validated_proof_compose_state(
+            validated = validated_proof_sidecar_state(
                 canonical_cache,
                 project,
                 read_state,
                 run_id=run_id,
                 registered_identity=identity,
-                allow_missing_compose_file=True,
             )
             if validated is None:
                 continue
             _, state = validated
             validated_states.append((identity, state))
-            cleanup_proof_compose(
-                canonical_cache,
-                project,
-                env,
-                results,
-                run,
-                read_state,
-                run_id=run_id,
-                registered_identity=identity,
-            )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             if not results or results[-1].get("error") != error:
                 results.append(
                     {
-                        "kind": "compose_state_validation",
+                        "kind": "sidecar_state_validation",
                         "state_file": str(identity.get("state_file", "")),
                         "error": error,
                     }
@@ -1271,7 +756,6 @@ def cleanup_proof_cache_on_exit(
     project: Path,
     cache_root: Path,
     artifact: Path,
-    run=subprocess.run,
     read_state=read_json_file,
     registered_sidecars: list[dict] | None = None,
 ):
@@ -1287,7 +771,6 @@ def cleanup_proof_cache_on_exit(
                 project,
                 cache_root,
                 artifact,
-                run,
                 read_state,
                 registered_sidecars=registered_sidecars,
             )
@@ -1310,7 +793,7 @@ def cleanup_proof_cache_on_exit(
 
 
 def proof_agent_environment(base: dict[str, str], run_id: str) -> dict[str, str]:
-    """Keep proof sidecars out of the process-global local Compose namespace."""
+    """Keep proof sidecars out of the process-global local namespace."""
     return {
         **base,
         "CODESTORY_SIDECAR_PROFILE": "agent",
@@ -1533,7 +1016,6 @@ def require_intel_default_backend_failure(payload: object, artifact: Path) -> No
     status = payload.get("project_status")
     require(isinstance(state, dict), "intel_default_backend", artifact, "bootstrap output is missing sidecar_state")
     require(isinstance(status, dict), "intel_default_backend", artifact, "bootstrap output is missing project_status")
-    require(payload.get("compose_started") is False, "intel_default_backend", artifact, "Intel default proof unexpectedly started Compose")
     require(payload.get("embed_reachable") is False, "intel_default_backend", artifact, "Intel default proof unexpectedly reached an embedding backend")
     require(status.get("retrieval_mode") != "full", "intel_default_backend", artifact, "Intel default proof incorrectly reported full retrieval")
     require(isinstance(status.get("repair"), dict), "intel_default_backend", artifact, "Intel default failure is missing actionable repair guidance")
@@ -1546,7 +1028,6 @@ def require_intel_cpu_external_ready(payload: object, artifact: Path, endpoint: 
     require(isinstance(payload, dict), "intel_cpu_external", artifact, "bootstrap output is not an object")
     state = payload.get("sidecar_state")
     require(isinstance(state, dict), "intel_cpu_external", artifact, "bootstrap output is missing sidecar_state")
-    require(payload.get("compose_started") is False, "intel_cpu_external", artifact, "external endpoint proof unexpectedly started Compose")
     require(payload.get("embed_reachable") is True, "intel_cpu_external", artifact, "explicit CPU/external embedding endpoint was not reachable")
     require(state.get("embed_url") == endpoint, "intel_cpu_external", artifact, "sidecar state did not retain the explicit embedding endpoint")
     require(state.get("embedding_device_policy") == "cpu_allowed", "intel_cpu_external", artifact, "CPU policy was not labelled cpu_allowed")
@@ -1731,7 +1212,6 @@ def port_reachability(port: int) -> bool:
 
 
 def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
-    cleanup_run = getattr(args, "run", subprocess.run)
     candidate_root = Path(args.cleanup_proof_temp_root)
     if candidate_root.is_symlink() or not candidate_root.is_dir():
         raise RuntimeError(f"proof cleanup root is missing or unsafe: {candidate_root}")
@@ -1822,8 +1302,8 @@ def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
                     {"kind": "native_process", "pid": launch.get("pid"), "error": error}
                 )
 
-    # Marker-bound process identities are independent of ephemeral project and
-    # Compose files, so always attempt them before inspecting stale sidecar state.
+    # Marker-bound process identities survive ephemeral project state, so
+    # attempt them before inspecting the sidecar state file.
     terminate_launches(recorded_launches)
     state_launches = []
     for identity in registered_sidecars:
@@ -1831,13 +1311,12 @@ def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
         if not state_file.is_file() or state_file.is_symlink():
             continue
         try:
-            validated = validated_proof_compose_state(
+            validated = validated_proof_sidecar_state(
                 Path(str(identity["cache_root"])),
                 Path(str(identity["project"])),
                 read_json_file,
                 run_id=str(identity["run_id"]),
                 registered_identity=identity,
-                allow_missing_compose_file=True,
             )
             if validated is not None:
                 launch = validated[1].get("embedding_launch")
@@ -1884,7 +1363,6 @@ def cleanup_registered_proof_temp_root(args: argparse.Namespace) -> None:
                 project,
                 cache,
                 artifact,
-                run=cleanup_run,
                 registered_sidecars=registered_sidecars,
                 direct_only=True,
                 owned_delete=lambda _cache_parent, _relative: owned_delete(
@@ -2342,13 +1820,13 @@ def plugin_stdio_status(
             project,
             layer="plugin_stdio",
             cwd=project,
-            env=proof_environment({
+            env={
                 **os.environ,
                 "CODESTORY_CLI": "",
                 "CODESTORY_CACHE_ROOT": str(cache_root),
                 "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
                 "PLUGIN_DATA": data,
-            }),
+            },
             cleanup_status_workers=True,
         )
 
@@ -2562,7 +2040,7 @@ def plugin_stdio_handoff(
             policy_artifact,
             "plugin sidecar policy enable failed",
         )
-        plugin_env = proof_environment({
+        plugin_env = {
             **os.environ,
             "CODESTORY_CLI": "",
             "CODESTORY_CACHE_ROOT": str(cache_root),
@@ -2570,7 +2048,7 @@ def plugin_stdio_handoff(
             "CODESTORY_PLUGIN_RELEASE_DIR": str(release_dir),
             "CODESTORY_PLUGIN_SIDECAR_POLICY_PATH": str(policy_path),
             "PLUGIN_DATA": str(plugin_data),
-        })
+        }
         ownership_before_status = proof_ownership_snapshot(cache_root)
         observational_artifact = artifact.with_name("managed-convergence-status-observational.json")
         observational_status = stdio_status_command(
@@ -3450,7 +2928,7 @@ def run_gate(args: argparse.Namespace) -> None:
                 registered_sidecars=proof_cleanup_sidecars,
             )
         )
-        proof_env = proof_environment({**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)})
+        proof_env = {**os.environ, "CODESTORY_CACHE_ROOT": str(cache_root)}
         stdio_cache_root = Path(tempfile.mkdtemp(prefix="codestory-packaged-stdio-cache-")).resolve(strict=True)
         stdio_cleanup_artifact = out_dir / "stdio-cache-cleanup.json"
         stdio_cleanup_sidecars = proof_agent_identities([stdio_cache_root], project)
@@ -3542,7 +3020,6 @@ def run_gate(args: argparse.Namespace) -> None:
                     "agent",
                     "--run-id",
                     PROOF_LOCAL_RUN_ID,
-                    "--skip-compose",
                     "--wait-secs",
                     "0",
                     "--format",
@@ -3577,7 +3054,6 @@ def run_gate(args: argparse.Namespace) -> None:
                         "agent",
                         "--run-id",
                         PROOF_LOCAL_RUN_ID,
-                        "--skip-compose",
                         "--wait-secs",
                         "0",
                         "--format",
@@ -3968,10 +3444,6 @@ def self_test() -> None:
         def fake_owned_delete(boundary: Path, relative: Path) -> None:
             remove_tree_with_retry(boundary / relative)
 
-        assert docker_created_epoch_ms(
-            "2026-07-13T14:08:36.245344828Z"
-        ) == docker_created_epoch_ms("2026-07-13T14:08:36.245344Z")
-
         require_agent_not_ready(
             {
                 "verdicts": [{
@@ -3991,7 +3463,6 @@ def self_test() -> None:
             assert port_reachability(port)
             require_intel_cpu_external_ready(
                 {
-                    "compose_started": False,
                     "embed_reachable": True,
                     "sidecar_state": {
                         "embed_url": endpoint,
@@ -4043,13 +3514,8 @@ def self_test() -> None:
                 process_probe.terminate()
                 process_probe.wait(timeout=5)
 
-        compose_file = root / "docker" / "retrieval-compose.yml"
-        compose_file.parent.mkdir()
-        compose_file.write_text("services: {}\n", encoding="utf-8")
-
-        def write_proof_compose_state(
+        def write_proof_sidecar_state(
             cache_root: Path,
-            overrides: dict | None = None,
             *,
             state_project: Path = root,
         ) -> dict[str, str]:
@@ -4058,20 +3524,16 @@ def self_test() -> None:
                 cache_root, state_project, PROOF_LOCAL_RUN_ID
             )
             state_root = Path(identity["state_file"]).parent
-            for name in ("qdrant", "lexical", "scip"):
+            for name in ("lexical", "scip"):
                 (state_root / name).mkdir(parents=True, exist_ok=True)
             state = {
                 "owner": "codestory",
                 "profile": "agent",
                 "run_id": PROOF_LOCAL_RUN_ID,
                 "namespace": identity["namespace"],
-                "compose_project": identity["compose_project"],
-                "compose_file": str(compose_file),
-                "qdrant_data_dir": identity["qdrant_data_dir"],
                 "lexical_data_dir": identity["lexical_data_dir"],
                 "scip_artifacts_root": identity["scip_artifacts_root"],
             }
-            state.update(overrides or {})
             write_json(Path(identity["state_file"]), state)
             return identity
 
@@ -4121,90 +3583,23 @@ def self_test() -> None:
                     worker.terminate()
                     worker.wait(timeout=5)
 
-        compose_cache = root / "compose-cleanup"
-        identity = write_proof_compose_state(compose_cache)
-        assert identity["namespace"].startswith("codestory-agent-v3-")
-        assert Path(identity["state_file"]).name == SIDECAR_STATE_FILE_V3
-        compose_calls = []
 
-        def fake_docker(command, **kwargs):
-            compose_calls.append(command)
-            namespace = kwargs["env"]["CODESTORY_SIDECAR_NAMESPACE"]
-            qdrant_root = kwargs["env"]["CODESTORY_QDRANT_DATA_DIR"]
-            container_id = f"container-{fnv1a_hex(qdrant_root)}"
-            network_id = f"network-{fnv1a_hex(qdrant_root)}"
-            if command[1:3] == ["container", "ls"]:
-                stdout = json.dumps({"ID": container_id})
-            elif command[1:3] == ["network", "ls"]:
-                stdout = json.dumps({"ID": network_id})
-            elif command[1:3] == ["container", "inspect"]:
-                stdout = json.dumps([{
-                    "Id": container_id,
-                    "Name": f"/{namespace}-qdrant",
-                    "Created": "2026-07-12T12:00:00Z",
-                    "Config": {"Labels": {
-                        "com.docker.compose.project": namespace,
-                        "com.docker.compose.service": "qdrant",
-                        "dev.codestory.owner": "codestory",
-                        "dev.codestory.profile": "agent",
-                        "dev.codestory.namespace": namespace,
-                    }},
-                    "Mounts": [{
-                        "Type": "bind",
-                        "Source": qdrant_root,
-                        "Destination": "/qdrant/storage",
-                    }],
-                }])
-            elif command[1:3] == ["network", "inspect"]:
-                stdout = json.dumps([{
-                    "Id": network_id,
-                    "Name": f"{namespace}_default",
-                    "Created": "2026-07-12T12:00:00Z",
-                    "Labels": {
-                        "com.docker.compose.project": namespace,
-                        "com.docker.compose.network": "default",
-                    },
-                    "Containers": {
-                        container_id: {"Name": f"{namespace}-qdrant"}
-                    },
-                }])
-            else:
-                stdout = "removed"
-            return subprocess.CompletedProcess(command, 0, stdout, "")
-
-        cleanup_artifact = root / "compose-cleanup.json"
-        cleanup_proof_cache(
-            None,
-            root,
-            compose_cache,
-            cleanup_artifact,
-            fake_docker,
-            registered_sidecars=[identity],
-            owned_delete=fake_owned_delete,
-        )
-        assert not compose_cache.exists()
-        assert [command[1] for command in compose_calls if "rm" in command] == [
-            "container",
-            "network",
-        ]
-
-        for state_file_name in (SIDECAR_STATE_FILE_V3, LEGACY_SIDECAR_STATE_FILE):
-            global_cache = root / f"global-local-cache-{state_file_name}"
-            global_cache.mkdir()
-            write_json(global_cache / state_file_name, {"owner": "codestory"})
-            try:
-                cleanup_proof_cache(
-                    None,
-                    root,
-                    global_cache,
-                    root / "global-local-cleanup.json",
-                    owned_delete=fake_owned_delete,
-                )
-            except RuntimeError as exc:
-                assert "global local-sidecar namespace" in str(exc)
-            else:
-                raise AssertionError("proof cleanup must refuse the global namespace")
-            remove_tree_with_retry(global_cache)
+        global_cache = root / f"global-local-cache-{SIDECAR_STATE_FILE_V3}"
+        global_cache.mkdir()
+        write_json(global_cache / SIDECAR_STATE_FILE_V3, {"owner": "codestory"})
+        try:
+            cleanup_proof_cache(
+                None,
+                root,
+                global_cache,
+                root / "global-local-cleanup.json",
+                owned_delete=fake_owned_delete,
+            )
+        except RuntimeError as exc:
+            assert "global local-sidecar namespace" in str(exc)
+        else:
+            raise AssertionError("proof cleanup must refuse the global namespace")
+        remove_tree_with_retry(global_cache)
 
         registered_root = (
             proof_root_parent
@@ -4216,9 +3611,8 @@ def self_test() -> None:
         archive = registered_root / "codestory-cli-v9.9.9-macos-arm64.tar.gz"
         archive.write_bytes(b"packaged proof")
         registered_cache = registered_root / "codestory-packaged-proof-cache-self-test"
-        registered_identity = write_proof_compose_state(
+        registered_identity = write_proof_sidecar_state(
             registered_cache,
-            {"compose_file": None},
             state_project=project,
         )
         write_json(

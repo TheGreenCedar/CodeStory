@@ -345,9 +345,9 @@ pub fn retrieval_publication_identity_from_storage(
             .sidecar_input_hash
             .filter(|value| !value.trim().is_empty())
             .context("retrieval manifest input hash is missing")?,
-        qdrant_collection: (!manifest.qdrant_collection.trim().is_empty())
-            .then_some(manifest.qdrant_collection)
-            .context("retrieval manifest Qdrant collection is missing")?,
+        semantic_generation: (!manifest.semantic_generation.trim().is_empty())
+            .then_some(manifest.semantic_generation)
+            .context("retrieval manifest semantic generation is missing")?,
     })
 }
 
@@ -440,7 +440,7 @@ fn resolve_batch_mode(
             embedding_device,
             runtime,
         );
-        return derive_degraded_mode(&report.lexical, &report.qdrant, &report.scip);
+        return derive_degraded_mode(&report.lexical, &report.semantic, &report.scip);
     }
     (
         RetrievalDegradedMode::LexicalOnly,
@@ -455,7 +455,6 @@ mod tests {
     use crate::index::finalize_index;
     use crate::sidecar_search::SidecarSearch;
     use crate::test_support::retrieval_manifest_fixture;
-    use crate::{QdrantClient, SidecarLayout};
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::{FileInfo, FileRole, LlmSymbolDoc, SearchSymbolProjection};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -526,7 +525,7 @@ mod tests {
                 Ok(self.record(query))
             }
 
-            fn qdrant_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
                 Ok(Vec::new())
             }
 
@@ -670,15 +669,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires live Qdrant and embedding sidecars; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
+    #[ignore = "requires a live embedding runtime; run explicitly with cargo test -p codestory-retrieval integration_query_against_fixture_manifest -- --ignored --nocapture"]
     fn integration_query_against_fixture_manifest() {
-        let layout = SidecarLayout::from_env();
-        if !QdrantClient::new(&layout)
-            .list_collections_probe()
-            .reachable
-        {
-            return;
-        }
         if crate::embeddings::embed_query("function").is_err() {
             return;
         }
@@ -801,7 +793,7 @@ mod tests {
                 .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                     project_id,
                     lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-                    qdrant_collection: "codestory_legacy".into(),
+                    semantic_generation: "codestory_legacy".into(),
                     scip_revision: Some("graph-test".into()),
                     built_at_epoch_ms: 1,
                     disk_bytes: None,

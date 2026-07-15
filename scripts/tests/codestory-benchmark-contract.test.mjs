@@ -24,7 +24,6 @@ test("benchmark child env preserves an explicit agent sidecar selection", () => 
   assert.equal(env.CODESTORY_RETRIEVAL_PROFILE, "agent");
   assert.equal(env.CODESTORY_SIDECAR_RUN_ID, "packet-runtime-test");
   assert.equal(env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS, "1");
-  assert.equal(env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE, "real");
   assert.equal(env.CODESTORY_EMBED_BACKEND, "llamacpp");
   assert.equal(env.CODESTORY_EMBED_LLAMACPP_URL, "http://127.0.0.1:8080/v1/embeddings");
   assert.equal(env.CODESTORY_EVAL_PROBES, undefined);
@@ -36,7 +35,6 @@ test("benchmark child env preserves an explicit agent sidecar selection", () => 
     code_story_retrieval: "1",
     runtime_profile: "agent",
     embedding_backend: "llamacpp",
-    compose_profile: "real",
   });
 });
 
@@ -71,19 +69,17 @@ test("explicit sidecar disable is rejected by the benchmark contract", () => {
   });
 });
 
-test("benchmark contract rejects diagnostic sidecar downgrades", () => {
+test("benchmark contract rejects diagnostic retrieval downgrades", () => {
   const env = {
     CODESTORY_RETRIEVAL: "1",
     CODESTORY_RETRIEVAL_SHADOW: "1",
-    CODESTORY_QDRANT_ENABLED: "0",
     CODESTORY_RETRIEVAL_REAL_EMBEDDINGS: "0",
-    CODESTORY_RETRIEVAL_COMPOSE_PROFILE: "stub",
     CODESTORY_EMBED_BACKEND: "hash",
   };
 
   const blockers = unsupportedSidecarContractRequests(env);
-  assert.equal(blockers.length, 5);
-  assert.throws(() => benchmarkChildEnv(env), /Qdrant sidecar is mandatory/);
+  assert.equal(blockers.length, 3);
+  assert.throws(() => benchmarkChildEnv(env), /llama.cpp embedding sidecar is mandatory/);
 });
 
 test("retrieval env captures sidecar variables", () => {

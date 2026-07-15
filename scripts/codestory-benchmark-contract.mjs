@@ -5,9 +5,7 @@ const RETRIEVAL_ENV_KEYS = [
   "CODESTORY_RETRIEVAL",
   "CODESTORY_RETRIEVAL_PROFILE",
   "CODESTORY_RETRIEVAL_SHADOW",
-  "CODESTORY_QDRANT_ENABLED",
   "CODESTORY_RETRIEVAL_REAL_EMBEDDINGS",
-  "CODESTORY_RETRIEVAL_COMPOSE_PROFILE",
   "CODESTORY_EMBED_BACKEND",
   "CODESTORY_EMBED_LLAMACPP_URL",
   "CODESTORY_EVAL_PROBES",
@@ -33,21 +31,12 @@ function unsupportedSidecarContractRequests(env = process.env) {
   if (shadow && !["0", "false", "no", "off"].includes(shadow)) {
     blockers.push("CODESTORY_RETRIEVAL_SHADOW is unsupported in product benchmarks; sidecar retrieval is primary");
   }
-  if (env.CODESTORY_QDRANT_ENABLED === "0" || env.CODESTORY_QDRANT_ENABLED === "false") {
-    blockers.push("CODESTORY_QDRANT_ENABLED=0 is unsupported; Qdrant sidecar is mandatory");
-  }
   if (
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === "0" ||
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === "false"
   ) {
     blockers.push(
       "CODESTORY_RETRIEVAL_REAL_EMBEDDINGS=0 is unsupported; llama.cpp embedding sidecar is mandatory",
-    );
-  }
-  const composeProfile = String(env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE ?? "").trim().toLowerCase();
-  if (composeProfile && composeProfile !== "real") {
-    blockers.push(
-      `CODESTORY_RETRIEVAL_COMPOSE_PROFILE=${composeProfile} is unsupported; profile real is mandatory`,
     );
   }
   const embeddingBackend = String(env.CODESTORY_EMBED_BACKEND ?? "").trim().toLowerCase();
@@ -84,7 +73,6 @@ function retrievalContractSummary(env = process.env) {
     runtime_profile:
       env.CODESTORY_RETRIEVAL_PROFILE ?? env.CODESTORY_SIDECAR_PROFILE ?? null,
     embedding_backend: env.CODESTORY_EMBED_BACKEND ?? null,
-    compose_profile: env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE ?? null,
   };
 }
 
@@ -101,9 +89,6 @@ function benchmarkChildEnv(baseEnv = process.env, additions = {}) {
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS === ""
   ) {
     env.CODESTORY_RETRIEVAL_REAL_EMBEDDINGS = "1";
-  }
-  if (env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE == null || env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE === "") {
-    env.CODESTORY_RETRIEVAL_COMPOSE_PROFILE = "real";
   }
   if (env.CODESTORY_EMBED_BACKEND == null || env.CODESTORY_EMBED_BACKEND === "") {
     env.CODESTORY_EMBED_BACKEND = "llamacpp";

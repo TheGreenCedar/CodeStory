@@ -1,4 +1,4 @@
-//! A supported local project reaches full retrieval without Docker or Qdrant.
+//! A supported local project reaches full retrieval through embedded storage and native embeddings.
 
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
 use codestory_retrieval::{
@@ -224,10 +224,8 @@ fn embedded_default_reaches_full_mode_and_returns_dense_hits() {
     }
     let runtime = runtime(project.path(), cache.path(), embedding.endpoint.clone());
 
-    let finalized = finalize_index_for_runtime(project.path(), &storage_path, &runtime)
+    let _finalized = finalize_index_for_runtime(project.path(), &storage_path, &runtime)
         .expect("finalize embedded retrieval");
-    assert_eq!(runtime.vector_backend().as_str(), "embedded");
-    assert!(!finalized.qdrant_stubbed);
 
     let result = execute_retrieval_query_with_cache_for_runtime(
         QueryRequest {
@@ -247,7 +245,7 @@ fn embedded_default_reaches_full_mode_and_returns_dense_hits() {
         result.hits.iter().any(|hit| {
             hit.node_id.as_deref() == Some("2001")
                 && hit.file_path == "lib.rs"
-                && (hit.source == CandidateSource::Qdrant
+                && (hit.source == CandidateSource::Semantic
                     || hit.provenance.iter().any(|source| source == "dense_anchor"))
         }),
         "expected embedded dense hit, got {:?}",

@@ -335,7 +335,7 @@ fn context_rejects_removed_hybrid_tuning_flags_as_unknown_args() {
 }
 
 #[test]
-#[ignore = "live full-sidecar contract; requires Docker/services plus CODESTORY_EMBED_BACKEND=llamacpp real embeddings"]
+#[ignore = "live full-retrieval contract; requires the managed embedding runtime"]
 fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     let workspace = tempdir().expect("workspace dir");
     write_retrieval_fixture(workspace.path());

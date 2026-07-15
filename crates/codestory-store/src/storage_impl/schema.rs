@@ -242,7 +242,7 @@ const TABLE_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
         project_id TEXT PRIMARY KEY,
         lexical_version TEXT NOT NULL,
-        qdrant_collection TEXT NOT NULL,
+        semantic_generation TEXT NOT NULL,
         scip_revision TEXT,
         built_at_epoch_ms INTEGER NOT NULL,
         disk_bytes INTEGER,
@@ -462,6 +462,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 21 {
         storage.set_schema_version(21)?;
     }
+    migrate_v22_retrieval_manifest_semantic_generation(&storage.conn)?;
+    if stored_version < 22 {
+        storage.set_schema_version(22)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -672,7 +676,7 @@ pub(super) fn migrate_v14_retrieval_index_manifest(conn: &Connection) -> Result<
         "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
             project_id TEXT PRIMARY KEY,
             zoekt_version TEXT NOT NULL,
-            qdrant_collection TEXT NOT NULL,
+            semantic_generation TEXT NOT NULL,
             scip_revision TEXT,
             built_at_epoch_ms INTEGER NOT NULL,
             disk_bytes INTEGER,
@@ -712,6 +716,30 @@ pub(super) fn migrate_v21_retrieval_manifest_lexical_version(
         )),
         (false, false) => Err(StorageError::Other(
             "retrieval_index_manifest is missing lexical_version".to_string(),
+        )),
+    }
+}
+
+pub(super) fn migrate_v22_retrieval_manifest_semantic_generation(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    let columns = table_columns(conn, "retrieval_index_manifest")?;
+    let has_old_name = columns.iter().any(|column| column == "qdrant_collection");
+    let has_semantic = columns.iter().any(|column| column == "semantic_generation");
+    match (has_old_name, has_semantic) {
+        (true, false) => {
+            conn.execute(
+                "ALTER TABLE retrieval_index_manifest RENAME COLUMN qdrant_collection TO semantic_generation",
+                [],
+            )?;
+            Ok(())
+        }
+        (false, true) => Ok(()),
+        (true, true) => Err(StorageError::Other(
+            "retrieval_index_manifest contains both old and semantic generation columns".into(),
+        )),
+        (false, false) => Err(StorageError::Other(
+            "retrieval_index_manifest is missing semantic_generation".into(),
         )),
     }
 }

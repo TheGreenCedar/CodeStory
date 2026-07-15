@@ -188,7 +188,7 @@ SHA.
 | Linux arm64 | `ubuntu-24.04-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows x64 | `windows-latest` | Version, help, stdio shape, installer ownership self-test, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 | Windows arm64 | `windows-11-arm` | Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
-| macOS x64 | `macos-15-intel` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, checksum-pinned native CPU retrieval without Docker/Qdrant or configuration, terminal shared-agent evidence, and cleanup; never Metal |
+| macOS x64 | `macos-15-intel` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, checksum-pinned native CPU retrieval without user configuration, terminal shared-agent evidence, and cleanup; never Metal |
 | macOS arm64 | `macos-15` | Unsigned in PR/integration cells; Developer ID signed and notarized only in release/post-publish cells. Version, help, stdio shape, managed provisioning, stale-local grounding convergence, terminal shared-agent evidence, and cleanup |
 
 The managed convergence proof on every native runner uses an isolated project
@@ -226,7 +226,7 @@ process must then reuse the exact native PID and launch fingerprint without a
 duplicate server. The remainder of the workflow proves readiness blocking after
 endpoint death, explicit recovery, packet/search, and proof-owned cleanup. The
 same protected run proves dynamic endpoint selection, live process identity,
-and exact cache/process/container/port ownership before marker-scoped cleanup;
+and exact cache/process/port ownership before marker-scoped cleanup;
 the following run also cleans a marker-owned prior attempt if cancellation
 prevented the prior `always()` step. Contract tests or hosted package smoke
 cannot replace this hardware evidence.
@@ -290,8 +290,8 @@ Proof cleanup validates the exact current `lexical_data_dir`. During the v0.15
 migration window it accepts the removed `zoekt_data_dir` spelling only as
 read compatibility for an otherwise proof-owned state file; remove that alias
 in v0.16. New state must emit only lexical path fields. When local retrieval
-indexing fails, the proof records Compose process state and bounded Qdrant logs
-before cleanup so the primary failure remains diagnosable; cleanup failure is
+indexing fails, the proof records managed native process state and bounded
+runtime logs before cleanup so the primary failure remains diagnosable; cleanup failure is
 retained as secondary evidence and must not replace the primary gate failure.
 
 Each native managed-plugin handoff also starts with a verified prior managed
@@ -458,7 +458,7 @@ attested gate below.
 Release-readiness evidence is tiered:
 
 Linux accelerator cells have the same evidence boundary. CI runs prove resolver,
-manifest, compose, and log-marker contracts only; they do not prove CUDA, HIP,
+manifest, launch, and log-marker contracts only; they do not prove CUDA, HIP,
 Vulkan, SYCL, or OpenVINO live GPU execution unless the run is explicitly backed
 by a GPU runner artifact. For Linux sidecar backend changes, attach manual or
 nightly evidence for every backend described as live-supported. Contract-only
@@ -467,7 +467,7 @@ cells must stay labeled as contract-only in PRs, issues, and release notes.
 | Evidence tier | Required proof | Release meaning |
 | --- | --- | --- |
 | Stats-only / degraded sidecar | Diagnostic timing or contract evidence without prepared full sidecars, or stats output whose `proof_tier` is `stats_only` | Useful local regression signal only; not release proof for packet/search readiness. The current passing `codestory_repo_release_e2e_emits_stats` harness asserts full sidecar status instead of completing as a passing no-full-sidecar row. |
-| Full sidecar | `codestory_repo_release_e2e_emits_stats` emits `proof_tier: "full_sidecar"` after the project-local SQLite lexical shard, SCIP, and required dense-anchor Qdrant/llama.cpp are prepared; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` with current symbol-doc and dense-anchor manifest fields; and search shadow mode is `full` | Required before claiming agent-facing packet/search readiness on the current workspace. This is the normal tier for a passing stats JSON object from the release e2e stats harness. |
+| Full sidecar | `codestory_repo_release_e2e_emits_stats` emits `proof_tier: "full_sidecar"` after the project-local SQLite lexical/vector generations, SCIP, and managed native llama.cpp are prepared; `retrieval index --refresh full` succeeds; `retrieval status --format json` reports `retrieval_mode: "full"` with current symbol-doc and dense-anchor manifest fields; and search shadow mode is `full` | Required before claiming agent-facing packet/search readiness on the current workspace. This is the normal tier for a passing stats JSON object from the release e2e stats harness. |
 | Real-repo drill | `CODESTORY_REAL_REPO_DRILL_CASES` points at prepared manifests and the drill cases run without skip allowances | Required before claiming the release was exercised beyond the CodeStory checkout. |
 | Promotion-grade benchmark | Full holdout packet-runtime rows cover cold and warm modes with three repeats, `--jobs 4`, prepared sidecars, `--publishable`, explicit `--max-source-reads-after-packet 0`, no `--allow-failures`, full sidecar provenance, no quality misses, no sufficiency gaps, and no SLA misses. Fixed-baseline A/B rows are supporting diagnostics only unless fingerprint-compatible. | Required for performance or retrieval-quality promotion claims. |
 

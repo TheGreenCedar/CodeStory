@@ -1339,7 +1339,6 @@ fn write_repair_status_fixture(
             "run_id": run_id,
             "attempt_id": format!("attempt:{run_id}"),
             "namespace": sidecar.namespace,
-            "compose_project": sidecar.compose_project,
             "phase": phase,
             "pid": pid,
             "started_at_epoch_ms": updated_at_epoch_ms,
@@ -3493,7 +3492,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
 fn resources_read_status_reports_active_agent_repair_phase() {
     let fixture = indexed_fixture();
     let status_path =
-        write_active_repair_status_fixture(&fixture, "issue-661-proof", "Qdrant finalize");
+        write_active_repair_status_fixture(&fixture, "issue-661-proof", "Semantic finalize");
     assert!(status_path.exists(), "repair status fixture should exist");
     let mut server = spawn_stdio_server(&fixture);
 
@@ -3513,7 +3512,7 @@ fn resources_read_status_reports_active_agent_repair_phase() {
     assert_eq!(agent_lane["status"], json!("repairing"), "{status}");
     assert_eq!(agent_lane["profile"], json!("agent"), "{status}");
     assert_eq!(agent_lane["run_id"], json!("issue-661-proof"), "{status}");
-    assert_eq!(agent_lane["phase"], json!("Qdrant finalize"), "{status}");
+    assert_eq!(agent_lane["phase"], json!("Semantic finalize"), "{status}");
     let broker_operation = status["readiness_broker"]["operations"]
         .as_array()
         .and_then(|operations| {

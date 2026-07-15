@@ -82,7 +82,6 @@ toml = "0.8"
 sha2 = "0.10"
 ring = "0.17.14"
 ureq = "2.12"
-turbovec = "0.9.0"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
 criterion = "0.8.2"
