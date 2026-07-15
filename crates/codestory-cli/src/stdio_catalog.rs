@@ -617,7 +617,7 @@ static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for proof-bearing graph/source follow-up.",
     &[
         SchemaProperty::string("query", "Search query."),
-        SchemaProperty::object("retrieval", "Retrieval state DTO."),
+        SchemaProperty::object("retrieval", "Retrieval readiness."),
         SchemaProperty::integer("limit_per_source", "Per-source result limit."),
         SchemaProperty::string("repo_text_mode", "Repo text search mode.")
             .with_enum(SEARCH_REPO_TEXT_MODES),
@@ -822,7 +822,6 @@ static GROUNDING_SNAPSHOT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("budget", "Grounding output budget.").with_enum(GROUNDING_BUDGETS),
         SchemaProperty::integer("generated_at_epoch_ms", "Snapshot generation time."),
         SchemaProperty::object("stats", "Indexed project stats."),
-        SchemaProperty::object("retrieval", "Optional retrieval state DTO.").nullable(),
         SchemaProperty::object("coverage", "Grounding coverage summary."),
         SchemaProperty::array(
             "root_symbols",

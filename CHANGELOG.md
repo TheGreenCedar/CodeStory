@@ -33,6 +33,10 @@
   indexing. While the first complete publication is still being built, ground
   and broad-search tools return a short same-tool retry instead of an empty
   success or terminal unavailable result.
+- Installed-host semantic migrations now keep packet, search, and context in a
+  same-tool preparing state while a refresh owns publication. Successful MCP
+  search reports only that retrieval is ready, and grounding no longer exposes
+  obsolete server-era semantic counters or backend details.
 
 ## 0.15.0
 
