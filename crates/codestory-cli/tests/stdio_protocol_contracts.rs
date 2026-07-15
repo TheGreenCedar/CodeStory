@@ -14,7 +14,6 @@ use tempfile::TempDir;
 struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,
-    hash_embeddings: bool,
     latest_release_version: Option<String>,
     disable_release_probe: bool,
     disable_installed_cli_probe: bool,
@@ -109,7 +108,42 @@ pub fn open_project(project_name: &str) -> String {
 }
 
 fn indexed_fixture() -> StdioFixture {
-    indexed_fixture_with_embedding_mode(true)
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+
+    let mut command = test_support::cli_command();
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("full")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(workspace.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path());
+    allow_explicit_cpu_embeddings(&mut command);
+    let output = command.output().expect("run index");
+    assert!(
+        output.status.success(),
+        "index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    StdioFixture {
+        workspace,
+        cache_dir,
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
+        disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
+        dirty_marker_path: None,
+        dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
+    }
 }
 
 fn write_dirty_marker_fixture(fixture: &StdioFixture, name: &str, marker: Value) -> PathBuf {
@@ -131,7 +165,7 @@ fn refresh_fixture_index(fixture: &StdioFixture) {
         .arg(fixture.workspace.path())
         .arg("--cache-dir")
         .arg(fixture.cache_dir.path());
-    apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
+    allow_explicit_cpu_embeddings(&mut command);
     let output = command.output().expect("run index refresh");
     assert!(
         output.status.success(),
@@ -139,46 +173,6 @@ fn refresh_fixture_index(fixture: &StdioFixture) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
-    let workspace = tempfile::tempdir().expect("workspace dir");
-    let cache_dir = tempfile::tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let mut command = test_support::cli_command();
-    command
-        .arg("index")
-        .arg("--refresh")
-        .arg("full")
-        .arg("--format")
-        .arg("json")
-        .arg("--project")
-        .arg(workspace.path())
-        .arg("--cache-dir")
-        .arg(cache_dir.path());
-    apply_fixture_embedding_env(&mut command, hash_embeddings);
-    let output = command.output().expect("run index");
-    assert!(
-        output.status.success(),
-        "index failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    StdioFixture {
-        workspace,
-        cache_dir,
-        hash_embeddings,
-        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        disable_release_probe: false,
-        disable_installed_cli_probe: false,
-        plugin_data_dir: None,
-        plugin_cli_source: None,
-        dirty_marker_path: None,
-        dirty_marker_project_root: None,
-        local_refresh_timeout_ms: None,
-    }
 }
 
 fn unindexed_fixture() -> StdioFixture {
@@ -189,7 +183,6 @@ fn unindexed_fixture() -> StdioFixture {
     StdioFixture {
         workspace,
         cache_dir,
-        hash_embeddings: true,
         latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         disable_release_probe: false,
         disable_installed_cli_probe: false,
@@ -226,10 +219,8 @@ fn write_managed_cli_fixture(plugin_data: &Path, version: &str) -> PathBuf {
     executable
 }
 
-fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
-    if hash_embeddings {
-        command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
-    }
+fn allow_explicit_cpu_embeddings(command: &mut Command) {
+    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
 }
 
 fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
@@ -250,7 +241,7 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .env("CODESTORY_CACHE_ROOT", state_root.join("cache"))
         .env("CODESTORY_STDIO_CACHE_ROOT", state_root.join("stdio-cache"))
         .env("CODESTORY_PLUGIN_DATA", state_root.join("plugin-data"));
-    apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
+    allow_explicit_cpu_embeddings(&mut command);
     if let Some(version) = &fixture.latest_release_version {
         command.env("CODESTORY_LATEST_RELEASE_VERSION", version);
     }
@@ -2399,7 +2390,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     );
     assert_ne!(
         status["retrieval_mode"], "full",
-        "hash-mode indexed fixture must not report mandatory sidecar retrieval as full: {status}"
+        "an explicit-CPU fixture without a compatible semantic publication must not report retrieval as full: {status}"
     );
     assert_eq!(
         status["local_refresh"]["state"],
@@ -3114,7 +3105,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
         .arg(fixture.workspace.path())
         .arg("--cache-dir")
         .arg(fixture.cache_dir.path());
-    apply_fixture_embedding_env(&mut index_command, fixture.hash_embeddings);
+    allow_explicit_cpu_embeddings(&mut index_command);
     let output = index_command
         .output()
         .expect("rerun index after stale status");
