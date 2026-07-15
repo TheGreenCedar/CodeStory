@@ -71,7 +71,7 @@ jq -e --arg profile_id "$profile_id" --arg contract_sha "$contract_sha" \
   .host.lima_version == $contract[0].host.lima_version and
   .vm.profile == $contract[0].vm.profile and .vm.type == $contract[0].vm.type and
   .vm.architecture == $contract[0].vm.architecture and
-  .vm.runtime == $contract[0].vm.runtime and
+  .vm.runtime == $contract[0].vm.runtime and .vm.binfmt == $contract[0].vm.binfmt and
   .vm.mount_type == $contract[0].vm.mount_type and .vm.host_mounts == [] and
   .vm.cpus == $contract[0].vm.cpus and .vm.memory_gib == $contract[0].vm.memory_gib and
   .vm.data_disk_gib == $contract[0].vm.data_disk_gib and

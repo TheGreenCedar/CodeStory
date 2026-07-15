@@ -17,7 +17,7 @@ The approved host shape for the 0.16 in-process retrieval baseline is:
 | Colima | 0.10.3 |
 | Capacity | 4 vCPU, 8 GiB maximum memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
-| Guest container runtime | containerd from the checksum-pinned Colima image; the host context is never activated |
+| Guest container runtime | containerd from the checksum-pinned Colima image; foreign-architecture emulation is disabled and the host context is never activated |
 | Stable profile ID | `codestory-release-evidence-linux-arm64-v2` |
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
@@ -53,8 +53,9 @@ Provisioning is idempotent. It:
 - installs native packages from a fixed Ubuntu archive snapshot at exact
   versions, then records the complete native package manifest;
 - uses the containerd runtime already owned by the checksum-pinned VM image;
-- binds the runner workspace from the dedicated 80 GiB data disk and verifies
-  that mount before accepting evidence;
+- binds the runner workspace from the dedicated 80 GiB data disk only after
+  Colima reports that disk ready, and verifies the single mount before accepting
+  evidence;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
 - verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and
@@ -64,7 +65,9 @@ Provisioning is idempotent. It:
 - keeps Cargo, Rust, temp, XDG, CodeStory, drill, work, and artifact state
   under the proof-owned volume.
 
-The tracked CodeStory source used by provisioning checks is streamed into the
+The runner workspace is mounted by the owned host lifecycle instead of guest
+`fstab`; this avoids boot-order races between the root disk and Colima's data
+disk. The tracked CodeStory source used by provisioning checks is streamed into the
 guest over SSH. It replaces the previous validation tree atomically enough for
 the stopped runner, so untracked or modified validation files cannot survive a
 provisioning pass. No source or tool is executed through a host mount. `verify`

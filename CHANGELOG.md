@@ -55,7 +55,8 @@
 - Release evidence is routed through the in-process Linux ARM64 machine profile.
   Its pinned VM image supplies containerd directly, without retaining a Docker
   repository package dependency. The one-shot proof VM is capped at 8 GiB, its
-  workspace is verified on the dedicated data disk, and it is stopped after the
+  workspace is mounted only after the dedicated data disk is ready, unused
+  cross-architecture emulation is disabled, and the VM is stopped after the
   final proof. Mac signing and notarization remain publication-only gates, not
   PR blockers.
 
