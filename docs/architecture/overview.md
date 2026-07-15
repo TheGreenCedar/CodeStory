@@ -16,7 +16,7 @@ flowchart LR
     Select --> Runtime["project RuntimeContext"]
     Runtime --> Graph["core graph and local navigation"]
     Runtime --> Retrieval["retrieval publication and broad evidence"]
-    Retrieval --> Engine["one process-wide embedding engine"]
+    Retrieval --> Engine["one sleeping or resident engine owner"]
 ```
 
 The launcher provisions only the exact CodeStory executable required by the
@@ -25,9 +25,11 @@ handshake, then hands requests to that executable. It does not provision a
 model or backend separately.
 
 Every MCP request carries an absolute project root. The stdio process retains
-one isolated runtime context per project while all projects share one lazily
-initialized model and accelerator context. Hook-written active-project files
-are diagnostics; they never route requests.
+one isolated runtime context per project while all projects share one embedding
+owner. Its model and accelerator context stay warm during active request bursts
+and are released after 60 idle seconds. The next product request restores them
+automatically. Hook-written active-project files are diagnostics; they never
+route requests.
 
 ## Data topology
 
@@ -65,7 +67,7 @@ evidence.
 
 | Scope | Identity and state | Lifetime |
 | --- | --- | --- |
-| Process | captured startup defaults and one embedding engine | one CLI or stdio process |
+| Process | captured startup defaults and one embedding owner | one CLI or stdio process |
 | Project | repository identity, cache namespace, immutable runtime config | retained across requests in multi-project stdio |
 | Publication | core generation/run plus retrieval generation/input/producer | one atomic old-or-new published view |
 | Request | explicit project, tool arguments, task and retry budget | one tool or CLI call |

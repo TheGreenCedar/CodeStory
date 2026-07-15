@@ -47,6 +47,8 @@ One stdio process can therefore serve repositories A, B, then A again:
 - process startup defaults are captured once and are not reread when projects
   switch;
 - the in-process embedding engine and materialized model are shared;
+- the heavy model and accelerator allocation sleep after 60 idle seconds and
+  wake automatically on the next product request;
 - small request-local and project-local caches are reset or selected explicitly,
   rather than leaking the prior project.
 
@@ -60,9 +62,10 @@ flowchart LR
     B --> Engine
 ```
 
-Switching projects changes the selected runtime and cache, not the model
-instance. Returning to A reuses both A's project state and the already-warm
-engine without making either visible to B.
+Switching projects changes the selected runtime and cache, not the engine
+owner. Returning to A during an active burst reuses the warm model. Returning
+after the idle window reloads the same verified model automatically without
+making either project's state visible to the other.
 
 ## Managed activation
 

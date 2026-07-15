@@ -22,5 +22,8 @@ llama-cpp-2 = { workspace = true, features = ["metal"] }
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 llama-cpp-2 = { workspace = true, features = ["vulkan"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [target.'cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))'.dependencies]
 llama-cpp-2 = { workspace = true }

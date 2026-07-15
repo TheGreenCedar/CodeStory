@@ -82,6 +82,7 @@ struct GenerationRetentionContext<'a> {
     workspace_id: &'a str,
     previous_manifest: Option<&'a RetrievalIndexManifest>,
     embedding_device: &'a crate::embeddings::EmbeddingDeviceReadiness,
+    embedding_residency: crate::embeddings::ProductEmbeddingResidencyLease,
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
@@ -135,6 +136,9 @@ pub fn finalize_index_for_runtime_with_progress(
     let _generation_lock = GenerationRetentionLock::acquire(&layout.state_file, &project_id)
         .context("lock sidecar generation publication and retention")?;
     layout.ensure_data_dirs()?;
+    let embedding_residency =
+        crate::embeddings::acquire_product_embedding_residency_for_runtime(runtime)
+            .context("mandatory retrieval embedding runtime could not be pinned")?;
     let degraded_modes = Vec::new();
     let scip_stubbed = false;
 
@@ -178,6 +182,7 @@ pub fn finalize_index_for_runtime_with_progress(
         workspace_id: &workspace_id,
         previous_manifest: previous_manifest.as_ref(),
         embedding_device: &embedding_device,
+        embedding_residency,
     };
 
     if let Some(previous) = previous_manifest.as_ref() {
@@ -652,6 +657,16 @@ fn semantic_ready_point_count(semantic: &SemanticGeneration<'_>) -> Option<u64> 
     health.ready.then_some(health.point_count)
 }
 
+fn with_embedding_publication_residency<T>(
+    residency: &crate::embeddings::ProductEmbeddingResidencyLease,
+    publish: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if residency.identity().is_none() && !cfg!(feature = "test-support") {
+        bail!("embedding publication fence is missing its residency lease identity");
+    }
+    publish()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn persist_finalized_manifest(
     project_root: &Path,
@@ -671,38 +686,47 @@ fn persist_finalized_manifest(
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    promote_retrieval_manifest(
-        &mut storage,
-        sidecar_input,
-        &manifest,
-        |storage| {
-            let lexical_source = lexical_source_input(project_root)
-                .context("rescan lexical source at publication fence")?;
-            let embedding_contract = SidecarEmbeddingContract {
-                backend: &embedding_backend,
-                dimension: embedding_dim,
-            };
-            let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
-                storage,
-                project_root,
-                &project_id,
-                &embedding_contract,
-                lexical_source,
-            )?;
-            if let Some(reason) = manifest_unavailable_reason_for_runtime(
-                &project_id,
-                storage,
-                &manifest,
-                retention_context.runtime,
-            ) {
-                bail!(
-                    "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
-                );
-            }
-            Ok(current_input)
-        },
-        || validate_candidate_generation(&project_id, sidecar_input, &manifest, retention_context),
-    )?;
+    with_embedding_publication_residency(&retention_context.embedding_residency, || {
+        promote_retrieval_manifest(
+            &mut storage,
+            sidecar_input,
+            &manifest,
+            |storage| {
+                let lexical_source = lexical_source_input(project_root)
+                    .context("rescan lexical source at publication fence")?;
+                let embedding_contract = SidecarEmbeddingContract {
+                    backend: &embedding_backend,
+                    dimension: embedding_dim,
+                };
+                let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
+                    storage,
+                    project_root,
+                    &project_id,
+                    &embedding_contract,
+                    lexical_source,
+                )?;
+                if let Some(reason) = manifest_unavailable_reason_for_runtime(
+                    &project_id,
+                    storage,
+                    &manifest,
+                    retention_context.runtime,
+                ) {
+                    bail!(
+                        "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
+                    );
+                }
+                Ok(current_input)
+            },
+            || {
+                validate_candidate_generation(
+                    &project_id,
+                    sidecar_input,
+                    &manifest,
+                    retention_context,
+                )
+            },
+        )
+    })?;
 
     let (generation_retention_plan, generation_retention) =
         retain_published_generations(storage_path, retention_context, &project_id, &manifest)?;
@@ -857,14 +881,28 @@ fn embedding_identity_matches(
     after: &crate::in_process_embedding::ProcessEmbeddingIdentity,
 ) -> bool {
     before.instance_id == after.instance_id
-        && before.model_load_count == 1
-        && after.model_load_count == 1
+        && before.load_generation == after.load_generation
+        && before.model_load_count == after.model_load_count
+        && before.residency == "resident"
+        && after.residency == "resident"
+        && before.worker_alive
+        && after.worker_alive
+        && before.load_error.is_none()
+        && after.load_error.is_none()
         && before.model_digest == after.model_digest
         && before.ggml_build_identity == after.ggml_build_identity
         && before.backend == after.backend
         && before.adapter_name == after.adapter_name
         && before.policy == after.policy
         && before.accelerator_execution_verified == after.accelerator_execution_verified
+}
+
+fn embedding_identity_matches_lease(
+    lease: &crate::in_process_embedding::ProcessEmbeddingIdentity,
+    before: &crate::in_process_embedding::ProcessEmbeddingIdentity,
+    after: &crate::in_process_embedding::ProcessEmbeddingIdentity,
+) -> bool {
+    embedding_identity_matches(lease, before) && embedding_identity_matches(before, after)
 }
 
 fn validate_candidate_generation(
@@ -914,6 +952,17 @@ fn validate_candidate_generation(
         context.runtime.embedding.allow_cpu,
     )
     .context("validate in-process embedding identity after final probes")?;
+    if let Some(lease_identity) = context.embedding_residency.identity() {
+        if !embedding_identity_matches_lease(
+            lease_identity,
+            &embedding_identity_before,
+            &embedding_identity_after,
+        ) {
+            bail!("embedding engine load generation changed inside the publication fence");
+        }
+    } else if !cfg!(feature = "test-support") {
+        bail!("embedding publication fence is missing its residency lease identity");
+    }
     let evidence = CandidateGenerationEvidence {
         lexical_matches: crate::lexical_index::shard_matches_lexical_input(
             &context.layout.lexical_data_dir,
@@ -1344,7 +1393,11 @@ mod tests {
         let accelerated = policy == "accelerated";
         crate::in_process_embedding::ProcessEmbeddingIdentity {
             instance_id: "inprocess:test".into(),
+            load_generation: 1,
             model_load_count: 1,
+            residency: "resident",
+            worker_alive: true,
+            load_error: None,
             model_digest: codestory_llama_sys::MODEL_SHA256,
             ggml_build_identity: codestory_llama_sys::GGML_BUILD_IDENTITY,
             backend: if accelerated { "Metal" } else { "CPU" }.into(),
@@ -1412,6 +1465,44 @@ mod tests {
         .expect("progress wrapper should return action result");
 
         assert_eq!(&*phases.borrow(), &["lexical sidecar"]);
+    }
+
+    #[test]
+    fn publication_requires_one_pinned_embedding_load_generation() {
+        let before = test_embedding_identity("accelerated");
+        let mut after = before.clone();
+        assert!(embedding_identity_matches_lease(&before, &before, &after));
+
+        after.load_generation += 1;
+        after.model_load_count += 1;
+        assert!(!embedding_identity_matches_lease(&before, &before, &after));
+
+        after = before.clone();
+        after.residency = "sleeping";
+        assert!(!embedding_identity_matches_lease(&before, &before, &after));
+
+        let mut lease = before.clone();
+        lease.load_generation += 1;
+        lease.model_load_count += 1;
+        assert!(!embedding_identity_matches_lease(&lease, &before, &before));
+    }
+
+    #[test]
+    fn publication_scope_retains_the_residency_guard_through_commit() {
+        use std::sync::atomic::Ordering;
+
+        let (residency, active) = crate::embeddings::ProductEmbeddingResidencyLease::test_lease(
+            test_embedding_identity("accelerated"),
+        );
+        with_embedding_publication_residency(&residency, || {
+            assert!(active.load(Ordering::Acquire));
+            Ok(())
+        })
+        .expect("publication under residency guard");
+        assert!(active.load(Ordering::Acquire));
+
+        drop(residency);
+        assert!(!active.load(Ordering::Acquire));
     }
 
     #[test]

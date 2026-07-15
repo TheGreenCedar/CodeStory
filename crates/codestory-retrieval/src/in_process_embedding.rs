@@ -1,19 +1,23 @@
 use anyhow::{Result, anyhow, bail};
-use codestory_llama_sys::{EmbeddingEngine, ExecutionPolicy};
+#[cfg(not(feature = "test-support"))]
+use codestory_llama_sys::EmbeddingResidencyLease;
+use codestory_llama_sys::{EmbeddingEngine, EngineLifecycleSnapshot, ExecutionPolicy};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 type ProcessEngineState = Option<Arc<ProcessEmbeddingEngine>>;
 
 static PROCESS_ENGINE: OnceLock<Mutex<ProcessEngineState>> = OnceLock::new();
 static PROCESS_EXIT_HOOK: OnceLock<Result<(), String>> = OnceLock::new();
-static MODEL_LOAD_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ProcessEmbeddingIdentity {
     pub instance_id: String,
+    pub load_generation: u64,
     pub model_load_count: u64,
+    pub residency: &'static str,
+    pub worker_alive: bool,
+    pub load_error: Option<String>,
     pub model_digest: &'static str,
     pub ggml_build_identity: &'static str,
     pub backend: String,
@@ -41,12 +45,28 @@ struct ProcessEmbeddingEngine {
     instance_id: String,
 }
 
+#[derive(Debug)]
+#[cfg(not(feature = "test-support"))]
+pub struct ProcessEmbeddingResidencyLease {
+    _process: Arc<ProcessEmbeddingEngine>,
+    _lease: EmbeddingResidencyLease,
+    identity: ProcessEmbeddingIdentity,
+}
+
+#[cfg(not(feature = "test-support"))]
+impl ProcessEmbeddingResidencyLease {
+    pub fn identity(&self) -> &ProcessEmbeddingIdentity {
+        &self.identity
+    }
+}
+
 pub fn process_embedding_identity(
     cache_root: &Path,
     allow_cpu: bool,
 ) -> Result<ProcessEmbeddingIdentity> {
     let process = process_engine(cache_root, allow_cpu)?;
-    Ok(identity_from_process(&process))
+    let snapshot = process.engine.ensure_resident()?;
+    Ok(identity_from_snapshot(&process, &snapshot))
 }
 
 /// Observes the process engine without starting it. Status and doctor surfaces
@@ -65,7 +85,23 @@ pub fn process_embedding_identity_if_initialized(
         return Ok(None);
     };
     validate_process_selection(process, cache_root, allow_cpu)?;
-    Ok(Some(identity_from_process(process)))
+    let snapshot = process.engine.snapshot()?;
+    Ok(Some(identity_from_snapshot(process, &snapshot)))
+}
+
+#[cfg(not(feature = "test-support"))]
+pub fn acquire_process_embedding_residency(
+    cache_root: &Path,
+    allow_cpu: bool,
+) -> Result<ProcessEmbeddingResidencyLease> {
+    let process = process_engine(cache_root, allow_cpu)?;
+    let lease = process.engine.acquire_residency_lease()?;
+    let identity = identity_from_snapshot(&process, lease.snapshot());
+    Ok(ProcessEmbeddingResidencyLease {
+        _process: process,
+        _lease: lease,
+        identity,
+    })
 }
 
 pub fn embed_prepared_in_process(
@@ -113,7 +149,6 @@ fn process_engine(cache_root: &Path, allow_cpu: bool) -> Result<Arc<ProcessEmbed
         // atexit callbacks run in reverse order, so this drops the live model
         // and context before ggml releases the selected Metal/Vulkan device.
         ensure_process_exit_hook()?;
-        MODEL_LOAD_COUNT.fetch_add(1, Ordering::AcqRel);
         *state = Some(Arc::new(ProcessEmbeddingEngine {
             engine,
             cache_root: cache_root.to_path_buf(),
@@ -156,11 +191,18 @@ fn validate_process_selection(
     Ok(())
 }
 
-fn identity_from_process(process: &ProcessEmbeddingEngine) -> ProcessEmbeddingIdentity {
-    let identity = process.engine.identity();
+fn identity_from_snapshot(
+    process: &ProcessEmbeddingEngine,
+    snapshot: &EngineLifecycleSnapshot,
+) -> ProcessEmbeddingIdentity {
+    let identity = &snapshot.identity;
     ProcessEmbeddingIdentity {
         instance_id: process.instance_id.clone(),
-        model_load_count: MODEL_LOAD_COUNT.load(Ordering::Acquire),
+        load_generation: snapshot.load_generation,
+        model_load_count: snapshot.model_load_count,
+        residency: snapshot.residency.as_str(),
+        worker_alive: snapshot.worker_alive,
+        load_error: snapshot.load_error.clone(),
         model_digest: identity.model_digest,
         ggml_build_identity: identity.ggml_build_identity,
         backend: identity.backend.clone(),

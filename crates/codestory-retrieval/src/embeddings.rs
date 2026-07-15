@@ -6,12 +6,16 @@ use crate::in_process_embedding::{
 };
 #[cfg(not(feature = "test-support"))]
 use crate::in_process_embedding::{
+    ProcessEmbeddingResidencyLease, acquire_process_embedding_residency,
     process_embedding_identity, process_embedding_identity_if_initialized,
 };
-#[cfg(not(feature = "test-support"))]
-use anyhow::anyhow;
 use anyhow::{Result, bail};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 #[cfg(not(feature = "test-support"))]
 use std::time::Instant;
 
@@ -58,6 +62,44 @@ pub struct EmbeddingEngineSnapshot {
     pub probe: EmbeddingRuntimeProbe,
     pub device: EmbeddingDeviceReadiness,
     pub identity: Option<ProcessEmbeddingIdentity>,
+}
+
+#[derive(Debug)]
+pub struct ProductEmbeddingResidencyLease {
+    #[cfg(not(feature = "test-support"))]
+    _inner: Option<ProcessEmbeddingResidencyLease>,
+    identity: Option<ProcessEmbeddingIdentity>,
+    #[cfg(test)]
+    drop_probe: Option<Arc<AtomicBool>>,
+}
+
+impl ProductEmbeddingResidencyLease {
+    pub(crate) fn identity(&self) -> Option<&ProcessEmbeddingIdentity> {
+        self.identity.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_lease(identity: ProcessEmbeddingIdentity) -> (Self, Arc<AtomicBool>) {
+        let active = Arc::new(AtomicBool::new(true));
+        (
+            Self {
+                #[cfg(not(feature = "test-support"))]
+                _inner: None,
+                identity: Some(identity),
+                drop_probe: Some(active.clone()),
+            },
+            active,
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProductEmbeddingResidencyLease {
+    fn drop(&mut self) {
+        if let Some(active) = self.drop_probe.as_ref() {
+            active.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Cheap cloneable handle into the one engine owned by this process.
@@ -155,6 +197,33 @@ pub fn ensure_product_embedding_backend_for_runtime(runtime: &SidecarRuntimeConf
     }
 }
 
+pub fn acquire_product_embedding_residency_for_runtime(
+    runtime: &SidecarRuntimeConfig,
+) -> Result<ProductEmbeddingResidencyLease> {
+    #[cfg(feature = "test-support")]
+    {
+        let _ = runtime;
+        Ok(ProductEmbeddingResidencyLease {
+            identity: None,
+            #[cfg(test)]
+            drop_probe: None,
+        })
+    }
+    #[cfg(not(feature = "test-support"))]
+    {
+        let lease =
+            acquire_process_embedding_residency(&runtime.cache_root, runtime.embedding.allow_cpu)?;
+        let identity = lease.identity().clone();
+        validate_identity(&identity, runtime.embedding.allow_cpu)?;
+        Ok(ProductEmbeddingResidencyLease {
+            _inner: Some(lease),
+            identity: Some(identity),
+            #[cfg(test)]
+            drop_probe: None,
+        })
+    }
+}
+
 /// Observes readiness without starting the engine or materializing the model.
 pub fn probe_product_embedding_runtime() -> EmbeddingRuntimeProbe {
     probe_product_embedding_runtime_for_runtime(&SidecarRuntimeConfig::local())
@@ -202,37 +271,59 @@ pub fn embedding_engine_snapshot_for_runtime(
     #[cfg(not(feature = "test-support"))]
     {
         let started = Instant::now();
-        let result = process_embedding_identity_if_initialized(
+        let observed = process_embedding_identity_if_initialized(
             &runtime.cache_root,
             runtime.embedding.allow_cpu,
-        )
-        .and_then(|identity| {
-            let identity =
-                identity.ok_or_else(|| anyhow!("retrieval embeddings not initialized"))?;
-            validate_identity(&identity, runtime.embedding.allow_cpu)?;
-            Ok(identity)
-        });
+        );
         let elapsed_ms = Some(elapsed_ms(started));
-        match result {
-            Ok(identity) => EmbeddingEngineSnapshot {
-                probe: EmbeddingRuntimeProbe {
-                    reachable: true,
-                    detail: "retrieval embeddings ready".into(),
-                    elapsed_ms,
-                },
-                device: readiness_from_identity(&identity, runtime.embedding.allow_cpu),
-                identity: Some(identity),
-            },
-            Err(error) => EmbeddingEngineSnapshot {
-                probe: EmbeddingRuntimeProbe {
-                    reachable: false,
-                    detail: format!("retrieval embeddings unavailable: {error}"),
-                    elapsed_ms,
-                },
-                device: unavailable_readiness(runtime.embedding.allow_cpu, &error.to_string()),
-                identity: None,
-            },
+        match observed {
+            Ok(Some(identity)) => observed_engine_snapshot(runtime, elapsed_ms, identity),
+            Ok(None) => unavailable_engine_snapshot(
+                runtime,
+                elapsed_ms,
+                "retrieval embeddings not initialized".into(),
+                None,
+            ),
+            Err(error) => unavailable_engine_snapshot(runtime, elapsed_ms, error.to_string(), None),
         }
+    }
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+fn observed_engine_snapshot(
+    runtime: &SidecarRuntimeConfig,
+    elapsed_ms: Option<u64>,
+    identity: ProcessEmbeddingIdentity,
+) -> EmbeddingEngineSnapshot {
+    if let Err(error) = validate_identity(&identity, runtime.embedding.allow_cpu) {
+        return unavailable_engine_snapshot(runtime, elapsed_ms, error.to_string(), Some(identity));
+    }
+    EmbeddingEngineSnapshot {
+        probe: EmbeddingRuntimeProbe {
+            reachable: true,
+            detail: "retrieval embeddings ready".into(),
+            elapsed_ms,
+        },
+        device: readiness_from_identity(&identity, runtime.embedding.allow_cpu),
+        identity: Some(identity),
+    }
+}
+
+#[cfg(any(not(feature = "test-support"), test))]
+fn unavailable_engine_snapshot(
+    runtime: &SidecarRuntimeConfig,
+    elapsed_ms: Option<u64>,
+    detail: String,
+    identity: Option<ProcessEmbeddingIdentity>,
+) -> EmbeddingEngineSnapshot {
+    EmbeddingEngineSnapshot {
+        probe: EmbeddingRuntimeProbe {
+            reachable: false,
+            detail: format!("retrieval embeddings unavailable: {detail}"),
+            elapsed_ms,
+        },
+        device: unavailable_readiness(runtime.embedding.allow_cpu, &detail),
+        identity,
     }
 }
 
@@ -277,6 +368,18 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
 
 #[cfg(any(not(feature = "test-support"), test))]
 fn validate_identity(identity: &ProcessEmbeddingIdentity, allow_cpu: bool) -> Result<()> {
+    if !identity.worker_alive {
+        bail!("embedding engine worker is not running");
+    }
+    if let Some(error) = identity.load_error.as_deref() {
+        bail!("embedding engine could not restore residency: {error}");
+    }
+    if !matches!(identity.residency, "resident" | "sleeping") {
+        bail!(
+            "embedding engine reported unknown residency {}",
+            identity.residency
+        );
+    }
     if !identity.embedded_model {
         bail!("embedding model is not embedded in this executable");
     }
@@ -319,7 +422,7 @@ fn validate_identity(identity: &ProcessEmbeddingIdentity, allow_cpu: bool) -> Re
     Ok(())
 }
 
-#[cfg(not(feature = "test-support"))]
+#[cfg(any(not(feature = "test-support"), test))]
 fn readiness_from_identity(
     identity: &ProcessEmbeddingIdentity,
     allow_cpu: bool,
@@ -347,7 +450,7 @@ fn readiness_from_identity(
     }
 }
 
-#[cfg(not(feature = "test-support"))]
+#[cfg(any(not(feature = "test-support"), test))]
 fn unavailable_readiness(allow_cpu: bool, reason: &str) -> EmbeddingDeviceReadiness {
     EmbeddingDeviceReadiness {
         requested_policy: requested_policy(allow_cpu),
@@ -384,7 +487,11 @@ mod tests {
     fn identity(policy: &'static str) -> ProcessEmbeddingIdentity {
         ProcessEmbeddingIdentity {
             instance_id: "test".into(),
+            load_generation: 1,
             model_load_count: 1,
+            residency: "resident",
+            worker_alive: true,
+            load_error: None,
             model_digest: codestory_llama_sys::MODEL_SHA256,
             ggml_build_identity: codestory_llama_sys::GGML_BUILD_IDENTITY,
             backend: if policy == "accelerated" {
@@ -431,6 +538,37 @@ mod tests {
     fn cpu_identity_is_accepted_only_under_explicit_policy() {
         let identity = identity("cpu_explicit");
         assert!(validate_identity(&identity, true).is_ok());
+        assert!(validate_identity(&identity, false).is_err());
+    }
+
+    #[test]
+    fn sleeping_identity_remains_ready_until_a_wake_fails() {
+        let mut identity = identity("accelerated");
+        identity.residency = "sleeping";
+        assert!(validate_identity(&identity, false).is_ok());
+        let sleeping =
+            observed_engine_snapshot(&SidecarRuntimeConfig::local(), Some(0), identity.clone());
+        assert!(sleeping.probe.reachable);
+        assert_eq!(
+            sleeping.identity.map(|identity| identity.residency),
+            Some("sleeping")
+        );
+
+        identity.load_error = Some("adapter disappeared".into());
+        assert!(validate_identity(&identity, false).is_err());
+        let snapshot = unavailable_engine_snapshot(
+            &SidecarRuntimeConfig::local(),
+            Some(0),
+            "adapter disappeared".into(),
+            Some(identity.clone()),
+        );
+        assert!(!snapshot.probe.reachable);
+        assert_eq!(
+            snapshot.identity.and_then(|identity| identity.load_error),
+            Some("adapter disappeared".into())
+        );
+        identity.load_error = None;
+        identity.worker_alive = false;
         assert!(validate_identity(&identity, false).is_err());
     }
 }

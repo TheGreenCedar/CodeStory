@@ -44,6 +44,11 @@ The embedding engine is process-wide, while manifests and artifacts are
 project-local. An incompatible cache-root or CPU-policy request fails rather
 than replacing an already initialized engine.
 
+Retrieval finalization holds an embedding residency lease across candidate
+build, validation, and publication. Manifest compatibility uses the stable
+producer contract; the lease's owner/load generation is a live publication
+fence and is not persisted as vector compatibility.
+
 ## Extension rules
 
 - add artifact formats and identity fields here before teaching runtime about

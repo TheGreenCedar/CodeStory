@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import stat
 import subprocess
@@ -149,7 +150,16 @@ def find_value(value: object, key: str) -> object | None:
     return None
 
 
-def engine_identity(status: dict, expected_policy: str | None, expected_backend: str | None) -> dict:
+def engine_identity(
+    status: dict,
+    expected_policy: str | None,
+    expected_backend: str | None,
+    *,
+    expected_load_count: int = 1,
+    expected_load_generation: int = 1,
+    expected_residency: str = "resident",
+    expected_load_error: bool = False,
+) -> dict:
     fields = {
         key: find_value(status, key)
         for key in (
@@ -159,6 +169,9 @@ def engine_identity(status: dict, expected_policy: str | None, expected_backend:
             "embedding_adapter",
             "embedding_policy",
             "embedding_engine_instance_id",
+            "embedding_engine_residency",
+            "embedding_engine_load_generation",
+            "embedding_engine_load_error",
             "embedding_model_load_count",
             "embedding_smoke_ms",
             "embedding_initialization_ms",
@@ -178,7 +191,13 @@ def engine_identity(status: dict, expected_policy: str | None, expected_backend:
     require(not any(token in adapter.lower() for token in SOFTWARE_ADAPTERS), f"software adapter is not allowed: {adapter}")
     require(fields["embedding_policy"] in {"accelerated", "cpu_explicit"}, "status lacks an explicit embedding policy")
     require(bool(fields["embedding_engine_instance_id"]), "status lacks the process engine identity")
-    require(fields["embedding_model_load_count"] == 1, "the process must load one shared embedding model")
+    require(fields["embedding_engine_residency"] == expected_residency, f"engine residency is {fields['embedding_engine_residency']!r}, expected {expected_residency!r}")
+    require(fields["embedding_model_load_count"] == expected_load_count, f"engine load count is {fields['embedding_model_load_count']!r}, expected {expected_load_count}")
+    require(fields["embedding_engine_load_generation"] == expected_load_generation, f"engine load generation is {fields['embedding_engine_load_generation']!r}, expected {expected_load_generation}")
+    if expected_load_error:
+        require(bool(fields["embedding_engine_load_error"]), "failed reload did not retain its load error")
+    else:
+        require(fields["embedding_engine_load_error"] is None, f"engine retained an unexpected load error: {fields['embedding_engine_load_error']}")
     require(isinstance(fields["embedding_smoke_ms"], (int, float)) and fields["embedding_smoke_ms"] >= 0, "status lacks the timed live embedding smoke")
     require(isinstance(fields["embedding_initialization_ms"], (int, float)) and fields["embedding_initialization_ms"] >= 0, "status lacks initialization timing")
     if expected_policy:
@@ -197,6 +216,52 @@ def engine_identity(status: dict, expected_policy: str | None, expected_backend:
     return fields
 
 
+def parse_byte_quantity(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMG])?", value.strip())
+    require(match is not None, f"invalid memory quantity: {value!r}")
+    scale = {None: 1, "K": 1024, "M": 1024**2, "G": 1024**3}[match.group(2)]
+    return round(float(match.group(1)) * scale)
+
+
+def process_resident_memory(pid: int) -> tuple[int, str]:
+    if os.name == "nt":
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f"(Get-Process -Id {pid} -ErrorAction Stop).WorkingSet64",
+        ]
+        scale = 1
+        metric = "windows_working_set"
+    elif sys.platform == "darwin":
+        completed = subprocess.run(
+            ["vmmap", "-summary", str(pid)],
+            text=True,
+            capture_output=True,
+            timeout=20,
+        )
+        require(completed.returncode == 0, f"could not read physical footprint for process {pid}: {completed.stderr.strip()}")
+        match = re.search(r"^Physical footprint:\s+([^\s]+)", completed.stdout, re.MULTILINE)
+        require(match is not None, f"vmmap omitted the physical footprint for process {pid}")
+        return parse_byte_quantity(match.group(1)), "macos_physical_footprint"
+    else:
+        command = ["ps", "-o", "rss=", "-p", str(pid)]
+        scale = 1024
+        metric = "rss"
+    completed = subprocess.run(command, text=True, capture_output=True, timeout=10)
+    require(completed.returncode == 0, f"could not read RSS for process {pid}: {completed.stderr.strip()}")
+    try:
+        return int(completed.stdout.strip()) * scale, metric
+    except ValueError as exc:
+        raise ProofFailure(f"invalid RSS for process {pid}: {completed.stdout!r}") from exc
+
+
+def engine_process_id(identity: dict) -> int:
+    parts = str(identity.get("embedding_engine_instance_id") or "").split(":")
+    require(len(parts) >= 3 and parts[0] == "inprocess" and parts[1].isdigit(), "invalid process engine identity")
+    return int(parts[1])
+
+
 def assert_public_status(status: dict) -> None:
     require(find_value(status, "retrieval_mode") == "full", "public status does not report full retrieval")
     maintainer_only = (
@@ -208,6 +273,9 @@ def assert_public_status(status: dict) -> None:
         "embedding_adapter",
         "embedding_policy",
         "embedding_engine_instance_id",
+        "embedding_engine_residency",
+        "embedding_engine_load_generation",
+        "embedding_engine_load_error",
         "embedding_materialized_path",
         "embedding_detected_provider",
         "embedding_detected_gpu",
@@ -382,6 +450,185 @@ def create_second_repository(root: Path) -> Path:
     return repo
 
 
+def native_cli_pid(mcp: McpProcess, plugin_handoff: bool) -> int:
+    if not plugin_handoff:
+        return mcp.process.pid
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if os.name == "nt":
+            command = [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"Get-CimInstance Win32_Process -Filter \"ParentProcessId = {mcp.process.pid}\" | Select-Object -ExpandProperty ProcessId",
+            ]
+            completed = subprocess.run(command, text=True, capture_output=True, timeout=10)
+            candidates = [line.strip() for line in completed.stdout.splitlines()]
+        else:
+            completed = subprocess.run(
+                ["ps", "-axo", "pid=,ppid="],
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            candidates = []
+            for line in completed.stdout.splitlines():
+                fields = line.split()
+                if len(fields) == 2 and fields[1] == str(mcp.process.pid):
+                    candidates.append(fields[0])
+        numeric = [int(value) for value in candidates if value.isdigit()]
+        if len(numeric) == 1:
+            return numeric[0]
+        time.sleep(0.1)
+    raise ProofFailure("plugin launcher did not expose exactly one native CLI child")
+
+
+def create_residency_projects(root: Path) -> list[tuple[Path, str]]:
+    projects = []
+    for name, symbol in (("idle fixture alpha", "AlphaResidency"), ("idle fixture ü", "BetaResidency")):
+        project = root / name
+        source = project / "src"
+        source.mkdir(parents=True, exist_ok=True)
+        (project / "Cargo.toml").write_text(
+            f'[package]\nname = "{name.replace(" ", "-").replace("ü", "u")}"\nversion = "0.1.0"\nedition = "2024"\n',
+            encoding="utf-8",
+        )
+        (source / "lib.rs").write_text(
+            f"pub struct {symbol};\nimpl {symbol} {{ pub fn ready(&self) -> bool {{ true }} }}\n",
+            encoding="utf-8",
+        )
+        projects.append((project, symbol))
+    return projects
+
+
+def prove_idle_residency(
+    args: argparse.Namespace,
+    command: list[str],
+    env: dict[str, str],
+    out_dir: Path,
+) -> dict:
+    projects = create_residency_projects(out_dir / "idle-fixtures")
+    project, query = projects[0]
+    additional_projects = projects[1:]
+    mcp = McpProcess(command, env=env, cwd=project, timeout=args.timeout_secs)
+    try:
+        mcp.initialize()
+        mcp.status(project, "idle-baseline-status")
+        for index, (additional_project, _) in enumerate(additional_projects, start=1):
+            mcp.status(additional_project, f"idle-baseline-additional-{index}")
+        cli_pid = native_cli_pid(mcp, args.plugin_handoff)
+        baseline_memory, memory_metric = process_resident_memory(cli_pid)
+
+        mcp.tool_until_ready(
+            "search",
+            {"project": str(project), "query": query, "why": True},
+            "idle-load-search",
+        )
+        first_identity = engine_identity(
+            mcp.engine_diagnostics(project, "idle-load-diagnostics"),
+            args.engine_policy,
+            args.expected_backend,
+        )
+        require(engine_process_id(first_identity) == cli_pid, "diagnostics identified a different CLI process")
+        require(first_identity["embedding_materialized_reused"] is True, "measured process did not reuse the materialized model")
+        for index, (additional_project, query) in enumerate(additional_projects, start=1):
+            mcp.tool_until_ready(
+                "search",
+                {"project": str(additional_project), "query": query, "why": True},
+                f"idle-load-additional-{index}",
+            )
+            additional_identity = engine_identity(
+                mcp.engine_diagnostics(additional_project, f"idle-load-additional-diagnostics-{index}"),
+                args.engine_policy,
+                args.expected_backend,
+            )
+            require(additional_identity["embedding_engine_instance_id"] == first_identity["embedding_engine_instance_id"], "measured repositories did not share one owner")
+        loaded_memory, loaded_metric = process_resident_memory(cli_pid)
+        require(loaded_metric == memory_metric, "process memory metric changed during the proof")
+
+        time.sleep(30)
+        warm_identity = engine_identity(
+            mcp.engine_diagnostics(project, "idle-still-warm-diagnostics"),
+            args.engine_policy,
+            args.expected_backend,
+        )
+        require(warm_identity["embedding_engine_instance_id"] == first_identity["embedding_engine_instance_id"], "recently active engine changed owner")
+        time.sleep(35)
+        sleeping_identity = engine_identity(
+            mcp.engine_diagnostics(project, "idle-sleeping-diagnostics"),
+            args.engine_policy,
+            args.expected_backend,
+            expected_residency="sleeping",
+        )
+        sleeping_memory, sleeping_metric = process_resident_memory(cli_pid)
+        require(sleeping_metric == memory_metric, "process memory metric changed during the proof")
+        loaded_increment = max(0, loaded_memory - baseline_memory)
+        idle_allowance = max(50 * 1024 * 1024, loaded_increment // 4)
+        require(
+            sleeping_memory <= baseline_memory + idle_allowance,
+            "idle process memory did not return near its pre-engine baseline: "
+            f"metric={memory_metric} baseline={baseline_memory} loaded={loaded_memory} "
+            f"sleeping={sleeping_memory} allowance={idle_allowance}",
+        )
+        assert_public_status(mcp.status(project, "idle-sleeping-status"))
+
+        materialized = Path(str(first_identity["embedding_materialized_path"]))
+        backup = materialized.with_name(materialized.name + ".proof-backup")
+        materialized.rename(backup)
+        materialized.mkdir()
+        try:
+            failed_wake = mcp.tool(
+                "search",
+                {"project": str(project), "query": query, "why": True},
+                "idle-failed-wake",
+            )
+            require(failed_wake.get("result", {}).get("isError") is True, "blocked model path did not fail the activating wake")
+            failed_identity = engine_identity(
+                mcp.engine_diagnostics(project, "idle-failed-wake-diagnostics"),
+                args.engine_policy,
+                args.expected_backend,
+                expected_residency="sleeping",
+                expected_load_error=True,
+            )
+        finally:
+            materialized.rmdir()
+            backup.rename(materialized)
+
+        mcp.tool_until_ready(
+            "search",
+            {"project": str(project), "query": query, "why": True},
+            "idle-wake-search",
+        )
+        wake_identity = engine_identity(
+            mcp.engine_diagnostics(project, "idle-wake-diagnostics"),
+            args.engine_policy,
+            args.expected_backend,
+            expected_load_count=2,
+            expected_load_generation=2,
+        )
+        require(wake_identity["embedding_engine_instance_id"] == first_identity["embedding_engine_instance_id"], "idle wake replaced the engine owner")
+        require(wake_identity["embedding_materialized_path"] == first_identity["embedding_materialized_path"], "idle wake selected a different model path")
+        require(wake_identity["embedding_materialized_reused"] is True, "idle wake rewrote the content-addressed model")
+        result = {
+            "memory_metric": memory_metric,
+            "baseline_memory_bytes": baseline_memory,
+            "loaded_memory_bytes": loaded_memory,
+            "sleeping_memory_bytes": sleeping_memory,
+            "idle_allowance_bytes": idle_allowance,
+            "warm_identity": warm_identity,
+            "sleeping_identity": sleeping_identity,
+            "failed_identity": failed_identity,
+            "wake_identity": wake_identity,
+            "wake_memory_bytes": process_resident_memory(cli_pid)[0],
+        }
+        transcript = mcp.transcript
+    finally:
+        mcp.close()
+    write_json(out_dir / "idle-residency-mcp.json", transcript)
+    write_json(out_dir / "idle-residency.json", result)
+    return result
+
+
 def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root: Path, out_dir: Path) -> dict:
     project = args.project.resolve()
     if args.additional_project:
@@ -464,6 +711,15 @@ def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root
     require(cold_materialization["sha256"] == identity["embedding_model_sha256"], "first-use model digest does not match engine identity")
     before_mtime = materialized.stat().st_mtime_ns
 
+    idle_residency = None
+    if args.idle_residency_proof:
+        idle_residency = prove_idle_residency(
+            args,
+            command,
+            env,
+            out_dir,
+        )
+
     restart = McpProcess([str(cli), "serve", "--stdio", "--multi-project", "--refresh", "none"], env=env, cwd=project, timeout=args.timeout_secs)
     try:
         restart.initialize()
@@ -479,11 +735,13 @@ def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root
     return {
         "cold_materialization": cold_materialization,
         "identity": identity,
+        "idle_residency": idle_residency,
         "restart_identity": restart_identity,
     }
 
 
 def self_test() -> None:
+    require(parse_byte_quantity("24.1M") == 25_270_682, "memory quantity parser failed")
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         payload = root / "artifact.zip"
@@ -511,6 +769,8 @@ def self_test() -> None:
             "embedding_adapter": "Apple GPU",
             "embedding_policy": "accelerated",
             "embedding_engine_instance_id": "engine-1",
+            "embedding_engine_residency": "resident",
+            "embedding_engine_load_generation": 1,
             "embedding_model_load_count": 1,
             "embedding_smoke_ms": 1.0,
             "embedding_initialization_ms": 2.0,
@@ -547,6 +807,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine-policy", choices=("accelerated", "cpu_explicit"))
     parser.add_argument("--expected-backend")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--idle-residency-proof", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 

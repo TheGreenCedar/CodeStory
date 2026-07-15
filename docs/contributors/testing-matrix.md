@@ -72,6 +72,8 @@ Focused proof covers:
 - prohibited silent CPU fallback and software-adapter rejection;
 - live embedding smoke and layer-offload evidence;
 - one engine/model load shared across repositories;
+- owner-thread idle unload, observational sleeping status, and automatic wake;
+- publication leases that retain one load generation through commit;
 - generation-coherent query reads and producer migration;
 - cleanup confined to proved owned generations.
 
@@ -89,6 +91,12 @@ They must report `cpu_explicit` and make no acceleration claim.
 archive in an isolated offline environment. It requires one native executable,
 version/help, full retrieval, plugin packet/search, multi-repository engine
 reuse, restart/materialization reuse, and no helper-process lifecycle state.
+
+Protected hardware proof also passes `--idle-residency-proof`. It records an
+uninitialized process-memory baseline, verifies the owner becomes `sleeping`
+after the idle window, requires memory to return near that baseline, then wakes
+the same owner and requires a second verified load from the unchanged
+materialized model. macOS uses physical footprint; Windows uses working set.
 
 Use `--plugin-handoff`, `--engine-policy`, `--expected-backend`, and `--offline`
 to make the claim explicit. The harness self-test is:

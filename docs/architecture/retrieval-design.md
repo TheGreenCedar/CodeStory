@@ -19,6 +19,13 @@ process. Initialization freezes process-level cache-root and CPU-policy
 compatibility; a later project cannot silently reconfigure the shared engine.
 One-shot CLI processes pay cold initialization themselves.
 
+The existing model worker also owns residency. It keeps the verified backend,
+model, and context warm while requests are active, then drops all three after
+60 seconds without a completed request or publication lease. The lightweight
+worker and its last verified identity remain. A later product request reloads
+the content-addressed model, reruns the timed accelerator smoke, and continues
+without a download, repair command, or consent step.
+
 The engine has one model worker with bounded interactive-query and bulk queues.
 Interactive queries take priority, including between bulk batches. Embedding
 uses the pinned CodeRank tokenizer, the
@@ -92,6 +99,10 @@ project-local retrieval publication, not evidence of an external service.
 5. Reject drift and leave the previous generation active, or atomically publish
    the complete candidate and manifest.
 
+The writer holds one embedding residency lease from backend validation through
+candidate publication. The lease pins the owner and load generation, so the
+idle policy cannot divide one publication across two runtime instances.
+
 Failure, cancellation, incomplete discovery, or source drift never authorizes a
 partial publication or deletion inferred from absence. Retention removes only
 proved CodeStory-owned generations through the shared handle-relative deletion
@@ -133,7 +144,7 @@ publication. Broad agent surfaces additionally require:
 
 - a current core and source identity;
 - the exact in-process producer identity;
-- a live timed embedding smoke;
+- a current or automatically restorable timed embedding smoke;
 - `accelerated` or explicitly permitted `cpu_explicit` policy;
 - an allowed packet/search/context surface.
 
@@ -145,6 +156,11 @@ timing details stay in maintainer diagnostics.
 Status and doctor observe this state. A broad product call may initialize the
 engine and build a missing generation automatically; it never asks the user to
 approve or repair an internal subsystem.
+
+Sleeping is healthy because the owner, packaged model, immutable policy, and
+last verified adapter identity remain available for automatic wake. A failed
+wake records the load error and blocks broad retrieval until a later product
+request proves a successful reload.
 
 ## Ownership and evidence
 
