@@ -196,20 +196,20 @@ Before adding a parser-backed language or widening a public claim:
 5. Run the full binaries, not filtered test names:
 
    ```sh
-   cargo test -p codestory-indexer --test fidelity_regression
-   cargo test -p codestory-indexer --test tictactoe_language_coverage
-   cargo test -p codestory-indexer --test call_resolution_common_methods
-   cargo test -p codestory-indexer --test import_resolution
-   cargo test -p codestory-indexer --test query_rule_regressions
-   cargo test -p codestory-indexer --test trait_interface_resolution
+   cargo test -p codestory-indexer --locked --test fidelity_regression
+   cargo test -p codestory-indexer --locked --test tictactoe_language_coverage
+   cargo test -p codestory-indexer --locked --test call_resolution_common_methods
+   cargo test -p codestory-indexer --locked --test import_resolution
+   cargo test -p codestory-indexer --locked --test query_rule_regressions
+   cargo test -p codestory-indexer --locked --test trait_interface_resolution
    ```
 
 6. For broader real-project smoke evidence, run either the OSS corpus dry-run
    manifest check or the relevant language subset:
 
    ```sh
-   CODESTORY_OSS_CORPUS_DRY_RUN=1 cargo test -p codestory-indexer --test oss_language_corpus -- --ignored --nocapture
-   CODESTORY_RUN_OSS_LANGUAGE_CORPUS=1 CODESTORY_OSS_CORPUS_LANGUAGES=python cargo test -p codestory-indexer --test oss_language_corpus -- --ignored --nocapture
+   CODESTORY_OSS_CORPUS_DRY_RUN=1 cargo test -p codestory-indexer --locked --test oss_language_corpus -- --ignored --nocapture
+   CODESTORY_RUN_OSS_LANGUAGE_CORPUS=1 CODESTORY_OSS_CORPUS_LANGUAGES=python cargo test -p codestory-indexer --locked --test oss_language_corpus -- --ignored --nocapture
    ```
 
 7. For agent-facing evidence, run at least the targeted language task from the

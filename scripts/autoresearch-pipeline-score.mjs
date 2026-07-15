@@ -80,6 +80,7 @@ function embeddingDimension(row) {
   }
   if (
     row.profile === "bge-base-en-v1.5" ||
+    row.profile === "coderank-embed" ||
     row.profile === "nomic-embed-text-v1.5" ||
     row.profile === "nomic-embed-text-v2-moe" ||
     row.profile === "embeddinggemma-300m"

@@ -8298,9 +8298,9 @@ mod tests {
         retrieval.semantic_ready = false;
         retrieval.fallback_reason = Some(RetrievalFallbackReasonDto::MissingEmbeddingRuntime);
         retrieval.current_embedding = Some(codestory_contracts::api::EmbeddingProfileContractDto {
-            profile: "bge-base-en-v1.5".to_string(),
+            profile: "coderank-embed".to_string(),
             backend: "inprocess".to_string(),
-            model_id: "BAAI/bge-base-en-v1.5-local".to_string(),
+            model_id: "nomic-ai/CodeRankEmbed".to_string(),
             cache_key: "current".to_string(),
             dimension: Some(768),
             doc_shape: "current-shape".to_string(),
@@ -8308,7 +8308,7 @@ mod tests {
         retrieval.stored_embedding =
             Some(codestory_contracts::api::StoredSemanticDocsContractDto {
                 doc_count: 1,
-                embedding_profile: Some("bge-base-en-v1.5".to_string()),
+                embedding_profile: Some("coderank-embed".to_string()),
                 embedding_backend: Some("onnx".to_string()),
                 cache_key: Some("old".to_string()),
                 dimension: Some(768),

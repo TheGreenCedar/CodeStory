@@ -515,7 +515,7 @@ function validateReleaseCoordinator(workflows, violations) {
   for (const [key, value] of Object.entries({
     ref: "${{ github.sha }}",
     proof_key: "release-${{ needs.preflight.outputs.version }}",
-    profile: "codestory-release-evidence-linux-arm64-v1",
+    profile: "codestory-release-evidence-linux-arm64-v2",
     drill_manifest: "/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
   })) {
     add(violations, object(evidence.with)[key] === value, `${releaseFile} release-evidence with.${key} must equal ${value}`);

@@ -1,67 +1,38 @@
 # Claude Code
 
-Use CodeStory in Claude Code with one session hook and the CodeStory MCP server.
-MCP setup is manual unless your Claude Code plugin flow wires it.
+The Claude Code plugin supplies a session hook and the CodeStory grounding
+contract. Configure MCP separately unless your plugin setup already wires the
+shipped adapter. Hooks record repository state and teach routing; MCP supplies
+the repository evidence.
 
-## What you get
+## Install the plugin
 
-| You | Agent |
-| --- | --- |
-| Install the CodeStory Claude plugin | A bounded session hook makes the grounding contract available |
-| Open your repo | The hook records the project without running tools or injecting source claims |
-| Ask concrete questions | Calls the matching CodeStory tool; managed preparation happens automatically |
-
-The hook fails open: missing Node or MCP does not block the host. Normal use does
-not begin with a status check and never asks you to configure CodeStory. If a
-first call is still preparing, the agent retries that same call after its delay.
-
-## Install
-
-Plugin manifest: `plugins/codestory/.claude-plugin/plugin.json`  
-Hooks: `plugins/codestory/hooks/claude-codex-hooks.json`
-
-### From the marketplace (recommended)
-
-From a terminal, with Claude Code on PATH:
+From a terminal:
 
 ```bash
 claude plugin marketplace add TheGreenCedar/AgentPluginMarketplace --ref main
 claude plugin install codestory@TheGreenCedar --scope project
 ```
 
-Or inside a Claude Code session:
+Or from a Claude Code session:
 
 ```text
 /plugin marketplace add TheGreenCedar/AgentPluginMarketplace
 /plugin install codestory@TheGreenCedar --scope project
 ```
 
-### From this repository checkout
-
-When you already have the CodeStory repo open locally:
+For local development from this checkout:
 
 ```bash
 claude plugin install ./plugins/codestory --scope project
 ```
 
-For a one-session test without installing:
+Use `claude --plugin-dir plugins/codestory` for a one-session test. Claude Code
+caches installed plugins, so reinstall after changing plugin files.
 
-```bash
-claude --plugin-dir plugins/codestory
-```
+## Configure MCP
 
-Re-run `claude plugin install ./plugins/codestory --scope project` after you
-change plugin files; Claude Code caches installed plugins.
-
-### MCP (manual)
-
-Configure MCP separately if your Claude Code setup does not inherit the Codex
-`.mcp.json` launch path. Point MCP at
-`plugins/codestory/scripts/codestory-mcp.cjs` (same shape as
-[Cursor MCP config](cursor.md#2-mcp-server-copy-shipped-config)).
-
-Use `CODESTORY_PLUGIN_DATA` in the MCP server env block to give Claude Code a
-persistent managed-runtime data directory:
+If the plugin does not register MCP for you, point a server at the adapter:
 
 ```json
 {
@@ -78,82 +49,43 @@ persistent managed-runtime data directory:
 }
 ```
 
-Open the repository you want to ground. Managed CLI bootstrap depends on MCP:
-the adapter provisions the runtime when the MCP server starts successfully.
+Use a persistent per-user plugin-data directory outside the repository. The
+same adapter shape is explained in the [Cursor guide](cursor.md#2-configure-mcp).
 
-## Install verification
+## Verify the install
 
-Run these two checks before your first real task:
+1. `claude plugin list` shows **codestory**.
+2. A fresh session loads the session hook.
+3. The CodeStory MCP server is connected.
+4. A normal repository question returns cited files and symbols.
 
-1. **Adapter present** — `claude plugin list` shows **codestory**, or you
-   started Claude with `--plugin-dir plugins/codestory`. Confirm the manifest
-   at `plugins/codestory/.claude-plugin/plugin.json` and hooks at
-   `plugins/codestory/hooks/claude-codex-hooks.json`.
-2. **Hooks live** — Start a new session. The session hook should make the
-   CodeStory grounding contract available (and fails open if Node is missing).
-
-## First session
-
-Start a new Claude Code session in the repository and ask a real repository
-question:
+For example:
 
 ```text
-Where is [Feature] implemented, who calls it, and which tests cover it?
+How does the configuration loader reach the runtime, and which tests exercise that path?
 ```
 
-**Expected wait:** On a large repository, the first index build can take several
-minutes. The agent should retry the same tool while CodeStory prepares.
+The first request may prepare the repository and retry. Hooks fail open when
+Node or MCP is missing, but hooks alone are not grounding evidence. Without MCP,
+the agent must use ordinary source inspection and report that CodeStory was
+unavailable.
 
-**Success looks like:** The agent answers with repository-specific files and
-symbols without asking you to run setup, approve a background service, or poll
-readiness.
-
-Hooks inject routing, not grounding evidence. Follow the selected live MCP
-surface and its evidence gaps before making source claims.
-
-## Example prompts
-
-**Find ownership**
-
-```text
-Where is [Feature] defined and who calls it?
-```
-
-**Plan a change**
-
-```text
-I am changing [path/to/file]. What symbols are affected and what tests should I run first?
-```
-
-**Broad question**
-
-```text
-How does [subsystem] interact with [other area]? Cite the owning files and symbols.
-```
-
-More pairs and anti-patterns: [Prompt patterns](prompt-patterns.md).
+Shared first-use behavior: [User guide](README.md#first-use).
 
 ## Troubleshooting
 
-| Symptom | What to try |
+| Symptom | Action |
 | --- | --- |
-| Hooks silent | Confirm `node` on PATH; check `CLAUDE_PLUGIN_ROOT` resolves to plugin dir |
-| No MCP tools | Add MCP server config; see [Cursor MCP section](cursor.md#2-mcp-server-copy-shipped-config) |
-| Broad search unavailable | [Troubleshooting - packet/search](troubleshooting.md#packetsearch-degraded-or-blocked) |
-| Hook timeout | Session continues; ask the repository question directly |
+| Plugin hook is silent | Confirm `node` is on `PATH` and `CLAUDE_PLUGIN_ROOT` resolves to the plugin directory |
+| No CodeStory tools | Add or repair the MCP configuration; the hook does not start MCP by itself |
+| First tool is preparing | Retry the same tool after its returned delay |
+| Installed changes do not appear | Reinstall the cached plugin and start a fresh session |
 
-Shared repair: [Troubleshooting](troubleshooting.md).
+See [shared troubleshooting](troubleshooting.md) for readiness and cache
+problems.
 
-## Limitations vs Codex
+## Differences from Codex
 
-| Feature | Claude Code | Codex |
-| --- | --- | --- |
-| MCP auto-start | Manual | Yes |
-| Hooks | Session | Session |
-| Skill | Partial (host-dependent) | Full `@CodeStory` skill |
-| Managed CLI | Yes when MCP sets `CODESTORY_PLUGIN_DATA` | Yes via plugin |
-
-Claude Code matches Codex on hooks when the plugin is installed, but MCP and
-managed bootstrap are not automatic unless you configure them.
-
-Compare: [capability matrix](README.md#capability-matrix).
+Claude Code provides the session hook, but MCP setup is normally manual and
+skill exposure depends on the host. Once MCP is connected, repository
+preparation and the in-process retrieval engine behave the same as in Codex.

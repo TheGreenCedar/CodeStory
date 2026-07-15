@@ -6,7 +6,7 @@ stable between candidates. Ordinary pull requests must not target this runner.
 
 ## Machine contract
 
-The approved host shape for the first v0.15 baseline is:
+The approved host shape for the 0.16 in-process retrieval baseline is:
 
 | Field | Value |
 | --- | --- |
@@ -21,7 +21,6 @@ The approved host shape for the first v0.15 baseline is:
 | Stable profile ID | `codestory-release-evidence-linux-arm64-v2` |
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
-| Model directory | `/srv/codestory-release-evidence/models` |
 | Drill manifest | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
 
 The profile ID is a stable comparison key, not evidence about the current
@@ -55,7 +54,7 @@ Provisioning is idempotent. It:
   versions, then records the complete native package manifest;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
-- verifies that the exact candidate contains its checksum-pinned BGE model and
+- verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and
   linked embedding engine without provisioning either one;
 - prepares a source-backed `serde_json` drill at an exact commit;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
@@ -134,9 +133,8 @@ evidence with:
 
 | Input | Value |
 | --- | --- |
-| `profile` | `codestory-release-evidence-linux-arm64-v1` |
+| `profile` | `codestory-release-evidence-linux-arm64-v2` |
 | `drill_manifest` | `/srv/codestory-release-evidence/drills/real-repo-drill-cases.json` |
-| `embedding_model_dir` | `/srv/codestory-release-evidence/models` |
 | `source_run_id` | empty for measurement; a rejected run ID only for exact-artifact re-evaluation |
 
 If a measured candidate is rejected and receives an exact, expiring approval,

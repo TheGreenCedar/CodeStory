@@ -40,6 +40,6 @@ Rehydrate requires clean source and target worktrees, matching `origin` URLs,
 matching Git tree ids, a source SQLite schema matching the running CLI, at
 least one indexed source file, and an empty target cache directory. This command
 preserves and rebases SQLite graph/search/doc rows, preserves portable v2 index
-artifact cache rows, and invalidates retrieval retrievals across
+artifact cache rows, and invalidates retrieval generations across
 worktree-root-derived project ids. It also does not configure Rust compilation
 cache such as `sccache`.

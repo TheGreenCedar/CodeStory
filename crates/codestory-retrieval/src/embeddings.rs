@@ -1,4 +1,4 @@
-//! Fixed BGE embeddings backed by the process-wide, statically linked llama.cpp engine.
+//! Fixed CodeRankEmbed vectors backed by the process-wide, linked llama.cpp engine.
 
 use crate::config::SidecarRuntimeConfig;
 use crate::in_process_embedding::{
@@ -15,11 +15,11 @@ use std::path::PathBuf;
 #[cfg(not(feature = "test-support"))]
 use std::time::Instant;
 
-/// bge-base-en-v1.5 vector width shared by stored and query vectors.
+/// CodeRankEmbed vector width shared by stored and query vectors.
 pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
-pub const BGE_BASE_EN_V1_5_GGUF: &str = codestory_llama_sys::MODEL_FILE_NAME;
-pub const BGE_QUERY_PREFIX_DEFAULT: &str =
-    "Represent this sentence for searching relevant passages: ";
+pub const CODERANK_EMBED_Q8_GGUF: &str = codestory_llama_sys::MODEL_FILE_NAME;
+pub const CODERANK_QUERY_PREFIX_DEFAULT: &str =
+    "Represent this query for searching relevant code: ";
 
 /// Manifest producer identity. Changing the model or linked ggml source makes
 /// existing semantic generations stale and causes one transparent rebuild.
@@ -79,7 +79,7 @@ impl InProcessEmbeddingClient {
         if text.trim().is_empty() {
             bail!("cannot embed an empty query");
         }
-        let prepared = format!("{BGE_QUERY_PREFIX_DEFAULT}{text}");
+        let prepared = format!("{CODERANK_QUERY_PREFIX_DEFAULT}{text}");
         embed_prepared_query_in_process(&self.cache_root, self.allow_cpu, prepared)
     }
 

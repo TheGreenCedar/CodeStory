@@ -232,7 +232,7 @@ jobs:
     with:
       ref: ${{ needs.route.outputs.head_sha }}
       proof_key: ${{ needs.route.outputs.proof_key }}
-      profile: codestory-release-evidence-linux-arm64-v1
+      profile: codestory-release-evidence-linux-arm64-v2
       drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
       source_run_id: ${{ inputs.source_run_id }}
 

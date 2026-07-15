@@ -24,11 +24,12 @@ Call the tool that matches the task. Do not call `status` first.
 4. Preserve cited anchors in source claims. Read focused source only for the
    remaining evidence gaps.
 
-CodeStory prepares its managed local runtime automatically. `status` and
+CodeStory prepares its local repository map and in-process retrieval runtime
+automatically. `status` and
 `codestory://status` are optional diagnostics for a failed or unexpectedly slow
 request, not prerequisites for normal grounding.
 
-If the server-specific tools are hidden and deferred discovery is available,
+If CodeStory tools are hidden and deferred discovery is available,
 search only for the intended tool, for example `codestory mcp packet`, then call
 it directly. If the plugin MCP is unavailable, use ordinary source inspection
 and report the visibility gap. Do not substitute CLI diagnostics for a live

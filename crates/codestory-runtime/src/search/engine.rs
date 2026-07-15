@@ -24,8 +24,8 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 
 pub const EMBEDDING_DIM: usize = codestory_retrieval::RETRIEVAL_EMBEDDING_DIM;
 const SEARCH_WRITER_HEAP_BYTES: usize = 20_000_000;
-const EMBEDDING_PROFILE: &str = "bge-base-en-v1.5";
-const EMBEDDING_MODEL_ID: &str = "BAAI/bge-base-en-v1.5";
+const EMBEDDING_PROFILE: &str = "coderank-embed";
+const EMBEDDING_MODEL_ID: &str = "nomic-ai/CodeRankEmbed";
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 #[cfg(test)]

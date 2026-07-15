@@ -4,8 +4,8 @@ CodeStory works best when you ask about **your repository** — symbols, files,
 call paths, and tests — not about how the agent should explore the tree.
 
 Use portable placeholders (`[Feature]`, `[path/to/file]`, `[SYMBOL]`) and your
-project's real names. Host-specific invocation (`@CodeStory`, MCP tools) lives
-in your [host guide](README.md#pick-your-host).
+project's real names. Ask the repository question directly; the host adapter or
+grounding skill chooses the CodeStory tool.
 
 ## Good vs bad
 
@@ -86,7 +86,7 @@ Ask the repository question directly. CodeStory prepares what it needs on the
 first relevant call. If preparation is still running, the agent retries that
 same call; you do not need a readiness prompt or setup command.
 
-More host examples: [Codex](codex.md#example-prompts), [Cursor](cursor.md#example-prompts),
-[Claude Code](claude-code.md#example-prompts), [Copilot](copilot.md#example-prompts).
+Host installation and adapter differences: [Codex](codex.md),
+[Cursor](cursor.md), [Claude Code](claude-code.md), and [Copilot](copilot.md).
 
 Quality limits and degraded output: [What to expect](what-to-expect.md).

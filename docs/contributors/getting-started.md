@@ -1,184 +1,142 @@
-# Contributor Setup
+# Contributor setup
 
-**Audience:** Contributors
+Start from the current integration head, change the owning layer, and run the
+smallest proof that can disprove the change. The broad workspace and platform
+gates belong on an accepted exact head, not every draft commit.
 
-Before changing CodeStory itself, pick the verification lane, ground the
-checkout, then trace the owning crate.
+## Prerequisites
 
-```mermaid
-flowchart TD
-    start["Contributor change"] --> lane["Pick verification lane"]
-    lane --> ground["Ground checkout or read subsystem page"]
-    ground --> edit["Edit owning crate"]
-    edit --> prove["Run lane proof from testing matrix"]
-```
+Install the Rust toolchain, Node.js 18 or later, Git, and Python 3. On macOS,
+CodeStory development supports macOS 15 or later and requires the Xcode Command
+Line Tools. Apple Silicon is the protected Metal cell; Intel Mac development
+uses explicit CPU operation and never claims Metal.
 
-**Example when working in this repository:**
-
-```text
-@CodeStory Where is RefreshMode defined, which codestory-cli commands accept --refresh, and what is the call path from index into codestory-store?
-```
-
-**Generalizable prompt template for any CodeStory change:**
-
-```text
-@CodeStory Where is [TARGET_FEATURE] defined, which codestory-cli commands accept --refresh, and what is the call path from index into [OWNING_CRATE]?
-```
-
-Replace `[TARGET_FEATURE]` and `[OWNING_CRATE]` with the specific feature and crate you are working on.
-
-## Host prerequisites
-
-Supported Mac development starts at macOS 15 on Apple Silicon or Intel. Install
-the Xcode Command Line Tools, Node.js 18+, and the Rust toolchain. Vectors are
-embedded in SQLite; Apple Silicon runs Metal and Intel development uses the
-explicit CPU policy.
-
-The protected packaged-hardware proof also requires `python3`; use that
-versioned command in Mac automation because Command Line Tools does not promise
-an unversioned `python` shim.
-
-Apple Silicon is the accelerated Mac cell. Intel is an explicit CPU diagnostic
-cell and must never be described as Metal. The executable contains its model;
-there is no embedding endpoint or setup step.
-
-## Choose The Verification Lane First
-
-Before running Cargo or setting up retrievals, answer two questions:
-
-1. Which crate owns the behavior?
-2. What is the smallest proof that covers the change?
-
-Use this lane picker from the repo root:
-
-| Change | Start here | Escalate when |
-| --- | --- | --- |
-| Docs only, including `README.md` or `docs/**` | Read the changed pages back, then run `git diff --check`. | The doc depends on new code behavior, command output, generated docs, or release evidence. |
-| CLI args, help, or output envelopes | `cargo test -p codestory-cli` | The CLI path crosses runtime behavior; use the runtime-backed CLI lane in the testing matrix. |
-| Runtime, search, grounding, or orchestration | `cargo test -p codestory-runtime` | Agent-facing `packet` or `search` readiness is claimed; use the full retrieval proof path below. |
-| Indexer, graph, language, or semantic resolution | The full indexer fidelity suites in the testing matrix. | Language-level packet quality is claimed; use the manifest-backed packet-runtime lane. |
-| Store, snapshots, trails, bookmarks, or search docs | `cargo test -p codestory-store` | The change affects repo-scale semantic or cold-start behavior. |
-| Release or version bump | The release scripts in the testing matrix. | Packet/search readiness is part of the release claim; use the retrieval evidence tiers. |
-
-**Key concepts for verification lanes:**
-
-- **Docs-only changes**: Documentation that doesn't depend on new code behavior, command output, generated docs, or release evidence. Use `git diff --check` to verify formatting.
-- **CLI changes**: Changes to command-line arguments, help text, or output envelopes. These cross runtime behavior and need runtime-backed CLI verification.
-- **Runtime changes**: Changes to search, grounding, orchestration, or agent flows. These claim agent-facing `packet` or `search` readiness and need full retrieval proof.
-- **Indexer changes**: Changes to indexing, graph, language, or semantic resolution. These claim language-level packet quality and need manifest-backed packet-runtime verification.
-- **Store changes**: Changes to storage, snapshots, trails, bookmarks, or search docs. These affect repo-scale semantic or cold-start behavior.
-- **Release changes**: Changes that affect release or version bump. These need retrieval evidence tiers for packet/search readiness.
-
-## Crate Ownership
-
-Before changing code, decide where the change belongs:
-
-```mermaid
-flowchart TD
-    start["Before changing code"] --> owner{"Which crate owns the behavior?"}
-    owner -->|"Manifest or discovery"| workspace["codestory-workspace"]
-    owner -->|"Parse, extract, or resolution"| indexer["codestory-indexer"]
-    owner -->|"SQLite, snapshots, trails, bookmarks, or search docs"| store["codestory-store"]
-    owner -->|"Search, grounding, orchestration, or agent flows"| runtime["codestory-runtime"]
-    owner -->|"Args or output rendering"| cli["codestory-cli"]
-    owner -->|"Shared DTOs, graph, or events"| contracts["codestory-contracts"]
-    start --> truth{"Source of truth or derived read model?"}
-    truth -->|"Source of truth"| first["Change the owning crate first"]
-    truth -->|"Derived or read model"| follow["Verify store and runtime boundaries before patching projections"]
-```
-
-Use this mapping:
-
-- manifest or discovery issue: `codestory-workspace`
-- parse, extract, or resolution issue: `codestory-indexer`
-- SQLite, snapshots, trails, bookmarks, or search docs: `codestory-store`
-- search ranking, grounding, orchestration, or agent flows: `codestory-runtime`
-- args or output rendering: `codestory-cli`
-- shared DTOs or graph/event types: `codestory-contracts`
-
-## Basic Cargo Lane
-
-Run these from the repo root:
+Debug Rust builds compile without embedding the release model. A release build
+requires the exact pinned model at build time:
 
 ```sh
-cargo fmt --check
-cargo check
-cargo test -p codestory-cli
+MODEL_PATH="$(node scripts/prepare-embedded-model.mjs)"
+CODESTORY_EMBED_MODEL_SOURCE="$MODEL_PATH" cargo build --release --locked -p codestory-cli
 ```
 
-**Why run serially:**
+The preparation script verifies the declared size and digest before publishing
+the build input. The resulting executable contains the model; product runtime
+does not download it.
 
-This workspace shares Cargo build locks. Running commands serially prevents lock contention and ensures consistent build results.
+## Establish the proof target
 
-**When to use this lane:**
+Before editing, inspect the branch, integration head, active worktrees, open PR
+ownership, and release state. Routine branches start from and target
+`dev/codestory-next`; do not reuse another active lane.
 
-Use this lane after the picker says broad Rust checks are useful. If you touch
-graph extraction, semantic resolution, runtime search, grounding, or repo-scale
-indexing behavior, check the testing matrix before you finish so the heavy lane
-is explicit instead of accidental.
-
-**What each command does:**
-
-- `cargo fmt --check`: Verifies that the code follows Rust formatting standards
-- `cargo check`: Checks for compilation errors without building
-- `cargo test -p codestory-cli`: Runs CLI tests to verify command behavior
-
-**Best practices:**
-
-- Always run these commands serially in the order shown
-- If any command fails, fix the issue before proceeding to the next
-- Use this lane for routine code changes and documentation updates
-- For heavy changes, use the appropriate verification lane from the testing matrix
-
-## Local CLI Loop
-
-When CLI behavior is in scope, verify the shipped flow with the built binary
-instead of `cargo run`:
+For a delegated worktree, run:
 
 ```sh
-cargo build --release -p codestory-cli
+node scripts/codex-worktree-setup.mjs
+```
+
+Treat its printed base, child head, PR head, remote-tip check, and proof target
+as authoritative. The dispatcher also selects a version-matched CLI, optionally
+uses `sccache`, attempts safe cache rehydration, refreshes the local map, and
+reports status. Shell and PowerShell files are compatibility adapters around
+this Node implementation.
+
+By default the setup does not initialize the embedded retrieval engine. Opt in
+only when full retrieval evidence belongs to the lane:
+
+```sh
+node scripts/codex-worktree-setup.mjs --full-retrieval-proof
+```
+
+Test setup behavior with:
+
+```sh
+node --test scripts/tests/codex-worktree-setup.test.mjs
+```
+
+## Ownership map
+
+Change the source-of-truth layer first. Do not patch a CLI or plugin projection
+to compensate for an upstream state bug.
+
+```mermaid
+flowchart LR
+  contracts["contracts"] --> workspace["workspace"]
+  contracts --> indexer["indexer"]
+  contracts --> store["store"]
+  workspace --> runtime["runtime"]
+  indexer --> runtime
+  store --> runtime
+  retrieval["retrieval + llama-sys"] --> runtime
+  runtime --> cli["cli"]
+  cli --> adapters["plugin and adapters"]
+  bench["bench"] -. measures .-> runtime
+```
+
+| Area | Owns |
+| --- | --- |
+| `codestory-contracts` | Shared DTOs, graph types, events, grounding and trail contracts |
+| `codestory-workspace` | Project discovery, inventories, refresh planning, repository identity |
+| `codestory-indexer` | Parsing, extraction, intermediate projections, semantic resolution |
+| `codestory-store` | SQLite source of truth, snapshots, projections, core publication |
+| `codestory-retrieval` | Lexical/vector/SCIP generations, manifests, query execution, in-process engine policy |
+| `codestory-llama-sys` | The small Rust-to-llama.cpp/ggml boundary and embedded-model build contract |
+| `codestory-runtime` | Product orchestration for indexing, grounding, search, packets, and agent flows |
+| `codestory-cli` | Arguments, transports, rendering, process configuration, managed runtime boundary |
+| `plugins/codestory` | Host hooks, CLI provisioning, MCP routing, canonical grounding skill |
+| `codestory-bench` | Measurement support; no product contracts |
+
+## Choose the verification lane first
+
+Use the [testing matrix](testing-matrix.md) as the source of truth. Common draft
+lanes are:
+
+| Change | Focused proof |
+| --- | --- |
+| Docs only | Read changed pages, `node .github/scripts/check-doc-links.mjs`, `git diff --check` |
+| One Rust crate | `cargo test --locked -p <crate> <filter>` then `cargo check --locked -p <crate>` |
+| CLI or stdio | Named CLI contract suite; add runtime tests when orchestration changes |
+| Plugin adapter | `node --test plugins/codestory/tests/plugin-static.test.mjs` |
+| Indexer or language | Full fidelity and language-coverage binaries |
+| Retrieval or embeddings | Retrieval/runtime admission tests plus the named engine proof |
+| Release metadata | Release-version and workflow-policy scripts |
+
+Run Cargo build, check, test, and clippy commands serially because worktrees can
+share build locks. Never serialize a test suite to hide leaked global state.
+
+The accepted exact-head source gate runs once:
+
+```sh
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+```
+
+## Local CLI loop
+
+Use the built binary rather than `cargo run` when the shipped command boundary
+is part of the claim:
+
+```sh
+MODEL_PATH="$(node scripts/prepare-embedded-model.mjs)"
+CODESTORY_EMBED_MODEL_SOURCE="$MODEL_PATH" cargo build --release --locked -p codestory-cli
 ./target/release/codestory-cli index --project . --refresh auto
 ./target/release/codestory-cli ready --project . --goal local
 ./target/release/codestory-cli ground --project . --why
-./target/release/codestory-cli files --project . --limit 20
 ./target/release/codestory-cli doctor --project .
 ```
 
-On Windows PowerShell, use `.\target\release\codestory-cli.exe`.
+On Windows, use `.\target\release\codestory-cli.exe`. Set `CODESTORY_CLI` to
+that exact binary when testing the plugin adapter against a local build.
 
-When changing CodeStory itself or testing the current checkout:
+Read commands default to `--refresh none`. Use `--refresh incremental` when a
+read should refresh an existing cache. Reserve full refresh for an empty cache,
+schema change, diagnosed corruption, or an explicit proof lane.
 
-```sh
-cargo build --release -p codestory-cli
-CODESTORY_CLI="./target/release/codestory-cli"
-"$CODESTORY_CLI" doctor --project <target-workspace>
-```
+## Full retrieval development
 
-The plugin source-build setup fallback accepts `CODESTORY_REPO_URL` and
-`CODESTORY_REPO_REF` when you need a specific source artifact. Without an
-explicit ref, setup fetches and builds the remote default branch.
-
-Read commands default to `--refresh none`. If a read command says the cache is
-empty, either run `index --refresh full` first or rerun the read command with an
-explicit refresh mode. Agent-facing `packet` and `search` evidence require full
-retrieval retrievals; prepare the retrieval lane below before treating those
-commands as product-quality proof.
-
-## Hybrid Retrieval Setup
-
-Use this lane only for packet/search, retrieval, ranking-quality, or retrieval
-work. Prepare the managed full-retrieval path before debugging ranking quality:
-
-- product retrieval setup: normal plugin tools initialize the embedded engine automatically; maintainers can run `codestory-cli retrieval index --project . --refresh full`
-- default symbol-doc scope: durable symbols only; set `CODESTORY_SEMANTIC_DOC_SCOPE=all` when you intentionally need the broad all-symbol diagnostic symbol-doc set
-- default dense policy: `graph_first_v1` embeds only selected dense anchors; private trivial code remains searchable through symbol docs, lexical source, and graph expansion
-- default semantic alias mode: compact aliases; set `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias` or `current_alias` only when reproducing benchmark rows
-- embedding throughput tuning: `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` and local llama.cpp retrieval settings
-
-Hash embeddings and lexical-only switches are diagnostic modes only; they are
-not valid agent-facing retrieval setup.
-
-After bootstrap, run a target-repo retrieval index before using packet/search:
+Use this loop only for packet/search, retrieval, ranking, or embedding work:
 
 ```sh
 ./target/release/codestory-cli index --project . --refresh full
@@ -187,157 +145,79 @@ After bootstrap, run a target-repo retrieval index before using packet/search:
 ./target/release/codestory-cli ready --project . --goal agent
 ```
 
-`index`, `ground`, `search`, `context`, and `doctor` report the active retrieval mode plus any degraded-state reason when retrieval state is available, so confirm that output before assuming the ranking logic regressed. Agent-facing retrieval requires `retrieval_mode=full`.
+Require `retrieval_mode: "full"` before treating packet/search output as
+product evidence. The in-process CodeRankEmbed engine initializes automatically. It has no
+endpoint, helper executable, port, or repair worker.
 
-## Delegated Worktree Proof Target
+Useful diagnostic policies:
 
-Before a delegated CodeStory lane spends time on cache repair, readiness, or
-full-retrieval proof, verify the Git target. The tracked Codex environment runs:
-
-```sh
-node scripts/codex-worktree-setup.mjs
-```
-
-The Node.js dispatcher owns the setup behavior on every platform.
-`scripts/codex-worktree-setup.ps1` and `scripts/codex-worktree-setup.sh` are
-thin compatibility adapters for callers that still invoke a platform script.
-The dispatcher prints this handoff surface first:
-
-```text
-intended_base_ref
-resolved_base_commit
-child_start_head
-child_branch_or_detached
-proof_target
-pr_head_ref
-pr_head_commit
-remote_tip_verification.<target>.command
-remote_tip_verification.<target>.result
-```
-
-Defaults are intentionally narrow: `intended_base_ref` is
-`origin/dev/codestory-next`, and a PR lane with `CODESTORY_PR_HEAD_REF`,
-`--pr-head-ref`, or `-PrHeadRef` proves
-`base:origin/dev/codestory-next + pr-head:<ref>`. Use `--branch-head-proof`,
-or `-BranchHeadProof` only when the lane is explicitly proving the branch head
-by itself.
-
-The setup reports stale `main`, stale local `dev/codestory-next`, stale PR
-heads, unresolved refs, and the exact `git ls-remote origin ...` result before
-it prepares the worktree. It then resolves a
-version-matched CLI through `CODESTORY_CLI`, PATH, the CodeStory install
-directory, this worktree, and sibling worktrees; tries the matching release;
-and falls back to a locked release Cargo build with optional `sccache`. It best-effort
-rehydrates a compatible sibling cache, refreshes the local repository map, and
-reports a compact setup state. The default does not prepare or wait for full
-retrieval, so it works without a model, Docker, or another local service.
-
-Maintainers can opt into the full retrieval preparation lane when that evidence
-is part of the verification target:
-
-```sh
-node scripts/codex-worktree-setup.mjs --full-retrieval-proof
-```
-
-The PowerShell adapter accepts `-FullRetrievalProof`. Treat Git-target warnings
-as proof-target blockers, not broad-search readiness blockers.
-
-Exercise the shared dispatcher behavior and the current platform adapter without
-changing your real workspace state:
-
-```sh
-node --test scripts/tests/codex-worktree-setup.test.mjs
-```
-
-`node scripts/codex-worktree-setup.mjs --self-test` is a compatibility alias
-for that same suite, not a second implementation-specific test path.
-
-## Recommended Reading Order
-
-Build a mental model in this order before editing the biggest implementation paths:
-
-1. [User guides](../users/README.md) for operator-facing workflow context
-2. [Architecture overview](../architecture/overview.md)
-3. [Runtime execution path](../architecture/runtime-execution-path.md)
-4. [Indexing pipeline](../architecture/indexing-pipeline.md)
-5. the subsystem page for the owning crate
-6. [Debugging guide](debugging.md)
-7. [Testing matrix](testing-matrix.md)
-
-## Rustdoc Baseline
-
-Run the rustdoc baseline before raising documentation or public API cleanup PRs:
-
-```sh
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-```
-
-CI runs the same rustdoc warning gate for Rust and contributor-doc changes. It
-keeps `codestory-bench` in the workspace pass for warning and link regressions,
-but `publish = false` benchmark helpers do not carry a broader missing-docs
-policy.
-
-Document public Rust APIs that a maintainer, integration, or downstream crate
-would need to call correctly. Keep comments operational:
-
-- Start each public crate and intentionally public module with `//!` docs that
-  name the crate boundary, source of truth, and runtime side effects.
-- Put `///` docs on public structs, enums, traits, type aliases, constants,
-  re-exports, and functions that are meant to be reused across crates.
-- State invariants, cache or retrieval effects, error behavior, and required
-  verification commands when those details affect correct use.
-- Avoid issue history, benchmark holdout names, local machine paths, and
-  process narration in rustdoc.
-- Prefer one accurate paragraph over examples that would duplicate tests or
-  drift from real command behavior.
-
-Public API documentation priority:
-
-| Crate | Public surface to document first |
+| Variable | Purpose |
 | --- | --- |
-| `codestory-contracts` | Shared DTOs, graph model, events, language support contracts, and query/trail types. |
-| `codestory-runtime` | Headless orchestration, service facades, cache rehydration, search/runtime exports, and repository identity reports. |
-| `codestory-retrieval` |  Retrieval health, query planning/execution, index manifests, cache keys, and degraded-mode contracts. |
-| `codestory-workspace` | Workspace discovery/settings, refresh planning, language settings, and repository/retrieval identity. |
-| `codestory-store` | Storage facades and projection/snapshot/file-store contracts. |
-| `codestory-indexer` | Public indexing config/results/events, language config, semantic-resolution contracts, and candidate path helpers. |
-| `codestory-cli` | Binary command behavior belongs in user/contributor docs; add rustdoc only for reusable library APIs if one is introduced. |
-| `codestory-bench` | Publish-false benchmark helpers; document only helpers reused outside a single benchmark lane. |
+| `CODESTORY_EMBED_ALLOW_CPU=1` | Explicit hosted-CI or maintainer CPU operation; never an acceleration claim |
+| `CODESTORY_SEMANTIC_DOC_SCOPE=all` | Broader all-symbol diagnostic document set |
+| `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=no_alias|current_alias` | Reproduce nondefault alias experiments; default is compact `alias_variant` |
+| `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE=<n>` | Embedding batch-size experiment |
 
-Do not enable workspace-wide or crate-wide `missing_docs` yet. The current
-public surface is broad enough that a crate-wide lint would force a noisy sweep.
-Phase it in behind explicit allowlists: start with module-scoped
-`#![warn(missing_docs)]` on newly cleaned public modules, allow known transitional
-exports explicitly, and move to crate-wide lints only after the crate root and
-intentional re-exports are documented.
+Hash embeddings and lexical-only modes are diagnostics, not agent-facing full
+retrieval.
 
-## Before Large Changes
+## Cache reuse across worktrees
 
-Read these pages first:
+Before indexing a clean child worktree with the same origin and Git tree:
 
-- `docs/architecture/overview.md`
-- `docs/architecture/runtime-execution-path.md`
-- `docs/architecture/indexing-pipeline.md`
-- the subsystem page for the owning crate
-- `docs/contributors/debugging.md`
-- `docs/contributors/testing-matrix.md`
+```sh
+codestory-cli cache rehydrate \
+  --from-project <parent-worktree> \
+  --project <child-worktree>
+```
 
-## Cache And Refresh Notes
+Rehydrate copies and rebases compatible SQLite graph/search/document rows and
+portable artifact-cache entries. It invalidates retrieval manifests because the
+project identity changed. Run the printed `doctor` command, then publish a fresh
+retrieval generation before using packet/search. If rehydrate reports
+`skipped`, use its normal rebuild commands.
 
-- default cache layout: user cache root + hashed project path
-- explicit `--cache-dir`: use the exact directory you passed
-- `cache identity`: reports schema-3 project, workspace, and artifact-scope ids; the lossless canonical repository identity; explicit legacy-alias disposition; Git remote/tree freshness input; cache schema version; and portable-reuse eligibility without changing cache files
-- Child worktree bootstrap: run `codestory-cli cache rehydrate --from-project <main-or-parent-worktree> --project <child-worktree>` before the first child-thread index. The command copies a compatible cache only when both worktrees are clean, share the same `origin` URL, have the same Git tree, the source SQLite schema matches the running CLI, and the target cache directory is empty.
-- Rehydrated caches rebase copied path-bound SQLite graph/search/doc rows under the child worktree path, preserve portable v2 index artifact cache rows, and invalidate retrieval manifests. Run the printed `doctor` command to inspect freshness, then run `retrieval index --refresh full` before using retrieval-backed packet/search evidence.
-- If `cache rehydrate` reports `skipped`, use the printed rebuild commands. This is CodeStory SQLite graph/search/doc plus portable v2 index artifact cache reuse; retrieval retrieval reuse across path/root-derived identities remains future work. It does not configure Rust compilation caching such as `sccache`.
-- `index --refresh auto`: chooses full on an empty cache and incremental after that
-- `ground`, `search`, `context`, `symbol`, `trail`, `snippet`, `query`, `explore`, `serve`: default to `--refresh none`
-- `drill`: defaults to `--refresh full` so report bundles are mechanically fresh
-- `drill`: sends its question and explicit anchors through one packet batch and
-  writes packet-backed JSON, Markdown, and summary artifacts
-- claim/source-truth scoring is evaluation-only: run
-  `node scripts/score-drill-ledger.mjs <drill-or-suite-report.json> <ledger.json> [scored-report.json]`;
-  production drill commands do not own a second readiness or scoring contract
-- `drill-suite --jobs N`: only uses workers with `--refresh none`; refresh/indexing runs stay serialized
-- use `--refresh full` after deleting the cache directory, after schema-affecting changes, or when stale state is suspected
-- delegated child worktree lanes: verify the Git proof target in [Delegated Worktree Proof Target](#delegated-worktree-proof-target) before cache rehydrate, readiness, or retrieval proof
+Cache rules:
+
+- `--cache-dir` is an exact override; otherwise CodeStory uses the user cache
+  root plus a project identity.
+- `index --refresh auto` builds an empty cache and is incremental thereafter.
+- Cleanup acts only on current CodeStory-owned generations and tokens.
+- Tests use isolated cache and plugin roots; never clean the real user cache to
+  make a test pass.
+
+## Documentation and Rustdoc
+
+For docs-only scope, read the changed pages and run:
+
+```sh
+node .github/scripts/check-doc-links.mjs
+git diff --check
+```
+
+When plugin files change, also run:
+
+```sh
+node --test plugins/codestory/tests/plugin-static.test.mjs
+```
+
+For public Rust API work:
+
+```sh
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+```
+
+Document source-of-truth ownership, side effects, invariants, and error behavior.
+Do not copy issue history or benchmark narration into Rustdoc, and do not enable
+a workspace-wide `missing_docs` lint until the existing public surface is
+deliberately reduced.
+
+## Reading order for large changes
+
+1. [Architecture overview](../architecture/overview.md)
+2. the owning subsystem page under `docs/architecture/subsystems/`
+3. [Runtime execution path](../architecture/runtime-execution-path.md) when orchestration changes
+4. [Indexing pipeline](../architecture/indexing-pipeline.md) when discovery or publication changes
+5. [Debugging guide](debugging.md)
+6. [Testing matrix](testing-matrix.md)
+7. [Retrieval engine operations](../ops/retrieval-engine.md) for embedding or retrieval work

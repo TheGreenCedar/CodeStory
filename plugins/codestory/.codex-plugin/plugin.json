@@ -1,6 +1,6 @@
 {
   "name": "codestory",
-  "version": "0.15.0",
+  "version": "0.16.0",
   "description": "CodeStory grounding for Codex over the local codestory-cli stdio server.",
   "author": {
     "name": "The Green Cedar",

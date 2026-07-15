@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "CodeStory retrieval retrieval promotion guards",
-  "description": "When retrieval retrieval is promotion-ready, block promotion if any trigger fires on consecutive full local-real benchmark runs.",
+  "title": "CodeStory retrieval promotion guards",
+  "description": "When retrieval is promotion-ready, block promotion if any trigger fires on consecutive full local-real benchmark runs.",
   "version": 1,
   "env": {
     "shadow_mode": "CODESTORY_RETRIEVAL_SHADOW"

@@ -744,7 +744,7 @@ mod tests {
                             .to_string(),
                     doc_version: 4,
                     doc_hash: "extension-service-doc".to_string(),
-                    embedding_profile: Some("bge-base-en-v1.5".to_string()),
+                    embedding_profile: Some("coderank-embed".to_string()),
                     embedding_model: "legacy-producer".to_string(),
                     embedding_backend: Some("legacy".to_string()),
                     embedding_dim: 768,

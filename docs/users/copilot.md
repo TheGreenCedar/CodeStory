@@ -1,181 +1,100 @@
 # GitHub Copilot
 
-CodeStory adapters for GitHub Copilot split by surface: CLI hooks vs editor
-instructions. Neither path auto-starts MCP.
+CodeStory has two Copilot adapters: session hooks for Copilot CLI and repository
+instructions for editor chat. Neither adapter auto-starts MCP. Hooks and
+instructions teach the agent when to use CodeStory; only a connected MCP server
+or an explicit CLI command can produce CodeStory evidence.
 
 ## Copilot CLI
 
-Use session-start hooks to inject CodeStory-first grounding rules. You manage
-the CLI and any MCP connection yourself.
+### Install the hook package
 
-### What you get
-
-| You | Agent |
-| --- | --- |
-| Install Copilot CLI plugin metadata | `sessionStart` runs `codestory-activate.cjs` |
-| Ensure runtime is reachable | Uses MCP only if you configure it separately |
-| Ask repo questions | Follows injected instructions when hooks run |
-
-Plugin manifest: `plugins/codestory/.github/plugin/plugin.json`  
-Hooks: `plugins/codestory/hooks/copilot-hooks.json`
-
-### Install
-
-From the CodeStory repository root (or any checkout that contains
-`plugins/codestory/`):
-
-**Install from GitHub (no local clone required):**
+From GitHub:
 
 ```bash
 copilot plugin install TheGreenCedar/CodeStory:plugins/codestory
 ```
 
-**Install from a local checkout:**
+From a local checkout:
 
 ```bash
 copilot plugin install plugins/codestory
 ```
 
-Re-run the same `copilot plugin install ...` command after you change plugin
-files; Copilot CLI caches installed plugins.
+Verify that `copilot plugin list` shows **codestory**, then start a fresh
+session. Reinstall after changing plugin files because Copilot caches installed
+plugins.
 
-Verify the install:
+### Connect MCP
 
-```bash
-copilot plugin list
-```
+Configure an MCP server that runs
+`plugins/codestory/scripts/codestory-mcp.cjs`. Use the same server block as the
+[Cursor guide](cursor.md#2-configure-mcp), with a persistent
+`CODESTORY_PLUGIN_DATA` directory.
 
-You should see **codestory** in the list.
+The session hook is useful without MCP because it preserves the grounding
+contract, but it cannot query the CodeStory index. Without MCP, the agent should
+say CodeStory is unavailable and inspect source normally.
 
-Configure MCP manually if you need `codestory://status` in Copilot CLI
-sessions — point MCP at `plugins/codestory/scripts/codestory-mcp.cjs` (same
-shape as [Cursor MCP config](cursor.md#2-mcp-server-copy-shipped-config)).
+### Verify the install
 
-Open the repository you want to ground in Copilot CLI.
-
-Skills ship under `plugins/codestory/skills/` but coverage is partial compared
-to Codex.
-
-### Install verification
-
-Run these two checks before your first real task:
-
-1. **Adapter present** — `copilot plugin list` shows **codestory**. Confirm the
-   manifest at `plugins/codestory/.github/plugin/plugin.json` and hooks at
-   `plugins/codestory/hooks/copilot-hooks.json`.
-2. **Hooks live** — Start a new Copilot CLI session in the repo; session-start
-   hook should inject CodeStory grounding rules (`node` must be on PATH).
-
-### First session
-
-Start a new Copilot CLI session in the repo. Session-start hook injects
-grounding rules. Ask:
+1. `copilot plugin list` shows **codestory**.
+2. A fresh session loads the `sessionStart` hook.
+3. The CodeStory MCP server is connected.
+4. A repository question returns cited files and symbols.
 
 ```text
-Where is [Feature] implemented, who calls it, and which tests cover it?
+Where is authorization enforced, who calls it, and which tests cover it?
 ```
 
-**Expected wait:** On a large repository, the first index build can take several
-minutes. The agent should retry the same tool while CodeStory prepares.
+The first MCP request may prepare the repository and retry. Shared behavior:
+[First use](README.md#first-use).
 
-**Success looks like:** The agent returns repository-specific files and symbols
-without asking you to run setup or poll readiness.
+### Troubleshooting
 
-Without MCP, see [CLI reference](cli-reference.md) for repair transcripts.
-
-### Example prompts
-
-```text
-Where is [Feature] defined and who calls it?
-```
-
-```text
-I am changing [path/to/file]. What symbols are affected and what tests should I run first?
-```
-
-```text
-How does [subsystem] work? Cite concrete files.
-```
-
-More pairs and anti-patterns: [Prompt patterns](prompt-patterns.md).
-
-### Troubleshooting (CLI)
-
-| Symptom | What to try |
+| Symptom | Action |
 | --- | --- |
-| No grounding injection | Confirm plugin hooks registered; `node` on PATH |
-| No status resource | Configure MCP or use [CLI reference](cli-reference.md) |
-| Stale graph | [Troubleshooting - local navigation](troubleshooting.md#local-navigation-stale-or-blocked) |
-
-### Limitations vs Codex
-
-No MCP auto-start, no prompt hooks (session start only), partial skill, manual
-CLI bootstrap. Compare [capability matrix](README.md#capability-matrix).
-
----
+| Hook does not load | Confirm the plugin is installed and `node` is on `PATH` |
+| No CodeStory tools | Configure MCP; the hook does not start it |
+| Installed changes are stale | Reinstall the cached plugin and start a fresh session |
+| Tool remains blocked | Follow [shared troubleshooting](troubleshooting.md) |
 
 ## Copilot editor
 
-Repository instructions tell the editor agent to prefer CodeStory when MCP is
-available. No hooks, no skill package, no managed bootstrap.
-
-### What you get
-
-| You | Agent |
-| --- | --- |
-| Keep `.github/copilot-instructions.md` in the repo | Reads instructions before source claims |
-| Optionally connect MCP yourself | Calls the matching CodeStory tool when MCP is live |
-| Ask repo questions | Grounding only when MCP + instructions align |
-
-Canonical instruction file in this repo: `.github/copilot-instructions.md`
-(same rules as `plugins/codestory/.cursor/rules/codestory.mdc`).
+Repository instructions can tell editor chat to prefer CodeStory when MCP is
+available. They do not install the CLI, start MCP, or create an index.
 
 ### Install
 
-1. Add or copy `.github/copilot-instructions.md` to your project root.
-2. Optionally configure an MCP server to `plugins/codestory/scripts/codestory-mcp.cjs`
-   if your Copilot editor build supports MCP (see [Cursor MCP config](cursor.md#2-mcp-server-copy-shipped-config)).
-3. Open the repository in the editor.
+1. Copy `.github/copilot-instructions.md` from this repository into the target
+   repository.
+2. If the editor supports MCP, configure the shipped CodeStory adapter as in
+   the [Cursor guide](cursor.md#2-configure-mcp).
+3. Open the repository root and start a fresh chat.
 
-### Install verification
+### Verify the install
 
-Run these two checks before your first real task:
-
-1. **Adapter present** — `.github/copilot-instructions.md` exists at the repo
-   root (copy from this repo or from
-   `plugins/codestory/.cursor/rules/codestory.mdc` content).
-2. **MCP live (optional)** — If your editor build supports MCP, the CodeStory
-   server is connected.
-
-### First session
-
-Open Copilot chat in the repo and ask:
+Confirm the instruction file is present. If MCP is configured, confirm the
+CodeStory server is connected and ask:
 
 ```text
-What owns [path/to/file], which symbols depend on it, and which tests should I run first?
+What owns src/auth/session.ts, which symbols depend on it, and which tests should I run first?
 ```
 
-**Expected wait:** On a large repository, the first index build can take several
-minutes when MCP triggers a fresh index.
+With MCP, a healthy result cites repository-specific evidence. Without MCP,
+there is no CodeStory readiness or first-index wait: the editor is following
+instructions and using its ordinary source tools.
 
-**Success looks like:** The agent follows the repo instructions and returns
-repository-specific files and symbols without asking you to poll readiness.
+### Troubleshooting
 
-### Example prompts
-
-Same portable shapes as [Copilot CLI](#example-prompts) above.
-
-### Troubleshooting (editor)
-
-| Symptom | What to try |
+| Symptom | Action |
 | --- | --- |
-| Agent ignores CodeStory | Confirm `copilot-instructions.md` at repo root; start fresh chat |
-| No MCP | Instructions point to CLI repair -- [CLI reference](cli-reference.md) |
-| Wrong repo scope | Open workspace at repository root |
+| Instructions are ignored | Confirm `.github/copilot-instructions.md` is at the repository root and start a fresh chat |
+| No CodeStory evidence | Connect MCP; instructions alone cannot query CodeStory |
+| Wrong repository scope | Open the intended repository root and pass that project to MCP |
 
-### Limitations vs Codex
+## Differences from Codex
 
-Instructions only: no hooks, no skill, no MCP auto-start, manual CLI. Weakest
-automation of the supported hosts.
-
-Shared repair: [Troubleshooting](troubleshooting.md).
+Copilot provides no CodeStory MCP auto-start. Copilot CLI has a session hook;
+editor chat has repository instructions only. Both need manual MCP setup for
+live CodeStory grounding.

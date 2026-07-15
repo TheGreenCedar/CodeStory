@@ -61,7 +61,7 @@ behavior changed. Intermediate commits do not append telemetry.
 ## Retrieval engine
 
 The supported product path is one executable with a process-wide in-process
-BGE-base Q8 engine. It performs no model or backend download and starts no
+CodeRankEmbed Q8 engine. It performs no model or backend download and starts no
 helper process. `retrieval_mode=full` still gates agent packet/search.
 
 Focused proof covers:

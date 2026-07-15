@@ -1695,7 +1695,7 @@ function localCacheProvenance(overrides = {}) {
     cache_policy: "prepared-retrieval-cache-read-only",
     retrieval_mode: "full",
     semantic_generation: "proj-current",
-    manifest_embedding_backend: "inprocess:bge-base-en-v1.5:q8_0:sha256-deadbeef",
+    manifest_embedding_backend: "inprocess:coderank-embed:q8_0:sha256-deadbeef",
     semantic_backend: "inprocess",
     embedding_engine_instance_id: "engine-1",
     embedding_policy: "accelerated",

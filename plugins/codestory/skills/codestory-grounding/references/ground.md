@@ -25,7 +25,7 @@ Produces a budget-aware grounding snapshot of the entire indexed codebase: root 
 |------|----------|
 | `strict` | Minimal snapshot — only top-level root symbols and compressed file list |
 | `balanced` | Default — covers most files with representative symbols |
-| `max` | Full-depth coverage of every file and symbol |
+| `max` | Largest bounded snapshot; output may still compress files and symbols to stay within protocol limits |
 
 ## Output
 

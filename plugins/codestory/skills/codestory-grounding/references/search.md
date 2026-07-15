@@ -47,7 +47,9 @@ fail-closed states.
 - Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
 - Repo-text evidence remains explicit navigation evidence. Treat repo-text hits
   as clues to inspect, not as retrieval success.
-- For architecture questions, broad natural-language `search` is discovery only. If `query_assessment` says `weak_top_hit=true` or there is no exact anchor, move to `drill` with concrete anchors from `ground`/`search`; do not answer from broad search hits alone.
+- For architecture questions, broad natural-language `search` is discovery
+  only. Use `packet` for the broad question; use `drill` only when a maintainer
+  explicitly needs a repeatable evaluation artifact.
 - `symbol`, `trail`, and `snippet` require a resolvable graph target. Semantic suggestions and repo-text hits can guide follow-up searches, but they are not promoted into graph targets by those commands.
 - **Hybrid weight overrides** are not public CLI options. `search --hybrid-*` flags are unknown arguments; use fixture-backed tests for ranking experiments instead.
 
@@ -87,7 +89,7 @@ For ranking or route-search changes, run the search-quality eval and interpret
 failures before promoting the change:
 
 ```bash
-cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+cargo test --locked -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
 ```
 
 - Low recall: an expected anchor is missing from indexed-symbol hits, repo-text
@@ -125,5 +127,5 @@ cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture s
 <codestory-cli> search --project <target-workspace> --query TrailResult --format json
 
 # Search-quality eval harness after ranking changes
-cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
+cargo test --locked -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
 ```

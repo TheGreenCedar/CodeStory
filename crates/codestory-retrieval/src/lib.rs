@@ -53,7 +53,7 @@ pub use config::{
     active_test_cache_root, enable_automatic_test_cache_root_for_process, with_test_cache_root,
 };
 pub use embeddings::{
-    BGE_BASE_EN_V1_5_GGUF, BGE_QUERY_PREFIX_DEFAULT, EmbeddingAcceleratorSmoke,
+    CODERANK_EMBED_Q8_GGUF, CODERANK_QUERY_PREFIX_DEFAULT, EmbeddingAcceleratorSmoke,
     EmbeddingDeviceReadiness, EmbeddingRuntimeProbe, InProcessEmbeddingClient,
     PRODUCT_EMBEDDING_RUNTIME_ID, RETRIEVAL_EMBEDDING_DIM, embed_documents_for_runtime,
     embed_query_for_runtime, embedding_backend_label, embedding_backend_label_for_runtime,

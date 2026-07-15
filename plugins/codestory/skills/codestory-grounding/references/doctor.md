@@ -1,6 +1,9 @@
 # `doctor` - Project And Retrieval Health
 
-Reads project/cache/index/retrieval health without mutating the index. Use it for maintainer/debug transcripts and when a read command fails unexpectedly. For agent MCP runtime truth, repair, and surface gating, see [status-contract.md](status-contract.md).
+Reads project/cache/index/retrieval health without mutating the index. Use it
+for maintainer/debug transcripts after a normal tool call fails unexpectedly.
+For agent MCP runtime truth and surface gating, see
+[status-contract.md](status-contract.md).
 
 ## Usage
 
@@ -23,7 +26,7 @@ Reads project/cache/index/retrieval health without mutating the index. Use it fo
 |------|---------|-----------------|
 | Normal path | `<codestory-cli> doctor --project <target-workspace>` | Reports project root, cache path, indexed stats, retrieval state, in-process engine health, environment hints, and next commands. |
 | Failure path | In MCP, retry the intended tool after its reported delay. If automatic preparation stops converging, continue with local navigation or ordinary source inspection and record the visibility gap. In a maintainer transcript, inspect `doctor` and run the specific index command it recommends; use an explicit full rebuild only when diagnostics identify stale or corrupt artifacts. If symbol docs, dense anchors, policy version, vector counts, or semantic health report partial/stale/failed state, do not trust broad evidence until the next complete publication is ready. | Separates user-facing capability state from maintainer diagnostics. |
-| Integration edge | Use doctor before `ground`, `search --why`, `explore`, `context`, or `serve`; its next commands are the safe follow-up loop. | Prevents read commands from silently querying the wrong or empty cache. |
+| Integration edge | Use `doctor` only after a direct tool call fails to converge or when collecting an explicit diagnostic transcript. | Keeps observational diagnostics out of the normal grounding loop. |
 
 For MCP/runtime drift, collect binary evidence only after status is missing or
 suspect (see [status-contract.md](status-contract.md#maintainer-recovery)). Installed

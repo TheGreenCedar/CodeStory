@@ -5,6 +5,10 @@ call paths, and bounded answer packets when broad search is ready. Quality depen
 on your **language mix**, **repo size**, and **readiness lane**, not on a single
 global score.
 
+The map and retrieval generations are stored per repository. One host process
+can serve several repositories and reuse one warm embedding engine, but it does
+not mix their indexes, publications, or readiness state.
+
 ## Language coverage (plain language)
 
 **Strong day-to-day navigation** — typical Python, Java, Rust, JavaScript,
@@ -18,6 +22,9 @@ workflows (under `.github/workflows/`), Docker Compose manifests, `Cargo.toml`
 pointers for those files; they are not the same as parser-backed navigation
 through application code.
 
+Docker Compose here is a file format CodeStory can index. CodeStory itself does
+not run Docker or a Compose-managed retrieval service.
+
 **Mixed repos** — a monorepo with Rust services and YAML configs gets graph
 navigation in Rust and structural anchors in config files. Ask concrete questions
 per area rather than expecting one uniform depth everywhere.
@@ -30,10 +37,17 @@ what each claim does *not* mean:
 
 - **First index** on a large checkout can take minutes; the agent retries the
   intended CodeStory call while preparation runs.
+- **First broad search in a process** also initializes the embedded model. Later
+  repositories in that process reuse the warm engine.
 - **Incremental refresh** after small edits is usually fast; stale local
-  navigation is a repair problem, not a prompt problem.
+  navigation is a freshness problem, not a prompt problem.
 - **Very large or unusual layouts** (generated trees, vendored giants) may index
   partially; the agent should cite gaps instead of guessing.
+
+The released executable contains its model and embedding backend. There is no
+separate model download or service startup. A verified content-addressed model
+copy may be materialized in the CodeStory cache for memory mapping and reused
+after restart.
 
 ## When output looks weak
 
@@ -44,7 +58,7 @@ that the answer is complete. Local graph tools may still be reliable meanwhile.
 Plain-language trust boundaries and good vs blocked sessions:
 [Trust and readiness](trust-and-readiness.md).
 
-Repair steps: [Troubleshooting](troubleshooting.md).
+Recovery steps: [Troubleshooting](troubleshooting.md).
 
 ## Benchmarks are not your repo
 

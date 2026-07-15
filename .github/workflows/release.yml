@@ -109,7 +109,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
       proof_key: release-${{ needs.preflight.outputs.version }}
-      profile: codestory-release-evidence-linux-arm64-v1
+      profile: codestory-release-evidence-linux-arm64-v2
       drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
       source_run_id: ${{ inputs.source_run_id }}
     secrets:
