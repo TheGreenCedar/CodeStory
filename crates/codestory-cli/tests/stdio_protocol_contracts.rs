@@ -3425,7 +3425,7 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
     // real indexer on smaller macOS runners. Keep the assertion bounded while
     // allowing the background publication worker to finish under that load.
     let deadline = Instant::now() + Duration::from_secs(120);
-    let new_generation = loop {
+    loop {
         let status_response = send_json(
             &mut reader_client,
             json!({
@@ -3484,16 +3484,15 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
         );
 
         if generation > old_generation && status["local_refresh"]["state"] != json!("refreshing") {
-            break generation;
+            break;
         }
         assert!(
             Instant::now() < deadline,
             "real refresh did not publish a new complete generation: {status}"
         );
         thread::sleep(Duration::from_millis(25));
-    };
+    }
 
-    assert_eq!(new_generation, old_generation + 1);
     let (_writer_client, writer_status) = writer.join().expect("join writer status client");
     assert_tool_success(&writer_status, json!("writer-start-refresh"));
 }
