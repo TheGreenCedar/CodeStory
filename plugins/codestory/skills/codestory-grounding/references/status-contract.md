@@ -15,14 +15,15 @@ across repositories.
 | `working_locally` | Local graph navigation is available while broad search prepares. | Continue with local tools and retry the original broad tool later. |
 | `unavailable` | CodeStory could not converge within the managed path. | Use focused source inspection and state the evidence gap. |
 
-`packet`, `search`, and `context` return `codestory_preparing` with
-`retry_tool` and `retry_after_ms` while their managed dependencies are coming
-up. Retry that same tool. Do not ask the user to enable, repair, approve, or
-configure an internal service.
+When no complete publication exists yet, `ground`, `packet`, `search`, and
+`context` return `codestory_preparing` with `retry_tool` and
+`retry_after_ms`. Broad tools use the same response while managed search is
+coming up. Retry that same tool. Do not ask the user to enable, repair,
+approve, or configure an internal service.
 
 `ground`, `files`, and `affected` can build or refresh the bounded local map as
-part of the call. Other local graph tools use the last complete publication and
-never read a half-published generation.
+part of the call. Once a complete publication exists, local graph tools keep
+using it during refresh and never read a half-published generation.
 
 ## Diagnostic status
 

@@ -29,6 +29,10 @@
   acceleration claim; Linux x64 proof retains the glibc 2.31 baseline.
 - Delegated worktree setup uses `retrieval index` for its optional full proof
   and no longer enters an embedding repair lifecycle.
+- A first `ground` request now initializes the in-process engine before
+  indexing. While the first complete publication is still being built, ground
+  and broad-search tools return a short same-tool retry instead of an empty
+  success or terminal unavailable result.
 
 ## 0.15.0
 

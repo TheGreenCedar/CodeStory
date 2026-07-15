@@ -167,7 +167,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | Status shows `runtime_update.state=available` | Current compatible surfaces keep working; reload when convenient if `restart_recommended=true` |
 | Status shows `repair_setup` | The active runtime could not start or prove compatibility; follow `recommended_next_calls` |
 | Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
-| Broad search is preparing | Retry the same `packet`, `search`, or `context` call after its reported delay. CodeStory initializes retrieval automatically. See [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
+| First ground or broad search is preparing | Retry the same `ground`, `packet`, `search`, or `context` call after its reported delay. CodeStory initializes retrieval automatically. See [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
 | A CodeStory call times out | Retry the same tool once. Read status only if it still does not converge. Reload only for host transport/registration failure, plugin replacement, or a runtime update whose status says `restart_recommended=true` |
 
 ### Managed platform matrix

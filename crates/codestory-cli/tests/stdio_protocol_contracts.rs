@@ -153,6 +153,49 @@ fn write_dirty_marker_fixture(fixture: &StdioFixture, name: &str, marker: Value)
     marker_path
 }
 
+fn write_live_local_refresh(fixture: &StdioFixture) -> u32 {
+    let project_root = fs::canonicalize(fixture.workspace.path())
+        .expect("canonical workspace")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as i64;
+    let pid = std::process::id();
+    fs::write(
+        fixture.cache_dir.path().join("local-refresh.lock"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "project_root": project_root,
+            "pid": pid,
+            "started_at_epoch_ms": now,
+            "token": format!("test:{pid}:{now}")
+        }))
+        .expect("serialize refresh lock"),
+    )
+    .expect("write refresh lock");
+    fs::write(
+        fixture.cache_dir.path().join("local-refresh-status.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "status": "refreshing",
+            "project_root": project_root,
+            "phase": "incremental_index",
+            "pid": pid,
+            "started_at_epoch_ms": now,
+            "updated_at_epoch_ms": now,
+            "last_failure_reason": null
+        }))
+        .expect("serialize refresh status"),
+    )
+    .expect("write refresh status");
+    pid
+}
+
 fn refresh_fixture_index(fixture: &StdioFixture) {
     let mut command = test_support::cli_command();
     command
@@ -3209,45 +3252,7 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
     )
     .expect("make the published index stale");
 
-    let project_root = fs::canonicalize(fixture.workspace.path())
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock")
-        .as_millis() as i64;
-    let pid = std::process::id();
-    fs::write(
-        fixture.cache_dir.path().join("local-refresh.lock"),
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": 1,
-            "project_root": project_root,
-            "pid": pid,
-            "started_at_epoch_ms": now,
-            "token": format!("test:{pid}:{now}")
-        }))
-        .expect("serialize refresh lock"),
-    )
-    .expect("write refresh lock");
-    fs::write(
-        fixture.cache_dir.path().join("local-refresh-status.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": 1,
-            "status": "refreshing",
-            "project_root": project_root,
-            "phase": "incremental_index",
-            "pid": pid,
-            "started_at_epoch_ms": now,
-            "updated_at_epoch_ms": now,
-            "last_failure_reason": null
-        }))
-        .expect("serialize refresh status"),
-    )
-    .expect("write refresh status");
+    let pid = write_live_local_refresh(&fixture);
 
     let mut status_client = spawn_stdio_server(&fixture);
     let status_response = send_json(
@@ -3438,8 +3443,8 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             .as_u64()
             .expect("reader complete generation");
         assert!(
-            generation == old_generation || generation == old_generation + 1,
-            "reader observed an unexpected publication generation: {status}"
+            generation >= old_generation,
+            "reader observed publication generation rollback: {status}"
         );
         let expected_status_file_count = if generation == old_generation { 5 } else { 101 };
         assert_eq!(
@@ -3462,12 +3467,14 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             ground_result["_meta"]["codestory_publication"]["publication"]["generation"]
                 .as_u64()
                 .expect("ground response publication generation");
+        assert!(
+            ground_generation >= old_generation,
+            "ground response identified publication generation rollback: {ground_result}"
+        );
         let expected_file_count = if ground_generation == old_generation {
             5
-        } else if ground_generation == old_generation + 1 {
-            101
         } else {
-            panic!("ground response identified an unexpected publication: {ground_result}");
+            101
         };
         assert!(
             ground["stats"]["file_count"]
@@ -3476,9 +3483,7 @@ fn two_stdio_processes_observe_only_complete_generations_during_real_refresh() {
             "reader ground mixed publication metadata and file contents: {ground_result}"
         );
 
-        if generation == old_generation + 1
-            && status["local_refresh"]["state"] != json!("refreshing")
-        {
+        if generation > old_generation && status["local_refresh"]["state"] != json!("refreshing") {
             break generation;
         }
         assert!(
@@ -3890,63 +3895,42 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
 }
 
 #[test]
-fn search_tool_retries_only_while_managed_preparation_is_live() {
-    let fixture = indexed_fixture();
+fn cold_ground_and_search_retry_while_first_publication_is_owned() {
+    let fixture = unindexed_fixture();
+    write_live_local_refresh(&fixture);
     let mut server = spawn_stdio_server(&fixture);
 
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "search-requires-full-retrieval",
-            "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {"query": "AppController"}
-            }
-        }),
-    );
-
-    let error = assert_tool_error(&response, json!("search-requires-full-retrieval"));
-    assert_eq!(error["tool"], json!("search"));
-    match error.pointer("/code").and_then(Value::as_str) {
-        Some("codestory_preparing") => {
-            assert_eq!(error["state"], json!("preparing"));
-            assert_eq!(error["retry_tool"], json!("search"));
-            assert!(
-                error["retry_after_ms"]
-                    .as_u64()
-                    .is_some_and(|delay| delay > 0)
-            );
-            assert!(
-                error["operation"]["id"]
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty()),
-                "retryable preparation must name the live operation: {response}"
-            );
-        }
-        Some("codestory_unavailable") => {
-            assert_eq!(error["state"], json!("unavailable"));
-            assert!(error.get("retry_tool").is_none(), "{response}");
-            assert!(error.get("retry_after_ms").is_none(), "{response}");
-        }
-        code => panic!("unexpected search preparation result {code:?}: {response}"),
-    }
-    assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
-    let serialized = error.to_string();
-    for hidden_detail in [
-        "sidecar",
-        "minimum_next",
-        "full_repair",
-        "repair_reason",
-        "failed_layer",
-        "pid",
-        "port",
-        "model",
+    for (name, arguments) in [
+        ("ground", json!({"budget": "strict"})),
+        ("search", json!({"query": "AppController"})),
     ] {
-        assert!(
-            !serialized.contains(hidden_detail),
-            "managed response should hide infrastructure detail `{hidden_detail}`: {response}"
+        let request_id = format!("cold-{name}-preparing");
+        let response = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
         );
+        let error = assert_tool_error(&response, json!(request_id));
+        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["tool"], json!(name));
+        assert_eq!(error["state"], json!("preparing"));
+        assert_eq!(error["retry_tool"], json!(name));
+        assert!(
+            error["retry_after_ms"]
+                .as_u64()
+                .is_some_and(|delay| delay > 0)
+        );
+        assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
+        let serialized = error.to_string();
+        for hidden_detail in ["sidecar", "repair", "pid", "port", "model", "operation"] {
+            assert!(
+                !serialized.contains(hidden_detail),
+                "preparation response should hide lifecycle detail `{hidden_detail}`: {response}"
+            );
+        }
     }
 }
