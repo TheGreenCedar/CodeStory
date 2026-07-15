@@ -345,9 +345,9 @@ pub fn retrieval_publication_identity_from_storage(
             .sidecar_input_hash
             .filter(|value| !value.trim().is_empty())
             .context("retrieval manifest input hash is missing")?,
-        qdrant_collection: (!manifest.qdrant_collection.trim().is_empty())
-            .then_some(manifest.qdrant_collection)
-            .context("retrieval manifest Qdrant collection is missing")?,
+        semantic_generation: (!manifest.semantic_generation.trim().is_empty())
+            .then_some(manifest.semantic_generation)
+            .context("retrieval manifest semantic generation is missing")?,
     })
 }
 
@@ -440,7 +440,7 @@ fn resolve_batch_mode(
             embedding_device,
             runtime,
         );
-        return derive_degraded_mode(&report.lexical, &report.qdrant, &report.scip);
+        return derive_degraded_mode(&report.lexical, &report.semantic, &report.scip);
     }
     (
         RetrievalDegradedMode::LexicalOnly,
@@ -793,7 +793,7 @@ mod tests {
                 .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                     project_id,
                     lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-                    qdrant_collection: "codestory_legacy".into(),
+                    semantic_generation: "codestory_legacy".into(),
                     scip_revision: Some("graph-test".into()),
                     built_at_epoch_ms: 1,
                     disk_bytes: None,

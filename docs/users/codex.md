@@ -21,8 +21,8 @@ Surfaces and readiness: [Glossary](../glossary.md).
 
 CodeStory supports macOS 15 and later on Apple Silicon and Intel Macs. Install
 the Xcode Command Line Tools and Node.js before using the managed plugin or
-source-worktree setup. Docker Desktop or another compatible Docker engine is
-currently required for broad search.
+source-worktree setup. Broad search uses embedded storage and a managed native
+embedding runtime; it does not require Docker or another user-managed service.
 
 Apple Silicon uses managed Metal acceleration automatically. Intel Macs keep
 local navigation available. If broad search cannot use a supported local or
@@ -176,7 +176,7 @@ More pairs, anti-patterns, and language-flavored examples:
 | --- | --- | --- |
 | Windows x64 | Yes | Native Vulkan |
 | Windows arm64 | Yes | Managed CPU or a trusted external endpoint |
-| Linux x64 / arm64 | Yes | Docker Vulkan with a verified `/dev/dri` render node |
+| Linux x64 / arm64 | Yes | Managed native Vulkan or CPU according to the packaged backend |
 | macOS arm64 (macOS 15+) | Yes | Managed native Metal |
 | macOS x64 (macOS 15+) | Yes | Managed CPU or a trusted external endpoint; never claims Metal |
 

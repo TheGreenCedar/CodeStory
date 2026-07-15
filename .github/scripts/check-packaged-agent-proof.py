@@ -36,7 +36,6 @@ PROOF_TEMP_OWNER_FILE = ".codestory-macos-metal-proof-owner.json"
 PROOF_LOCAL_RUN_ID = "shared-agent"
 PROOF_AGENT_RUN_IDS = (PROOF_LOCAL_RUN_ID,)
 SIDECAR_STATE_FILE_V3 = "retrieval-sidecars-v3.json"
-LEGACY_SIDECAR_STATE_FILE = "retrieval-sidecars.json"
 
 
 class GateFailure(Exception):
@@ -526,14 +525,11 @@ def validated_proof_sidecar_state(
         raise RuntimeError("proof cache and project roots must not be symlinks")
     cache_root = cache_root.resolve(strict=True)
     project = project.resolve(strict=registered_identity is None)
-    for local_state in (
-        cache_root / SIDECAR_STATE_FILE_V3,
-        cache_root / LEGACY_SIDECAR_STATE_FILE,
-    ):
-        if local_state.exists() or local_state.is_symlink():
-            raise RuntimeError(
-                f"proof cleanup refuses the global local-sidecar namespace: {local_state}"
-            )
+    local_state = cache_root / SIDECAR_STATE_FILE_V3
+    if local_state.exists() or local_state.is_symlink():
+        raise RuntimeError(
+            f"proof cleanup refuses the global local-sidecar namespace: {local_state}"
+        )
     expected = registered_identity or proof_agent_identity(cache_root, project, run_id)
     required_identity = proof_agent_identity(cache_root, Path(expected.get("project", project)), run_id)
     for name in (
@@ -603,7 +599,7 @@ def validated_proof_sidecar_state(
         raise RuntimeError(f"proof sidecar lexical_data_dir escaped its cache root: {state_file}")
     lexical_value = state.get("lexical_data_dir")
     if not isinstance(lexical_value, str) or not lexical_value:
-        raise TypeError(f"proof sidecar state canonical or legacy lexical data directory is not a path string: {state_file}")
+        raise TypeError(f"proof sidecar state lexical data directory is not a path string: {state_file}")
     observed = Path(lexical_value)
     if observed.is_symlink() or observed.resolve(strict=False) != canonical_lexical_expected:
         raise RuntimeError(f"proof sidecar state lexical_data_dir escaped its cache root: {state_file}")
@@ -3588,23 +3584,22 @@ def self_test() -> None:
                     worker.wait(timeout=5)
 
 
-        for state_file_name in (SIDECAR_STATE_FILE_V3, LEGACY_SIDECAR_STATE_FILE):
-            global_cache = root / f"global-local-cache-{state_file_name}"
-            global_cache.mkdir()
-            write_json(global_cache / state_file_name, {"owner": "codestory"})
-            try:
-                cleanup_proof_cache(
-                    None,
-                    root,
-                    global_cache,
-                    root / "global-local-cleanup.json",
-                    owned_delete=fake_owned_delete,
-                )
-            except RuntimeError as exc:
-                assert "global local-sidecar namespace" in str(exc)
-            else:
-                raise AssertionError("proof cleanup must refuse the global namespace")
-            remove_tree_with_retry(global_cache)
+        global_cache = root / f"global-local-cache-{SIDECAR_STATE_FILE_V3}"
+        global_cache.mkdir()
+        write_json(global_cache / SIDECAR_STATE_FILE_V3, {"owner": "codestory"})
+        try:
+            cleanup_proof_cache(
+                None,
+                root,
+                global_cache,
+                root / "global-local-cleanup.json",
+                owned_delete=fake_owned_delete,
+            )
+        except RuntimeError as exc:
+            assert "global local-sidecar namespace" in str(exc)
+        else:
+            raise AssertionError("proof cleanup must refuse the global namespace")
+        remove_tree_with_retry(global_cache)
 
         registered_root = (
             proof_root_parent

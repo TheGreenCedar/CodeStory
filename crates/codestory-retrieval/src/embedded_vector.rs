@@ -171,7 +171,7 @@ impl EmbeddedVectorIndex {
 
 pub(crate) fn index_path(layout: &SidecarLayout, collection: &str) -> PathBuf {
     layout
-        .qdrant_data_dir
+        .semantic_data_dir
         .join("collections")
         .join(collection)
         .join(VECTOR_INDEX_FILE)
@@ -434,10 +434,8 @@ mod tests {
 
     fn layout(root: &Path) -> SidecarLayout {
         SidecarLayout {
-            qdrant_http_port: 0,
-            qdrant_grpc_port: 0,
             lexical_data_dir: root.join("lexical"),
-            qdrant_data_dir: root.join("semantic"),
+            semantic_data_dir: root.join("semantic"),
             scip_artifacts_root: root.join("scip"),
             state_file: root.join("state.json"),
         }

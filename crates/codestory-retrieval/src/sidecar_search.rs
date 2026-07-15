@@ -176,7 +176,7 @@ impl LiveSidecarSearch {
             .and_then(|manifest| manifest.sidecar_input_hash.clone())
             .unwrap_or_else(|| "missing-manifest".to_string());
         let vector_generation = manifest
-            .map(|manifest| manifest.qdrant_collection.clone())
+            .map(|manifest| manifest.semantic_generation.clone())
             .unwrap_or_else(|| format!("codestory_{project_id}_missing_manifest"));
         let semantic = EmbeddedVectorIndex::open(
             &layout,
@@ -392,10 +392,8 @@ mod tests {
     fn test_layout() -> SidecarLayout {
         let root = std::env::temp_dir().join("codestory-sidecar-search-test");
         SidecarLayout {
-            qdrant_http_port: 32102,
-            qdrant_grpc_port: 32103,
             lexical_data_dir: root.join("lexical"),
-            qdrant_data_dir: root.join("qdrant"),
+            semantic_data_dir: root.join("semantic"),
             scip_artifacts_root: root.join("scip"),
             state_file: root.join("retrieval-sidecars.json"),
         }

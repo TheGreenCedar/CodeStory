@@ -1453,7 +1453,7 @@ fn unresolved_candidate_is_diagnostic(
 
 fn bare_dense_anchor_unresolved(candidate: &CandidateHit, resolution_label: &str) -> bool {
     resolution_label == "path_unresolvable"
-        && candidate.source == CandidateSource::Qdrant
+        && candidate.source == CandidateSource::Semantic
         && bare_dense_anchor_path(candidate)
 }
 
@@ -1828,7 +1828,7 @@ fn score_breakdown_for_candidate(candidate: &CandidateHit) -> RetrievalScoreBrea
         .map(|features| (features.lexical, features.semantic, features.scip_distance))
         .unwrap_or_else(|| match candidate.source {
             CandidateSource::Lexical => (candidate.score, 0.0, 0.0),
-            CandidateSource::Qdrant => (0.0, candidate.score, 0.0),
+            CandidateSource::Semantic => (0.0, candidate.score, 0.0),
             CandidateSource::Scip => (0.0, 0.0, candidate.score),
             CandidateSource::Legacy => (candidate.score, 0.0, 0.0),
         });
@@ -1851,7 +1851,7 @@ fn candidate_provenance_labels(candidate: &CandidateHit) -> Vec<String> {
     }
     let label = match candidate.source {
         CandidateSource::Lexical => "lexical_source",
-        CandidateSource::Qdrant => "dense_anchor",
+        CandidateSource::Semantic => "dense_anchor",
         CandidateSource::Scip => "graph_neighbor",
         CandidateSource::Legacy => "legacy",
     };
@@ -1903,7 +1903,7 @@ mod tests {
             core_run_id: None,
             project_id: "abc".into(),
             lexical_version: "v1".into(),
-            qdrant_collection: "codestory_abc".into(),
+            semantic_generation: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
             sidecar_input_hash: Some("hash".into()),
@@ -2306,7 +2306,7 @@ mod tests {
             "src/search.rs",
             Some("SearchService".into()),
             0.86,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
         candidate.provenance = vec!["dense_anchor".into()];
         let ranked = rank_candidates(&classify_query("explain search service"), vec![candidate]);
@@ -2326,7 +2326,7 @@ mod tests {
             "semantic:handler",
             Some("handler".into()),
             0.5,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         );
         candidate.start_line = Some(42);
         let shadow = shadow_from_query_result_with_counts_and_resolution_labels(
@@ -2391,7 +2391,7 @@ mod tests {
                 "apii",
                 Some("apii".to_string()),
                 0.5,
-                CandidateSource::Qdrant,
+                CandidateSource::Semantic,
             )],
             trace: QueryTrace {
                 retrieval_mode: "full".into(),
@@ -2422,7 +2422,7 @@ mod tests {
                 "main/java/org/apache/commons/lang3/Missing.java",
                 Some("StringUtils".to_string()),
                 0.5,
-                CandidateSource::Qdrant,
+                CandidateSource::Semantic,
             )],
             trace: QueryTrace {
                 retrieval_mode: "full".into(),
@@ -2813,7 +2813,7 @@ mod tests {
     fn upsert_manifest(storage_path: &Path, project_id: &str) {
         let hash = "deadbeefcafebabe";
         let generation = format!("{project_id}-{hash}");
-        let qdrant_collection = format!("codestory_{project_id}_{hash}");
+        let semantic_generation = format!("codestory_{project_id}_{hash}");
         let built_at_epoch_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before unix epoch")
@@ -2823,7 +2823,7 @@ mod tests {
             .upsert_retrieval_index_manifest(&codestory_store::RetrievalIndexManifest {
                 project_id: project_id.into(),
                 lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
-                qdrant_collection,
+                semantic_generation,
                 scip_revision: Some("graph-test".into()),
                 built_at_epoch_ms,
                 disk_bytes: None,
@@ -3040,7 +3040,7 @@ mod tests {
                 "semantic:handler",
                 Some("handler".into()),
                 0.5,
-                CandidateSource::Qdrant,
+                CandidateSource::Semantic,
             )],
             trace: QueryTrace {
                 retrieval_mode: "full".into(),
@@ -3165,7 +3165,7 @@ mod tests {
                 "semantic:handler",
                 Some("handler".into()),
                 0.5,
-                CandidateSource::Qdrant,
+                CandidateSource::Semantic,
             )],
             trace: QueryTrace {
                 retrieval_mode: "full".into(),
@@ -3377,7 +3377,7 @@ mod tests {
                 "semantic:handler",
                 Some("handler".into()),
                 0.5,
-                CandidateSource::Qdrant,
+                CandidateSource::Semantic,
             )],
             trace: QueryTrace {
                 retrieval_mode: "full".into(),

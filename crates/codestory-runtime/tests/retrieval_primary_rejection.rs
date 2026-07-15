@@ -15,7 +15,7 @@ fn phantom_only_candidates_are_detected() {
             "semantic:handler",
             Some("handler".into()),
             0.55,
-            CandidateSource::Qdrant,
+            CandidateSource::Semantic,
         ),
     ];
     assert!(codestory_retrieval::phantom_sidecar_candidates_only(&hits));
@@ -30,7 +30,7 @@ fn phantom_only_candidates_are_detected() {
         hits,
         trace: QueryTrace {
             retrieval_mode: "no_semantic".into(),
-            degraded_reason: Some("qdrant_hash_vectors_only".into()),
+            degraded_reason: Some("semantic_hash_vectors_only".into()),
             total_budget_ms: 500,
             elapsed_ms: 1,
             cancel_reason: None,

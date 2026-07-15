@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_id": "codestory-release-evidence-linux-arm64-v1",
+  "profile_id": "codestory-release-evidence-linux-arm64-v2",
   "repository": "TheGreenCedar/CodeStory",
   "runner": {
     "name": "codestory-release-evidence-m5-colima-arm64",
@@ -13,7 +13,7 @@
       "codestory-release-evidence"
     ],
     "root": "/srv/codestory-release-evidence",
-    "data_root": "/var/lib/docker/codestory-release-evidence"
+    "data_root": "/var/lib/codestory-release-evidence"
   },
   "host": {
     "architecture": "arm64",
@@ -29,7 +29,7 @@
     "profile": "codestory-release-evidence",
     "type": "vz",
     "architecture": "aarch64",
-    "runtime": "docker",
+    "runtime": "containerd",
     "activate_host_context": false,
     "mount_type": "virtiofs",
     "host_mounts": [],
@@ -38,8 +38,8 @@
     "data_disk_gib": 80,
     "root_disk_gib": 20,
     "base_image": {
-      "url": "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-docker.raw.gz",
-      "sha512": "32242674b046b5057e60c4aba334b51e3665f05412cda89ed081cc2de153ae5c41f6b105b5c442cbe48d78e2cc21e9ba1950e406b6fb4fc2fd1dd2259240abbd",
+      "url": "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-containerd.raw.gz",
+      "sha512": "86fd0879941f890b72ad54709cd28d0b9c31638b3ba0201d3abd11eaadc0e87079b908af05de939d9cceb1d338ec3827efc73e81b9c6716148048ab91c7f9286",
       "guest_build_serial": "20260521"
     }
   },

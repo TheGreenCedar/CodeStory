@@ -2583,7 +2583,6 @@ fn gpu_proof_matches_selected_runtime(
     identity.profile == runtime.profile.as_str()
         && identity.run_id == runtime.run_id
         && identity.namespace == runtime.namespace
-        && identity.compose_project == runtime.compose_project
         && identity.embed_url == runtime.ownership().ports.embed_url
         && runtime
             .project_identity
@@ -2977,10 +2976,9 @@ fn repair_ready_state(
             sidecar,
         ) {
             eprintln!(
-                "ready repair agent sidecar already full with identity-bound GPU proof: profile=agent run_id={} namespace={} compose_project={} embedding_device_state={} observation_source={} cpu_allowed={}",
+                "ready repair agent sidecar already full with identity-bound GPU proof: profile=agent run_id={} namespace={} embedding_device_state={} observation_source={} cpu_allowed={}",
                 sidecar.run_id.as_deref().unwrap_or("none"),
                 sidecar.namespace,
-                sidecar.compose_project,
                 existing_status.embedding_device_state,
                 existing_status.embedding_device_observation_source,
                 existing_status.embedding_cpu_allowed
@@ -3027,11 +3025,6 @@ fn repair_ready_state(
         return Ok(None);
     }
 
-    let storage_scope = codestory_retrieval::BootstrapStorageScope::from_parts(
-        Some(runtime.project_root.as_path()),
-        Some(runtime.storage_path.as_path()),
-        Some(runtime.cache_root.as_path()),
-    );
     let mut sidecar = sidecar.expect("agent sidecar should be selected for agent goal");
     let _project_repair_lock = match ready_repair_status::try_acquire_project_ready_repair_lock(
         &sidecar,
@@ -3107,12 +3100,7 @@ fn repair_ready_state(
     let ReadyRepairResult {
         final_status: _final_status,
         gpu_proof,
-    } = run_ready_repair_with_native_embedding_lease(
-        runtime,
-        &mut sidecar,
-        &broker_scope,
-        &storage_scope,
-    )?;
+    } = run_ready_repair_with_native_embedding_lease(runtime, &mut sidecar, &broker_scope)?;
     let _ = readiness_broker::refresh_broker_snapshot(readiness_broker::BrokerSnapshotInput {
         project_root: runtime.project_root.clone(),
         cache_root: runtime.cache_root.clone(),
@@ -3172,13 +3160,11 @@ fn run_ready_repair_with_native_embedding_lease(
     runtime: &RuntimeContext,
     sidecar: &mut codestory_retrieval::SidecarRuntimeConfig,
     broker_scope: &readiness_broker::BrokerScope,
-    storage_scope: &codestory_retrieval::BootstrapStorageScope,
 ) -> Result<ReadyRepairResult> {
     eprintln!(
-        "ready repair agent sidecar: profile=agent run_id={} namespace={} compose_project={}",
+        "ready repair agent sidecar: profile=agent run_id={} namespace={}",
         sidecar.run_id.as_deref().unwrap_or("none"),
-        sidecar.namespace,
-        sidecar.compose_project
+        sidecar.namespace
     );
     let progress = ReadyRepairProgress::start(sidecar, &runtime.project_root, &runtime.cache_root);
     readiness_broker::run_with_native_embedding_lease_lifecycle(
@@ -3197,11 +3183,7 @@ fn run_ready_repair_with_native_embedding_lease(
          observe_new_native_launch| {
             codestory_retrieval::bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
                 selected_sidecar,
-                Some(runtime.project_root.as_path()),
                 codestory_retrieval::BootstrapSidecarsOptions {
-                    storage_scope: storage_scope.clone(),
-                    compose_file: None,
-                    skip_compose: false,
                     wait_timeout: Duration::from_secs(90),
                     allow_native_embedding_spawn,
                     reusable_native_embedding_launch: reusable_native_embedding_launch.cloned(),
@@ -3276,16 +3258,6 @@ fn run_ready_repair_with_native_embedding_lease(
                     reconciliation: None,
                 });
             progress.set_phase("semantic finalize");
-            if selected_sidecar.vector_backend()
-                == codestory_retrieval::VectorBackend::ExternalQdrant
-            {
-                codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-                    &runtime.project_root,
-                    &runtime.storage_path,
-                    selected_sidecar,
-                )
-                .context("ready repair external vector collection")?;
-            }
             progress.set_phase("graph artifact");
             runtime
                 .index
@@ -3357,12 +3329,8 @@ fn ensure_ready_repair_embed_liveness_with_probe(
     let smoke = probe();
     if !smoke.reachable {
         bail!(
-            "ready repair embedding liveness failed before semantic readiness validation: {}; lexical_ready={} ({}); semantic_ready={} ({})",
-            smoke.detail,
-            infrastructure.lexical_ready,
-            infrastructure.lexical_detail,
-            infrastructure.qdrant_reachable,
-            infrastructure.qdrant_detail
+            "ready repair embedding liveness failed before semantic readiness validation: {}",
+            smoke.detail
         );
     }
     Ok(ReadyRepairEmbedSmoke {
@@ -3499,7 +3467,7 @@ fn ensure_ready_repair_full_sidecar(
         report.embedding_device_state,
         report.embedding_device_observation_source,
         ready_repair_component_detail(&report.lexical),
-        ready_repair_component_detail(&report.qdrant),
+        ready_repair_component_detail(&report.semantic),
         ready_repair_component_detail(&report.scip)
     )
 }
@@ -7518,7 +7486,6 @@ fn apply_broker_ready_repair_overlay(
     lane.profile = operation.profile.clone();
     lane.run_id = operation.run_id.clone();
     lane.namespace = operation.namespace.clone();
-    lane.compose_project = operation.compose_project.clone();
     lane.phase = operation.phase.clone();
     lane.repair_updated_at_epoch_ms = operation.updated_at_epoch_ms;
     lane.next_command = Some(retrieval_status_command_for_agent(
@@ -7554,7 +7521,6 @@ fn readiness_lane_output(
             .unwrap_or_else(|| "unknown".to_string()),
         run_id: sidecar.run_id.clone(),
         namespace: None,
-        compose_project: None,
         phase: None,
         repair_updated_at_epoch_ms: None,
         sidecar_mode: sidecar.retrieval_mode.clone(),
@@ -7581,7 +7547,6 @@ fn apply_ready_repair_status_overlay(
     lane.profile = status.profile;
     lane.run_id = status.run_id.clone();
     lane.namespace = Some(status.namespace);
-    lane.compose_project = Some(status.compose_project);
     lane.phase = Some(status.phase);
     lane.repair_updated_at_epoch_ms = Some(status.updated_at_epoch_ms);
     lane.next_command = Some(retrieval_status_command_for_agent(
@@ -9326,7 +9291,6 @@ mod tests {
         codestory_retrieval::RetrievalStatusReport {
             retrieval_mode: mode.into(),
             ownership: None,
-            sidecar_images: codestory_retrieval::default_sidecar_image_pins(),
             degraded_reason: reason.map(str::to_string),
             repair: None,
             query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
@@ -9350,8 +9314,8 @@ mod tests {
                 codestory_retrieval::ComponentStatus::Unavailable,
                 "retrieval_manifest_missing",
             ),
-            qdrant: ready_repair_test_component(
-                "qdrant",
+            semantic: ready_repair_test_component(
+                "semantic",
                 codestory_retrieval::ComponentStatus::Unavailable,
                 "retrieval_manifest_missing",
             ),
@@ -9376,8 +9340,6 @@ mod tests {
     fn ready_repair_final_snapshot_preserves_embed_smoke_proof() {
         let final_status = ready_repair_test_report("full", None);
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "accelerated".into(),
@@ -9388,8 +9350,6 @@ mod tests {
             embedding_accelerator_request_provider: Some("vulkan".into()),
             embedding_accelerator_request_device: Some("Vulkan0".into()),
             embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
         let result = ReadyRepairResult {
@@ -9449,7 +9409,6 @@ mod tests {
             profile: sidecar.profile.as_str().into(),
             run_id: sidecar.run_id.clone(),
             namespace: sidecar.namespace.clone(),
-            compose_project: sidecar.compose_project.clone(),
             embed_url: codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port),
             embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
             embedding_endpoint_fingerprint_sha256: sidecar
@@ -9559,7 +9518,7 @@ mod tests {
     #[test]
     fn ready_repair_progress_line_names_phase_identity_and_status() {
         let line = ready_repair_progress_line(
-            "Qdrant finalize",
+            "Semantic finalize",
             "agent",
             "shared-agent",
             "codestory-agent",
@@ -9568,7 +9527,7 @@ mod tests {
         );
 
         assert!(line.starts_with("[ready-repair] "));
-        assert!(line.contains("phase=\"Qdrant finalize\""));
+        assert!(line.contains("phase=\"Semantic finalize\""));
         assert!(line.contains("profile=agent"));
         assert!(line.contains("run_id=shared-agent"));
         assert!(line.contains("namespace=codestory-agent"));
@@ -9589,15 +9548,13 @@ mod tests {
         assert!(message.contains("embedding_device_state=accelerated"));
         assert!(message.contains("observation_source=native_log"));
         assert!(message.contains("lexical=Unavailable"));
-        assert!(message.contains("qdrant=Unavailable"));
+        assert!(message.contains("semantic=Unavailable"));
         assert!(message.contains("scip=Unavailable"));
     }
 
     #[test]
     fn ready_repair_embed_liveness_blocks_before_semantic_smoke() {
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
             embed_reachable: false,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "accelerated".into(),
@@ -9608,8 +9565,6 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
             embed_detail:
                 "llama.cpp embeddings unavailable: http://127.0.0.1:55280/v1/embeddings: Connection Failed"
                     .into(),
@@ -9627,15 +9582,13 @@ mod tests {
         let message = format!("{error:#}");
 
         assert!(message.contains("embedding sidecar liveness failed"));
-        assert!(message.contains("before mandatory Qdrant semantic smoke"));
+        assert!(message.contains("before mandatory semantic smoke"));
         assert!(message.contains("http://127.0.0.1:55280/v1/embeddings"));
     }
 
     #[test]
     fn ready_repair_blocks_unknown_embedding_device_before_indexing() {
         let infrastructure = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "unknown".into(),
@@ -9646,8 +9599,6 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
 
@@ -9680,28 +9631,22 @@ mod tests {
         let sidecar = codestory_retrieval::SidecarRuntimeConfig {
             project_identity: None,
             layout: codestory_retrieval::SidecarLayout {
-                qdrant_http_port: 16333,
-                qdrant_grpc_port: 16334,
                 lexical_data_dir: root.path().join("lexical"),
-                qdrant_data_dir: root.path().join("qdrant"),
+                semantic_data_dir: root.path().join("semantic"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
             },
             profile: codestory_retrieval::SidecarProfile::Agent,
             run_id: Some("shared-agent".into()),
             namespace: "agent-shared-agent".into(),
-            compose_project: "codestory-agent-shared-agent".into(),
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
-            labels: BTreeMap::new(),
             ..crate::sidecar_runtime::local()
         };
         let state_dir = sidecar.layout.state_file.parent().expect("state parent");
         fs::create_dir_all(state_dir).expect("create state dir");
         let log_path = state_dir.join("llama-server-native.log");
         let stale = codestory_retrieval::InfrastructureHealth {
-            lexical_ready: true,
-            qdrant_reachable: true,
             embed_reachable: true,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "unknown".into(),
@@ -9712,8 +9657,6 @@ mod tests {
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            lexical_detail: "http 200".into(),
-            qdrant_detail: "http 200".into(),
             embed_detail: "llama.cpp embeddings reachable dim=768".into(),
         };
         ensure_ready_repair_embed_liveness_with_probe(&stale, || {

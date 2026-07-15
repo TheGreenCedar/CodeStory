@@ -314,14 +314,14 @@ pub struct GenerationArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationBundle {
     pub generation: String,
-    pub qdrant_collection: String,
+    pub semantic_generation: String,
     pub state: GenerationRetentionState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lexical: Option<GenerationArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scip: Option<GenerationArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "qdrant")]
+    #[serde(rename = "semantic")]
     pub semantic: Option<GenerationArtifact>,
     pub bytes: u64,
 }
@@ -396,12 +396,12 @@ pub(crate) fn plan_generation_retention_with_unrooted_state(
         &mut errors,
     );
     if direct_directory_exists_or_missing(
-        &layout.qdrant_data_dir,
+        &layout.semantic_data_dir,
         "semantic vector root",
         &mut errors,
     ) {
         discover_vector_generations(
-            &layout.qdrant_data_dir.join("collections"),
+            &layout.semantic_data_dir.join("collections"),
             project_id,
             &mut builders,
             &mut blocked,
@@ -513,7 +513,7 @@ impl FsGenerationRemover {
             .lexical_data_dir
             .parent()
             .context("lexical data directory has no sidecar root")?;
-        if layout.qdrant_data_dir.parent() != Some(root)
+        if layout.semantic_data_dir.parent() != Some(root)
             || layout.scip_artifacts_root.parent() != Some(root)
         {
             bail!("retrieval generation roots do not share one owned sidecar root");
@@ -523,7 +523,7 @@ impl FsGenerationRemover {
         Ok(Self {
             root: root.to_path_buf(),
             deletion,
-            collections_dir: layout.qdrant_data_dir.join("collections"),
+            collections_dir: layout.semantic_data_dir.join("collections"),
         })
     }
 
@@ -561,9 +561,9 @@ impl GenerationRemover for FsGenerationRemover {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationRemovalResult {
     pub generation: String,
-    pub qdrant_collection: String,
+    pub semantic_generation: String,
     pub removed_paths: Vec<PathBuf>,
-    pub qdrant_collection_removed: bool,
+    pub semantic_generation_removed: bool,
     pub removed_bytes: u64,
     pub remaining_reclaimable_bytes: u64,
     pub errors: Vec<String>,
@@ -615,27 +615,27 @@ pub fn apply_generation_retention(
     {
         let mut result = GenerationRemovalResult {
             generation: bundle.generation.clone(),
-            qdrant_collection: bundle.qdrant_collection.clone(),
+            semantic_generation: bundle.semantic_generation.clone(),
             removed_paths: Vec::new(),
-            qdrant_collection_removed: false,
+            semantic_generation_removed: false,
             removed_bytes: 0,
             remaining_reclaimable_bytes: bundle.bytes,
             errors: Vec::new(),
         };
-        match remover.remove_vector_generation(&bundle.qdrant_collection) {
+        match remover.remove_vector_generation(&bundle.semantic_generation) {
             Ok(true) => {
-                result.qdrant_collection_removed = true;
+                result.semantic_generation_removed = true;
                 result.removed_bytes = result
                     .removed_bytes
                     .saturating_add(bundle.semantic.as_ref().map_or(0, |item| item.bytes));
             }
             Ok(false) => result.errors.push(format!(
                 "delete vector generation {} was acknowledged but its local data remains",
-                bundle.qdrant_collection
+                bundle.semantic_generation
             )),
             Err(error) => result.errors.push(format!(
                 "delete vector generation {}: {error:#}",
-                bundle.qdrant_collection
+                bundle.semantic_generation
             )),
         }
         for artifact in [bundle.lexical.as_ref(), bundle.scip.as_ref()]
@@ -718,7 +718,7 @@ impl BundleBuilder {
             .to_string();
         GenerationBundle {
             generation,
-            qdrant_collection: format!("codestory_{project_id}_{suffix}"),
+            semantic_generation: format!("codestory_{project_id}_{suffix}"),
             state,
             lexical: self.lexical,
             scip: self.scip,
@@ -817,7 +817,7 @@ fn canonical_manifest_generation(manifest: &RetrievalIndexManifest) -> Result<St
     let Some(suffix) = canonical_generation_suffix(&manifest.project_id, generation) else {
         bail!("retrieval manifest has a noncanonical sidecar generation");
     };
-    if manifest.qdrant_collection != format!("codestory_{}_{suffix}", manifest.project_id) {
+    if manifest.semantic_generation != format!("codestory_{}_{suffix}", manifest.project_id) {
         bail!("retrieval manifest generation and semantic vector generation do not match");
     }
     Ok(generation.to_string())
@@ -924,18 +924,18 @@ fn deduplicate_manifests(manifests: &mut Vec<RetrievalIndexManifest>) {
         (
             &left.project_id,
             &left.sidecar_generation,
-            &left.qdrant_collection,
+            &left.semantic_generation,
         )
             .cmp(&(
                 &right.project_id,
                 &right.sidecar_generation,
-                &right.qdrant_collection,
+                &right.semantic_generation,
             ))
     });
     manifests.dedup_by(|left, right| {
         left.project_id == right.project_id
             && left.sidecar_generation == right.sidecar_generation
-            && left.qdrant_collection == right.qdrant_collection
+            && left.semantic_generation == right.semantic_generation
     });
 }
 
@@ -1190,7 +1190,7 @@ mod tests {
         RetrievalIndexManifest {
             project_id: project_id.into(),
             lexical_version: "v1".into(),
-            qdrant_collection: format!("codestory_{project_id}_{suffix}"),
+            semantic_generation: format!("codestory_{project_id}_{suffix}"),
             scip_revision: Some(format!("graph-{suffix}")),
             built_at_epoch_ms,
             disk_bytes: None,
@@ -1215,10 +1215,8 @@ mod tests {
 
     fn layout(root: &Path) -> SidecarLayout {
         SidecarLayout {
-            qdrant_http_port: 9,
-            qdrant_grpc_port: 10,
             lexical_data_dir: root.join("lexical"),
-            qdrant_data_dir: root.join("qdrant"),
+            semantic_data_dir: root.join("semantic"),
             scip_artifacts_root: root.join("scip"),
             state_file: root.join("retrieval-sidecars.json"),
         }
@@ -1228,11 +1226,15 @@ mod tests {
         let generation = format!("{project_id}-{suffix}");
         let lexical = layout.lexical_data_dir.join("shards").join(&generation);
         let scip = layout.scip_artifacts_root.join(&generation);
-        let qdrant = layout
-            .qdrant_data_dir
+        let semantic = layout
+            .semantic_data_dir
             .join("collections")
             .join(format!("codestory_{project_id}_{suffix}"));
-        for (dir, size) in [(&lexical, sizes[0]), (&scip, sizes[1]), (&qdrant, sizes[2])] {
+        for (dir, size) in [
+            (&lexical, sizes[0]),
+            (&scip, sizes[1]),
+            (&semantic, sizes[2]),
+        ] {
             std::fs::create_dir_all(dir).expect("artifact dir");
             std::fs::write(dir.join("data"), vec![b'x'; size]).expect("artifact bytes");
         }
@@ -1250,10 +1252,8 @@ mod tests {
             profile,
             run_id: None,
             namespace: "test".into(),
-            compose_project: "test".into(),
             embed_http_port: 0,
             cleanup_command: String::new(),
-            labels: BTreeMap::new(),
             ..SidecarRuntimeConfig::local()
         };
         let local = runtime(
@@ -1283,7 +1283,7 @@ mod tests {
         removed_paths: Vec<PathBuf>,
         removed_collections: Vec<String>,
         fail_path_fragment: Option<String>,
-        qdrant_data_remains: bool,
+        semantic_data_remains: bool,
     }
 
     impl GenerationRemover for TestRemover {
@@ -1453,7 +1453,6 @@ mod tests {
             &layout,
             project,
             &protection,
-            &[],
             GenerationRetentionState::Building,
         );
 
@@ -1636,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_qdrant_delete_does_not_overstate_removed_bytes_when_data_remains() {
+    fn acknowledged_semantic_delete_does_not_overstate_removed_bytes_when_data_remains() {
         let root = tempdir().expect("root");
         let layout = layout(root.path());
         let project = "repo-v1-project";
@@ -1653,7 +1652,7 @@ mod tests {
             },
         );
         let mut remover = TestRemover {
-            qdrant_data_remains: true,
+            semantic_data_remains: true,
             ..TestRemover::default()
         };
 
@@ -1661,7 +1660,7 @@ mod tests {
 
         assert_eq!(report.removed_bytes, 5);
         assert_eq!(report.remaining_reclaimable_bytes, 4);
-        assert!(!report.removals[0].qdrant_collection_removed);
+        assert!(!report.removals[0].semantic_generation_removed);
         assert!(report.errors[0].contains("local data remains"));
     }
 

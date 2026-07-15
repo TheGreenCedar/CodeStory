@@ -13,7 +13,6 @@ on:
       - .github/workflows/**
       - benchmarks/**
       - crates/**
-      - docker/**
       - docs/architecture/language-support.md
       - docs/architecture/retrieval-*
       - docs/contributors/testing-matrix.md
@@ -36,7 +35,6 @@ on:
       - .github/workflows/**
       - benchmarks/**
       - crates/**
-      - docker/**
       - docs/architecture/language-support.md
       - docs/architecture/retrieval-*
       - docs/contributors/testing-matrix.md
@@ -163,8 +161,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-
 
-      - name: Retrieval bootstrap manifest-missing contract
-        run: cargo test --locked -p codestory-cli --test retrieval_bootstrap_contracts
+      - name: Retrieval readiness manifest-missing contract
+        run: cargo test --locked -p codestory-cli --test ready_command
 
       - name: Save Cargo registry, git sources, and build output
         if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''

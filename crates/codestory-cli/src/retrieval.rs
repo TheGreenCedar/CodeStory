@@ -3,10 +3,9 @@ use codestory_contracts::api::IndexMode;
 use std::time::Duration;
 
 use codestory_retrieval::{
-    BootstrapStorageScope, FinalizeIndexOutcome, ProjectQdrantRepairOutcome, QueryRequest,
-    RetrievalIndexManifest, RetrievalStatusReport, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarProfile, SidecarRuntimeConfig, sidecar_up_with_runtime_preserving_launch,
-    strict_sidecar_status_for_runtime,
+    FinalizeIndexOutcome, QueryRequest, RetrievalIndexManifest, RetrievalStatusReport,
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarProfile, SidecarRuntimeConfig,
+    sidecar_up_with_runtime_preserving_launch, strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
@@ -44,11 +43,6 @@ fn run_retrieval_prewarm_assets(cmd: RetrievalPrewarmAssetsCommand) -> Result<()
 fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
     preflight_output(cmd.output_file.as_deref())?;
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let storage_scope = BootstrapStorageScope::from_parts(
-        Some(runtime.project_root.as_path()),
-        Some(runtime.storage_path.as_path()),
-        Some(runtime.cache_root.as_path()),
-    );
     let sidecar_profile = cmd.profile;
     let mut sidecar = runtime.sidecar.with_profile_and_run_id(
         Some(&runtime.project_root),
@@ -62,59 +56,42 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
         "retrieval_bootstrap",
         env!("CARGO_PKG_VERSION"),
     );
-    let (report, project_qdrant_repair, status) =
-        crate::readiness_broker::run_with_native_embedding_lease_lifecycle(
-            crate::readiness_broker::NativeEmbeddingLeaseLifecycleParams {
-                scope: &broker_scope,
-                sidecar: &mut sidecar,
-                resource: crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
-                wait: Duration::from_secs(30),
-                poll: Duration::from_millis(250),
-                bootstrap_context: "retrieval bootstrap",
-                sidecar_cleanup_label: "retrieval sidecar",
-            },
-            |selected_sidecar,
-             allow_native_embedding_spawn,
-             reusable_native_embedding_launch,
-             observe_new_native_launch| {
-                codestory_retrieval::bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
-                    selected_sidecar,
-                    Some(&runtime.project_root),
-                    codestory_retrieval::BootstrapSidecarsOptions {
-                        storage_scope: storage_scope.clone(),
-                        compose_file: cmd.compose_file.clone(),
-                        skip_compose: cmd.skip_compose,
-                        wait_timeout: Duration::from_secs(cmd.wait_secs),
-                        allow_native_embedding_spawn,
-                        reusable_native_embedding_launch: reusable_native_embedding_launch.cloned(),
-                    },
-                    |_| {},
-                    observe_new_native_launch,
-                )
-            },
-            |report| &report.state,
-            |report, selected_sidecar| {
-                let project_qdrant_repair = (selected_sidecar.vector_backend()
-                    == codestory_retrieval::VectorBackend::ExternalQdrant)
-                    .then(|| {
-                        codestory_retrieval::repair_project_qdrant_collection_for_runtime(
-                            &runtime.project_root,
-                            &runtime.storage_path,
-                            selected_sidecar,
-                        )
-                    })
-                    .transpose()
-                    .context("retrieval external vector repair")?
-                    .flatten();
-                let status = strict_sidecar_status_for_runtime(
-                    &runtime.project_root,
-                    Some(&runtime.storage_path),
-                    selected_sidecar.clone(),
-                )
-                .context("retrieval status after bootstrap")?;
-                Ok((report, project_qdrant_repair, status))
-            },
-        )?;
+    let (report, status) = crate::readiness_broker::run_with_native_embedding_lease_lifecycle(
+        crate::readiness_broker::NativeEmbeddingLeaseLifecycleParams {
+            scope: &broker_scope,
+            sidecar: &mut sidecar,
+            resource: crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
+            wait: Duration::from_secs(30),
+            poll: Duration::from_millis(250),
+            bootstrap_context: "retrieval bootstrap",
+            sidecar_cleanup_label: "retrieval sidecar",
+        },
+        |selected_sidecar,
+         allow_native_embedding_spawn,
+         reusable_native_embedding_launch,
+         observe_new_native_launch| {
+            codestory_retrieval::bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
+                selected_sidecar,
+                codestory_retrieval::BootstrapSidecarsOptions {
+                    wait_timeout: Duration::from_secs(cmd.wait_secs),
+                    allow_native_embedding_spawn,
+                    reusable_native_embedding_launch: reusable_native_embedding_launch.cloned(),
+                },
+                |_| {},
+                observe_new_native_launch,
+            )
+        },
+        |report| &report.state,
+        |report, selected_sidecar| {
+            let status = strict_sidecar_status_for_runtime(
+                &runtime.project_root,
+                Some(&runtime.storage_path),
+                selected_sidecar.clone(),
+            )
+            .context("retrieval status after bootstrap")?;
+            Ok((report, status))
+        },
+    )?;
     let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
         crate::readiness_broker::BrokerSnapshotInput {
             project_root: runtime.project_root.clone(),
@@ -128,7 +105,6 @@ fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
     emit_retrieval_bootstrap(
         cmd.format,
         &report,
-        project_qdrant_repair.as_ref(),
         &status,
         &readiness_broker,
         cmd.output_file.as_deref(),
@@ -142,8 +118,7 @@ fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
         cmd.profile.into(),
         cmd.run_id.as_deref(),
     );
-    let state =
-        sidecar_up_with_runtime_preserving_launch(&sidecar, None).context("retrieval up")?;
+    let state = sidecar_up_with_runtime_preserving_launch(&sidecar).context("retrieval up")?;
     println!("{}", serde_json::to_string_pretty(&state)?);
     Ok(())
 }
@@ -375,7 +350,7 @@ fn sidecar_runtime_mismatch(
     let same_paths = indexed.profile == default.profile
         && indexed.namespace == default.namespace
         && indexed.layout.lexical_data_dir == default.layout.lexical_data_dir
-        && indexed.layout.qdrant_data_dir == default.layout.qdrant_data_dir
+        && indexed.layout.semantic_data_dir == default.layout.semantic_data_dir
         && indexed.layout.scip_artifacts_root == default.layout.scip_artifacts_root
         && indexed.layout.state_file == default.layout.state_file;
     (!same_paths).then(|| {
@@ -389,12 +364,12 @@ fn sidecar_runtime_mismatch(
 
 pub(crate) fn format_sidecar_runtime(runtime: &SidecarRuntimeConfig) -> String {
     format!(
-        "profile={} namespace={} state={} lexical={} qdrant={} scip={}",
+        "profile={} namespace={} state={} lexical={} semantic={} scip={}",
         runtime.profile.as_str(),
         runtime.namespace,
         runtime.layout.state_file.display(),
         runtime.layout.lexical_data_dir.display(),
-        runtime.layout.qdrant_data_dir.display(),
+        runtime.layout.semantic_data_dir.display(),
         runtime.layout.scip_artifacts_root.display()
     )
 }
@@ -424,7 +399,6 @@ fn preflight_output(output_file: Option<&std::path::Path>) -> Result<()> {
 struct RetrievalIndexOutput<'a> {
     manifest: &'a RetrievalIndexManifest,
     degraded_modes: &'a [String],
-    qdrant_stubbed: bool,
     scip_stubbed: bool,
     generation_retention_plan: &'a codestory_retrieval::GenerationRetentionPlan,
     generation_retention: &'a codestory_retrieval::GenerationRetentionApplyReport,
@@ -438,7 +412,6 @@ fn emit_retrieval_index(
     let payload = RetrievalIndexOutput {
         manifest: &outcome.manifest,
         degraded_modes: &outcome.degraded_modes,
-        qdrant_stubbed: outcome.qdrant_stubbed,
         scip_stubbed: outcome.scip_stubbed,
         generation_retention_plan: &outcome.generation_retention_plan,
         generation_retention: &outcome.generation_retention,
@@ -447,7 +420,7 @@ fn emit_retrieval_index(
         "# Retrieval index\n\n- project_id: `{}`\n- lexical_version: `{}`\n- semantic_generation: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n- retention_retained_bytes: {}\n- retention_reclaimable_bytes: {}\n- retention_removed_bytes: {}\n- retention_remaining_reclaimable_bytes: {}\n- retention_pruning_suppressed: {}\n",
         payload.manifest.project_id,
         payload.manifest.lexical_version,
-        payload.manifest.qdrant_collection,
+        payload.manifest.semantic_generation,
         payload.manifest.scip_revision,
         payload.degraded_modes,
         payload.generation_retention.retained_bytes,
@@ -484,17 +457,8 @@ fn emit_retrieval_query(
 #[derive(serde::Serialize)]
 struct RetrievalBootstrapOutput<'a> {
     semantic_backend: &'static str,
-    compose_started: bool,
-    compose_file: Option<&'a str>,
-    lexical_ready: bool,
-    qdrant_reachable: bool,
     embed_reachable: bool,
-    lexical_detail: &'a str,
-    qdrant_detail: &'a str,
     embed_detail: &'a str,
-    storage_repair: &'a codestory_retrieval::QdrantStorageRepairReport,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    project_qdrant_repair: Option<&'a ProjectQdrantRepairOutcome>,
     sidecar_state: &'a codestory_retrieval::SidecarStateFile,
     project_status: &'a RetrievalStatusReport,
     readiness_broker: &'a crate::readiness_broker::ReadinessBrokerSnapshot,
@@ -503,95 +467,21 @@ struct RetrievalBootstrapOutput<'a> {
 fn emit_retrieval_bootstrap(
     format: OutputFormat,
     report: &codestory_retrieval::BootstrapReport,
-    project_qdrant_repair: Option<&ProjectQdrantRepairOutcome>,
     status: &RetrievalStatusReport,
     readiness_broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
-    let compose_path = report
-        .compose_file
-        .as_ref()
-        .map(|path| path.display().to_string());
     let payload = RetrievalBootstrapOutput {
-        semantic_backend: if report.state.qdrant_http_port == 0 {
-            "embedded"
-        } else {
-            "external_qdrant"
-        },
-        compose_started: report.compose_started,
-        compose_file: compose_path.as_deref(),
-        lexical_ready: report.infrastructure.lexical_ready,
-        qdrant_reachable: report.infrastructure.qdrant_reachable,
+        semantic_backend: "embedded_sqlite",
         embed_reachable: report.infrastructure.embed_reachable,
-        lexical_detail: &report.infrastructure.lexical_detail,
-        qdrant_detail: &report.infrastructure.qdrant_detail,
         embed_detail: &report.infrastructure.embed_detail,
-        storage_repair: &report.storage_repair,
-        project_qdrant_repair,
         sidecar_state: &report.state,
         project_status: status,
         readiness_broker,
     };
-    let repair = &report.storage_repair;
-    let overflow_note = if repair.overflow_protected {
-        "\n- storage_repair_warning: all collections are protected but count exceeds retention cap; no collections pruned\n"
-    } else {
-        ""
-    };
-    let scan_warning = if repair.scan_errors.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n- storage_repair_scan_warnings: {} (see JSON for details)\n",
-            repair.scan_errors.len()
-        )
-    };
-    let prune_suppressed_note = repair
-        .prune_suppressed_reason
-        .as_deref()
-        .map(|reason| {
-            if reason
-                == codestory_retrieval::PRUNE_SUPPRESSED_POST_PUBLICATION_RETENTION
-            {
-                return format!(
-                    "\n- storage_repair_prune_suppressed: `{reason}` (valid generations are pruned only after a replacement is fully published)\n"
-                );
-            }
-            format!(
-                "\n- storage_repair_prune_suppressed: `{reason}` (retention deletes skipped; set CODESTORY_RETRIEVAL_PRUNE_ON_SCAN_ERROR=1 to override)\n"
-            )
-        })
-        .unwrap_or_default();
-    let project_repair_note = project_qdrant_repair
-        .map(|repair| {
-            format!(
-                "\n- project_qdrant_repair: collection=`{}` repaired={} points={} skipped_reason={:?}",
-                repair.qdrant_collection,
-                repair.repaired,
-                repair.points_upserted,
-                repair.skipped_reason
-            )
-        })
-        .unwrap_or_default();
-    let sidecar_images_note = if payload.semantic_backend == "external_qdrant" {
-        format!(
-            "\n- sidecar_images: qdrant=`{}` embed=`{}`",
-            payload.sidecar_state.sidecar_images.qdrant, payload.sidecar_state.sidecar_images.embed
-        )
-    } else {
-        format!(
-            "\n- embedding_image: `{}`",
-            payload.sidecar_state.sidecar_images.embed
-        )
-    };
     let markdown = format!(
-        "# Retrieval bootstrap\n\n- compose_started: {}\n- lexical_ready: {} ({})\n- semantic_backend: `{}`\n- semantic_ready: {} ({})\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`\n- storage_repair: protected={} pruned={} invalid_dirs_removed={} stub_markers_migrated={} collections_seen={} overflow_protected={}{overflow_note}{scan_warning}{prune_suppressed_note}",
-        payload.compose_started,
-        payload.lexical_ready,
-        payload.lexical_detail,
+        "# Retrieval bootstrap\n\n- semantic_backend: `{}`\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`",
         payload.semantic_backend,
-        payload.qdrant_reachable,
-        payload.qdrant_detail,
         payload.embed_reachable,
         payload.embed_detail,
         report.infrastructure.embedding_device_policy,
@@ -610,19 +500,8 @@ fn emit_retrieval_bootstrap(
             .as_deref(),
         report.infrastructure.embedding_cpu_allowed,
         payload.project_status.retrieval_mode,
-        repair.protected_collections,
-        repair.pruned_collections,
-        repair.removed_invalid_dirs,
-        repair.migrated_legacy_stub_markers,
-        repair.collections_seen,
-        repair.overflow_protected,
     );
-    emit(
-        format,
-        &payload,
-        format!("{markdown}{sidecar_images_note}{project_repair_note}"),
-        output_file,
-    )
+    emit(format, &payload, markdown, output_file)
 }
 
 fn emit_retrieval_status(
@@ -638,7 +517,7 @@ fn emit_retrieval_status(
             serde_json::to_value(readiness_broker)?,
         );
     }
-    let manifest_vector_backend = report
+    let manifest_vector_embedding_backend = report
         .manifest_vector_embedding_backend
         .as_deref()
         .unwrap_or("<none>");
@@ -676,37 +555,16 @@ fn emit_retrieval_status(
         .ownership
         .as_ref()
         .map(|ownership| {
-            let ports = if ownership.ports.qdrant_http == 0 {
-                format!("embed:{}", ownership.ports.embed_http)
-            } else {
-                format!(
-                    "qdrant:{} grpc:{} embed:{}",
-                    ownership.ports.qdrant_http,
-                    ownership.ports.qdrant_grpc,
-                    ownership.ports.embed_http,
-                )
-            };
             format!(
-                "- ownership: owner=`{}` profile=`{}` namespace=`{}` cleanup=`{}` ports={}\n",
+                "- ownership: owner=`{}` profile=`{}` namespace=`{}` cleanup=`{}` embed_port={}\n",
                 ownership.owner,
                 ownership.profile,
                 ownership.namespace,
                 ownership.cleanup_command,
-                ports,
+                ownership.ports.embed_http,
             )
         })
         .unwrap_or_default();
-    let sidecar_images_note = report
-        .ownership
-        .as_ref()
-        .filter(|ownership| ownership.ports.qdrant_http != 0)
-        .map(|_| {
-            format!(
-                "- sidecar_images: qdrant=`{}` embed=`{}`\n",
-                report.sidecar_images.qdrant, report.sidecar_images.embed
-            )
-        })
-        .unwrap_or_else(|| format!("- embedding_image: `{}`\n", report.sidecar_images.embed));
     let broker_note = format!(
         "- readiness_broker: project_id={} persistence={} operations={} gpu_proof={}\n",
         readiness_broker.project_id,
@@ -719,7 +577,7 @@ fn emit_retrieval_status(
             .unwrap_or("unknown")
     );
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_embedding_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -732,7 +590,7 @@ fn emit_retrieval_status(
         report.embedding_accelerator_request_provider.as_deref(),
         report.embedding_accelerator_request_device.as_deref(),
         report.embedding_cpu_allowed,
-        manifest_vector_backend,
+        manifest_vector_embedding_backend,
         report.manifest_vector_embedding_dim,
         stored_doc_backend,
         report.stored_doc_vector_dim,
@@ -740,14 +598,13 @@ fn emit_retrieval_status(
         manifest_contract_note,
         repair_note,
         ownership_note,
-        sidecar_images_note,
         broker_note,
         report.lexical.status,
         report.lexical.detail,
         report.lexical.capabilities.lexical,
-        report.qdrant.status,
-        report.qdrant.detail,
-        report.qdrant.capabilities.semantic,
+        report.semantic.status,
+        report.semantic.detail,
+        report.semantic.capabilities.semantic,
         report.scip.status,
         report.scip.detail,
         report.scip.capabilities.graph,
@@ -761,12 +618,9 @@ fn emit_retrieval_inventory(
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut markdown = format!(
-        "# Retrieval sidecar inventory\n\n- dry_run: {}\n- docker_available: {}\n- cache_root: `{}`\n",
-        report.dry_run, report.docker_available, report.cache_root
+        "# Retrieval runtime inventory\n\n- dry_run: {}\n- cache_root: `{}`\n",
+        report.dry_run, report.cache_root
     );
-    if let Some(error) = report.docker_error.as_deref() {
-        markdown.push_str(&format!("- docker_error: `{error}`\n"));
-    }
     if let Some(retention) = report.generation_retention.as_ref() {
         markdown.push_str(&format!(
             "- generation_retention_active_bytes: {}\n- generation_retention_rollback_bytes: {}\n- generation_retention_building_bytes: {}\n- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
@@ -788,14 +642,8 @@ fn emit_retrieval_inventory(
         markdown.push_str("\nNo sidecar namespaces found.\n");
     }
     for namespace in &report.namespaces {
-        let ports = namespace
-            .containers
-            .iter()
-            .filter_map(|container| container.ports.as_deref())
-            .collect::<Vec<_>>()
-            .join("; ");
         markdown.push_str(&format!(
-            "\n## {}\n\n- state: `{:?}`\n- owner/profile: `{}` / `{}`\n- state_path: `{}`\n- cleanup_command: `{}`\n- age_ms: `{}`\n- compose_project: `{}`\n- containers: {}\n- networks: {}\n- ports: `{}`\n- model_dir: `{}` required_gguf=`{}` present={}\n",
+            "\n## {}\n\n- state: `{:?}`\n- owner/profile: `{}` / `{}`\n- state_path: `{}`\n- cleanup_command: `{}`\n- age_ms: `{}`\n- model_dir: `{}` required_gguf=`{}` present={}\n",
             namespace.namespace,
             namespace.state,
             namespace.owner.as_deref().unwrap_or("<unknown>"),
@@ -806,10 +654,6 @@ fn emit_retrieval_inventory(
                 .age_ms
                 .map(|age| age.to_string())
                 .unwrap_or_else(|| "<unknown>".to_string()),
-            namespace.compose_project.as_deref().unwrap_or("<unknown>"),
-            namespace.containers.len(),
-            namespace.networks.len(),
-            if ports.is_empty() { "<none>" } else { &ports },
             namespace.model.model_dir.as_deref().unwrap_or("<none>"),
             namespace.model.required_gguf,
             namespace.model.required_gguf_present,
@@ -833,16 +677,12 @@ fn emit_retrieval_gc(
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut markdown = format!(
-        "# Retrieval sidecar GC\n\n- dry_run: {}\n- docker_available: {}\n- cache_root: `{}`\n- removed: {}\n- blocked: {}\n",
+        "# Retrieval runtime GC\n\n- dry_run: {}\n- cache_root: `{}`\n- removed: {}\n- blocked: {}\n",
         report.dry_run,
-        report.docker_available,
         report.cache_root,
         report.removed.len(),
         report.blocked.len()
     );
-    if let Some(error) = report.docker_error.as_deref() {
-        markdown.push_str(&format!("- docker_error: `{error}`\n"));
-    }
     if let Some(retention) = report.generation_retention.as_ref() {
         markdown.push_str(&format!(
             "- generation_retention_active_bytes: {}\n- generation_retention_rollback_bytes: {}\n- generation_retention_building_bytes: {}\n- generation_retention_retained_bytes: {}\n- generation_retention_reclaimable_bytes: {}\n- generation_retention_removed_bytes: {}\n- generation_retention_remaining_reclaimable_bytes: {}\n- generation_retention_pruning_suppressed: {}\n",
@@ -868,12 +708,11 @@ fn emit_retrieval_gc(
     }
     for namespace in &report.removed {
         markdown.push_str(&format!(
-            "\n- `{}` ({:?}): {}; paths={} docker_resources={}\n",
+            "\n- `{}` ({:?}): {}; paths={}\n",
             namespace.namespace,
             namespace.state,
             namespace.reason,
             namespace.removed_paths.len(),
-            namespace.removed_docker_resources.len()
         ));
     }
     markdown.push_str("\n## Blocked namespaces\n");
@@ -920,8 +759,8 @@ mod tests {
 
     #[test]
     fn auto_refresh_does_not_retry_unrelated_finalize_errors() {
-        let error = anyhow!("mandatory Qdrant semantic collection incomplete")
-            .context("retrieval index finalize");
+        let error =
+            anyhow!("mandatory semantic generation incomplete").context("retrieval index finalize");
 
         assert!(!retrieval_index_should_retry_full_refresh(
             RefreshMode::Auto,

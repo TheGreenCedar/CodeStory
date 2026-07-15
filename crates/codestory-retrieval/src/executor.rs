@@ -97,7 +97,7 @@ pub struct RetrievalPublicationIdentity {
     pub core_run_id: String,
     pub sidecar_generation: String,
     pub sidecar_input_hash: String,
-    pub qdrant_collection: String,
+    pub semantic_generation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,7 +292,7 @@ impl<'a> QueryExecutor<'a> {
             } else {
                 probe_sidecar_health(layout, &manifest.project_id, Some(manifest.clone()))
             };
-            return derive_degraded_mode(&report.lexical, &report.qdrant, &report.scip);
+            return derive_degraded_mode(&report.lexical, &report.semantic, &report.scip);
         }
         (
             RetrievalDegradedMode::LexicalOnly,
@@ -1002,7 +1002,7 @@ mod tests {
         RetrievalIndexManifest {
             project_id: "testproj".into(),
             lexical_version: "v1".into(),
-            qdrant_collection: "codestory_testproj".into(),
+            semantic_generation: "codestory_testproj".into(),
             scip_revision: Some("rev1".into()),
             built_at_epoch_ms: 0,
             disk_bytes: None,
@@ -1402,7 +1402,7 @@ mod tests {
             result.trace.stages.iter().any(|stage| {
                 stage.stage == RetrievalStageKind::Stage1bSemantic && stage.candidates_added > 0
             }),
-            "Qdrant must still contribute after Lexical overrun: {:?}",
+            "Semantic must still contribute after Lexical overrun: {:?}",
             result.trace.stages
         );
         assert!(
@@ -1424,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_query_slow_scip_expand_still_allows_qdrant_contribution() {
+    fn broad_query_slow_scip_expand_still_allows_semantic_contribution() {
         struct SlowScipExpandSidecars;
 
         impl SidecarSearch for SlowScipExpandSidecars {
@@ -1497,7 +1497,7 @@ mod tests {
             result.trace.stages.iter().any(|stage| {
                 stage.stage == RetrievalStageKind::Stage1bSemantic && stage.candidates_added > 0
             }),
-            "Qdrant must still contribute after SCIP expand overrun: {:?}",
+            "Semantic must still contribute after SCIP expand overrun: {:?}",
             result.trace.stages
         );
         assert!(
@@ -1733,12 +1733,12 @@ mod tests {
             .execute("packet search output evidence retrieval shadow", Some(800))
             .expect("query");
 
-        let qdrant_index = result
+        let semantic_index = result
             .trace
             .stages
             .iter()
             .position(|stage| stage.stage == RetrievalStageKind::Stage1bSemantic)
-            .expect("qdrant stage");
+            .expect("semantic stage");
         let expand_index = result
             .trace
             .stages
@@ -1746,7 +1746,7 @@ mod tests {
             .position(|stage| stage.stage == RetrievalStageKind::Stage2ScipExpand)
             .expect("scip expand stage");
         assert!(
-            qdrant_index < expand_index,
+            semantic_index < expand_index,
             "dense anchors should be available before graph expansion: {:?}",
             result.trace.stages
         );
@@ -1925,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn symbol_like_queries_expand_scip_before_slow_qdrant_can_consume_window() {
+    fn symbol_like_queries_expand_scip_before_slow_semantic_can_consume_window() {
         struct SlowDenseSymbolSidecars;
 
         impl SidecarSearch for SlowDenseSymbolSidecars {
@@ -1989,14 +1989,14 @@ mod tests {
             .iter()
             .position(|stage| stage.stage == RetrievalStageKind::Stage2ScipExpand)
             .expect("scip expand stage");
-        let qdrant_index = result
+        let semantic_index = result
             .trace
             .stages
             .iter()
             .position(|stage| stage.stage == RetrievalStageKind::Stage1bSemantic)
-            .expect("qdrant stage");
+            .expect("semantic stage");
         assert!(
-            expand_index < qdrant_index,
+            expand_index < semantic_index,
             "symbol-like graph expansion must preserve pre-dense ordering: {:?}",
             result.trace.stages
         );
@@ -2011,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn executor_skips_qdrant_when_policy_selects_zero_dense_anchors() {
+    fn executor_skips_semantic_when_policy_selects_zero_dense_anchors() {
         let mock = MockSidecarSearch {
             semantic: Mutex::new(HashMap::from([(
                 "how does startup sequence work".into(),
@@ -2055,7 +2055,7 @@ mod tests {
                 .iter()
                 .any(|stage| stage.stage == RetrievalStageKind::Stage1bSemantic
                     && stage.cancel_reason.as_deref() == Some("zero_dense_anchors")),
-            "zero dense policy should skip qdrant explicitly: {:?}",
+            "zero dense policy should skip semantic explicitly: {:?}",
             result.trace.stages
         );
         assert!(
@@ -2063,7 +2063,7 @@ mod tests {
                 .hits
                 .iter()
                 .all(|hit| hit.file_path != "src/semantic.rs"),
-            "qdrant hits must not be recalled when dense count is zero: {:?}",
+            "semantic hits must not be recalled when dense count is zero: {:?}",
             result.hits
         );
     }

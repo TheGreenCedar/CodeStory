@@ -1,7 +1,5 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
 use crate::embedded_vector::{EmbeddedVectorIndex, SemanticPoint};
-#[cfg(test)]
-use crate::generation::manifest_unavailable_reason;
 use crate::generation::{
     SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract,
     manifest_unavailable_reason_for_runtime, sidecar_generation_id,
@@ -58,7 +56,6 @@ struct SidecarEmbeddingContract<'a> {
     backend: &'a str,
     dimension: i32,
     config: &'a crate::config::EmbeddingRuntimeConfig,
-    vector_backend: &'a str,
 }
 
 struct SemanticGeneration<'a> {
@@ -159,7 +156,6 @@ pub fn finalize_index_for_runtime_with_progress(
         backend: &embedding_backend,
         dimension: embedding_dim,
         config: &runtime.embedding,
-        vector_backend: "embedded",
     };
     let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
         input_snapshot.storage(),
@@ -208,7 +204,7 @@ pub fn finalize_index_for_runtime_with_progress(
             );
             let previous_semantic = SemanticGeneration {
                 layout: &layout,
-                collection: &previous.qdrant_collection,
+                collection: &previous.semantic_generation,
                 generation: previous.sidecar_generation.as_deref().unwrap_or_default(),
                 input_hash: previous.sidecar_input_hash.as_deref().unwrap_or_default(),
                 embedding_backend: &embedding_backend,
@@ -299,7 +295,7 @@ pub fn finalize_index_for_runtime_with_progress(
             &sidecar_input.lexical_hash,
             &sidecar_input.hash,
         );
-    let semantic_ready_points = if existing_status.qdrant.capabilities.semantic {
+    let semantic_ready_points = if existing_status.semantic.capabilities.semantic {
         semantic_ready_point_count(&semantic_generation)
     } else {
         None
@@ -590,7 +586,7 @@ fn retrieval_manifest_for_sidecar(
     RetrievalIndexManifest {
         project_id: project_id.to_string(),
         lexical_version: LEXICAL_INDEX_VERSION.to_string(),
-        qdrant_collection: collection.to_string(),
+        semantic_generation: collection.to_string(),
         scip_revision: None,
         built_at_epoch_ms: Utc::now().timestamp_millis(),
         disk_bytes: None,
@@ -632,7 +628,10 @@ fn sidecar_disk_bytes(
             generation,
         ))
         .saturating_add(dir_size_bytes(
-            &layout.qdrant_data_dir.join("collections").join(collection),
+            &layout
+                .semantic_data_dir
+                .join("collections")
+                .join(collection),
         ))
         .saturating_add(dir_size_bytes(scip_dir)) as i64,
     )
@@ -685,7 +684,6 @@ fn persist_finalized_manifest(
                 backend: &embedding_backend,
                 dimension: embedding_dim,
                 config: &retention_context.runtime.embedding,
-                vector_backend: "embedded",
             };
             let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
                 storage,
@@ -706,15 +704,7 @@ fn persist_finalized_manifest(
             }
             Ok(current_input)
         },
-        || {
-            validate_candidate_generation(
-                project_root,
-                &project_id,
-                sidecar_input,
-                &manifest,
-                retention_context,
-            )
-        },
+        || validate_candidate_generation(&project_id, sidecar_input, &manifest, retention_context),
     )?;
 
     let (generation_retention_plan, generation_retention) =
@@ -723,7 +713,7 @@ fn persist_finalized_manifest(
     info!(
         project_id = %project_id,
         lexical_version = %manifest.lexical_version,
-        qdrant_collection = %manifest.qdrant_collection,
+        semantic_generation = %manifest.semantic_generation,
         sidecar_generation = ?manifest.sidecar_generation,
         degraded_modes = ?degraded_modes,
         "retrieval index manifest persisted"
@@ -784,9 +774,6 @@ struct CandidateGenerationEvidence {
     embedding_launch_before: Option<crate::health::EmbeddingLaunchMetadata>,
     embedding_launch_after: Option<crate::health::EmbeddingLaunchMetadata>,
     expected_embedding_launch: Option<crate::health::EmbeddingLaunchMetadata>,
-    embedding_container_identity_required: bool,
-    embedding_container_identity_before: Option<String>,
-    embedding_container_identity_after: Option<String>,
     retrieval_mode: String,
     degraded_reason: Option<String>,
 }
@@ -834,18 +821,6 @@ fn validate_candidate_generation_evidence(
     if !semantic_valid {
         bail!("mandatory candidate generation component failed validation: semantic");
     }
-    let container_identity_valid = if evidence.embedding_container_identity_required {
-        matches!(
-            (
-                evidence.embedding_container_identity_before.as_deref(),
-                evidence.embedding_container_identity_after.as_deref(),
-            ),
-            (Some(before), Some(after)) if before == after
-        )
-    } else {
-        evidence.embedding_container_identity_before.is_none()
-            && evidence.embedding_container_identity_after.is_none()
-    };
     let native_launch_stable = match (
         evidence.embedding_launch_before.as_ref(),
         evidence.embedding_launch_after.as_ref(),
@@ -861,7 +836,6 @@ fn validate_candidate_generation_evidence(
         evidence.embedding_launch_after.as_ref(),
         evidence.expected_embedding_launch.as_ref(),
     ) || !native_launch_stable
-        || !container_identity_valid
     {
         bail!("mandatory candidate generation component failed validation: embedding_runtime");
     }
@@ -946,7 +920,6 @@ fn normalize_embedding_model_token(value: &str) -> String {
 }
 
 fn validate_candidate_generation(
-    project_root: &Path,
     project_id: &str,
     sidecar_input: &SidecarInputFingerprint,
     manifest: &RetrievalIndexManifest,
@@ -957,24 +930,12 @@ fn validate_candidate_generation(
         .as_deref()
         .context("mandatory sidecar manifest is missing its generation")?;
     let scip_dir = context.layout.scip_project_dir(generation);
-    let embedding_server_launch_mode =
-        crate::config::embedding_server_launch_mode_for_runtime(context.runtime)?;
-    let embedding_container_identity_required = embedding_server_launch_mode
-        == crate::config::EmbeddingServerLaunchMode::DockerComposeEmbed;
     let embedding_launch_before =
         crate::sidecar::live_native_embedding_launch_metadata_for_runtime(context.runtime)
             .context("validate native embedding identity before final probes")?;
-    let embedding_container_identity_before = embedding_container_identity_required
-        .then(|| {
-            crate::embeddings::ensure_persisted_running_embedding_container_identity(
-                context.runtime,
-            )
-        })
-        .transpose()
-        .context("validate candidate embedding container identity before final probes")?;
     let semantic_generation = SemanticGeneration {
         layout: context.layout,
-        collection: &manifest.qdrant_collection,
+        collection: &manifest.semantic_generation,
         generation,
         input_hash: &sidecar_input.hash,
         embedding_backend: manifest.embedding_backend.as_deref().unwrap_or_default(),
@@ -998,14 +959,6 @@ fn validate_candidate_generation(
         &embedding_device,
         context.runtime,
     );
-    let embedding_container_identity_after = embedding_container_identity_required
-        .then(|| {
-            crate::embeddings::ensure_persisted_running_embedding_container_identity(
-                context.runtime,
-            )
-        })
-        .transpose()
-        .context("validate candidate embedding container identity after final probes")?;
     let embedding_launch_after =
         crate::sidecar::live_native_embedding_launch_metadata_for_runtime(context.runtime)
             .context("validate native embedding identity after final probes")?;
@@ -1022,24 +975,19 @@ fn validate_candidate_generation(
         semantic_points: (sidecar_input.projection_count > 0)
             .then_some(semantic_points)
             .flatten(),
-        semantic_ready: status.qdrant.capabilities.semantic,
+        semantic_ready: status.semantic.capabilities.semantic,
         semantic_zero_dense_policy: sidecar_input.projection_count == 0
             && sidecar_input.dense_projection_count == 0
-            && status.qdrant.status == crate::health::ComponentStatus::Healthy
-            && status.qdrant.degraded_reason.is_none()
-            && status.qdrant.capabilities.semantic,
+            && status.semantic.status == crate::health::ComponentStatus::Healthy
+            && status.semantic.degraded_reason.is_none()
+            && status.semantic.capabilities.semantic,
         embedding_device,
         embedding_accelerator_smoke_elapsed_ms: embedding_accelerator_smoke
             .map(|smoke| smoke.elapsed_ms),
         embedding_launch_before,
         embedding_launch_after,
-        expected_embedding_launch: crate::compose::expected_native_embedding_launch_metadata(
-            project_root,
-            context.runtime,
-        )?,
-        embedding_container_identity_required,
-        embedding_container_identity_before,
-        embedding_container_identity_after,
+        expected_embedding_launch:
+            crate::native_embedding::expected_native_embedding_launch_metadata(context.runtime)?,
         retrieval_mode: status.retrieval_mode,
         degraded_reason: status.degraded_reason,
     };
@@ -1167,7 +1115,6 @@ pub(crate) fn compute_sidecar_input_fingerprint_for_runtime(
         backend: embedding_backend,
         dimension: embedding_dim,
         config: &runtime.embedding,
-        vector_backend: "embedded",
     };
     compute_sidecar_input_fingerprint_with_lexical_source(
         storage,
@@ -1243,7 +1190,6 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         &mut hasher,
         embedding.config.document_prefix.as_deref().unwrap_or(""),
     );
-    hash_part(&mut hasher, embedding.vector_backend);
     hash_part(&mut hasher, "semantic-vectors-v2");
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
@@ -1586,7 +1532,7 @@ mod tests {
             manifest.sidecar_generation.as_deref(),
             Some(generation.as_str())
         );
-        assert_eq!(manifest.qdrant_collection, collection);
+        assert_eq!(manifest.semantic_generation, collection);
     }
 
     #[test]
@@ -1738,7 +1684,6 @@ mod tests {
             backend: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             dimension: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
             config: &runtime.embedding,
-            vector_backend: "embedded",
         };
         storage
             .insert_nodes_batch(&[Node {
@@ -1882,9 +1827,6 @@ mod tests {
             embedding_launch_before: None,
             embedding_launch_after: None,
             expected_embedding_launch: None,
-            embedding_container_identity_required: false,
-            embedding_container_identity_before: None,
-            embedding_container_identity_after: None,
             retrieval_mode: "full".into(),
             degraded_reason: None,
         };
@@ -1971,32 +1913,6 @@ mod tests {
             &cpu_evidence,
         )
         .expect("explicit CPU policy remains valid");
-        let mut replaced_container = passing.clone();
-        replaced_container.embedding_container_identity_required = true;
-        replaced_container.embedding_container_identity_before =
-            Some("container-a|start-a|true".into());
-        replaced_container.embedding_container_identity_after =
-            Some("container-b|start-b|true".into());
-        let replaced_error = validate_candidate_generation_evidence(
-            "proj",
-            &second,
-            &new_manifest,
-            &runtime,
-            &replaced_container,
-        )
-        .expect_err("container replacement during final probes must reject promotion");
-        assert!(replaced_error.to_string().contains("embedding_runtime"));
-        let mut stable_container = replaced_container;
-        stable_container.embedding_container_identity_after =
-            stable_container.embedding_container_identity_before.clone();
-        validate_candidate_generation_evidence(
-            "proj",
-            &second,
-            &new_manifest,
-            &runtime,
-            &stable_container,
-        )
-        .expect("one persisted running container identity remains valid across final probes");
         let mut native_runtime = runtime.clone();
         native_runtime.embedding.server_launch = Some("native_spawned".into());
         let native_input = compute_sidecar_input_fingerprint_for_runtime(
@@ -2072,7 +1988,7 @@ mod tests {
         let rollback_hash = "verified-rollback-input";
         rollback_manifest.sidecar_input_hash = Some(rollback_hash.into());
         rollback_manifest.sidecar_generation = Some(sidecar_generation_id("proj", rollback_hash));
-        rollback_manifest.qdrant_collection =
+        rollback_manifest.semantic_generation =
             crate::generation::sidecar_vector_generation("proj", rollback_hash);
         rollback_manifest.built_at_epoch_ms -= 1;
         let state_file = storage_dir.path().join("state/retrieval-sidecars.json");

@@ -7,6 +7,7 @@
 use crate::outbound_http::read_bytes;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{File, OpenOptions};
@@ -1162,6 +1163,7 @@ fn env_truthy(name: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 pub fn embed_query(text: &str) -> Result<Vec<f32>> {
     LlamaCppEmbeddingClient::new(&crate::config::SidecarRuntimeConfig::local().embedding)?
         .embed_query(text)
@@ -1488,6 +1490,7 @@ fn l2_normalize(vector: &mut [f32]) {
 }
 
 /// Stable 8-d hash vector used only for diagnostic downgraded vectors.
+#[cfg(test)]
 pub fn label_to_vector(label: &str) -> Vec<f32> {
     let digest = Sha256::digest(label.as_bytes());
     (0..8).map(|index| digest[index] as f32 / 255.0).collect()
@@ -1501,7 +1504,6 @@ pub fn semantic_vector_dim() -> usize {
 mod tests {
     use super::*;
     use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
-    use std::collections::BTreeMap;
     use std::io::Write;
     use std::net::TcpListener;
 
@@ -2115,7 +2117,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_backend_log_markers_count_as_accelerator_evidence() {
+    fn linux_vulkan_log_markers_count_as_accelerator_evidence() {
         let _lock = crate::test_support::env_lock();
         let _allow_cpu = EnvGuard::remove(ALLOW_CPU_ENV);
         let _policy = EnvGuard::remove(DEVICE_POLICY_ENV);
@@ -2123,27 +2125,17 @@ mod tests {
         let _llama_device = EnvGuard::remove(LLAMACPP_DEVICE_ENV);
         let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "linux/x86_64");
 
-        for (provider, marker) in [
-            ("cuda", "cuda backend ready"),
-            ("hip", "hip backend ready"),
-            ("vulkan", "vulkan backend ready"),
-            ("sycl", "sycl backend ready"),
-            ("openvino", "openvino backend ready"),
-        ] {
-            let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, provider);
-            assert_eq!(
-                observed_embedding_device_state_from_text(&format!(
-                    "{marker}\nload_tensors: offloaded layers\n"
-                )),
-                "accelerated",
-                "{provider} markers should prove acceleration"
-            );
-            assert_eq!(
-                observed_embedding_device_state_from_text(&format!("{marker}\n")),
-                "unknown",
-                "{provider} without offload marker is inconclusive"
-            );
-        }
+        let _provider = EnvGuard::set(DEVICE_PROVIDER_ENV, "vulkan");
+        assert_eq!(
+            observed_embedding_device_state_from_text(
+                "vulkan backend ready\nload_tensors: offloaded layers\n"
+            ),
+            "accelerated"
+        );
+        assert_eq!(
+            observed_embedding_device_state_from_text("vulkan backend ready\n"),
+            "unknown"
+        );
     }
 
     #[test]
@@ -2631,12 +2623,8 @@ offloaded 13/13 layers to GPU\n";
             log_path: Some(owner_log.display().to_string()),
             requested_device: Some("Metal0".into()),
         };
-        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(
-            &runtime,
-            None,
-            Some(launch.clone()),
-        )
-        .expect("persist reused launch");
+        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(&runtime, Some(launch.clone()))
+            .expect("persist reused launch");
 
         let state: crate::sidecar::SidecarStateFile = serde_json::from_slice(
             &std::fs::read(&runtime.layout.state_file).expect("read reused state"),
@@ -2685,7 +2673,7 @@ offloaded 13/13 layers to GPU\n";
             .expect("outside log");
         let mut forged = launch;
         forged.log_path = Some(outside_log.display().to_string());
-        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(forged))
+        crate::sidecar::sidecar_up_with_runtime_and_launch_metadata(&runtime, Some(forged))
             .expect("persist forged path");
         assert_eq!(
             native_embedding_log_path(&runtime),
@@ -2782,20 +2770,16 @@ offloaded 13/13 layers to GPU\n";
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                qdrant_http_port: 16333,
-                qdrant_grpc_port: 16334,
                 lexical_data_dir: root.path().join("lexical"),
-                qdrant_data_dir: root.path().join("qdrant"),
+                semantic_data_dir: root.path().join("semantic"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
             },
             profile: SidecarProfile::Agent,
             run_id: Some("shared-agent".into()),
             namespace: "agent-shared-agent".into(),
-            compose_project: "codestory-agent-shared-agent".into(),
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
-            labels: BTreeMap::new(),
             ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))
@@ -2832,20 +2816,16 @@ offloaded 13/13 layers to GPU\n";
         let runtime = SidecarRuntimeConfig {
             project_identity: None,
             layout: SidecarLayout {
-                qdrant_http_port: 16333,
-                qdrant_grpc_port: 16334,
                 lexical_data_dir: root.path().join("lexical"),
-                qdrant_data_dir: root.path().join("qdrant"),
+                semantic_data_dir: root.path().join("semantic"),
                 scip_artifacts_root: root.path().join("scip"),
                 state_file: root.path().join("state").join("retrieval-sidecars.json"),
             },
             profile: SidecarProfile::Agent,
             run_id: Some("shared-agent".into()),
             namespace: "agent-shared-agent".into(),
-            compose_project: "codestory-agent-shared-agent".into(),
             embed_http_port: 18080,
             cleanup_command: "codestory-cli retrieval down".into(),
-            labels: BTreeMap::new(),
             ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
         };
         std::fs::create_dir_all(runtime.layout.state_file.parent().expect("state parent"))

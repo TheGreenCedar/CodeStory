@@ -1,11 +1,5 @@
-use crate::config::{
-    EmbeddingServerLaunchMode, NATIVE_LLAMA_MANAGED_CACHE_REL_PATH,
-    NATIVE_LLAMA_SOURCE_CACHE_REL_PATH, SidecarLayout, SidecarProfile, SidecarRuntimeConfig,
-    user_cache_root,
-};
+use crate::config::{EmbeddingServerLaunchMode, SidecarRuntimeConfig, user_cache_root};
 use crate::health::{InfrastructureHealth, probe_infrastructure_health};
-#[cfg(test)]
-use crate::sidecar::sidecar_up_with_runtime_and_launch_metadata;
 use crate::sidecar::{
     EmbeddingLaunchOwnership, SidecarStateFile,
     sidecar_up_with_runtime_and_launch_metadata_and_ownership,
@@ -225,7 +219,7 @@ struct NativeEmbeddingSpawn {
 #[derive(Debug, Clone)]
 struct NativeLlamaCandidate {
     path: PathBuf,
-    backend: Option<crate::config::LlamaSidecarBackend>,
+    backend: crate::config::LlamaSidecarBackend,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,24 +232,8 @@ struct NativeLlamaInstallManifest {
     executable_sha256: String,
 }
 
-pub fn bootstrap_sidecars_with_runtime_progress(
-    runtime: &SidecarRuntimeConfig,
-    repo_root: Option<&Path>,
-    options: BootstrapSidecarsOptions,
-    progress: impl FnMut(&'static str),
-) -> Result<BootstrapReport> {
-    bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
-        runtime,
-        repo_root,
-        options,
-        progress,
-        |_| Ok(()),
-    )
-}
-
 pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
     runtime: &SidecarRuntimeConfig,
-    repo_root: Option<&Path>,
     options: BootstrapSidecarsOptions,
     progress: impl FnMut(&'static str),
     observe_new_native_launch: impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
@@ -274,7 +252,6 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
     let native_embedding = (launch_mode == EmbeddingServerLaunchMode::NativeSpawned)
         .then(|| {
             native_embedding_server_launch_for_bootstrap(
-                repo_root,
                 runtime,
                 reusable_native_embedding_launch.as_ref(),
             )
@@ -286,7 +263,6 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
             spawn_native_embedding_server(
                 launch,
                 runtime,
-                repo_root,
                 allow_native_embedding_spawn,
                 reusable_native_embedding_launch.as_ref(),
                 &mut observe_new_native_launch,
@@ -304,9 +280,9 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
         None
     };
 
-    let mut embedding_launch = native_embedding.as_ref().map(|launch| {
-        embedding_launch_metadata(launch, runtime, repo_root, native_embedding_spawn)
-    });
+    let mut embedding_launch = native_embedding
+        .as_ref()
+        .map(|launch| embedding_launch_metadata(launch, runtime, native_embedding_spawn));
     if let (Some(selected), Some(reused)) = (
         embedding_launch.as_mut(),
         reusable_native_embedding_launch.as_ref(),
@@ -325,7 +301,6 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
         };
     let state = match sidecar_up_with_runtime_and_launch_metadata_and_ownership(
         runtime,
-        None,
         embedding_launch.clone(),
         embedding_launch_ownership,
     ) {
@@ -352,17 +327,15 @@ pub fn bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
         }
     };
 
-    let infrastructure = if !wait_timeout.is_zero() {
+    if !wait_timeout.is_zero() {
         with_bootstrap_progress(&mut progress, "model/bootstrap", || {
             wait_for_infrastructure(
                 runtime,
                 wait_timeout,
                 newly_spawned_native_launch(embedding_launch.as_ref(), native_embedding_spawn),
             )
-        })?
-    } else {
-        probe_infrastructure_health(runtime)
-    };
+        })?;
+    }
 
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
     let infrastructure = crate::health::probe_infrastructure_health_with_embedding_device(
@@ -387,14 +360,12 @@ fn with_bootstrap_progress<T>(
 }
 
 fn native_embedding_server_launch(
-    repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<NativeEmbeddingServerLaunch> {
     ensure_native_launch_backend_supported(runtime)?;
-    ensure_selected_managed_native_llama_server(repo_root)?;
-    let executable = native_llama_server_path(repo_root)?;
-    let model_path =
-        embed_model_dir(repo_root, &runtime.layout)?.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
+    ensure_selected_managed_native_llama_server()?;
+    let executable = native_llama_server_path()?;
+    let model_path = embed_model_dir()?.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
     if !model_path.is_file() {
         bail!(
             "native llama.cpp embedding model not found: {}; run `node scripts/setup-retrieval-env.mjs --fetch-embed-model` or set CODESTORY_EMBED_MODEL_DIR",
@@ -407,7 +378,6 @@ fn native_embedding_server_launch(
 }
 
 fn native_embedding_server_launch_for_bootstrap(
-    repo_root: Option<&Path>,
     runtime: &SidecarRuntimeConfig,
     reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
 ) -> Result<NativeEmbeddingServerLaunch> {
@@ -415,7 +385,7 @@ fn native_embedding_server_launch_for_bootstrap(
         return native_embedding_server_launch_from_verified_metadata(runtime, reusable_launch)
             .context("restore verified native embedding launch contract for reuse");
     }
-    native_embedding_server_launch(repo_root, runtime)
+    native_embedding_server_launch(runtime)
 }
 
 fn native_embedding_server_launch_from_verified_metadata(
@@ -472,7 +442,7 @@ pub fn native_embedding_launch_contract_from_paths(
     runtime: &SidecarRuntimeConfig,
 ) -> crate::health::EmbeddingLaunchMetadata {
     let launch = native_embedding_server_launch_from_paths(executable, model_path, runtime);
-    embedding_launch_metadata(&launch, runtime, None, None)
+    embedding_launch_metadata(&launch, runtime, None)
 }
 
 fn native_embedding_launch_matches_runtime_contract(
@@ -494,7 +464,6 @@ fn native_embedding_launch_matches_runtime_contract(
 }
 
 pub fn expected_native_embedding_launch_metadata(
-    repo_root: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<crate::health::EmbeddingLaunchMetadata>> {
     if crate::config::embedding_server_launch_mode_for_runtime(runtime)?
@@ -502,13 +471,8 @@ pub fn expected_native_embedding_launch_metadata(
     {
         return Ok(None);
     }
-    let launch = native_embedding_server_launch(Some(repo_root), runtime)?;
-    Ok(Some(embedding_launch_metadata(
-        &launch,
-        runtime,
-        Some(repo_root),
-        None,
-    )))
+    let launch = native_embedding_server_launch(runtime)?;
+    Ok(Some(embedding_launch_metadata(&launch, runtime, None)))
 }
 
 fn native_embedding_server_launch_from_paths(
@@ -592,7 +556,6 @@ fn native_embedding_endpoint_port(runtime: &SidecarRuntimeConfig) -> u16 {
 fn embedding_launch_metadata(
     native_launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
-    repo_root: Option<&Path>,
     spawn: Option<NativeEmbeddingSpawn>,
 ) -> crate::health::EmbeddingLaunchMetadata {
     crate::health::EmbeddingLaunchMetadata {
@@ -611,10 +574,7 @@ fn embedding_launch_metadata(
         spawn_protocol: None,
         launch_args: native_launch.args.clone(),
         launch_fingerprint_sha256: Some(native_embedding_launch_fingerprint(native_launch)),
-        executable_source: Some(native_llama_executable_source(
-            &native_launch.executable,
-            repo_root,
-        )),
+        executable_source: Some(native_llama_executable_source(&native_launch.executable)),
         executable_path: Some(native_launch.executable.display().to_string()),
         model_path: Some(native_launch.model_path.display().to_string()),
         model_sha256: native_launch.model_sha256.clone(),
@@ -641,7 +601,7 @@ fn now_epoch_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> String {
+fn native_llama_executable_source(path: &Path) -> String {
     if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
         return "env:CODESTORY_EMBED_NATIVE_LLAMA_SERVER".to_string();
     }
@@ -651,32 +611,16 @@ fn native_llama_executable_source(path: &Path, repo_root: Option<&Path>) -> Stri
             if path == user_cache_root().join(&rel_path) {
                 return "managed_cache".to_string();
             }
-            if let Some(root) = repo_root
-                && path == root.join(&rel_path)
-            {
-                return "repo_managed_cache".to_string();
-            }
-        }
-    }
-    if path == user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
-        return "managed_cache".to_string();
-    }
-    if let Some(root) = repo_root {
-        if path == root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH) {
-            return "source_cache".to_string();
-        }
-        if path == root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH) {
-            return "repo_managed_cache".to_string();
         }
     }
     "resolved_path".to_string()
 }
 
-fn native_llama_server_path(repo_root: Option<&Path>) -> Result<PathBuf> {
+fn native_llama_server_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER") {
         return validate_explicit_native_llama_server(PathBuf::from(path));
     }
-    native_llama_server_path_from_candidates(native_llama_server_candidates(repo_root))
+    native_llama_server_path_from_candidates(native_llama_server_candidates()?)
 }
 
 fn validate_explicit_native_llama_server(path: PathBuf) -> Result<PathBuf> {
@@ -698,22 +642,16 @@ fn native_llama_server_path_from_candidates(
     candidates: Vec<NativeLlamaCandidate>,
 ) -> Result<PathBuf> {
     let install_hint = candidates
-        .iter()
-        .find(|candidate| candidate.backend.is_some())
+        .first()
         .map(|candidate| candidate.path.display().to_string())
-        .unwrap_or_else(|| {
-            user_cache_root()
-                .join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH)
-                .display()
-                .to_string()
-        });
+        .context("managed native llama-server candidate list is empty")?;
     let mut invalid_managed_candidate = None;
     for candidate in candidates {
         if !candidate.path.is_file() {
             continue;
         }
-        if let Some(backend) = &candidate.backend
-            && let Err(error) = validate_managed_native_llama_server(&candidate.path, backend)
+        if let Err(error) =
+            validate_managed_native_llama_server(&candidate.path, &candidate.backend)
         {
             invalid_managed_candidate = Some(error.to_string());
             continue;
@@ -729,39 +667,19 @@ fn native_llama_server_path_from_candidates(
     ))
 }
 
-fn native_llama_server_candidates(repo_root: Option<&Path>) -> Vec<NativeLlamaCandidate> {
-    if let Some(backend) = selected_native_llama_backend() {
-        let mut candidates = Vec::new();
-        for backend in matching_native_llama_backends(&backend.provider) {
-            let rel_path = native_llama_backend_rel_path(&backend);
-            candidates.push(NativeLlamaCandidate {
-                path: user_cache_root().join(&rel_path),
-                backend: Some(backend.clone()),
-            });
-            if let Some(root) = repo_root {
-                candidates.push(NativeLlamaCandidate {
-                    path: root.join(rel_path),
-                    backend: Some(backend),
-                });
-            }
-        }
-        return candidates;
-    }
-    let mut candidates = vec![NativeLlamaCandidate {
-        path: user_cache_root().join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH),
-        backend: None,
-    }];
-    if let Some(root) = repo_root {
+fn native_llama_server_candidates() -> Result<Vec<NativeLlamaCandidate>> {
+    let backend = selected_native_llama_backend().context(
+        "no managed native llama-server backend matches this platform and device policy",
+    )?;
+    let mut candidates = Vec::new();
+    for backend in matching_native_llama_backends(&backend.provider) {
+        let rel_path = native_llama_backend_rel_path(&backend);
         candidates.push(NativeLlamaCandidate {
-            path: root.join(NATIVE_LLAMA_SOURCE_CACHE_REL_PATH),
-            backend: None,
-        });
-        candidates.push(NativeLlamaCandidate {
-            path: root.join(NATIVE_LLAMA_MANAGED_CACHE_REL_PATH),
-            backend: None,
+            path: user_cache_root().join(&rel_path),
+            backend: backend.clone(),
         });
     }
-    candidates
+    Ok(candidates)
 }
 
 fn selected_native_llama_backend() -> Option<crate::config::LlamaSidecarBackend> {
@@ -773,9 +691,6 @@ fn selected_native_llama_backend() -> Option<crate::config::LlamaSidecarBackend>
 
 fn matching_native_llama_backends(provider: &str) -> Vec<crate::config::LlamaSidecarBackend> {
     crate::config::llama_sidecar_backends(provider)
-        .into_iter()
-        .filter(|backend| backend.launch_mode == EmbeddingServerLaunchMode::NativeSpawned.as_str())
-        .collect()
 }
 
 fn ensure_native_launch_backend_supported(runtime: &SidecarRuntimeConfig) -> Result<()> {
@@ -791,24 +706,11 @@ fn ensure_native_launch_backend_supported(runtime: &SidecarRuntimeConfig) -> Res
         return Ok(());
     }
     let host = crate::config::embedding_host_platform();
-    let available = crate::config::llama_sidecar_backends(&request.provider)
-        .into_iter()
-        .map(|backend| backend.launch_mode)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let available = if available.is_empty() {
-        "none".to_string()
-    } else {
-        available
-    };
     anyhow::bail!(
-        "CODESTORY_EMBED_SERVER_LAUNCH=native_spawned is unsupported for provider={} on {}/{}; available launch modes: {}; choose a provider with native_spawned metadata or configure a trusted external endpoint",
+        "CODESTORY_EMBED_SERVER_LAUNCH=native_spawned is unsupported for provider={} on {}/{}; choose a provider with a managed native backend or configure a trusted external endpoint",
         request.provider,
         host.os,
-        host.arch,
-        available
+        host.arch
     )
 }
 
@@ -816,18 +718,17 @@ fn native_llama_backend_rel_path(backend: &crate::config::LlamaSidecarBackend) -
     Path::new(&backend.managed_cache_rel_dir).join(&backend.executable_rel_path)
 }
 
-fn ensure_selected_managed_native_llama_server(repo_root: Option<&Path>) -> Result<()> {
+fn ensure_selected_managed_native_llama_server() -> Result<()> {
     if std::env::var("CODESTORY_EMBED_NATIVE_LLAMA_SERVER").is_ok() {
         return Ok(());
     }
-    if let Some(backend) = selected_native_llama_backend() {
-        if native_llama_server_path_from_candidates(native_llama_server_candidates(repo_root))
-            .is_ok()
-        {
-            return Ok(());
-        }
-        ensure_managed_native_llama_server(&backend)?;
+    let backend = selected_native_llama_backend().context(
+        "no managed native llama-server backend matches this platform and device policy",
+    )?;
+    if native_llama_server_path_from_candidates(native_llama_server_candidates()?).is_ok() {
+        return Ok(());
     }
+    ensure_managed_native_llama_server(&backend)?;
     Ok(())
 }
 
@@ -896,12 +797,6 @@ pub fn prewarm_managed_assets(
                 "no managed native llama-server backend is available for this host and accelerator",
             )?,
         };
-        if backend.launch_mode != EmbeddingServerLaunchMode::NativeSpawned.as_str() {
-            bail!(
-                "managed llama-server backend {} is not a native backend",
-                backend.id
-            );
-        }
         ensure_managed_native_llama_server(&backend)?;
         Some(backend)
     } else {
@@ -1297,7 +1192,6 @@ fn sha256_file(path: &Path) -> Result<String> {
 fn spawn_native_embedding_server(
     launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
-    repo_root: Option<&Path>,
     allow_spawn: bool,
     reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
     observe_new_native_launch: &mut impl FnMut(&crate::health::EmbeddingLaunchMetadata) -> Result<()>,
@@ -1306,7 +1200,6 @@ fn spawn_native_embedding_server(
     spawn_native_embedding_server_with_probe_and_observer(
         launch,
         runtime,
-        repo_root,
         allow_spawn,
         reusable_launch,
         probe,
@@ -1314,29 +1207,9 @@ fn spawn_native_embedding_server(
     )
 }
 
-#[cfg(test)]
-fn spawn_native_embedding_server_with_probe(
-    launch: &NativeEmbeddingServerLaunch,
-    runtime: &SidecarRuntimeConfig,
-    allow_spawn: bool,
-    reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
-    probe: crate::embeddings::EmbeddingRuntimeProbe,
-) -> Result<Option<NativeEmbeddingSpawn>> {
-    spawn_native_embedding_server_with_probe_and_observer(
-        launch,
-        runtime,
-        None,
-        allow_spawn,
-        reusable_launch,
-        probe,
-        &mut |_| Ok(()),
-    )
-}
-
 fn spawn_native_embedding_server_with_probe_and_observer(
     launch: &NativeEmbeddingServerLaunch,
     runtime: &SidecarRuntimeConfig,
-    repo_root: Option<&Path>,
     allow_spawn: bool,
     reusable_launch: Option<&crate::health::EmbeddingLaunchMetadata>,
     probe: crate::embeddings::EmbeddingRuntimeProbe,
@@ -1412,7 +1285,7 @@ fn spawn_native_embedding_server_with_probe_and_observer(
         "native llama.cpp embedding server Darwin session detachment=setsid"
     )
     .ok();
-    let mut pending_launch = embedding_launch_metadata(launch, runtime, repo_root, None);
+    let mut pending_launch = embedding_launch_metadata(launch, runtime, None);
     pending_launch.spawned_at_epoch_ms = Some(now_epoch_ms());
     pending_launch.spawn_protocol = native_embedding_spawn_protocol().map(str::to_string);
     observe_new_native_launch(&pending_launch)
@@ -1425,8 +1298,7 @@ fn spawn_native_embedding_server_with_probe_and_observer(
                 spawned_at_epoch_ms: now_epoch_ms(),
                 newly_spawned: true,
             };
-            let mut selected_launch =
-                embedding_launch_metadata(launch, runtime, repo_root, Some(spawn));
+            let mut selected_launch = embedding_launch_metadata(launch, runtime, Some(spawn));
             selected_launch.spawn_protocol = native_embedding_spawn_protocol().map(str::to_string);
             if selected_launch.process_start_identity.is_none() {
                 let error = anyhow::anyhow!(
@@ -1769,7 +1641,7 @@ fn native_embedding_breakaway_denied(error: &std::io::Error) -> bool {
     }
 }
 
-fn embed_model_dir(_repo_root: Option<&Path>, _layout: &SidecarLayout) -> Result<PathBuf> {
+fn embed_model_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
         let path = PathBuf::from(path);
         if embed_model_dir_ready(&path) {
@@ -1784,11 +1656,8 @@ fn embed_model_dir(_repo_root: Option<&Path>, _layout: &SidecarLayout) -> Result
         .context("prepare managed embedding model")
 }
 
-pub fn embed_model_inventory(
-    repo_root: Option<&Path>,
-    layout: &SidecarLayout,
-) -> EmbedModelInventory {
-    let candidates = embed_model_candidates(repo_root, layout);
+pub fn embed_model_inventory() -> EmbedModelInventory {
+    let candidates = embed_model_candidates();
     let model_dir = candidates
         .iter()
         .find(|candidate| embed_model_dir_ready(candidate))
@@ -1813,22 +1682,13 @@ pub fn embed_model_inventory(
     }
 }
 
-fn embed_model_candidates(_repo_root: Option<&Path>, _layout: &SidecarLayout) -> Vec<PathBuf> {
+fn embed_model_candidates() -> Vec<PathBuf> {
     if let Ok(path) = std::env::var("CODESTORY_EMBED_MODEL_DIR") {
         return vec![PathBuf::from(path)];
     }
-    let cache_root = user_cache_root();
-    let mut candidates = Vec::new();
-    for candidate in [
-        crate::managed_assets::managed_embedding_model_dir(&cache_root),
-        cache_root.join("retrieval-models"),
-        cache_root.join("embed-models"),
-    ] {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    candidates
+    vec![crate::managed_assets::managed_embedding_model_dir(
+        &user_cache_root(),
+    )]
 }
 
 fn embed_model_dir_ready(path: &Path) -> bool {
@@ -1885,6 +1745,10 @@ fn wait_for_infrastructure(
     Ok(last)
 }
 
+fn infrastructure_ready(health: &InfrastructureHealth) -> bool {
+    health.embed_reachable
+}
+
 fn newly_spawned_native_readiness_confirmed(
     launch: Option<&crate::health::EmbeddingLaunchMetadata>,
 ) -> Result<bool> {
@@ -1936,1404 +1800,4 @@ fn current_native_embedding_log_tail(path: &Path) -> Option<String> {
     let tail = String::from_utf8_lossy(&tail).to_ascii_lowercase();
     let current_launch_start = tail.rfind("starting native llama.cpp embedding server:")?;
     Some(tail[current_launch_start..].to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{SocketAddr, TcpListener};
-    use tempfile::tempdir;
-
-    fn compose_test_runtime(root: &std::path::Path) -> SidecarRuntimeConfig {
-        SidecarRuntimeConfig {
-            project_identity: None,
-            layout: SidecarLayout {
-                qdrant_http_port: 16333,
-                qdrant_grpc_port: 16334,
-                lexical_data_dir: root.join("lexical"),
-                qdrant_data_dir: root.join("qdrant"),
-                scip_artifacts_root: root.join("scip"),
-                state_file: root.join("retrieval-sidecars.json"),
-            },
-            profile: SidecarProfile::Local,
-            run_id: None,
-            namespace: "test".to_string(),
-            compose_project: "test".to_string(),
-            embed_http_port: 18080,
-            cleanup_command: "codestory-cli retrieval down".to_string(),
-            labels: std::collections::BTreeMap::new(),
-            ..crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None)
-        }
-    }
-
-    #[test]
-    fn failed_bootstrap_error_retains_compose_lock_through_caller_cleanup() {
-        let root = tempdir().expect("root");
-        let mut runtime = compose_test_runtime(root.path());
-        runtime.compose_project = format!(
-            "test-{}",
-            &format!(
-                "{:x}",
-                Sha256::digest(root.path().as_os_str().as_encoded_bytes())
-            )[..16]
-        );
-
-        let mut lock = Some(
-            acquire_compose_bootstrap_lock(&runtime.compose_project).expect("first Compose lock"),
-        );
-        let error = hold_compose_bootstrap_lock_on_error(anyhow::anyhow!("failed"), &mut lock);
-        assert!(lock.is_none(), "returned error must own the Compose lock");
-        assert!(
-            try_acquire_compose_bootstrap_lock(&runtime.compose_project)
-                .expect("contending Compose lock")
-                .is_none(),
-            "a concurrent bootstrap must wait while caller-side cleanup handles the error"
-        );
-
-        drop(error);
-        assert!(
-            try_acquire_compose_bootstrap_lock(&runtime.compose_project)
-                .expect("Compose lock after cleanup")
-                .is_some(),
-            "the next bootstrap may inspect ownership only after cleanup completes"
-        );
-    }
-
-    #[test]
-    fn local_qdrant_transition_preserves_state_on_failure_then_publishes_embedded_state() {
-        let root = tempdir().expect("root");
-        let compose_file = root.path().join("retrieval-compose.yml");
-        std::fs::write(&compose_file, "services: {}\n").expect("compose file");
-        let mut runtime = compose_test_runtime(root.path());
-        runtime.layout.qdrant_http_port = 0;
-        runtime.layout.qdrant_grpc_port = 0;
-        runtime.embedding.endpoint_origin =
-            crate::config::EmbeddingEndpointOrigin::ProcessEnvironment;
-        runtime.embedding.endpoint = SidecarLayout::embed_base_url(runtime.embed_http_port);
-        runtime
-            .labels
-            .insert("dev.codestory.vector_backend".into(), "embedded".into());
-
-        let old_state: SidecarStateFile = serde_json::from_value(serde_json::json!({
-            "owner": "codestory",
-            "profile": "local",
-            "namespace": runtime.namespace,
-            "compose_project": runtime.compose_project,
-            "qdrant_http_port": 16333,
-            "qdrant_grpc_port": 16334,
-            "embed_http_port": runtime.embed_http_port,
-            "embed_url": SidecarLayout::embed_base_url(runtime.embed_http_port),
-            "lexical_data_dir": runtime.layout.lexical_data_dir,
-            "qdrant_data_dir": runtime.layout.qdrant_data_dir,
-            "scip_artifacts_root": runtime.layout.scip_artifacts_root,
-            "compose_file": compose_file,
-            "cleanup_command": "codestory-cli retrieval down",
-            "started_at_epoch_ms": 1
-        }))
-        .expect("old state");
-        let old_bytes = serde_json::to_vec_pretty(&old_state).expect("serialize old state");
-        std::fs::write(&runtime.layout.state_file, &old_bytes).expect("write old state");
-        let options = BootstrapSidecarsOptions {
-            storage_scope: BootstrapStorageScope {
-                repo_root: None,
-                active_storage_path: None,
-                active_cache_root: None,
-                global_cache_root: root.path().to_path_buf(),
-            },
-            compose_file: None,
-            skip_compose: true,
-            wait_timeout: Duration::ZERO,
-            allow_native_embedding_spawn: false,
-            reusable_native_embedding_launch: None,
-        };
-
-        let error = bootstrap_sidecars_with_transition_down(
-            &runtime,
-            None,
-            options.clone(),
-            |_| {},
-            |_| Ok(()),
-            |state| {
-                assert_eq!(state.qdrant_http_port, 16333);
-                assert_eq!(state.qdrant_grpc_port, 16334);
-                bail!("injected transition down failure")
-            },
-        )
-        .expect_err("transition failure");
-        assert!(format!("{error:#}").contains("injected transition down failure"));
-        assert_eq!(
-            std::fs::read(&runtime.layout.state_file).expect("preserved state"),
-            old_bytes
-        );
-        drop(error);
-
-        let report = bootstrap_sidecars_with_transition_down(
-            &runtime,
-            None,
-            options,
-            |_| {},
-            |_| Ok(()),
-            |state| {
-                assert_eq!(state.qdrant_http_port, 16333);
-                assert_eq!(state.qdrant_grpc_port, 16334);
-                assert_eq!(state.embed_http_port, runtime.embed_http_port);
-                Ok(())
-            },
-        )
-        .expect("retry transition");
-        assert_eq!(report.state.qdrant_http_port, 0);
-        assert_eq!(report.state.qdrant_grpc_port, 0);
-        assert_eq!(report.state.embed_http_port, runtime.embed_http_port);
-    }
-
-    fn one_shot_json_server(body: serde_json::Value) -> (SocketAddr, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
-        let address = listener.local_addr().expect("test HTTP server address");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept test HTTP request");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                let read = stream.read(&mut buffer).expect("read test HTTP request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                let Some(header_end) = request
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
-                    .map(|index| index + 4)
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                    .unwrap_or(0);
-                if request.len().saturating_sub(header_end) >= content_length {
-                    break;
-                }
-            }
-            let body = body.to_string();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .expect("write test HTTP response");
-        });
-        (address, handle)
-    }
-
-    #[test]
-    fn infrastructure_wait_uses_selected_runtime_embedding_endpoint() {
-        let root = tempdir().expect("root");
-        let (embedding_address, embedding_server) = one_shot_json_server(serde_json::json!({
-            "data": [{ "index": 0, "embedding": [0.1, 0.2, 0.3] }]
-        }));
-        let mut runtime = compose_test_runtime(root.path());
-        runtime.embed_http_port = embedding_address.port();
-        runtime.embedding.configuration_error = None;
-        runtime.embedding.backend = "llamacpp".to_string();
-        runtime.embedding.endpoint = format!("http://{embedding_address}/v1/embeddings");
-        runtime.embedding.expected_dim = Some(3);
-        runtime.embedding.allow_remote = false;
-        runtime.embedding.device_policy = "allow_cpu".to_string();
-        runtime
-            .layout
-            .ensure_data_dirs()
-            .expect("create infrastructure data dirs");
-
-        let health = wait_for_infrastructure(&runtime, Duration::from_secs(2), None)
-            .expect("selected runtime infrastructure health");
-
-        assert!(health.lexical_ready);
-        assert!(health.qdrant_reachable, "{}", health.qdrant_detail);
-        assert!(health.embed_reachable, "{}", health.embed_detail);
-        embedding_server.join().expect("embedding test server");
-    }
-
-    #[test]
-    fn compose_start_failure_rolls_back_exact_partial_startup() {
-        let calls = std::cell::RefCell::new(Vec::new());
-
-        let error = start_compose_with_rollback(
-            true,
-            || {
-                calls.borrow_mut().push("start");
-                bail!("partial_up_failed")
-            },
-            || {
-                calls.borrow_mut().push("rollback");
-                bail!("rollback_failed")
-            },
-        )
-        .expect_err("partial startup and rollback failure must both be reported");
-
-        assert_eq!(*calls.borrow(), ["start", "rollback"]);
-        let error = format!("{error:#}");
-        assert!(error.contains("partial_up_failed"), "{error}");
-        assert!(error.contains("rollback_failed"), "{error}");
-    }
-
-    #[test]
-    fn compose_start_failure_preserves_preexisting_exact_project() {
-        let calls = std::cell::RefCell::new(Vec::new());
-
-        let error = start_compose_with_rollback(
-            false,
-            || {
-                calls.borrow_mut().push("start");
-                bail!("up_failed")
-            },
-            || {
-                calls.borrow_mut().push("rollback");
-                Ok(())
-            },
-        )
-        .expect_err("pre-existing Compose project must be preserved");
-
-        assert_eq!(*calls.borrow(), ["start"]);
-        let error = format!("{error:#}");
-        assert!(error.contains("up_failed"), "{error}");
-        assert!(error.contains("preserved pre-existing"), "{error}");
-    }
-
-    #[test]
-    fn compose_down_restores_required_interpolation_environment() {
-        let root = tempdir().expect("root");
-        let qdrant_data_dir = root.path().join("qdrant");
-        let state: SidecarStateFile = serde_json::from_value(serde_json::json!({
-            "owner": "codestory",
-            "profile": "agent",
-            "namespace": "codestory-agent-test",
-            "compose_project": "codestory-agent-test",
-            "qdrant_http_port": 16333,
-            "qdrant_grpc_port": 16334,
-            "lexical_data_dir": root.path().join("lexical"),
-            "qdrant_data_dir": qdrant_data_dir,
-            "scip_artifacts_root": root.path().join("scip"),
-            "cleanup_command": "codestory-cli retrieval down",
-            "started_at_epoch_ms": 1
-        }))
-        .expect("state");
-
-        let environment = compose_down_environment(&state)
-            .into_iter()
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            environment.get("CODESTORY_SIDECAR_NAMESPACE"),
-            Some(&state.namespace)
-        );
-        assert_eq!(
-            environment.get("CODESTORY_QDRANT_DATA_DIR"),
-            Some(&docker_bind_path(Path::new(&state.qdrant_data_dir)))
-        );
-        assert!(!environment.contains_key("CODESTORY_ZOEKT_DATA_DIR"));
-        assert_eq!(
-            environment.get("CODESTORY_EMBED_MODEL_DIR"),
-            Some(&docker_bind_path(Path::new(&state.qdrant_data_dir)))
-        );
-    }
-
-    #[test]
-    fn compose_down_emits_removed_interpolation_only_for_legacy_compose_input() {
-        let root = tempdir().expect("root");
-        let compose_file = root.path().join("legacy-compose.yml");
-        std::fs::write(
-            &compose_file,
-            "volumes:\n  - ${CODESTORY_ZOEKT_DATA_DIR}:/data\n",
-        )
-        .expect("write legacy compose fixture");
-        let state: SidecarStateFile = serde_json::from_value(serde_json::json!({
-            "owner": "codestory",
-            "profile": "agent",
-            "namespace": "codestory-agent-test",
-            "compose_project": "codestory-agent-test",
-            "qdrant_http_port": 16333,
-            "qdrant_grpc_port": 16334,
-            "lexical_data_dir": root.path().join("lexical"),
-            "qdrant_data_dir": root.path().join("qdrant"),
-            "scip_artifacts_root": root.path().join("scip"),
-            "compose_file": compose_file,
-            "cleanup_command": "codestory-cli retrieval down",
-            "started_at_epoch_ms": 1
-        }))
-        .expect("state");
-
-        let environment = compose_down_environment(&state)
-            .into_iter()
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            environment.get("CODESTORY_ZOEKT_DATA_DIR"),
-            Some(&docker_bind_path(Path::new(&state.lexical_data_dir)))
-        );
-    }
-
-    #[test]
-    fn embed_model_dir_uses_only_explicit_project_override() {
-        let _lock = crate::test_support::env_lock();
-        let project = tempdir().expect("project");
-        let model_dir = project
-            .path()
-            .join("models")
-            .join("gguf")
-            .join("bge-base-en-v1.5");
-        std::fs::create_dir_all(&model_dir).expect("model dir");
-        std::fs::write(
-            model_dir.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
-            b"model placeholder",
-        )
-        .expect("model file");
-        let _override = EnvGuard::set(
-            "CODESTORY_EMBED_MODEL_DIR",
-            model_dir.to_str().expect("utf8 model dir"),
-        );
-        let layout = SidecarLayout::from_env();
-
-        assert_eq!(
-            embed_model_dir(Some(project.path()), &layout).expect("model dir"),
-            model_dir
-        );
-    }
-
-    #[test]
-    fn embed_model_inventory_reports_machine_cache_without_mutating_it() {
-        let _lock = crate::test_support::env_lock();
-        let _override = EnvGuard::remove("CODESTORY_EMBED_MODEL_DIR");
-        let cache = tempdir().expect("cache");
-        let project = tempdir().expect("project");
-        let model_dir = cache.path().join("retrieval-models");
-        std::fs::create_dir_all(&model_dir).expect("model dir");
-        std::fs::write(
-            model_dir.join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
-            b"model placeholder",
-        )
-        .expect("model file");
-        let layout = compose_test_runtime(project.path()).layout;
-        let inventory = crate::config::with_test_cache_root(cache.path(), || {
-            embed_model_inventory(Some(project.path()), &layout)
-        });
-
-        assert_eq!(
-            inventory.model_dir.as_deref(),
-            Some(model_dir.to_str().unwrap())
-        );
-        assert!(inventory.required_gguf_present);
-    }
-
-    #[test]
-    fn docker_bind_path_removes_windows_verbatim_prefix() {
-        assert_eq!(
-            docker_bind_path(Path::new(r"\\?\C:\Users\alber\codestory\models")),
-            "C:/Users/alber/codestory/models"
-        );
-    }
-
-    #[test]
-    fn compose_failure_classifies_docker_address_pool_exhaustion() {
-        let project = Path::new("C:/repo/example project");
-        let stdout = "compose stdout\n";
-        let stderr =
-            "failed to create network: all predefined address pools have been fully subnetted";
-
-        let message = docker_compose_up_failure_message(Some(1), stdout, stderr, Some(project));
-
-        assert!(message.contains("reason=docker_address_pool_exhausted"));
-        assert!(message.contains(stdout));
-        assert!(message.contains(stderr));
-        assert!(message.contains(
-            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format markdown"
-        ));
-        assert!(message.contains(
-            "codestory-cli sidecar inventory --project \"C:/repo/example project\" --format json"
-        ));
-        for forbidden in [" prune", " remove", " down", " delete", " restart"] {
-            assert!(
-                !message.to_ascii_lowercase().contains(forbidden),
-                "guidance must stay non-destructive: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn compose_failure_preserves_generic_stderr_without_reason() {
-        let stderr = "compose service failed for another reason";
-
-        let message = docker_compose_up_failure_message(Some(17), "stdout\n", stderr, None);
-
-        assert!(message.contains("docker compose up failed (exit Some(17))"));
-        assert!(message.contains("stdout\n"));
-        assert!(message.contains(stderr));
-        assert!(!message.contains("docker_address_pool_exhausted"));
-        assert!(!message.contains("sidecar inventory"));
-    }
-
-    #[test]
-    fn bundled_compose_file_is_written_to_cache() {
-        let cache = tempdir().expect("cache");
-        let path = write_bundled_compose_file(cache.path()).expect("write bundled compose");
-
-        assert_eq!(path, cache.path().join("retrieval-compose.yml"));
-        let contents = std::fs::read_to_string(path).expect("read bundled compose");
-        assert!(contents.contains("name: ${CODESTORY_SIDECAR_NAMESPACE:-codestory-retrieval}"));
-        assert!(contents.contains("dev.codestory.workspace_id"));
-        assert!(contents.contains("dev.codestory.artifact_scope_id"));
-        for image in [
-            crate::config::QDRANT_IMAGE_PIN,
-            crate::config::LLAMACPP_SERVER_IMAGE_PIN,
-        ] {
-            assert!(
-                image.contains("@sha256:"),
-                "image pin must include digest: {image}"
-            );
-            assert!(
-                contents.contains(image),
-                "bundled compose should contain exact image pin {image}"
-            );
-        }
-    }
-
-    #[test]
-    fn bundled_compose_keeps_llamacpp_device_env_request_only() {
-        assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_DEVICE"));
-        assert!(BUNDLED_RETRIEVAL_COMPOSE.contains("- LLAMA_ARG_N_GPU_LAYERS"));
-        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("/dev/dri:/dev/dri"));
-        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("devices:"));
-        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains("LLAMA_ARG_DEVICE:"));
-        assert!(!BUNDLED_RETRIEVAL_COMPOSE.contains(":-none"));
-    }
-
-    #[test]
-    fn vulkan_compose_override_is_only_written_when_host_render_node_exists() {
-        let cache = tempdir().expect("cache");
-        let missing = cache.path().join("missing-dri");
-        let missing_error = maybe_write_vulkan_compose_override(cache.path(), &missing, true)
-            .expect_err("missing render node");
-        assert!(
-            missing_error
-                .to_string()
-                .contains("linux_accelerator_device_missing")
-        );
-
-        let disabled =
-            maybe_write_vulkan_compose_override(cache.path(), &missing, false).expect("disabled");
-        assert_eq!(disabled, None);
-
-        let render_node = cache.path().join("dri");
-        std::fs::create_dir(&render_node).expect("render node dir");
-        let written =
-            maybe_write_vulkan_compose_override(cache.path(), &render_node, true).expect("write");
-        let written = written.expect("override path");
-        let contents = std::fs::read_to_string(written).expect("override contents");
-        assert!(contents.contains("/dev/dri:/dev/dri"));
-    }
-
-    #[test]
-    fn native_launch_mode_does_not_require_vulkan_compose_override() {
-        let request = crate::embeddings::EmbeddingAcceleratorRequest {
-            provider: "vulkan".to_string(),
-            device: Some("Vulkan0".to_string()),
-            n_gpu_layers: "99".to_string(),
-        };
-
-        assert!(!vulkan_compose_override_requested(
-            EmbeddingServerLaunchMode::NativeSpawned,
-            Some(&request)
-        ));
-        assert!(!vulkan_compose_override_requested(
-            EmbeddingServerLaunchMode::ExternalEndpoint,
-            Some(&request)
-        ));
-        assert!(vulkan_compose_override_requested(
-            EmbeddingServerLaunchMode::DockerComposeEmbed,
-            Some(&request)
-        ));
-        assert!(!vulkan_compose_override_requested(
-            EmbeddingServerLaunchMode::DockerComposeEmbed,
-            None
-        ));
-    }
-
-    #[test]
-    fn bootstrap_progress_is_emitted_before_blocking_work() {
-        let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let progress_phases = std::rc::Rc::clone(&phases);
-        let action_phases = std::rc::Rc::clone(&phases);
-
-        with_bootstrap_progress(
-            &mut |phase| progress_phases.borrow_mut().push(phase),
-            "model/bootstrap",
-            || {
-                assert_eq!(&*action_phases.borrow(), &["model/bootstrap"]);
-                Ok(())
-            },
-        )
-        .expect("progress wrapper should return action result");
-
-        assert_eq!(&*phases.borrow(), &["model/bootstrap"]);
-    }
-
-    #[test]
-    fn native_explicit_executable_requires_absolute_file() {
-        let relative = validate_explicit_native_llama_server(PathBuf::from("llama-server.exe"))
-            .expect_err("relative executable must fail closed");
-        assert!(relative.to_string().contains("absolute path"));
-
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server.exe");
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        assert_eq!(
-            validate_explicit_native_llama_server(exe.clone()).expect("absolute file"),
-            exe
-        );
-    }
-
-    #[test]
-    fn native_executable_candidates_do_not_fall_back_to_path() {
-        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
-            path: PathBuf::from("llama-server.exe"),
-            backend: None,
-        }])
-        .expect_err("bare executable must not resolve through PATH");
-
-        assert!(
-            error
-                .to_string()
-                .contains("ambient PATH lookup is not allowed")
-        );
-    }
-
-    #[test]
-    fn windows_manifest_candidates_prefer_b9902_and_keep_legacy_b9058() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
-        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-
-        let candidates = native_llama_server_candidates(None);
-        let ids = candidates
-            .iter()
-            .filter_map(|candidate| {
-                candidate
-                    .backend
-                    .as_ref()
-                    .map(|backend| backend.id.as_str())
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            ids,
-            vec![
-                "windows-x86_64-vulkan",
-                "windows-x86_64-vulkan-b9058-legacy"
-            ]
-        );
-        assert!(
-            candidates[0]
-                .path
-                .display()
-                .to_string()
-                .contains("llama-b9902-bin-win-vulkan-x64")
-        );
-        assert!(
-            candidates[1]
-                .path
-                .display()
-                .to_string()
-                .contains("llama-b9058-bin-win-vulkan-x64")
-        );
-    }
-
-    #[test]
-    fn native_spawned_rejects_linux_compose_only_backend_metadata() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "linux/x86_64");
-        let _launch = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "native_spawned");
-        let _provider = EnvGuard::set("CODESTORY_EMBED_DEVICE_PROVIDER", "vulkan");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
-        let runtime =
-            crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
-
-        let error = native_embedding_server_launch(None, &runtime)
-            .expect_err("linux compose-only backend must not satisfy native_spawned");
-
-        assert!(
-            error
-                .to_string()
-                .contains("native_spawned is unsupported for provider=vulkan on linux/x86_64"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn legacy_windows_vulkan_cache_accepts_the_original_install_manifest_shape() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
-        let legacy = crate::config::llama_sidecar_backends("vulkan")
-            .into_iter()
-            .find(|backend| backend.id == "windows-x86_64-vulkan-b9058-legacy")
-            .expect("legacy windows vulkan backend");
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server.exe");
-        std::fs::write(&exe, b"legacy exe").expect("exe");
-
-        let missing_manifest =
-            native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
-                path: exe.clone(),
-                backend: Some(legacy.clone()),
-            }])
-            .expect_err("legacy cache still needs install manifest");
-        assert!(
-            missing_manifest
-                .to_string()
-                .contains("install-manifest.json")
-        );
-
-        let exe_sha = sha256_file(&exe).expect("exe sha");
-        let manifest = serde_json::json!({
-            "backend": legacy.id,
-            "artifact": legacy.artifact,
-            "artifact_sha256": legacy.sha256,
-            "executable_rel_path": legacy.executable_rel_path,
-            "executable_sha256": exe_sha,
-            "source_url": legacy.url,
-        });
-        std::fs::write(
-            temp.path().join("install-manifest.json"),
-            serde_json::to_vec_pretty(&manifest).expect("manifest"),
-        )
-        .expect("manifest write");
-        std::fs::write(temp.path().join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
-            .expect("marker write");
-        let mut legacy = legacy;
-        legacy.executable_sha256 = exe_sha;
-        let selected = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
-            path: exe.clone(),
-            backend: Some(legacy),
-        }])
-        .expect("legacy cache path with manifest");
-
-        assert_eq!(selected, exe);
-    }
-
-    #[test]
-    fn managed_native_candidate_rejects_manifest_blessed_wrong_executable() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
-        let backend =
-            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server");
-        std::fs::write(&exe, b"wrong exe").expect("exe");
-        let executable_sha = sha256_file(&exe).expect("sha");
-        std::fs::write(
-            temp.path().join("install-manifest.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "artifact": backend.artifact,
-                "artifact_bytes": backend.artifact_bytes,
-                "artifact_sha256": backend.sha256,
-                "executable_rel_path": backend.executable_rel_path,
-                "executable_sha256": executable_sha,
-            }))
-            .expect("manifest"),
-        )
-        .expect("manifest write");
-        std::fs::write(temp.path().join(MANAGED_LLAMA_EXTRACTED_MARKER), b"1")
-            .expect("marker write");
-
-        let error = native_llama_server_path_from_candidates(vec![NativeLlamaCandidate {
-            path: exe,
-            backend: Some(backend),
-        }])
-        .expect_err("cache manifest must not bless arbitrary executable bytes");
-
-        assert!(
-            error
-                .to_string()
-                .contains("executable manifest checksum mismatch")
-                || error.to_string().contains("executable checksum mismatch"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn managed_native_archive_member_path_must_be_contained() {
-        assert!(safe_archive_member_path("llama-b9902/llama-server").is_ok());
-        assert!(safe_archive_member_path("../llama-server").is_err());
-        assert!(safe_archive_member_path("/tmp/llama-server").is_err());
-        assert!(safe_archive_member_path("llama-b9902\\llama-server").is_err());
-    }
-
-    #[test]
-    fn managed_native_copy_rejects_symlink_escape() {
-        let temp = tempdir().expect("temp");
-        let source_dir = temp.path().join("payload");
-        let outside_dir = temp.path().join("outside");
-        std::fs::create_dir_all(&source_dir).expect("payload dir");
-        std::fs::create_dir_all(&outside_dir).expect("outside dir");
-        std::fs::write(outside_dir.join("lib.dylib"), b"outside").expect("outside file");
-
-        let error = copy_archive_symlinked_file_target(
-            &source_dir.join("libggml-rpc.0.dylib"),
-            &temp.path().join("install").join("libggml-rpc.0.dylib"),
-            &std::fs::canonicalize(&source_dir).expect("canonical source"),
-            Path::new("../outside/lib.dylib"),
-        )
-        .expect_err("escaping symlink should fail");
-
-        assert!(error.to_string().contains("escapes payload"));
-    }
-
-    #[test]
-    fn managed_native_install_extracts_archive_and_writes_manifest() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
-        let mut backend =
-            crate::config::selected_llama_sidecar_backend("metal").expect("mac metal backend");
-        let temp = tempdir().expect("temp");
-        let archive_root = temp.path().join("archive-root");
-        let payload_dir = archive_root.join("llama-b9902");
-        std::fs::create_dir_all(&payload_dir).expect("payload dir");
-        std::fs::write(payload_dir.join("llama-server"), b"fake exe").expect("payload exe");
-        std::fs::write(payload_dir.join("libllama-test.dylib"), b"fake dylib")
-            .expect("payload dylib");
-        backend.executable_archive_path = "llama-b9902/llama-server".to_string();
-        backend.executable_sha256 =
-            sha256_file(&payload_dir.join("llama-server")).expect("executable sha");
-        let archive = temp.path().join("llama-test.tar.gz");
-        let output = Command::new("tar")
-            .arg("-czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&archive_root)
-            .arg("llama-b9902")
-            .output()
-            .expect("tar");
-        assert!(
-            output.status.success(),
-            "tar failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        backend.artifact = "llama-test.tar.gz".to_string();
-        backend.sha256 = sha256_file(&archive).expect("archive sha");
-
-        let executable = temp
-            .path()
-            .join("managed-embeddings")
-            .join("llama")
-            .join("b9902")
-            .join("llama-b9902-bin-macos-arm64-metal")
-            .join("llama-server");
-        backend.artifact_bytes = std::fs::metadata(&archive).expect("archive metadata").len();
-        install_managed_native_llama_server_from_archive(
-            &backend,
-            &archive,
-            &temp.path().join("extract"),
-            &executable,
-        )
-        .expect("install");
-
-        assert_eq!(
-            std::fs::read(&executable).expect("installed exe"),
-            b"fake exe"
-        );
-        assert_eq!(
-            std::fs::read(executable.parent().unwrap().join("libllama-test.dylib"))
-                .expect("installed sibling"),
-            b"fake dylib"
-        );
-        assert!(
-            executable
-                .parent()
-                .unwrap()
-                .join(MANAGED_LLAMA_EXTRACTED_MARKER)
-                .is_file()
-        );
-        validate_managed_native_llama_server(&executable, &backend)
-            .expect("installed manifest validates");
-    }
-
-    #[test]
-    fn native_launch_args_use_model_port_and_default_vulkan_device() {
-        let _lock = crate::test_support::env_lock();
-        let _provider = EnvGuard::remove("CODESTORY_EMBED_DEVICE_PROVIDER");
-        let _name = EnvGuard::remove("CODESTORY_EMBED_DEVICE_NAME");
-        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "windows/x86_64");
-
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server.exe");
-        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        std::fs::write(&model, b"fake model").expect("model");
-        let runtime =
-            crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
-
-        let launch =
-            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
-        let model_arg = model.display().to_string();
-        let port_arg = runtime.embed_http_port.to_string();
-
-        assert_eq!(launch.executable, exe);
-        assert_eq!(launch.args[0], "--embedding");
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--model" && pair[1] == model_arg.as_str())
-        );
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--host" && pair[1] == "127.0.0.1")
-        );
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--port" && pair[1] == port_arg.as_str())
-        );
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
-        );
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--device" && pair[1] == "Vulkan0")
-        );
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--log-verbosity" && pair[1] == "4")
-        );
-        let metadata = embedding_launch_metadata(
-            &launch,
-            &runtime,
-            Some(temp.path()),
-            Some(NativeEmbeddingSpawn {
-                pid: 1234,
-                spawned_at_epoch_ms: 456,
-                newly_spawned: true,
-            }),
-        );
-        assert_eq!(metadata.provider, "llamacpp");
-        assert_eq!(metadata.launch_mode, "native_spawned");
-        assert_eq!(metadata.pid, Some(1234));
-        assert_eq!(metadata.spawned_at_epoch_ms, Some(456));
-        assert_eq!(metadata.launch_args, launch.args);
-        assert!(metadata.launch_fingerprint_sha256.is_some());
-        assert_eq!(metadata.executable_path, Some(exe.display().to_string()));
-        assert_eq!(metadata.model_path, Some(model.display().to_string()));
-        assert_eq!(metadata.requested_device.as_deref(), Some("Vulkan0"));
-    }
-
-    #[test]
-    fn metal_native_launch_uses_gpu_layers_and_proof_verbosity_without_device_arg() {
-        let _lock = crate::test_support::env_lock();
-        let _platform = EnvGuard::set("CODESTORY_TEST_HOST_PLATFORM", "macos/aarch64");
-        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server");
-        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        std::fs::write(&model, b"fake model").expect("model");
-        let runtime =
-            crate::config::test_sidecar_runtime_from_env(None, SidecarProfile::Local, None);
-
-        let launch =
-            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
-
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--n-gpu-layers" && pair[1] == "99")
-        );
-        assert!(
-            launch
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--log-verbosity" && pair[1] == "4")
-        );
-        assert!(!launch.args.iter().any(|arg| arg == "--device"));
-        let metadata = embedding_launch_metadata(&launch, &runtime, Some(temp.path()), None);
-        assert_eq!(metadata.requested_device, None);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn native_embedding_windows_spawn_requires_breakaway_from_job() {
-        let flags = NATIVE_EMBEDDING_WINDOWS_CREATION_FLAGS;
-        assert_ne!(flags & WINDOWS_DETACHED_PROCESS, 0);
-        assert_ne!(flags & WINDOWS_CREATE_NEW_PROCESS_GROUP, 0);
-        assert_ne!(flags & WINDOWS_CREATE_BREAKAWAY_FROM_JOB, 0);
-        assert_ne!(flags & WINDOWS_CREATE_NO_WINDOW, 0);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn native_embedding_spawn_guard_restores_standard_handle_inheritance() {
-        use std::os::windows::io::AsRawHandle;
-
-        let file = tempfile::tempfile().expect("temp file");
-        let handle = file.as_raw_handle();
-        windows_set_handle_inheritance(handle, true).expect("mark handle inheritable");
-        assert_ne!(
-            windows_handle_information(handle).expect("inheritable flags")
-                & WINDOWS_HANDLE_FLAG_INHERIT,
-            0
-        );
-
-        {
-            let _guard = WindowsStandardHandleInheritanceGuard::from_handles([handle])
-                .expect("clear inheritance");
-            assert_eq!(
-                windows_handle_information(handle).expect("guarded flags")
-                    & WINDOWS_HANDLE_FLAG_INHERIT,
-                0
-            );
-        }
-
-        assert_ne!(
-            windows_handle_information(handle).expect("restored flags")
-                & WINDOWS_HANDLE_FLAG_INHERIT,
-            0
-        );
-        windows_set_handle_inheritance(handle, false).expect("clear test inheritance");
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn native_embedding_breakaway_denied_classifies_permission_errors() {
-        assert!(native_embedding_breakaway_denied(&std::io::Error::from(
-            std::io::ErrorKind::PermissionDenied
-        )));
-        assert!(native_embedding_breakaway_denied(
-            &std::io::Error::from_raw_os_error(5)
-        ));
-        assert!(!native_embedding_breakaway_denied(&std::io::Error::from(
-            std::io::ErrorKind::NotFound
-        )));
-    }
-
-    #[test]
-    fn native_embedding_reuses_healthy_existing_endpoint() {
-        let reachable = crate::embeddings::EmbeddingRuntimeProbe {
-            reachable: true,
-            detail: "llama.cpp embeddings reachable dim=768".into(),
-            elapsed_ms: Some(12),
-        };
-        let unreachable = crate::embeddings::EmbeddingRuntimeProbe {
-            reachable: false,
-            detail: "llama.cpp embeddings unavailable".into(),
-            elapsed_ms: Some(5),
-        };
-
-        assert!(native_embedding_server_reusable(&reachable));
-        assert!(!native_embedding_server_reusable(&unreachable));
-    }
-
-    #[test]
-    fn native_embedding_reuse_only_refuses_unreachable_endpoint_before_spawn() {
-        let temp = tempdir().expect("temp");
-        let runtime = compose_test_runtime(temp.path());
-        let launch = native_embedding_server_launch_from_paths(
-            temp.path().join("missing-llama-server.exe"),
-            temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
-            &runtime,
-        );
-        let probe = crate::embeddings::EmbeddingRuntimeProbe {
-            reachable: false,
-            detail: "llama.cpp embeddings unavailable".into(),
-            elapsed_ms: Some(5),
-        };
-        std::fs::create_dir_all(launch.log_path.parent().expect("log parent")).expect("log parent");
-        std::fs::write(&launch.log_path, b"existing launch output\n").expect("existing log");
-
-        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, false, None, probe)
-            .expect_err("reuse-only lease must not fall through to spawn");
-
-        let error_text = format!("{error:?}");
-        assert!(
-            error_text.contains("reuse-only"),
-            "expected reuse-only error before spawn attempt, got {error:?}"
-        );
-        assert!(
-            !error_text.contains("missing-llama-server"),
-            "spawn path should not run under reuse-only lease: {error:?}"
-        );
-        let log = std::fs::read_to_string(&launch.log_path).expect("current log");
-        assert!(log.contains("existing launch output"));
-        assert!(log.contains("reuse-only"));
-        assert!(
-            !launch
-                .log_path
-                .with_file_name("llama-server-native.previous.log")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn native_embedding_new_spawn_rotates_log_before_attempt() {
-        let temp = tempdir().expect("temp");
-        let runtime = compose_test_runtime(temp.path());
-        let launch = native_embedding_server_launch_from_paths(
-            temp.path().join("missing-llama-server.exe"),
-            temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
-            &runtime,
-        );
-        std::fs::create_dir_all(launch.log_path.parent().expect("log parent")).expect("log parent");
-        std::fs::write(&launch.log_path, b"existing launch output\n").expect("existing log");
-        let probe = crate::embeddings::EmbeddingRuntimeProbe {
-            reachable: false,
-            detail: "llama.cpp embeddings unavailable".into(),
-            elapsed_ms: Some(5),
-        };
-        let mut observed = Vec::new();
-
-        spawn_native_embedding_server_with_probe_and_observer(
-            &launch,
-            &runtime,
-            None,
-            true,
-            None,
-            probe,
-            &mut |metadata| {
-                observed.push(metadata.clone());
-                Ok(())
-            },
-        )
-        .expect_err("missing executable must fail after rotation");
-
-        let current = std::fs::read_to_string(&launch.log_path).expect("current log");
-        assert!(!current.contains("existing launch output"));
-        assert!(current.contains("starting native llama.cpp embedding server"));
-        let previous = std::fs::read_to_string(
-            launch
-                .log_path
-                .with_file_name("llama-server-native.previous.log"),
-        )
-        .expect("previous log");
-        assert_eq!(previous, "existing launch output\n");
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            observed.len(),
-            2,
-            "gated spawn publishes pending and exact wrapper ownership before exec"
-        );
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(observed.len(), 1, "pending ownership precedes spawn");
-        assert_eq!(observed[0].pid, None);
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            observed[0].spawn_protocol.as_deref(),
-            Some(NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL)
-        );
-        let expected_executable = launch.executable.display().to_string();
-        assert_eq!(
-            observed[0].executable_path.as_deref(),
-            Some(expected_executable.as_str())
-        );
-    }
-
-    #[test]
-    fn native_embedding_spawn_continues_when_log_rotation_is_blocked() {
-        let temp = tempdir().expect("temp");
-        let runtime = compose_test_runtime(temp.path());
-        let launch = native_embedding_server_launch_from_paths(
-            temp.path().join("missing-llama-server.exe"),
-            temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF),
-            &runtime,
-        );
-        std::fs::create_dir_all(launch.log_path.parent().expect("log parent")).expect("log parent");
-        std::fs::write(&launch.log_path, b"existing launch output\n").expect("existing log");
-        std::fs::create_dir(
-            launch
-                .log_path
-                .with_file_name("llama-server-native.previous.log"),
-        )
-        .expect("block previous log publication");
-        let probe = crate::embeddings::EmbeddingRuntimeProbe {
-            reachable: false,
-            detail: "llama.cpp embeddings unavailable".into(),
-            elapsed_ms: Some(5),
-        };
-
-        let error = spawn_native_embedding_server_with_probe(&launch, &runtime, true, None, probe)
-            .expect_err("missing executable must still be the terminal failure");
-
-        let error = format!("{error:?}");
-        assert!(!error.contains("write bounded previous native embedding log"));
-        let current = std::fs::read_to_string(&launch.log_path).expect("current log");
-        assert!(current.contains("existing launch output"));
-        assert!(current.contains("starting native llama.cpp embedding server"));
-    }
-
-    #[test]
-    fn native_embedding_reuse_attaches_matching_state_pid() {
-        let _lock = crate::test_support::env_lock();
-        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server.exe");
-        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        std::fs::write(&model, b"fake model").expect("model");
-        let runtime = compose_test_runtime(temp.path());
-        let launch =
-            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
-        let launch_metadata = embedding_launch_metadata(
-            &launch,
-            &runtime,
-            Some(temp.path()),
-            Some(NativeEmbeddingSpawn {
-                pid: 4321,
-                spawned_at_epoch_ms: 123,
-                newly_spawned: true,
-            }),
-        );
-        sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
-            .expect("write state");
-
-        let mut validator_called = false;
-        let spawn = reusable_native_embedding_spawn_from_state_with_identity(
-            &runtime,
-            &launch,
-            |metadata| {
-                validator_called = true;
-                assert_eq!(metadata.pid, Some(4321));
-                Ok(4321)
-            },
-        )
-        .expect("read state")
-        .expect("matching pid");
-
-        assert_eq!(spawn.pid, 4321);
-        assert_eq!(spawn.spawned_at_epoch_ms, 123);
-        assert!(validator_called);
-    }
-
-    #[test]
-    fn native_embedding_reuse_bootstraps_from_owner_contract_without_borrower_model() {
-        let _lock = crate::test_support::env_lock();
-        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-
-        let owner = tempdir().expect("owner");
-        let borrower = tempdir().expect("borrower");
-        let executable = owner.path().join("llama-server");
-        let model = owner.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
-        std::fs::write(&executable, b"owner executable").expect("owner executable");
-        std::fs::write(&model, b"owner model").expect("owner model");
-        let owner_runtime = compose_test_runtime(owner.path());
-        let mut borrower_runtime = compose_test_runtime(borrower.path());
-        borrower_runtime
-            .use_broker_verified_native_embedding_endpoint(
-                owner_runtime.ownership().ports.embed_http,
-            )
-            .expect("reuse owner endpoint");
-        let owner_contract = native_embedding_launch_contract_from_paths(
-            executable.clone(),
-            model.clone(),
-            &owner_runtime,
-        );
-        assert!(owner_contract.model_sha256.is_some());
-
-        let selected = native_embedding_server_launch_for_bootstrap(
-            Some(borrower.path()),
-            &borrower_runtime,
-            Some(&owner_contract),
-        )
-        .expect("select verified owner launch");
-
-        assert_eq!(selected.executable, executable);
-        assert_eq!(selected.model_path, model);
-        assert_eq!(selected.model_sha256, owner_contract.model_sha256);
-        assert!(
-            !borrower
-                .path()
-                .join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF)
-                .exists(),
-            "bootstrap must not require a borrower model copy"
-        );
-    }
-
-    #[test]
-    fn native_embedding_bind_failure_is_detected_from_current_log_tail() {
-        let temp = tempdir().expect("temp");
-        let log = temp.path().join("llama-server.log");
-        std::fs::write(
-            &log,
-            b"old failure: address already in use\nstarting native llama.cpp embedding server: fixture\nerror: failed to bind HTTP server: Address already in use\n",
-        )
-        .expect("write bind failure log");
-        assert!(native_embedding_log_reports_bind_failure(&log));
-
-        std::fs::write(
-            &log,
-            b"old failure: address already in use\nsrv  llama_server: listening on http://127.0.0.1:18080\nstarting native llama.cpp embedding server: fixture\nsrv  llama_server: listening on http://127.0.0.1:18081\n",
-        )
-        .expect("write healthy log");
-        assert!(!native_embedding_log_reports_bind_failure(&log));
-        assert!(native_embedding_log_reports_listener(
-            &log,
-            "http://127.0.0.1:18081/v1/embeddings"
-        ));
-        assert!(
-            !native_embedding_log_reports_listener(&log, "http://127.0.0.1:18080/v1/embeddings"),
-            "a stale prior-launch listener marker must not prove the current launch"
-        );
-
-        let mut boundary_log = b"x".to_vec();
-        boundary_log.extend_from_slice("ü".as_bytes());
-        let mut current_launch = b"starting native llama.cpp embedding server: fixture\nerror: failed to bind HTTP server: Address already in use\n".to_vec();
-        current_launch.resize(64 * 1024 - 1, b'x');
-        boundary_log.extend_from_slice(&current_launch);
-        std::fs::write(&log, boundary_log).expect("write Unicode-boundary bind failure log");
-        assert!(
-            native_embedding_log_reports_bind_failure(&log),
-            "a multibyte character split at the bounded tail must not hide the current launch"
-        );
-    }
-
-    #[test]
-    fn native_embedding_reuse_rejects_identity_mismatch() {
-        let _lock = crate::test_support::env_lock();
-        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server.exe");
-        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        std::fs::write(&model, b"fake model").expect("model");
-        let runtime = compose_test_runtime(temp.path());
-        let launch =
-            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
-        let launch_metadata = embedding_launch_metadata(
-            &launch,
-            &runtime,
-            Some(temp.path()),
-            Some(NativeEmbeddingSpawn {
-                pid: 4321,
-                spawned_at_epoch_ms: 123,
-                newly_spawned: true,
-            }),
-        );
-        sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
-            .expect("write state");
-
-        let error =
-            reusable_native_embedding_spawn_from_state_with_identity(&runtime, &launch, |_| {
-                bail!("identity_unverified: wrong executable")
-            })
-            .expect_err("identity mismatch should fail closed");
-
-        let error_text = format!("{error:?}");
-        assert!(
-            error_text.contains("identity_unverified"),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn native_embedding_reuse_rejects_matching_state_without_pid() {
-        let _lock = crate::test_support::env_lock();
-        let _device = EnvGuard::remove("CODESTORY_EMBED_LLAMACPP_DEVICE");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-
-        let temp = tempdir().expect("temp");
-        let exe = temp.path().join("llama-server.exe");
-        let model = temp.path().join(crate::embeddings::BGE_BASE_EN_V1_5_GGUF);
-        std::fs::write(&exe, b"fake exe").expect("exe");
-        std::fs::write(&model, b"fake model").expect("model");
-        let runtime = compose_test_runtime(temp.path());
-        let launch =
-            native_embedding_server_launch_from_paths(exe.clone(), model.clone(), &runtime);
-        let mut launch_metadata = embedding_launch_metadata(
-            &launch,
-            &runtime,
-            Some(temp.path()),
-            Some(NativeEmbeddingSpawn {
-                pid: 4321,
-                spawned_at_epoch_ms: 123,
-                newly_spawned: true,
-            }),
-        );
-        launch_metadata.pid = None;
-        sidecar_up_with_runtime_and_launch_metadata(&runtime, None, Some(launch_metadata))
-            .expect("write state");
-
-        assert!(
-            reusable_native_embedding_spawn_from_state(&runtime, &launch)
-                .expect("read state")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn repo_compose_file_still_wins_over_bundled_fallback() {
-        let project = tempdir().expect("project");
-        let compose = project.path().join(DEFAULT_COMPOSE_REL_PATH);
-        std::fs::create_dir_all(compose.parent().expect("compose parent"))
-            .expect("create compose parent");
-        std::fs::write(&compose, "services: {}\n").expect("write compose");
-
-        let resolved = resolve_compose_file(Some(project.path()), None).expect("resolve compose");
-
-        assert_eq!(resolved, compose);
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
 }

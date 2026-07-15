@@ -20,15 +20,11 @@ use std::time::{Duration, SystemTime};
 
 pub const DEFAULT_EMBED_HTTP_PORT: u16 = 8080;
 pub const DEFAULT_AGENT_RUN_ID: &str = "shared-agent";
-pub const NATIVE_LLAMA_MANAGED_CACHE_REL_PATH: &str =
-    "managed-embeddings/llama/b9058/llama-b9058-bin-win-vulkan-x64/llama-server.exe";
-pub const NATIVE_LLAMA_SOURCE_CACHE_REL_PATH: &str = "target/llamacpp/b8840/llama-server.exe";
 const LLAMA_SIDECAR_BACKENDS_JSON: &str = include_str!("../assets/llama-sidecar-backends.json");
 const TEST_HOST_PLATFORM_ENV: &str = "CODESTORY_TEST_HOST_PLATFORM";
 pub(crate) const LOCAL_SIDECAR_NAMESPACE_V3: &str = "codestory-v3";
 pub(crate) const AGENT_SIDECAR_NAMESPACE_PREFIX_V3: &str = "codestory-agent-v3-";
 pub(crate) const SIDECAR_STATE_FILE_V3: &str = "retrieval-sidecars-v3.json";
-pub(crate) const LEGACY_SIDECAR_STATE_FILE: &str = "retrieval-sidecars.json";
 const EMBEDDING_ENDPOINT_FINGERPRINT_KEY_FILE: &str = "embedding-endpoint-fingerprint-hmac.key";
 const EMBEDDING_ENDPOINT_FINGERPRINT_KEY_LOCK_FILE: &str =
     "embedding-endpoint-fingerprint-hmac.lock";
@@ -96,7 +92,6 @@ pub(crate) struct LlamaSidecarBackend {
     pub os: String,
     pub arch: String,
     pub provider: String,
-    pub launch_mode: String,
     pub artifact: String,
     #[serde(default)]
     pub artifact_bytes: u64,
@@ -163,6 +158,7 @@ fn llama_sidecar_backend_manifest() -> LlamaSidecarBackendManifest {
 #[derive(Debug, Clone)]
 pub struct SidecarLayout {
     pub lexical_data_dir: PathBuf,
+    pub semantic_data_dir: PathBuf,
     pub scip_artifacts_root: PathBuf,
     pub state_file: PathBuf,
 }
@@ -340,7 +336,6 @@ pub struct SidecarOwnership {
     #[serde(default)]
     pub embedding_endpoint_origin: EmbeddingEndpointOrigin,
     pub embedding_endpoint_fingerprint_sha256: String,
-    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,7 +347,6 @@ pub struct SidecarRuntimeConfig {
     pub namespace: String,
     pub embed_http_port: u16,
     pub cleanup_command: String,
-    pub labels: BTreeMap<String, String>,
     pub embedding: EmbeddingRuntimeConfig,
     pub retrieval: RetrievalRuntimeConfig,
     pub summary: SummaryRuntimeConfig,
@@ -569,48 +563,13 @@ impl SidecarRuntimeConfig {
         };
         let layout = SidecarLayout {
             lexical_data_dir: root.join("lexical"),
+            semantic_data_dir: root.join("semantic"),
             scip_artifacts_root: root.join("scip"),
             state_file: state_file.clone(),
         };
         let cleanup_command = project_root
             .map(|path| retrieval_command("down", path, profile, run_id.as_deref(), None))
             .unwrap_or_else(|| "codestory-cli retrieval down".to_string());
-        let mut labels = BTreeMap::new();
-        labels.insert("dev.codestory.owner".into(), "codestory".into());
-        labels.insert("dev.codestory.profile".into(), profile.as_str().into());
-        labels.insert("dev.codestory.namespace".into(), namespace.clone());
-        if let Some(project_root) = project_root {
-            if let Some(identity) = project_identity.as_ref() {
-                labels.insert(
-                    "dev.codestory.project_hash".into(),
-                    identity.workspace_id.clone(),
-                );
-                labels.insert(
-                    "dev.codestory.project_id".into(),
-                    identity.project_id.clone(),
-                );
-                labels.insert(
-                    "dev.codestory.workspace_id".into(),
-                    identity.workspace_id.clone(),
-                );
-                labels.insert(
-                    "dev.codestory.artifact_scope_id".into(),
-                    identity.artifact_scope_id.clone(),
-                );
-                labels.insert(
-                    "dev.codestory.project_identity_schema_version".into(),
-                    identity.project_identity_schema_version.to_string(),
-                );
-            }
-            labels.insert(
-                "dev.codestory.workspace_root".into(),
-                project_root.to_string_lossy().to_string(),
-            );
-        }
-        if let Some(run_id) = run_id.as_deref() {
-            labels.insert("dev.codestory.run_id".into(), run_id.to_string());
-            labels.insert("dev.codestory.agent_id".into(), run_id.to_string());
-        }
         let mut embedding = embedding_runtime_config(embed_http_port, defaults, overrides);
         if embedding.endpoint_origin == EmbeddingEndpointOrigin::ManagedSidecar
             && let Some(stored_endpoint) = stored
@@ -637,7 +596,6 @@ impl SidecarRuntimeConfig {
             namespace,
             embed_http_port,
             cleanup_command,
-            labels,
             embedding,
             retrieval,
             summary,
@@ -662,13 +620,7 @@ impl SidecarRuntimeConfig {
             embedding_endpoint_fingerprint_sha256: self
                 .embedding_endpoint_fingerprint()
                 .unwrap_or_default(),
-            labels: self.labels.clone(),
         }
-    }
-
-    #[doc(hidden)]
-    pub fn legacy_state_path_for_compatibility(&self) -> Option<PathBuf> {
-        legacy_state_path_for_runtime(self)
     }
 
     pub(crate) fn embedding_endpoint_fingerprint(&self) -> Result<String> {
@@ -938,7 +890,11 @@ impl SidecarLayout {
     }
 
     pub fn ensure_data_dirs(&self) -> Result<()> {
-        for dir in [&self.lexical_data_dir, &self.scip_artifacts_root] {
+        for dir in [
+            &self.lexical_data_dir,
+            &self.semantic_data_dir,
+            &self.scip_artifacts_root,
+        ] {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("create sidecar data dir {}", dir.display()))?;
         }
@@ -1243,70 +1199,6 @@ fn agent_namespace_prefix(project_root: &Path) -> String {
         "{AGENT_SIDECAR_NAMESPACE_PREFIX_V3}{}-",
         codestory_workspace::workspace_id_v3_for_root(project_root)
     )
-}
-
-fn legacy_agent_namespace_prefix(project_root: &Path) -> String {
-    format!(
-        "codestory-agent-{}-",
-        fnv1a_hex(project_root.to_string_lossy().as_bytes())
-    )
-}
-
-pub(crate) fn legacy_state_file_for_runtime(runtime: &SidecarRuntimeConfig) -> Option<PathBuf> {
-    let path = legacy_state_path_for_runtime(runtime)?;
-    let metadata = std::fs::symlink_metadata(&path).ok()?;
-    if !metadata.file_type().is_file() {
-        return None;
-    }
-    let legacy_namespace = match runtime.profile {
-        SidecarProfile::Local => "codestory",
-        SidecarProfile::Agent => path.parent()?.file_name()?.to_str()?,
-    };
-    let value = read_sidecar_state_value(&path)?;
-    let project_identity_matches = match runtime.labels.get("dev.codestory.workspace_root") {
-        Some(project_root) => value
-            .get("project_identity")
-            .cloned()
-            .and_then(|identity| serde_json::from_value(identity).ok())
-            .is_some_and(|stored: codestory_workspace::ProjectIdentityV2| {
-                stored == codestory_workspace::project_identity_v2(Path::new(project_root))
-            }),
-        None => value
-            .get("project_identity")
-            .is_none_or(serde_json::Value::is_null),
-    };
-    let owned_legacy_state = value.get("owner").and_then(serde_json::Value::as_str)
-        == Some("codestory")
-        && value.get("profile").and_then(serde_json::Value::as_str)
-            == Some(runtime.profile.as_str())
-        && value.get("namespace").and_then(serde_json::Value::as_str) == Some(legacy_namespace)
-        && value
-            .get("compose_project")
-            .and_then(serde_json::Value::as_str)
-            == Some(legacy_namespace)
-        && value.get("run_id").and_then(serde_json::Value::as_str) == runtime.run_id.as_deref()
-        && project_identity_matches;
-    owned_legacy_state.then_some(path)
-}
-
-pub(crate) fn legacy_state_path_for_runtime(runtime: &SidecarRuntimeConfig) -> Option<PathBuf> {
-    let cache_root = runtime.cache_root()?;
-    let path = match runtime.profile {
-        SidecarProfile::Local => cache_root.join(LEGACY_SIDECAR_STATE_FILE),
-        SidecarProfile::Agent => {
-            let project_root = Path::new(runtime.labels.get("dev.codestory.workspace_root")?);
-            let legacy_namespace = format!(
-                "{}{}",
-                legacy_agent_namespace_prefix(project_root),
-                runtime.run_id.as_deref().unwrap_or("run")
-            );
-            cache_root
-                .join("sidecars")
-                .join(legacy_namespace)
-                .join(LEGACY_SIDECAR_STATE_FILE)
-        }
-    };
-    (path != runtime.layout.state_file).then_some(path)
 }
 
 fn latest_agent_run_id_in_cache(project_root: &Path, cache_root: &Path) -> Option<String> {
@@ -1890,6 +1782,7 @@ fn automatic_unit_test_cache_root() -> Option<PathBuf> {
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
+#[allow(dead_code)]
 pub fn with_test_cache_root<T>(root: &Path, task: impl FnOnce() -> T) -> T {
     struct Reset(Option<PathBuf>);
     impl Drop for Reset {
@@ -1903,10 +1796,6 @@ pub fn with_test_cache_root<T>(root: &Path, task: impl FnOnce() -> T) -> T {
         TEST_CACHE_ROOT_OVERRIDE.with(|current| current.replace(Some(root.to_path_buf())));
     let _reset = Reset(previous);
     task()
-}
-
-pub fn embedding_server_launch_mode() -> Result<EmbeddingServerLaunchMode> {
-    embedding_server_launch_mode_for_runtime(&SidecarRuntimeConfig::local())
 }
 
 pub fn embedding_server_launch_mode_for_runtime(
@@ -2050,18 +1939,6 @@ mod tests {
             codestory_workspace::PROJECT_IDENTITY_V3_SCHEMA_VERSION
         );
 
-        assert_eq!(
-            runtime.labels.get("dev.codestory.project_id"),
-            Some(&identity.project_id)
-        );
-        assert_eq!(
-            runtime.labels.get("dev.codestory.workspace_id"),
-            Some(&identity.workspace_id)
-        );
-        assert_eq!(
-            runtime.labels.get("dev.codestory.artifact_scope_id"),
-            Some(&identity.artifact_scope_id)
-        );
         assert!(
             runtime
                 .namespace
@@ -2190,88 +2067,6 @@ mod tests {
             .expect_err("identity drift must fail closed");
 
         assert!(format!("{error:#}").contains("project identity changed"));
-    }
-
-    #[test]
-    fn legacy_agent_namespace_is_discovered_but_not_selected() {
-        let cache = tempdir().expect("cache");
-        let project = tempdir().expect("project");
-        let noncanonical_project = project.path().join(".");
-        let run_id = "legacy-run";
-        let legacy_namespace = format!(
-            "{}{}",
-            legacy_agent_namespace_prefix(&noncanonical_project),
-            run_id
-        );
-        let legacy_state_file = cache
-            .path()
-            .join("sidecars")
-            .join(&legacy_namespace)
-            .join(LEGACY_SIDECAR_STATE_FILE);
-        std::fs::create_dir_all(legacy_state_file.parent().expect("legacy state parent"))
-            .expect("legacy state directory");
-        std::fs::write(&legacy_state_file, b"{}\n").expect("legacy state file");
-
-        let runtime = test_sidecar_runtime_in_cache(
-            Some(&noncanonical_project),
-            SidecarProfile::Agent,
-            Some(run_id),
-            cache.path(),
-        );
-
-        assert_eq!(legacy_state_file_for_runtime(&runtime), None);
-        let legacy_identity = codestory_workspace::project_identity_v2(&noncanonical_project);
-        std::fs::write(
-            &legacy_state_file,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "project_identity": legacy_identity,
-                "owner": "codestory",
-                "profile": "agent",
-                "namespace": legacy_namespace,
-                "compose_project": legacy_namespace,
-                "run_id": run_id,
-            }))
-            .expect("owned legacy state json"),
-        )
-        .expect("owned legacy state");
-
-        assert_eq!(
-            legacy_state_file_for_runtime(&runtime).as_ref(),
-            Some(&legacy_state_file)
-        );
-        assert_ne!(runtime.layout.state_file, legacy_state_file);
-        assert_eq!(
-            latest_agent_run_id_in_cache(&noncanonical_project, cache.path()),
-            None
-        );
-
-        let v3_run_id = "current-run";
-        let v3_runtime = test_sidecar_runtime_in_cache(
-            Some(&noncanonical_project),
-            SidecarProfile::Agent,
-            Some(v3_run_id),
-            cache.path(),
-        );
-        std::fs::create_dir_all(
-            v3_runtime
-                .layout
-                .state_file
-                .parent()
-                .expect("v3 state parent"),
-        )
-        .expect("v3 state directory");
-        let mut v3_state = serde_json::to_value(v3_runtime.ownership()).expect("v3 ownership");
-        v3_state["run_id"] = serde_json::json!(v3_run_id);
-        std::fs::write(
-            &v3_runtime.layout.state_file,
-            serde_json::to_vec_pretty(&v3_state).expect("owned v3 state json"),
-        )
-        .expect("owned v3 state");
-
-        assert_eq!(
-            latest_agent_run_id_in_cache(&noncanonical_project, cache.path()).as_deref(),
-            Some(v3_run_id)
-        );
     }
 
     #[test]
@@ -2582,7 +2377,7 @@ mod tests {
     #[test]
     fn external_endpoint_forces_external_launch_instead_of_managed_launch() {
         let _lock = crate::test_support::env_lock();
-        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "docker_compose_embed");
+        let _mode = EnvGuard::set("CODESTORY_EMBED_SERVER_LAUNCH", "external_endpoint");
         let endpoint = "http://127.0.0.1:37040/v1/embeddings";
         let _url = EnvGuard::set("CODESTORY_EMBED_LLAMACPP_URL", endpoint);
         let runtime = test_sidecar_runtime_from_env(None, SidecarProfile::Agent, None);
@@ -2649,7 +2444,6 @@ mod tests {
         );
         let backend = selected_llama_sidecar_backend("cpu").expect("macOS Intel CPU backend");
         assert_eq!(backend.id, "macos-x86_64-cpu");
-        assert_eq!(backend.launch_mode, "native_spawned");
         assert_eq!(backend.executable_archive_path, "llama-b9902/llama-server");
     }
 
@@ -2680,14 +2474,7 @@ mod tests {
         assert_eq!(selected.artifact, "llama-b9902-bin-win-vulkan-x64.zip");
         assert_eq!(selected.executable_archive_path, "llama-server.exe");
         assert!(selected.managed_cache_rel_dir.contains("/llama/b9902/"));
-        assert!(
-            matching
-                .iter()
-                .any(|backend| backend.id == "windows-x86_64-vulkan-b9058-legacy"
-                    && backend.artifact == "llama-b9058-bin-win-vulkan-x64.zip"
-                    && !backend.sha256.is_empty()
-                    && !backend.executable_sha256.is_empty())
-        );
+        assert_eq!(matching.len(), 1);
     }
 
     #[test]
@@ -2699,11 +2486,9 @@ mod tests {
         let cpu = selected_llama_sidecar_backend("cpu").expect("linux CPU backend");
 
         assert_eq!(vulkan.id, "linux-x86_64-vulkan");
-        assert_eq!(vulkan.launch_mode, "native_spawned");
         assert_eq!(vulkan.artifact, "llama-b9902-bin-ubuntu-vulkan-x64.tar.gz");
         assert!(!vulkan.sha256.is_empty());
         assert_eq!(cpu.id, "linux-x86_64-cpu");
-        assert_eq!(cpu.launch_mode, "native_spawned");
         assert_eq!(selected_llama_sidecar_backend("cuda"), None);
     }
 
@@ -2715,7 +2500,6 @@ mod tests {
         let vulkan = selected_llama_sidecar_backend("vulkan").expect("linux arm64 vulkan backend");
 
         assert_eq!(vulkan.id, "linux-aarch64-vulkan");
-        assert_eq!(vulkan.launch_mode, "native_spawned");
         assert_eq!(
             vulkan.artifact,
             "llama-b9902-bin-ubuntu-vulkan-arm64.tar.gz"

@@ -12,7 +12,7 @@ pub struct RetrievalCacheKey {
     pub core_run_id: Option<String>,
     pub project_id: String,
     pub lexical_version: String,
-    pub qdrant_collection: String,
+    pub semantic_generation: String,
     pub scip_revision: Option<String>,
     pub sidecar_generation: Option<String>,
     pub sidecar_input_hash: Option<String>,
@@ -31,7 +31,7 @@ impl RetrievalCacheKey {
             core_run_id: None,
             project_id: manifest.project_id.clone(),
             lexical_version: manifest.lexical_version.clone(),
-            qdrant_collection: manifest.qdrant_collection.clone(),
+            semantic_generation: manifest.semantic_generation.clone(),
             scip_revision: manifest.scip_revision.clone(),
             sidecar_generation: manifest.sidecar_generation.clone(),
             sidecar_input_hash: manifest.sidecar_input_hash.clone(),
@@ -183,7 +183,7 @@ mod tests {
             core_run_id: None,
             project_id: "abc".into(),
             lexical_version: "v1".into(),
-            qdrant_collection: "codestory_abc".into(),
+            semantic_generation: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
             sidecar_input_hash: Some("hash".into()),
@@ -206,7 +206,7 @@ mod tests {
             core_run_id: None,
             project_id: "abc".into(),
             lexical_version: "v1".into(),
-            qdrant_collection: "codestory_abc".into(),
+            semantic_generation: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
             sidecar_input_hash: Some("hash".into()),
@@ -247,7 +247,7 @@ mod tests {
             core_run_id: None,
             project_id: "abc".into(),
             lexical_version: "v1".into(),
-            qdrant_collection: "codestory_abc".into(),
+            semantic_generation: "codestory_abc".into(),
             scip_revision: None,
             sidecar_generation: Some("abc-hash".into()),
             sidecar_input_hash: Some("hash".into()),
@@ -298,7 +298,7 @@ mod tests {
         let base = RetrievalIndexManifest {
             project_id: "abc".into(),
             lexical_version: "v1".into(),
-            qdrant_collection: "codestory_abc_hash_a".into(),
+            semantic_generation: "codestory_abc_hash_a".into(),
             scip_revision: Some("scip-a".into()),
             built_at_epoch_ms: 0,
             disk_bytes: None,
@@ -320,7 +320,7 @@ mod tests {
             precise_semantic_import_producer: None,
         };
         let mut changed = base.clone();
-        changed.qdrant_collection = "codestory_abc_hash_b".into();
+        changed.semantic_generation = "codestory_abc_hash_b".into();
         changed.sidecar_input_hash = Some("hash-b".into());
         changed.sidecar_generation = Some("abc-hash-b".into());
 
@@ -334,7 +334,7 @@ mod tests {
             core_run_id: "run-a".into(),
             sidecar_generation: "abc-hash-a".into(),
             sidecar_input_hash: "hash-a".into(),
-            qdrant_collection: base.qdrant_collection.clone(),
+            semantic_generation: base.semantic_generation.clone(),
         };
         let second = crate::executor::RetrievalPublicationIdentity {
             core_generation_id: "core-b".into(),

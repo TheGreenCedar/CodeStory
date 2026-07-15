@@ -5,7 +5,6 @@ param(
     [switch]$CheckOnly,
     [switch]$DryRun,
     [switch]$SkipBuild,
-    [switch]$SkipCompose,
     [switch]$SkipStatus,
     [switch]$WithHoldoutClone,
     [switch]$FetchEmbedModel,
@@ -36,7 +35,6 @@ $mjs = Join-Path $scriptDir "setup-retrieval-env.mjs"
 $nodeArgs = @($mjs)
 if ($CheckOnly -or $DryRun) { $nodeArgs += "--check-only" }
 if ($SkipBuild) { $nodeArgs += "--skip-build" }
-if ($SkipCompose) { $nodeArgs += "--skip-compose" }
 if ($SkipStatus) { $nodeArgs += "--skip-status" }
 if ($WithHoldoutClone) { $nodeArgs += "--with-holdout-clone" }
 if ($FetchEmbedModel) { $nodeArgs += "--fetch-embed-model" }

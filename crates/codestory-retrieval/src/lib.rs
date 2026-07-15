@@ -12,7 +12,6 @@
 mod cache;
 mod candidate;
 mod capabilities;
-mod compose;
 mod config;
 mod embedded_vector;
 mod embeddings;
@@ -25,6 +24,7 @@ mod lexical_client;
 mod lexical_index;
 mod managed_assets;
 mod mode;
+mod native_embedding;
 pub mod outbound_http;
 mod planner;
 mod port_registry;
@@ -45,24 +45,11 @@ pub use cache::{RetrievalCache, RetrievalCacheKey};
 pub use candidate::{CandidateHit, CandidateSource, RankFeatures};
 pub use candidate::{is_phantom_sidecar_hit, phantom_sidecar_candidates_only};
 pub use capabilities::SidecarCapabilities;
-pub use compose::{
-    BootstrapReport, BootstrapSidecarsOptions, DEFAULT_COMPOSE_REL_PATH, EmbedModelInventory,
-    ManagedAssetPrewarmReport, NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL,
-    NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON, NativeEmbeddingStartupCleanupFailure,
-    bootstrap_sidecars, bootstrap_sidecars_with_profile, bootstrap_sidecars_with_runtime,
-    bootstrap_sidecars_with_runtime_progress,
-    bootstrap_sidecars_with_runtime_progress_and_native_launch_observer, docker_available,
-    embed_model_inventory, expected_native_embedding_launch_metadata,
-    native_embedding_launch_contract_from_paths, native_embedding_launch_matches_runtime_for_reuse,
-    native_embedding_startup_cleanup_failure, prewarm_managed_assets, resolve_compose_file,
-};
 pub use config::{
-    DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, DEFAULT_QDRANT_GRPC_PORT,
-    DEFAULT_QDRANT_HTTP_PORT, EmbeddingEndpointOrigin, EmbeddingRuntimeConfig,
-    EmbeddingServerLaunchMode, QDRANT_IMAGE_PIN, RetrievalRuntimeConfig, SidecarImagePins,
-    SidecarLayout, SidecarOwnership, SidecarPorts, SidecarProcessDefaults, SidecarProfile,
-    SidecarRuntimeConfig, SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
-    VectorBackend, default_sidecar_image_pins, embedding_server_launch_mode,
+    DEFAULT_AGENT_RUN_ID, DEFAULT_EMBED_HTTP_PORT, EmbeddingEndpointOrigin, EmbeddingRuntimeConfig,
+    EmbeddingServerLaunchMode, RetrievalRuntimeConfig, SidecarLayout, SidecarOwnership,
+    SidecarPorts, SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig,
+    SidecarRuntimeDefaults, SidecarRuntimeOverrides, SummaryRuntimeConfig,
     embedding_server_launch_mode_for_runtime, sidecar_process_defaults, user_cache_root,
 };
 #[cfg(feature = "test-support")]
@@ -94,14 +81,22 @@ pub use index::{
     finalize_index_for_runtime_with_progress, project_id_for_root, sidecar_project_id_for_root,
 };
 pub use inventory::{
-    SidecarDockerResource, SidecarDockerResourceKind, SidecarGcNamespaceResult, SidecarGcReport,
-    SidecarInventoryEntry, SidecarInventoryReport, SidecarInventoryState, sidecar_gc_apply,
-    sidecar_gc_apply_with_storage, sidecar_inventory, sidecar_inventory_with_storage,
+    SidecarGcNamespaceResult, SidecarGcReport, SidecarInventoryEntry, SidecarInventoryReport,
+    SidecarInventoryState, sidecar_gc_apply_with_storage, sidecar_inventory_with_storage,
 };
 pub use lexical_client::LexicalClient;
 pub use lexical_index::LEXICAL_INDEX_VERSION;
 pub use mode::RetrievalDegradedMode;
 pub use mode::derive_degraded_mode;
+pub use native_embedding::{
+    BootstrapReport, BootstrapSidecarsOptions, EmbedModelInventory, ManagedAssetPrewarmReport,
+    NATIVE_EMBEDDING_DARWIN_EXEC_GATE_PROTOCOL, NATIVE_EMBEDDING_PORT_BIND_FAILED_REASON,
+    NativeEmbeddingStartupCleanupFailure,
+    bootstrap_sidecars_with_runtime_progress_and_native_launch_observer, embed_model_inventory,
+    expected_native_embedding_launch_metadata, native_embedding_launch_contract_from_paths,
+    native_embedding_launch_matches_runtime_for_reuse, native_embedding_startup_cleanup_failure,
+    prewarm_managed_assets,
+};
 pub use planner::{PlannedStage, RetrievalPlan, RetrievalStageKind, plan_query};
 pub use process_identity::{
     ProcessOwnerState, ProcessStartProbe, native_embedding_process_start_identity,
@@ -124,12 +119,10 @@ pub use scip_client::ScipClient;
 pub use sidecar::{
     EmbeddingLaunchOwnership, NativeEmbeddingLaunchIdentityStatus, SidecarStateFile,
     attached_native_embedding_state_paths, ensure_native_embedding_launch_identity,
-    native_embedding_launch_identity_status, sidecar_down,
-    sidecar_down_after_failed_bootstrap_for_runtime, sidecar_down_for_project,
-    sidecar_down_for_runtime, sidecar_state_matches_runtime, sidecar_status, sidecar_up,
-    sidecar_up_with_runtime, sidecar_up_with_runtime_preserving_launch,
-    stop_native_embedding_process_for_launch, strict_sidecar_status,
-    strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
+    native_embedding_launch_identity_status, sidecar_down_after_failed_bootstrap_for_runtime,
+    sidecar_down_for_runtime, sidecar_state_matches_runtime, sidecar_status,
+    sidecar_up_with_runtime_preserving_launch, stop_native_embedding_process_for_launch,
+    strict_sidecar_status, strict_sidecar_status_for_profile, strict_sidecar_status_for_runtime,
     validate_sidecar_state_matches_runtime,
 };
 pub use sidecar_search::{LiveSidecarSearch, SidecarSearch};

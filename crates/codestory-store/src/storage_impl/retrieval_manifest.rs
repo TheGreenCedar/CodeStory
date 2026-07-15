@@ -6,7 +6,7 @@ const MANIFEST_SELECT: &str = "
     SELECT
         project_id,
         lexical_version,
-        qdrant_collection,
+        semantic_generation,
         scip_revision,
         built_at_epoch_ms,
         disk_bytes,
@@ -38,7 +38,7 @@ const MANIFEST_SELECT: &str = "
 pub struct RetrievalIndexManifest {
     pub project_id: String,
     pub lexical_version: String,
-    pub qdrant_collection: String,
+    pub semantic_generation: String,
     pub scip_revision: Option<String>,
     pub built_at_epoch_ms: i64,
     pub disk_bytes: Option<i64>,
@@ -48,7 +48,7 @@ pub struct RetrievalIndexManifest {
     pub embedding_dim: Option<i32>,
     /// Version of the sidecar input hash/generation contract.
     pub sidecar_schema_version: Option<i32>,
-    /// Stable hash of all local inputs used to build lexical, Qdrant, and SCIP artifacts.
+    /// Stable hash of all local inputs used to build lexical, Semantic, and SCIP artifacts.
     pub sidecar_input_hash: Option<String>,
     /// Artifact generation id used for lexical/SCIP directories.
     pub sidecar_generation: Option<String>,
@@ -56,7 +56,7 @@ pub struct RetrievalIndexManifest {
     pub projection_count: Option<i64>,
     /// Number of graph-native symbol-search docs included in the sidecar input hash.
     pub symbol_doc_count: Option<i64>,
-    /// Number of dense semantic anchors included in Qdrant.
+    /// Number of dense semantic anchors included in Semantic.
     pub dense_projection_count: Option<i64>,
     pub semantic_policy_version: Option<String>,
     pub graph_artifact_hash: Option<String>,
@@ -77,7 +77,7 @@ impl Storage {
             "INSERT INTO retrieval_index_manifest (
                 project_id,
                 lexical_version,
-                qdrant_collection,
+                semantic_generation,
                 scip_revision,
                 built_at_epoch_ms,
                 disk_bytes,
@@ -100,7 +100,7 @@ impl Storage {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
             ON CONFLICT(project_id) DO UPDATE SET
                 lexical_version = excluded.lexical_version,
-                qdrant_collection = excluded.qdrant_collection,
+                semantic_generation = excluded.semantic_generation,
                 scip_revision = excluded.scip_revision,
                 built_at_epoch_ms = excluded.built_at_epoch_ms,
                 disk_bytes = excluded.disk_bytes,
@@ -123,7 +123,7 @@ impl Storage {
             rusqlite::params![
                 manifest.project_id,
                 manifest.lexical_version,
-                manifest.qdrant_collection,
+                manifest.semantic_generation,
                 manifest.scip_revision,
                 manifest.built_at_epoch_ms,
                 manifest.disk_bytes,
@@ -179,11 +179,11 @@ impl Storage {
         Ok(manifests)
     }
 
-    /// Return Qdrant collection names referenced by stored retrieval manifests.
-    pub fn list_retrieval_qdrant_collections(&self) -> Result<Vec<String>, StorageError> {
+    /// Return Semantic collection names referenced by stored retrieval manifests.
+    pub fn list_retrieval_semantic_generations(&self) -> Result<Vec<String>, StorageError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT qdrant_collection FROM retrieval_index_manifest")?;
+            .prepare("SELECT DISTINCT semantic_generation FROM retrieval_index_manifest")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         let mut collections = Vec::new();
         for row in rows {
@@ -199,14 +199,14 @@ impl Storage {
         Ok(removed)
     }
 
-    /// Latest manifest `built_at_epoch_ms` per Qdrant collection (for retention ranking).
-    pub fn list_retrieval_qdrant_collections_with_recency(
+    /// Latest manifest `built_at_epoch_ms` per Semantic collection (for retention ranking).
+    pub fn list_retrieval_semantic_generations_with_recency(
         &self,
     ) -> Result<Vec<(String, i64)>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT qdrant_collection, MAX(built_at_epoch_ms)
+            "SELECT semantic_generation, MAX(built_at_epoch_ms)
              FROM retrieval_index_manifest
-             GROUP BY qdrant_collection",
+             GROUP BY semantic_generation",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let mut collections = Vec::new();
@@ -221,7 +221,7 @@ fn manifest_from_row(row: &Row<'_>) -> rusqlite::Result<RetrievalIndexManifest> 
     Ok(RetrievalIndexManifest {
         project_id: row.get(0)?,
         lexical_version: row.get(1)?,
-        qdrant_collection: row.get(2)?,
+        semantic_generation: row.get(2)?,
         scip_revision: row.get(3)?,
         built_at_epoch_ms: row.get(4)?,
         disk_bytes: row.get(5)?,
@@ -251,7 +251,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn list_retrieval_qdrant_collections_with_recency_uses_latest_manifest() {
+    fn list_retrieval_semantic_generations_with_recency_uses_latest_manifest() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("codestory.db");
         let mut storage = Storage::open(&db_path).expect("open storage");
@@ -264,7 +264,7 @@ mod tests {
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
                     project_id: project_id.into(),
                     lexical_version: "v1".into(),
-                    qdrant_collection: collection.into(),
+                    semantic_generation: collection.into(),
                     scip_revision: None,
                     built_at_epoch_ms: built_at,
                     disk_bytes: None,
@@ -288,7 +288,7 @@ mod tests {
                 .expect("upsert manifest");
         }
         let mut recency = storage
-            .list_retrieval_qdrant_collections_with_recency()
+            .list_retrieval_semantic_generations_with_recency()
             .expect("list recency");
         recency.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(
@@ -308,7 +308,7 @@ mod tests {
         let manifest = RetrievalIndexManifest {
             project_id: "proj".into(),
             lexical_version: "v1".into(),
-            qdrant_collection: "codestory_proj_deadbeef".into(),
+            semantic_generation: "codestory_proj_deadbeef".into(),
             scip_revision: Some("graph-1234".into()),
             built_at_epoch_ms: 123,
             disk_bytes: Some(456),
@@ -354,7 +354,7 @@ mod tests {
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
                     project_id: project_id.into(),
                     lexical_version: "v1".into(),
-                    qdrant_collection: format!("codestory_{project_id}_{suffix}"),
+                    semantic_generation: format!("codestory_{project_id}_{suffix}"),
                     scip_revision: Some(format!("graph-{suffix}")),
                     built_at_epoch_ms: 1,
                     disk_bytes: None,
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn list_retrieval_qdrant_collections_returns_distinct_names() {
+    fn list_retrieval_semantic_generations_returns_distinct_names() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("codestory.db");
         let mut storage = Storage::open(&db_path).expect("open storage");
@@ -410,7 +410,7 @@ mod tests {
                 .upsert_retrieval_index_manifest(&RetrievalIndexManifest {
                     project_id: project_id.into(),
                     lexical_version: "v1".into(),
-                    qdrant_collection: collection.into(),
+                    semantic_generation: collection.into(),
                     scip_revision: None,
                     built_at_epoch_ms: 1,
                     disk_bytes: None,
@@ -434,7 +434,7 @@ mod tests {
                 .expect("upsert manifest");
         }
         let mut collections = storage
-            .list_retrieval_qdrant_collections()
+            .list_retrieval_semantic_generations()
             .expect("list collections");
         collections.sort();
         assert_eq!(

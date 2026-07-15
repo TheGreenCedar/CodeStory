@@ -56,8 +56,6 @@ pub(crate) struct BrokerOperationSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) compose_project: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pid: Option<u32>,
@@ -146,7 +144,6 @@ pub(crate) struct BrokerGpuRuntimeIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) run_id: Option<String>,
     pub(crate) namespace: String,
-    pub(crate) compose_project: String,
     pub(crate) embed_url: String,
     #[serde(default)]
     pub(crate) embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin,

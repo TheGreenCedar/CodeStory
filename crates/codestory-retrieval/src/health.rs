@@ -1,7 +1,6 @@
 use crate::capabilities::SidecarCapabilities;
 use crate::config::{
-    SidecarImagePins, SidecarLayout, SidecarOwnership, SidecarProfile, SidecarRuntimeConfig,
-    default_sidecar_image_pins, retrieval_command,
+    SidecarLayout, SidecarOwnership, SidecarProfile, SidecarRuntimeConfig, retrieval_command,
 };
 use crate::embedded_vector::EmbeddedVectorIndex;
 use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
@@ -105,8 +104,6 @@ pub struct RetrievalStatusReport {
     pub retrieval_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ownership: Option<SidecarOwnership>,
-    #[serde(default = "default_sidecar_image_pins")]
-    pub sidecar_images: SidecarImagePins,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,7 +136,7 @@ pub struct RetrievalStatusReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_launch: Option<EmbeddingLaunchMetadata>,
     pub lexical: ComponentHealth,
-    pub qdrant: ComponentHealth,
+    pub semantic: ComponentHealth,
     pub scip: ComponentHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_contract: Option<RetrievalManifestContractReport>,
@@ -261,9 +258,9 @@ fn manifest_contract_report(
                 .embedding_backend
                 .clone()
                 .unwrap_or_else(|| "embedding_backend_missing".into()),
-            provenance: format!("vector_generation:{}", manifest.qdrant_collection),
+            provenance: format!("vector_generation:{}", manifest.semantic_generation),
             count: manifest.dense_projection_count,
-            status: component_status_label(&report.qdrant),
+            status: component_status_label(&report.semantic),
         },
         RetrievalManifestLaneProvenance {
             lane: "graph".into(),
@@ -353,8 +350,6 @@ fn graph_hash_label(manifest: &codestory_store::RetrievalIndexManifest) -> Strin
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfrastructureHealth {
-    pub lexical_ready: bool,
-    pub qdrant_reachable: bool,
     pub embed_reachable: bool,
     pub embedding_device_policy: String,
     pub embedding_device_state: String,
@@ -370,8 +365,6 @@ pub struct InfrastructureHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_accelerator_request_device: Option<String>,
     pub embedding_cpu_allowed: bool,
-    pub lexical_detail: String,
-    pub qdrant_detail: String,
     pub embed_detail: String,
 }
 
@@ -414,7 +407,6 @@ pub fn unavailable_status_report_with_embedding_device(
     RetrievalStatusReport {
         retrieval_mode: retrieval_mode.into(),
         ownership: None,
-        sidecar_images: default_sidecar_image_pins(),
         degraded_reason: Some(reason.clone()),
         repair: None,
         query_embedding_backend: crate::embeddings::embedding_runtime_id(),
@@ -436,7 +428,7 @@ pub fn unavailable_status_report_with_embedding_device(
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch: None,
         lexical: unavailable_component("lexical", &reason),
-        qdrant: unavailable_component("semantic", &reason),
+        semantic: unavailable_component("semantic", &reason),
         scip: unavailable_component("scip", &reason),
         manifest_contract: None,
         manifest,
@@ -453,11 +445,8 @@ pub fn probe_infrastructure_health_with_embedding_device(
     runtime: &SidecarRuntimeConfig,
     embedding_device: &EmbeddingDeviceReadiness,
 ) -> InfrastructureHealth {
-    let layout = &runtime.layout;
     let embed_probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
     InfrastructureHealth {
-        lexical_ready: layout.lexical_data_dir.is_dir(),
-        qdrant_reachable: true,
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
         embedding_device_state: embedding_device.observed_state.into(),
@@ -470,11 +459,6 @@ pub fn probe_infrastructure_health_with_embedding_device(
             .clone(),
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
-        lexical_detail: format!(
-            "project-local SQLite FTS root {}",
-            layout.lexical_data_dir.display()
-        ),
-        qdrant_detail: "embedded SQLite vectors require no external service".into(),
         embed_detail: embed_probe.detail,
     }
 }
@@ -639,7 +623,7 @@ pub fn probe_sidecar_health_for_runtime(
     let semantic = if dense_anchor_count == 0 {
         zero_dense_semantic_health(embedding_device)
     } else {
-        let collection = manifest.qdrant_collection.clone();
+        let collection = manifest.semantic_generation.clone();
         let expected_points = u64::try_from(dense_anchor_count).unwrap_or(u64::MAX);
         let embedded = EmbeddedVectorIndex::health(
             layout,
@@ -727,7 +711,6 @@ pub fn probe_sidecar_health_for_runtime(
     RetrievalStatusReport {
         retrieval_mode: retrieval_mode.into(),
         ownership: None,
-        sidecar_images: default_sidecar_image_pins(),
         degraded_reason,
         repair: None,
         query_embedding_backend: current_embedding_backend,
@@ -749,7 +732,7 @@ pub fn probe_sidecar_health_for_runtime(
         embedding_cpu_allowed: embedding_device.cpu_allowed,
         embedding_launch: None,
         lexical,
-        qdrant: semantic,
+        semantic,
         scip,
         manifest_contract: None,
         manifest: Some(manifest),
@@ -851,7 +834,7 @@ mod tests {
         let manifest = codestory_store::RetrievalIndexManifest {
             project_id: "testproject".into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-            qdrant_collection: "codestory_testproject".into(),
+            semantic_generation: "codestory_testproject".into(),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,
             disk_bytes: None,
@@ -881,7 +864,7 @@ mod tests {
             Some("sidecar_manifest_generation_contract_missing")
         );
         assert_eq!(report.lexical.capabilities, SidecarCapabilities::NONE);
-        assert_eq!(report.qdrant.capabilities, SidecarCapabilities::NONE);
+        assert_eq!(report.semantic.capabilities, SidecarCapabilities::NONE);
         assert_eq!(report.scip.capabilities, SidecarCapabilities::NONE);
     }
 
@@ -1060,7 +1043,7 @@ mod tests {
         let manifest = codestory_store::RetrievalIndexManifest {
             project_id: "testproject".into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-            qdrant_collection: "codestory_testproject_hash".into(),
+            semantic_generation: "codestory_testproject_hash".into(),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,
             disk_bytes: Some(42),
@@ -1084,7 +1067,6 @@ mod tests {
         let report = RetrievalStatusReport {
             retrieval_mode: "full".into(),
             ownership: None,
-            sidecar_images: default_sidecar_image_pins(),
             degraded_reason: None,
             query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
             manifest_vector_embedding_backend: manifest.embedding_backend.clone(),
@@ -1114,7 +1096,7 @@ mod tests {
                     graph: false,
                 },
             },
-            qdrant: ComponentHealth {
+            semantic: ComponentHealth {
                 name: "semantic".into(),
                 status: ComponentStatus::Healthy,
                 latency_ms: Some(1),

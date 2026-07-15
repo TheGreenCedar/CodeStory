@@ -525,7 +525,6 @@ struct StdioRecentSidecarRepair {
     project_root: PathBuf,
     run_id: String,
     namespace: String,
-    compose_project: String,
     pid: u32,
     attempt_id: String,
     started_at_epoch_ms: i64,
@@ -3441,7 +3440,6 @@ fn stdio_status_with_recent_sidecar_repair_for_sidecar(
             "run_id": repair.run_id.clone(),
             "agent_id": repair.run_id.clone(),
             "namespace": repair.namespace.clone(),
-            "compose_project": repair.compose_project.clone(),
             "phase": active_repair
                 .get("phase")
                 .cloned()
@@ -5344,7 +5342,6 @@ fn handle_stdio_sidecar_repair(
                 project_root: runtime.project_root.clone(),
                 run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
                 namespace: repair_sidecar.namespace.clone(),
-                compose_project: repair_sidecar.compose_project.clone(),
                 pid: child_pid,
                 attempt_id: attempt_id.clone(),
                 started_at_epoch_ms: repair_started_at_epoch_ms,
@@ -6285,7 +6282,6 @@ mod tests {
             profile: "agent".to_string(),
             run_id: Some("agent-default".to_string()),
             namespace: "codestory-agent-test".to_string(),
-            compose_project: "codestory-agent-test".to_string(),
             embed_url: "http://127.0.0.1:18080".to_string(),
             embedding_endpoint_origin: codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar,
             embedding_endpoint_fingerprint_sha256: "hmac-sha256:fixture".to_string(),
@@ -6314,7 +6310,6 @@ mod tests {
             project_root: project.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6328,7 +6323,7 @@ mod tests {
                     "profile": "agent",
                     "run_id": "shared-agent",
                     "namespace": "codestory-test",
-                    "phase": "Qdrant finalize",
+                    "phase": "Semantic finalize",
                     "pid": 22,
                     "updated_at_epoch_ms": 200
                 }
@@ -6342,11 +6337,11 @@ mod tests {
 
         assert_eq!(
             updated["managed_retrieval"]["active_repair"]["phase"],
-            json!("Qdrant finalize")
+            json!("Semantic finalize")
         );
         assert_eq!(
             updated["readiness_broker"]["operations"][0]["phase"],
-            json!("Qdrant finalize")
+            json!("Semantic finalize")
         );
         assert_eq!(
             updated["readiness_broker"]["operations"][0]["pid"],
@@ -6366,7 +6361,6 @@ mod tests {
             project_root: project.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: live_pid,
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6460,7 +6454,6 @@ mod tests {
             project_root: project.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6485,12 +6478,11 @@ mod tests {
     fn stdio_status_recent_repair_retains_when_durable_active_even_if_overlay_pid_dead() {
         let project = tempfile::tempdir().expect("project");
         let run_id = "shared-agent";
-        write_live_durable_ready_repair(project.path(), run_id, "Qdrant finalize");
+        write_live_durable_ready_repair(project.path(), run_id, "Semantic finalize");
         let mut recent = Some(StdioRecentSidecarRepair {
             project_root: project.path().to_path_buf(),
             run_id: run_id.to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6524,12 +6516,11 @@ mod tests {
         // even when a live durable repair status still exists.
         let project = tempfile::tempdir().expect("project");
         let run_id = "shared-agent";
-        write_live_durable_ready_repair(project.path(), run_id, "Qdrant finalize");
+        write_live_durable_ready_repair(project.path(), run_id, "Semantic finalize");
         let mut recent = Some(StdioRecentSidecarRepair {
             project_root: project.path().to_path_buf(),
             run_id: run_id.to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6560,7 +6551,6 @@ mod tests {
             project_root: other.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6587,7 +6577,6 @@ mod tests {
             project_root: other.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6604,7 +6593,6 @@ mod tests {
             project_root: project.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6623,7 +6611,6 @@ mod tests {
             project_root: project.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6644,7 +6631,6 @@ mod tests {
             project_root: project.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: u32::MAX,
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -6665,7 +6651,6 @@ mod tests {
             project_root: project.path().to_path_buf(),
             run_id: "shared-agent".to_string(),
             namespace: "codestory-test".to_string(),
-            compose_project: "codestory-test".to_string(),
             pid: std::process::id(),
             attempt_id: "test-attempt".to_string(),
             started_at_epoch_ms: 100,
@@ -7416,7 +7401,7 @@ starting sidecar setup
         let manifest = codestory_retrieval::RetrievalIndexManifest {
             project_id: "project-a".into(),
             lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
-            qdrant_collection: "codestory_project_a_hash_a".into(),
+            semantic_generation: "codestory_project_a_hash_a".into(),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 1,
             disk_bytes: None,

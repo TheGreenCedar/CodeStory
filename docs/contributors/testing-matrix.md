@@ -226,7 +226,7 @@ process must then reuse the exact native PID and launch fingerprint without a
 duplicate server. The remainder of the workflow proves readiness blocking after
 endpoint death, explicit recovery, packet/search, and proof-owned cleanup. The
 same protected run proves dynamic endpoint selection, live process identity,
-and exact cache/process/container/port ownership before marker-scoped cleanup;
+and exact cache/process/port ownership before marker-scoped cleanup;
 the following run also cleans a marker-owned prior attempt if cancellation
 prevented the prior `always()` step. Contract tests or hosted package smoke
 cannot replace this hardware evidence.

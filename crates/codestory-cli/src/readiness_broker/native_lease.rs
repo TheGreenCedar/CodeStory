@@ -595,14 +595,14 @@ pub(crate) fn sidecar_down_with_native_embedding_handoff(
         }
     }
     codestory_retrieval::sidecar_down_for_runtime(sidecar)?;
-    if state.owns_embedding_launch() {
-        if !release_machine_resource_lock_for_native_launch_with_guard(
+    if state.owns_embedding_launch()
+        && !release_machine_resource_lock_for_native_launch_with_guard(
             NATIVE_EMBEDDING_RESOURCE,
             launch,
             &guard,
-        )? {
-            bail!("CodeStory repository search ownership changed during shutdown; retry shortly");
-        }
+        )?
+    {
+        bail!("CodeStory repository search ownership changed during shutdown; retry shortly");
     }
     Ok(())
 }
@@ -713,7 +713,7 @@ fn reusable_native_embedding_resource_launch(
     busy: &BrokerMachineResourceBusy,
     validate_launch: &mut impl FnMut(&codestory_retrieval::EmbeddingLaunchMetadata) -> Result<u32>,
 ) -> Result<Option<codestory_retrieval::EmbeddingLaunchMetadata>> {
-    let Some(mut launch) = reusable_native_embedding_resource_launch_with_matcher(
+    let Some(launch) = reusable_native_embedding_resource_launch_with_matcher(
         scope,
         sidecar,
         busy,
@@ -730,31 +730,7 @@ fn reusable_native_embedding_resource_launch(
         return Ok(None);
     };
     if launch.log_path.is_none() {
-        let lock_path = machine_resource_lock_path(&busy.snapshot.resource);
-        let Some(lock) = read_machine_resource_lock_file(&lock_path) else {
-            return Ok(None);
-        };
-        let owner_profile = match lock.scope.profile.as_str() {
-            "local" => codestory_retrieval::SidecarProfile::Local,
-            "agent" => codestory_retrieval::SidecarProfile::Agent,
-            _ => return Ok(None),
-        };
-        let owner_root = Path::new(&lock.scope.workspace_root);
-        let owner_runtime = sidecar.with_profile_and_run_id(
-            Some(owner_root),
-            owner_profile,
-            lock.scope.run_id.as_deref(),
-        );
-        let Some(expected_owner) = codestory_retrieval::expected_native_embedding_launch_metadata(
-            owner_root,
-            &owner_runtime,
-        )?
-        else {
-            return Ok(None);
-        };
-        if !enrich_legacy_native_launch_log_path(&expected_owner, &mut launch) {
-            return Ok(None);
-        }
+        return Ok(None);
     }
     Ok(Some(launch))
 }
@@ -886,45 +862,6 @@ pub(super) fn reused_launch_matches_owner_and_requested_runtime(
         requested_runtime,
         launch,
     )
-}
-
-pub(super) fn same_native_launch_configuration(
-    expected: &codestory_retrieval::EmbeddingLaunchMetadata,
-    actual: &codestory_retrieval::EmbeddingLaunchMetadata,
-    require_log_path: bool,
-) -> bool {
-    expected.provider == actual.provider
-        && expected.launch_mode == actual.launch_mode
-        && expected.endpoint == actual.endpoint
-        && expected.launch_args == actual.launch_args
-        && expected.launch_fingerprint_sha256 == actual.launch_fingerprint_sha256
-        && expected.executable_path == actual.executable_path
-        && expected.model_path == actual.model_path
-        && actual
-            .model_sha256
-            .as_ref()
-            .is_none_or(|digest| expected.model_sha256.as_ref() == Some(digest))
-        && expected.requested_device == actual.requested_device
-        && (!require_log_path
-            || actual.log_path.is_none()
-            || expected.log_path.as_deref().is_some_and(|expected| {
-                actual.log_path.as_deref().is_some_and(|actual| {
-                    codestory_workspace::same_workspace_path(Path::new(expected), Path::new(actual))
-                })
-            }))
-}
-
-pub(super) fn enrich_legacy_native_launch_log_path(
-    expected: &codestory_retrieval::EmbeddingLaunchMetadata,
-    actual: &mut codestory_retrieval::EmbeddingLaunchMetadata,
-) -> bool {
-    if !same_native_launch_configuration(expected, actual, true) {
-        return false;
-    }
-    if actual.log_path.is_none() {
-        actual.log_path.clone_from(&expected.log_path);
-    }
-    actual.log_path.is_some()
 }
 
 fn bail_native_embedding_busy<T>(busy: &BrokerMachineResourceBusy) -> Result<T> {

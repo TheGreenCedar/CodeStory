@@ -31,7 +31,7 @@ pub fn manifest_has_current_sidecar_contract(
         && manifest.lexical_version == crate::lexical_index::LEXICAL_INDEX_VERSION
         && manifest.sidecar_schema_version == Some(SIDECAR_SCHEMA_VERSION)
         && manifest.sidecar_generation.as_deref() == Some(expected_generation.as_str())
-        && manifest.qdrant_collection == expected_collection
+        && manifest.semantic_generation == expected_collection
         && manifest.projection_count.is_some_and(|count| count >= 0)
         && manifest.symbol_doc_count.is_some_and(|count| count >= 0)
         && manifest
@@ -168,20 +168,6 @@ pub fn manifest_staleness_reason_for_runtime(
         Err(error) => Some(format!("indexed_file_mtime_unavailable: {error}")),
         _ => None,
     }
-}
-
-#[cfg(test)]
-pub fn manifest_unavailable_reason(
-    project_id: &str,
-    storage: &Store,
-    manifest: &RetrievalIndexManifest,
-) -> Option<String> {
-    manifest_unavailable_reason_for_runtime(
-        project_id,
-        storage,
-        manifest,
-        &crate::config::SidecarRuntimeConfig::local(),
-    )
 }
 
 pub fn manifest_unavailable_reason_for_runtime(
@@ -379,7 +365,7 @@ mod tests {
         RetrievalIndexManifest {
             project_id: project_id.into(),
             lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
-            qdrant_collection: sidecar_vector_generation(project_id, hash),
+            semantic_generation: sidecar_vector_generation(project_id, hash),
             scip_revision: Some("graph-test".into()),
             built_at_epoch_ms: 123,
             disk_bytes: None,
@@ -417,7 +403,7 @@ mod tests {
         ));
 
         let mut stale_collection = current.clone();
-        stale_collection.qdrant_collection = "codestory_proj_old".into();
+        stale_collection.semantic_generation = "codestory_proj_old".into();
         assert!(!manifest_has_current_sidecar_contract(
             project_id,
             &stale_collection

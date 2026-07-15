@@ -5,8 +5,7 @@
  * Primary documented path: `cargo retrieval-setup` from repo root.
  * This script adds prerequisite reporting and optional holdout repo clones.
  *
- * Prerequisites: Node 18+ and cargo. Docker is needed only for the managed
- * Linux embedding service or an explicitly selected external-Qdrant compose path.
+ * Prerequisites: Node 18+ and cargo.
  * SCIP language indexers are documented only — not installed by this script.
  */
 import { spawnSync } from "node:child_process";
@@ -25,7 +24,6 @@ function usage() {
 Options:
   --check-only, --dry-run   Verify prerequisites and print planned steps (no changes)
   --skip-build              Do not run cargo build -p codestory-cli
-  --skip-compose            Pass --skip-compose to "retrieval bootstrap"
   --skip-status             Skip final "retrieval status"
   --with-holdout-clone      Clone holdout-retrieval OSS repos (network; large)
   --fetch-embed-model       Prewarm the machine-wide pinned embedding model cache
@@ -48,7 +46,6 @@ function parseArgs(argv) {
   const opts = {
     checkOnly: false,
     skipBuild: false,
-    skipCompose: false,
     skipStatus: false,
     withHoldoutClone: false,
     fetchEmbedModel: false,
@@ -72,10 +69,6 @@ function parseArgs(argv) {
     }
     if (arg === "--skip-build") {
       opts.skipBuild = true;
-      continue;
-    }
-    if (arg === "--skip-compose") {
-      opts.skipCompose = true;
       continue;
     }
     if (arg === "--skip-status") {
@@ -190,12 +183,7 @@ function cargoRunArgs(...args) {
 }
 
 function printPrereqReport(opts) {
-  const composeFile = path.join(repoRoot, "docker", "retrieval-compose.yml");
   const cacheRoot = codestoryCacheRoot();
-  const externalQdrant =
-    process.env.CODESTORY_VECTOR_BACKEND?.trim().toLowerCase() === "external_qdrant";
-  const composeRequired =
-    !opts.skipCompose && !opts.fetchOnly && (process.platform === "linux" || externalQdrant);
   const checks = [
     ["node", commandExists("node"), "required"],
     [
@@ -204,25 +192,11 @@ function printPrereqReport(opts) {
       opts.skipBuild ? "optional" : "required",
     ],
     [
-      "docker",
-      commandExists("docker"),
-      composeRequired
-        ? "required for the selected container-backed service"
-        : "optional; unused by the default managed path on this host",
-    ],
-    [
       "tar",
       commandExists("tar"),
       opts.fetchLlamaServer && !opts.checkOnly
         ? "required for llama-server archive extraction"
         : "optional",
-    ],
-    [
-      `compose file (${composeFile})`,
-      fs.existsSync(composeFile),
-      composeRequired
-        ? "required unless CODESTORY_RETRIEVAL_COMPOSE_FILE points elsewhere"
-        : "optional for the selected managed path",
     ],
   ];
 
@@ -241,16 +215,8 @@ function printPrereqReport(opts) {
   }
 
   console.log("\nAutomated:");
-  if (externalQdrant) {
-    console.log("  - External-Qdrant compatibility path selected explicitly");
-  } else {
-    console.log("  - Embedded SQLite vector generation (no Qdrant service)");
-  }
-  console.log(
-    process.platform === "linux"
-      ? "  - Managed llama.cpp embedding service through Docker Compose"
-      : "  - Managed native llama.cpp embedding service",
-  );
+  console.log("  - Embedded SQLite vector generation");
+  console.log("  - Managed native llama.cpp embedding service");
   console.log("  - codestory retrieval bootstrap (cache dirs, sidecar state, health wait)");
   console.log("  - codestory retrieval status --project <path>");
   if (opts.withHoldoutClone) {
@@ -260,17 +226,6 @@ function printPrereqReport(opts) {
   console.log("\nManual (not automated):");
   console.log("  - SCIP indexers per language (rust-analyzer scip, scip-typescript, etc.)");
   console.log("  - retrieval index --project <repo> after sidecars are healthy");
-
-  if (composeRequired && !commandExists("docker")) {
-    console.log("\nDocker install:");
-    console.log("  https://docs.docker.com/desktop/");
-    console.log("\nManual Qdrant without compose:");
-    console.log(
-      `  docker run -d --name codestory-qdrant -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 ` +
-        `-v "${path.join(cacheRoot, "qdrant")}:/qdrant/storage" qdrant/qdrant:v1.12.5@sha256:05fecce7dce45d1254e0468bc037e8210e187fd56fa847688b012293d5f08aae`,
-    );
-    console.log("\nLexical search needs no service; CodeStory stores project-local SQLite FTS shards.");
-  }
 
   return failed;
 }
@@ -414,15 +369,11 @@ function runSelfTest() {
   const macMetal = backends.find((backend) => backend.id === "macos-aarch64-metal");
   const macCpu = backends.find((backend) => backend.id === "macos-x86_64-cpu");
   const winVulkan = backends.find((backend) => backend.id === "windows-x86_64-vulkan");
-  const winLegacy = backends.find(
-    (backend) => backend.id === "windows-x86_64-vulkan-b9058-legacy",
-  );
   if (!macMetal) {
     throw new Error("missing macos-aarch64-metal backend");
   }
   if (
     !macCpu ||
-    macCpu.launch_mode !== "native_spawned" ||
     !macCpu.sha256 ||
     !macCpu.executable_sha256
   ) {
@@ -430,9 +381,6 @@ function runSelfTest() {
   }
   if (!winVulkan) {
     throw new Error("missing windows-x86_64-vulkan backend");
-  }
-  if (!winLegacy || !winLegacy.sha256 || !winLegacy.executable_sha256) {
-    throw new Error("missing checksum-backed legacy Windows Vulkan managed-cache fallback");
   }
   if (
     backends.some(
@@ -498,8 +446,8 @@ async function main() {
   if (opts.checkOnly) {
     process.exit(failed ? 1 : 0);
   }
-  if (failed && !opts.skipCompose) {
-    throw new Error("Fix missing prerequisites (or use --skip-compose / --skip-build where applicable).");
+  if (failed) {
+    throw new Error("Fix missing prerequisites (or use --skip-build where applicable).");
   }
 
   if (opts.fetchEmbedModel || opts.fetchLlamaServer) {
@@ -521,9 +469,6 @@ async function main() {
     "--wait-secs",
     String(opts.waitSecs),
   );
-  if (opts.skipCompose) {
-    bootstrapArgs.push("--skip-compose");
-  }
   if (opts.release) {
     bootstrapArgs.splice(1, 0, "--release");
   }

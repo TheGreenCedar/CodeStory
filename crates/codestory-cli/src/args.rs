@@ -742,7 +742,7 @@ pub(crate) enum RetrievalAction {
     Bootstrap(RetrievalBootstrapCommand),
     #[command(name = "prewarm-assets", hide = true)]
     PrewarmAssets(RetrievalPrewarmAssetsCommand),
-    /// Prepare local sidecar data directories and write sidecar state (does not start Docker).
+    /// Prepare local retrieval data directories and write runtime state.
     Up(RetrievalSidecarStateCommand),
     /// Remove local sidecar state file (does not stop external processes).
     Down(RetrievalSidecarStateCommand),
@@ -831,22 +831,11 @@ pub(crate) struct RetrievalBootstrapCommand {
     pub(crate) run_id: Option<String>,
     #[arg(
         long,
-        help = "Skip docker compose even when Docker is installed (dirs + state file only)."
-    )]
-    pub(crate) skip_compose: bool,
-    #[arg(
-        long,
         value_name = "SECS",
         default_value_t = 90,
         help = "Seconds to wait for managed retrieval health (0 = no wait)."
     )]
     pub(crate) wait_secs: u64,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Override docker/retrieval-compose.yml path."
-    )]
-    pub(crate) compose_file: Option<PathBuf>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
@@ -1613,8 +1602,6 @@ pub(crate) struct ReadinessLaneOutput {
     pub(crate) run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) namespace: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) compose_project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
