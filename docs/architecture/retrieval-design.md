@@ -138,9 +138,10 @@ candidate never weakens the last known-good publication.
 Query and resolution share one pinned session; they never reopen “whatever is
 current” for numeric candidate resolution. A publication change yields the
 typed `publication_changed` error and permits one whole-operation runtime retry.
-The complete response owns one admission check and pin even when packet or
-agent planning issues several retrieval subqueries. No nested adapter repeats
-the attestation scan or opens another generation.
+One pinned retrieval session covers sidecar query execution and numeric
+candidate resolution. Higher-level graph, source, packet, agent, CLI, and MCP
+assembly is not yet part of that proof boundary and must not describe the
+session identity as a complete-operation pin.
 
 ## Readiness
 

@@ -696,6 +696,93 @@ mod tests {
         assert_eq!(changed.detail(), None);
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn strict_session_accepts_fresh_generation_after_core_identity_only_change() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let first_core = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let second_core = IndexPublicationRecord {
+            generation: 2,
+            generation_id: "22222222-2222-4222-8222-222222222222".into(),
+            run_id: "run-two".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        let store = Store::open(&storage_path).expect("open storage");
+        store
+            .put_index_publication(&first_core)
+            .expect("publish first core identity");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+
+        let first_manifest =
+            publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+                .expect("publish first strict generation");
+        let first_session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
+            .expect("first strict query admission");
+        assert_eq!(
+            first_session.publication_identity().core_generation_id,
+            first_core.generation_id
+        );
+        drop(first_session);
+
+        let mut store = Store::open(&storage_path).expect("open identity-only writer");
+        store
+            .put_index_publication(&second_core)
+            .expect("publish second core identity");
+        store
+            .publish_dense_anchor_generation(
+                &second_core,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .expect("rebind unchanged dense anchors");
+        drop(store);
+        assert!(
+            PinnedQuerySession::begin(project.path(), &storage_path, &runtime).is_err(),
+            "old publication-bound vectors must fail strict admission"
+        );
+
+        let second_manifest =
+            publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+                .expect("publish fresh strict generation");
+        assert_ne!(
+            first_manifest.sidecar_input_hash, second_manifest.sidecar_input_hash,
+            "core publication identity must bind the immutable vector generation"
+        );
+        assert_ne!(
+            first_manifest.sidecar_generation,
+            second_manifest.sidecar_generation
+        );
+        let second_session = PinnedQuerySession::begin(project.path(), &storage_path, &runtime)
+            .expect("strict query admits rebuilt publication-bound vectors");
+        assert_eq!(
+            second_session.publication_identity().core_generation_id,
+            second_core.generation_id
+        );
+        assert_eq!(
+            second_session.publication_identity().core_run_id,
+            second_core.run_id
+        );
+    }
+
     #[test]
     fn empty_batch_query_does_not_require_storage() {
         let project = TempDir::new().expect("project");

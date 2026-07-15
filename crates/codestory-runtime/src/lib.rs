@@ -5247,6 +5247,73 @@ impl SemanticDocGraphContext {
     }
 }
 
+fn semantic_graph_dependent_file_ids_by_seed(
+    storage: &Storage,
+    seed_file_ids: &HashSet<GraphNodeId>,
+) -> Result<HashMap<GraphNodeId, HashSet<GraphNodeId>>, ApiError> {
+    let mut dependent_file_ids = seed_file_ids
+        .iter()
+        .copied()
+        .map(|file_id| (file_id, HashSet::from([file_id])))
+        .collect::<HashMap<_, _>>();
+    if seed_file_ids.is_empty() {
+        return Ok(dependent_file_ids);
+    }
+
+    let nodes = storage.get_nodes().map_err(|error| {
+        ApiError::internal(format!("Failed to load semantic dependency nodes: {error}"))
+    })?;
+    let file_id_by_node = nodes
+        .iter()
+        .filter_map(|node| {
+            node.file_node_id
+                .or_else(|| {
+                    (node.kind == codestory_contracts::graph::NodeKind::FILE).then_some(node.id)
+                })
+                .map(|file_id| (node.id, file_id))
+        })
+        .collect::<HashMap<_, _>>();
+    let seed_node_ids = file_id_by_node
+        .iter()
+        .filter_map(|(node_id, file_id)| seed_file_ids.contains(file_id).then_some(*node_id))
+        .collect::<Vec<_>>();
+    if seed_node_ids.is_empty() {
+        return Ok(dependent_file_ids);
+    }
+
+    let edges_by_node = storage
+        .get_edges_for_node_ids(&seed_node_ids)
+        .map_err(|error| {
+            ApiError::internal(format!("Failed to load semantic dependency edges: {error}"))
+        })?;
+    let mut seen_edge_ids = HashSet::new();
+    for edge in edges_by_node.into_values().flatten() {
+        if !seen_edge_ids.insert(edge.id) {
+            continue;
+        }
+        let endpoint_file_ids = [
+            Some(edge.source),
+            Some(edge.target),
+            edge.resolved_source,
+            edge.resolved_target,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|node_id| file_id_by_node.get(&node_id).copied())
+        .collect::<HashSet<_>>();
+        for seed_file_id in endpoint_file_ids
+            .iter()
+            .filter(|file_id| seed_file_ids.contains(file_id))
+        {
+            dependent_file_ids
+                .entry(*seed_file_id)
+                .or_default()
+                .extend(endpoint_file_ids.iter().copied());
+        }
+    }
+    Ok(dependent_file_ids)
+}
+
 fn build_semantic_file_text_cache(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
@@ -11996,6 +12063,15 @@ where
             )));
         }
     };
+    let rebuild_complete_dense_anchor_set = staged
+        .store_mut()
+        .get_dense_anchor_publication_manifest()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read staged dense anchor publication identity: {error}"
+            ))
+        })?
+        .is_none();
     let publication_run_id = Uuid::new_v4().to_string();
     let publication = next_index_publication(
         previous_publication.as_ref(),
@@ -12024,6 +12100,36 @@ where
                 .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
             let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
             let execution_plan = refresh_builder(&workspace, &refresh_inputs)?;
+            let mut planned_semantic_seed_file_ids = execution_plan
+                .files_to_remove
+                .iter()
+                .copied()
+                .map(codestory_contracts::graph::NodeId)
+                .collect::<HashSet<_>>();
+            for path in &execution_plan.files_to_index {
+                let normalized_path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                };
+                if let Some(file_info) = staged
+                    .store_mut()
+                    .get_file_by_path(&normalized_path)
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "Failed to resolve previous semantic scope for {}: {error}",
+                            normalized_path.display()
+                        ))
+                    })?
+                {
+                    planned_semantic_seed_file_ids
+                        .insert(codestory_contracts::graph::NodeId(file_info.id));
+                }
+            }
+            let previous_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
+                staged.store_mut(),
+                &planned_semantic_seed_file_ids,
+            )?;
             let existing_file_paths =
                 semantic_file_table_path_map(staged.store_mut().get_files().map_err(|error| {
                     ApiError::internal(format!("Failed to load files: {error}"))
@@ -12075,7 +12181,7 @@ where
                 }
                 Err(e) => return Err(ApiError::internal(format!("Indexing failed: {e}"))),
             };
-            let mut llm_refresh_scope = HashSet::new();
+            let mut semantic_refresh_seed_file_ids = HashSet::new();
             for path in &execution_plan.files_to_index {
                 let normalized_path = if path.is_absolute() {
                     path.clone()
@@ -12091,20 +12197,36 @@ where
                             normalized_path.display()
                         ))
                     })?;
-                // Workspace refresh plans include discovered files that have no
-                // graph collector. Only files materialized in the staged graph
-                // can own semantic documents.
-                if let Some(file_info) = file_info {
-                    llm_refresh_scope.insert(codestory_contracts::graph::NodeId(file_info.id));
+                // Workspace refresh plans include discovered files that have no graph
+                // collector, while incomplete reads preserve the last verified graph.
+                // Only complete files can prove that their semantic projection changed.
+                if let Some(file_info) = file_info
+                    && file_info.complete
+                {
+                    semantic_refresh_seed_file_ids
+                        .insert(codestory_contracts::graph::NodeId(file_info.id));
                 }
             }
             for file_id in &execution_plan.files_to_remove {
-                llm_refresh_scope.insert(codestory_contracts::graph::NodeId(*file_id));
+                semantic_refresh_seed_file_ids.insert(codestory_contracts::graph::NodeId(*file_id));
+            }
+            let current_semantic_dependents_by_seed = semantic_graph_dependent_file_ids_by_seed(
+                staged.store_mut(),
+                &semantic_refresh_seed_file_ids,
+            )?;
+            let mut llm_refresh_scope = semantic_refresh_seed_file_ids.clone();
+            for seed_file_id in &semantic_refresh_seed_file_ids {
+                if let Some(file_ids) = previous_semantic_dependents_by_seed.get(seed_file_id) {
+                    llm_refresh_scope.extend(file_ids.iter().copied());
+                }
+                if let Some(file_ids) = current_semantic_dependents_by_seed.get(seed_file_id) {
+                    llm_refresh_scope.extend(file_ids.iter().copied());
+                }
             }
             let staged_semantic_stats = finalize_staged_semantic_docs_for_runtime(
                 staged.store_mut(),
-                Some(&llm_refresh_scope),
-                Some(&component_report_refresh),
+                (!rebuild_complete_dense_anchor_set).then_some(&llm_refresh_scope),
+                (!rebuild_complete_dense_anchor_set).then_some(&component_report_refresh),
                 &dense_anchor_source_identity,
                 cancel_token,
                 runtime,
@@ -13682,6 +13804,62 @@ mod tests {
                 .symbol_doc
                 .doc_text
                 .contains("component_report: dir:.")
+        );
+    }
+
+    #[test]
+    fn semantic_refresh_scope_includes_files_connected_to_changed_graph_nodes() {
+        let mut storage = Storage::new_in_memory().expect("storage");
+        storage
+            .insert_nodes_batch(&[
+                Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/caller.rs".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(2),
+                    kind: NodeKind::FILE,
+                    serialized_name: "src/callee.rs".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(11),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "caller".into(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(22),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "callee".into(),
+                    file_node_id: Some(CoreNodeId(2)),
+                    ..Default::default()
+                },
+            ])
+            .expect("nodes");
+        storage
+            .insert_edges_batch(&[Edge {
+                id: EdgeId(1),
+                source: CoreNodeId(11),
+                target: CoreNodeId(22),
+                kind: EdgeKind::CALL,
+                resolved_source: Some(CoreNodeId(11)),
+                resolved_target: Some(CoreNodeId(22)),
+                ..Default::default()
+            }])
+            .expect("edge");
+
+        let dependents =
+            semantic_graph_dependent_file_ids_by_seed(&storage, &HashSet::from([CoreNodeId(1)]))
+                .expect("semantic dependents");
+
+        assert_eq!(
+            dependents.get(&CoreNodeId(1)),
+            Some(&HashSet::from([CoreNodeId(1), CoreNodeId(2)])),
+            "an untouched endpoint file must be recomputed when related-symbol and edge text can change"
         );
     }
 
@@ -16736,6 +16914,145 @@ fn build_llm_symbol_doc_text() -> String {
                 .is_empty()
         );
         assert!(controller.state.lock().search_engine.is_none());
+    }
+
+    #[test]
+    fn core_dense_anchor_publication_succeeds_when_embedding_backend_is_unavailable() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let embedding_cache_root = workspace.path().join("embedding-unavailable");
+        fs::create_dir_all(&embedding_cache_root).expect("embedding cache root");
+        fs::write(
+            embedding_cache_root.join(codestory_retrieval::TEST_EMBEDDING_UNAVAILABLE_MARKER),
+            b"unavailable",
+        )
+        .expect("embedding unavailable marker");
+        let process_defaults = codestory_retrieval::SidecarProcessDefaults::new(
+            embedding_cache_root,
+            codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
+        );
+        let runtime =
+            codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
+                Some(workspace.path()),
+                codestory_retrieval::SidecarProfile::Local,
+                None,
+                &process_defaults,
+                &codestory_retrieval::SidecarRuntimeOverrides::default(),
+            );
+        let unavailable =
+            codestory_retrieval::ensure_product_embedding_backend_for_runtime(&runtime)
+                .expect_err("test runtime must reject embedding initialization");
+        assert!(
+            unavailable
+                .to_string()
+                .contains("embedding backend unavailable")
+        );
+        assert!(
+            !codestory_retrieval::probe_product_embedding_runtime_for_runtime(&runtime).reachable
+        );
+
+        let controller = AppController::new_with_config(runtime);
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("core indexing must not initialize or access embeddings");
+
+        let storage = Storage::open(&storage_path).expect("core storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("core publication")
+            .expect("complete core publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("dense publication without embeddings");
+        assert!(manifest.anchor_count > 0);
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy vectors")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn incomplete_incremental_source_preserves_last_verified_dense_anchors() {
+        let mut env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        let first_manifest = first_storage
+            .validate_dense_anchor_publication(&first_publication)
+            .expect("first dense manifest");
+        let first_file_id = first_storage
+            .get_file_by_path(&source_path)
+            .expect("first file lookup")
+            .expect("indexed Rust source")
+            .id;
+        let first_anchors = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file_id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert!(
+            !first_anchors.is_empty(),
+            "fixture needs Rust dense anchors"
+        );
+        drop(first_storage);
+
+        let mut source = fs::read_to_string(&source_path).expect("read source");
+        source.push_str("\n// scheduled but deliberately unreadable to this index run\n");
+        fs::write(&source_path, source).expect("change source");
+        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incomplete incremental index");
+
+        let storage = Storage::open(&storage_path).expect("incremental storage");
+        let file = storage
+            .get_file_by_path(&source_path)
+            .expect("file lookup")
+            .expect("source file");
+        assert!(!file.complete, "the source must remain scheduled for retry");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("incremental publication")
+            .expect("complete incremental publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("retained dense publication");
+        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        let retained_anchors = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("retained anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(file.id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert_eq!(retained_anchors, first_anchors);
     }
 
     #[test]

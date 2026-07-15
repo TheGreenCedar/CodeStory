@@ -274,6 +274,11 @@ fn interrupted_v19_run_migrates_manifest_column_without_clearing_fence() -> Resu
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     assert!(columns.iter().any(|column| column == "lexical_version"));
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "rollback_record_json")
+    );
     assert!(!columns.iter().any(|column| column == "zoekt_version"));
     storage.finish_incremental_run()?;
     assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
@@ -2077,6 +2082,55 @@ fn current_schema_uses_only_lexical_manifest_column() -> Result<(), StorageError
 
     drop(storage);
     let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn schema_24_adds_atomic_retrieval_rollback_without_losing_current() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v24-retrieval-rollback-migration");
+    let _ = std::fs::remove_file(&db_path);
+    let current = RetrievalIndexManifest {
+        project_id: "proj".into(),
+        lexical_version: "v1".into(),
+        semantic_generation: "codestory_proj_aaaaaaaaaaaaaaaa".into(),
+        scip_revision: Some("graph".into()),
+        built_at_epoch_ms: 1,
+        disk_bytes: None,
+        degraded_modes_json: "[]".into(),
+        embedding_backend: Some("backend".into()),
+        embedding_dim: Some(768),
+        sidecar_schema_version: Some(5),
+        sidecar_input_hash: Some("a".repeat(64)),
+        sidecar_generation: Some("proj-aaaaaaaaaaaaaaaa".into()),
+        projection_count: Some(0),
+        symbol_doc_count: Some(0),
+        dense_projection_count: Some(0),
+        semantic_policy_version: Some("graph_first_v1".into()),
+        graph_artifact_hash: Some("graph".into()),
+        dense_reason_counts_json: Some("{}".into()),
+        precise_semantic_import_status: None,
+        precise_semantic_import_reason: None,
+        precise_semantic_import_revision: None,
+        precise_semantic_import_producer: None,
+    };
+    {
+        let mut storage = Storage::open(&db_path)?;
+        storage.upsert_retrieval_index_manifest(&current)?;
+        storage.conn.execute(
+            "ALTER TABLE retrieval_index_manifest DROP COLUMN rollback_record_json",
+            [],
+        )?;
+        storage.set_schema_version(24)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert_eq!(
+        storage.get_retrieval_index_publication("proj")?,
+        Some((current, None))
+    );
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&db_path);
     Ok(())
 }
 

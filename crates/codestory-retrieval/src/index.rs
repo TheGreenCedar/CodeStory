@@ -16,9 +16,8 @@ use crate::lexical_index::{
 use crate::retention::{
     FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
     GenerationRetentionLock, GenerationRetentionMarker, GenerationRetentionPlan,
-    VerifiedRollbackManifest, apply_generation_retention, global_generation_gc_state_file,
-    plan_generation_retention, read_retention_marker, scan_retention_protection,
-    write_retention_marker,
+    apply_generation_retention, global_generation_gc_state_file, plan_generation_retention,
+    scan_retention_protection, write_retention_marker,
 };
 use crate::scip_index::{
     SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
@@ -29,7 +28,10 @@ use chrono::Utc;
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
 #[cfg(test)]
 use codestory_store::LlmSymbolDoc;
-use codestory_store::{DenseAnchorInput, FileRole, RetrievalIndexManifest, Store, SymbolSearchDoc};
+use codestory_store::{
+    DenseAnchorInput, FileRole, RetrievalIndexManifest, RetrievalIndexRollbackRecord, Store,
+    SymbolSearchDoc,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -93,8 +95,7 @@ struct GenerationRetentionContext<'a> {
 }
 
 struct PreparedGenerationRetention {
-    marker: GenerationRetentionMarker,
-    verified_previous: Option<VerifiedRollbackManifest>,
+    verified_previous: Option<RetrievalIndexRollbackRecord>,
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
@@ -852,7 +853,7 @@ fn persist_finalized_manifest(
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    let prepared_retention = with_embedding_publication_residency(
+    let _prepared_retention = with_embedding_publication_residency(
         &retention_context.embedding_residency,
         || {
             promote_retrieval_manifest(
@@ -893,22 +894,30 @@ fn persist_finalized_manifest(
                         retention_context,
                     )
                 },
-                || prepare_generation_retention(retention_context, &project_id, &manifest),
-                |prepared| {
-                    write_retention_marker(&retention_context.layout.state_file, &prepared.marker)
-                        .context("publish generation retention marker before current manifest")?;
-                    Ok(())
+                |storage| {
+                    prepare_generation_retention(retention_context, &project_id, &manifest, storage)
                 },
+                |prepared| Ok(prepared.verified_previous.clone()),
             )
         },
     )?;
 
-    let (generation_retention_plan, generation_retention) = retain_published_generations(
-        storage_path,
-        retention_context,
+    let marker_error = match publish_derived_retention_marker(
+        &storage,
+        retention_context.layout,
+        retention_context.workspace_id,
         &project_id,
-        &prepared_retention,
-    )?;
+    ) {
+        Ok(()) => None,
+        Err(error) => {
+            let error = format!("publish derived generation retention marker: {error:#}");
+            warn!(project_id = %project_id, error = %error, "retention marker update failed after SQLite publication");
+            Some(error)
+        }
+    };
+
+    let (generation_retention_plan, generation_retention) =
+        retain_published_generations(storage_path, retention_context, &project_id, marker_error)?;
 
     info!(
         project_id = %project_id,
@@ -945,25 +954,47 @@ fn promote_retrieval_manifest<T>(
     manifest: &RetrievalIndexManifest,
     current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
     validate_candidate: impl FnOnce() -> Result<()>,
-    prepare_publication: impl FnOnce() -> Result<T>,
-    publish_retention_pointer: impl FnOnce(&T) -> Result<()>,
+    prepare_publication: impl FnOnce(&Store) -> Result<T>,
+    publication_rollback: impl FnOnce(&T) -> Result<Option<RetrievalIndexRollbackRecord>>,
 ) -> Result<T> {
     validate_candidate()?;
-    let prepared = prepare_publication()?;
+    let prepared = prepare_publication(storage)?;
     let mut publication = storage
         .write_transaction()
         .context("lock sidecar input and manifest publication")?;
     let current = current_input(publication.storage())?;
     ensure_sidecar_input_unchanged(expected, &current)?;
-    publish_retention_pointer(&prepared)?;
+    let rollback = publication_rollback(&prepared)?;
     publication
         .storage_mut()
-        .upsert_retrieval_index_manifest(manifest)
-        .context("persist retrieval_index_manifest")?;
+        .publish_retrieval_index_publication(manifest, rollback.as_ref())
+        .context("persist atomic retrieval current and rollback pointers")?;
     publication
         .finish()
         .context("commit retrieval manifest publication")?;
     Ok(prepared)
+}
+
+fn publish_derived_retention_marker(
+    storage: &Store,
+    layout: &SidecarLayout,
+    workspace_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    let (active, rollback) = storage
+        .get_retrieval_index_publication(project_id)
+        .context("read committed retrieval publication for retention marker")?
+        .context("committed retrieval publication is missing")?;
+    let marker = GenerationRetentionMarker::next(
+        workspace_id,
+        active,
+        rollback,
+        Utc::now().timestamp_millis(),
+    )
+    .context("derive generation retention marker from SQLite publication")?;
+    write_retention_marker(&layout.state_file, &marker)
+        .context("write derived generation retention marker")?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1187,20 +1218,22 @@ fn prepare_generation_retention(
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
     active: &RetrievalIndexManifest,
+    storage: &Store,
 ) -> Result<PreparedGenerationRetention> {
     let now = Utc::now().timestamp_millis();
-    let existing_marker = read_retention_marker(&context.layout.state_file, context.workspace_id)
-        .context("read generation retention marker before publication")?;
     let active_generation = active.sidecar_generation.as_deref();
     let mut candidates = Vec::new();
     if let Some(previous) = context.previous_manifest {
         candidates.push(previous.clone());
     }
-    if let Some(marker) = existing_marker.as_ref() {
-        candidates.push(marker.active.clone());
-        if let Some(rollback) = marker.rollback.as_ref() {
-            candidates.push(rollback.manifest.clone());
-        }
+    match storage.get_retrieval_index_publication(project_id) {
+        Ok(Some((_, Some(rollback)))) => candidates.push(rollback.manifest),
+        Ok(_) => {}
+        Err(error) => warn!(
+            project_id = %project_id,
+            error = %error,
+            "stored rollback pointer is unreadable and will not be retained as authoritative"
+        ),
     }
     candidates.retain(|candidate| {
         candidate.project_id == project_id
@@ -1209,50 +1242,73 @@ fn prepare_generation_retention(
     });
     candidates.sort_by_key(|candidate| candidate.built_at_epoch_ms);
     candidates.dedup_by(|left, right| left.sidecar_generation == right.sidecar_generation);
-    let verified_previous = candidates.into_iter().rev().find_map(|candidate| {
-        let status = probe_sidecar_health_for_runtime(
-            context.layout,
-            project_id,
-            Some(candidate.clone()),
-            context.embedding_device,
-            context.runtime,
-        );
-        (status.retrieval_mode == "full").then_some(VerifiedRollbackManifest {
-            manifest: candidate,
-            verified_at_epoch_ms: now,
+
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication for rollback validation")?;
+    let verified_previous = publication.and_then(|publication| {
+        candidates.into_iter().rev().find_map(|candidate| {
+            let validation = crate::embedded_vector::validate_generation_evidence_for_publication(
+                context.layout,
+                storage,
+                &candidate,
+                &publication,
+                context.runtime,
+                context.embedding_device,
+                context.embedding_residency.identity(),
+            )
+            .context("validate rollback vector bytes, producer evidence, and anchor coverage")
+            .and_then(|_| {
+                let status = probe_sidecar_health_for_runtime(
+                    context.layout,
+                    project_id,
+                    Some(candidate.clone()),
+                    context.embedding_device,
+                    context.runtime,
+                );
+                if status.retrieval_mode != "full" {
+                    bail!(
+                        "rollback generation is not full: {} {:?}",
+                        status.retrieval_mode,
+                        status.degraded_reason
+                    );
+                }
+                Ok(())
+            });
+            match validation {
+                Ok(()) => Some(RetrievalIndexRollbackRecord {
+                    manifest: candidate,
+                    verified_at_epoch_ms: now,
+                }),
+                Err(error) => {
+                    warn!(
+                        project_id = %project_id,
+                        sidecar_generation = ?candidate.sidecar_generation,
+                        error = %format!("{error:#}"),
+                        "retrieval rollback candidate failed deep validation"
+                    );
+                    None
+                }
+            }
         })
     });
 
-    let marker = GenerationRetentionMarker::next(
-        context.workspace_id,
-        active.clone(),
-        verified_previous.clone(),
-        now,
-    )
-    .context("build generation retention marker before publication")?;
-
-    Ok(PreparedGenerationRetention {
-        marker,
-        verified_previous,
-    })
+    Ok(PreparedGenerationRetention { verified_previous })
 }
 
 fn retain_published_generations(
     storage_path: &Path,
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
-    prepared: &PreparedGenerationRetention,
+    marker_error: Option<String>,
 ) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
     let mut protection = scan_retention_protection(
         &crate::config::user_cache_root(),
         Some(storage_path),
         &context.layout.state_file,
     );
-    if let Some(rollback) = prepared.verified_previous.as_ref() {
-        protection
-            .authoritative_rollback
-            .push(rollback.manifest.clone());
-        protection.rollback.push(rollback.manifest.clone());
+    if let Some(error) = marker_error {
+        protection.errors.push(error);
     }
     let plan = plan_generation_retention(context.layout, project_id, &protection);
     let mut remover = FsGenerationRemover::new(context.layout)?;
@@ -1292,9 +1348,26 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         .context("hash lexical symbol input")?;
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v8");
+    hash_part(&mut hasher, "codestory-sidecar-input-v9");
     hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
+    let core_publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication for sidecar hash")?;
+    hash_part(
+        &mut hasher,
+        core_publication
+            .as_ref()
+            .map_or("<missing>", |publication| {
+                publication.generation_id.as_str()
+            }),
+    );
+    hash_part(
+        &mut hasher,
+        core_publication
+            .as_ref()
+            .map_or("<missing>", |publication| publication.run_id.as_str()),
+    );
     hash_part(&mut hasher, &SIDECAR_SCHEMA_VERSION.to_string());
     hash_part(&mut hasher, LEXICAL_INDEX_VERSION);
     hash_part(&mut hasher, &lexical.file_count.to_string());
@@ -1486,6 +1559,7 @@ fn normalize_sidecar_file_path(path: &str, project_root: &Path) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retention::read_retention_marker;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::SearchSymbolProjectionDetail;
     use std::path::PathBuf;
@@ -1547,7 +1621,8 @@ mod tests {
         assert!(
             message.contains("mandatory")
                 || message.contains("embedding_device_unverified")
-                || message.contains("without its embedded embedding model"),
+                || message.contains("without its embedded embedding model")
+                || message.contains("complete core publication"),
             "expected a pre-publication retrieval trust-gate error, got {error:#}"
         );
     }
@@ -1774,6 +1849,15 @@ mod tests {
         storage
             .upsert_dense_anchor_inputs_batch(&[doc.clone()])
             .expect("first doc");
+        storage
+            .put_index_publication(&codestory_store::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "g1".into(),
+                run_id: "r1".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("first core publication");
         let first = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
@@ -1786,6 +1870,15 @@ mod tests {
         storage
             .upsert_dense_anchor_inputs_batch(&[doc.clone()])
             .expect("rebind unchanged doc");
+        storage
+            .put_index_publication(&codestory_store::IndexPublicationRecord {
+                generation: 2,
+                generation_id: "g2".into(),
+                run_id: "r2".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            })
+            .expect("second core publication");
         let rebound = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
@@ -1794,9 +1887,9 @@ mod tests {
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
         )
         .expect("rebound fingerprint");
-        assert_eq!(
+        assert_ne!(
             first.hash, rebound.hash,
-            "publication identity must not invalidate content-addressed vector reuse"
+            "publication-bound vector evidence requires a fresh immutable generation"
         );
         let old_manifest = retrieval_manifest_for_sidecar(
             "proj",
@@ -1855,8 +1948,8 @@ mod tests {
                 )
             },
             || Ok(()),
-            || Ok(()),
             |_| Ok(()),
+            |_| Ok(None),
         );
         assert!(rejected.is_err());
         assert_eq!(
@@ -1995,7 +2088,7 @@ mod tests {
         let marker = GenerationRetentionMarker::next(
             "workspace",
             old_manifest.clone(),
-            Some(VerifiedRollbackManifest {
+            Some(RetrievalIndexRollbackRecord {
                 manifest: rollback_manifest,
                 verified_at_epoch_ms: 123,
             }),
@@ -2040,8 +2133,8 @@ mod tests {
                         &failing,
                     )
                 },
-                || Ok(()),
                 |_| Ok(()),
+                |_| Ok(None),
             )
             .expect_err("component failure must reject promotion");
             assert!(
@@ -2080,8 +2173,8 @@ mod tests {
                     )?;
                     panic!("simulated crash before candidate promotion")
                 },
-                || Ok(()),
                 |_| Ok(()),
+                |_| Ok(None),
             );
         }));
         assert!(crashed.is_err());
@@ -2125,8 +2218,8 @@ mod tests {
                 std::fs::write(&source_path, "pub fn changed_during_validation() {}\n")?;
                 Ok(())
             },
-            || Ok(()),
             |_| Ok(()),
+            |_| Ok(None),
         )
         .expect_err("source drift during validation must reject publication");
         assert!(drifted.to_string().contains("input changed"));
@@ -2162,11 +2255,15 @@ mod tests {
                     &passing,
                 )
             },
-            || Ok(()),
-            |_| bail!("simulated retention pointer write failure"),
+            |_| Ok(()),
+            |_| bail!("simulated SQLite rollback pointer failure"),
         )
-        .expect_err("retention pointer failure must reject publication");
-        assert!(pointer_fault.to_string().contains("retention pointer"));
+        .expect_err("SQLite rollback pointer failure must reject publication");
+        assert!(
+            pointer_fault
+                .to_string()
+                .contains("SQLite rollback pointer")
+        );
         assert_eq!(
             storage
                 .get_retrieval_index_manifest("proj")
@@ -2181,6 +2278,10 @@ mod tests {
             "retention pointer failure changed rollback state"
         );
 
+        let rollback_record = RetrievalIndexRollbackRecord {
+            manifest: old_manifest.clone(),
+            verified_at_epoch_ms: 456,
+        };
         promote_retrieval_manifest(
             &mut storage,
             &second,
@@ -2205,15 +2306,149 @@ mod tests {
                     &passing,
                 )
             },
-            || Ok(()),
             |_| Ok(()),
+            |_| Ok(Some(rollback_record.clone())),
         )
         .expect("unchanged input promotes manifest");
         assert_eq!(
             storage
-                .get_retrieval_index_manifest("proj")
-                .expect("current manifest"),
-            Some(new_manifest)
+                .get_retrieval_index_publication("proj")
+                .expect("current publication"),
+            Some((new_manifest.clone(), Some(rollback_record.clone())))
+        );
+
+        let marker_blocker = storage_dir.path().join("marker-blocker");
+        std::fs::write(&marker_blocker, b"not a directory").expect("marker blocker");
+        let mut blocked_layout = runtime.layout.clone();
+        blocked_layout.state_file = marker_blocker.join("retrieval.state");
+        publish_derived_retention_marker(&storage, &blocked_layout, "workspace", "proj")
+            .expect_err("derived marker failure happens after SQLite commit");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("publication survives marker failure"),
+            Some((new_manifest, Some(rollback_record.clone())))
+        );
+        let mut protection = scan_retention_protection(
+            storage_dir.path(),
+            Some(&storage_path),
+            &blocked_layout.state_file,
+        );
+        protection
+            .errors
+            .push("derived marker publication failed".into());
+        assert!(
+            protection
+                .authoritative_rollback
+                .contains(&rollback_record.manifest),
+            "restart scans must recover rollback authority from SQLite without a marker"
+        );
+        assert!(
+            plan_generation_retention(&runtime.layout, "proj", &protection).pruning_suppressed,
+            "marker failure must conservatively suppress pruning"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rollback_selection_rejects_corrupt_vector_evidence_and_anchor_publication() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+        use std::io::Write as _;
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let store = Store::open(&storage_path).expect("open storage");
+        store
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "run-one".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("publish core identity");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        let previous =
+            publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+                .expect("publish rollback candidate");
+        let active_hash = "b".repeat(64);
+        let active =
+            crate::test_support::retrieval_manifest_fixture(&previous.project_id, &active_hash);
+        let select = |storage: &Store| {
+            let residency =
+                crate::embeddings::acquire_product_embedding_residency_for_runtime(&runtime)
+                    .expect("acquire test residency");
+            let device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
+            let context = GenerationRetentionContext {
+                runtime: &runtime,
+                layout: &runtime.layout,
+                workspace_id: "workspace",
+                previous_manifest: Some(&previous),
+                embedding_device: &device,
+                embedding_residency: residency,
+            };
+            prepare_generation_retention(&context, &previous.project_id, &active, storage)
+                .expect("prepare retention")
+                .verified_previous
+        };
+
+        let storage = Store::open(&storage_path).expect("open candidate storage");
+        assert!(
+            select(&storage).is_some(),
+            "complete rollback must be selected"
+        );
+        let vector_path =
+            crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&vector_path)
+            .expect("open vector database")
+            .write_all(b"corrupt")
+            .expect("corrupt vector bytes");
+        assert!(
+            select(&storage).is_none(),
+            "exact vector-byte corruption must disqualify rollback"
+        );
+        drop(storage);
+
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("repair vector fixture");
+        let evidence_path =
+            crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation)
+                .parent()
+                .expect("vector collection directory")
+                .join("vector-generation-manifest.json");
+        std::fs::write(&evidence_path, b"{}\n").expect("corrupt producer evidence");
+        let storage = Store::open(&storage_path).expect("open evidence-corrupt storage");
+        assert!(
+            select(&storage).is_none(),
+            "producer-evidence corruption must disqualify rollback"
+        );
+        drop(storage);
+
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("repair evidence fixture");
+        let storage = Store::open(&storage_path).expect("open anchor-corrupt storage");
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE dense_anchor_publication SET anchor_digest = ?1 WHERE id = 1",
+                rusqlite::params!["c".repeat(64)],
+            )
+            .expect("corrupt anchor publication");
+        assert!(
+            select(&storage).is_none(),
+            "anchor-publication corruption must disqualify rollback"
         );
     }
 

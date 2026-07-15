@@ -32,7 +32,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -2710,6 +2710,18 @@ impl Storage {
                 OR instr(COALESCE(file_path, ''), ?1) > 0
                 OR instr(doc_text, ?1) > 0
                 OR instr(source_provenance, ?1) > 0",
+            "UPDATE dense_anchor_input
+             SET
+                display_name = replace(display_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2),
+                source_provenance = replace(source_provenance, ?1, ?2),
+                document_text = replace(document_text, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0
+                OR instr(source_provenance, ?1) > 0
+                OR instr(document_text, ?1) > 0",
             "UPDATE search_symbol_projection
              SET display_name = replace(display_name, ?1, ?2)
              WHERE instr(display_name, ?1) > 0",
@@ -2732,6 +2744,10 @@ impl Storage {
             updated =
                 updated.saturating_add(tx.execute(statement, params![source_root, target_root])?);
         }
+        // Dense anchor rows have been rebound to a different project identity. Keep them
+        // available as incremental inputs, but require core indexing to publish a new,
+        // internally consistent manifest before retrieval can consume them.
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
         tx.commit()?;
         Ok(updated)
     }
@@ -2782,6 +2798,7 @@ impl Storage {
             "SELECT COUNT(*) FROM error WHERE message LIKE ?1",
             "SELECT COUNT(*) FROM llm_symbol_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1",
             "SELECT COUNT(*) FROM symbol_search_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1 OR source_provenance LIKE ?1",
+            "SELECT COUNT(*) FROM dense_anchor_input WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR source_provenance LIKE ?1 OR document_text LIKE ?1",
             "SELECT COUNT(*) FROM search_symbol_projection WHERE display_name LIKE ?1",
             "SELECT COUNT(*) FROM grounding_file_snapshot WHERE path LIKE ?1",
             "SELECT COUNT(*) FROM grounding_node_snapshot WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1 OR display_name LIKE ?1 OR file_path LIKE ?1",
@@ -7550,7 +7567,7 @@ mod grounding_snapshot_fast_path_tests {
     }
 }
 
-pub use retrieval_manifest::RetrievalIndexManifest;
+pub use retrieval_manifest::{RetrievalIndexManifest, RetrievalIndexRollbackRecord};
 
 #[cfg(test)]
 mod tests;

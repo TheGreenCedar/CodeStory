@@ -2,7 +2,7 @@
 
 use crate::config::{SidecarLayout, SidecarProfile, SidecarRuntimeConfig};
 use anyhow::{Context, Result, bail};
-use codestory_store::{RetrievalIndexManifest, Store};
+use codestory_store::{RetrievalIndexManifest, RetrievalIndexRollbackRecord, Store};
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
@@ -29,19 +29,13 @@ pub fn global_generation_gc_state_file(runtime: &SidecarRuntimeConfig) -> PathBu
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifiedRollbackManifest {
-    pub manifest: RetrievalIndexManifest,
-    pub verified_at_epoch_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationRetentionMarker {
     pub schema_version: u32,
     pub workspace_id: String,
     pub project_id: String,
     pub active: RetrievalIndexManifest,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rollback: Option<VerifiedRollbackManifest>,
+    pub rollback: Option<RetrievalIndexRollbackRecord>,
     pub updated_at_epoch_ms: i64,
 }
 
@@ -49,7 +43,7 @@ impl GenerationRetentionMarker {
     pub fn next(
         workspace_id: &str,
         active: RetrievalIndexManifest,
-        verified_previous: Option<VerifiedRollbackManifest>,
+        verified_previous: Option<RetrievalIndexRollbackRecord>,
         updated_at_epoch_ms: i64,
     ) -> Result<Self> {
         validate_retention_component(workspace_id)?;
@@ -171,6 +165,7 @@ pub fn retention_lock_path(state_file: &Path, scope_id: &str) -> Result<PathBuf>
     Ok(retention_dir(state_file).join(format!("{scope_id}.lock")))
 }
 
+#[cfg(test)]
 pub fn read_retention_marker(
     state_file: &Path,
     workspace_id: &str,
@@ -234,13 +229,24 @@ pub fn scan_retention_protection(
     let mut scan = RetentionProtectionScan::default();
     let storage_paths = storage_paths_for_scan(cache_root, active_storage_path, &mut scan.errors);
     for storage_path in storage_paths {
-        match Store::open(&storage_path).and_then(|store| store.list_retrieval_index_manifests()) {
-            Ok(manifests) => {
+        match Store::open(&storage_path).and_then(|store| store.list_retrieval_index_publications())
+        {
+            Ok(publications) => {
+                let manifests = publications
+                    .iter()
+                    .map(|(manifest, _)| manifest.clone())
+                    .collect::<Vec<_>>();
+                let rollbacks = publications
+                    .into_iter()
+                    .filter_map(|(_, rollback)| rollback.map(|record| record.manifest))
+                    .collect::<Vec<_>>();
                 if active_storage_path.is_some_and(|active| active == storage_path) {
                     scan.authoritative_active.extend(manifests.clone());
+                    scan.authoritative_rollback.extend(rollbacks.clone());
                 }
                 scan.storage_paths_scanned.push(storage_path);
                 scan.active.extend(manifests);
+                scan.rollback.extend(rollbacks);
             }
             Err(error) => scan.errors.push(format!(
                 "scan retrieval manifests in {}: {error}",
@@ -1409,7 +1415,7 @@ mod tests {
             let marker = GenerationRetentionMarker::next(
                 workspace,
                 manifest(project, active, 10),
-                Some(VerifiedRollbackManifest {
+                Some(RetrievalIndexRollbackRecord {
                     manifest: manifest(project, rollback, 5),
                     verified_at_epoch_ms: 10,
                 }),
@@ -1695,7 +1701,7 @@ mod tests {
     fn marker_update_preserves_only_a_freshly_verified_rollback() {
         let project = "repo-v1-project";
         let active = manifest(project, "aaaaaaaaaaaaaaaa", 10);
-        let rollback = VerifiedRollbackManifest {
+        let rollback = RetrievalIndexRollbackRecord {
             manifest: manifest(project, "bbbbbbbbbbbbbbbb", 9),
             verified_at_epoch_ms: 11,
         };

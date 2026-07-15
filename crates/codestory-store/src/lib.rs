@@ -23,9 +23,9 @@ pub use storage_impl::{
     FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,
     GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState, IndexPublicationMode,
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    ProjectionFlushBreakdown, RetrievalIndexManifest, SearchSymbolProjection,
-    SearchSymbolProjectionDetail, Storage as Store, StorageError, StorageOpenMode, StorageStats,
-    SymbolSearchDoc, SymbolSummaryRecord,
+    ProjectionFlushBreakdown, RetrievalIndexManifest, RetrievalIndexRollbackRecord,
+    SearchSymbolProjection, SearchSymbolProjectionDetail, Storage as Store, StorageError,
+    StorageOpenMode, StorageStats, SymbolSearchDoc, SymbolSummaryRecord,
 };
 
 impl Store {

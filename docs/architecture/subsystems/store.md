@@ -31,6 +31,11 @@ the complete row count and digest, policy version, migration state, and every
 row's source identity to the current core generation/run. A migrated cache has
 no complete manifest until core indexing republishes it.
 
+Schema v25 also stores the current retrieval manifest and its deeply verified
+rollback record in the same SQLite row. They change in one transaction. The
+filesystem retention marker is derived after commit and can only make cleanup
+more conservative; it is not a publication authority.
+
 ## Entry points
 
 - `src/storage_impl/mod.rs`: schema lifecycle, reads/writes, publication journal,

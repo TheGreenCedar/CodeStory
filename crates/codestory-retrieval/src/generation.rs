@@ -3,7 +3,7 @@ use codestory_contracts::graph::NodeKind;
 use codestory_store::{RetrievalIndexManifest, Store};
 use std::collections::BTreeMap;
 
-pub const SIDECAR_SCHEMA_VERSION: i32 = 5;
+pub const SIDECAR_SCHEMA_VERSION: i32 = 6;
 pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";

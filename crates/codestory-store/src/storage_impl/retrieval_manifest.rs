@@ -25,7 +25,8 @@ const MANIFEST_SELECT: &str = "
         precise_semantic_import_status,
         precise_semantic_import_reason,
         precise_semantic_import_revision,
-        precise_semantic_import_producer
+        precise_semantic_import_producer,
+        rollback_record_json
     FROM retrieval_index_manifest";
 
 /// Manifest row describing retrieval sidecar freshness for one project id.
@@ -67,12 +68,40 @@ pub struct RetrievalIndexManifest {
     pub precise_semantic_import_producer: Option<String>,
 }
 
+/// Last retrieval generation proven safe to retain as a rollback target.
+///
+/// This record is stored with the current manifest in the same SQLite row so
+/// readers observe either the complete old pointer pair or the complete new
+/// pointer pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalIndexRollbackRecord {
+    pub manifest: RetrievalIndexManifest,
+    pub verified_at_epoch_ms: i64,
+}
+
 impl Storage {
-    /// Insert or replace the retrieval manifest for a project id.
+    /// Insert or replace the retrieval manifest and clear any stale rollback.
     pub fn upsert_retrieval_index_manifest(
         &mut self,
         manifest: &RetrievalIndexManifest,
     ) -> Result<(), StorageError> {
+        self.publish_retrieval_index_publication(manifest, None)
+    }
+
+    /// Atomically replace the authoritative current and rollback pointers.
+    pub fn publish_retrieval_index_publication(
+        &mut self,
+        manifest: &RetrievalIndexManifest,
+        rollback: Option<&RetrievalIndexRollbackRecord>,
+    ) -> Result<(), StorageError> {
+        validate_rollback_record(manifest, rollback)?;
+        let rollback_record_json =
+            rollback
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    StorageError::Other(format!("Failed to serialize retrieval rollback: {error}"))
+                })?;
         self.conn.execute(
             "INSERT INTO retrieval_index_manifest (
                 project_id,
@@ -96,8 +125,9 @@ impl Storage {
                 precise_semantic_import_status,
                 precise_semantic_import_reason,
                 precise_semantic_import_revision,
-                precise_semantic_import_producer
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                precise_semantic_import_producer,
+                rollback_record_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
             ON CONFLICT(project_id) DO UPDATE SET
                 lexical_version = excluded.lexical_version,
                 semantic_generation = excluded.semantic_generation,
@@ -119,7 +149,8 @@ impl Storage {
                 precise_semantic_import_status = excluded.precise_semantic_import_status,
                 precise_semantic_import_reason = excluded.precise_semantic_import_reason,
                 precise_semantic_import_revision = excluded.precise_semantic_import_revision,
-                precise_semantic_import_producer = excluded.precise_semantic_import_producer",
+                precise_semantic_import_producer = excluded.precise_semantic_import_producer,
+                rollback_record_json = excluded.rollback_record_json",
             rusqlite::params![
                 manifest.project_id,
                 manifest.lexical_version,
@@ -143,9 +174,26 @@ impl Storage {
                 manifest.precise_semantic_import_reason,
                 manifest.precise_semantic_import_revision,
                 manifest.precise_semantic_import_producer,
+                rollback_record_json,
             ],
         )?;
         Ok(())
+    }
+
+    /// Load the authoritative current and rollback pointers from one SQLite row.
+    pub fn get_retrieval_index_publication(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
+    {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{MANIFEST_SELECT} WHERE project_id = ?1"))?;
+        let mut rows = stmt.query(rusqlite::params![project_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(publication_from_row(row)?))
     }
 
     /// Load the retrieval manifest for a project id, if one has been built.
@@ -161,6 +209,20 @@ impl Storage {
             return Ok(None);
         };
         Ok(Some(manifest_from_row(row)?))
+    }
+
+    /// Return every authoritative current and rollback pointer pair.
+    pub fn list_retrieval_index_publications(
+        &self,
+    ) -> Result<Vec<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
+    {
+        let mut stmt = self.conn.prepare(MANIFEST_SELECT)?;
+        let rows = stmt.query_map([], publication_from_row)?;
+        let mut publications = Vec::new();
+        for row in rows {
+            publications.push(row?);
+        }
+        Ok(publications)
     }
 
     /// Return every current retrieval manifest in this store.
@@ -181,14 +243,15 @@ impl Storage {
 
     /// Return Semantic collection names referenced by stored retrieval manifests.
     pub fn list_retrieval_semantic_generations(&self) -> Result<Vec<String>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT DISTINCT semantic_generation FROM retrieval_index_manifest")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
         let mut collections = Vec::new();
-        for row in rows {
-            collections.push(row?);
+        for (current, rollback) in self.list_retrieval_index_publications()? {
+            collections.push(current.semantic_generation);
+            if let Some(rollback) = rollback {
+                collections.push(rollback.manifest.semantic_generation);
+            }
         }
+        collections.sort();
+        collections.dedup();
         Ok(collections)
     }
 
@@ -203,16 +266,18 @@ impl Storage {
     pub fn list_retrieval_semantic_generations_with_recency(
         &self,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT semantic_generation, MAX(built_at_epoch_ms)
-             FROM retrieval_index_manifest
-             GROUP BY semantic_generation",
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         let mut collections = Vec::new();
-        for row in rows {
-            collections.push(row?);
+        for (current, rollback) in self.list_retrieval_index_publications()? {
+            collections.push((current.semantic_generation, current.built_at_epoch_ms));
+            if let Some(rollback) = rollback {
+                collections.push((
+                    rollback.manifest.semantic_generation,
+                    rollback.manifest.built_at_epoch_ms,
+                ));
+            }
         }
+        collections.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+        collections.dedup_by(|left, right| left.0 == right.0);
         Ok(collections)
     }
 }
@@ -242,6 +307,63 @@ fn manifest_from_row(row: &Row<'_>) -> rusqlite::Result<RetrievalIndexManifest> 
         precise_semantic_import_revision: row.get(20)?,
         precise_semantic_import_producer: row.get(21)?,
     })
+}
+
+fn publication_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)> {
+    let manifest = manifest_from_row(row)?;
+    let rollback_json = row.get::<_, Option<String>>(22)?;
+    let rollback = rollback_json
+        .map(|json| {
+            serde_json::from_str::<RetrievalIndexRollbackRecord>(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    22,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
+    validate_rollback_record(&manifest, rollback.as_ref()).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(22, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok((manifest, rollback))
+}
+
+fn validate_rollback_record(
+    current: &RetrievalIndexManifest,
+    rollback: Option<&RetrievalIndexRollbackRecord>,
+) -> Result<(), StorageError> {
+    let Some(rollback) = rollback else {
+        return Ok(());
+    };
+    let current_generation = current
+        .sidecar_generation
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| StorageError::Other("Current retrieval generation is missing".into()))?;
+    let rollback_generation = rollback
+        .manifest
+        .sidecar_generation
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| StorageError::Other("Rollback retrieval generation is missing".into()))?;
+    if rollback.manifest.project_id != current.project_id
+        || rollback_generation == current_generation
+        || rollback.manifest.semantic_generation.trim().is_empty()
+        || rollback
+            .manifest
+            .sidecar_input_hash
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        || rollback.verified_at_epoch_ms < 0
+    {
+        return Err(StorageError::Other(
+            "Retrieval rollback does not describe a distinct verified generation".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -394,6 +516,158 @@ mod tests {
             manifests[1].sidecar_generation.as_deref(),
             Some("proj_b-bbbbbbbbbbbbbbbb")
         );
+    }
+
+    #[test]
+    fn retrieval_publication_updates_current_and_rollback_atomically() {
+        fn manifest(suffix: &str, built_at_epoch_ms: i64) -> RetrievalIndexManifest {
+            RetrievalIndexManifest {
+                project_id: "proj".into(),
+                lexical_version: "v1".into(),
+                semantic_generation: format!("codestory_proj_{suffix}"),
+                scip_revision: Some(format!("graph-{suffix}")),
+                built_at_epoch_ms,
+                disk_bytes: None,
+                degraded_modes_json: "[]".into(),
+                embedding_backend: Some("backend".into()),
+                embedding_dim: Some(768),
+                sidecar_schema_version: Some(2),
+                sidecar_input_hash: Some(suffix.repeat(4)),
+                sidecar_generation: Some(format!("proj-{suffix}")),
+                projection_count: Some(1),
+                symbol_doc_count: Some(1),
+                dense_projection_count: Some(1),
+                semantic_policy_version: Some("graph_first_v1".into()),
+                graph_artifact_hash: Some(format!("graph-{suffix}")),
+                dense_reason_counts_json: Some("{\"public_api\":1}".into()),
+                precise_semantic_import_status: None,
+                precise_semantic_import_reason: None,
+                precise_semantic_import_revision: None,
+                precise_semantic_import_producer: None,
+            }
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("codestory.db");
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        let first = manifest("aaaaaaaaaaaaaaaa", 1);
+        let second = manifest("bbbbbbbbbbbbbbbb", 2);
+        let third = manifest("cccccccccccccccc", 3);
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: first.clone(),
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .upsert_retrieval_index_manifest(&first)
+            .expect("seed current");
+
+        {
+            let mut publication = storage.write_transaction().expect("begin publication");
+            publication
+                .storage_mut()
+                .publish_retrieval_index_publication(&second, Some(&rollback))
+                .expect("stage pointer pair");
+        }
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("load after rollback"),
+            Some((first.clone(), None)),
+            "dropping the transaction must retain the complete old pointer pair"
+        );
+
+        {
+            let mut publication = storage.write_transaction().expect("begin publication");
+            publication
+                .storage_mut()
+                .publish_retrieval_index_publication(&second, Some(&rollback))
+                .expect("stage pointer pair");
+            publication.finish().expect("commit pointer pair");
+        }
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("load committed pair"),
+            Some((second, Some(rollback)))
+        );
+
+        storage
+            .upsert_retrieval_index_manifest(&third)
+            .expect("legacy current-only publication");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("load current-only publication"),
+            Some((third, None)),
+            "current-only writes must clear an obsolete rollback pointer"
+        );
+    }
+
+    #[test]
+    fn malformed_retrieval_rollback_fails_closed_without_changing_current() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("codestory.db");
+        let mut storage = Storage::open(&db_path).expect("open storage");
+        let mut current = retrieval_manifest_fixture_for_store("aaaaaaaaaaaaaaaa");
+        storage
+            .upsert_retrieval_index_manifest(&current)
+            .expect("seed current");
+        let malformed = RetrievalIndexRollbackRecord {
+            manifest: current.clone(),
+            verified_at_epoch_ms: 2,
+        };
+        current.built_at_epoch_ms = 2;
+        assert!(
+            storage
+                .publish_retrieval_index_publication(&current, Some(&malformed))
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("load current"),
+            Some((
+                retrieval_manifest_fixture_for_store("aaaaaaaaaaaaaaaa"),
+                None
+            ))
+        );
+
+        storage
+            .conn
+            .execute(
+                "UPDATE retrieval_index_manifest SET rollback_record_json = 'not-json' WHERE project_id = 'proj'",
+                [],
+            )
+            .expect("corrupt rollback JSON");
+        assert!(storage.get_retrieval_index_publication("proj").is_err());
+        assert!(storage.get_retrieval_index_manifest("proj").is_ok());
+    }
+
+    fn retrieval_manifest_fixture_for_store(suffix: &str) -> RetrievalIndexManifest {
+        RetrievalIndexManifest {
+            project_id: "proj".into(),
+            lexical_version: "v1".into(),
+            semantic_generation: format!("codestory_proj_{suffix}"),
+            scip_revision: Some("graph".into()),
+            built_at_epoch_ms: 1,
+            disk_bytes: None,
+            degraded_modes_json: "[]".into(),
+            embedding_backend: Some("backend".into()),
+            embedding_dim: Some(768),
+            sidecar_schema_version: Some(2),
+            sidecar_input_hash: Some(suffix.repeat(4)),
+            sidecar_generation: Some(format!("proj-{suffix}")),
+            projection_count: Some(1),
+            symbol_doc_count: Some(1),
+            dense_projection_count: Some(1),
+            semantic_policy_version: Some("graph_first_v1".into()),
+            graph_artifact_hash: Some("graph".into()),
+            dense_reason_counts_json: Some("{}".into()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        }
     }
 
     #[test]

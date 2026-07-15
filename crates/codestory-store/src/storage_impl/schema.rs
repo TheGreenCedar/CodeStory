@@ -293,7 +293,8 @@ const TABLE_STATEMENTS: &[&str] = &[
         precise_semantic_import_status TEXT,
         precise_semantic_import_reason TEXT,
         precise_semantic_import_revision TEXT,
-        precise_semantic_import_producer TEXT
+        precise_semantic_import_producer TEXT,
+        rollback_record_json TEXT
     )",
 ];
 
@@ -511,6 +512,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v24_dense_anchor_publication(&storage.conn)?;
     if stored_version < 24 {
         storage.set_schema_version(24)?;
+    }
+    migrate_v25_retrieval_rollback(&storage.conn)?;
+    if stored_version < 25 {
+        storage.set_schema_version(25)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -834,6 +839,14 @@ pub(super) fn migrate_v24_dense_anchor_publication(conn: &Connection) -> Result<
         [],
     )?;
     Ok(())
+}
+
+pub(super) fn migrate_v25_retrieval_rollback(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "rollback_record_json TEXT",
+    )
 }
 
 fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {

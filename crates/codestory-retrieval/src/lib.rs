@@ -52,6 +52,8 @@ pub use config::{
 pub use config::{
     active_test_cache_root, enable_automatic_test_cache_root_for_process, with_test_cache_root,
 };
+#[cfg(feature = "test-support")]
+pub use embeddings::TEST_EMBEDDING_UNAVAILABLE_MARKER;
 pub use embeddings::{
     CODERANK_EMBED_Q8_GGUF, CODERANK_QUERY_PREFIX_DEFAULT, EmbeddingAcceleratorSmoke,
     EmbeddingDeviceReadiness, EmbeddingRuntimeProbe, InProcessEmbeddingClient,
