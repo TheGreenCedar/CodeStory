@@ -12,16 +12,16 @@ Line Tools. Apple Silicon is the protected Metal cell; Intel Mac development
 uses explicit CPU operation and never claims Metal.
 
 Debug Rust builds compile without embedding the release model. A release build
-requires the exact pinned model at build time:
+automatically reuses or prepares the exact pinned model at build time:
 
 ```sh
-MODEL_PATH="$(node scripts/prepare-embedded-model.mjs)"
-CODESTORY_EMBED_MODEL_SOURCE="$MODEL_PATH" cargo build --release --locked -p codestory-cli
+cargo build --release --locked -p codestory-cli
 ```
 
 The preparation script verifies the declared size and digest before publishing
-the build input. The resulting executable contains the model; product runtime
-does not download it.
+the build input. Set `CODESTORY_EMBED_MODEL_SOURCE` only when a hermetic or
+offline build must provide an explicit preverified source. The resulting
+executable contains the model; product runtime does not download it.
 
 ## Establish the proof target
 
@@ -119,8 +119,7 @@ Use the built binary rather than `cargo run` when the shipped command boundary
 is part of the claim:
 
 ```sh
-MODEL_PATH="$(node scripts/prepare-embedded-model.mjs)"
-CODESTORY_EMBED_MODEL_SOURCE="$MODEL_PATH" cargo build --release --locked -p codestory-cli
+cargo build --release --locked -p codestory-cli
 ./target/release/codestory-cli index --project . --refresh auto
 ./target/release/codestory-cli ready --project . --goal local
 ./target/release/codestory-cli ground --project . --why

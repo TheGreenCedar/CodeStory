@@ -187,6 +187,16 @@ Check:
 - whether JSON and markdown output still match the runtime DTO shape
 - whether the change belongs in runtime rather than the adapter layer
 
+## If A Release Build Cannot Prepare The Embedded Model
+
+`cargo build --release --locked -p codestory-cli` normally reuses the verified
+workspace build asset or runs `scripts/prepare-embedded-model.mjs`
+automatically. If preparation fails, check the emitted Node.js or network error
+and leave the partial file for the script's bounded cleanup path. For a
+hermetic or offline build, point `CODESTORY_EMBED_MODEL_SOURCE` at the exact
+checksum-pinned GGUF; an invalid override fails closed and is never replaced by
+a download.
+
 ## Cache Reset Cookbook
 
 Use this when you need to wipe state instead of debugging a clearly broken cache:
