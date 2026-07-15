@@ -2,30 +2,20 @@
 
 ## Unreleased
 
-## 0.16.0
-
 ### Highlights
 
-- CodeStory search now lives inside the CodeStory executable. The release ships with its model and embedding engine already included, so there is no helper server, Docker service, model download, endpoint, port, or repair process to manage.
-- First use is automatic. Ask a repository question and CodeStory prepares the map and search index itself. If a large project needs more time, the agent retries the same tool; users are never asked to approve or repair an internal retrieval component.
-- One warm embedding engine can serve several open repositories while every repository keeps its own cache, publication, and readiness state. Switching projects no longer means loading the model again.
-- Inactive coding tasks no longer keep the model and GPU allocation forever. After a short quiet period CodeStory releases that memory, then restores the same packaged engine automatically when the task needs search again.
-- Apple Silicon uses Metal. Windows and supported Linux hardware use Vulkan. Production never silently falls back to CPU; hosted CI can opt into the clearly labelled CPU path without making an acceleration claim.
-- Search readiness now proves the exact model and engine build, physical adapter, full accelerator offload, a live embedding smoke, and one coherent graph/search publication before returning broad evidence.
+- CodeStory now carries its search model and embedding engine inside the executable. There is no Docker service, helper server, model download, endpoint, port, or repair step to manage.
+- The first repository question prepares the local map and broader search automatically. If a large project needs more time, the agent retries the same request; users are never asked to approve or repair an internal retrieval component.
+- Repositories handled by the same CodeStory process share one warm model without sharing indexes or readiness state. Separate idle task processes release the model and GPU memory after a short quiet period, then reload automatically when search is needed again.
+- Apple Silicon uses Metal, and Windows x64 uses Vulkan on supported physical GPUs. Linux packages are Vulkan-capable, but this release makes no Linux GPU claim. Production never silently falls back to CPU.
+- CodeStory reports broad search ready only after its model, physical accelerator, live embedding check, and repository publication agree. Local navigation remains available while broader search prepares.
 
-### Better first use and recovery
+### Search quality and reliability
 
-- A first `ground`, `packet`, or `search` call can finish managed preparation without a separate setup command. While a new semantic generation is being published, the same call returns a short retry instead of an empty answer or a dead-end error.
-- Existing semantic indexes rebuild once under the new in-process producer identity. The previous complete publication remains usable during safe refreshes, and mixed-generation results still fail closed.
-- Normal plugin output now says whether retrieval is ready, preparing, or unavailable. Model, backend, adapter, and timing details stay in maintainer diagnostics instead of leaking into everyday agent conversations.
-- The user, contributor, operations, and architecture documentation has been rebuilt around the actual single-executable lifecycle, multi-repository routing, publication boundaries, and the shortest recovery path.
-
-### Performance and release confidence
-
-- CodeRankEmbed Q8 replaces BGE-base-en-v1.5 after a same-machine Metal comparison. On the frozen dense-retrieval slice it improved MRR@10 by 36% and Hit@1 by 55%. It is a larger, slower model, but the quality gain was worth the measured throughput and memory cost. Existing semantic generations rebuild once; no experimental selector or compatibility branch ships.
-- Offline package proof now starts from one executable, exercises multiple repositories through one engine, verifies restart cache reuse, and rejects software adapters such as WARP, llvmpipe, and lavapipe.
-- Windows vector publication now flushes a writable durability handle, and the release model hash no longer depends on an enlarged build-script stack.
-- Release evidence is routed through the in-process Linux ARM64 machine profile. Its pinned VM image supplies containerd directly, without retaining a Docker repository package dependency. The one-shot proof VM is capped at 8 GiB, its workspace is mounted only after the dedicated data disk is ready, unused cross-architecture emulation is disabled, and the VM is stopped after the final proof. Mac signing and notarization remain publication-only gates, not PR blockers.
+- CodeRankEmbed replaces BGE. In a fixed same-machine comparison, it improved ranking quality by 36% and the first-result hit rate by 55%. It uses more memory and indexes more slowly, so inactive task processes now unload it instead of holding that cost indefinitely.
+- Existing semantic indexes rebuild once after upgrade. The last complete index stays available during safe refreshes, and CodeStory refuses to mix results from different generations.
+- The packaged executable works offline after installation, reuses its verified model material across restarts, and does not start helper processes or open retrieval ports.
+- Everyday plugin messages say whether broader search is ready, preparing, or unavailable. Model, backend, adapter, and timing details stay in maintainer diagnostics.
 
 ### Upgrade note
 
