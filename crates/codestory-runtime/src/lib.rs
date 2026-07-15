@@ -44,10 +44,10 @@ use codestory_indexer::{
     CancellationToken, IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
 use codestory_store::{
-    CURRENT_SCHEMA_VERSION, FileInfo, GroundingEdgeKindCount, GroundingNodeRecord,
-    IndexPublicationMode, IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata,
-    LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore, Store, SymbolSearchDoc,
-    SymbolSummaryRecord,
+    CURRENT_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata, FileInfo,
+    FileRole as StoreFileRole, GroundingEdgeKindCount, GroundingNodeRecord, IndexPublicationMode,
+    IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocStats, SearchSymbolProjection, SnapshotStore,
+    Store, SymbolSearchDoc, SymbolSummaryRecord,
 };
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use codestory_workspace::{
@@ -3486,6 +3486,7 @@ fn build_search_state_for_runtime(
                 component_reports: None,
             },
             hydrate_semantic_docs,
+            &dense_anchor_source_identity(storage)?,
             None,
             runtime,
         )?,
@@ -3515,6 +3516,22 @@ fn current_epoch_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+fn dense_anchor_source_identity(storage: &Storage) -> Result<String, ApiError> {
+    storage
+        .get_index_publication()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read core publication identity for dense anchors: {error}"
+            ))
+        })
+        .map(|publication| {
+            publication.map_or_else(
+                || "core:unpublished".to_string(),
+                |publication| format!("core:{}:{}", publication.generation_id, publication.run_id),
+            )
+        })
 }
 
 fn runtime_relative_path(root: &Path, path: &Path) -> String {
@@ -5646,6 +5663,7 @@ struct PendingLlmSymbolDoc {
     qualified_name: Option<String>,
     file_path: Option<String>,
     start_line: Option<u32>,
+    end_line: Option<u32>,
     doc_text: String,
     doc_hash: String,
     dense_reason: DenseAnchorReason,
@@ -5656,97 +5674,6 @@ struct BuiltLlmSymbolDoc {
     symbol_doc: SymbolSearchDoc,
     pending: Option<PendingLlmSymbolDoc>,
     reusable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SemanticVectorReuseContractKey {
-    backend: String,
-    profile: String,
-    model_id: String,
-    dimension: u32,
-    doc_shape: String,
-    semantic_policy_version: String,
-}
-
-impl SemanticVectorReuseContractKey {
-    fn from_existing(existing_doc: &LlmSymbolDocReuseMetadata) -> Option<Self> {
-        if existing_doc.doc_version != LLM_SYMBOL_DOC_SCHEMA_VERSION
-            || existing_doc.embedding_dim == 0
-        {
-            return None;
-        }
-        Some(Self {
-            backend: existing_doc.embedding_backend.clone()?,
-            profile: existing_doc.embedding_profile.clone()?,
-            model_id: existing_doc.embedding_model.clone(),
-            dimension: existing_doc.embedding_dim,
-            doc_shape: existing_doc.doc_shape.clone()?,
-            semantic_policy_version: existing_doc.semantic_policy_version.clone()?,
-        })
-    }
-
-    fn current(embedding_contract: &EmbeddingProfileContractDto, dimension: u32) -> Self {
-        Self {
-            backend: embedding_contract.backend.clone(),
-            profile: embedding_contract.profile.clone(),
-            model_id: embedding_contract.cache_key.clone(),
-            dimension,
-            doc_shape: embedding_contract.doc_shape.clone(),
-            semantic_policy_version: SEMANTIC_POLICY_VERSION.to_string(),
-        }
-    }
-
-    fn matches_current_without_known_dimension(
-        &self,
-        embedding_contract: &EmbeddingProfileContractDto,
-    ) -> bool {
-        self.backend.as_str() == embedding_contract.backend.as_str()
-            && self.profile.as_str() == embedding_contract.profile.as_str()
-            && self.model_id.as_str() == embedding_contract.cache_key.as_str()
-            && self.dimension > 0
-            && self.doc_shape.as_str() == embedding_contract.doc_shape.as_str()
-            && self.semantic_policy_version.as_str() == SEMANTIC_POLICY_VERSION
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SemanticVectorReuseKey {
-    contract: SemanticVectorReuseContractKey,
-    doc_hash: String,
-}
-
-impl SemanticVectorReuseKey {
-    fn from_existing(existing_doc: &LlmSymbolDocReuseMetadata) -> Option<Self> {
-        if existing_doc.doc_hash.is_empty() {
-            return None;
-        }
-        Some(Self {
-            contract: SemanticVectorReuseContractKey::from_existing(existing_doc)?,
-            doc_hash: existing_doc.doc_hash.clone(),
-        })
-    }
-
-    fn current(
-        doc_hash: &str,
-        embedding_contract: &EmbeddingProfileContractDto,
-        dimension: u32,
-    ) -> Self {
-        Self {
-            contract: SemanticVectorReuseContractKey::current(embedding_contract, dimension),
-            doc_hash: doc_hash.to_string(),
-        }
-    }
-
-    fn matches_current_without_known_dimension(
-        &self,
-        doc_hash: &str,
-        embedding_contract: &EmbeddingProfileContractDto,
-    ) -> bool {
-        self.doc_hash == doc_hash
-            && self
-                .contract
-                .matches_current_without_known_dimension(embedding_contract)
-    }
 }
 
 #[cfg(test)]
@@ -5770,35 +5697,6 @@ fn llm_symbol_doc_hash_with_alias(doc_text: &str, alias_mode: SemanticDocAliasMo
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     format!("{hash:016x}")
-}
-
-fn llm_symbol_doc_contract_matches(
-    existing_doc: &LlmSymbolDocReuseMetadata,
-    embedding_contract: &EmbeddingProfileContractDto,
-) -> bool {
-    let Some(existing_key) = SemanticVectorReuseContractKey::from_existing(existing_doc) else {
-        return false;
-    };
-    if let Some(dimension) = embedding_contract.dimension {
-        return existing_key
-            == SemanticVectorReuseContractKey::current(embedding_contract, dimension);
-    }
-    existing_key.matches_current_without_known_dimension(embedding_contract)
-}
-
-fn llm_symbol_doc_can_reuse(
-    existing_doc: &LlmSymbolDocReuseMetadata,
-    doc_hash: &str,
-    embedding_contract: &EmbeddingProfileContractDto,
-) -> bool {
-    let Some(existing_key) = SemanticVectorReuseKey::from_existing(existing_doc) else {
-        return false;
-    };
-    if let Some(dimension) = embedding_contract.dimension {
-        return existing_key
-            == SemanticVectorReuseKey::current(doc_hash, embedding_contract, dimension);
-    }
-    existing_key.matches_current_without_known_dimension(doc_hash, embedding_contract)
 }
 
 fn observe_dense_anchor_reason(stats: &mut SemanticProjectionStats, reason: DenseAnchorReason) {
@@ -6156,15 +6054,13 @@ fn is_retrieval_artifact_node(node: &GraphNode) -> bool {
 fn build_component_report_docs(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
-    existing_docs: &HashMap<GraphNodeId, LlmSymbolDocReuseMetadata>,
-    embedding_contract: Option<&EmbeddingProfileContractDto>,
+    existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
     updated_at_epoch_ms: i64,
 ) -> Vec<BuiltLlmSymbolDoc> {
     build_component_report_docs_with_policy(
         graph_context,
         semantic_nodes,
         existing_docs,
-        embedding_contract,
         updated_at_epoch_ms,
         semantic_doc_alias_mode_from_env(),
         semantic_doc_max_tokens_from_env(),
@@ -6174,8 +6070,7 @@ fn build_component_report_docs(
 fn build_component_report_docs_with_policy(
     graph_context: &SemanticDocGraphContext,
     semantic_nodes: &[&GraphNode],
-    existing_docs: &HashMap<GraphNodeId, LlmSymbolDocReuseMetadata>,
-    embedding_contract: Option<&EmbeddingProfileContractDto>,
+    existing_docs: &HashMap<GraphNodeId, DenseAnchorInputReuseMetadata>,
     updated_at_epoch_ms: i64,
     alias_mode: SemanticDocAliasMode,
     max_tokens: usize,
@@ -6269,31 +6164,25 @@ fn build_component_report_docs_with_policy(
                 source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
                 updated_at_epoch_ms,
             };
-            let pending = embedding_contract.map(|embedding_contract| {
-                let dense_reason = DenseAnchorReason::ComponentReport;
-                let reusable = existing_docs.get(&node_id).is_some_and(|existing_doc| {
-                    llm_symbol_doc_can_reuse(existing_doc, &doc_hash, embedding_contract)
-                        && existing_doc.dense_reason.as_deref() == Some(dense_reason.as_str())
-                });
-                (
-                    PendingLlmSymbolDoc {
-                        node_id,
-                        file_node_id: None,
-                        kind,
-                        display_name,
-                        qualified_name,
-                        file_path: representative_file_path,
-                        start_line: None,
-                        doc_text,
-                        doc_hash,
-                        dense_reason,
-                    },
-                    reusable,
-                )
+            let dense_reason = DenseAnchorReason::ComponentReport;
+            let reusable = existing_docs.get(&node_id).is_some_and(|existing_doc| {
+                existing_doc.document_hash == doc_hash
+                    && existing_doc.selection_reason == dense_reason.as_str()
+                    && existing_doc.policy_version == SEMANTIC_POLICY_VERSION
             });
-            let (pending, reusable) = pending
-                .map(|(pending, reusable)| (Some(pending), reusable))
-                .unwrap_or((None, false));
+            let pending = Some(PendingLlmSymbolDoc {
+                node_id,
+                file_node_id: None,
+                kind,
+                display_name,
+                qualified_name,
+                file_path: representative_file_path,
+                start_line: None,
+                end_line: None,
+                doc_text,
+                doc_hash,
+                dense_reason,
+            });
             Some(BuiltLlmSymbolDoc {
                 symbol_doc,
                 pending,
@@ -6303,20 +6192,14 @@ fn build_component_report_docs_with_policy(
         .collect()
 }
 
-fn sort_pending_llm_symbol_docs_for_embedding_batches(docs: &mut [PendingLlmSymbolDoc]) {
-    docs.sort_by(|left, right| {
-        left.doc_text
-            .len()
-            .cmp(&right.doc_text.len())
-            .then_with(|| left.node_id.0.cmp(&right.node_id.0))
-    });
+fn sort_pending_dense_anchor_inputs(docs: &mut [PendingLlmSymbolDoc]) {
+    docs.sort_by_key(|doc| doc.node_id.0);
 }
 
-fn flush_pending_llm_symbol_docs(
+fn flush_pending_dense_anchor_inputs(
     storage: &mut Storage,
-    engine: &mut SearchEngine,
     batch: &[PendingLlmSymbolDoc],
-    embedding_contract: &EmbeddingProfileContractDto,
+    source_identity: &str,
     updated_at_epoch_ms: i64,
     stats: &mut SemanticProjectionStats,
     cancel_token: Option<&CancellationToken>,
@@ -6328,25 +6211,9 @@ fn flush_pending_llm_symbol_docs(
         return Err(indexing_cancelled_error());
     }
 
-    let payloads = batch
-        .iter()
-        .map(|doc| doc.doc_text.as_str())
-        .collect::<Vec<_>>();
-    let embedding_started = Instant::now();
-    let embeddings = engine
-        .embed_text_refs(&payloads)
-        .map_err(|e| ApiError::internal(format!("Failed to embed symbol docs: {e:#}")))?;
-    stats.embedding_ms = stats
-        .embedding_ms
-        .saturating_add(clamp_u128_to_u32(embedding_started.elapsed().as_millis()));
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
-    }
-
     let docs = batch
         .iter()
-        .zip(embeddings)
-        .map(|(doc, embedding)| LlmSymbolDoc {
+        .map(|doc| DenseAnchorInput {
             node_id: doc.node_id,
             file_node_id: doc.file_node_id,
             kind: doc.kind,
@@ -6354,43 +6221,30 @@ fn flush_pending_llm_symbol_docs(
             qualified_name: doc.qualified_name.clone(),
             file_path: doc.file_path.clone(),
             start_line: doc.start_line,
-            doc_text: doc.doc_text.clone(),
-            doc_version: LLM_SYMBOL_DOC_SCHEMA_VERSION,
-            doc_hash: doc.doc_hash.clone(),
-            embedding_profile: Some(embedding_contract.profile.clone()),
-            embedding_model: embedding_contract.cache_key.clone(),
-            embedding_backend: Some(embedding_contract.backend.clone()),
-            embedding_dim: embedding.len() as u32,
-            doc_shape: Some(embedding_contract.doc_shape.clone()),
-            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.to_string()),
-            dense_reason: Some(doc.dense_reason.as_str().to_string()),
-            embedding,
+            end_line: doc.end_line,
+            file_role: doc
+                .file_path
+                .as_deref()
+                .map(Path::new)
+                .map(StoreFileRole::classify_path)
+                .unwrap_or(StoreFileRole::Source),
+            source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
+            text: doc.doc_text.clone(),
+            document_hash: doc.doc_hash.clone(),
+            selection_reason: doc.dense_reason.as_str().to_string(),
+            policy_version: SEMANTIC_POLICY_VERSION.to_string(),
+            source_identity: source_identity.to_string(),
             updated_at_epoch_ms,
         })
         .collect::<Vec<_>>();
 
-    persist_embedded_llm_symbol_docs(storage, &docs, stats, cancel_token)
-}
-
-fn persist_embedded_llm_symbol_docs(
-    storage: &mut Storage,
-    docs: &[LlmSymbolDoc],
-    stats: &mut SemanticProjectionStats,
-    cancel_token: Option<&CancellationToken>,
-) -> Result<(), ApiError> {
-    if is_indexing_cancelled(cancel_token) {
-        return Err(indexing_cancelled_error());
-    }
     let upsert_started = Instant::now();
     storage
-        .upsert_llm_symbol_docs_batch(docs)
-        .map_err(|e| ApiError::internal(format!("Failed to upsert LLM symbol docs: {e}")))?;
+        .upsert_dense_anchor_inputs_batch(&docs)
+        .map_err(|e| ApiError::internal(format!("Failed to upsert dense anchor inputs: {e}")))?;
     stats.db_upsert_ms = stats
         .db_upsert_ms
         .saturating_add(clamp_u128_to_u32(upsert_started.elapsed().as_millis()));
-    stats.docs_embedded = stats
-        .docs_embedded
-        .saturating_add(clamp_usize_to_u32(docs.len()));
     Ok(())
 }
 
@@ -6402,6 +6256,7 @@ fn sync_llm_symbol_projection_for_runtime(
     engine: &mut SearchEngine,
     refresh_scope: SemanticRefreshScope<'_>,
     hydrate_semantic_docs: bool,
+    source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<SemanticProjectionStats, ApiError> {
@@ -6420,24 +6275,11 @@ fn sync_llm_symbol_projection_for_runtime(
         return Ok(stats);
     }
 
-    let embedding_contract = match engine.set_embedding_runtime_for_runtime(runtime) {
-        Ok(()) => Some(current_embedding_contract_for_runtime(runtime).ok_or_else(|| {
-            ApiError::internal(
-                "Failed to resolve current embedding profile contract after configuring runtime",
-            )
-        })?),
-        Err(error) => {
-            tracing::warn!(
-                "embedding runtime unavailable ({error}); graph-native symbol docs will still be refreshed, but dense anchor retrieval will be unavailable until the llama.cpp embedding sidecar is reachable or embedding env points at an explicit diagnostic runtime. Agent-facing retrieval must be repaired to full sidecar readiness before packet/search evidence is trusted."
-            );
-            None
-        }
-    };
     let updated_at_epoch_ms = current_epoch_ms();
 
     let existing_docs = storage
-        .get_llm_symbol_doc_reuse_metadata()
-        .map_err(|e| ApiError::internal(format!("Failed to load semantic doc metadata: {e}")))?
+        .get_dense_anchor_input_reuse_metadata()
+        .map_err(|e| ApiError::internal(format!("Failed to load dense anchor metadata: {e}")))?
         .into_iter()
         .map(|doc| (doc.node_id, doc))
         .collect::<HashMap<_, _>>();
@@ -6450,12 +6292,10 @@ fn sync_llm_symbol_projection_for_runtime(
                     "Failed to inspect graph-native semantic doc versions: {e}"
                 ))
             })?;
-    let dense_doc_contract_mismatch = embedding_contract.as_ref().is_some_and(|contract| {
-        refresh_scope.file_ids.is_some()
-            && existing_docs
-                .values()
-                .any(|existing_doc| !llm_symbol_doc_contract_matches(existing_doc, contract))
-    });
+    let dense_doc_contract_mismatch = refresh_scope.file_ids.is_some()
+        && existing_docs
+            .values()
+            .any(|existing_doc| existing_doc.policy_version != SEMANTIC_POLICY_VERSION);
     let expand_semantic_scope_for_contract_repair =
         graph_doc_schema_mismatch || dense_doc_contract_mismatch;
     if expand_semantic_scope_for_contract_repair {
@@ -6470,14 +6310,16 @@ fn sync_llm_symbol_projection_for_runtime(
     } else {
         refresh_scope.file_ids
     };
-    let embed_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
+    let anchor_batch_size = runtime.retrieval.llm_doc_embed_batch_size;
     let semantic_alias_mode =
         semantic_doc_alias_mode_from_value(&runtime.retrieval.semantic_doc_alias_mode);
     let semantic_max_tokens = runtime.retrieval.semantic_doc_max_tokens;
-    let stream_pending_docs = runtime.retrieval.stream_pending_docs;
     let stream_sort_window_batches = runtime.retrieval.stream_sort_window_batches;
-    let stream_sort_window_size = embed_batch_size.saturating_mul(stream_sort_window_batches);
-    tracing::debug!(embed_batch_size, "Using semantic doc embedding batch size");
+    let stream_sort_window_size = anchor_batch_size.saturating_mul(stream_sort_window_batches);
+    tracing::debug!(
+        anchor_batch_size,
+        "Using dense anchor input publication batch size"
+    );
     let mut pending_docs = Vec::<PendingLlmSymbolDoc>::new();
     let mut seen_symbol_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
     let mut seen_dense_node_ids = Vec::<codestory_contracts::graph::NodeId>::new();
@@ -6648,35 +6490,29 @@ fn sync_llm_symbol_projection_for_runtime(
                     source_provenance: SYMBOL_SEARCH_DOC_PROVENANCE.to_string(),
                     updated_at_epoch_ms,
                 };
-                let pending_with_reuse =
-                    embedding_contract.as_ref().and_then(|embedding_contract| {
-                        dense_reason.map(|dense_reason| {
-                            let reusable =
-                                existing_docs.get(&node.id).is_some_and(|existing_doc| {
-                                    llm_symbol_doc_can_reuse(
-                                        existing_doc,
-                                        &doc_hash,
-                                        embedding_contract,
-                                    ) && existing_doc.dense_reason.as_deref()
-                                        == Some(dense_reason.as_str())
-                                });
-                            (
-                                PendingLlmSymbolDoc {
-                                    node_id: node.id,
-                                    file_node_id: node.file_node_id,
-                                    kind: node.kind,
-                                    display_name,
-                                    qualified_name: node.qualified_name.clone(),
-                                    file_path,
-                                    start_line: node.start_line,
-                                    doc_text,
-                                    doc_hash,
-                                    dense_reason,
-                                },
-                                reusable,
-                            )
-                        })
+                let pending_with_reuse = dense_reason.map(|dense_reason| {
+                    let reusable = existing_docs.get(&node.id).is_some_and(|existing_doc| {
+                        existing_doc.document_hash == doc_hash
+                            && existing_doc.selection_reason == dense_reason.as_str()
+                            && existing_doc.policy_version == SEMANTIC_POLICY_VERSION
                     });
+                    (
+                        PendingLlmSymbolDoc {
+                            node_id: node.id,
+                            file_node_id: node.file_node_id,
+                            kind: node.kind,
+                            display_name,
+                            qualified_name: node.qualified_name.clone(),
+                            file_path,
+                            start_line: node.start_line,
+                            end_line: node.end_line,
+                            doc_text,
+                            doc_hash,
+                            dense_reason,
+                        },
+                        reusable,
+                    )
+                });
                 let (pending, reusable) = pending_with_reuse
                     .map(|(pending, reusable)| (Some(pending), reusable))
                     .unwrap_or((None, false));
@@ -6718,31 +6554,26 @@ fn sync_llm_symbol_projection_for_runtime(
             observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
             if built_doc.reusable {
                 stats.docs_reused = stats.docs_reused.saturating_add(1);
-                continue;
+            } else {
+                stats.docs_pending = stats.docs_pending.saturating_add(1);
             }
-
-            stats.docs_pending = stats.docs_pending.saturating_add(1);
             pending_docs.push(pending_doc);
         }
 
-        while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+        while pending_docs.len() >= anchor_batch_size {
             if is_indexing_cancelled(cancel_token) {
                 return Err(indexing_cancelled_error());
             }
-            let Some(embedding_contract) = embedding_contract.as_ref() else {
-                break;
-            };
-            sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
-            flush_pending_llm_symbol_docs(
+            sort_pending_dense_anchor_inputs(&mut pending_docs);
+            flush_pending_dense_anchor_inputs(
                 storage,
-                engine,
-                &pending_docs[..embed_batch_size],
-                embedding_contract,
+                &pending_docs[..anchor_batch_size],
+                source_identity,
                 updated_at_epoch_ms,
                 &mut stats,
                 cancel_token,
             )?;
-            pending_docs.drain(..embed_batch_size);
+            pending_docs.drain(..anchor_batch_size);
         }
     }
 
@@ -6755,7 +6586,6 @@ fn sync_llm_symbol_projection_for_runtime(
             &graph_context,
             &report_semantic_nodes,
             &existing_docs,
-            embedding_contract.as_ref(),
             updated_at_epoch_ms,
             semantic_alias_mode,
             semantic_max_tokens,
@@ -6814,53 +6644,44 @@ fn sync_llm_symbol_projection_for_runtime(
                 observe_dense_anchor_reason(&mut stats, pending_doc.dense_reason);
                 if built_doc.reusable {
                     stats.docs_reused = stats.docs_reused.saturating_add(1);
-                    continue;
+                } else {
+                    stats.docs_pending = stats.docs_pending.saturating_add(1);
                 }
-                stats.docs_pending = stats.docs_pending.saturating_add(1);
                 pending_docs.push(pending_doc);
             }
 
-            while stream_pending_docs && pending_docs.len() >= embed_batch_size {
+            while pending_docs.len() >= anchor_batch_size {
                 if is_indexing_cancelled(cancel_token) {
                     return Err(indexing_cancelled_error());
                 }
-                let Some(embedding_contract) = embedding_contract.as_ref() else {
-                    break;
-                };
-                sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
-                flush_pending_llm_symbol_docs(
+                sort_pending_dense_anchor_inputs(&mut pending_docs);
+                flush_pending_dense_anchor_inputs(
                     storage,
-                    engine,
-                    &pending_docs[..embed_batch_size],
-                    embedding_contract,
+                    &pending_docs[..anchor_batch_size],
+                    source_identity,
                     updated_at_epoch_ms,
                     &mut stats,
                     cancel_token,
                 )?;
-                pending_docs.drain(..embed_batch_size);
+                pending_docs.drain(..anchor_batch_size);
             }
         }
     }
     stats.doc_build_ms = clamp_u128_to_u32(doc_build_ns / 1_000_000);
 
-    if !stream_pending_docs {
-        sort_pending_llm_symbol_docs_for_embedding_batches(&mut pending_docs);
-    }
-    if let Some(embedding_contract) = embedding_contract.as_ref() {
-        for batch in pending_docs.chunks(embed_batch_size) {
-            if is_indexing_cancelled(cancel_token) {
-                return Err(indexing_cancelled_error());
-            }
-            flush_pending_llm_symbol_docs(
-                storage,
-                engine,
-                batch,
-                embedding_contract,
-                updated_at_epoch_ms,
-                &mut stats,
-                cancel_token,
-            )?;
+    sort_pending_dense_anchor_inputs(&mut pending_docs);
+    for batch in pending_docs.chunks(anchor_batch_size) {
+        if is_indexing_cancelled(cancel_token) {
+            return Err(indexing_cancelled_error());
         }
+        flush_pending_dense_anchor_inputs(
+            storage,
+            batch,
+            source_identity,
+            updated_at_epoch_ms,
+            &mut stats,
+            cancel_token,
+        )?;
     }
 
     if is_indexing_cancelled(cancel_token) {
@@ -6880,27 +6701,22 @@ fn sync_llm_symbol_projection_for_runtime(
             .prune_symbol_search_docs_to_node_ids(&seen_symbol_node_ids)
             .map_err(|e| ApiError::internal(format!("Failed to prune stale symbol docs: {e}")))?
     };
-    let stale_dense_docs = if embedding_contract.is_some() {
-        if let Some(scope) = effective_llm_refresh_file_scope {
-            let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
-            storage
-                .delete_llm_symbol_docs_for_files_except_node_ids(
-                    &file_node_ids,
-                    &seen_dense_node_ids,
-                )
-                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
-        } else {
-            storage
-                .prune_llm_symbol_docs_to_node_ids(&seen_dense_node_ids)
-                .map_err(|e| ApiError::internal(format!("Failed to prune stale LLM docs: {e}")))?
-        }
+    let stale_dense_docs = if let Some(scope) = effective_llm_refresh_file_scope {
+        let file_node_ids = scope.iter().copied().collect::<Vec<_>>();
+        storage
+            .delete_dense_anchor_inputs_for_files_except_node_ids(
+                &file_node_ids,
+                &seen_dense_node_ids,
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?
     } else {
-        storage.clear_llm_symbol_docs().map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to clear dense docs without an embedding runtime: {e}"
-            ))
-        })?
+        storage
+            .prune_dense_anchor_inputs_to_node_ids(&seen_dense_node_ids)
+            .map_err(|e| ApiError::internal(format!("Failed to prune dense anchor inputs: {e}")))?
     };
+    let removed_legacy_vectors = storage
+        .clear_llm_symbol_docs()
+        .map_err(|e| ApiError::internal(format!("Failed to remove legacy core vectors: {e}")))?;
     let stale_component_docs = storage
         .prune_retrieval_artifacts_to_node_ids(
             &component_report_node_ids,
@@ -6910,14 +6726,13 @@ fn sync_llm_symbol_projection_for_runtime(
     stats.prune_ms = clamp_u128_to_u32(prune_started.elapsed().as_millis());
     stats.docs_stale = clamp_usize_to_u32(
         stale_dense_docs
+            .saturating_add(removed_legacy_vectors)
             .saturating_add(stale_symbol_docs)
             .saturating_add(stale_component_docs),
     );
 
     if hydrate_semantic_docs {
-        let reload_started = Instant::now();
-        reload_llm_docs_from_storage(storage, engine, LLM_DOC_RELOAD_BATCH_SIZE)?;
-        stats.reload_ms = clamp_u128_to_u32(reload_started.elapsed().as_millis());
+        engine.index_llm_symbol_docs(Vec::new());
     }
 
     Ok(stats)
@@ -6934,6 +6749,7 @@ fn finalize_staged_semantic_docs(
         storage,
         llm_refresh_file_scope,
         component_report_refresh,
+        "core:test-publication",
         cancel_token,
         &test_sidecar_runtime_from_env(),
     )
@@ -6943,6 +6759,7 @@ fn finalize_staged_semantic_docs_for_runtime(
     storage: &mut Storage,
     llm_refresh_file_scope: Option<&HashSet<codestory_contracts::graph::NodeId>>,
     component_report_refresh: Option<&ComponentReportRefreshScope>,
+    source_identity: &str,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> Result<SemanticProjectionStats, ApiError> {
@@ -6968,6 +6785,7 @@ fn finalize_staged_semantic_docs_for_runtime(
             component_reports: component_report_refresh,
         },
         false,
+        source_identity,
         cancel_token,
         runtime,
     )
@@ -11705,6 +11523,13 @@ fn index_full_for_runtime(
         None
     };
     let publication_run_id = Uuid::new_v4().to_string();
+    let publication = next_index_publication(
+        previous_publication.as_ref(),
+        IndexPublicationMode::Full,
+        &publication_run_id,
+    )?;
+    let dense_anchor_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
     let recovering_incomplete_run = if storage_path.exists() {
         match Storage::database_schema_version(storage_path) {
             Ok(version) if version > codestory_store::CURRENT_SCHEMA_VERSION => {
@@ -11797,10 +11622,13 @@ fn index_full_for_runtime(
                 tracing::warn!("Failed to copy symbol docs into staged storage: {error}")
             }
         }
-        match staged.store_mut().copy_llm_symbol_docs_from(storage_path) {
-            Ok(copied) => tracing::debug!(copied, "Copied semantic docs into staged storage"),
+        match staged
+            .store_mut()
+            .copy_dense_anchor_inputs_from(storage_path)
+        {
+            Ok(copied) => tracing::debug!(copied, "Copied dense anchor inputs into staged storage"),
             Err(error) => {
-                tracing::warn!("Failed to copy semantic docs into staged storage: {error}")
+                tracing::warn!("Failed to copy dense anchor inputs into staged storage: {error}")
             }
         }
     }
@@ -11808,6 +11636,7 @@ fn index_full_for_runtime(
         staged.store_mut(),
         None,
         None,
+        &dense_anchor_source_identity,
         cancel_token,
         runtime,
     ) {
@@ -11850,17 +11679,6 @@ fn index_full_for_runtime(
             "Failed to preserve incomplete marker through staged recovery: {err}"
         )));
     }
-    let publication = match next_index_publication(
-        previous_publication.as_ref(),
-        IndexPublicationMode::Full,
-        &publication_run_id,
-    ) {
-        Ok(publication) => publication,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
     #[cfg(test)]
     if let Err(error) = publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)
     {
@@ -12176,6 +11994,13 @@ where
         }
     };
     let publication_run_id = Uuid::new_v4().to_string();
+    let publication = next_index_publication(
+        previous_publication.as_ref(),
+        IndexPublicationMode::Incremental,
+        &publication_run_id,
+    )?;
+    let dense_anchor_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
     let staged_result =
         (|| {
             staged.store_mut().begin_incremental_run().map_err(|e| {
@@ -12277,6 +12102,7 @@ where
                 staged.store_mut(),
                 Some(&llm_refresh_scope),
                 Some(&component_report_refresh),
+                &dense_anchor_source_identity,
                 cancel_token,
                 runtime,
             )?;
@@ -12327,17 +12153,6 @@ where
         let _ = staged.discard();
         return Err(indexing_cancelled_error());
     }
-    let publication = match next_index_publication(
-        previous_publication.as_ref(),
-        IndexPublicationMode::Incremental,
-        &publication_run_id,
-    ) {
-        Ok(publication) => publication,
-        Err(error) => {
-            let _ = staged.discard();
-            return Err(error);
-        }
-    };
     #[cfg(test)]
     if let Err(error) = publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)
     {
@@ -13457,6 +13272,7 @@ mod tests {
             qualified_name: None,
             file_path: None,
             start_line: None,
+            end_line: None,
             doc_text: doc_text.to_string(),
             doc_hash: llm_symbol_doc_hash(doc_text),
             dense_reason: DenseAnchorReason::PublicApi,
@@ -13757,13 +13573,8 @@ mod tests {
         context
             .edge_digests
             .insert(node.id, vec!["CALL=9".to_string()]);
-        let reports = build_component_report_docs(
-            &context,
-            &[&node],
-            &std::collections::HashMap::new(),
-            None,
-            123,
-        );
+        let reports =
+            build_component_report_docs(&context, &[&node], &std::collections::HashMap::new(), 123);
 
         assert_eq!(reports.len(), 1);
         let report = &reports[0];
@@ -13781,7 +13592,16 @@ mod tests {
             Some("crates/app/src/service.rs")
         );
         assert!(report.symbol_doc.doc_text.contains("god_nodes:"));
-        assert!(report.pending.is_none());
+        let pending = report
+            .pending
+            .as_ref()
+            .expect("component report should publish a dense anchor input");
+        assert_eq!(pending.node_id, report.symbol_doc.node_id);
+        assert_eq!(pending.dense_reason, DenseAnchorReason::ComponentReport);
+        assert_eq!(pending.doc_hash, report.symbol_doc.doc_hash);
+        assert_eq!(pending.doc_text, report.symbol_doc.doc_text);
+        assert!(pending.end_line.is_none());
+        assert!(!report.reusable);
     }
 
     #[test]
@@ -13841,7 +13661,6 @@ mod tests {
             &context,
             &semantic_nodes,
             &std::collections::HashMap::new(),
-            None,
             123,
         );
         assert_eq!(reports.len(), 1);
@@ -13927,38 +13746,19 @@ mod tests {
         assert_eq!(cache.get("c.rs"), Some(&None));
     }
 
-    fn padded_char_cost(docs: &[PendingLlmSymbolDoc], batch_size: usize) -> usize {
-        docs.chunks(batch_size)
-            .map(|batch| {
-                let max_len = batch
-                    .iter()
-                    .map(|doc| doc.doc_text.len())
-                    .max()
-                    .unwrap_or(0);
-                max_len * batch.len()
-            })
-            .sum()
-    }
-
     #[test]
-    fn semantic_docs_are_length_bucketed_before_embedding() {
+    fn dense_anchor_inputs_are_sorted_deterministically_before_publication() {
         let mut docs = vec![
             pending_semantic_doc_for_test(1, &"x".repeat(900)),
             pending_semantic_doc_for_test(2, "tiny"),
             pending_semantic_doc_for_test(3, &"m".repeat(880)),
             pending_semantic_doc_for_test(4, "small"),
         ];
-        let original_cost = padded_char_cost(&docs, 2);
-
-        sort_pending_llm_symbol_docs_for_embedding_batches(&mut docs);
+        sort_pending_dense_anchor_inputs(&mut docs);
 
         assert_eq!(
             docs.iter().map(|doc| doc.node_id.0).collect::<Vec<_>>(),
-            vec![2, 4, 3, 1]
-        );
-        assert!(
-            padded_char_cost(&docs, 2) < (original_cost * 3 / 5),
-            "length bucketing should avoid padding tiny docs to long-doc batches"
+            vec![1, 2, 3, 4]
         );
     }
 
@@ -16784,7 +16584,7 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn run_indexing_without_runtime_refresh_populates_semantic_docs_in_storage() {
+    fn run_indexing_without_runtime_refresh_populates_dense_anchor_inputs_in_storage() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -16807,17 +16607,30 @@ fn build_llm_symbol_doc_text() -> String {
         drop(state);
 
         let storage = Storage::open(&storage_path).expect("reopen storage");
-        let stats = storage
-            .get_llm_symbol_doc_stats()
-            .expect("semantic doc stats");
+        let anchors = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs");
         assert!(
-            stats.doc_count > 0,
-            "expected full indexing to persist semantic docs without requiring a follow-up open"
+            !anchors.is_empty(),
+            "expected full indexing to publish dense anchor inputs without requiring a follow-up open"
+        );
+        assert!(anchors.iter().all(|anchor| {
+            !anchor.document_hash.is_empty()
+                && anchor.policy_version == SEMANTIC_POLICY_VERSION
+                && anchor.source_identity.starts_with("core:")
+                && !anchor.text.is_empty()
+        }));
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic docs")
+                .is_empty(),
+            "core indexing must not persist vectors"
         );
     }
 
     #[test]
-    fn full_refresh_reuses_unchanged_semantic_docs_from_previous_live_index() {
+    fn full_refresh_reuses_unchanged_dense_anchor_inputs_from_previous_live_index() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -16833,21 +16646,36 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("first full index");
         assert!(
-            first_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "initial full refresh should embed semantic docs"
+            first_timings.semantic_docs_pending.unwrap_or(0) > 0,
+            "initial full refresh should publish pending dense anchor inputs"
         );
+        assert_eq!(first_timings.semantic_docs_embedded.unwrap_or(0), 0);
         assert_eq!(first_timings.semantic_docs_reused.unwrap_or(0), 0);
 
-        let first_docs = Storage::open(&storage_path)
-            .expect("open first storage")
-            .get_all_llm_symbol_docs()
-            .expect("first semantic docs");
+        let first_storage = Storage::open(&storage_path).expect("open first storage");
+        let first_docs = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first dense anchor inputs");
         assert!(
-            first_docs
-                .iter()
-                .all(|doc| doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-                    && !doc.doc_hash.is_empty()),
-            "semantic docs should carry reuse metadata"
+            first_docs.iter().all(|doc| !doc.document_hash.is_empty()
+                && doc.policy_version == SEMANTIC_POLICY_VERSION
+                && doc.source_identity.starts_with("core:")),
+            "dense anchor inputs should carry content, policy, and source reuse identity"
+        );
+        let first_reuse = first_docs
+            .iter()
+            .map(|doc| {
+                (
+                    doc.node_id,
+                    (doc.document_hash.clone(), doc.source_identity.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(
+            first_storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
         );
 
         let second_timings = controller
@@ -16864,16 +16692,34 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(
             second_timings.semantic_docs_embedded.unwrap_or(u32::MAX),
             0,
-            "unchanged full refresh should not re-embed semantic docs"
+            "core refreshes must not embed semantic docs"
         );
         assert!(
             second_timings.semantic_docs_reused.unwrap_or(0) > 0,
-            "unchanged full refresh should reuse semantic docs copied into the staged DB"
+            "unchanged full refresh should reuse dense anchor content copied into the staged DB"
+        );
+        assert_eq!(second_timings.semantic_docs_pending.unwrap_or(u32::MAX), 0);
+        let second_storage = Storage::open(&storage_path).expect("open second storage");
+        let second_docs = second_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("second dense anchor inputs");
+        assert!(second_docs.iter().all(|doc| {
+            first_reuse.get(&doc.node_id).is_some_and(|(hash, source)| {
+                hash == &doc.document_hash
+                    && source != &doc.source_identity
+                    && doc.source_identity.starts_with("core:")
+            })
+        }));
+        assert!(
+            second_storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
         );
     }
 
     #[test]
-    fn unchanged_incremental_refresh_rebuilds_previous_semantic_doc_schema() {
+    fn unchanged_incremental_refresh_rebuilds_previous_dense_anchor_contract() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -16890,29 +16736,25 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("initial full index");
 
         let mut contaminated_docs = Storage::open(&storage_path)
-            .expect("open storage before schema downgrade")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs before schema downgrade");
+            .expect("open storage before contract downgrade")
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs before contract downgrade");
         assert!(
             !contaminated_docs.is_empty(),
-            "fixture should persist semantic docs"
+            "fixture should persist dense anchor inputs"
         );
         for doc in &mut contaminated_docs {
-            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
-            doc.doc_text
+            doc.policy_version = "graph_first_v0".to_string();
+            doc.source_identity = "core:legacy-publication".to_string();
+            doc.text
                 .push_str("domain_aliases: benchmark-shaped legacy text\n");
-            doc.doc_shape = doc.doc_shape.as_ref().map(|shape| {
-                shape.replace(
-                    &format!("semantic_doc_version={LLM_SYMBOL_DOC_SCHEMA_VERSION}"),
-                    &format!("semantic_doc_version={}", LLM_SYMBOL_DOC_SCHEMA_VERSION - 1),
-                )
-            });
+            doc.document_hash = format!("legacy-{}", doc.node_id.0);
         }
         let contaminated_count = contaminated_docs.len();
         Storage::open(&storage_path)
-            .expect("reopen storage for schema downgrade")
-            .upsert_llm_symbol_docs_batch(&contaminated_docs)
-            .expect("persist downgraded semantic docs");
+            .expect("reopen storage for contract downgrade")
+            .upsert_dense_anchor_inputs_batch(&contaminated_docs)
+            .expect("persist downgraded dense anchor inputs");
 
         let mut contaminated_symbol_docs = Storage::open(&storage_path)
             .expect("open graph-native docs before schema downgrade")
@@ -16937,10 +16779,11 @@ fn build_llm_symbol_doc_text() -> String {
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
             .expect("unchanged incremental refresh repairs semantic doc schema");
         assert!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0)
+            repair_timings.semantic_docs_pending.unwrap_or(0)
                 >= clamp_usize_to_u32(contaminated_count),
-            "schema drift must expand an empty incremental scope and rebuild all semantic docs"
+            "contract drift must expand an empty incremental scope and rebuild all dense anchors"
         );
+        assert_eq!(repair_timings.semantic_docs_embedded.unwrap_or(0), 0);
         assert!(
             repair_timings.symbol_search_docs_written.unwrap_or(0)
                 >= clamp_usize_to_u32(contaminated_symbol_count),
@@ -16949,15 +16792,17 @@ fn build_llm_symbol_doc_text() -> String {
 
         let repaired_docs = Storage::open(&storage_path)
             .expect("open storage after schema repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after schema repair");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs after contract repair");
         assert!(
             repaired_docs.iter().all(|doc| {
-                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-                    && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
-                    && !doc.doc_text.contains("domain_aliases:")
+                doc.policy_version == SEMANTIC_POLICY_VERSION
+                    && doc.source_identity.starts_with("core:")
+                    && doc.source_identity != "core:legacy-publication"
+                    && !doc.document_hash.starts_with("legacy-")
+                    && !doc.text.contains("domain_aliases:")
             }),
-            "unchanged incremental repair should replace every previous-schema semantic document"
+            "unchanged incremental repair should replace every stale dense anchor input"
         );
         let repaired_symbol_docs = Storage::open(&storage_path)
             .expect("open graph-native docs after schema repair")
@@ -16970,10 +16815,17 @@ fn build_llm_symbol_doc_text() -> String {
             }),
             "unchanged incremental repair should replace every previous-schema graph-native semantic document"
         );
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open legacy vector store")
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic docs")
+                .is_empty()
+        );
     }
 
     #[test]
-    fn full_refresh_repairs_reused_semantic_docs_missing_contract_metadata() {
+    fn full_refresh_repairs_reused_dense_anchors_missing_contract_metadata() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
         let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -16991,41 +16843,49 @@ fn build_llm_symbol_doc_text() -> String {
 
         let mut legacy_docs = Storage::open(&storage_path)
             .expect("open storage before legacy rewrite")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs before legacy rewrite");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs before legacy rewrite");
         assert!(
             !legacy_docs.is_empty(),
-            "initial full index should persist semantic docs"
+            "initial full index should persist dense anchor inputs"
         );
         for doc in &mut legacy_docs {
-            doc.embedding_profile = None;
-            doc.embedding_backend = None;
-            doc.doc_shape = None;
+            doc.policy_version.clear();
+            doc.source_identity = "core:legacy-unknown".to_string();
         }
         Storage::open(&storage_path)
             .expect("reopen storage for legacy rewrite")
-            .upsert_llm_symbol_docs_batch(&legacy_docs)
-            .expect("rewrite legacy semantic docs");
+            .upsert_dense_anchor_inputs_batch(&legacy_docs)
+            .expect("rewrite legacy dense anchor inputs");
 
         let repair_timings = controller
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("full refresh repairs legacy contract metadata");
         assert!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "missing contract metadata should prevent stale semantic docs from being reused"
+            repair_timings.semantic_docs_pending.unwrap_or(0) > 0,
+            "missing contract metadata should prevent stale dense anchors from being reused"
         );
+        assert_eq!(repair_timings.semantic_docs_embedded.unwrap_or(0), 0);
 
         let repaired_docs = Storage::open(&storage_path)
             .expect("open storage after repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after repair");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs after repair");
         assert!(
             repaired_docs.iter().all(|doc| {
-                doc.embedding_profile.as_deref() == Some("coderank-embed")
-                    && doc.embedding_backend.as_deref() == Some("inprocess")
-                    && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
+                doc.policy_version == SEMANTIC_POLICY_VERSION
+                    && doc.source_identity.starts_with("core:")
+                    && doc.source_identity != "core:legacy-unknown"
+                    && !doc.document_hash.is_empty()
             }),
-            "full refresh should backfill reusable docs with the current semantic contract"
+            "full refresh should backfill dense anchors with the current core contract"
+        );
+        assert!(
+            Storage::open(&storage_path)
+                .expect("open legacy vector store")
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic docs")
+                .is_empty()
         );
     }
 
@@ -17297,9 +17157,25 @@ fn build_llm_symbol_doc_text() -> String {
         let snapshot = controller
             .grounding_snapshot(GroundingBudgetDto::Balanced)
             .expect("grounding snapshot");
-        assert_eq!(
-            snapshot.retrieval.as_ref().map(|state| state.mode),
-            Some(RetrievalModeDto::Hybrid)
+        let retrieval = snapshot.retrieval.expect("retrieval state");
+        assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
+        assert!(!retrieval.semantic_ready);
+        assert_eq!(retrieval.semantic_doc_count, 0);
+
+        let storage = Storage::open(&storage_path).expect("open indexed storage");
+        assert!(
+            !storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("dense anchor inputs")
+                .is_empty(),
+            "core indexing should publish embedding-free dense anchor inputs"
+        );
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy semantic rows")
+                .is_empty(),
+            "core indexing should not publish retrieval-owned embeddings"
         );
 
         let state = controller.state.lock();
@@ -17328,7 +17204,9 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("index without runtime refresh");
 
         let retrieval = controller.retrieval_state().expect("retrieval state");
-        assert_eq!(retrieval.mode, RetrievalModeDto::Hybrid);
+        assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
+        assert!(!retrieval.semantic_ready);
+        assert_eq!(retrieval.semantic_doc_count, 0);
 
         let state = controller.state.lock();
         assert!(
@@ -17874,75 +17752,60 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn staged_semantic_finalization_rebuilds_mixed_model_docs() {
+    fn staged_semantic_finalization_repairs_mixed_dense_anchor_contracts() {
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
         let mut storage = Storage::new_in_memory().expect("storage");
         insert_semantic_fixture_nodes(&mut storage, &file_path);
 
         let _env = hybrid_test_env();
-        finalize_staged_semantic_docs(&mut storage, None, None, None)
+        let initial_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
             .expect("initial finalization");
-        assert_eq!(
-            storage
-                .get_llm_symbol_doc_stats()
-                .expect("initial doc stats")
-                .embedding_model
-                .as_deref(),
-            Some(codestory_retrieval::PRODUCT_EMBEDDING_RUNTIME_ID)
-        );
-        let mut seeded_docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("initial semantic docs");
-        if seeded_docs.len() == 1 {
-            let mut extra = seeded_docs[0].clone();
-            extra.node_id = CoreNodeId(3);
-            extra.display_name = "beta".to_string();
-            extra.qualified_name = Some("pkg::beta".to_string());
-            extra.dense_reason = Some("documented_nontrivial".to_string());
-            storage
-                .upsert_llm_symbol_docs_batch(&[extra])
-                .expect("seed second dense doc");
-            seeded_docs = storage
-                .get_all_llm_symbol_docs()
-                .expect("seeded semantic docs");
-        }
+        assert!(initial_stats.docs_pending > 0);
+        assert_eq!(initial_stats.docs_embedded, 0);
+        let seeded_docs = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("initial dense anchor inputs");
         let mixed_node_id = seeded_docs
             .last()
-            .expect("at least one semantic doc")
+            .expect("at least one dense anchor input")
             .node_id
             .0;
 
         storage
             .get_connection()
             .execute(
-                "UPDATE llm_symbol_doc
-                 SET embedding_model = CASE
-                     WHEN node_id = ?1 THEN 'legacy-producer'
-                     ELSE embedding_model
-                 END",
+                "UPDATE dense_anchor_input
+                 SET policy_version = 'graph_first_v0',
+                     source_identity = 'core:legacy-publication',
+                     document_hash = 'legacy-document-hash'
+                 WHERE node_id = ?1",
                 [mixed_node_id],
             )
-            .expect("mark one semantic doc as mixed");
-        assert_eq!(
-            storage
-                .get_llm_symbol_doc_stats()
-                .expect("mixed doc stats")
-                .embedding_model,
-            None
-        );
+            .expect("mark one dense anchor contract as stale");
 
-        finalize_staged_semantic_docs(&mut storage, None, None, None)
-            .expect("mixed corpus should force finalization");
+        let repair_stats = finalize_staged_semantic_docs(&mut storage, None, None, None)
+            .expect("mixed dense anchor contract should force finalization");
+        assert!(repair_stats.docs_pending > 0);
+        assert_eq!(repair_stats.docs_embedded, 0);
 
         let docs = storage
-            .get_all_llm_symbol_docs()
-            .expect("reloaded semantic docs");
-        assert!(!docs.is_empty(), "expected rebuilt semantic docs");
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("reloaded dense anchor inputs");
+        assert!(!docs.is_empty(), "expected rebuilt dense anchor inputs");
         assert!(
-            docs.iter().all(|doc| doc.embedding_model
-                == codestory_retrieval::PRODUCT_EMBEDDING_RUNTIME_ID),
-            "expected mixed semantic docs to be rebuilt to a uniform model"
+            docs.iter().all(|doc| {
+                doc.policy_version == SEMANTIC_POLICY_VERSION
+                    && doc.source_identity == "core:test-publication"
+                    && doc.document_hash != "legacy-document-hash"
+            }),
+            "expected mixed dense anchor inputs to be rebuilt to one core contract"
+        );
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
         );
     }
 
@@ -17962,9 +17825,18 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("publish identity");
         finalize_staged_semantic_docs(&mut storage, None, None, None)
             .expect("finalize semantic rows");
-        let before = storage
+        let before_legacy = storage
             .get_all_llm_symbol_docs()
-            .expect("semantic rows before cache load");
+            .expect("legacy semantic rows before cache load");
+        let before_symbolic = storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("symbolic rows before cache load");
+        let before_dense = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs before cache load");
+        assert!(before_legacy.is_empty());
+        assert!(!before_symbolic.is_empty());
+        assert!(!before_dense.is_empty());
         storage
             .get_connection()
             .execute_batch(
@@ -17979,26 +17851,47 @@ fn build_llm_symbol_doc_text() -> String {
                  CREATE TRIGGER reject_live_symbol_update BEFORE UPDATE ON symbol_search_doc
                  BEGIN SELECT RAISE(ABORT, 'live symbol update'); END;
                  CREATE TRIGGER reject_live_symbol_delete BEFORE DELETE ON symbol_search_doc
-                 BEGIN SELECT RAISE(ABORT, 'live symbol delete'); END;",
+                 BEGIN SELECT RAISE(ABORT, 'live symbol delete'); END;
+                 CREATE TRIGGER reject_live_dense_insert BEFORE INSERT ON dense_anchor_input
+                 BEGIN SELECT RAISE(ABORT, 'live dense insert'); END;
+                 CREATE TRIGGER reject_live_dense_update BEFORE UPDATE ON dense_anchor_input
+                 BEGIN SELECT RAISE(ABORT, 'live dense update'); END;
+                 CREATE TRIGGER reject_live_dense_delete BEFORE DELETE ON dense_anchor_input
+                 BEGIN SELECT RAISE(ABORT, 'live dense delete'); END;",
             )
             .expect("install live semantic mutation guards");
 
         let result = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
             .expect("hydrate cache without semantic persistence");
 
-        assert!(result.engine.semantic_index_ready());
+        assert!(!result.engine.semantic_index_ready());
+        assert_eq!(result.engine.full_text_doc_count(), result.node_names.len());
         assert_eq!(
             storage
                 .get_all_llm_symbol_docs()
-                .expect("semantic rows after cache load"),
-            before
+                .expect("legacy semantic rows after cache load"),
+            before_legacy
+        );
+        assert_eq!(
+            storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("symbolic rows after cache load"),
+            before_symbolic
+        );
+        assert_eq!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("dense anchor inputs after cache load"),
+            before_dense
         );
 
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
-        let error = persist_embedded_llm_symbol_docs(
+        let error = flush_pending_dense_anchor_inputs(
             &mut storage,
-            &before[..1],
+            &[pending_semantic_doc_for_test(1, "cancelled")],
+            "core:test-publication",
+            current_epoch_ms(),
             &mut SemanticProjectionStats::default(),
             Some(&cancel_token),
         )

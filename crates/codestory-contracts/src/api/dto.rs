@@ -242,6 +242,215 @@ pub struct EmbeddingProfileContractDto {
     pub doc_shape: String,
 }
 
+/// Current wire version for producer evidence attached to a vector publication.
+pub const EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION: u32 = 1;
+
+/// Immutable identity of the bytes that define an embedding model.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingModelIdentityDto {
+    pub model_id: String,
+    pub model_sha256: String,
+    pub model_size_bytes: u64,
+    pub tokenizer_sha256: String,
+    pub config_sha256: String,
+}
+
+/// Vector semantics that readers must agree on before consuming a publication.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorSemanticsDto {
+    pub dimension: u32,
+    pub query_prefix: String,
+    pub document_prefix: String,
+    pub pooling: String,
+    pub normalization: String,
+    pub element_type: String,
+    pub vector_schema_version: u32,
+}
+
+/// Versioned identity of the engine and device that produced vectors.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingEngineIdentityDto {
+    pub engine: String,
+    pub engine_build_id: String,
+    pub backend: String,
+    pub device_id: String,
+    pub device_class: String,
+    pub accelerator_kind: String,
+}
+
+/// Runtime evidence proving the declared producer was actually eligible.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingExecutionEvidenceDto {
+    pub eligibility: String,
+    pub observed_state: String,
+    pub observation_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smoke_elapsed_ms: Option<u64>,
+    pub observed_at_epoch_ms: i64,
+}
+
+/// Exact source and sidecar generations to which producer evidence applies.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorPublicationIdentityDto {
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub retrieval_generation: String,
+    pub retrieval_input_hash: String,
+    pub semantic_generation: String,
+}
+
+/// Unified, fail-closed evidence for an embedding/vector producer.
+///
+/// The contract intentionally contains no answer-quality claim. It proves only
+/// producer identity, vector compatibility, runtime eligibility, and the exact
+/// publication to which that evidence belongs.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorProducerEvidenceDto {
+    pub schema_version: u32,
+    pub model: EmbeddingModelIdentityDto,
+    pub semantics: EmbeddingVectorSemanticsDto,
+    pub engine: EmbeddingEngineIdentityDto,
+    pub execution: EmbeddingExecutionEvidenceDto,
+    pub publication: EmbeddingVectorPublicationIdentityDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+pub struct EmbeddingVectorEvidenceCompatibilityDto {
+    pub compatible: bool,
+    pub migration_required: bool,
+    pub mismatches: Vec<String>,
+}
+
+impl EmbeddingVectorProducerEvidenceDto {
+    /// Report incomplete or unsupported evidence without inferring defaults.
+    pub fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version != EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION {
+            errors.push("schema_version".to_string());
+        }
+        for (field, value) in [
+            ("model.model_id", self.model.model_id.as_str()),
+            ("engine.engine", self.engine.engine.as_str()),
+            (
+                "engine.engine_build_id",
+                self.engine.engine_build_id.as_str(),
+            ),
+            ("engine.backend", self.engine.backend.as_str()),
+            ("engine.device_id", self.engine.device_id.as_str()),
+            ("engine.device_class", self.engine.device_class.as_str()),
+            (
+                "engine.accelerator_kind",
+                self.engine.accelerator_kind.as_str(),
+            ),
+            ("execution.eligibility", self.execution.eligibility.as_str()),
+            (
+                "execution.observed_state",
+                self.execution.observed_state.as_str(),
+            ),
+            (
+                "execution.observation_source",
+                self.execution.observation_source.as_str(),
+            ),
+            ("semantics.pooling", self.semantics.pooling.as_str()),
+            (
+                "semantics.normalization",
+                self.semantics.normalization.as_str(),
+            ),
+            (
+                "semantics.element_type",
+                self.semantics.element_type.as_str(),
+            ),
+            (
+                "publication.core_generation_id",
+                self.publication.core_generation_id.as_str(),
+            ),
+            (
+                "publication.core_run_id",
+                self.publication.core_run_id.as_str(),
+            ),
+            (
+                "publication.retrieval_generation",
+                self.publication.retrieval_generation.as_str(),
+            ),
+            (
+                "publication.retrieval_input_hash",
+                self.publication.retrieval_input_hash.as_str(),
+            ),
+            (
+                "publication.semantic_generation",
+                self.publication.semantic_generation.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(field.to_string());
+            }
+        }
+        for (field, value) in [
+            ("model.model_sha256", self.model.model_sha256.as_str()),
+            (
+                "model.tokenizer_sha256",
+                self.model.tokenizer_sha256.as_str(),
+            ),
+            ("model.config_sha256", self.model.config_sha256.as_str()),
+        ] {
+            if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                errors.push(field.to_string());
+            }
+        }
+        if self.model.model_size_bytes == 0 {
+            errors.push("model.model_size_bytes".to_string());
+        }
+        if self.semantics.dimension == 0 {
+            errors.push("semantics.dimension".to_string());
+        }
+        if self.semantics.vector_schema_version == 0 {
+            errors.push("semantics.vector_schema_version".to_string());
+        }
+        if self.execution.observed_at_epoch_ms < 0 {
+            errors.push("execution.observed_at_epoch_ms".to_string());
+        }
+        errors
+    }
+
+    /// Compare expected evidence with observed evidence, including publication identity.
+    pub fn compatibility_with(&self, observed: &Self) -> EmbeddingVectorEvidenceCompatibilityDto {
+        let mut mismatches = observed.validation_errors();
+        let migration_required =
+            observed.schema_version != EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION;
+        macro_rules! compare {
+            ($field:literal, $left:expr, $right:expr) => {
+                if $left != $right && !mismatches.iter().any(|entry| entry == $field) {
+                    mismatches.push($field.to_string());
+                }
+            };
+        }
+        compare!(
+            "schema_version",
+            self.schema_version,
+            observed.schema_version
+        );
+        compare!("model", self.model, observed.model);
+        compare!("semantics", self.semantics, observed.semantics);
+        compare!("engine", self.engine, observed.engine);
+        compare!(
+            "execution.eligibility",
+            self.execution.eligibility,
+            observed.execution.eligibility
+        );
+        compare!(
+            "execution.observed_state",
+            self.execution.observed_state,
+            observed.execution.observed_state
+        );
+        compare!("publication", self.publication, observed.publication);
+        EmbeddingVectorEvidenceCompatibilityDto {
+            compatible: mismatches.is_empty(),
+            migration_required,
+            mismatches,
+        }
+    }
+}
+
 /// Semantic document profile stored in the index cache.
 ///
 /// `mixed_*` flags are diagnostic evidence that the cache was built from more
@@ -2059,6 +2268,96 @@ pub struct BookmarkCategoryDto {
 #[cfg(test)]
 mod packet_tests {
     use super::*;
+
+    fn producer_evidence() -> EmbeddingVectorProducerEvidenceDto {
+        EmbeddingVectorProducerEvidenceDto {
+            schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
+            model: EmbeddingModelIdentityDto {
+                model_id: "model-v1".to_string(),
+                model_sha256: "a".repeat(64),
+                model_size_bytes: 1024,
+                tokenizer_sha256: "b".repeat(64),
+                config_sha256: "c".repeat(64),
+            },
+            semantics: EmbeddingVectorSemanticsDto {
+                dimension: 384,
+                query_prefix: "query: ".to_string(),
+                document_prefix: "passage: ".to_string(),
+                pooling: "mean".to_string(),
+                normalization: "l2".to_string(),
+                element_type: "f32".to_string(),
+                vector_schema_version: 2,
+            },
+            engine: EmbeddingEngineIdentityDto {
+                engine: "llama.cpp".to_string(),
+                engine_build_id: "build-v1".to_string(),
+                backend: "metal".to_string(),
+                device_id: "gpu-0".to_string(),
+                device_class: "apple-gpu".to_string(),
+                accelerator_kind: "metal".to_string(),
+            },
+            execution: EmbeddingExecutionEvidenceDto {
+                eligibility: "eligible".to_string(),
+                observed_state: "smoke_passed".to_string(),
+                observation_source: "runtime_probe".to_string(),
+                smoke_elapsed_ms: Some(8),
+                observed_at_epoch_ms: 123,
+            },
+            publication: EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-1".to_string(),
+                core_run_id: "run-1".to_string(),
+                retrieval_generation: "retrieval-1".to_string(),
+                retrieval_input_hash: "d".repeat(64),
+                semantic_generation: "semantic-1".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn vector_producer_evidence_round_trips_without_losing_identity() {
+        let evidence = producer_evidence();
+        let json = serde_json::to_string(&evidence).expect("serialize evidence");
+        let decoded: EmbeddingVectorProducerEvidenceDto =
+            serde_json::from_str(&json).expect("deserialize evidence");
+
+        assert_eq!(decoded, evidence);
+        assert!(decoded.validation_errors().is_empty());
+    }
+
+    #[test]
+    fn vector_producer_evidence_fails_closed_on_incomplete_or_unknown_contracts() {
+        let mut evidence = producer_evidence();
+        evidence.schema_version += 1;
+        evidence.model.model_sha256 = "not-a-digest".to_string();
+        evidence.publication.core_run_id.clear();
+
+        assert_eq!(
+            evidence.validation_errors(),
+            vec![
+                "schema_version".to_string(),
+                "publication.core_run_id".to_string(),
+                "model.model_sha256".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_producer_compatibility_binds_engine_semantics_and_publication() {
+        let expected = producer_evidence();
+        let mut observed = expected.clone();
+        observed.execution.observed_at_epoch_ms += 1;
+        assert!(expected.compatibility_with(&observed).compatible);
+
+        observed.semantics.dimension += 1;
+        observed.publication.semantic_generation = "semantic-2".to_string();
+        let compatibility = expected.compatibility_with(&observed);
+        assert!(!compatibility.compatible);
+        assert_eq!(
+            compatibility.mismatches,
+            vec!["semantics".to_string(), "publication".to_string()]
+        );
+        assert!(!compatibility.migration_required);
+    }
 
     #[test]
     fn packet_request_uses_compact_budget_by_default() {

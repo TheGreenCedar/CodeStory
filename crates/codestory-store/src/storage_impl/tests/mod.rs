@@ -812,6 +812,124 @@ fn test_symbol_search_doc_version_mismatch_detection() -> Result<(), StorageErro
     Ok(())
 }
 
+fn dense_anchor(node_id: i64, file_node_id: Option<i64>, source: &str) -> DenseAnchorInput {
+    DenseAnchorInput {
+        node_id: NodeId(node_id),
+        file_node_id: file_node_id.map(NodeId),
+        kind: NodeKind::FUNCTION,
+        display_name: format!("function_{node_id}"),
+        qualified_name: Some(format!("pkg::function_{node_id}")),
+        file_path: Some("src/lib.rs".to_string()),
+        start_line: Some(node_id as u32),
+        end_line: Some(node_id as u32 + 2),
+        file_role: FileRole::Source,
+        source_provenance: "parser".to_string(),
+        text: format!("function function_{node_id}"),
+        document_hash: format!("hash-{node_id}"),
+        selection_reason: "public_symbol".to_string(),
+        policy_version: "dense-anchor-v1".to_string(),
+        source_identity: source.to_string(),
+        updated_at_epoch_ms: 123,
+    }
+}
+
+#[test]
+fn dense_anchor_inputs_round_trip_prune_and_copy_with_node_ownership() -> Result<(), StorageError> {
+    let source_path = unique_temp_db_path("dense-anchor-source");
+    let destination_path = unique_temp_db_path("dense-anchor-destination");
+    {
+        let mut source = Storage::open(&source_path)?;
+        source.insert_nodes_batch(&[
+            file_node(700, "src/lib.rs"),
+            Node {
+                id: NodeId(701),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "function_701".to_string(),
+                file_node_id: Some(NodeId(700)),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(702),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "function_702".to_string(),
+                file_node_id: Some(NodeId(700)),
+                ..Default::default()
+            },
+        ])?;
+        source.upsert_dense_anchor_inputs_batch(&[
+            dense_anchor(701, Some(700), "core:g1:r1"),
+            dense_anchor(702, Some(700), "core:g1:r1"),
+        ])?;
+
+        let rows = source.get_dense_anchor_inputs_batch_after(None, 10)?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], dense_anchor(701, Some(700), "core:g1:r1"));
+        assert_eq!(
+            source.prune_dense_anchor_inputs_to_node_ids(&[NodeId(702)])?,
+            1
+        );
+        assert_eq!(source.get_dense_anchor_input_reuse_metadata()?.len(), 1);
+    }
+
+    {
+        let mut destination = Storage::open(&destination_path)?;
+        destination.insert_nodes_batch(&[
+            file_node(700, "src/lib.rs"),
+            Node {
+                id: NodeId(702),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "function_702".to_string(),
+                file_node_id: Some(NodeId(700)),
+                ..Default::default()
+            },
+        ])?;
+        assert_eq!(destination.copy_dense_anchor_inputs_from(&source_path)?, 1);
+        assert_eq!(
+            destination.get_dense_anchor_inputs_batch_after(None, 10)?,
+            vec![dense_anchor(702, Some(700), "core:g1:r1")]
+        );
+    }
+
+    let _ = cleanup_sqlite_sidecars(&source_path);
+    let _ = cleanup_sqlite_sidecars(&destination_path);
+    Ok(())
+}
+
+#[test]
+fn schema_22_migrates_to_dense_anchor_inputs_without_synthesizing_rows() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("dense-anchor-v23-migration");
+    {
+        let storage = Storage::open(&path)?;
+        storage
+            .get_connection()
+            .execute_batch("DROP TABLE dense_anchor_input;")?;
+        storage.set_schema_version(22)?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10)?
+            .is_empty()
+    );
+    let indexes = storage
+        .get_connection()
+        .prepare("PRAGMA index_list(dense_anchor_input)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "idx_dense_anchor_input_reuse")
+    );
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
+    Ok(())
+}
+
 #[test]
 fn test_llm_symbol_doc_round_trip() -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;

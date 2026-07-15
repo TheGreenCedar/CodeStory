@@ -45,6 +45,10 @@ pub(crate) struct RuntimeContext {
     pub(crate) browser: ReadOnlyBrowserService,
     pub(crate) events: crossbeam_channel::Receiver<AppEventPayload>,
     pub(crate) project_root: PathBuf,
+    /// Immutable logical/workspace/artifact identity captured when this
+    /// project context is opened. These identities must never be reconstructed
+    /// from a later path spelling or environment read.
+    pub(crate) project_identity: codestory_workspace::ProjectIdentityV3,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
     pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
@@ -154,6 +158,7 @@ impl RuntimeContext {
         startup: &crate::config::CliStartupConfig,
     ) -> Result<Self> {
         let project_root = canonicalize_project_root(&args.project)?;
+        let project_identity = codestory_workspace::project_identity_v3(&project_root);
         let config = crate::config::load_config_with_startup(&project_root, startup)?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
         let process_cache_root = startup
@@ -184,6 +189,7 @@ impl RuntimeContext {
             browser: runtime.browser_service(),
             events,
             project_root,
+            project_identity,
             cache_root,
             storage_path,
             sidecar,
@@ -292,7 +298,7 @@ pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
 /// Return the cache directory used for one project.
 ///
 /// Explicit overrides are returned unchanged; otherwise the cache root is a
-/// stable hash of the canonical project path under the platform cache directory.
+/// stable native-filesystem workspace identity under the process cache root.
 #[cfg(test)]
 pub(crate) fn cache_root_for_project(
     project_root: &Path,
@@ -312,11 +318,14 @@ fn cache_root_for_project_in(
 ) -> Result<PathBuf> {
     match override_dir {
         Some(path) => Ok(path.to_path_buf()),
-        None => Ok(process_cache_root.join(fnv1a_hex(project_root.to_string_lossy().as_bytes()))),
+        None => Ok(
+            process_cache_root.join(codestory_workspace::workspace_id_v3_for_root(project_root))
+        ),
     }
 }
 
 /// Small stable hash used for path-derived cache directory names.
+#[cfg(test)]
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -652,5 +661,48 @@ mod tests {
         assert!(second.storage_path.starts_with(&second_cache));
         assert!(first.sidecar.layout.state_file.starts_with(&first_cache));
         assert!(second.sidecar.layout.state_file.starts_with(&second_cache));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_aliases_capture_one_native_workspace_context() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let alias = temp.path().join("project-alias");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        symlink(&project, &alias).expect("create project alias");
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: true,
+            stdio_cache_root: Some(cache.clone()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache,
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+
+        let open = |root: PathBuf| {
+            RuntimeContext::new_agent_sidecar_with_startup(
+                &ProjectArgs {
+                    project: root,
+                    cache_dir: None,
+                },
+                &startup,
+            )
+            .expect("runtime context")
+        };
+        let canonical = open(project);
+        let aliased = open(alias);
+
+        assert!(codestory_workspace::same_workspace_path(
+            &canonical.project_root,
+            &aliased.project_root
+        ));
+        assert_eq!(canonical.project_identity, aliased.project_identity);
+        assert_eq!(canonical.cache_root, aliased.cache_root);
+        assert_eq!(canonical.storage_path, aliased.storage_path);
     }
 }

@@ -8,7 +8,7 @@ recovery.
 
 - file, node, edge, occurrence, component, callable, bookmark, and trail rows;
 - grounding snapshots and search projections;
-- graph-native symbol documents, component reports, and reusable dense anchors;
+- graph-native symbol documents, component reports, and reusable embedding-free dense-anchor inputs;
 - core `generation_id`/`run_id` and retrieval-manifest records;
 - schema migrations and a versioned promotion journal.
 
@@ -22,8 +22,9 @@ never rolled back merely because a backup remains.
 
 Incremental refresh updates the live database and refreshes derived snapshots
 in place. Readers that need publication coherence use store read snapshots and
-compare the recorded generation/run identity; retrieval runtime combines those
-reads with generation leases before returning evidence.
+compare the recorded generation/run identity; retrieval owns the session that
+combines that transaction with immutable generation leases before returning
+evidence.
 
 ## Entry points
 

@@ -12,6 +12,8 @@
 
 ### Search quality and reliability
 
+- Core indexing now publishes deterministic, embedding-free dense inputs. Retrieval alone loads the model, builds deeply validated immutable vectors, and records versioned evidence for the exact model bytes, vector semantics, engine/device execution, and core/retrieval generation.
+- Packet and search hold one pinned query session across sidecar execution and numeric-node resolution. A concurrent core, retrieval, vector, or engine identity change returns one typed whole-operation retry instead of mixing evidence.
 - CodeRankEmbed replaces BGE. In a fixed same-machine comparison, it improved ranking quality by 36% and the first-result hit rate by 55%. It uses more memory and indexes more slowly, so inactive task processes now unload it instead of holding that cost indefinitely.
 - Existing semantic indexes rebuild once after upgrade. The last complete index stays available during safe refreshes, and CodeStory refuses to mix results from different generations.
 - The packaged executable works offline after installation, reuses its verified model material across restarts, and does not start helper processes or open retrieval ports.

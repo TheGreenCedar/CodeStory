@@ -491,19 +491,20 @@ impl StdioServerSession {
             return Ok(());
         };
         let project_root = crate::runtime::canonicalize_project_root(Path::new(project))?;
-        if self
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.project_root == project_root)
-        {
+        let workspace_id = codestory_workspace::workspace_id_v3_for_root(&project_root);
+        if self.runtime.as_ref().is_some_and(|runtime| {
+            runtime.project_identity.workspace_id == workspace_id
+                && codestory_workspace::same_workspace_path(&runtime.project_root, &project_root)
+        }) {
             return Ok(());
         }
 
-        let cache_dir = self.startup.stdio_cache_root.as_ref().cloned().map(|root| {
-            root.join(crate::runtime::fnv1a_hex(
-                project_root.to_string_lossy().as_bytes(),
-            ))
-        });
+        let cache_dir = self
+            .startup
+            .stdio_cache_root
+            .as_ref()
+            .cloned()
+            .map(|root| root.join(&workspace_id));
         let runtime = RuntimeContext::new_agent_sidecar_with_startup(
             &args::ProjectArgs {
                 project: project_root,

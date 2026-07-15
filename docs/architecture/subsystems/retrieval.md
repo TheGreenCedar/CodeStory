@@ -8,13 +8,13 @@ adapter rendering.
 ## Inputs and outputs
 
 Inputs are a selected project runtime config, a current core store publication,
-a complete source inventory, graph-native search documents, and the immutable
-process embedding policy. Outputs are:
+a complete source inventory, graph-native search documents, embedding-free
+dense-anchor inputs, and the immutable process embedding policy. Outputs are:
 
 - immutable lexical `lexical-index.sqlite3`, semantic `vectors.sqlite3`, and
   SCIP generations;
-- a manifest binding those artifacts to source, core, schema, and producer
-  identity;
+- a manifest binding those artifacts to source, core, schema, model bytes,
+  vector semantics, engine execution, and producer identity;
 - health/readiness reports;
 - query hits carrying `RetrievalPublicationIdentity`.
 
@@ -35,10 +35,10 @@ process embedding policy. Outputs are:
 
 Writers stage a whole generation, deep-validate it, rescan source at the commit
 fence, and publish the manifest only when every identity still matches.
-Readers carry one publication identity through candidate resolution, retain
-generation leases, and revalidate before returning. Query-time checks stay
-cheap; deep corpus validation is a build, promotion, readiness, or health
-operation.
+Readers use one `PinnedQuerySession` for the core transaction, candidate query,
+numeric-ID resolution, immutable generation leases, manifest/evidence identity,
+engine residency, and final revalidation. Query-time checks stay cheap; deep
+corpus validation is a build, promotion, readiness, or health operation.
 
 The embedding engine is process-wide, while manifests and artifacts are
 project-local. An incompatible cache-root or CPU-policy request fails rather

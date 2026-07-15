@@ -140,11 +140,16 @@ named fault and race cases for:
 - cleanup failure after a committed publication;
 - stale/invalid backup ambiguity;
 - source drift at the publication fence;
-- core and semantic generation changes during a query;
+- core, retrieval, vector-evidence, and engine changes during a query;
+- exact dense-anchor ID/hash coverage and corrupt/non-finite/unnormalized vector rejection;
+- evidence serialization, unknown schema, incompatible model/semantics/engine,
+  and publication-identity mismatch;
 - handle-relative cleanup during an ancestor swap.
 
 Evidence must show that failure leaves the previous complete publication usable
-and never deletes an outside sentinel.
+and never deletes an outside sentinel. Query drift must return typed
+`publication_changed`; runtime may retry the complete query-and-resolution
+operation once, never an internal fragment against a newly current generation.
 
 ## CLI and plugin
 

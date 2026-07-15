@@ -132,6 +132,35 @@ impl Drop for GenerationRetentionLock {
     }
 }
 
+/// Shared generation locks held for the complete lifetime of one retrieval query session.
+///
+/// The global lock is always acquired before the project lock. Keeping that order here avoids
+/// making every query caller reproduce the publication/GC lock protocol.
+pub(crate) struct GenerationRetentionLease {
+    _global: GenerationRetentionLock,
+    _project: GenerationRetentionLock,
+}
+
+impl GenerationRetentionLease {
+    pub(crate) fn acquire_for_query(
+        runtime: &SidecarRuntimeConfig,
+        project_id: &str,
+    ) -> Result<Self> {
+        let global = GenerationRetentionLock::acquire_shared(
+            &global_generation_gc_state_file(runtime),
+            GLOBAL_GENERATION_GC_LOCK_SCOPE,
+        )
+        .context("pin global retrieval generation retention")?;
+        let project =
+            GenerationRetentionLock::acquire_shared(&runtime.layout.state_file, project_id)
+                .with_context(|| format!("pin retrieval generation for project {project_id}"))?;
+        Ok(Self {
+            _global: global,
+            _project: project,
+        })
+    }
+}
+
 pub fn retention_marker_path(state_file: &Path, workspace_id: &str) -> Result<PathBuf> {
     validate_retention_component(workspace_id)?;
     Ok(retention_dir(state_file).join(format!("{workspace_id}.json")))

@@ -356,27 +356,6 @@ impl EmbeddingRuntime {
         }
     }
 
-    pub fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        match &self.backend {
-            #[cfg(not(any(test, feature = "test-support")))]
-            EmbeddingBackend::InProcess(client) => client.embed_documents(texts),
-            #[cfg(any(test, feature = "test-support"))]
-            EmbeddingBackend::HashProjection => Ok(texts
-                .iter()
-                .map(|text| embed_text_with_hash_projection(text, EMBEDDING_DIM))
-                .collect()),
-        }
-    }
-
-    pub fn embed_text_refs(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.embed_texts(
-            &texts
-                .iter()
-                .map(|text| (*text).to_string())
-                .collect::<Vec<_>>(),
-        )
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_runtime() -> Self {
         Self {
@@ -799,14 +778,6 @@ impl SearchEngine {
     #[cfg(test)]
     pub fn semantic_doc_count(&self) -> u32 {
         self.llm_docs.len().min(u32::MAX as usize) as u32
-    }
-
-    pub fn embed_text_refs(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let runtime = self
-            .embedding_runtime
-            .as_ref()
-            .ok_or_else(|| anyhow!("embedding runtime is not configured"))?;
-        runtime.embed_text_refs(texts)
     }
 
     pub fn index_llm_symbol_docs(&mut self, docs: Vec<LlmSearchDoc>) {

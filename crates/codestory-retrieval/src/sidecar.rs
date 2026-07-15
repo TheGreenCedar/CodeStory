@@ -138,6 +138,33 @@ fn status_with_runtime(
                 &runtime,
             ));
         }
+        if let Some(manifest) = manifest.as_ref() {
+            let evidence = storage
+                .get_complete_index_publication()
+                .context("load core publication for retrieval evidence status")?
+                .context("retrieval evidence status requires a complete core publication")
+                .and_then(|publication| {
+                    crate::embedded_vector::validate_generation_evidence_for_publication(
+                        &layout,
+                        manifest,
+                        &publication,
+                        embedding_snapshot.identity.as_ref(),
+                    )
+                    .map(|_| ())
+                });
+            if let Err(error) = evidence {
+                return Ok(enrich_stored_status(
+                    unavailable_status_report_with_embedding_device(
+                        format!("retrieval_vector_evidence_unavailable: {error:#}"),
+                        Some(manifest.clone()),
+                        &embedding_device,
+                    ),
+                    project_root,
+                    &storage,
+                    &runtime,
+                ));
+            }
+        }
         return Ok(enrich_stored_status(
             probe_sidecar_health_for_runtime(
                 &layout,

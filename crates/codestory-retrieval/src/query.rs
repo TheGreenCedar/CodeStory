@@ -1,8 +1,11 @@
 use crate::cache::RetrievalCache;
 #[cfg(test)]
 use crate::cache::RetrievalCacheKey;
-use crate::config::{SidecarLayout, SidecarRuntimeConfig};
-use crate::embeddings::{EmbeddingDeviceReadiness, embedding_device_readiness_for_runtime};
+use crate::config::SidecarRuntimeConfig;
+use crate::embeddings::{
+    EmbeddingDeviceReadiness, ProductEmbeddingResidencyLease,
+    acquire_product_embedding_residency_for_runtime, embedding_device_readiness_for_runtime,
+};
 use crate::executor::{
     QueryExecutor, QueryResult, RetrievalPublicationIdentity, cancellation_flag,
 };
@@ -11,17 +14,85 @@ use crate::health::probe_sidecar_health_for_runtime;
 use crate::index::{query_fingerprint, sidecar_project_id_for_runtime};
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
 use crate::query_features::classify_query;
+use crate::retention::GenerationRetentionLease;
 use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
 use crate::sidecar_search::LiveSidecarSearch;
 use crate::sidecar_search::SidecarSearch;
 use anyhow::{Context, Result, bail};
 use codestory_store::{FileRole, RetrievalIndexManifest, Store};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const STRICT_BATCH_WORKER_CAP: usize = 4;
+pub const RETRIEVAL_PUBLICATION_CHANGED_CODE: &str = "publication_changed";
+
+/// Typed signal that the complete query session must be discarded and retried by its caller.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "publication_changed: retrieval publication changed while {operation}; retry the complete query session"
+)]
+pub struct RetrievalPublicationChanged {
+    operation: String,
+    expected: RetrievalPublicationIdentity,
+    observed: Option<RetrievalPublicationIdentity>,
+    detail: Option<String>,
+}
+
+impl RetrievalPublicationChanged {
+    pub fn code(&self) -> &'static str {
+        RETRIEVAL_PUBLICATION_CHANGED_CODE
+    }
+
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub fn expected(&self) -> &RetrievalPublicationIdentity {
+        &self.expected
+    }
+
+    pub fn observed(&self) -> Option<&RetrievalPublicationIdentity> {
+        self.observed.as_ref()
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
+    fn changed(
+        operation: impl Into<String>,
+        expected: &RetrievalPublicationIdentity,
+        observed: Option<RetrievalPublicationIdentity>,
+    ) -> Self {
+        Self {
+            operation: operation.into(),
+            expected: expected.clone(),
+            observed,
+            detail: None,
+        }
+    }
+
+    fn unreadable(
+        operation: impl Into<String>,
+        expected: &RetrievalPublicationIdentity,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            operation: operation.into(),
+            expected: expected.clone(),
+            observed: None,
+            detail: Some(error.to_string()),
+        }
+    }
+}
+
+pub fn is_retrieval_publication_changed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RetrievalPublicationChanged>()
+        .is_some()
+}
 
 #[derive(Debug, Clone)]
 pub struct QueryRequest<'a> {
@@ -46,6 +117,269 @@ pub struct QueryBatchRequest<'a> {
     pub cancelled: Option<Arc<AtomicBool>>,
 }
 
+/// One coherent retrieval read, from core SQLite evidence through sidecar execution and candidate
+/// resolution. The caller may retry this whole session once when `revalidate` returns
+/// [`RetrievalPublicationChanged`]; the session itself never retries.
+pub struct PinnedQuerySession {
+    storage: Store,
+    storage_path: PathBuf,
+    project_root: PathBuf,
+    project_id: String,
+    runtime: SidecarRuntimeConfig,
+    manifest: RetrievalIndexManifest,
+    file_roles: Arc<HashMap<String, FileRole>>,
+    embedding_device: EmbeddingDeviceReadiness,
+    publication_identity: RetrievalPublicationIdentity,
+    sidecars: Arc<dyn SidecarSearch>,
+    _generation_lease: GenerationRetentionLease,
+    _embedding_residency: ProductEmbeddingResidencyLease,
+    transaction_active: bool,
+}
+
+impl PinnedQuerySession {
+    pub fn begin(
+        project_root: &Path,
+        storage_path: &Path,
+        runtime: &SidecarRuntimeConfig,
+    ) -> Result<Self> {
+        if !storage_path.exists() {
+            let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
+            bail!(
+                "retrieval sidecar storage is missing; run retrieval index for project {project_id}"
+            );
+        }
+
+        let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
+        let generation_lease = GenerationRetentionLease::acquire_for_query(runtime, &project_id)?;
+        let storage = Store::open_read_only(storage_path).context("open storage for query")?;
+        storage
+            .get_connection()
+            .execute_batch("BEGIN DEFERRED TRANSACTION")
+            .context("pin core publication for retrieval query")?;
+
+        let manifest = storage
+            .get_retrieval_index_manifest(&project_id)
+            .context("load retrieval manifest")?
+            .with_context(|| {
+                format!(
+                    "retrieval sidecar manifest is missing; run retrieval index for project {project_id}"
+                )
+            })?;
+        if let Some(reason) =
+            manifest_unavailable_reason_for_runtime(&project_id, &storage, &manifest, runtime)
+        {
+            bail!(
+                "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
+            );
+        }
+
+        // Acquire residency before strict readiness and keep it through candidate resolution.
+        let embedding_residency = acquire_product_embedding_residency_for_runtime(runtime)
+            .context("pin retrieval embedding engine")?;
+        if let Err(error) =
+            validate_strict_sidecar_readiness_for_runtime(project_root, &storage, runtime)
+        {
+            bail!(
+                "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
+            );
+        }
+        let embedding_device = embedding_device_readiness_for_runtime(runtime);
+        let file_roles = storage
+            .get_files()
+            .map(|files| {
+                files
+                    .into_iter()
+                    .map(|file| (file.path.to_string_lossy().to_string(), file.file_role))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let publication_identity =
+            retrieval_publication_identity_from_storage(&storage, &project_id)?;
+        let core_publication = storage
+            .get_complete_index_publication()
+            .context("load pinned core publication for vector evidence")?
+            .context("pinned retrieval query requires a complete core publication")?;
+        crate::embedded_vector::validate_generation_evidence_for_publication(
+            &runtime.layout,
+            &manifest,
+            &core_publication,
+            embedding_residency.identity(),
+        )
+        .context("validate attested vector generation")?;
+        let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
+            runtime,
+            runtime.layout.clone(),
+            project_id.clone(),
+            Some(&manifest),
+            Some(embedding_device.clone()),
+        )?);
+
+        Ok(Self {
+            storage,
+            storage_path: storage_path.to_path_buf(),
+            project_root: project_root.to_path_buf(),
+            project_id,
+            runtime: runtime.clone(),
+            manifest,
+            file_roles: Arc::new(file_roles),
+            embedding_device,
+            publication_identity,
+            sidecars,
+            _generation_lease: generation_lease,
+            _embedding_residency: embedding_residency,
+            transaction_active: true,
+        })
+    }
+
+    pub fn storage(&self) -> &Store {
+        &self.storage
+    }
+
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn manifest(&self) -> &RetrievalIndexManifest {
+        &self.manifest
+    }
+
+    pub fn publication_identity(&self) -> &RetrievalPublicationIdentity {
+        &self.publication_identity
+    }
+
+    pub fn execute_with_cache(
+        &self,
+        query: &str,
+        budget_ms: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<QueryResult> {
+        let cancelled = cancelled.unwrap_or_else(cancellation_flag);
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query cancelled before preflight");
+        }
+        cache.scope_to_publication(&self.publication_identity);
+        let mut executor = QueryExecutor {
+            sidecars: Arc::clone(&self.sidecars),
+            cache,
+            manifest: Some(self.manifest.clone()),
+            file_roles: Arc::clone(&self.file_roles),
+            cancelled,
+            mode_override: None,
+        };
+        executor
+            .execute(query, budget_ms)
+            .map(|result| result.with_publication_identity(&self.publication_identity))
+    }
+
+    pub fn execute_batch_with_cache(
+        &self,
+        queries: &[QueryBatchItem<'_>],
+        cancelled: Option<Arc<AtomicBool>>,
+        cache: &mut RetrievalCache,
+    ) -> Result<Vec<QueryResult>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cancelled = cancelled.unwrap_or_else(cancellation_flag);
+        if cancelled.load(Ordering::Acquire) {
+            bail!("retrieval query batch cancelled before preflight");
+        }
+        cache.scope_to_publication(&self.publication_identity);
+        let (mode, degraded_reason) = resolve_batch_mode(
+            self.sidecars.as_ref(),
+            Some(&self.manifest),
+            &self.embedding_device,
+            &self.runtime,
+        );
+        if mode != RetrievalDegradedMode::Full {
+            bail!(
+                "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
+                mode.as_str(),
+                degraded_reason.as_deref().unwrap_or("unknown")
+            );
+        }
+        let mut results = execute_strict_retrieval_query_batch_against_sidecars(
+            Arc::clone(&self.sidecars),
+            Some(self.manifest.clone()),
+            Arc::clone(&self.file_roles),
+            cancelled,
+            mode,
+            queries,
+            cache,
+            strict_batch_worker_limit(queries.len()),
+        )?;
+        for result in &mut results {
+            result.publication_identity = Some(self.publication_identity.clone());
+        }
+        Ok(results)
+    }
+
+    pub fn ensure_result_identity(
+        &self,
+        result: &QueryResult,
+        operation: impl Into<String>,
+    ) -> Result<()> {
+        if result.publication_identity.as_ref() != Some(&self.publication_identity) {
+            return Err(RetrievalPublicationChanged::changed(
+                operation,
+                &self.publication_identity,
+                result.publication_identity.clone(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Compare against a fresh publication after all candidate resolution and response assembly.
+    pub fn revalidate(&self) -> Result<()> {
+        let current = Store::open_read_only(&self.storage_path)
+            .context("open current retrieval publication")
+            .and_then(|storage| {
+                let snapshot = storage
+                    .read_snapshot()
+                    .context("pin current retrieval publication")?;
+                let identity = retrieval_publication_identity_from_storage(
+                    snapshot.storage(),
+                    &self.project_id,
+                );
+                snapshot
+                    .finish()
+                    .context("finish current retrieval publication")?;
+                identity
+            });
+        let current = current.map_err(|error| {
+            RetrievalPublicationChanged::unreadable(
+                "revalidating the query session",
+                &self.publication_identity,
+                error,
+            )
+        })?;
+        if current != self.publication_identity {
+            return Err(RetrievalPublicationChanged::changed(
+                "revalidating the query session",
+                &self.publication_identity,
+                Some(current),
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PinnedQuerySession {
+    fn drop(&mut self) {
+        if self.transaction_active {
+            let _ = self.storage.get_connection().execute_batch("ROLLBACK");
+            self.transaction_active = false;
+        }
+    }
+}
+
 pub fn execute_retrieval_query(request: QueryRequest<'_>) -> Result<QueryResult> {
     let mut cache = RetrievalCache::new();
     execute_retrieval_query_with_cache(request, &mut cache)
@@ -64,37 +398,11 @@ pub fn execute_retrieval_query_with_cache_for_runtime(
     cache: &mut RetrievalCache,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<QueryResult> {
-    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
-    if cancelled.load(Ordering::Acquire) {
-        bail!("retrieval query cancelled before preflight");
-    }
-    let QueryContext {
-        layout,
-        project_id,
-        manifest,
-        file_roles,
-        embedding_device,
-        publication_identity,
-    } = load_query_context(request.project_root, request.storage_path, runtime)?;
-    cache.scope_to_publication(&publication_identity);
-    let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
-        runtime,
-        layout,
-        project_id,
-        manifest.as_ref(),
-        Some(embedding_device),
-    )?);
-    let mut executor = QueryExecutor {
-        sidecars,
-        cache,
-        manifest,
-        file_roles,
-        cancelled,
-        mode_override: None,
-    };
-    executor
-        .execute(request.query, request.budget_ms)
-        .map(|result| result.with_publication_identity(&publication_identity))
+    let session = PinnedQuerySession::begin(request.project_root, request.storage_path, runtime)?;
+    let result =
+        session.execute_with_cache(request.query, request.budget_ms, request.cancelled, cache)?;
+    session.revalidate()?;
+    Ok(result)
 }
 
 pub fn execute_strict_retrieval_query_batch_with_cache(
@@ -113,52 +421,9 @@ pub fn execute_strict_retrieval_query_batch_with_cache_for_runtime(
     if request.queries.is_empty() {
         return Ok(Vec::new());
     }
-    let cancelled = request.cancelled.unwrap_or_else(cancellation_flag);
-    if cancelled.load(Ordering::Acquire) {
-        bail!("retrieval query batch cancelled before preflight");
-    }
-    let QueryContext {
-        layout,
-        project_id,
-        manifest,
-        file_roles,
-        embedding_device,
-        publication_identity,
-    } = load_query_context(request.project_root, request.storage_path, runtime)?;
-    cache.scope_to_publication(&publication_identity);
-    let sidecars = Arc::new(LiveSidecarSearch::new_for_runtime_with_embedding_device(
-        runtime,
-        layout,
-        project_id,
-        manifest.as_ref(),
-        Some(embedding_device.clone()),
-    )?);
-    let (mode, degraded_reason) = resolve_batch_mode(
-        sidecars.as_ref(),
-        manifest.as_ref(),
-        &embedding_device,
-        runtime,
-    );
-    if mode != RetrievalDegradedMode::Full {
-        bail!(
-            "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
-            mode.as_str(),
-            degraded_reason.as_deref().unwrap_or("unknown")
-        );
-    }
-    let mut results = execute_strict_retrieval_query_batch_against_sidecars(
-        sidecars,
-        manifest,
-        file_roles,
-        cancelled,
-        mode,
-        request.queries,
-        cache,
-        strict_batch_worker_limit(request.queries.len()),
-    )?;
-    for result in &mut results {
-        result.publication_identity = Some(publication_identity.clone());
-    }
+    let session = PinnedQuerySession::begin(request.project_root, request.storage_path, runtime)?;
+    let results = session.execute_batch_with_cache(request.queries, request.cancelled, cache)?;
+    session.revalidate()?;
     Ok(results)
 }
 
@@ -313,15 +578,6 @@ fn strict_batch_worker_limit(query_count: usize) -> usize {
     query_count.min(available).clamp(1, STRICT_BATCH_WORKER_CAP)
 }
 
-struct QueryContext {
-    layout: SidecarLayout,
-    project_id: String,
-    manifest: Option<RetrievalIndexManifest>,
-    file_roles: Arc<HashMap<String, FileRole>>,
-    embedding_device: EmbeddingDeviceReadiness,
-    publication_identity: RetrievalPublicationIdentity,
-}
-
 pub fn retrieval_publication_identity_from_storage(
     storage: &Store,
     project_id: &str,
@@ -348,72 +604,6 @@ pub fn retrieval_publication_identity_from_storage(
         semantic_generation: (!manifest.semantic_generation.trim().is_empty())
             .then_some(manifest.semantic_generation)
             .context("retrieval manifest semantic generation is missing")?,
-    })
-}
-
-fn load_query_context(
-    project_root: &Path,
-    storage_path: &Path,
-    runtime: &SidecarRuntimeConfig,
-) -> Result<QueryContext> {
-    let layout = runtime.layout.clone();
-    let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
-    let (manifest, file_roles, publication_identity) = if storage_path.exists() {
-        let storage = Store::open_read_only(storage_path).context("open storage for query")?;
-        let snapshot = storage
-            .read_snapshot()
-            .context("pin core publication for retrieval query")?;
-        let storage = snapshot.storage();
-        let manifest = storage
-            .get_retrieval_index_manifest(&project_id)
-            .context("load retrieval manifest")?;
-        if let Some(manifest) = manifest.as_ref() {
-            if let Some(reason) =
-                manifest_unavailable_reason_for_runtime(&project_id, storage, manifest, runtime)
-            {
-                bail!(
-                    "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
-                );
-            }
-            if let Err(error) =
-                validate_strict_sidecar_readiness_for_runtime(project_root, storage, runtime)
-            {
-                bail!(
-                    "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
-                );
-            }
-        } else {
-            bail!(
-                "retrieval sidecar manifest is missing; run retrieval index for project {project_id}"
-            );
-        }
-        let roles = storage
-            .get_files()
-            .map(|files| {
-                files
-                    .into_iter()
-                    .map(|file| (file.path.to_string_lossy().to_string(), file.file_role))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let publication_identity =
-            retrieval_publication_identity_from_storage(storage, &project_id)?;
-        snapshot
-            .finish()
-            .context("finish pinned retrieval query context")?;
-        (manifest, roles, publication_identity)
-    } else {
-        bail!("retrieval sidecar storage is missing; run retrieval index for project {project_id}");
-    };
-
-    let embedding_device = embedding_device_readiness_for_runtime(runtime);
-    Ok(QueryContext {
-        layout,
-        project_id,
-        manifest,
-        file_roles: Arc::new(file_roles),
-        embedding_device,
-        publication_identity,
     })
 }
 
@@ -469,6 +659,38 @@ mod tests {
         manifest.dense_projection_count = Some(projection_count);
         manifest.dense_reason_counts_json = Some(format!("{{\"public_api\":{projection_count}}}"));
         manifest
+    }
+
+    fn publication_identity(label: &str) -> RetrievalPublicationIdentity {
+        RetrievalPublicationIdentity {
+            core_generation_id: format!("core-{label}"),
+            core_run_id: format!("run-{label}"),
+            sidecar_generation: format!("sidecar-{label}"),
+            sidecar_input_hash: format!("hash-{label}"),
+            semantic_generation: format!("semantic-{label}"),
+        }
+    }
+
+    #[test]
+    fn publication_change_is_typed_for_one_complete_session_retry() {
+        let expected = publication_identity("old");
+        let observed = publication_identity("new");
+        let error = anyhow::Error::from(RetrievalPublicationChanged::changed(
+            "resolving candidates",
+            &expected,
+            Some(observed.clone()),
+        ))
+        .context("assemble packet response");
+
+        assert!(is_retrieval_publication_changed(&error));
+        let changed = error
+            .downcast_ref::<RetrievalPublicationChanged>()
+            .expect("typed publication change");
+        assert_eq!(changed.code(), RETRIEVAL_PUBLICATION_CHANGED_CODE);
+        assert_eq!(changed.operation(), "resolving candidates");
+        assert_eq!(changed.expected(), &expected);
+        assert_eq!(changed.observed(), Some(&observed));
+        assert_eq!(changed.detail(), None);
     }
 
     #[test]

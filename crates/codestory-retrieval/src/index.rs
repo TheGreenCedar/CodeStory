@@ -1,5 +1,8 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
-use crate::embedded_vector::{EmbeddedVectorIndex, SemanticPoint};
+use crate::embedded_vector::{
+    AttestedSemanticPoint, EmbeddedVectorIndex, ExpectedVectorAnchor, SemanticPoint,
+    VectorEvidenceContract, VectorGenerationManifest, vector_compatibility_identity,
+};
 use crate::generation::{
     SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract,
     manifest_unavailable_reason_for_runtime, sidecar_generation_id,
@@ -22,9 +25,16 @@ use crate::scip_index::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store, SymbolSearchDoc};
+use codestory_contracts::api::{
+    EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION, EmbeddingEngineIdentityDto,
+    EmbeddingExecutionEvidenceDto, EmbeddingModelIdentityDto, EmbeddingVectorProducerEvidenceDto,
+    EmbeddingVectorPublicationIdentityDto, EmbeddingVectorSemanticsDto,
+};
+#[cfg(test)]
+use codestory_store::LlmSymbolDoc;
+use codestory_store::{DenseAnchorInput, FileRole, RetrievalIndexManifest, Store, SymbolSearchDoc};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -353,10 +363,10 @@ pub fn finalize_index_for_runtime_with_progress(
 
     let _semantic_point_count = ensure_semantic_index(
         storage_path,
-        project_root,
         &project_id,
         &semantic_generation,
         semantic_ready_points,
+        &retention_context,
         &mut progress,
     )?;
 
@@ -446,40 +456,168 @@ fn ensure_lexical_generation(
 
 fn ensure_semantic_index(
     storage_path: &Path,
-    project_root: &Path,
     project_id: &str,
     semantic: &SemanticGeneration<'_>,
     semantic_ready_points: Option<u64>,
+    retention: &GenerationRetentionContext<'_>,
     progress: &mut impl FnMut(&'static str),
 ) -> Result<u64> {
-    if semantic.expected_points == 0 {
-        info!(
-            project_id = %project_id,
-            collection = %semantic.collection,
-            "dense vector index skipped because graph_first_v1 selected zero dense anchors"
-        );
-        return Ok(0);
+    let storage = Store::open(storage_path).context("open core storage for dense anchors")?;
+    let snapshot = storage
+        .read_snapshot()
+        .context("pin dense anchor input generation")?;
+    let publication = snapshot
+        .storage()
+        .get_complete_index_publication()
+        .context("read pinned core publication for vector generation")?
+        .context("dense anchor inputs require a complete core publication")?;
+    let expected_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
+    let mut anchors = Vec::<DenseAnchorInput>::new();
+    let mut after = None;
+    loop {
+        let batch = snapshot
+            .storage()
+            .get_dense_anchor_inputs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
+            .context("load pinned dense anchor inputs")?;
+        if batch.is_empty() {
+            break;
+        }
+        after = batch.last().map(|anchor| anchor.node_id);
+        for anchor in batch {
+            if anchor.source_identity != expected_source_identity {
+                bail!(
+                    "dense anchor {} belongs to source identity {}, expected {}",
+                    anchor.node_id.0,
+                    anchor.source_identity,
+                    expected_source_identity
+                );
+            }
+            anchors.push(anchor);
+        }
     }
-    if let Some(point_count) = semantic_ready_points {
-        info!(
-            project_id = %project_id,
-            sidecar_generation = %semantic.generation,
-            point_count,
-            "embedded vector generation reused"
+    if i64::try_from(anchors.len()).unwrap_or(i64::MAX) != semantic.expected_points {
+        bail!(
+            "pinned dense anchor generation count changed: expected {}, found {}",
+            semantic.expected_points,
+            anchors.len()
         );
-        return Ok(point_count);
     }
-    let point_count = with_finalize_progress(progress, "embedded vectors", || {
-        EmbeddedVectorIndex::build_with_points(
+    let evidence = vector_producer_evidence(retention, semantic, &publication)?;
+    let compatibility_identity = vector_compatibility_identity(&evidence)?;
+    let dimension =
+        usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?;
+    let contract = VectorEvidenceContract::new(
+        semantic.embedding_backend,
+        dimension,
+        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+        &compatibility_identity,
+    );
+    let expected_anchors = anchors
+        .iter()
+        .map(|anchor| ExpectedVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let point_count = if let Some(point_count) = semantic_ready_points {
+        let manifest =
+            EmbeddedVectorIndex::load_generation_manifest(semantic.layout, semantic.collection)?;
+        let compatibility = evidence.compatibility_with(&manifest.evidence);
+        if !compatibility.compatible {
+            bail!(
+                "stored vector producer evidence is incompatible: {}",
+                compatibility.mismatches.join(", ")
+            );
+        }
+        EmbeddedVectorIndex::validate_published_attestation(
             semantic.layout,
             semantic.collection,
             semantic.generation,
             semantic.input_hash,
-            semantic.embedding_backend,
-            usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
-            |visit| visit_semantic_points_from_store(storage_path, project_root, visit),
-        )
-    })?;
+            &contract,
+            &expected_anchors,
+            &manifest.vectors,
+        )?;
+        info!(
+            project_id = %project_id,
+            sidecar_generation = %semantic.generation,
+            point_count,
+            "attested vector generation reused"
+        );
+        point_count
+    } else {
+        let attestation = with_finalize_progress(progress, "embedded vectors", || {
+            EmbeddedVectorIndex::build_attested_with_points(
+                semantic.layout,
+                semantic.collection,
+                semantic.generation,
+                semantic.input_hash,
+                &contract,
+                &expected_anchors,
+                |visit| {
+                    let client =
+                        crate::embeddings::InProcessEmbeddingClient::new(retention.runtime);
+                    for batch in
+                        anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
+                    {
+                        let texts = batch
+                            .iter()
+                            .map(|anchor| anchor.text.clone())
+                            .collect::<Vec<_>>();
+                        let vectors = client
+                            .embed_documents(&texts)
+                            .context("embed pinned dense anchor batch")?;
+                        if vectors.len() != batch.len() {
+                            bail!(
+                                "embedding engine returned {} vectors for {} anchors",
+                                vectors.len(),
+                                batch.len()
+                            );
+                        }
+                        for (anchor, vector) in batch.iter().zip(vectors) {
+                            visit(AttestedSemanticPoint {
+                                point: SemanticPoint {
+                                    display_name: anchor
+                                        .qualified_name
+                                        .clone()
+                                        .unwrap_or_else(|| anchor.display_name.clone()),
+                                    node_id: anchor.node_id.0.to_string(),
+                                    file_path: anchor.file_path.clone(),
+                                    file_role: Some(anchor.file_role),
+                                    dense_reason: Some(anchor.selection_reason.clone()),
+                                    vector: normalize_vector(vector)?,
+                                },
+                                document_hash: anchor.document_hash.clone(),
+                            })?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+        })?;
+        let point_count = attestation.point_count;
+        let generation_manifest = VectorGenerationManifest::new(evidence, attestation.clone())?;
+        EmbeddedVectorIndex::publish_generation_manifest(
+            semantic.layout,
+            semantic.collection,
+            &generation_manifest,
+        )?;
+        EmbeddedVectorIndex::validate_published_attestation(
+            semantic.layout,
+            semantic.collection,
+            semantic.generation,
+            semantic.input_hash,
+            &contract,
+            &expected_anchors,
+            &attestation,
+        )?;
+        point_count
+    };
+    snapshot
+        .finish()
+        .context("finish pinned dense anchor input generation")?;
     if point_count != u64::try_from(semantic.expected_points).unwrap_or(u64::MAX) {
         bail!(
             "embedded vector generation incomplete for {project_id}: expected {} points, found {point_count}",
@@ -493,6 +631,113 @@ fn ensure_semantic_index(
         "embedded SQLite vector generation published"
     );
     Ok(point_count)
+}
+
+fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
+    if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+        bail!("embedding engine returned an empty or non-finite vector");
+    }
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        bail!("embedding engine returned a zero vector");
+    }
+    for value in &mut vector {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+    Ok(vector)
+}
+
+fn vector_producer_evidence(
+    retention: &GenerationRetentionContext<'_>,
+    semantic: &SemanticGeneration<'_>,
+    publication: &codestory_store::IndexPublicationRecord,
+) -> Result<EmbeddingVectorProducerEvidenceDto> {
+    let identity = retention.embedding_residency.identity();
+    let engine_build_id = identity
+        .map(|identity| identity.ggml_build_identity.to_string())
+        .unwrap_or_else(|| codestory_llama_sys::PRODUCT_EMBEDDING_RUNTIME_ID.to_string());
+    let backend = identity
+        .map(|identity| identity.backend.clone())
+        .or_else(|| retention.embedding_device.detected_provider.clone())
+        .unwrap_or_else(|| "test-support".to_string());
+    let device_id = identity
+        .map(|identity| identity.execution_device_names.join(","))
+        .filter(|device| !device.is_empty())
+        .or_else(|| retention.embedding_device.detected_gpu.clone())
+        .or_else(|| retention.embedding_device.detected_provider.clone())
+        .unwrap_or_else(|| "test-support".to_string());
+    let evidence = EmbeddingVectorProducerEvidenceDto {
+        schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
+        model: EmbeddingModelIdentityDto {
+            model_id: codestory_llama_sys::MODEL_FILE_NAME.to_string(),
+            model_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
+            model_size_bytes: codestory_llama_sys::MODEL_SIZE,
+            tokenizer_sha256: contract_digest("tokenizer", codestory_llama_sys::MODEL_SHA256),
+            config_sha256: contract_digest(
+                "config",
+                &format!(
+                    "{}:{}:mean:l2",
+                    codestory_llama_sys::MODEL_SHA256,
+                    crate::embeddings::RETRIEVAL_EMBEDDING_DIM
+                ),
+            ),
+        },
+        semantics: EmbeddingVectorSemanticsDto {
+            dimension: u32::try_from(semantic.embedding_dim)
+                .context("negative embedding dimension")?,
+            query_prefix: crate::embeddings::CODERANK_QUERY_PREFIX_DEFAULT.to_string(),
+            document_prefix: String::new(),
+            pooling: "mean".to_string(),
+            normalization: "l2".to_string(),
+            element_type: "f32_le".to_string(),
+            vector_schema_version: 2,
+        },
+        engine: EmbeddingEngineIdentityDto {
+            engine: "llama.cpp".to_string(),
+            engine_build_id,
+            backend,
+            device_id,
+            device_class: retention.embedding_device.observed_state.to_string(),
+            accelerator_kind: retention
+                .embedding_device
+                .detected_provider
+                .clone()
+                .unwrap_or_else(|| retention.embedding_device.requested_policy.to_string()),
+        },
+        execution: EmbeddingExecutionEvidenceDto {
+            eligibility: retention.embedding_device.requested_policy.to_string(),
+            observed_state: retention.embedding_device.observed_state.to_string(),
+            observation_source: retention.embedding_device.observation_source.to_string(),
+            smoke_elapsed_ms: identity.map(|identity| identity.smoke_ms),
+            observed_at_epoch_ms: Utc::now().timestamp_millis(),
+        },
+        publication: EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            retrieval_generation: semantic.generation.to_string(),
+            retrieval_input_hash: semantic.input_hash.to_string(),
+            semantic_generation: semantic.collection.to_string(),
+        },
+    };
+    let errors = evidence.validation_errors();
+    if !errors.is_empty() {
+        bail!(
+            "vector producer evidence is incomplete: {}",
+            errors.join(", ")
+        );
+    }
+    Ok(evidence)
+}
+
+fn contract_digest(domain: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hash_part(&mut hasher, domain);
+    hash_part(&mut hasher, value);
+    format!("{:x}", hasher.finalize())
 }
 
 fn ensure_scip_artifacts(
@@ -642,9 +887,6 @@ fn sidecar_disk_bytes(
 
 fn semantic_ready_point_count(semantic: &SemanticGeneration<'_>) -> Option<u64> {
     let expected = u64::try_from(semantic.expected_points).ok()?;
-    if expected == 0 {
-        return Some(0);
-    }
     let health = EmbeddedVectorIndex::health(
         semantic.layout,
         semantic.collection,
@@ -1121,7 +1363,7 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
     hash_part(&mut hasher, &lexical.hash);
     hash_part(&mut hasher, embedding.backend);
     hash_part(&mut hasher, &embedding.dimension.to_string());
-    hash_part(&mut hasher, "semantic-vectors-v2");
+    hash_part(&mut hasher, "dense-anchor-inputs-v1");
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
     let mut symbol_doc_count = 0_i64;
@@ -1150,22 +1392,18 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
     let mut after = None;
     loop {
         let batch = storage
-            .get_llm_symbol_docs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
-            .context("load stored semantic docs for sidecar hash")?;
+            .get_dense_anchor_inputs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
+            .context("load dense anchor inputs for sidecar hash")?;
         if batch.is_empty() {
             break;
         }
         after = batch.last().map(|doc| doc.node_id);
-        let batch = batch
-            .into_iter()
-            .filter(semantic_doc_row)
-            .collect::<Vec<_>>();
         dense_projection_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
         for doc in batch {
-            observe_policy_version(&mut policy_versions, doc.semantic_policy_version.as_deref());
-            let reason = doc.dense_reason.as_deref().unwrap_or("unknown").to_string();
+            observe_policy_version(&mut policy_versions, Some(doc.policy_version.as_str()));
+            let reason = doc.selection_reason.clone();
             *dense_reason_counts.entry(reason).or_insert(0) += 1;
-            hash_semantic_doc_detail(&mut hasher, project_root, &doc);
+            hash_dense_anchor_input(&mut hasher, project_root, &doc);
         }
     }
     let dense_reason_counts_json =
@@ -1242,7 +1480,7 @@ fn hash_symbol_search_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: 
     hash_part(hasher, &doc.source_provenance);
 }
 
-fn hash_semantic_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &LlmSymbolDoc) {
+fn hash_dense_anchor_input(hasher: &mut Sha256, project_root: &Path, doc: &DenseAnchorInput) {
     let file_path = doc
         .file_path
         .as_deref()
@@ -1265,17 +1503,19 @@ fn hash_semantic_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &LlmS
             .map(|line| line.to_string())
             .unwrap_or_default(),
     );
-    hash_part(hasher, &doc.doc_version.to_string());
-    hash_part(hasher, &doc.doc_hash);
-    hash_part(hasher, doc.semantic_policy_version.as_deref().unwrap_or(""));
-    hash_part(hasher, doc.dense_reason.as_deref().unwrap_or(""));
-    hash_part(hasher, doc.embedding_profile.as_deref().unwrap_or(""));
-    hash_part(hasher, &doc.embedding_model);
-    hash_part(hasher, doc.embedding_backend.as_deref().unwrap_or(""));
-    hash_part(hasher, &doc.embedding_dim.to_string());
-    hash_part(hasher, doc.doc_shape.as_deref().unwrap_or(""));
-    hash_part(hasher, &doc.embedding.len().to_string());
-    hash_embedding_vector(hasher, &doc.embedding);
+    hash_part(
+        hasher,
+        &doc.end_line
+            .map(|line| line.to_string())
+            .unwrap_or_default(),
+    );
+    hash_part(hasher, doc.file_role.as_str());
+    hash_part(hasher, &doc.source_provenance);
+    hash_part(hasher, &doc.text);
+    hash_part(hasher, &doc.document_hash);
+    hash_part(hasher, &doc.selection_reason);
+    hash_part(hasher, &doc.policy_version);
+    hash_part(hasher, &doc.source_identity);
 }
 
 #[cfg(test)]
@@ -1290,82 +1530,9 @@ fn semantic_projection_row(row: &codestory_store::SearchSymbolProjectionDetail) 
     crate::generation::sidecar_semantic_node_kind(kind)
 }
 
-fn semantic_doc_row(doc: &LlmSymbolDoc) -> bool {
-    crate::generation::sidecar_semantic_doc_is_product_eligible(doc)
-}
-
 fn hash_part(hasher: &mut Sha256, value: &str) {
     hasher.update(value.len().to_le_bytes());
     hasher.update(value.as_bytes());
-}
-
-fn hash_embedding_vector(hasher: &mut Sha256, embedding: &[f32]) {
-    hasher.update(embedding.len().to_le_bytes());
-    for value in embedding {
-        hasher.update(value.to_bits().to_le_bytes());
-    }
-}
-
-fn visit_semantic_points_from_store(
-    storage_path: &Path,
-    project_root: &Path,
-    visit: &mut dyn FnMut(SemanticPoint) -> Result<()>,
-) -> Result<()> {
-    let mut storage = Store::open(storage_path).context("open storage for semantic vectors")?;
-    ensure_search_symbol_projection(&mut storage)?;
-    let file_roles = storage
-        .get_files()
-        .map(|files| sidecar_file_role_map(files, project_root))
-        .unwrap_or_default();
-    let mut after = None;
-    loop {
-        let batch = storage
-            .get_llm_symbol_docs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
-            .context("load stored semantic docs for vector indexing")?;
-        if batch.is_empty() {
-            break;
-        }
-        after = batch.last().map(|doc| doc.node_id);
-        for doc in batch.into_iter().filter(semantic_doc_row) {
-            let display_name = doc.qualified_name.clone().unwrap_or(doc.display_name);
-            let file_path = doc
-                .file_path
-                .as_deref()
-                .and_then(|path| normalize_sidecar_file_path(path, project_root).ok());
-            let file_role = file_path
-                .as_deref()
-                .and_then(|path| file_roles.get(path).copied())
-                .or_else(|| {
-                    file_path
-                        .as_deref()
-                        .map(|path| FileRole::classify_path(Path::new(path)))
-                });
-            visit(SemanticPoint {
-                display_name,
-                node_id: doc.node_id.0.to_string(),
-                file_path,
-                file_role,
-                dense_reason: doc.dense_reason.clone(),
-                vector: doc.embedding,
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn sidecar_file_role_map(
-    files: Vec<codestory_store::FileInfo>,
-    project_root: &Path,
-) -> HashMap<String, FileRole> {
-    files
-        .into_iter()
-        .filter_map(|file| {
-            let path = file.path.to_string_lossy().to_string();
-            normalize_sidecar_file_path(&path, project_root)
-                .ok()
-                .map(|path| (path, file.file_role))
-        })
-        .collect()
 }
 
 fn normalize_sidecar_file_path(path: &str, project_root: &Path) -> Result<String> {
@@ -1566,57 +1733,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_doc_requires_product_stored_embedding() {
-        let doc = |kind: NodeKind, backend: Option<&str>, dim: u32| LlmSymbolDoc {
-            node_id: codestory_contracts::graph::NodeId(1),
-            file_node_id: None,
-            kind,
-            display_name: "do_work".into(),
-            qualified_name: Some("pkg::do_work".into()),
-            file_path: Some("src/lib.rs".into()),
-            start_line: Some(1),
-            doc_text: "semantic doc".into(),
-            doc_version: 4,
-            doc_hash: "hash".into(),
-            embedding_profile: Some("coderank-embed".into()),
-            embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
-            embedding_backend: backend.map(str::to_string),
-            embedding_dim: dim,
-            doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            dense_reason: Some("public_api".into()),
-            embedding: vec![0.01; dim as usize],
-            updated_at_epoch_ms: 123,
-        };
-
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::FUNCTION,
-            Some("other"),
-            768
-        )));
-        assert!(semantic_doc_row(&doc(
-            NodeKind::METHOD,
-            Some("inprocess"),
-            768
-        )));
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::VARIABLE,
-            Some("other"),
-            768
-        )));
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::FUNCTION,
-            Some("hash"),
-            768
-        )));
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::FUNCTION,
-            Some("other"),
-            384
-        )));
-    }
-
-    #[test]
     fn canonical_sidecar_generation_is_stable_across_clean_roots_with_same_input() {
         let Some(first_project) = git_project() else {
             return;
@@ -1700,7 +1816,7 @@ mod tests {
                 ..Default::default()
             }])
             .expect("node");
-        let mut doc = LlmSymbolDoc {
+        let mut doc = DenseAnchorInput {
             node_id: NodeId(1),
             file_node_id: None,
             kind: NodeKind::FUNCTION,
@@ -1708,21 +1824,18 @@ mod tests {
             qualified_name: Some("pkg::do_work".into()),
             file_path: Some("lib.rs".into()),
             start_line: Some(1),
-            doc_text: "semantic doc".into(),
-            doc_version: 4,
-            doc_hash: "hash".into(),
-            embedding_profile: Some("coderank-embed".into()),
-            embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
-            embedding_backend: Some("inprocess".into()),
-            embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
-            doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            dense_reason: Some("public_api".into()),
-            embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
+            end_line: Some(2),
+            file_role: FileRole::Source,
+            source_provenance: "parser".into(),
+            text: "semantic doc".into(),
+            document_hash: "hash-one".into(),
+            selection_reason: "public_api".into(),
+            policy_version: crate::generation::SEMANTIC_POLICY_VERSION.into(),
+            source_identity: "core:g1:r1".into(),
             updated_at_epoch_ms: 123,
         };
         storage
-            .upsert_llm_symbol_docs_batch(&[doc.clone()])
+            .upsert_dense_anchor_inputs_batch(&[doc.clone()])
             .expect("first doc");
         let first = compute_sidecar_input_fingerprint(
             &storage,
@@ -1743,10 +1856,11 @@ mod tests {
         storage
             .upsert_retrieval_index_manifest(&old_manifest)
             .expect("old manifest");
-        doc.embedding[0] = 0.02;
+        doc.text = "changed semantic doc".into();
+        doc.document_hash = "hash-two".into();
         let mut concurrent = Store::open(&storage_path).expect("concurrent store");
         concurrent
-            .upsert_llm_symbol_docs_batch(&[doc])
+            .upsert_dense_anchor_inputs_batch(&[doc])
             .expect("second doc");
         drop(concurrent);
         let second = compute_sidecar_input_fingerprint(
