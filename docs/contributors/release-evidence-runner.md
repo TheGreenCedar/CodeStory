@@ -15,7 +15,7 @@ The approved host shape for the 0.16 in-process retrieval baseline is:
 | Physical host | `Mac17,4`, Apple M5, 24 GiB, macOS 26.5.2 |
 | VM | Colima VZ profile `codestory-release-evidence`, Ubuntu 24.04 ARM64 |
 | Colima | 0.10.3 |
-| Capacity | 4 vCPU, 17 GiB configured memory, 80 GiB data disk |
+| Capacity | 4 vCPU, 8 GiB maximum memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
 | Guest container runtime | containerd from the checksum-pinned Colima image; the host context is never activated |
 | Stable profile ID | `codestory-release-evidence-linux-arm64-v2` |
@@ -33,9 +33,9 @@ boot is rejected.
 ## Provision and verify
 
 The host needs macOS, Colima, and an authenticated `gh` with repository
-administration access. A 24 GiB Mac cannot safely run this 17 GiB profile beside
-the normal 8 GiB Colima profile; stop the normal profile first after confirming
-it has no active work.
+administration access. The proof VM is capped at 8 GiB and should run only for
+an accepted release head. Stop it immediately after collecting the final
+evidence; it is not a development service.
 
 From a clean trusted CodeStory checkout:
 
@@ -53,6 +53,8 @@ Provisioning is idempotent. It:
 - installs native packages from a fixed Ubuntu archive snapshot at exact
   versions, then records the complete native package manifest;
 - uses the containerd runtime already owned by the checksum-pinned VM image;
+- binds the runner workspace from the dedicated 80 GiB data disk and verifies
+  that mount before accepting evidence;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
 - verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and

@@ -13,7 +13,7 @@
       "codestory-release-evidence"
     ],
     "root": "/srv/codestory-release-evidence",
-    "data_root": "/var/lib/codestory-release-evidence"
+    "data_root": "/mnt/lima-colima-codestory-release-evidence/codestory-release-evidence"
   },
   "host": {
     "architecture": "arm64",
@@ -34,8 +34,9 @@
     "mount_type": "virtiofs",
     "host_mounts": [],
     "cpus": 4,
-    "memory_gib": 17,
+    "memory_gib": 8,
     "data_disk_gib": 80,
+    "data_disk_mount": "/mnt/lima-colima-codestory-release-evidence",
     "root_disk_gib": 20,
     "base_image": {
       "url": "https://github.com/abiosoft/colima-core/releases/download/v0.10.4/ubuntu-24.04-minimal-cloudimg-arm64-containerd.raw.gz",
