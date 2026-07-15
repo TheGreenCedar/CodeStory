@@ -20222,6 +20222,42 @@ public:
     }
 
     #[test]
+    fn test_rust_2024_constructs_are_complete() -> Result<()> {
+        let language_config = get_language_for_ext("rs").unwrap();
+        let result = index_file(
+            Path::new("rust_2024.rs"),
+            r#"
+unsafe extern "C" {
+    fn foreign(value: i32) -> i32;
+}
+
+fn checked_foreign(value: Option<i32>) -> Option<i32> {
+    let Some(value) = value else {
+        return None;
+    };
+    if let Some(next) = value.checked_add(1)
+        && next > 0
+    {
+        Some(unsafe { foreign(next) })
+    } else {
+        None
+    }
+}
+"#,
+            &language_config,
+            None,
+            None,
+        )?;
+
+        assert_eq!(result.files.len(), 1);
+        assert!(
+            result.files[0].complete,
+            "valid Rust 2024 source should be parser-complete"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_incremental_indexing() -> Result<()> {
         use codestory_store::Store as Storage;
         use codestory_workspace::RefreshInfo;
