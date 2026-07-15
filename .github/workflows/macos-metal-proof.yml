@@ -128,6 +128,7 @@ jobs:
             --engine-policy accelerated \
             --expected-backend Metal \
             --offline \
+            --idle-residency-proof \
             --timeout-secs 1800 \
             --out-dir target/macos-metal-proof/packaged-agent
 

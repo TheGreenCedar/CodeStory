@@ -105,6 +105,7 @@ jobs:
             --engine-policy accelerated `
             --expected-backend Vulkan `
             --offline `
+            --idle-residency-proof `
             --timeout-secs 1800 `
             --out-dir target/windows-vulkan-proof/packaged-agent
 

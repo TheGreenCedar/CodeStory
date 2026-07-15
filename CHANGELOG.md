@@ -17,6 +17,9 @@
 - One warm embedding engine can serve several open repositories while every
   repository keeps its own cache, publication, and readiness state. Switching
   projects no longer means loading the model again.
+- Inactive coding tasks no longer keep the model and GPU allocation forever.
+  After a short quiet period CodeStory releases that memory, then restores the
+  same packaged engine automatically when the task needs search again.
 - Apple Silicon uses Metal. Windows and supported Linux hardware use Vulkan.
   Production never silently falls back to CPU; hosted CI can opt into the
   clearly labelled CPU path without making an acceleration claim.

@@ -1,6 +1,6 @@
 //! CodeStory-owned boundary around the statically linked llama.cpp runtime.
 
-use crossbeam_channel::{Receiver, Sender, bounded, select_biased, unbounded};
+use crossbeam_channel::{Receiver, Sender, after, bounded, select_biased, unbounded};
 use fs4::fs_std::FileExt;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType};
@@ -31,6 +31,7 @@ const MODEL_CONTEXT_TOKENS: usize = 512;
 const LOGICAL_BATCH_TOKENS: usize = 1024;
 const MAX_BATCH_SEQUENCES: usize = 6;
 const REQUEST_QUEUE_CAPACITY: usize = 64;
+const ENGINE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -97,6 +98,31 @@ pub struct EngineIdentity {
     pub accelerator_execution_verified: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineResidency {
+    Resident,
+    Sleeping,
+}
+
+impl EngineResidency {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Sleeping => "sleeping",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineLifecycleSnapshot {
+    pub identity: EngineIdentity,
+    pub residency: EngineResidency,
+    pub load_generation: u64,
+    pub model_load_count: u64,
+    pub worker_alive: bool,
+    pub load_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MaterializedModel {
     pub path: PathBuf,
@@ -108,11 +134,37 @@ pub struct EmbeddingEngine {
     shared: Arc<EngineShared>,
 }
 
+pub struct EmbeddingResidencyLease {
+    shared: Arc<EngineShared>,
+    snapshot: EngineLifecycleSnapshot,
+}
+
+impl std::fmt::Debug for EmbeddingResidencyLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddingResidencyLease")
+            .field("load_generation", &self.snapshot.load_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddingResidencyLease {
+    pub fn snapshot(&self) -> &EngineLifecycleSnapshot {
+        &self.snapshot
+    }
+}
+
+impl Drop for EmbeddingResidencyLease {
+    fn drop(&mut self) {
+        let _ = self.shared.control_sender.send(Control::ReleaseLease);
+    }
+}
+
 impl std::fmt::Debug for EmbeddingEngine {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("EmbeddingEngine")
-            .field("identity", &self.shared.identity)
+            .field("snapshot", &self.snapshot().ok())
             .finish_non_exhaustive()
     }
 }
@@ -121,7 +173,7 @@ struct EngineShared {
     query_sender: Sender<EmbeddingRequest>,
     bulk_sender: Sender<EmbeddingRequest>,
     control_sender: Sender<Control>,
-    identity: EngineIdentity,
+    lifecycle: Arc<Mutex<Option<EngineLifecycleSnapshot>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -151,6 +203,13 @@ struct EmbeddingRequest {
 
 enum Control {
     Shutdown,
+    EnsureResident {
+        response: Sender<Result<EngineLifecycleSnapshot, EngineError>>,
+    },
+    AcquireLease {
+        response: Sender<Result<EngineLifecycleSnapshot, EngineError>>,
+    },
+    ReleaseLease,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -165,6 +224,8 @@ impl EmbeddingEngine {
         let (bulk_sender, bulk_receiver) = bounded(REQUEST_QUEUE_CAPACITY);
         let (control_sender, control_receiver) = unbounded();
         let (startup_sender, startup_receiver) = bounded(1);
+        let lifecycle = Arc::new(Mutex::new(None));
+        let worker_lifecycle = lifecycle.clone();
         let cache_root = cache_root.to_path_buf();
         let worker = thread::Builder::new()
             .name("codestory-embedding-engine".into())
@@ -176,13 +237,14 @@ impl EmbeddingEngine {
                     &query_receiver,
                     &bulk_receiver,
                     &control_receiver,
+                    &worker_lifecycle,
                 ) {
                     let _ = startup_sender.try_send(Err(error));
                 }
             })
             .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?;
-        let identity = match startup_receiver.recv() {
-            Ok(Ok(identity)) => identity,
+        match startup_receiver.recv() {
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 let _ = worker.join();
                 return Err(error);
@@ -191,20 +253,62 @@ impl EmbeddingEngine {
                 let _ = worker.join();
                 return Err(EngineError::WorkerUnavailable(error.to_string()));
             }
-        };
+        }
         Ok(Self {
             shared: Arc::new(EngineShared {
                 query_sender,
                 bulk_sender,
                 control_sender,
-                identity,
+                lifecycle,
                 worker: Mutex::new(Some(worker)),
             }),
         })
     }
 
-    pub fn identity(&self) -> &EngineIdentity {
-        &self.shared.identity
+    pub fn snapshot(&self) -> Result<EngineLifecycleSnapshot, EngineError> {
+        let mut snapshot = self
+            .shared
+            .lifecycle
+            .lock()
+            .map_err(|_| EngineError::WorkerUnavailable("lifecycle mutex was poisoned".into()))?
+            .clone()
+            .ok_or_else(|| {
+                EngineError::WorkerUnavailable("lifecycle snapshot is unavailable".into())
+            })?;
+        snapshot.worker_alive = self
+            .shared
+            .worker
+            .lock()
+            .map_err(|_| EngineError::WorkerUnavailable("worker mutex was poisoned".into()))?
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished());
+        Ok(snapshot)
+    }
+
+    pub fn ensure_resident(&self) -> Result<EngineLifecycleSnapshot, EngineError> {
+        let (response, result) = bounded(1);
+        self.shared
+            .control_sender
+            .send(Control::EnsureResident { response })
+            .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?;
+        result
+            .recv()
+            .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?
+    }
+
+    pub fn acquire_residency_lease(&self) -> Result<EmbeddingResidencyLease, EngineError> {
+        let (response, result) = bounded(1);
+        self.shared
+            .control_sender
+            .send(Control::AcquireLease { response })
+            .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?;
+        let snapshot = result
+            .recv()
+            .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))??;
+        Ok(EmbeddingResidencyLease {
+            shared: self.shared.clone(),
+            snapshot,
+        })
     }
 
     pub fn embed_query_prepared(&self, input: String) -> Result<Vec<f32>, EngineError> {
@@ -251,143 +355,429 @@ impl EmbeddingEngine {
 fn run_engine_owner(
     cache_root: &Path,
     allow_cpu: bool,
-    startup: &Sender<Result<EngineIdentity, EngineError>>,
+    startup: &Sender<Result<EngineLifecycleSnapshot, EngineError>>,
     query_receiver: &Receiver<EmbeddingRequest>,
     bulk_receiver: &Receiver<EmbeddingRequest>,
     control_receiver: &Receiver<Control>,
+    lifecycle: &Arc<Mutex<Option<EngineLifecycleSnapshot>>>,
 ) -> Result<(), EngineError> {
-    let started = Instant::now();
-    let materialized = materialize_embedded_model(cache_root)?;
-    send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
-    let backend = LlamaBackend::init().map_err(llama_error)?;
-    let devices = list_llama_ggml_backend_devices();
-    let (device, policy) = select_device(&devices, allow_cpu)?;
-    let free_before = device.memory_free;
+    let mut wake = WakeReason::Startup;
+    let mut load_generation = 0;
+    let mut last_snapshot: Option<EngineLifecycleSnapshot> = None;
+    loop {
+        let result = run_resident_generation(
+            cache_root,
+            allow_cpu,
+            wake,
+            load_generation + 1,
+            startup,
+            query_receiver,
+            bulk_receiver,
+            control_receiver,
+            lifecycle,
+        );
+        trim_unloaded_engine_working_set();
+        match result {
+            ResidentRunResult::Sleeping(mut snapshot) => {
+                load_generation = snapshot.load_generation;
+                snapshot.residency = EngineResidency::Sleeping;
+                publish_lifecycle(lifecycle, snapshot.clone())?;
+                last_snapshot = Some(snapshot);
+            }
+            ResidentRunResult::Shutdown(mut snapshot) => {
+                snapshot.worker_alive = false;
+                publish_lifecycle(lifecycle, snapshot)?;
+                return Ok(());
+            }
+            ResidentRunResult::LoadFailed { wake, error } => {
+                if let Some(snapshot) = last_snapshot.as_mut() {
+                    snapshot.residency = EngineResidency::Sleeping;
+                    snapshot.load_error = Some(error.to_string());
+                    publish_lifecycle(lifecycle, snapshot.clone())?;
+                }
+                if fail_wake(wake, startup, error) {
+                    return Ok(());
+                }
+            }
+        }
 
-    let mut model_params = LlamaModelParams::default().with_use_mmap(true);
-    if policy == ExecutionPolicy::Accelerated {
-        model_params = model_params
-            .with_devices(&[device.index])
-            .map_err(llama_error)?
-            .with_n_gpu_layers(u32::MAX);
-    } else {
-        model_params = model_params.with_n_gpu_layers(0);
+        let Some(next_wake) = wait_for_wake(query_receiver, bulk_receiver, control_receiver) else {
+            if let Some(mut snapshot) = last_snapshot {
+                snapshot.worker_alive = false;
+                publish_lifecycle(lifecycle, snapshot)?;
+            }
+            return Ok(());
+        };
+        wake = next_wake;
     }
-    let model = LlamaModel::load_from_file(&backend, &materialized.path, &model_params)
-        .map_err(llama_error)?;
-    if model.n_embd() as usize != EMBEDDING_DIM {
-        return Err(EngineError::Dimension {
-            expected: EMBEDDING_DIM,
-            actual: model.n_embd() as usize,
-        });
-    }
-    let model_layer_count = model.n_layer() + 1;
+}
 
-    let context_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(4096))
-        .with_n_batch(LOGICAL_BATCH_TOKENS as u32)
-        .with_n_ubatch(LOGICAL_BATCH_TOKENS as u32)
-        .with_n_seq_max(MAX_BATCH_SEQUENCES as u32)
-        .with_attention_type(LlamaAttentionType::NonCausal)
-        .with_pooling_type(LlamaPoolingType::Cls)
-        .with_embeddings(true);
-    let mut context = model
-        .new_context(&backend, context_params)
-        .map_err(llama_error)?;
-    let free_after = list_llama_ggml_backend_devices()
-        .into_iter()
-        .find(|candidate| candidate.index == device.index)
-        .map_or(device.memory_free, |candidate| candidate.memory_free);
-    // llama.cpp receives one explicit physical device and n_gpu_layers=u32::MAX.
-    // A successful load with a real allocation on that device proves the full
-    // layer request was realized; llama.cpp does not silently lower this value.
-    let accelerator_execution_verified =
-        policy == ExecutionPolicy::Accelerated && free_before > free_after && free_after > 0;
-    if policy == ExecutionPolicy::Accelerated && !accelerator_execution_verified {
-        return Err(EngineError::AcceleratorExecutionUnverified(format!(
-            "{} ({})",
-            device.name, device.description
-        )));
-    }
-    let offloaded_layer_count = if accelerator_execution_verified {
-        model_layer_count
-    } else {
-        0
-    };
+#[cfg(target_os = "windows")]
+fn trim_unloaded_engine_working_set() {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
 
-    let smoke_started = Instant::now();
-    let smoke = embed_inputs(
-        &model,
-        &mut context,
-        &[
-            "Represent this query for searching relevant code: codestory embedding smoke"
-                .to_string(),
-        ],
-        RequestPriority::Query,
-        query_receiver,
-    )?;
-    if smoke
-        .first()
-        .is_none_or(|vector| vector.len() != EMBEDDING_DIM)
-    {
-        return Err(EngineError::Dimension {
-            expected: EMBEDDING_DIM,
-            actual: smoke.first().map_or(0, Vec::len),
-        });
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle for the calling process. Passing
+    // usize::MAX for both limits asks Windows to evict unused pages after the llama objects drop.
+    let _ = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn trim_unloaded_engine_working_set() {}
+
+enum WakeReason {
+    Startup,
+    Query(EmbeddingRequest),
+    Bulk(EmbeddingRequest),
+    EnsureResident(Sender<Result<EngineLifecycleSnapshot, EngineError>>),
+    AcquireLease(Sender<Result<EngineLifecycleSnapshot, EngineError>>),
+}
+
+enum ResidentRunResult {
+    Sleeping(EngineLifecycleSnapshot),
+    Shutdown(EngineLifecycleSnapshot),
+    LoadFailed {
+        wake: WakeReason,
+        error: EngineError,
+    },
+}
+
+#[derive(Debug)]
+struct ResidencyTracker {
+    idle_timeout: Duration,
+    last_activity: Instant,
+    leases: usize,
+}
+
+impl ResidencyTracker {
+    fn new(idle_timeout: Duration, now: Instant) -> Self {
+        Self {
+            idle_timeout,
+            last_activity: now,
+            leases: 0,
+        }
     }
-    let identity = EngineIdentity {
-        model_digest: MODEL_SHA256,
-        ggml_build_identity: GGML_BUILD_IDENTITY,
-        backend: device.backend.clone(),
-        adapter_name: device.name.clone(),
-        adapter_description: device.description.clone(),
-        policy,
-        embedded_model: EMBEDDED_MODEL_COMPILED,
-        materialized_path: materialized.path,
-        materialized_reused: materialized.reused,
-        initialization_duration: started.elapsed(),
-        smoke_duration: smoke_started.elapsed(),
-        adapter_memory_total: device.memory_total,
-        adapter_memory_free_before_load: free_before,
-        adapter_memory_free_after_load: free_after,
-        execution_device_names: if accelerator_execution_verified {
-            vec![device.name.clone()]
+
+    fn complete_activity(&mut self, now: Instant) {
+        self.last_activity = now;
+    }
+
+    fn acquire_lease(&mut self) {
+        self.leases += 1;
+    }
+
+    fn release_lease(&mut self, now: Instant) {
+        self.leases = self.leases.saturating_sub(1);
+        self.last_activity = now;
+    }
+
+    fn remaining(&self, now: Instant) -> Duration {
+        if self.leases > 0 {
+            return self.idle_timeout;
+        }
+        self.idle_timeout
+            .saturating_sub(now.saturating_duration_since(self.last_activity))
+    }
+
+    fn should_sleep(&self, now: Instant) -> bool {
+        self.leases == 0 && now.saturating_duration_since(self.last_activity) >= self.idle_timeout
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_resident_generation(
+    cache_root: &Path,
+    allow_cpu: bool,
+    wake: WakeReason,
+    load_generation: u64,
+    startup: &Sender<Result<EngineLifecycleSnapshot, EngineError>>,
+    query_receiver: &Receiver<EmbeddingRequest>,
+    bulk_receiver: &Receiver<EmbeddingRequest>,
+    control_receiver: &Receiver<Control>,
+    lifecycle: &Arc<Mutex<Option<EngineLifecycleSnapshot>>>,
+) -> ResidentRunResult {
+    let mut pending_wake = Some(wake);
+    let result = (|| -> Result<ResidentRunResult, EngineError> {
+        let started = Instant::now();
+        let materialized = materialize_embedded_model(cache_root)?;
+        send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
+        let backend = LlamaBackend::init().map_err(llama_error)?;
+        let devices = list_llama_ggml_backend_devices();
+        let (device, policy) = select_device(&devices, allow_cpu)?;
+        let free_before = device.memory_free;
+
+        let mut model_params = LlamaModelParams::default().with_use_mmap(true);
+        if policy == ExecutionPolicy::Accelerated {
+            model_params = model_params
+                .with_devices(&[device.index])
+                .map_err(llama_error)?
+                .with_n_gpu_layers(u32::MAX);
         } else {
-            Vec::new()
+            model_params = model_params.with_n_gpu_layers(0);
+        }
+        let model = LlamaModel::load_from_file(&backend, &materialized.path, &model_params)
+            .map_err(llama_error)?;
+        if model.n_embd() as usize != EMBEDDING_DIM {
+            return Err(EngineError::Dimension {
+                expected: EMBEDDING_DIM,
+                actual: model.n_embd() as usize,
+            });
+        }
+        let model_layer_count = model.n_layer() + 1;
+
+        let context_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(4096))
+            .with_n_batch(LOGICAL_BATCH_TOKENS as u32)
+            .with_n_ubatch(LOGICAL_BATCH_TOKENS as u32)
+            .with_n_seq_max(MAX_BATCH_SEQUENCES as u32)
+            .with_attention_type(LlamaAttentionType::NonCausal)
+            .with_pooling_type(LlamaPoolingType::Cls)
+            .with_embeddings(true);
+        let mut context = model
+            .new_context(&backend, context_params)
+            .map_err(llama_error)?;
+        let free_after = list_llama_ggml_backend_devices()
+            .into_iter()
+            .find(|candidate| candidate.index == device.index)
+            .map_or(device.memory_free, |candidate| candidate.memory_free);
+        let accelerator_execution_verified =
+            policy == ExecutionPolicy::Accelerated && free_before > free_after && free_after > 0;
+        if policy == ExecutionPolicy::Accelerated && !accelerator_execution_verified {
+            return Err(EngineError::AcceleratorExecutionUnverified(format!(
+                "{} ({})",
+                device.name, device.description
+            )));
+        }
+        let offloaded_layer_count = if accelerator_execution_verified {
+            model_layer_count
+        } else {
+            0
+        };
+
+        let smoke_started = Instant::now();
+        let smoke = embed_inputs(
+            &model,
+            &mut context,
+            &[
+                "Represent this query for searching relevant code: codestory embedding smoke"
+                    .to_string(),
+            ],
+            RequestPriority::Query,
+            query_receiver,
+        )?;
+        if smoke
+            .first()
+            .is_none_or(|vector| vector.len() != EMBEDDING_DIM)
+        {
+            return Err(EngineError::Dimension {
+                expected: EMBEDDING_DIM,
+                actual: smoke.first().map_or(0, Vec::len),
+            });
+        }
+        let identity = EngineIdentity {
+            model_digest: MODEL_SHA256,
+            ggml_build_identity: GGML_BUILD_IDENTITY,
+            backend: device.backend.clone(),
+            adapter_name: device.name.clone(),
+            adapter_description: device.description.clone(),
+            policy,
+            embedded_model: EMBEDDED_MODEL_COMPILED,
+            materialized_path: materialized.path,
+            materialized_reused: materialized.reused,
+            initialization_duration: started.elapsed(),
+            smoke_duration: smoke_started.elapsed(),
+            adapter_memory_total: device.memory_total,
+            adapter_memory_free_before_load: free_before,
+            adapter_memory_free_after_load: free_after,
+            execution_device_names: if accelerator_execution_verified {
+                vec![device.name.clone()]
+            } else {
+                Vec::new()
+            },
+            model_layer_count,
+            offloaded_layer_count,
+            accelerator_execution_verified,
+        };
+        let snapshot = EngineLifecycleSnapshot {
+            identity,
+            residency: EngineResidency::Resident,
+            load_generation,
+            model_load_count: load_generation,
+            worker_alive: true,
+            load_error: None,
+        };
+        publish_lifecycle(lifecycle, snapshot.clone())?;
+
+        let channels = ResidentChannels {
+            startup,
+            query: query_receiver,
+            bulk: bulk_receiver,
+            control: control_receiver,
+        };
+        Ok(serve_resident_generation(
+            pending_wake
+                .take()
+                .expect("resident generation must have one wake reason"),
+            &snapshot,
+            &channels,
+            ENGINE_IDLE_TIMEOUT,
+            |request, priority| {
+                handle_request(request, priority, &model, &mut context, query_receiver);
+            },
+        ))
+    })();
+
+    match result {
+        Ok(result) => result,
+        Err(error) => ResidentRunResult::LoadFailed {
+            wake: pending_wake
+                .take()
+                .expect("load failure must retain its wake reason"),
+            error,
         },
-        model_layer_count,
-        offloaded_layer_count,
-        accelerator_execution_verified,
-    };
-    startup
-        .send(Ok(identity))
-        .map_err(|error| EngineError::WorkerUnavailable(error.to_string()))?;
+    }
+}
+
+struct ResidentChannels<'a> {
+    startup: &'a Sender<Result<EngineLifecycleSnapshot, EngineError>>,
+    query: &'a Receiver<EmbeddingRequest>,
+    bulk: &'a Receiver<EmbeddingRequest>,
+    control: &'a Receiver<Control>,
+}
+
+fn serve_resident_generation(
+    wake: WakeReason,
+    snapshot: &EngineLifecycleSnapshot,
+    channels: &ResidentChannels<'_>,
+    idle_timeout: Duration,
+    mut handle: impl FnMut(EmbeddingRequest, RequestPriority),
+) -> ResidentRunResult {
+    let mut tracker = ResidencyTracker::new(idle_timeout, Instant::now());
+    match wake {
+        WakeReason::Startup => {
+            let _ = channels.startup.send(Ok(snapshot.clone()));
+        }
+        WakeReason::Query(request) => {
+            handle(request, RequestPriority::Query);
+            tracker.complete_activity(Instant::now());
+        }
+        WakeReason::Bulk(request) => {
+            handle(request, RequestPriority::Bulk);
+            tracker.complete_activity(Instant::now());
+        }
+        WakeReason::EnsureResident(response) => {
+            tracker.complete_activity(Instant::now());
+            let _ = response.send(Ok(snapshot.clone()));
+        }
+        WakeReason::AcquireLease(response) => {
+            grant_residency_lease(response, snapshot, &mut tracker);
+        }
+    }
 
     loop {
+        let idle = after(tracker.remaining(Instant::now()));
         select_biased! {
-            recv(control_receiver) -> _ => break,
-            recv(query_receiver) -> request => match request {
-                Ok(request) => handle_request(
-                    request,
-                    RequestPriority::Query,
-                    &model,
-                    &mut context,
-                    query_receiver,
-                ),
-                Err(_) => break,
+            recv(channels.control) -> control => match control {
+                Ok(Control::Shutdown) | Err(_) => {
+                    return ResidentRunResult::Shutdown(snapshot.clone());
+                }
+                Ok(Control::EnsureResident { response }) => {
+                    tracker.complete_activity(Instant::now());
+                    let _ = response.send(Ok(snapshot.clone()));
+                }
+                Ok(Control::AcquireLease { response }) => {
+                    grant_residency_lease(response, snapshot, &mut tracker);
+                }
+                Ok(Control::ReleaseLease) => tracker.release_lease(Instant::now()),
             },
-            recv(bulk_receiver) -> request => match request {
-                Ok(request) => handle_request(
-                    request,
-                    RequestPriority::Bulk,
-                    &model,
-                    &mut context,
-                    query_receiver,
-                ),
-                Err(_) => break,
+            recv(channels.query) -> request => match request {
+                Ok(request) => {
+                    handle(request, RequestPriority::Query);
+                    tracker.complete_activity(Instant::now());
+                }
+                Err(_) => return ResidentRunResult::Shutdown(snapshot.clone()),
+            },
+            recv(channels.bulk) -> request => match request {
+                Ok(request) => {
+                    handle(request, RequestPriority::Bulk);
+                    tracker.complete_activity(Instant::now());
+                }
+                Err(_) => return ResidentRunResult::Shutdown(snapshot.clone()),
+            },
+            recv(idle) -> _ => {
+                if tracker.should_sleep(Instant::now()) {
+                    return ResidentRunResult::Sleeping(snapshot.clone());
+                }
             },
         }
     }
+}
+
+fn grant_residency_lease(
+    response: Sender<Result<EngineLifecycleSnapshot, EngineError>>,
+    snapshot: &EngineLifecycleSnapshot,
+    tracker: &mut ResidencyTracker,
+) {
+    if response.send(Ok(snapshot.clone())).is_ok() {
+        tracker.acquire_lease();
+    }
+}
+
+fn fail_wake(
+    wake: WakeReason,
+    startup: &Sender<Result<EngineLifecycleSnapshot, EngineError>>,
+    error: EngineError,
+) -> bool {
+    match wake {
+        WakeReason::Startup => {
+            let _ = startup.send(Err(error));
+            true
+        }
+        WakeReason::Query(request) | WakeReason::Bulk(request) => {
+            let _ = request.response.send(Err(error));
+            false
+        }
+        WakeReason::EnsureResident(response) | WakeReason::AcquireLease(response) => {
+            let _ = response.send(Err(error));
+            false
+        }
+    }
+}
+
+fn wait_for_wake(
+    query_receiver: &Receiver<EmbeddingRequest>,
+    bulk_receiver: &Receiver<EmbeddingRequest>,
+    control_receiver: &Receiver<Control>,
+) -> Option<WakeReason> {
+    loop {
+        select_biased! {
+            recv(control_receiver) -> control => match control {
+                Ok(Control::Shutdown) | Err(_) => return None,
+                Ok(Control::EnsureResident { response }) => {
+                    return Some(WakeReason::EnsureResident(response));
+                }
+                Ok(Control::AcquireLease { response }) => {
+                    return Some(WakeReason::AcquireLease(response));
+                }
+                Ok(Control::ReleaseLease) => {}
+            },
+            recv(query_receiver) -> request => {
+                return request.ok().map(WakeReason::Query);
+            },
+            recv(bulk_receiver) -> request => {
+                return request.ok().map(WakeReason::Bulk);
+            },
+        }
+    }
+}
+
+fn publish_lifecycle(
+    lifecycle: &Arc<Mutex<Option<EngineLifecycleSnapshot>>>,
+    snapshot: EngineLifecycleSnapshot,
+) -> Result<(), EngineError> {
+    *lifecycle
+        .lock()
+        .map_err(|_| EngineError::WorkerUnavailable("lifecycle mutex was poisoned".into()))? =
+        Some(snapshot);
     Ok(())
 }
 
@@ -751,6 +1141,143 @@ mod tests {
                 device_type: LlamaBackendDeviceType::Gpu,
             };
             assert!(is_software_adapter(&device));
+        }
+    }
+
+    #[test]
+    fn residency_tracker_sleeps_only_after_the_idle_window() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(60);
+        let tracker = ResidencyTracker::new(timeout, started);
+
+        assert_eq!(tracker.remaining(started), timeout);
+        assert!(!tracker.should_sleep(started + timeout - Duration::from_millis(1)));
+        assert!(tracker.should_sleep(started + timeout));
+    }
+
+    #[test]
+    fn residency_lease_pins_the_load_and_release_starts_a_fresh_window() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(60);
+        let mut tracker = ResidencyTracker::new(timeout, started);
+        tracker.acquire_lease();
+
+        assert!(!tracker.should_sleep(started + timeout * 2));
+
+        let released = started + timeout * 2;
+        tracker.release_lease(released);
+        assert!(!tracker.should_sleep(released + timeout - Duration::from_millis(1)));
+        assert!(tracker.should_sleep(released + timeout));
+    }
+
+    #[test]
+    fn abandoned_lease_handoff_does_not_pin_residency() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(60);
+        let mut tracker = ResidencyTracker::new(timeout, started);
+        let snapshot = test_lifecycle_snapshot();
+        let (sender, receiver) = bounded(1);
+        drop(receiver);
+
+        grant_residency_lease(sender, &snapshot, &mut tracker);
+
+        assert!(tracker.should_sleep(started + timeout));
+    }
+
+    #[test]
+    fn owner_loop_honors_injected_timeout_and_all_live_leases() {
+        let (startup_sender, _startup_receiver) = bounded(1);
+        let (_query_sender, query_receiver) = bounded(1);
+        let (_bulk_sender, bulk_receiver) = bounded(1);
+        let (control_sender, control_receiver) = unbounded();
+        let (first_lease_sender, first_lease_receiver) = bounded(1);
+        let (done_sender, done_receiver) = bounded(1);
+        let snapshot = test_lifecycle_snapshot();
+
+        let worker = thread::spawn(move || {
+            let channels = ResidentChannels {
+                startup: &startup_sender,
+                query: &query_receiver,
+                bulk: &bulk_receiver,
+                control: &control_receiver,
+            };
+            let result = serve_resident_generation(
+                WakeReason::AcquireLease(first_lease_sender),
+                &snapshot,
+                &channels,
+                Duration::from_millis(20),
+                |_, _| panic!("lease-only owner test received an embedding request"),
+            );
+            let _ = done_sender.send(result);
+        });
+
+        first_lease_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first lease handoff")
+            .expect("first lease grant");
+        let (second_lease_sender, second_lease_receiver) = bounded(1);
+        control_sender
+            .send(Control::AcquireLease {
+                response: second_lease_sender,
+            })
+            .expect("queue second lease");
+        second_lease_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second lease handoff")
+            .expect("second lease grant");
+
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(60))
+                .is_err()
+        );
+        control_sender
+            .send(Control::ReleaseLease)
+            .expect("release first lease");
+        assert!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(60))
+                .is_err()
+        );
+        control_sender
+            .send(Control::ReleaseLease)
+            .expect("release final lease");
+        assert!(matches!(
+            done_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("owner should sleep after the injected timeout"),
+            ResidentRunResult::Sleeping(_)
+        ));
+        worker.join().expect("owner test worker");
+    }
+
+    fn test_lifecycle_snapshot() -> EngineLifecycleSnapshot {
+        EngineLifecycleSnapshot {
+            identity: EngineIdentity {
+                model_digest: MODEL_SHA256,
+                ggml_build_identity: GGML_BUILD_IDENTITY,
+                backend: "test".into(),
+                adapter_name: "test".into(),
+                adapter_description: "test".into(),
+                policy: ExecutionPolicy::CpuExplicit,
+                embedded_model: true,
+                materialized_path: PathBuf::from("test.gguf"),
+                materialized_reused: true,
+                initialization_duration: Duration::ZERO,
+                smoke_duration: Duration::ZERO,
+                adapter_memory_total: 0,
+                adapter_memory_free_before_load: 0,
+                adapter_memory_free_after_load: 0,
+                execution_device_names: Vec::new(),
+                model_layer_count: 13,
+                offloaded_layer_count: 0,
+                accelerator_execution_verified: false,
+            },
+            residency: EngineResidency::Resident,
+            load_generation: 1,
+            model_load_count: 1,
+            worker_alive: true,
+            load_error: None,
         }
     }
 }

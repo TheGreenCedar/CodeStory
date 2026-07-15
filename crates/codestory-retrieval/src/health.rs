@@ -273,6 +273,12 @@ pub struct InfrastructureHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_engine_instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_engine_residency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_engine_load_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_engine_load_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model_load_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_smoke_ms: Option<u64>,
@@ -391,6 +397,15 @@ pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> Infrastruc
         embedding_engine_instance_id: identity
             .as_ref()
             .map(|identity| identity.instance_id.clone()),
+        embedding_engine_residency: identity
+            .as_ref()
+            .map(|identity| identity.residency.to_string()),
+        embedding_engine_load_generation: identity
+            .as_ref()
+            .map(|identity| identity.load_generation),
+        embedding_engine_load_error: identity
+            .as_ref()
+            .and_then(|identity| identity.load_error.clone()),
         embedding_model_load_count: identity.as_ref().map(|identity| identity.model_load_count),
         embedding_smoke_ms: identity.as_ref().map(|identity| identity.smoke_ms),
         embedding_initialization_ms: identity.as_ref().map(|identity| identity.initialization_ms),

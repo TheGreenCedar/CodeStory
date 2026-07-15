@@ -98,8 +98,9 @@ Recovery order:
 4. Require `codestory-cli retrieval status --project . --format json` to report
    `retrieval_mode: "full"` before trusting packet/search evidence.
 5. If `doctor` reports an engine failure, inspect its model digest, ggml build,
-   backend, adapter, policy, and live-smoke fields. Do not enable CPU merely to
-   hide an acceleration failure.
+   backend, adapter, policy, residency, load generation, and live-smoke fields.
+   `sleeping` is healthy and must not initialize the engine; a recorded wake
+   failure is not. Do not enable CPU merely to hide an acceleration failure.
 6. If semantic retrieval is still the only failing part, inspect the reported degraded-state reason before touching lexical ranking or CLI rendering.
 
 ## If Cold Indexing Is Slow

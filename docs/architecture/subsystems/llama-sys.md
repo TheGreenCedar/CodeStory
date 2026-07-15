@@ -22,6 +22,8 @@ execution remains available only through the caller's explicit
 - verified content-addressed model materialization for mmap;
 - physical backend and adapter selection, including software-adapter rejection;
 - one model worker with bounded query and bulk queues;
+- owner-thread residency with a 60-second idle unload and automatic wake;
+- RAII residency leases for operations that must retain one load generation;
 - query priority between bulk batches;
 - the CodeRank query prefix (`Represent this query for searching relevant code: `),
   no document prefix, batching, CLS pooling, and L2 normalization;
@@ -42,6 +44,8 @@ accelerator failure by silently selecting CPU.
 
 - the runtime downloads a model or backend;
 - more than one model context is loaded in a multi-project process;
+- an idle task retains its model, context, or accelerator allocation after the
+  residency window;
 - WARP, llvmpipe, lavapipe, or SwiftShader satisfies accelerated policy;
 - model bytes are materialized without digest verification and atomic publish;
 - backend details leak into normal user-facing readiness messages.
