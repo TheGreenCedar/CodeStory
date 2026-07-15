@@ -371,6 +371,12 @@ struct StdioServerState {
     recent_local_refresh: Option<crate::readiness::LocalRefreshOutput>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdioActivationOutcome {
+    CheckReadiness,
+    RetrievalPreparing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StdioResource {
     Status,
@@ -684,18 +690,29 @@ fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<
                 return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
             }
             let runtime = session.runtime.as_ref().expect("stdio project selected");
-            if stdio_tool_reads_publication(name)
-                && let Err(error) = activate_stdio_project(
+            let activation = if stdio_tool_reads_publication(name) {
+                match activate_stdio_project(
                     runtime,
                     &mut session.state,
                     matches!(name, "ground" | "packet" | "search" | "context"),
-                )
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let error = serde_json::json!({
+                            "code": "project_activation_failed",
+                            "message": format!("Unable to activate CodeStory before running `{name}`: {error}"),
+                            "tool": name
+                        });
+                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                    }
+                }
+            } else {
+                StdioActivationOutcome::CheckReadiness
+            };
+            if activation == StdioActivationOutcome::RetrievalPreparing
+                && matches!(name, "packet" | "search" | "context")
             {
-                let error = serde_json::json!({
-                    "code": "project_activation_failed",
-                    "message": format!("Unable to activate CodeStory before running `{name}`: {error}"),
-                    "tool": name
-                });
+                let error = stdio_tool_preparing_error(runtime, name);
                 return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
             }
             if name != "status" {
@@ -980,9 +997,9 @@ fn activate_stdio_project(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
     requires_retrieval: bool,
-) -> Result<()> {
+) -> Result<StdioActivationOutcome> {
     if stdio_workspace_mismatch(runtime).is_some() {
-        return Ok(());
+        return Ok(StdioActivationOutcome::CheckReadiness);
     }
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
@@ -999,12 +1016,16 @@ fn activate_stdio_project(
         state.recent_local_refresh = refresh;
         state.status_cache = None;
         if refresh_is_live {
-            return Ok(());
+            return Ok(if requires_retrieval {
+                StdioActivationOutcome::RetrievalPreparing
+            } else {
+                StdioActivationOutcome::CheckReadiness
+            });
         }
     }
 
     if !requires_retrieval || !embedding_ready {
-        return Ok(());
+        return Ok(StdioActivationOutcome::CheckReadiness);
     }
     let ready = codestory_retrieval::strict_sidecar_status_for_runtime(
         &runtime.project_root,
@@ -1013,39 +1034,71 @@ fn activate_stdio_project(
     )
     .is_ok_and(|status| status.is_live_ready());
     if !ready {
-        if crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(runtime, &agent_sidecar)
-            .is_err()
-        {
-            if runtime
-                .index
-                .run_indexing_blocking(IndexMode::Full)
-                .map_err(map_api_error)
-                .is_err()
+        match crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(
+            runtime,
+            &agent_sidecar,
+        ) {
+            Ok(_) => {}
+            Err(error)
+                if stdio_activation_outcome_for_error(&error)
+                    == StdioActivationOutcome::RetrievalPreparing =>
             {
-                return Ok(());
+                return Ok(StdioActivationOutcome::RetrievalPreparing);
             }
-            if crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(
-                runtime,
-                &agent_sidecar,
-            )
-            .is_err()
-            {
-                return Ok(());
+            Err(_) => {
+                if let Err(error) = runtime
+                    .index
+                    .run_indexing_blocking(IndexMode::Full)
+                    .map_err(map_api_error)
+                {
+                    return Ok(stdio_activation_outcome_for_error(&error));
+                }
+                if let Err(error) = crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(
+                    runtime,
+                    &agent_sidecar,
+                ) {
+                    return Ok(stdio_activation_outcome_for_error(&error));
+                }
             }
         }
-        let Ok(status) = codestory_retrieval::strict_sidecar_status_for_runtime(
+        let status = match codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
             agent_sidecar,
-        ) else {
-            return Ok(());
+        ) {
+            Ok(status) => status,
+            Err(error) => return Ok(stdio_activation_outcome_for_error(&error)),
         };
         if !status.is_live_ready() {
-            return Ok(());
+            return Ok(StdioActivationOutcome::CheckReadiness);
         }
     }
     state.status_cache = None;
-    Ok(())
+    Ok(StdioActivationOutcome::CheckReadiness)
+}
+
+fn stdio_activation_outcome_for_error(error: &anyhow::Error) -> StdioActivationOutcome {
+    const RETRYABLE_MARKERS: &[&str] = &[
+        "cache_busy",
+        "database is locked",
+        "database table is locked",
+        "another indexing run owns the writer lock",
+        "sidecar generation input changed before manifest publication",
+        "publication changed",
+    ];
+    if error
+        .chain()
+        .map(|cause| cause.to_string().to_ascii_lowercase())
+        .any(|message| {
+            RETRYABLE_MARKERS
+                .iter()
+                .any(|marker| message.contains(marker))
+        })
+    {
+        StdioActivationOutcome::RetrievalPreparing
+    } else {
+        StdioActivationOutcome::CheckReadiness
+    }
 }
 
 fn stdio_jsonrpc_tool_call_from_legacy(
@@ -1677,7 +1730,9 @@ fn handle_stdio_ground(runtime: &RuntimeContext, request: &serde_json::Value) ->
     runtime
         .grounding
         .grounding_snapshot(budget)
-        .map(|snapshot| serde_json::json!({"result": snapshot}))
+        .map(|snapshot| {
+            serde_json::json!({"result": compact_stdio_ground_result(serde_json::json!(snapshot))})
+        })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
 
@@ -4769,6 +4824,33 @@ fn enrich_stdio_search_result(
         }
         object.insert("counts".to_string(), counts);
     }
+    compact_stdio_ready_search_retrieval(&mut value);
+    value
+}
+
+fn compact_stdio_ready_search_retrieval(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "retrieval".to_string(),
+            serde_json::json!({"state": "ready"}),
+        );
+    }
+}
+
+fn compact_stdio_ground_result(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("retrieval");
+        if let Some(notes) = object
+            .get_mut("notes")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            notes.retain(|note| {
+                !note
+                    .as_str()
+                    .is_some_and(|note| note.starts_with("Retrieval mode:"))
+            });
+        }
+    }
     value
 }
 
@@ -5328,6 +5410,35 @@ version = "0.11.20"
             hit.get("links").is_none(),
             "non-resolvable repo-text hits should stay link-free: {hit}"
         );
+    }
+
+    #[test]
+    fn stdio_installed_host_migration_contracts_stay_retryable_and_compact() {
+        for message in [
+            "cache_busy: publication changed",
+            "sidecar generation input changed before manifest publication",
+            "database is locked",
+        ] {
+            assert_eq!(
+                stdio_activation_outcome_for_error(&anyhow::anyhow!(message)),
+                StdioActivationOutcome::RetrievalPreparing
+            );
+        }
+        assert_eq!(
+            stdio_activation_outcome_for_error(&anyhow::anyhow!("accelerator unavailable")),
+            StdioActivationOutcome::CheckReadiness
+        );
+
+        let mut search = json!({"retrieval": {"fallback_reason": "missing_semantic_docs"}});
+        compact_stdio_ready_search_retrieval(&mut search);
+        assert_eq!(search["retrieval"], json!({"state": "ready"}));
+
+        let snapshot = json!({
+            "retrieval": {"mode": "symbolic"},
+            "notes": ["keep", "Retrieval mode: symbolic"]
+        });
+        let ground = compact_stdio_ground_result(snapshot);
+        assert_eq!(ground, json!({"notes": ["keep"]}));
     }
 
     #[test]

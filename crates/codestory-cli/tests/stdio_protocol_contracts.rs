@@ -3933,4 +3933,23 @@ fn cold_ground_and_search_retry_while_first_publication_is_owned() {
             );
         }
     }
+
+    let fixture = indexed_fixture();
+    write_live_local_refresh(&fixture);
+    let mut server = spawn_stdio_server(&fixture);
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "migration-search-preparing",
+            "method": "tools/call",
+            "params": {
+                "name": "search",
+                "arguments": {"query": "AppController"}
+            }
+        }),
+    );
+    let error = assert_tool_error(&response, json!("migration-search-preparing"));
+    assert_eq!(error["code"], json!("codestory_preparing"));
+    assert_eq!(error["retry_tool"], json!("search"));
 }
