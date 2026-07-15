@@ -64,6 +64,7 @@ const STDIO_TEXT_MAX_BYTES: usize = 4 * 1024;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
 const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
+const STDIO_PREPARING_RETRY_AFTER_MS: u64 = 1_500;
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
@@ -422,7 +423,7 @@ impl StdioResource {
     }
 
     fn requires_retrieval(&self) -> bool {
-        false
+        matches!(self, Self::Grounding)
     }
 
     fn uri(&self) -> String {
@@ -687,7 +688,7 @@ fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<
                 && let Err(error) = activate_stdio_project(
                     runtime,
                     &mut session.state,
-                    matches!(name, "packet" | "search" | "context"),
+                    matches!(name, "ground" | "packet" | "search" | "context"),
                 )
             {
                 let error = serde_json::json!({
@@ -854,6 +855,16 @@ fn stdio_tool_blocked_error(
     let Some(surface) = status.pointer(&format!("/allowed_surfaces/{name}")) else {
         return Ok(None);
     };
+    let updating = status
+        .pointer("/local_refresh/state")
+        .and_then(serde_json::Value::as_str)
+        == Some("refreshing");
+    let has_complete_publication = status
+        .get("index_publication")
+        .is_some_and(|publication| !publication.is_null());
+    if updating && !has_complete_publication && stdio_tool_reads_publication(name) {
+        return Ok(Some(stdio_tool_preparing_error(runtime, name)));
+    }
     if surface
         .get("allowed")
         .and_then(serde_json::Value::as_bool)
@@ -862,6 +873,9 @@ fn stdio_tool_blocked_error(
         return Ok(None);
     }
     if matches!(name, "packet" | "search" | "context") {
+        if updating {
+            return Ok(Some(stdio_tool_preparing_error(runtime, name)));
+        }
         return Ok(Some(serde_json::json!({
             "code": "codestory_unavailable",
             "message": "CodeStory could not prepare broad repository search automatically. Continue with local navigation or inspect diagnostics.",
@@ -871,10 +885,6 @@ fn stdio_tool_blocked_error(
             "diagnostics_uri": "codestory://status"
         })));
     }
-    let updating = status
-        .pointer("/local_refresh/state")
-        .and_then(serde_json::Value::as_str)
-        == Some("refreshing");
     let (code, message, state_name, retry_after_ms) = if updating {
         (
             "codestory_updating",
@@ -900,6 +910,19 @@ fn stdio_tool_blocked_error(
         "project": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "diagnostics_uri": "codestory://status"
     })))
+}
+
+fn stdio_tool_preparing_error(runtime: &RuntimeContext, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "code": "codestory_preparing",
+        "message": "CodeStory is preparing this repository. Retry the same tool shortly.",
+        "tool": name,
+        "state": "preparing",
+        "retry_tool": name,
+        "retry_after_ms": STDIO_PREPARING_RETRY_AFTER_MS,
+        "project": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+        "diagnostics_uri": "codestory://status"
+    })
 }
 
 fn compact_stdio_status(status: &serde_json::Value) -> serde_json::Value {
@@ -965,15 +988,22 @@ fn activate_stdio_project(
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
     let summary = inspect_runtime.open_project_summary()?;
     let agent_sidecar = stdio_agent_sidecar_for_runtime(runtime);
+    let embedding_ready = !requires_retrieval
+        || codestory_retrieval::ensure_product_embedding_backend_for_runtime(&agent_sidecar)
+            .is_ok();
     if crate::local_freshness_needs_refresh(&summary) {
         let (_, refresh) = wait_for_stdio_local_freshness(&project, &summary)?;
+        let refresh_is_live = refresh.as_ref().is_some_and(|refresh| {
+            refresh.state == crate::readiness::LocalRefreshState::Refreshing
+        });
         state.recent_local_refresh = refresh;
+        state.status_cache = None;
+        if refresh_is_live {
+            return Ok(());
+        }
     }
 
-    if !requires_retrieval {
-        return Ok(());
-    }
-    if codestory_retrieval::ensure_product_embedding_backend_for_runtime(&agent_sidecar).is_err() {
+    if !requires_retrieval || !embedding_ready {
         return Ok(());
     }
     let ready = codestory_retrieval::strict_sidecar_status_for_runtime(
@@ -983,18 +1013,25 @@ fn activate_stdio_project(
     )
     .is_ok_and(|status| status.is_live_ready());
     if !ready {
-        if runtime
-            .index
-            .run_indexing_blocking(IndexMode::Full)
-            .map_err(map_api_error)
-            .is_err()
-        {
-            return Ok(());
-        }
         if crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(runtime, &agent_sidecar)
             .is_err()
         {
-            return Ok(());
+            if runtime
+                .index
+                .run_indexing_blocking(IndexMode::Full)
+                .map_err(map_api_error)
+                .is_err()
+            {
+                return Ok(());
+            }
+            if crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(
+                runtime,
+                &agent_sidecar,
+            )
+            .is_err()
+            {
+                return Ok(());
+            }
         }
         let Ok(status) = codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,

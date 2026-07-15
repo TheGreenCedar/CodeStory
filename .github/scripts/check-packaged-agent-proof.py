@@ -299,6 +299,26 @@ class McpProcess:
         require("error" not in response, f"MCP {name} failed: {response.get('error')}")
         return response
 
+    def tool_until_ready(self, name: str, arguments: dict, request_id: str) -> tuple[dict, int]:
+        deadline = time.monotonic() + self.timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            response = self.tool(name, arguments, f"{request_id}-{attempt}")
+            result = response.get("result", {})
+            if result.get("isError") is not True:
+                return response, attempt
+            state = result.get("structuredContent", {})
+            require(
+                state.get("code") in {"codestory_preparing", "codestory_updating"},
+                f"MCP {name} did not converge: {state}",
+            )
+            require(state.get("retry_tool") == name, f"MCP {name} returned the wrong retry tool: {state}")
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, f"MCP {name} did not become ready")
+            delay = max(1, int(state.get("retry_after_ms", 1))) / 1000
+            time.sleep(min(delay, remaining))
+
     def close(self) -> None:
         if self.process.stdin:
             self.process.stdin.close()
@@ -364,21 +384,19 @@ def create_second_repository(root: Path) -> Path:
 
 def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root: Path, out_dir: Path) -> dict:
     project = args.project.resolve()
-    second = create_second_repository(root)
-    commands = {}
+    if args.additional_project:
+        require(
+            len(args.additional_project) == len(args.additional_query),
+            "each --additional-project requires one --additional-query",
+        )
+        additional_projects = [
+            (path.resolve(), query)
+            for path, query in zip(args.additional_project, args.additional_query)
+        ]
+    else:
+        additional_projects = [(create_second_repository(root), "shared_engine_probe")]
     embedded_models = Path(env["CODESTORY_CACHE_ROOT"]) / "embedded-models"
     require(not embedded_models.exists(), "isolated proof cache was not empty before first use")
-    commands["index"], _ = json_command([str(cli), "index", "--project", str(project), "--refresh", "full", "--format", "json"], env=env, cwd=project, timeout=args.timeout_secs)
-    cold_models = list(embedded_models.rglob("*.gguf"))
-    require(len(cold_models) == 1, "first use did not materialize exactly one embedded model")
-    cold_materialization = {
-        "path": str(cold_models[0]),
-        "sha256": sha256(cold_models[0]),
-        "first_command_wall_ms": commands["index"]["wall_ms"],
-    }
-    commands["retrieval_index"], _ = json_command([str(cli), "retrieval", "index", "--project", str(project), "--refresh", "full", "--format", "json"], env=env, cwd=project, timeout=args.timeout_secs)
-    commands["status"], status = json_command([str(cli), "retrieval", "status", "--project", str(project), "--format", "json"], env=env, cwd=project, timeout=args.timeout_secs)
-    require(find_value(status, "retrieval_mode") == "full", "retrieval status is not full")
 
     command = [str(cli), "serve", "--stdio", "--multi-project", "--refresh", "none"]
     if args.plugin_handoff:
@@ -390,17 +408,50 @@ def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root
     mcp = McpProcess(command, env=env, cwd=project, timeout=args.timeout_secs)
     try:
         mcp.initialize()
-        mcp.tool("search", {"project": str(project), "query": args.query, "why": True}, "search-one")
+        cold_started = time.perf_counter()
+        _, cold_attempts = mcp.tool_until_ready(
+            "ground", {"project": str(project), "budget": "strict"}, "cold-ground"
+        )
+        cold_ground_wall_ms = round((time.perf_counter() - cold_started) * 1000, 3)
+        cold_models = list(embedded_models.rglob("*.gguf"))
+        require(len(cold_models) == 1, "first use did not materialize exactly one embedded model")
+        cold_materialization = {
+            "path": str(cold_models[0]),
+            "sha256": sha256(cold_models[0]),
+            "first_command_wall_ms": cold_ground_wall_ms,
+            "ground_attempts": cold_attempts,
+        }
+        mcp.tool_until_ready(
+            "search", {"project": str(project), "query": args.query, "why": True}, "search-one"
+        )
         public_status = mcp.status(project, "status-one")
         assert_public_status(public_status)
         first = mcp.engine_diagnostics(project, "diagnostics-one")
-        mcp.tool("search", {"project": str(second), "query": "shared_engine_probe", "why": True}, "search-two")
-        second_status = mcp.engine_diagnostics(second, "diagnostics-two")
         first_identity = engine_identity(first, args.engine_policy, args.expected_backend)
-        second_identity = engine_identity(second_status, args.engine_policy, args.expected_backend)
-        require(first_identity["embedding_engine_instance_id"] == second_identity["embedding_engine_instance_id"], "repositories did not share one process engine")
-        require(second_identity["embedding_model_load_count"] == 1, "second repository reloaded the model")
-        mcp.tool("packet", {"project": str(project), "question": args.question, "budget": "compact"}, "packet")
+        for index, (additional_project, query) in enumerate(additional_projects, start=1):
+            mcp.tool_until_ready(
+                "search",
+                {"project": str(additional_project), "query": query, "why": True},
+                f"search-additional-{index}",
+            )
+            additional_status = mcp.engine_diagnostics(
+                additional_project, f"diagnostics-additional-{index}"
+            )
+            additional_identity = engine_identity(
+                additional_status, args.engine_policy, args.expected_backend
+            )
+            require(
+                first_identity["embedding_engine_instance_id"]
+                == additional_identity["embedding_engine_instance_id"],
+                "repositories did not share one process engine",
+            )
+            require(
+                additional_identity["embedding_model_load_count"] == 1,
+                "an additional repository reloaded the model",
+            )
+        mcp.tool_until_ready(
+            "packet", {"project": str(project), "question": args.question, "budget": "compact"}, "packet"
+        )
         transcript = mcp.transcript
     finally:
         mcp.close()
@@ -426,7 +477,6 @@ def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root
     require(materialized.stat().st_mtime_ns == before_mtime, "restart rewrote the materialized model")
     assert_no_legacy_state(Path(env["CODESTORY_CACHE_ROOT"]))
     return {
-        "commands": commands,
         "cold_materialization": cold_materialization,
         "identity": identity,
         "restart_identity": restart_identity,
@@ -489,6 +539,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=Path("target/packaged-agent-proof"))
     parser.add_argument("--query", default=DEFAULT_QUERY)
     parser.add_argument("--question", default=DEFAULT_QUESTION)
+    parser.add_argument("--additional-project", type=Path, action="append", default=[])
+    parser.add_argument("--additional-query", action="append", default=[])
     parser.add_argument("--timeout-secs", type=int, default=900)
     parser.add_argument("--version-only", action="store_true")
     parser.add_argument("--plugin-handoff", action="store_true")
