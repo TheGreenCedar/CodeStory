@@ -54,8 +54,9 @@
   release model hash no longer depends on an enlarged build-script stack.
 - Release evidence is routed through the in-process Linux ARM64 machine profile.
   Its pinned VM image supplies containerd directly, without retaining a Docker
-  repository package dependency. Mac signing and notarization remain
-  publication-only gates, not PR blockers.
+  repository package dependency, and guest capacity checks use the same kernel
+  memory source recorded in the attestation. Mac signing and notarization
+  remain publication-only gates, not PR blockers.
 
 ### Upgrade note
 

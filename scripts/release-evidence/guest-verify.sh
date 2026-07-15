@@ -39,9 +39,11 @@ test "$(nproc)" = "$(get '.vm.cpus')"
 test "$(sed -n 's/^serial: //p' /etc/cloud/build.info)" = "$(get '.vm.base_image.guest_build_serial')"
 
 python3 - "$runner_root" <<'PY'
-import os, shutil, sys
+import shutil, sys
 root = sys.argv[1]
-memory_gib = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+with open("/proc/meminfo", encoding="utf-8") as meminfo:
+    memory_kib = int(next(line.split()[1] for line in meminfo if line.startswith("MemTotal:")))
+memory_gib = memory_kib * 1024 / 2**30
 disk_gib = shutil.disk_usage(root).free / 2**30
 assert memory_gib >= 16, memory_gib
 assert disk_gib >= 20, disk_gib
