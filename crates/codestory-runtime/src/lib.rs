@@ -11692,47 +11692,54 @@ fn index_full_for_runtime(
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
         }
     };
-    if has_verified_live_publication {
-        let incomplete_paths = match staged.store_mut().get_files() {
-            Ok(files) => files
-                .into_iter()
-                .filter(|file| !file.complete)
-                .map(|file| file.path)
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                let _ = staged.discard();
-                return Err(ApiError::internal(format!(
-                    "Failed to verify staged full-refresh files: {error}"
-                )));
-            }
-        };
-        if !incomplete_paths.is_empty() {
-            let sample = incomplete_paths
-                .iter()
-                .take(3)
-                .map(|path| {
-                    path.strip_prefix(root)
-                        .unwrap_or(path)
-                        .display()
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let remainder = incomplete_paths.len().saturating_sub(3);
-            let sample = if remainder > 0 {
-                format!("{sample}, and {remainder} more")
-            } else {
-                sample
-            };
-            let count = incomplete_paths.len();
+    let incomplete_paths = match staged.store_mut().get_files() {
+        Ok(files) => files
+            .into_iter()
+            .filter(|file| !file.complete)
+            .map(|file| file.path)
+            .collect::<Vec<_>>(),
+        Err(error) => {
             let _ = staged.discard();
-            return Err(ApiError::new(
-                "index_incomplete",
-                format!(
-                    "Full refresh could not verify {count} scheduled file(s): {sample}. The previous complete publication was preserved; fix unreadable, unstable, or oversized sources and retry."
-                ),
-            ));
+            return Err(ApiError::internal(format!(
+                "Failed to verify staged full-refresh files: {error}"
+            )));
         }
+    };
+    if !incomplete_paths.is_empty() {
+        let sample = incomplete_paths
+            .iter()
+            .take(3)
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remainder = incomplete_paths.len().saturating_sub(3);
+        let sample = if remainder > 0 {
+            format!("{sample}, and {remainder} more")
+        } else {
+            sample
+        };
+        let preserved_state = if has_verified_live_publication {
+            "The previous complete publication was preserved"
+        } else if recovering_incomplete_run {
+            "The existing live index and its incomplete-run recovery fence were preserved"
+        } else if previous_publication.is_some() {
+            "The existing live index was preserved and no replacement publication was created"
+        } else {
+            "No core publication was created"
+        };
+        let count = incomplete_paths.len();
+        let _ = staged.discard();
+        return Err(ApiError::new(
+            "index_incomplete",
+            format!(
+                "Full refresh could not verify {count} scheduled file(s): {sample}. {preserved_state}; fix unreadable, unstable, or oversized sources and retry."
+            ),
+        ));
     }
     if can_copy_forward {
         match staged
@@ -17058,6 +17065,54 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
+    fn incomplete_first_full_refresh_creates_no_core_or_dense_publication() {
+        let mut env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
+
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("an incomplete first full refresh must not publish");
+
+        assert_eq!(error.code, "index_incomplete");
+        assert!(
+            error.message.contains("No core publication was created"),
+            "first-publication failure should not claim that a previous publication was preserved: {}",
+            error.message
+        );
+        if storage_path.exists() {
+            let storage = Storage::open(&storage_path).expect("open empty live storage");
+            assert_eq!(
+                storage
+                    .get_index_publication()
+                    .expect("empty core publication"),
+                None
+            );
+            assert!(
+                storage
+                    .get_dense_anchor_publication_manifest()
+                    .expect("empty dense publication")
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .get_dense_anchor_inputs_batch_after(None, 1)
+                    .expect("empty dense inputs")
+                    .is_empty()
+            );
+        }
+        assert_no_staged_publication_artifacts(&storage_path);
+    }
+
+    #[test]
     fn incomplete_incremental_source_preserves_last_verified_dense_anchors() {
         let mut env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -17216,6 +17271,93 @@ fn build_llm_symbol_doc_text() -> String {
             .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
             .collect::<HashSet<_>>();
         assert_eq!(retained_anchors, first_anchors);
+    }
+
+    #[test]
+    fn incomplete_full_recovery_preserves_prior_anchors_and_recovery_fence() {
+        let mut env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        let first_manifest = first_storage
+            .validate_dense_anchor_publication(&first_publication)
+            .expect("first dense manifest");
+        let first_anchors = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first anchors");
+        assert!(!first_anchors.is_empty(), "fixture needs dense anchors");
+        first_storage
+            .begin_incremental_run()
+            .expect("mark interrupted incremental run");
+        drop(first_storage);
+
+        let mut source = fs::read_to_string(&source_path).expect("read source");
+        source.push_str("\n// recovery candidate is deliberately unreadable\n");
+        fs::write(&source_path, source).expect("change source");
+        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("incomplete recovery must preserve the fenced live index");
+
+        assert_eq!(error.code, "index_incomplete");
+        assert!(
+            error
+                .message
+                .contains("incomplete-run recovery fence were preserved"),
+            "recovery failure should describe the preserved fence: {}",
+            error.message
+        );
+        let storage = Storage::open(&storage_path).expect("preserved fenced storage");
+        assert_eq!(
+            storage
+                .get_index_publication()
+                .expect("preserved raw publication"),
+            Some(first_publication.clone()),
+            "an incomplete recovery must not advance the raw generation"
+        );
+        assert!(
+            storage
+                .has_incomplete_incremental_run()
+                .expect("preserved recovery fence"),
+            "the interrupted-run fence must remain until a complete recovery publishes"
+        );
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("fenced complete publication"),
+            None,
+            "a fenced live index must remain unavailable as a complete publication"
+        );
+        assert_eq!(
+            storage
+                .validate_dense_anchor_publication(&first_publication)
+                .expect("preserved dense manifest"),
+            first_manifest
+        );
+        assert_eq!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("preserved dense anchors"),
+            first_anchors,
+            "unreadable recovery discovery must not create anchor deletion evidence"
+        );
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]
@@ -17475,6 +17617,104 @@ fn build_llm_symbol_doc_text() -> String {
                 .get_all_llm_symbol_docs()
                 .expect("legacy semantic docs")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn incremental_refresh_rebuilds_untouched_dense_anchor_after_cross_file_edge_removal() {
+        let _env = hybrid_test_env();
+        let workspace = tempdir().expect("workspace dir");
+        let src = workspace.path().join("src");
+        fs::create_dir_all(&src).expect("create source directory");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"semantic-scope-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write package manifest");
+        let callee_path = src.join("lib.rs");
+        let caller_path = src.join("main.rs");
+        fs::write(&callee_path, "pub struct Helper;\n").expect("write callee source");
+        fs::write(
+            &caller_path,
+            "mod lib;\nuse crate::lib::Helper;\npub fn run() -> Helper { Helper }\n",
+        )
+        .expect("write caller source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full index");
+
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_anchors = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first dense anchors");
+        let first_anchor = first_anchors
+            .iter()
+            .find(|anchor| {
+                anchor.display_name == "Helper" && anchor.file_path.as_deref() == Some("src/lib.rs")
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "callee dense anchor; available={:?}",
+                    first_anchors
+                        .iter()
+                        .map(|anchor| (
+                            anchor.display_name.as_str(),
+                            anchor.file_path.as_deref(),
+                            anchor.file_node_id,
+                            anchor.selection_reason.as_str(),
+                        ))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            first_anchor.text.contains("edge_digest: IMPORT=1"),
+            "the initial callee document must expose the cross-file import edge: {}",
+            first_anchor.text
+        );
+        let callee_bytes = fs::read(&callee_path).expect("read untouched callee source");
+        drop(first_storage);
+
+        fs::write(&caller_path, "pub fn run() -> i32 { 2 }\n").expect("remove cross-file edge");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental caller refresh");
+
+        assert_eq!(
+            fs::read(&callee_path).expect("reread untouched callee source"),
+            callee_bytes,
+            "the endpoint source must remain byte-for-byte untouched"
+        );
+        let storage = Storage::open(&storage_path).expect("incremental storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("incremental publication")
+            .expect("complete incremental publication");
+        storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("complete dense anchor publication");
+        let rebuilt_anchor = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("rebuilt dense anchors")
+            .into_iter()
+            .find(|anchor| anchor.node_id == first_anchor.node_id)
+            .expect("rebuilt callee dense anchor");
+        assert_ne!(
+            rebuilt_anchor.document_hash, first_anchor.document_hash,
+            "removing a cross-file edge must rebuild the connected untouched endpoint"
+        );
+        assert!(
+            !rebuilt_anchor.text.contains("edge_digest: IMPORT=1"),
+            "the rebuilt endpoint must not retain the removed cross-file edge: {}",
+            rebuilt_anchor.text
         );
     }
 
@@ -20462,6 +20702,55 @@ fn build_llm_symbol_doc_text() -> String {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runtime_service_shared_cancellation_stops_full_refresh_before_core_publication() {
+        let workspace = tempdir().expect("workspace dir");
+        let source_path = workspace.path().join("lib.rs");
+        fs::write(&source_path, "pub fn old_generation() -> i32 { 1 }\n")
+            .expect("write baseline source");
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new();
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open shared-cancellation baseline");
+        controller
+            .run_indexing_blocking(IndexMode::Full)
+            .expect("publish shared-cancellation baseline");
+        let baseline = Storage::open(&storage_path)
+            .expect("open shared-cancellation baseline")
+            .get_complete_index_publication()
+            .expect("read shared-cancellation baseline")
+            .expect("complete shared-cancellation baseline");
+
+        fs::write(&source_path, "pub fn new_generation() -> i32 { 2 }\n")
+            .expect("write replacement source");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestAction::Cancel,
+        );
+        let error = crate::services::IndexService::new(controller)
+            .run_indexing_blocking_with_cancel_flag(IndexMode::Full, Arc::clone(&cancelled))
+            .expect_err("shared cancellation must stop the full refresh before publication");
+
+        assert_eq!(error.code, "cancelled");
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        let storage = Storage::open(&storage_path).expect("open cancelled publication");
+        assert_eq!(
+            storage
+                .get_complete_index_publication()
+                .expect("read cancelled publication"),
+            Some(baseline),
+            "shared cancellation advanced the core publication"
+        );
+        assert!(storage_has_symbol(&storage, "old_generation"));
+        assert!(!storage_has_symbol(&storage, "new_generation"));
+        assert_no_staged_publication_artifacts(&storage_path);
     }
 
     #[test]

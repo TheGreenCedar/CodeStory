@@ -569,7 +569,7 @@ struct StdioWorkspaceMismatch {
 fn handle_stdio_message(
     session: &mut StdioServerSession,
     line: &str,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) -> Option<serde_json::Value> {
     let request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
@@ -1010,7 +1010,7 @@ fn activate_stdio_project(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
     requires_retrieval: bool,
-    cancelled: &AtomicBool,
+    cancelled: &Arc<AtomicBool>,
 ) -> Result<StdioActivationOutcome> {
     ensure_stdio_activation_not_cancelled(cancelled, "activation preflight")?;
     if stdio_workspace_mismatch(runtime).is_some() {
@@ -1067,7 +1067,7 @@ fn activate_stdio_project(
                 ensure_stdio_activation_not_cancelled(cancelled, "core refresh")?;
                 if let Err(error) = runtime
                     .index
-                    .run_indexing_blocking(IndexMode::Full)
+                    .run_indexing_blocking_with_cancel_flag(IndexMode::Full, Arc::clone(cancelled))
                     .map_err(map_api_error)
                 {
                     return Ok(stdio_activation_outcome_for_error(&error));
@@ -5121,7 +5121,7 @@ mod tests {
             cache_dir: Some(cache.path().to_path_buf()),
         })
         .expect("inspect runtime");
-        let cancelled = AtomicBool::new(true);
+        let cancelled = Arc::new(AtomicBool::new(true));
 
         let error =
             activate_stdio_project(&runtime, &mut StdioServerState::default(), true, &cancelled)
@@ -5980,7 +5980,7 @@ version = "0.11.20"
                 }
             })
             .to_string(),
-            &AtomicBool::new(false),
+            &Arc::new(AtomicBool::new(false)),
         )
         .expect("invalid resource response");
 

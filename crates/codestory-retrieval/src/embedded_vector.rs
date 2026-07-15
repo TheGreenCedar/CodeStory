@@ -143,6 +143,9 @@ pub(crate) fn build_vector_producer_evidence(
     embedding_dim: u32,
     publication: EmbeddingVectorPublicationIdentityDto,
 ) -> EmbeddingVectorProducerEvidenceDto {
+    let vector_semantics = codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
+    let pooling = vector_semantics.pooling_id();
+    let normalization = vector_semantics.normalization_id();
     let engine_build_id = live_identity
         .map(|identity| identity.ggml_build_identity.to_string())
         .unwrap_or_else(|| codestory_llama_sys::PRODUCT_EMBEDDING_RUNTIME_ID.to_string());
@@ -180,8 +183,8 @@ pub(crate) fn build_vector_producer_evidence(
             config_sha256: evidence_contract_digest(
                 "config",
                 &format!(
-                    "{}:{embedding_dim}:mean:l2",
-                    codestory_llama_sys::MODEL_SHA256
+                    "{}:{embedding_dim}:{pooling}:{normalization}",
+                    codestory_llama_sys::MODEL_SHA256,
                 ),
             ),
         },
@@ -189,8 +192,8 @@ pub(crate) fn build_vector_producer_evidence(
             dimension: embedding_dim,
             query_prefix: crate::embeddings::CODERANK_QUERY_PREFIX_DEFAULT.to_string(),
             document_prefix: String::new(),
-            pooling: "mean".to_string(),
-            normalization: "l2".to_string(),
+            pooling: pooling.to_string(),
+            normalization: normalization.to_string(),
             element_type: "f32_le".to_string(),
             vector_schema_version: VECTOR_INDEX_SCHEMA_VERSION as u32,
         },
@@ -2161,6 +2164,69 @@ mod tests {
     }
 
     #[test]
+    fn reader_admission_rejects_a_generation_from_an_incompatible_producer() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let runtime = reader_runtime(root.path(), &layout);
+        let publication = reader_publication();
+        let storage = seed_reader_store(&root.path().join("core.sqlite3"), &publication);
+        let producer_a_device = accelerated_device();
+        let producer_a_identity = accelerated_identity();
+        let manifest = reader_manifest(&crate::embeddings::embedding_runtime_id_for_runtime(
+            &runtime,
+        ));
+
+        let published = publish_reader_generation(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &producer_a_device,
+            &producer_a_identity,
+            |_| {},
+        );
+        let producer_a_compatibility = vector_producer_compatibility_identity(
+            &producer_a_device,
+            Some(&producer_a_identity),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+        )
+        .expect("producer A compatibility identity");
+        assert_eq!(published.compatibility_sha256, producer_a_compatibility);
+
+        let mut producer_b_device = producer_a_device.clone();
+        producer_b_device.detected_provider = Some("cuda".into());
+        producer_b_device.detected_gpu = Some("test cuda accelerator".into());
+        producer_b_device.accelerator_request_provider = Some("cuda".into());
+        producer_b_device.accelerator_request_device = Some("test cuda accelerator".into());
+        let mut producer_b_identity = producer_a_identity.clone();
+        producer_b_identity.backend = "CUDA".into();
+        producer_b_identity.adapter_name = "test cuda accelerator".into();
+        producer_b_identity.adapter_description = "test cuda".into();
+        producer_b_identity.execution_device_names = vec!["test cuda accelerator".into()];
+        let producer_b_compatibility = vector_producer_compatibility_identity(
+            &producer_b_device,
+            Some(&producer_b_identity),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+        )
+        .expect("producer B compatibility identity");
+        assert_ne!(producer_a_compatibility, producer_b_compatibility);
+
+        let error = validate_generation_evidence_for_publication(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &runtime,
+            &producer_b_device,
+            Some(&producer_b_identity),
+        )
+        .expect_err("producer B must not admit producer A's persisted generation");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("producer evidence is incompatible"));
+        assert!(detail.contains("engine"));
+    }
+
+    #[test]
     fn producer_compatibility_covers_every_evidence_group_and_execution_proof() {
         let device = accelerated_device();
         let identity = accelerated_identity();
@@ -2176,6 +2242,18 @@ mod tests {
             Some(&identity),
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
             publication,
+        );
+        assert_eq!(
+            expected.semantics.dimension as usize,
+            codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension()
+        );
+        assert_eq!(
+            expected.semantics.pooling,
+            codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.pooling_id()
+        );
+        assert_eq!(
+            expected.semantics.normalization,
+            codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.normalization_id()
         );
         assert_eq!(expected.engine.device_class, identity.adapter_description);
         assert_ne!(expected.engine.device_class, device.observed_state);

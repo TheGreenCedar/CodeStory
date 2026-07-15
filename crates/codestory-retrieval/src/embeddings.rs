@@ -20,7 +20,8 @@ use std::sync::{
 use std::time::Instant;
 
 /// CodeRankEmbed vector width shared by stored and query vectors.
-pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
+pub const RETRIEVAL_EMBEDDING_DIM: usize =
+    codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension();
 pub const CODERANK_EMBED_Q8_GGUF: &str = codestory_llama_sys::MODEL_FILE_NAME;
 pub const CODERANK_QUERY_PREFIX_DEFAULT: &str =
     "Represent this query for searching relevant code: ";

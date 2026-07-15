@@ -13,6 +13,8 @@ use codestory_contracts::api::{
 use crate::AppController;
 use codestory_indexer::CancellationToken;
 use codestory_store::IndexPublicationRecord;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone)]
 pub struct ProjectService {
@@ -103,6 +105,20 @@ impl IndexService {
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.controller
             .run_indexing_blocking_with_cancel(mode, cancel_token)
+    }
+
+    /// Run indexing with a host-owned cancellation flag.
+    ///
+    /// This keeps the indexer's cancellation token behind the runtime service
+    /// boundary while allowing transports to share their request lifecycle.
+    pub fn run_indexing_blocking_with_cancel_flag(
+        &self,
+        mode: IndexMode,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
+        let cancel_token = CancellationToken::from_shared_flag(cancelled);
+        self.controller
+            .run_indexing_blocking_with_cancel(mode, &cancel_token)
     }
 
     pub fn run_indexing_blocking_without_runtime_refresh(

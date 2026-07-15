@@ -405,37 +405,6 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     };
     let scip_ready = existing_status.scip.capabilities.graph;
 
-    if lexical_ready && semantic_ready_points.is_some() && scip_ready {
-        update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
-        manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
-        let status = probe_sidecar_health_for_runtime(
-            &layout,
-            &project_id,
-            Some(manifest.clone()),
-            &embedding_device,
-            runtime,
-        );
-        if status.retrieval_mode == "full" {
-            info!(
-                project_id = %project_id,
-                sidecar_generation = %generation,
-                semantic_point_count = semantic_ready_points.unwrap_or_default(),
-                "current generated sidecars already healthy; persisted manifest without rebuild"
-            );
-            return persist_finalized_manifest(
-                project_root,
-                storage_path,
-                &retention_context,
-                cancelled,
-                &sidecar_input,
-                project_id,
-                manifest,
-                degraded_modes,
-                SidecarStubFlags { scip_stubbed },
-            );
-        }
-    }
-
     let lexical_outcome = with_finalize_progress(&mut progress, "lexical sidecar", || {
         ensure_lexical_generation(
             project_root,
@@ -627,25 +596,44 @@ fn ensure_semantic_index(
         })
         .collect::<Vec<_>>();
 
-    let point_count = if let Some(point_count) = semantic_ready_points {
-        let manifest =
-            EmbeddedVectorIndex::load_generation_manifest(semantic.layout, semantic.collection)?;
-        let mismatches = producer_evidence_mismatches(&evidence, &manifest.evidence);
-        if !mismatches.is_empty() {
-            bail!(
-                "stored vector producer evidence is incompatible: {}",
-                mismatches.join(", ")
-            );
+    let reusable_point_count = semantic_ready_points.and_then(|point_count| {
+        let validation = (|| {
+            let manifest = EmbeddedVectorIndex::load_generation_manifest(
+                semantic.layout,
+                semantic.collection,
+            )?;
+            let mismatches = producer_evidence_mismatches(&evidence, &manifest.evidence);
+            if !mismatches.is_empty() {
+                bail!(
+                    "stored vector producer evidence is incompatible: {}",
+                    mismatches.join(", ")
+                );
+            }
+            EmbeddedVectorIndex::validate_published_attestation(
+                semantic.layout,
+                semantic.collection,
+                semantic.generation,
+                semantic.input_hash,
+                &contract,
+                &expected_anchors,
+                &manifest.vectors,
+            )
+        })();
+        match validation {
+            Ok(_) => Some(point_count),
+            Err(error) => {
+                warn!(
+                    project_id = %project_id,
+                    sidecar_generation = %semantic.generation,
+                    error = %format!("{error:#}"),
+                    "existing vector candidate is incomplete or incompatible; rebuilding"
+                );
+                None
+            }
         }
-        EmbeddedVectorIndex::validate_published_attestation(
-            semantic.layout,
-            semantic.collection,
-            semantic.generation,
-            semantic.input_hash,
-            &contract,
-            &expected_anchors,
-            &manifest.vectors,
-        )?;
+    });
+
+    let point_count = if let Some(point_count) = reusable_point_count {
         info!(
             project_id = %project_id,
             sidecar_generation = %semantic.generation,
@@ -1988,6 +1976,278 @@ mod tests {
                 .expect("read publication after cancellation"),
             prior,
             "cancelled transaction changed current or rollback pointers"
+        );
+    }
+
+    #[test]
+    fn partial_zero_dense_vector_candidate_repairs_then_promotes_without_weakening_prior() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut storage = Store::open(&storage_path).expect("open storage");
+        storage
+            .put_index_publication(&publication)
+            .expect("publish core identity");
+        storage
+            .publish_dense_anchor_generation(
+                &publication,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .expect("publish empty dense-anchor generation");
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        let (residency, _active) = crate::embeddings::ProductEmbeddingResidencyLease::test_lease(
+            test_embedding_identity("accelerated"),
+        );
+        let device = crate::embeddings::EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "inprocess_engine",
+            detected_provider: Some("metal".into()),
+            detected_gpu: Some("test accelerator".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("metal".into()),
+            accelerator_request_device: Some("test accelerator".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        };
+        let producer_compatibility_identity = vector_producer_compatibility_identity(
+            &device,
+            residency.identity(),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+        )
+        .expect("producer compatibility identity");
+        let input = |hash: &str| SidecarInputFingerprint {
+            hash: hash.into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: format!("graph-{hash}"),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: format!("lexical-{hash}"),
+            lexical_coverage: Default::default(),
+        };
+        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
+            let mut manifest = retrieval_manifest_for_sidecar(
+                "proj",
+                &sidecar_generation_id("proj", &input.hash),
+                &crate::generation::sidecar_vector_generation("proj", &input.hash),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                input,
+            );
+            manifest.built_at_epoch_ms = built_at_epoch_ms;
+            manifest
+        };
+        let rollback_input = input(&"a".repeat(64));
+        let current_input = input(&"b".repeat(64));
+        let candidate_input = input(&"c".repeat(64));
+        let rollback_manifest = manifest(&rollback_input, 1);
+        let current_manifest = manifest(&current_input, 2);
+        let candidate_manifest = manifest(&candidate_input, 3);
+        let publish_empty_vectors = |manifest: &RetrievalIndexManifest,
+                                     publish_manifest: bool|
+         -> VectorGenerationManifest {
+            let evidence = build_vector_producer_evidence(
+                &device,
+                residency.identity(),
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+                EmbeddingVectorPublicationIdentityDto {
+                    core_generation_id: publication.generation_id.clone(),
+                    core_run_id: publication.run_id.clone(),
+                    retrieval_generation: manifest
+                        .sidecar_generation
+                        .clone()
+                        .expect("retrieval generation"),
+                    retrieval_input_hash: manifest
+                        .sidecar_input_hash
+                        .clone()
+                        .expect("retrieval input hash"),
+                    semantic_generation: manifest.semantic_generation.clone(),
+                },
+            );
+            let contract = VectorEvidenceContract::new(
+                manifest
+                    .embedding_backend
+                    .clone()
+                    .expect("embedding backend"),
+                usize::try_from(manifest.embedding_dim.expect("embedding dimension"))
+                    .expect("positive embedding dimension"),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                vector_compatibility_identity(&evidence).expect("compatibility identity"),
+            );
+            let attestation = EmbeddedVectorIndex::build_attested_with_points(
+                &runtime.layout,
+                &manifest.semantic_generation,
+                manifest
+                    .sidecar_generation
+                    .as_deref()
+                    .expect("retrieval generation"),
+                manifest
+                    .sidecar_input_hash
+                    .as_deref()
+                    .expect("retrieval input hash"),
+                &contract,
+                &[],
+                |_visit| Ok(()),
+            )
+            .expect("publish empty vector database");
+            let generation = VectorGenerationManifest::new(evidence, attestation)
+                .expect("build vector generation manifest");
+            if publish_manifest {
+                EmbeddedVectorIndex::publish_generation_manifest(
+                    &runtime.layout,
+                    &manifest.semantic_generation,
+                    &generation,
+                )
+                .expect("publish vector generation manifest");
+            }
+            generation
+        };
+        publish_empty_vectors(&rollback_manifest, true);
+        publish_empty_vectors(&current_manifest, true);
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: rollback_manifest.clone(),
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
+            .expect("seed current and rollback pointers");
+        let prior = storage
+            .get_retrieval_index_publication("proj")
+            .expect("read prior publication");
+
+        let candidate_generation = publish_empty_vectors(&candidate_manifest, false);
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            &runtime.layout,
+            &candidate_manifest.semantic_generation,
+            &candidate_generation,
+            || bail!("simulated cancellation after vector database publication"),
+        )
+        .expect_err("evidence publication must be cancelled");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read publication after evidence cancellation"),
+            prior,
+            "partial candidate changed current or rollback pointers"
+        );
+        for prior_manifest in [&current_manifest, &rollback_manifest] {
+            crate::embedded_vector::validate_generation_evidence_for_publication(
+                &runtime.layout,
+                &storage,
+                prior_manifest,
+                &publication,
+                &runtime,
+                &device,
+                residency.identity(),
+            )
+            .expect("prior generation remains deeply usable");
+        }
+        let semantic = SemanticGeneration {
+            layout: &runtime.layout,
+            collection: &candidate_manifest.semantic_generation,
+            generation: candidate_manifest
+                .sidecar_generation
+                .as_deref()
+                .expect("candidate generation"),
+            input_hash: candidate_manifest
+                .sidecar_input_hash
+                .as_deref()
+                .expect("candidate input hash"),
+            embedding_backend: candidate_manifest
+                .embedding_backend
+                .as_deref()
+                .expect("candidate embedding backend"),
+            embedding_dim: candidate_manifest
+                .embedding_dim
+                .expect("candidate embedding dimension"),
+            expected_points: 0,
+        };
+        let context = GenerationRetentionContext {
+            runtime: &runtime,
+            layout: &runtime.layout,
+            workspace_id: "workspace",
+            previous_manifest: Some(&current_manifest),
+            embedding_device: &device,
+            embedding_residency: residency,
+            producer_compatibility_identity,
+        };
+        let cancelled = AtomicBool::new(false);
+        ensure_semantic_index(
+            &storage_path,
+            "proj",
+            &semantic,
+            Some(0),
+            &context,
+            &cancelled,
+            &mut |_| {},
+        )
+        .expect("retry repairs the partial zero-dense candidate");
+        crate::embedded_vector::validate_generation_evidence_for_publication(
+            &runtime.layout,
+            &storage,
+            &candidate_manifest,
+            &publication,
+            &runtime,
+            &device,
+            context.embedding_residency.identity(),
+        )
+        .expect("repaired candidate deep-validates");
+
+        promote_retrieval_manifest(
+            &mut storage,
+            &candidate_input,
+            &candidate_manifest,
+            |_| Ok(candidate_input.clone()),
+            |storage| {
+                crate::embedded_vector::validate_generation_evidence_for_publication(
+                    &runtime.layout,
+                    storage,
+                    &candidate_manifest,
+                    &publication,
+                    &runtime,
+                    &device,
+                    context.embedding_residency.identity(),
+                )
+                .map(|_| ())
+            },
+            |_| Ok(()),
+            |_| {
+                Ok(Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest.clone(),
+                    verified_at_epoch_ms: 3,
+                }))
+            },
+        )
+        .expect("promote repaired candidate");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read repaired publication"),
+            Some((
+                candidate_manifest,
+                Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest,
+                    verified_at_epoch_ms: 3,
+                }),
+            ))
         );
     }
 
