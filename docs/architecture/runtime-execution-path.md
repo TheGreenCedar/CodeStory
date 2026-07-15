@@ -26,27 +26,27 @@ sequenceDiagram
     participant Retrieval as codestory-retrieval
 
     CLI->>Runtime: resolve command and query options
-    Runtime->>Retrieval: strict_sidecar_status(project, storage)
+    Runtime->>Retrieval: strict_retrieval_status(project, storage)
     Retrieval->>Store: load retrieval manifest and validate live indexable inventory
     Retrieval-->>Runtime: retrieval_mode + degraded reason
-    Runtime->>Retrieval: execute sidecar query only when retrieval_mode=full
-    Runtime->>Store: resolve sidecar candidates to indexed symbols
-    Runtime->>Runtime: map sidecar trace and resolved hits into DTOs
+    Runtime->>Retrieval: execute retrieval query only when retrieval_mode=full
+    Runtime->>Store: resolve retrieval candidates to indexed symbols
+    Runtime->>Runtime: map retrieval trace and resolved hits into DTOs
     Runtime-->>CLI: result DTOs
     CLI->>CLI: render markdown or JSON
 ```
 
 1. CLI resolves the project and query options.
-2. Runtime asks `codestory-retrieval` for sidecar status before serving results.
-3. Retrieval status loads the stored retrieval manifest, applies stale-manifest checks, and reports the exact degraded reason before any healthy sidecar probe can bless an invalid manifest.
-4. `retrieval_mode = full` is the only product-serving search path. Missing, stale, partial, or non-product sidecar state fails closed with the degraded reason.
-5. Runtime executes the mandatory sidecar query in AST-first order: exact symbol/AST lookup, lexical source and virtual-doc search, graph expansion, then dense-anchor augmentation. It resolves returned candidates back into indexed symbols and rejects unresolved or non-full candidate sets before returning product hits.
+2. Runtime asks `codestory-retrieval` for retrieval status before serving results.
+3. Retrieval status loads the stored retrieval manifest, applies stale-manifest checks, and reports the exact degraded reason before any healthy retrieval probe can bless an invalid manifest.
+4. `retrieval_mode = full` is the only product-serving search path. Missing, stale, partial, or non-product retrieval state fails closed with the degraded reason.
+5. Runtime executes the mandatory retrieval query in AST-first order: exact symbol/AST lookup, lexical source and virtual-doc search, graph expansion, then dense-anchor augmentation. It resolves returned candidates back into indexed symbols and rejects unresolved or non-full candidate sets before returning product hits.
 6. Hybrid semantic state, repo-text matches, and local lexical search are diagnostic/navigation surfaces only; they are not a product fallback for `search`.
 7. For broad architecture-style queries, runtime may assemble a Search Plan with extracted/dropped terms, bounded subqueries, candidate windows, anchor groups, bridge evidence, next commands, and source-truth checks.
-8. Runtime maps retrieval state plus resolved sidecar matches into contract DTOs and CLI renders them.
+8. Runtime maps retrieval state plus resolved retrieval matches into contract DTOs and CLI renders them.
 
 When `search --why` is requested, the CLI renders compact explanations from the
-same DTO surface: sidecar origin, degraded/fail-closed state, candidate
+same DTO surface: retrieval origin, degraded/fail-closed state, candidate
 provenance (`exact`, `lexical_source`, `symbol_doc`, `graph_neighbor`,
 `component_report`, `dense_anchor`),
 resolution details, and the Search Plan when the broad-query planner emitted
@@ -59,11 +59,11 @@ non-serving paths.
 sequenceDiagram
     participant CLI as codestory-cli
     participant Runtime as codestory-runtime
-    participant Retrieval as mandatory sidecar retrieval
+    participant Retrieval as mandatory retrieval retrieval
     participant Graph as runtime graph builders
 
     CLI->>Runtime: concrete target request
-    Runtime->>Retrieval: Investigate sidecar-primary retrieval
+    Runtime->>Retrieval: Investigate retrieval-primary retrieval
     Runtime->>Graph: neighborhood, trail, snippets, citations
     Runtime-->>CLI: context packet with trace and evidence
     CLI->>CLI: render markdown/json and optional bundle
@@ -74,14 +74,14 @@ to one concrete target. Query target selection may use read-only indexed-symbol
 resolution to choose that target; it is not broad packet/search discovery.
 The context packet still delegates to `runtime.browser.ask` with the
 `Investigate` retrieval profile and the selected `focus_node_id`. Runtime then
-builds the deep evidence packet from sidecar-primary retrieval, graph
-neighborhoods, trails, snippets, and citations. If sidecar primary is
+builds the deep evidence packet from retrieval-primary retrieval, graph
+neighborhoods, trails, snippets, and citations. If retrieval primary is
 unavailable, rejected, disabled, or non-`full`, the Investigate path can fail
 closed rather than serving a DB-only answer packet. It is not a
 question-answering command and does not interpret broad natural-language
 prompts. Use `symbol`, `trail`, `snippet`, or `explore` for cache-only local
-navigation when sidecars are degraded; use `packet` or `search` for broad
-sidecar-backed discovery.
+navigation when retrievals are degraded; use `packet` or `search` for broad
+retrieval-backed discovery.
 
 ## Ground, Symbol, Trail, and Snippet Commands
 

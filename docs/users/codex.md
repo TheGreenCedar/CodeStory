@@ -28,7 +28,7 @@ Apple Silicon uses managed Metal acceleration automatically. Intel Macs keep
 local navigation available. If broad search cannot use a supported local or
 trusted external backend, the requested tool returns `unavailable` and the
 agent continues with focused source inspection. Backend, process, and model
-details live in the [maintainer operations guide](../ops/retrieval-sidecars.md),
+details live in the [maintainer operations guide](../ops/retrieval-engine.md),
 not the normal user flow.
 
 The plugin downloads the matching signed and notarized CLI. Contributors who
@@ -167,18 +167,18 @@ More pairs, anti-patterns, and language-flavored examples:
 | Status shows `runtime_update.state=available` | Current compatible surfaces keep working; reload when convenient if `restart_recommended=true` |
 | Status shows `repair_setup` | The active runtime could not start or prove compatibility; follow `recommended_next_calls` |
 | Windows terminal refresh says `Access is denied` | Quit stale Codex windows running the old plugin, then refresh from `/plugins` or rerun `codex.cmd plugin add codestory@TheGreenCedar` |
-| Broad search is preparing | Retry the same `packet`, `search`, or `context` call after its reported delay. CodeStory prepares the managed runtime automatically. See [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
-| A CodeStory call times out | Retry the same tool once. Read status only if it still does not converge; do not kill managed processes. Reload only for host transport/registration failure, plugin replacement, or a runtime update whose status says `restart_recommended=true` |
+| Broad search is preparing | Retry the same `packet`, `search`, or `context` call after its reported delay. CodeStory initializes retrieval automatically. See [Troubleshooting](troubleshooting.md#packetsearch-degraded-or-blocked) |
+| A CodeStory call times out | Retry the same tool once. Read status only if it still does not converge. Reload only for host transport/registration failure, plugin replacement, or a runtime update whose status says `restart_recommended=true` |
 
 ### Managed platform matrix
 
 | Host | Managed CLI | Managed broad search |
 | --- | --- | --- |
 | Windows x64 | Yes | Native Vulkan |
-| Windows arm64 | Yes | Managed CPU or a trusted external endpoint |
-| Linux x64 / arm64 | Yes | Managed native Vulkan or CPU according to the packaged backend |
-| macOS arm64 (macOS 15+) | Yes | Managed native Metal |
-| macOS x64 (macOS 15+) | Yes | Managed CPU or a trusted external endpoint; never claims Metal |
+| Windows arm64 | Yes | Vulkan when hardware proof exists; explicit CPU is diagnostic/CI only |
+| Linux x64 / arm64 | Yes | Vulkan with real hardware evidence; explicit CPU is diagnostic/CI only |
+| macOS arm64 (macOS 15+) | Yes | Native Metal |
+| macOS x64 (macOS 15+) | Yes | Explicit CPU diagnostic/CI path; never claims Metal |
 
 Linux CUDA, HIP/ROCm, SYCL, and OpenVINO remain contract-only until packaging,
 launch, and live GPU evidence exist. A compatible version difference is
@@ -187,7 +187,7 @@ replacement and host reload.
 
 CodeStory verifies process identity, publication freshness, and acceleration
 before returning broad-search evidence. Those implementation diagnostics live
-in the [retrieval operations guide](../ops/retrieval-sidecars.md); normal users
+in the [retrieval operations guide](../ops/retrieval-engine.md); normal users
 only need the tool state and retry guidance.
 
 Optional Git dirty-marker hooks (local graph freshness after checkout/merge):

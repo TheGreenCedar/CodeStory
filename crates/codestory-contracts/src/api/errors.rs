@@ -56,7 +56,7 @@ impl ApiErrorDetails {
     pub fn retrieval_unavailable(project: impl Into<String>, next_commands: Vec<String>) -> Self {
         let minimum_next = next_commands.iter().take(1).cloned().collect::<Vec<_>>();
         Self {
-            failed_layer: Some("retrieval_sidecar".to_string()),
+            failed_layer: Some("retrieval_engine".to_string()),
             project: Some(project.into()),
             minimum_next,
             full_repair: next_commands.clone(),
@@ -131,12 +131,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retrieval_unavailable_error_serializes_repair_details() {
+    fn retrieval_unavailable_error_serializes_recovery_details() {
         let error = ApiError::retrieval_unavailable(
-            "sidecar retrieval primary is unavailable or degraded",
+            "retrieval is unavailable or degraded",
             "C:/repo/example",
             vec![
-                "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
+                "codestory-cli retrieval index --profile agent --refresh auto --project \"C:/repo/example\" --format json"
                     .to_string(),
                 "codestory-cli retrieval status --project \"C:/repo/example\" --format json"
                     .to_string(),
@@ -147,15 +147,15 @@ mod tests {
         let value = serde_json::to_value(error).expect("serialize api error");
 
         assert_eq!(value["code"], "retrieval_unavailable");
-        assert_eq!(value["details"]["failed_layer"], "retrieval_sidecar");
+        assert_eq!(value["details"]["failed_layer"], "retrieval_engine");
         assert_eq!(value["details"]["project"], "C:/repo/example");
         assert_eq!(
             value["details"]["next_commands"][0],
-            "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
+            "codestory-cli retrieval index --profile agent --refresh auto --project \"C:/repo/example\" --format json"
         );
         assert_eq!(
             value["details"]["minimum_next"][0],
-            "codestory-cli ready --goal agent --repair --project \"C:/repo/example\" --format json"
+            "codestory-cli retrieval index --profile agent --refresh auto --project \"C:/repo/example\" --format json"
         );
         assert_eq!(
             value["details"]["full_repair"][1],

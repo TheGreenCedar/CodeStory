@@ -1,257 +1,114 @@
-# Managed Retrieval Design
+# Retrieval Design
 
-CodeStory packet/search evidence is sidecar-primary. A product response may be
-served only when the current project has a manifest-backed sidecar generation
-with `retrieval_mode=full`.
+CodeStory serves agent packet/search evidence only from a current, complete
+publication. The graph database, lexical shard, semantic vectors, SCIP data,
+and embedding producer identity are one fail-closed contract.
 
-`full` means all of the following are true for the same generation:
+## Runtime shape
 
-- The project-local SQLite FTS lexical shard exists, matches the current lexical input hash, and
-  answers smoke queries against source files plus generated graph-native symbol
-  docs and component-report virtual docs.
-- The immutable embedded SQLite vector generation exists, has the exact
-  manifest dense-anchor projection count, and matches the product-compatible
-  BGE-base embedding contract when the active semantic policy selects dense
-  anchors. If the policy selects zero dense anchors, no vector index is
-  required.
-- SCIP graph artifacts exist and are not stub markers.
-- The SQLite `retrieval_index_manifest` has the current schema version and
-  canonical `lexical_version`, sidecar input hash, sidecar generation, semantic
-  generation key, embedding backend, embedding dimension, symbol-doc count,
-  dense-anchor count, semantic policy version, graph artifact hash, and dense
-  reason counts.
+The release contains one CodeStory executable. A small internal sys crate links
+llama.cpp and ggml into it, and the checksum-pinned BGE-base-en-v1.5 Q8 GGUF is
+embedded as release data. When mmap is required, the process atomically
+materializes those bytes to a content-addressed file below the CodeStory cache.
+The file is disposable and verified before use. Retrieval never downloads a
+model or helper executable.
 
-Everything else is diagnostic only. `no_scip`, `no_semantic`, `lexical_only`,
-`unavailable`, stale manifests, stub markers, disabled sidecars, hash vectors,
-removed ONNX configuration, old env aliases, and `CODESTORY_RETRIEVAL=0` fail
-closed for agent-facing packet/search.
+One lazily initialized model and accelerator context is shared process-wide by
+every repository opened through multi-project stdio. One-shot CLI commands pay
+their own initialization cost; CodeStory does not use a daemon to conceal it.
 
-Schema 21 renames the former lexical producer column in place, preserving every
-manifest row while removing the legacy column from both fresh and upgraded
-databases. Current code reads and writes only `lexical_version`.
-
-## Ownership
-
-| Area | Owner | Supporting areas |
-|------|-------|------------------|
-| Sidecar clients, health, index generation, query execution | `codestory-retrieval` | `codestory-cli` |
-| Manifest persistence and migrations | `codestory-store` | `codestory-contracts` |
-| Packet/search routing and fail-closed behavior | `codestory-runtime` | `codestory-contracts` |
-| CLI setup, status, index, query commands | `codestory-cli` | `codestory-retrieval` |
-| Benchmarks and promotion gates | `scripts/` | docs |
-
-## Mode Matrix
-
-| SQLite lexical | Semantic vectors | SCIP | Dense anchors | Mode | Product behavior |
-|-------|--------|------|---------------|------|------------------|
-| up | up | up | >0 | `full` | Serve packet/search evidence |
-| up | skipped by policy | up | 0 | `full` | Serve graph/lexical packet/search evidence; dense stage is explicitly skipped |
-| up | up | down | any | `no_scip` | Fail closed |
-| up | down | up | >0 | `no_semantic` | Fail closed |
-| up | down | down | >0 | `lexical_only` | Fail closed |
-| down | * | * | any | `unavailable` | Fail closed |
-
-Runtime rules:
-
-- Only `full` can serve primary packet/search results.
-- Non-`full` modes must expose `retrieval_mode` and `degraded_reason`.
-- Guard checks may warn or block promotion, but never switch product behavior to
-  an older retrieval path.
-- Repo-text, hash, stub, and old local search surfaces may be used only as
-  explicitly labeled diagnostics.
-- Each opened project owns one immutable `SidecarRuntimeConfig`. Retrieval
-  indexing, query embedding, readiness/status, runtime search, and summary
-  generation consume that retained value. Managed embedding endpoints are
-  derived from the selected profile/run ports; external endpoints retain their
-  trusted origin. Persisted state records that origin plus an install-keyed
-  HMAC-SHA256 fingerprint of the full endpoint while exposing only the redacted
-  endpoint. The key remains private in the trusted cache. Request handlers never
-  activate endpoints by mutating process environment variables.
-
-## Generation And Reuse
-
-Sidecar generation is content-addressed by `artifact_scope_id` and sidecar input
-hash. Identity is intentionally split: logical `project_id` is repository-wide,
-`workspace_id` owns local processes and state, and `artifact_scope_id` uses the
-logical repository only when portable reuse is eligible. Dirty workspaces fall
-back to `workspace_id`; `canonical_root_hash` is only a local broker snapshot
-locator. Sidecar state, Agent namespaces, generation roots, and
-retention all use project identity schema 3.
-
-Repository identity schema 2 lowercases only the remote host, normalizes an
-omitted port to that scheme's effective default, and preserves the transport
-scheme, repository path case, and meaningful ports. SCP spellings normalize to
-SSH while preserving absolute versus home-relative paths; unqualified local
-remotes fail closed. HTTPS, SSH, Git, and unknown schemes remain distinct.
-Project identity schema 3 hashes canonical workspace paths from native OS
-bytes/code units rather than a lossy UTF-8 rendering. Existing paths are
-compared by filesystem file identity; only missing paths use platform lexical
-rules. On Windows that fallback normalizes separators and dot segments and uses
-ordinal Unicode ignore-case;
-because the target does not exist, it cannot observe a future directory's
-case-sensitivity flag. A schema-1 repository id is never inferred from the
-current remote spelling alone; migration requires persisted provenance.
-
-The schema-2/schema-3 contract is exposed through
-`inspect_repository_identity_v2` and `project_identity_v3`. Legacy
-project-identity-v2 sidecar state is discovered for inventory and
-provenance-aware operator cleanup, but never reused, attached to GPU proof, or
-destructively cleaned through a schema-3 runtime. Unknown, missing, mismatched,
-or ambiguous identity state rebuilds in the schema-3 scope. A retained runtime
-also aborts if re-observation changes its workspace or artifact scope.
-
-The hash includes local lexical input, graph-native `symbol_search_doc` rows,
-dense-anchor rows, semantic file-role metadata, sidecar schema version, lexical
-version pin, embedding backend, configured profile/model/pooling/normalization
-contract, embedding dimension, vector engine, semantic policy version, dense
-reason counts, and SCIP artifact contract inputs. Endpoint ports are deliberately excluded:
-they route the retained runtime but do not identify the model or its vectors.
-
-`retrieval index --refresh auto` should reuse an unchanged healthy generation.
-If inputs match but health is not `full`, CodeStory rebuilds the unhealthy
-component and persists the manifest only after the full stack is healthy.
-Generation fingerprint reads use one SQLite snapshot. Promotion hashes source
-files before taking the database lock, then takes an immediate SQLite write
-transaction to hash stored symbol/semantic inputs and update the current
-manifest together. Graph or semantic input drift during a build therefore
-leaves the previous current manifest untouched without holding the write lock
-during workspace discovery.
-
-The publication path has one mandatory validation gate immediately before its
-short input/pointer transaction. The candidate manifest must bind the expected
-SQLite lexical shard, SCIP revision and graph artifacts, embedded vector
-generation with an exact point count, llama.cpp runtime identity and dimension,
-and the configured model/profile contract. Native managed launches must also
-expose a matching model path and launch fingerprint. Accelerator-required
-policy reruns a bounded embedding
-request at promotion and binds its timing and current runtime log to the exact
-requested provider and device; explicit CPU policy needs a CPU policy
-observation. External accelerator endpoints cannot borrow local runtime logs.
-Device inventory and manual assertions are diagnostic, not promotion proof. A
-failed component check or crash before pointer replacement leaves current and
-rollback unchanged.
-
-Generation cleanup is a reachability pass. Every canonical generation named by
-a readable current manifest or active/rollback retention marker in the shared
-cache scope is a root. GC obtains the exclusive publication/retention locks and
-may delete only generation artifacts outside that root set. Inventory uses a shared
-view when available; if a writer owns the lock, it does not wait or infer that
-new artifacts are garbage, and instead reports all unrooted bytes as building.
-Status exposes active, rollback, building, and reclaimable bytes separately.
-
-## AST-First Semantic Contract
-
-Code structure is graph-native first. Runtime writes a deterministic
-`symbol_search_doc` for every durable AST symbol. These docs contain symbol name,
-kind, file, signature, comments, aliases, related symbols, edge digest, hash,
-policy version, extracted provenance, and file/node provenance. They are indexed
-lexically and used for candidate generation and graph expansion; they are not
-embedded by default.
-
-Dense vectors are reserved for `graph_first_v1` anchors. Allowed reasons are
-`public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`,
-`component_report`, and `unstructured_doc`. Rejected private trivial helpers,
-generated/vendor code, test-only helpers, and local implementation details must
-still be discoverable through symbol docs, source lexical search, exact symbol
-lookup, and graph expansion. There is no anonymous foreground cap: every dense
-or skipped symbol must be explainable through policy counters.
-
-Component reports are deterministic extracted graph artifacts. They group symbols
-by crate/module/directory ownership and summarize central "god node" symbols
-using import/call/reference shape. Reports are virtual docs in the lexical shard
-and may be dense anchors with reason `component_report`.
-
-## Evidence Rules
-
-- Exact symbol and path evidence remains the precision floor.
-- Candidate generation order is exact symbol/AST lookup, lexical source and
-  virtual-doc search, graph expansion, then dense-anchor augmentation.
-- Dense search must never be the only recall path for code symbols.
-- Served search evidence should expose provenance labels such as `exact`,
-  `lexical_source`, `symbol_doc`, `graph_neighbor`, `component_report`, and
-  `dense_anchor`.
-- Broad prompt retrieval should let lexical/source evidence compete with
-  semantic evidence and should downrank tests, generated files, benchmarks, and
-  vendor paths unless the query explicitly asks for those roles.
-- Broad packet/search results must preserve provenance and mark weak evidence.
-- Search plans and repo-text diagnostics are discovery aids, not final proof.
-- Promotion metrics must come from one coherent fresh artifact run.
-- `retrieval_mode=full` is necessary infrastructure readiness. It is not enough
-  to promote answer quality or language quality without packet-runtime or drill
-  evidence at the matching proof tier.
-
-Packet claims expose `proof_status` and `required_evidence_role`.
-`proof_status` is `proven`, `likely`, `diagnostic`, or `unsupported`.
-`required_evidence_role` reuses the packet evidence tier taxonomy below; dense
-semantic hits and generated summaries stay diagnostic unless another
-proof-bearing citation backs the claim. Packet citations may expose optional
-JSON fields: `evidence_tier`, `evidence_producer`, `resolution_status`,
-`coverage_role`, and `eligible_for_sufficiency`. Sufficiency is role-bearing:
-a citation can help prove a packet claim only when the evidence tier,
-resolved/source-range status, and coverage role match the claim being covered.
-
-| Evidence tier | Proof role | Sufficiency rule |
+| Platform | Production backend | Policy |
 | --- | --- | --- |
-| `exact_source` | Source line/range that directly covers the claim role. | Proof-bearing when source-range or resolved metadata is role-aligned. |
-| `resolved_graph` | Typed graph symbol, edge, route, receiver, or dependency evidence. | Proof-bearing when resolved and aligned to the required role. |
-| `lexical_source` | Lexical source hit from the manifest generation. | Proof-bearing only when the source range and role identify the needed behavior or shape. |
-| `symbol_doc` | Generated graph-native symbol document. | Proof-bearing when it points back to resolved symbol/source provenance for the required role. |
-| `component_report` | Deterministic graph component artifact. | Proof-bearing for ownership or component-shape claims when backed by graph/source provenance. |
-| `dense_semantic` | Dense-anchor recall signal. | Diagnostic unless another proof-bearing citation covers the role. |
-| `generated_summary` | Generated explanation or summary. | Diagnostic only. |
-| `synthetic_source_scan` | Generic source scan, repo-text, or synthetic probe. | Diagnostic unless runtime policy admits a specific structural/source-shape role. |
+| macOS Apple Silicon | Metal | Required and live-verified |
+| Windows | Vulkan | Required and live-verified |
+| Linux | Vulkan | Claimed only with protected hardware evidence |
+| Hosted CI / maintainer diagnostic | CPU | Only with `CODESTORY_EMBED_ALLOW_CPU=1` |
 
-Generic `source evidence` is not proof by itself. Proof-bearing roles need
-resolved or role-aligned source, graph, lexical, symbol-doc, or component
-evidence. Dense semantic hits, generated summaries, repo-text, and generic
-synthetic source scans can explain where to look, but they must not carry
-sufficiency unless a runtime policy explicitly admits their structural/source
-shape for that role.
+There is no silent GPU-to-CPU fallback. Software adapters such as llvmpipe,
+lavapipe, WARP, and SwiftShader are rejected for accelerated policy.
 
-## Cost Envelope
+## Embedding contract
 
-| Tier | Example repos | Cold index budget | Sidecar disk budget | Query process budget |
-|------|---------------|-------------------|---------------------|----------------------|
-| S | `codestory`, `axios` | 8 min | 4 GB | 1.5 GB |
-| M | `ripgrep`, `rootandruntime`, `axios` | 15 min | 8 GB | 3 GB |
-| L | `redis`, `sourcetrail`, `vscode` | 45 min | 25 GB | 6 GB |
-| XL | `vscode` monolith | 60 min | 35 GB | 8 GB |
+The product contract remains BGE-base-en-v1.5 Q8 GGUF with the pinned tokenizer,
+query and document prefixes, CLS pooling, normalization, dimensions, batching,
+and vector persistence format. These values participate in the producer and
+manifest identity. A change requires a new identity and rebuild.
 
-Promotion is blocked for a tier if cold index exceeds budget by more than 20%
-without a documented exception.
+Maintainer health evidence includes:
 
-## Promotion Guards
+- exact model SHA-256 and linked ggml build identity;
+- backend and physical adapter identity;
+- `accelerated` or `cpu_explicit` policy;
+- timed live embedding smoke and initialization time;
+- process engine instance and model load count;
+- materialized model path/reuse state;
+- model and offloaded layer counts plus live accelerator verification.
 
-Guard warnings block promotion when consecutive full local-real runs show:
+Normal plugin UX reduces that detail to whether retrieval is ready.
 
-| Trigger | Threshold |
-|---------|-----------|
-| p95 packet wall regression | >25% versus current accepted sidecar baseline |
-| retrieval p99 regression | >50% versus current accepted sidecar baseline |
-| quality pass drop | at least one repo worse than prior promotion |
-| sufficient-quality mismatch | any increase |
-| degraded mode rate | >5% of runs |
-| VS Code claim recall | <50% while packet says sufficient |
+## Publication identity
 
-The file currently named `retrieval-rollback.json` stores these guard
-thresholds. It is not a runtime rollback mechanism.
+Each published retrieval generation binds:
 
-## Generalization
+- core graph `generation_id` and `run_id`;
+- lexical version and source/input fingerprint;
+- semantic generation and Qdrant collection;
+- graph artifact hash, symbol-document count, and dense-anchor count;
+- embedding producer identity and schema/policy versions.
 
-Local-real tuning repos are declared in `benchmarks/tasks/local-real/`. Holdout
-repos should be fetched into ignored target directories and must not influence
-ranker/planner tuning. Dogfood results on `codestory` are fast regression
-evidence, not generalization proof.
+Readers pin the core SQLite snapshot and semantic-generation lease together.
+Candidate resolution never reopens the current database halfway through a
+query. Before returning packet/search output, runtime revalidates both identities
+and returns `cache_busy` for one bounded retry when publication changed.
 
-Promotion requires at least:
+Writers stage and validate a complete candidate, rescan source inside the
+publication fence, then publish atomically. Failure or drift leaves the prior
+generation live. Old semantic generations with the former producer identity
+are rebuilt once; there is no legacy execution branch.
 
-- fresh coherent six-lane artifacts,
-- served packet/search rows reporting `retrieval_mode=full`,
-- local-real quality that beats the prior accepted baseline,
-- no diagnostic/stub/hash product evidence,
-- docs and runbooks aligned with the current mandatory sidecar contract.
+## Query path
 
-Proof tiers, promotion checklist, and north-star SLOs:
-[`retrieval-architecture.md`](../testing/retrieval-architecture.md). Setup,
-version pins, agent readiness repair, env vars, and CI smoke:
-[`retrieval-sidecars.md`](../ops/retrieval-sidecars.md#agent-readiness-repair).
+1. Validate cheap immutable generation/schema metadata.
+2. Pin one complete retrieval publication.
+3. Generate the query vector with the shared in-process engine.
+4. Combine lexical, semantic, SCIP, and graph candidates under runtime policy.
+5. Resolve evidence through the pinned core snapshot.
+6. Revalidate publication and engine identity before returning.
+
+Deep corpus validation runs at build, promotion, readiness, or explicit health
+boundaries, never before every query.
+
+## Readiness
+
+`retrieval_mode=full` remains the agent-facing classification. Full mode
+requires a current manifest, coherent graph/lexical/semantic identities, and a
+live engine satisfying its explicit policy. Missing, stale, partial, ambiguous,
+or mismatched evidence blocks packet/search while local graph navigation can
+remain available.
+
+Status and doctor are observational. A product tool call may initialize the
+embedded engine and build missing retrieval state automatically; it never asks
+the user to approve an internal subsystem.
+
+## Ownership and cleanup
+
+Retrieval artifacts live below the project cache and are removed only through
+the shared owned-deletion boundary using a trusted root handle and relative
+generation path. Cleanup never follows a previously validated pathname and
+never removes resources outside a proved CodeStory ownership token.
+
+There are no embedding endpoints, ports, leases, PIDs, repair workers, server
+logs, or process shutdown records in this architecture.
+
+## Performance gate
+
+Changes to the engine compare incumbent and candidate inside the same release
+build on the same machine. Measure cold initialization, warm queries, bulk
+indexing, RSS, GPU memory, vector parity, quality, and multi-repository reuse
+separately. The accepted historical reference is roughly 368-372 embedded
+documents/sec, 84.7 ms cross-repository search p95, MRR@10 0.9824, Hit@10 1.0,
+Hit@1 0.973, and 829-1,020 MB peak working set. Five percent is measurement
+noise, not an allowed repeatable regression.
+
+See [retrieval engine operations](../ops/retrieval-engine.md) and the
+[testing architecture](../testing/retrieval-architecture.md).

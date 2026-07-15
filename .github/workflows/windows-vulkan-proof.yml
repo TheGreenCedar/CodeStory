@@ -1,0 +1,117 @@
+name: Windows Vulkan proof
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+      proof_key:
+        required: false
+        default: ""
+        type: string
+      use_packaged_cli_artifact:
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        required: false
+        type: string
+      proof_key:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-vulkan-proof-${{ inputs.proof_key || inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packaged-vulkan:
+    name: Packaged Windows Vulkan engine
+    runs-on: [self-hosted, Windows, X64, codestory-vulkan]
+    environment: windows-vulkan-proof
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Capture host evidence
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/windows-vulkan-proof | Out-Null
+          Get-ComputerInfo | Out-File target/windows-vulkan-proof/host.txt
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, AdapterCompatibility, DriverVersion, VideoMemoryType |
+            Format-List | Out-File -Append target/windows-vulkan-proof/host.txt
+
+      - name: Install pinned Rust
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup default 1.95.0
+
+      - name: Prepare checksum-pinned embedded model
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        run: node scripts/prepare-embedded-model.mjs
+
+      - name: Build and package native CLI
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $version = $env:VERSION.TrimStart('v')
+          cargo build --release --locked -p codestory-cli
+          python .github/scripts/package-codestory-release.py `
+            --version $version `
+            --target windows-x64 `
+            --binary target/release/codestory-cli.exe `
+            --out-dir target/release-dist
+
+      - name: Download packaged CLI artifact
+        if: inputs.use_packaged_cli_artifact
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: codestory-cli-windows-x64
+          path: target/release-dist
+
+      - name: Prove offline Vulkan and multi-repository reuse
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          CODESTORY_EMBED_ALLOW_CPU: "0"
+        run: |
+          $version = $env:VERSION.TrimStart('v')
+          python .github/scripts/check-packaged-agent-proof.py `
+            --archive "target/release-dist/codestory-cli-v$version-windows-x64.zip" `
+            --checksum-file "target/release-dist/codestory-cli-v$version-windows-x64.zip.sha256" `
+            --expected-version $version `
+            --project "${{ github.workspace }}" `
+            --plugin-root plugins/codestory `
+            --plugin-handoff `
+            --engine-policy accelerated `
+            --expected-backend Vulkan `
+            --offline `
+            --timeout-secs 1800 `
+            --out-dir target/windows-vulkan-proof/packaged-agent
+
+      - name: Upload Vulkan proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-x64-vulkan-proof-${{ inputs.version }}
+          path: target/windows-vulkan-proof
+          if-no-files-found: error

@@ -9,7 +9,7 @@ Trust boundaries: [Trust and readiness](trust-and-readiness.md). Terms:
 **Need JSON field names?** Normal tools report their capability state and a
 retry delay when preparation is still running. Full agent contract:
 [status-contract](../../plugins/codestory/skills/codestory-grounding/references/status-contract.md).
-CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#readiness-and-repair).
+CLI commands are maintainer/debug transcripts: [CLI reference](cli-reference.md#readiness-and-retrieval).
 
 ## Quick reference
 
@@ -38,8 +38,8 @@ flowchart TD
 | Symptom | Codex | Cursor | Claude Code | Copilot |
 | --- | --- | --- | --- | --- |
 | MCP missing | Fresh thread after `/plugins` install | Check `.cursor/mcp.json`; reload MCP server | MCP configured separately from hooks | MCP not auto-started; configure or use CLI |
-| Stale index / wrong symbols | Retry `ground`; CodeStory refreshes automatically | Retry `ground` | Retry `ground` | Run [local repair](cli-reference.md#readiness-and-repair) |
-| Broad search preparing | Retry the same tool after its delay | Same | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-repair) only as a debug transcript |
+| Stale index / wrong symbols | Retry `ground`; CodeStory refreshes automatically | Retry `ground` | Retry `ground` | Run a [local refresh](cli-reference.md#readiness-and-retrieval) |
+| Broad search preparing | Retry the same tool after its delay | Same | Same | Use CLI [retrieval status](cli-reference.md#readiness-and-retrieval) only as a debug transcript |
 | Version drift after update | Refresh marketplace, refresh plugin package, restart host, fresh status read | Reload MCP server | Restart session | Reinstall or point to current binary |
 
 Host-specific steps: [Codex](codex.md#troubleshooting), [Cursor](cursor.md#troubleshooting), [Claude Code](claude-code.md#troubleshooting), [Copilot](copilot.md).
@@ -114,7 +114,7 @@ tool. CodeStory refreshes the repository map as part of the call.
 **You (CLI debug transcript):**
 
 ```sh
-codestory-cli fix --project <repo> --format json
+codestory-cli index --project <repo> --refresh auto --format json
 codestory-cli doctor --project <repo>
 ```
 
@@ -141,33 +141,32 @@ without exposing internal processes or services. Do not treat an unavailable
 or partial result as proof. See [Trust and readiness](trust-and-readiness.md#proof-vs-hint).
 
 **Maintainer:** Runtime lifecycle details are kept in
-[retrieval operations](../ops/retrieval-sidecars.md).
+[retrieval operations](../ops/retrieval-engine.md).
 
 CLI check:
 
 ```sh
 codestory-cli retrieval status --project <repo> --format json
-codestory-cli fix --project <repo> --format json
+codestory-cli retrieval index --project <repo> --refresh full --format json
 ```
 
 Require `retrieval_mode: "full"` before trusting packet/search evidence.
-Command table: [CLI reference - readiness and repair](cli-reference.md#readiness-and-repair).
+Command table: [CLI reference - readiness and retrieval](cli-reference.md#readiness-and-retrieval).
 
 ### macOS broad search
 
-Apple Silicon uses managed Metal acceleration automatically. Retry the original
+Apple Silicon uses Metal acceleration automatically. Retry the original
 broad-search tool while CodeStory reports `preparing`; local navigation remains
-available in the meantime. The first broad search can take longer while
-CodeStory prepares its local search support once for the Mac; later repositories
-reuse it automatically.
+available in the meantime. The first broad search can take longer while the
+process initializes its embedded model; later repositories reuse that engine.
 
-Intel Macs use the managed native CPU path automatically. Broad search should
-move through `preparing` to ready without user configuration and must report
-CPU operation rather than Metal. A `needs_environment` result
-means automatic preparation failed; relay only the plain host requirement.
+Intel Macs require the explicit CPU policy for maintainer/CI use. Production
+does not silently change from acceleration to CPU. A `needs_environment` result
+means the host has no supported accelerated path; relay only that plain host
+requirement.
 
 Maintainer-only acceleration evidence and recovery commands are in
-[retrieval operations](../ops/retrieval-sidecars.md).
+[retrieval operations](../ops/retrieval-engine.md).
 
 ## MCP visibility failure
 
@@ -227,4 +226,4 @@ active runtime through `codestory://status`, not only `codex.cmd plugin list`.
 - [Trust and readiness](trust-and-readiness.md) -- when to trust output
 - [CLI reference - command by situation](cli-reference.md#command-by-situation) for command-by-situation table
 - [Contributor debugging](../contributors/debugging.md) for crate-level investigation
-- [Managed search operations](../ops/retrieval-sidecars.md) for maintainer-only backend diagnostics
+- [Retrieval engine operations](../ops/retrieval-engine.md) for maintainer-only backend diagnostics

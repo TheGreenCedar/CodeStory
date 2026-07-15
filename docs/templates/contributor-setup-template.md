@@ -63,7 +63,7 @@ below. Do not nest triple-backtick fences.
 
     ## Choose The Verification Lane First
 
-    Before running Cargo or setting up sidecars, answer two questions:
+    Before running Cargo or setting up retrievals, answer two questions:
 
     1. Which crate owns the behavior?
     2. What is the smallest proof that covers the change?

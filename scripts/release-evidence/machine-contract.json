@@ -56,15 +56,18 @@
       "containerd.io": "2.2.4-1~ubuntu.24.04~noble",
       "curl": "8.5.0-2ubuntu10.11",
       "git": "1:2.43.0-1ubuntu7.3",
+      "glslc": "2023.8-1build1",
       "jq": "1.7.1-3ubuntu0.24.04.2",
       "libclang-dev": "1:18.0-59~exp2",
       "libsqlite3-dev": "3.45.1-1ubuntu2.6",
       "libssl-dev": "3.0.13-0ubuntu3.11",
+      "libvulkan-dev": "1.3.275.0-1build1",
       "lsof": "4.95.0-1build3",
       "pkg-config": "1.8.1-2build1",
       "procps": "2:4.0.4-4ubuntu3.2",
       "python3": "3.12.3-0ubuntu2.1",
       "python3-venv": "3.12.3-0ubuntu2.1",
+      "spirv-headers": "1.6.1+1.4.309.0-1~ubuntu0.24.04.2",
       "tar": "1.35+dfsg-3ubuntu0.2",
       "unzip": "6.0-28ubuntu4.1",
       "xz-utils": "5.6.1+really5.4.5-1ubuntu0.3",
@@ -81,12 +84,6 @@
     "rust": {
       "version": "1.97.0",
       "rustup_init_sha256": "9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792"
-    }
-  },
-  "assets": {
-    "model": {
-      "name": "bge-base-en-v1.5.Q8_0.gguf",
-      "sha256": "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c"
     }
   },
   "drill": {

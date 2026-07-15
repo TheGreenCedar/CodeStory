@@ -4220,8 +4220,8 @@ mod tests {
             sufficiency
                 .follow_up_commands
                 .first()
-                .is_some_and(|command| command.contains("ready --goal agent --repair")),
-            "blocked full retrieval should lead with canonical sidecar repair: {sufficiency:?}"
+                .is_some_and(|command| command.contains("retrieval index")),
+            "blocked full retrieval should lead with retrieval activation: {sufficiency:?}"
         );
         assert!(
             sufficiency
@@ -4263,8 +4263,8 @@ mod tests {
             sufficiency
                 .follow_up_commands
                 .first()
-                .is_some_and(|command| command.contains("ready --goal agent --repair")),
-            "missing retrieval shadow should lead with canonical sidecar repair: {sufficiency:?}"
+                .is_some_and(|command| command.contains("retrieval index")),
+            "missing retrieval metadata should lead with retrieval activation: {sufficiency:?}"
         );
         assert!(
             sufficiency.follow_up_commands.iter().all(|command| {
@@ -4298,8 +4298,8 @@ mod tests {
             sufficiency
                 .follow_up_commands
                 .iter()
-                .any(|command| command.contains("ready --goal agent --repair")),
-            "blocked insufficient packet should recommend canonical sidecar repair: {sufficiency:?}"
+                .any(|command| command.contains("retrieval index")),
+            "blocked insufficient packet should recommend retrieval activation: {sufficiency:?}"
         );
         assert!(
             sufficiency
@@ -4649,7 +4649,7 @@ fn packet_follow_up_commands(
                 missing_required_probe_queries.to_vec()
             };
             if !full_retrieval_available {
-                let mut commands = vec![packet_agent_repair_command(project.as_str())];
+                let mut commands = vec![packet_retrieval_activation_command(project.as_str())];
                 commands.extend(packet_follow_up_trail_commands(project.as_str(), &queries));
                 commands.truncate(8);
                 return commands;
@@ -4676,7 +4676,7 @@ fn packet_follow_up_commands(
                 ]
             } else {
                 vec![
-                    packet_agent_repair_command(project.as_str()),
+                    packet_retrieval_activation_command(project.as_str()),
                     format!("codestory-cli ground --project {project} --why"),
                 ]
             }
@@ -4692,8 +4692,10 @@ fn packet_full_retrieval_available(answer: &AgentAnswerDto) -> bool {
         .is_some_and(|shadow| shadow.retrieval_mode == "full")
 }
 
-fn packet_agent_repair_command(quoted_project: &str) -> String {
-    format!("codestory-cli ready --goal agent --repair --project {quoted_project} --format json")
+fn packet_retrieval_activation_command(quoted_project: &str) -> String {
+    format!(
+        "codestory-cli retrieval index --profile agent --refresh auto --project {quoted_project} --format json"
+    )
 }
 
 fn packet_follow_up_trail_commands(quoted_project: &str, queries: &[String]) -> Vec<String> {

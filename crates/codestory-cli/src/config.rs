@@ -33,20 +33,11 @@ impl CliStartupConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct CliConfig {
     pub(crate) cache_dir: Option<PathBuf>,
-    pub(crate) embedding_profile: Option<String>,
-    pub(crate) embedding_model_id: Option<String>,
-    #[serde(default)]
-    pub(crate) embedding_model: Option<String>,
-    pub(crate) embedding_endpoint: Option<String>,
-    pub(crate) embedding_query_prefix: Option<String>,
-    pub(crate) embedding_document_prefix: Option<String>,
     pub(crate) hybrid_retrieval_enabled: Option<bool>,
     pub(crate) semantic_doc_scope: Option<String>,
     pub(crate) semantic_doc_alias_mode: Option<String>,
     pub(crate) summary_endpoint: Option<String>,
     pub(crate) summary_model: Option<String>,
-    #[serde(skip)]
-    embedding_endpoint_source: Option<ConfigSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,24 +104,6 @@ fn merge_config_file(
     if file_config.cache_dir.is_some() {
         config.cache_dir = file_config.cache_dir;
     }
-    if file_config.embedding_profile.is_some() {
-        config.embedding_profile = file_config.embedding_profile;
-    }
-    if file_config.embedding_model_id.is_some() || file_config.embedding_model.is_some() {
-        config.embedding_model_id = file_config
-            .embedding_model_id
-            .or(file_config.embedding_model);
-    }
-    if file_config.embedding_endpoint.is_some() {
-        config.embedding_endpoint = file_config.embedding_endpoint;
-        config.embedding_endpoint_source = Some(source);
-    }
-    if file_config.embedding_query_prefix.is_some() {
-        config.embedding_query_prefix = file_config.embedding_query_prefix;
-    }
-    if file_config.embedding_document_prefix.is_some() {
-        config.embedding_document_prefix = file_config.embedding_document_prefix;
-    }
     if file_config.hybrid_retrieval_enabled.is_some() {
         config.hybrid_retrieval_enabled = file_config.hybrid_retrieval_enabled;
     }
@@ -168,10 +141,10 @@ fn validate_config_trust_boundary(
             "project config field `cache_dir` is not trusted; set it in the user home .codestory.toml or pass --cache-dir instead"
         );
     }
-    for field in ["summary_endpoint", "summary_model", "embedding_endpoint"] {
+    for field in ["summary_endpoint", "summary_model"] {
         if table.contains_key(field) && !project_network_config_allowed {
             anyhow::bail!(
-                "project config field `{field}` is not trusted; set CODESTORY_SUMMARY_ENDPOINT, CODESTORY_SUMMARY_MODEL, CODESTORY_EMBED_LLAMACPP_URL, or pass a trusted CLI option instead"
+                "project config field `{field}` is not trusted; set CODESTORY_SUMMARY_ENDPOINT or CODESTORY_SUMMARY_MODEL, or pass a trusted CLI option instead"
             );
         }
     }
@@ -181,19 +154,6 @@ fn validate_config_trust_boundary(
 impl CliConfig {
     pub(crate) fn runtime_overrides(&self) -> codestory_retrieval::SidecarRuntimeOverrides {
         codestory_retrieval::SidecarRuntimeOverrides {
-            embedding_profile: self.embedding_profile.clone(),
-            embedding_model_id: self.embedding_model_id.clone(),
-            embedding_endpoint: self.embedding_endpoint.clone(),
-            embedding_endpoint_origin: self.embedding_endpoint_source.map(|source| match source {
-                ConfigSource::TrustedUser => {
-                    codestory_retrieval::EmbeddingEndpointOrigin::TrustedUserConfig
-                }
-                ConfigSource::Project => {
-                    codestory_retrieval::EmbeddingEndpointOrigin::TrustedProjectConfig
-                }
-            }),
-            embedding_query_prefix: self.embedding_query_prefix.clone(),
-            embedding_document_prefix: self.embedding_document_prefix.clone(),
             hybrid_retrieval_enabled: self.hybrid_retrieval_enabled,
             semantic_doc_scope: self.semantic_doc_scope.clone(),
             semantic_doc_alias_mode: self.semantic_doc_alias_mode.clone(),
@@ -260,246 +220,6 @@ mod tests {
                 std::env::remove_var(name);
             }
         }
-    }
-
-    #[test]
-    fn config_retains_embedding_profile_and_model_without_mutating_environment() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_PROFILE",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-        clear_env(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_PROFILE",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-
-        let project = tempdir()?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"
-embedding_profile = "bge-small-en-v1.5"
-embedding_model_id = "BAAI/bge-small-en-v1.5-local"
-"#,
-        )?;
-
-        let config = load_config(project.path())?;
-
-        assert_eq!(
-            config.embedding_profile.as_deref(),
-            Some("bge-small-en-v1.5")
-        );
-        assert_eq!(
-            config.embedding_model_id.as_deref(),
-            Some("BAAI/bge-small-en-v1.5-local")
-        );
-        assert!(std::env::var("CODESTORY_EMBED_PROFILE").is_err());
-        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
-        assert!(std::env::var_os("CODESTORY_EMBEDDING_MODEL").is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn config_keeps_legacy_embedding_model_as_model_id_alias() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-        clear_env(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-
-        let project = tempdir()?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"embedding_model = "legacy/model-id""#,
-        )?;
-
-        let config = load_config(project.path())?;
-
-        assert_eq!(
-            config.embedding_model_id.as_deref(),
-            Some("legacy/model-id")
-        );
-        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
-        assert!(std::env::var_os("CODESTORY_EMBEDDING_MODEL").is_none());
-
-        Ok(())
-    }
-
-    #[test]
-    fn config_prefers_embedding_model_id_over_legacy_alias_in_same_file() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-        clear_env(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-
-        let project = tempdir()?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"
-embedding_model = "legacy/model-id"
-embedding_model_id = "current/model-id"
-"#,
-        )?;
-
-        let config = load_config(project.path())?;
-
-        assert_eq!(
-            config.embedding_model_id.as_deref(),
-            Some("current/model-id")
-        );
-        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn config_preserves_explicit_embedding_env_over_config_defaults() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_PROFILE",
-            "CODESTORY_EMBED_MODEL_ID",
-        ]);
-        clear_env(&["USERPROFILE", "HOME"]);
-        unsafe {
-            std::env::set_var("CODESTORY_EMBED_PROFILE", "explicit-profile");
-            std::env::set_var("CODESTORY_EMBED_MODEL_ID", "explicit/model-id");
-        }
-
-        let project = tempdir()?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"
-embedding_profile = "config-profile"
-embedding_model_id = "config/model-id"
-"#,
-        )?;
-
-        let config = load_config(project.path())?;
-
-        assert_eq!(config.embedding_profile.as_deref(), Some("config-profile"));
-        assert_eq!(
-            config.embedding_model_id.as_deref(),
-            Some("config/model-id")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_PROFILE").as_deref(),
-            Ok("explicit-profile")
-        );
-        assert_eq!(
-            std::env::var("CODESTORY_EMBED_MODEL_ID").as_deref(),
-            Ok("explicit/model-id")
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn config_project_file_overrides_home_file() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_PROFILE",
-            "CODESTORY_EMBED_MODEL_ID",
-        ]);
-        clear_env(&[
-            "HOME",
-            "CODESTORY_EMBED_PROFILE",
-            "CODESTORY_EMBED_MODEL_ID",
-        ]);
-
-        let home = tempdir()?;
-        let project = tempdir()?;
-        unsafe {
-            std::env::set_var("USERPROFILE", home.path());
-        }
-        std::fs::write(
-            home.path().join(".codestory.toml"),
-            r#"
-embedding_profile = "home-profile"
-embedding_model_id = "home/model-id"
-"#,
-        )?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"
-embedding_profile = "project-profile"
-embedding_model_id = "project/model-id"
-"#,
-        )?;
-
-        let config = load_config(project.path())?;
-
-        assert_eq!(config.embedding_profile.as_deref(), Some("project-profile"));
-        assert_eq!(
-            config.embedding_model_id.as_deref(),
-            Some("project/model-id")
-        );
-        assert!(std::env::var("CODESTORY_EMBED_PROFILE").is_err());
-        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
-
-        Ok(())
-    }
-
-    #[test]
-    fn config_project_legacy_embedding_model_overrides_home_model_id() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-        clear_env(&[
-            "HOME",
-            "CODESTORY_EMBED_MODEL_ID",
-            "CODESTORY_EMBEDDING_MODEL",
-        ]);
-
-        let home = tempdir()?;
-        let project = tempdir()?;
-        unsafe {
-            std::env::set_var("USERPROFILE", home.path());
-        }
-        std::fs::write(
-            home.path().join(".codestory.toml"),
-            r#"embedding_model_id = "home/current-model-id""#,
-        )?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"embedding_model = "project/legacy-model-id""#,
-        )?;
-
-        let config = load_config(project.path())?;
-
-        assert_eq!(
-            config.embedding_model_id.as_deref(),
-            Some("project/legacy-model-id")
-        );
-        assert!(std::env::var("CODESTORY_EMBED_MODEL_ID").is_err());
-        assert!(std::env::var_os("CODESTORY_EMBEDDING_MODEL").is_none());
-
-        Ok(())
     }
 
     #[test]
@@ -584,25 +304,6 @@ embedding_model_id = "project/model-id"
     }
 
     #[test]
-    fn project_config_rejects_embedding_endpoint_without_trusted_opt_in() -> Result<()> {
-        let _env = EnvRestore::capture(&["USERPROFILE", "HOME", PROJECT_NETWORK_CONFIG_OPT_IN_ENV]);
-        clear_env(&["USERPROFILE", "HOME", PROJECT_NETWORK_CONFIG_OPT_IN_ENV]);
-
-        let project = tempdir()?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings""#,
-        )?;
-
-        let err = load_config(project.path()).expect_err("project embedding endpoint should fail");
-        let message = format!("{err:#}");
-        assert!(message.contains("project config field `embedding_endpoint` is not trusted"));
-        assert!(message.contains("CODESTORY_EMBED_LLAMACPP_URL"));
-
-        Ok(())
-    }
-
-    #[test]
     fn trusted_opt_in_allows_project_summary_endpoint() -> Result<()> {
         let _env = EnvRestore::capture(&[
             "USERPROFILE",
@@ -633,49 +334,17 @@ embedding_model_id = "project/model-id"
     }
 
     #[test]
-    fn trusted_opt_in_allows_project_embedding_endpoint() -> Result<()> {
-        let _env = EnvRestore::capture(&[
-            "USERPROFILE",
-            "HOME",
-            PROJECT_NETWORK_CONFIG_OPT_IN_ENV,
-            "CODESTORY_EMBED_LLAMACPP_URL",
-        ]);
-        clear_env(&["USERPROFILE", "HOME", "CODESTORY_EMBED_LLAMACPP_URL"]);
-        unsafe {
-            std::env::set_var(PROJECT_NETWORK_CONFIG_OPT_IN_ENV, "1");
-        }
-
-        let project = tempdir()?;
-        std::fs::write(
-            project.path().join(".codestory.toml"),
-            r#"embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings""#,
-        )?;
-
-        let config = load_config(project.path())?;
-
-        assert_eq!(
-            config.embedding_endpoint.as_deref(),
-            Some("http://127.0.0.1:8080/v1/embeddings")
-        );
-        assert!(std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err());
-
-        Ok(())
-    }
-
-    #[test]
     fn home_config_can_set_cache_dir_and_network_defaults() -> Result<()> {
         let _env = EnvRestore::capture(&[
             "USERPROFILE",
             "HOME",
             "CODESTORY_SUMMARY_ENDPOINT",
             "CODESTORY_SUMMARY_MODEL",
-            "CODESTORY_EMBED_LLAMACPP_URL",
         ]);
         clear_env(&[
             "HOME",
             "CODESTORY_SUMMARY_ENDPOINT",
             "CODESTORY_SUMMARY_MODEL",
-            "CODESTORY_EMBED_LLAMACPP_URL",
         ]);
 
         let home = tempdir()?;
@@ -689,7 +358,6 @@ embedding_model_id = "project/model-id"
 cache_dir = "C:/trusted-cache"
 summary_endpoint = "https://example.invalid/v1/chat/completions"
 summary_model = "trusted/model"
-embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings"
 "#,
         )?;
 
@@ -704,13 +372,8 @@ embedding_endpoint = "http://127.0.0.1:8080/v1/embeddings"
             Some("https://example.invalid/v1/chat/completions")
         );
         assert_eq!(config.summary_model.as_deref(), Some("trusted/model"));
-        assert_eq!(
-            config.embedding_endpoint.as_deref(),
-            Some("http://127.0.0.1:8080/v1/embeddings")
-        );
         assert!(std::env::var("CODESTORY_SUMMARY_ENDPOINT").is_err());
         assert!(std::env::var("CODESTORY_SUMMARY_MODEL").is_err());
-        assert!(std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err());
 
         Ok(())
     }

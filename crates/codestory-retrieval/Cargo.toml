@@ -10,6 +10,7 @@ test-support = []
 anyhow = { workspace = true }
 chrono = { workspace = true }
 codestory-contracts = { workspace = true }
+codestory-llama-sys = { workspace = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
 directories = { workspace = true }
@@ -18,7 +19,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 rusqlite = { workspace = true }
-ring = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ureq = { workspace = true }

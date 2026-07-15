@@ -1466,36 +1466,6 @@ mod tests {
     }
 
     #[test]
-    fn inexact_queries_prefer_llamacpp_endpoint_parser_entrypoint() {
-        let endpoint_parser = hit(
-            "parser",
-            "LlamaCppEndpoint::parse",
-            NodeKind::FUNCTION,
-            0.40,
-        );
-        let url_constant = hit(
-            "url-env",
-            "LLAMACPP_EMBEDDINGS_URL_ENV",
-            NodeKind::FUNCTION,
-            0.95,
-        );
-
-        let mut hits = [url_constant, endpoint_parser.clone()];
-        hits.sort_by(|left, right| {
-            compare_search_hits(
-                "llama.cpp embeddings endpoint URL environment variable",
-                left,
-                right,
-            )
-        });
-
-        assert_eq!(
-            hits.first().map(|hit| &hit.node_id),
-            Some(&endpoint_parser.node_id)
-        );
-    }
-
-    #[test]
     fn inexact_queries_prefer_compare_resolution_hits_entrypoint() {
         let resolution_hits = hit(
             "resolution_hits",

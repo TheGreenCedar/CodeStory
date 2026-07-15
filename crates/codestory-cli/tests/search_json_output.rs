@@ -100,9 +100,7 @@ fn run_cli(workspace: &Path, args: &[&str]) -> std::process::Output {
     command.args(args);
     command.arg("--project").arg(workspace);
     command.env("CODESTORY_HYBRID_RETRIEVAL_ENABLED", "true");
-    command.env_remove("CODESTORY_EMBED_RUNTIME_MODE");
-    command.env("CODESTORY_EMBED_BACKEND", "llamacpp");
-    command.env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
+    command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     command.output().expect("run codestory-cli")
 }
 
@@ -249,18 +247,17 @@ fn search_json_fails_closed_without_full_sidecars() {
     assert_eq!(failure["schema_version"], 1);
     assert_eq!(failure["error"]["code"], "command_failed");
     assert!(
-        failure_text.contains(
-            "retrieval_unavailable: sidecar retrieval primary is unavailable or degraded"
-        ) && failure_text.contains("expected profile=agent mode=full"),
-        "search should report mandatory agent sidecar full-mode boundary: {failure:#}"
+        failure_text.contains("retrieval_unavailable: retrieval is unavailable or degraded")
+            && failure_text.contains("expected profile=agent mode=full"),
+        "search should report the mandatory full-retrieval boundary: {failure:#}"
     );
     assert!(
         failure_text.contains("Minimum next:")
-            && failure_text.contains("Full repair:")
-            && failure_text.contains("codestory-cli ready --goal agent --repair")
+            && failure_text.contains("Additional checks:")
+            && failure_text.contains("codestory-cli retrieval index")
             && failure_text.contains("codestory-cli retrieval status")
             && failure_text.contains("codestory-cli doctor"),
-        "search should include retrieval repair commands: {failure:#}"
+        "search should include retrieval activation and diagnostic commands: {failure:#}"
     );
 }
 
@@ -340,27 +337,6 @@ fn search_json_emits_sidecar_primary_results_without_repo_text_fallback() {
     let workspace = tempdir().expect("workspace dir");
     write_retrieval_fixture(workspace.path());
     let run_id = "search-json-sidecar";
-
-    let bootstrap = run_cli(
-        workspace.path(),
-        &[
-            "retrieval",
-            "bootstrap",
-            "--profile",
-            "agent",
-            "--run-id",
-            run_id,
-            "--wait-secs",
-            "30",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        bootstrap.status.success(),
-        "retrieval bootstrap failed; live full-sidecar fixture is blocked: {}",
-        String::from_utf8_lossy(&bootstrap.stderr)
-    );
 
     let index = run_cli(
         workspace.path(),
@@ -1168,27 +1144,6 @@ fn search_quality_eval_reports_recall_mrr_and_latency_for_symbols_and_routes() {
     let workspace = tempdir().expect("workspace dir");
     write_search_quality_fixture(workspace.path());
     let run_id = "search-quality-eval";
-
-    let bootstrap = run_cli(
-        workspace.path(),
-        &[
-            "retrieval",
-            "bootstrap",
-            "--profile",
-            "agent",
-            "--run-id",
-            run_id,
-            "--wait-secs",
-            "30",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        bootstrap.status.success(),
-        "retrieval bootstrap failed; search quality eval fixture is blocked: {}",
-        String::from_utf8_lossy(&bootstrap.stderr)
-    );
 
     let index = run_cli(
         workspace.path(),

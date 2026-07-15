@@ -356,7 +356,6 @@ fn load_query_context(
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<QueryContext> {
-    let embedding_device = embedding_device_readiness_for_runtime(runtime);
     let layout = runtime.layout.clone();
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
     let (manifest, file_roles, publication_identity) = if storage_path.exists() {
@@ -369,21 +368,18 @@ fn load_query_context(
             .get_retrieval_index_manifest(&project_id)
             .context("load retrieval manifest")?;
         if let Some(manifest) = manifest.as_ref() {
-            if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
-                project_root,
-                storage_path,
-                storage,
-                runtime,
-            ) {
-                bail!(
-                    "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
-                );
-            }
             if let Some(reason) =
                 manifest_unavailable_reason_for_runtime(&project_id, storage, manifest, runtime)
             {
                 bail!(
                     "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
+                );
+            }
+            if let Err(error) =
+                validate_strict_sidecar_readiness_for_runtime(project_root, storage, runtime)
+            {
+                bail!(
+                    "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
                 );
             }
         } else {
@@ -410,6 +406,7 @@ fn load_query_context(
         bail!("retrieval sidecar storage is missing; run retrieval index for project {project_id}");
     };
 
+    let embedding_device = embedding_device_readiness_for_runtime(runtime);
     Ok(QueryContext {
         layout,
         project_id,
@@ -748,8 +745,8 @@ mod tests {
                     doc_version: 4,
                     doc_hash: "extension-service-doc".to_string(),
                     embedding_profile: Some("bge-base-en-v1.5".to_string()),
-                    embedding_model: "BAAI/bge-base-en-v1.5-local|backend=onnx".to_string(),
-                    embedding_backend: Some("onnx".to_string()),
+                    embedding_model: "legacy-producer".to_string(),
+                    embedding_backend: Some("legacy".to_string()),
                     embedding_dim: 768,
                     doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".to_string()),
                     semantic_policy_version: Some(
@@ -851,7 +848,7 @@ mod tests {
         })
         .expect_err("stale manifests must fail closed");
 
-        assert!(error.to_string().contains("sidecar_manifest_stale"));
+        assert!(error.to_string().contains("retrieval_manifest_stale"));
     }
 
     #[test]
@@ -898,7 +895,11 @@ mod tests {
             cancelled: None,
         })
         .expect_err("changed indexed file must fail closed");
-        assert!(changed_error.to_string().contains("sidecar_manifest_stale"));
+        assert!(
+            changed_error
+                .to_string()
+                .contains("retrieval_manifest_stale")
+        );
 
         std::fs::remove_file(&source_path).expect("remove source");
         let removed_error = execute_retrieval_query(QueryRequest {
@@ -909,7 +910,11 @@ mod tests {
             cancelled: None,
         })
         .expect_err("removed indexed file must fail closed");
-        assert!(removed_error.to_string().contains("sidecar_manifest_stale"));
+        assert!(
+            removed_error
+                .to_string()
+                .contains("retrieval_manifest_stale")
+        );
     }
 
     #[test]
@@ -960,7 +965,7 @@ mod tests {
         })
         .expect_err("new indexable file must fail closed");
 
-        assert!(error.to_string().contains("sidecar_manifest_stale"));
+        assert!(error.to_string().contains("retrieval_manifest_stale"));
     }
 
     fn live_mtime_millis(path: &Path) -> i64 {

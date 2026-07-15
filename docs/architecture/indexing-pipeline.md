@@ -238,14 +238,17 @@ The dense-anchor policy version is `graph_first_v1`. Dense reasons are `public_a
 
 The default semantic text alias policy is `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant`. It keeps compact language, terminal-name, owner-name, and symbol-role hints, but leaves out the noisier full name-alias and path-alias lists from the earlier `current_alias` research variant. Use `no_alias` for baseline research rows and `current_alias` only when reproducing older alias-enriched runs.
 
-Embedding throughput is optimized for the local embedding path:
+Embedding throughput is optimized inside the CodeStory process:
 
 - pending dense-anchor docs are sorted by generated text length before embedding, which keeps batches close to uniform length
 - the default semantic embedding batch size is `128`, with `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` available for profiling
-- product sidecar embeddings use `CODESTORY_EMBED_BACKEND=llamacpp` and the
-  local `CODESTORY_EMBED_LLAMACPP_URL` endpoint; the manifest must record
-  `llamacpp:bge-base-en-v1.5`
-- ONNX rows are historical records only; hash embeddings remain diagnostic
+- one process-wide model and accelerator context serves every open repository
+- the checksum-pinned BGE-base Q8 model, tokenizer contract, CLS pooling, and
+  normalization are compiled into the executable
+- Metal or Vulkan is required for production; CPU is accepted only when
+  `CODESTORY_EMBED_ALLOW_CPU=1` was set explicitly
+- old producer identities are rejected and rebuilt rather than retained behind
+  compatibility branches
 
 Keep measured repo-scale timings in [codestory-e2e-stats-log.md](../testing/codestory-e2e-stats-log.md). Architecture explains the lifecycle; the testing log owns time-specific numbers because caches, backends, and workstation state drift.
 
@@ -285,7 +288,7 @@ Symbol docs are deterministic graph artifacts persisted in SQLite with generated
 
 Cold start embeds only dense anchors that have no reusable row. The cold path is
 kept under control by using graph-native symbol docs for code recall, the
-`graph_first_v1` dense policy, length-bucketed batches, full sidecar readiness,
+`graph_first_v1` dense policy, length-bucketed batches, full retrieval readiness,
 and stored vector quantization.
 
 ### What timing output means

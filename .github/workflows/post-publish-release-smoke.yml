@@ -167,25 +167,25 @@ jobs:
           --expected-version "${{ steps.release.outputs.version }}"
           --project "${{ github.workspace }}"
           --plugin-root plugins/codestory
-          --managed-plugin-handoff
+          --plugin-handoff
           --out-dir target/post-publish-managed-proof
 
-      - name: Prove published Intel macOS backend policy and explicit CPU/external operation
+      - name: Prove published Intel macOS explicit CPU policy
         if: matrix.asset_target == 'macos-x64'
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
         run: >-
           python3 .github/scripts/check-packaged-agent-proof.py
           --archive "${{ steps.asset.outputs.archive }}"
           --checksum-file "${{ steps.asset.outputs.checksum }}"
           --expected-version "${{ steps.release.outputs.version }}"
           --project "${{ github.workspace }}"
-          --intel-runtime-policy
+          --engine-policy cpu_explicit
+          --expected-backend CPU
+          --offline
           --out-dir target/post-publish-intel-policy-proof
 
-      - name: Fetch retrieval embedding model
-        if: matrix.asset_target == 'linux-x64'
-        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
-
-      - name: Prove published Linux full-sidecar agent runtime
+      - name: Prove published Linux in-process agent runtime
         if: matrix.asset_target == 'linux-x64'
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
@@ -196,6 +196,10 @@ jobs:
           --expected-version "${{ steps.release.outputs.version }}"
           --project "${{ github.workspace }}"
           --plugin-root plugins/codestory
+          --plugin-handoff
+          --engine-policy cpu_explicit
+          --expected-backend CPU
+          --offline
           --out-dir target/post-publish-agent-proof
 
       - name: Upload post-publish proof artifacts

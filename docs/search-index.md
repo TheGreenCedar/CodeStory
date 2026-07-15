@@ -67,7 +67,7 @@ Keyword index for CodeStory documentation. For routing by job, start at
 - **codestory-stdio-warm-loop-stats.md**: Stdin/stdout warm loop statistics
 
 #### docs/ops/
-- **retrieval-sidecars.md**: Retrieval sidecars operations
+- **retrieval-engine.md**: In-process retrieval engine operations
 
 #### Other
 - **glossary.md**: Terminology across operator, architecture, and verification docs

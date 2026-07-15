@@ -78,7 +78,7 @@ test("parses packet-runtime benchmark run id", () => {
         "local-real",
         "--no-prepare-codestory-cache",
       ]),
-    /sidecar preparation is mandatory/,
+    /retrieval preparation is mandatory/,
   );
   assert.throws(
     () =>
@@ -109,7 +109,7 @@ test("packet-runtime cache observations preserve prepared cache provenance", () 
 
     assert.equal(observations.cache_prepared, true);
     assert.equal(observations.cache_preparation, cachePreparation[0]);
-    assert.equal(cachePolicyForRun(observations), "prepared-sidecar-cache-read-only");
+    assert.equal(cachePolicyForRun(observations), "prepared-retrieval-cache-read-only");
   }
 });
 
@@ -287,7 +287,7 @@ test("categorizes commands without treating source paths as cli invocations", ()
   assert.equal(commandCategory("cargo test -p codestory-cli --test runtime_backed_flows"), "build_test");
 });
 
-test("packet gate retries only transient sidecar packet failures", async () => {
+test("packet gate retries only transient retrieval packet failures", async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-gate-retry-"));
   try {
     const retryable = {
@@ -436,18 +436,8 @@ test("packet command keeps manifest-derived extra probes diagnostic-only", () =>
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
-  assert.deepEqual(args.slice(args.indexOf("--profile"), args.indexOf("--profile") + 2), [
-    "--profile",
-    "local",
-  ]);
-  const agentArgs = packetCommandArgs({ path: "C:\\repo" }, task, {
-    packetSidecarProfile: "agent",
-    packetSidecarRunId: "packet-runtime-test",
-  });
-  assert.deepEqual(
-    agentArgs.slice(agentArgs.indexOf("--profile"), agentArgs.indexOf("--profile") + 4),
-    ["--profile", "agent", "--run-id", "packet-runtime-test"],
-  );
+  assert.equal(args.includes("--profile"), false);
+  assert.equal(args.includes("--run-id"), false);
 
   const diagnosticArgs = packetCommandArgs(
     { path: "C:\\repo" },
@@ -1702,13 +1692,15 @@ function localCacheProvenance(overrides = {}) {
   return {
     doctor_status: "pass",
     storage_path: "C:/Users/alber/AppData/Local/codestory/cache/codestory.db",
-    cache_policy: "prepared-sidecar-cache-read-only",
+    cache_policy: "prepared-retrieval-cache-read-only",
     retrieval_mode: "full",
-    sidecar_generation: "proj-current",
-    manifest_embedding_backend: "llamacpp:bge-base-en-v1.5",
-    semantic_backend: "llamacpp",
+    semantic_generation: "proj-current",
+    manifest_embedding_backend: "inprocess:bge-base-en-v1.5:q8_0:sha256-deadbeef",
+    semantic_backend: "inprocess",
+    embedding_engine_instance_id: "engine-1",
+    embedding_policy: "accelerated",
     local_only: true,
-    locality_kind: "loopback_endpoint",
+    locality_kind: "in_process",
     indexed: true,
     freshness_status: "fresh",
     semantic_ready: true,

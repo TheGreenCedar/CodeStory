@@ -5,19 +5,19 @@
   "commit": "2222222222222222222222222222222222222222",
   "profile": "ci-contract-v1",
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
-  "baseline_sha256": "e7488c0625620ebeaf669fab3b9d4150a29b60d08398a3c6a005b2ee4c152642",
+  "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "0bae343abdfbf71c9957e234e4df0406d01682a12b18e26ab0d4d7e8fedef126",
+  "candidate_sha256": "9a069488c94abeeeb1594a82f30aefc4fcf86aa0df293b85f88dc5f221aacfab",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
-      "sha256": "f65c55078260a4ee6a6e1c0c73346317aeb972c8fe10c0c9580cab7c963da30a",
-      "bytes": 1106
+      "sha256": "921d7d9c31040b0e437f0971474ca6cb994c5efd38c0f3ace29548d8678e6e8e",
+      "bytes": 1088
     },
     {
       "path": "candidate-packet.json",
-      "sha256": "a541c576391fec8949a470c6de2920b8c9387fbdfcaad82cd42700dedae5956e",
-      "bytes": 4986
+      "sha256": "89997a923b41e668ccdafc3a4e43d64be4d13c13f2ab8281a283c6b9e89e5d44",
+      "bytes": 5330
     }
   ],
   "metrics": [
@@ -29,7 +29,7 @@
       "reference": 1,
       "threshold": 1.25,
       "unit": "seconds",
-      "aggregation": "full-sidecar command wall time",
+      "aggregation": "full-retrieval command wall time",
       "source": "baseline-raw.json"
     },
     {
@@ -40,7 +40,7 @@
       "reference": 1,
       "threshold": 1.25,
       "unit": "seconds",
-      "aggregation": "full-sidecar command wall time",
+      "aggregation": "full-retrieval command wall time",
       "source": "baseline-raw.json"
     },
     {
@@ -73,7 +73,7 @@
       "reference": 1,
       "threshold": 1.25,
       "unit": "seconds",
-      "aggregation": "full-sidecar command wall time",
+      "aggregation": "full-retrieval command wall time",
       "source": "baseline-raw.json"
     },
     {

@@ -57,9 +57,9 @@ function parseArgs(argv) {
     } else if (arg === "--output-dir") {
       opts.outputDir = requireValue(argv, ++index, arg);
     } else if (arg === "--from-existing") {
-      throw new Error("--from-existing is unsupported; provide fresh coherent mandatory-sidecar artifact paths");
+      throw new Error("--from-existing is unsupported; provide fresh coherent mandatory-retrieval artifact paths");
     } else if (arg === "--allow-mixed-run-inputs") {
-      throw new Error("--allow-mixed-run-inputs is unsupported; mandatory-sidecar scoring requires one coherent artifact run");
+      throw new Error("--allow-mixed-run-inputs is unsupported; mandatory-retrieval scoring requires one coherent artifact run");
     } else if (arg === "--help" || arg === "-h") {
       opts.help = true;
     } else {
@@ -155,7 +155,7 @@ function computeAgentValueScore(inputPaths, opts = {}) {
   const symbolSummary = inputPaths.symbolSummary ? readJson(inputPaths.symbolSummary) : null;
   const packetSummary = inputPaths.packetSummary ? readJson(inputPaths.packetSummary) : null;
   const abRatios = inputPaths.abDoc ? parseAgentAbRatios(fs.readFileSync(inputPaths.abDoc, "utf8")) : [];
-  const sidecarDiagnostics = aggregateSidecarDiagnostics([
+  const retrievalDiagnostics = aggregateRetrievalDiagnostics([
     ...promptSummaryEntries.map((entry) => ({ path: entry.path, summary: entry.summary })),
     ...(inputPaths.symbolSummary && symbolSummary
       ? [{ path: inputPaths.symbolSummary, summary: symbolSummary }]
@@ -274,36 +274,36 @@ function computeAgentValueScore(inputPaths, opts = {}) {
       live_ab_overhead_ratio_mean: round(abOverheadRatioMean, 9),
       live_ab_savings_score: round(abSavingsScore, 9),
       live_ab_ratio_count: abRatios.length,
-      sidecar_expected_files_present_missing_from_search_count:
-        sidecarDiagnostics.expected_files_present_missing_from_search_count,
-      sidecar_expected_symbols_present_missing_from_search_count:
-        sidecarDiagnostics.expected_symbols_present_missing_from_search_count,
-      sidecar_query_trace_with_candidates_count:
-        sidecarDiagnostics.query_trace_with_candidates_count,
-      sidecar_query_trace_no_candidates_count:
-        sidecarDiagnostics.query_trace_no_candidates_count,
-      sidecar_prepare_count: sidecarDiagnostics.sidecar_prepare_count,
-      sidecar_prepare_failed_count: sidecarDiagnostics.sidecar_prepare_failed_count,
-      sidecar_prepare_max_latency_ms: sidecarDiagnostics.sidecar_prepare_max_latency_ms,
-      sidecar_candidate_count: sidecarDiagnostics.candidate_count,
-      sidecar_resolved_hit_count: sidecarDiagnostics.resolved_hit_count,
-      sidecar_unresolved_candidate_count:
-        sidecarDiagnostics.unresolved_candidate_count,
-      sidecar_candidate_resolution_rate:
-        sidecarDiagnostics.candidate_count > 0
-          ? round(sidecarDiagnostics.resolved_hit_count / sidecarDiagnostics.candidate_count, 9)
+      retrieval_expected_files_present_missing_from_search_count:
+        retrievalDiagnostics.expected_files_present_missing_from_search_count,
+      retrieval_expected_symbols_present_missing_from_search_count:
+        retrievalDiagnostics.expected_symbols_present_missing_from_search_count,
+      retrieval_query_trace_with_candidates_count:
+        retrievalDiagnostics.query_trace_with_candidates_count,
+      retrieval_query_trace_no_candidates_count:
+        retrievalDiagnostics.query_trace_no_candidates_count,
+      retrieval_prepare_count: retrievalDiagnostics.retrieval_prepare_count,
+      retrieval_prepare_failed_count: retrievalDiagnostics.retrieval_prepare_failed_count,
+      retrieval_prepare_max_latency_ms: retrievalDiagnostics.retrieval_prepare_max_latency_ms,
+      retrieval_candidate_count: retrievalDiagnostics.candidate_count,
+      retrieval_resolved_hit_count: retrievalDiagnostics.resolved_hit_count,
+      retrieval_unresolved_candidate_count:
+        retrievalDiagnostics.unresolved_candidate_count,
+      retrieval_candidate_resolution_rate:
+        retrievalDiagnostics.candidate_count > 0
+          ? round(retrievalDiagnostics.resolved_hit_count / retrievalDiagnostics.candidate_count, 9)
           : null,
     },
     packet_quality_deltas: packetQualityDeltas,
     triage,
     contributors: {
       ...contributors,
-      sidecar_diagnostics: sidecarDiagnostics,
+      retrieval_diagnostics: retrievalDiagnostics,
     },
   };
 }
 
-function aggregateSidecarDiagnostics(summaryEntries) {
+function aggregateRetrievalDiagnostics(summaryEntries) {
   const seen = new Set();
   const aggregate = {
     summary_count: 0,
@@ -311,9 +311,9 @@ function aggregateSidecarDiagnostics(summaryEntries) {
     expected_symbols_present_missing_from_search_count: 0,
     query_trace_with_candidates_count: 0,
     query_trace_no_candidates_count: 0,
-    sidecar_prepare_count: 0,
-    sidecar_prepare_failed_count: 0,
-    sidecar_prepare_max_latency_ms: 0,
+    retrieval_prepare_count: 0,
+    retrieval_prepare_failed_count: 0,
+    retrieval_prepare_max_latency_ms: 0,
     candidate_count: 0,
     resolved_hit_count: 0,
     unresolved_candidate_count: 0,
@@ -329,35 +329,35 @@ function aggregateSidecarDiagnostics(summaryEntries) {
     const summary = payload?.summary ?? {};
     aggregate.summary_count += 1;
     aggregate.expected_files_present_missing_from_search_count += numericCount(
-      summary.sidecar_expected_files_present_missing_from_search_count,
+      summary.retrieval_expected_files_present_missing_from_search_count,
     );
     aggregate.expected_symbols_present_missing_from_search_count += numericCount(
-      summary.sidecar_expected_symbols_present_missing_from_search_count,
+      summary.retrieval_expected_symbols_present_missing_from_search_count,
     );
     aggregate.query_trace_with_candidates_count += numericCount(
-      summary.sidecar_query_trace_with_candidates_count,
+      summary.retrieval_query_trace_with_candidates_count,
     );
     aggregate.query_trace_no_candidates_count += numericCount(
-      summary.sidecar_query_trace_no_candidates_count,
+      summary.retrieval_query_trace_no_candidates_count,
     );
-    aggregate.sidecar_prepare_count += numericCount(summary.sidecar_prepare_count);
-    aggregate.sidecar_prepare_failed_count += numericCount(summary.sidecar_prepare_failed_count);
-    aggregate.sidecar_prepare_max_latency_ms = Math.max(
-      aggregate.sidecar_prepare_max_latency_ms,
-      finiteNumber(summary.sidecar_prepare_max_latency_ms) || 0,
+    aggregate.retrieval_prepare_count += numericCount(summary.retrieval_prepare_count);
+    aggregate.retrieval_prepare_failed_count += numericCount(summary.retrieval_prepare_failed_count);
+    aggregate.retrieval_prepare_max_latency_ms = Math.max(
+      aggregate.retrieval_prepare_max_latency_ms,
+      finiteNumber(summary.retrieval_prepare_max_latency_ms) || 0,
     );
 
     const summaryHasShadowCounts =
-      Number.isFinite(Number(summary.sidecar_shadow_candidate_count)) ||
-      Number.isFinite(Number(summary.sidecar_shadow_resolved_hit_count)) ||
-      Number.isFinite(Number(summary.sidecar_shadow_unresolved_candidate_count));
+      Number.isFinite(Number(summary.retrieval_shadow_candidate_count)) ||
+      Number.isFinite(Number(summary.retrieval_shadow_resolved_hit_count)) ||
+      Number.isFinite(Number(summary.retrieval_shadow_unresolved_candidate_count));
     if (summaryHasShadowCounts) {
-      aggregate.candidate_count += numericCount(summary.sidecar_shadow_candidate_count);
-      aggregate.resolved_hit_count += numericCount(summary.sidecar_shadow_resolved_hit_count);
+      aggregate.candidate_count += numericCount(summary.retrieval_shadow_candidate_count);
+      aggregate.resolved_hit_count += numericCount(summary.retrieval_shadow_resolved_hit_count);
       aggregate.unresolved_candidate_count += numericCount(
-        summary.sidecar_shadow_unresolved_candidate_count,
+        summary.retrieval_shadow_unresolved_candidate_count,
       );
-      mergeResolutionCounts(resolutionCounts, summary.sidecar_shadow_resolution_counts);
+      mergeResolutionCounts(resolutionCounts, summary.retrieval_shadow_resolution_counts);
     } else {
       aggregateShadowRows(aggregate, resolutionCounts, payload?.rows ?? []);
     }
@@ -869,8 +869,8 @@ function renderMarkdown(summary) {
     (row) =>
       `- ${row.repo ?? "unknown"} / ${row.task_id ?? "unknown"} / ${row.mode ?? "unknown"}: lane \`${row.recommended_next_lane ?? "n/a"}\`, quality \`${row.packet_quality_score ?? "n/a"}\`, latency \`${row.packet_latency_score ?? "n/a"}\`, top step \`${row.top_latency_step ?? "n/a"}\` \`${row.median_top_step_ms ?? "n/a"}ms\``,
   );
-  const sidecarDiagnostics = summary.contributors?.sidecar_diagnostics ?? {};
-  const sidecarResolutionLines = (sidecarDiagnostics.resolution_counts ?? []).map(
+  const retrievalDiagnostics = summary.contributors?.retrieval_diagnostics ?? {};
+  const retrievalResolutionLines = (retrievalDiagnostics.resolution_counts ?? []).map(
     (entry) => `- ${entry.resolution}: \`${entry.count}\``,
   );
   const deltaLines = (summary.packet_quality_deltas?.tasks ?? [])
@@ -909,18 +909,18 @@ function renderMarkdown(summary) {
     "",
     ...(packetContributorLines.length ? packetContributorLines : ["- n/a"]),
     "",
-    "## Sidecar Diagnostics",
+    "## Retrieval Diagnostics",
     "",
-    `- summaries: \`${sidecarDiagnostics.summary_count ?? 0}\``,
-    `- expected files present in sidecars but missing from search: \`${sidecarDiagnostics.expected_files_present_missing_from_search_count ?? 0}\``,
-    `- expected symbols present in sidecars but missing from search: \`${sidecarDiagnostics.expected_symbols_present_missing_from_search_count ?? 0}\``,
-    `- sidecar prepare rows: \`${sidecarDiagnostics.sidecar_prepare_count ?? 0}\``,
-    `- sidecar prepare failures: \`${sidecarDiagnostics.sidecar_prepare_failed_count ?? 0}\``,
-    `- sidecar prepare max latency ms: \`${sidecarDiagnostics.sidecar_prepare_max_latency_ms ?? 0}\``,
-    `- sidecar candidates: \`${sidecarDiagnostics.candidate_count ?? 0}\``,
-    `- resolved hits: \`${sidecarDiagnostics.resolved_hit_count ?? 0}\``,
-    `- unresolved candidates: \`${sidecarDiagnostics.unresolved_candidate_count ?? 0}\``,
-    ...(sidecarResolutionLines.length ? sidecarResolutionLines : ["- resolution counts: `n/a`"]),
+    `- summaries: \`${retrievalDiagnostics.summary_count ?? 0}\``,
+    `- expected files present in retrievals but missing from search: \`${retrievalDiagnostics.expected_files_present_missing_from_search_count ?? 0}\``,
+    `- expected symbols present in retrievals but missing from search: \`${retrievalDiagnostics.expected_symbols_present_missing_from_search_count ?? 0}\``,
+    `- retrieval prepare rows: \`${retrievalDiagnostics.retrieval_prepare_count ?? 0}\``,
+    `- retrieval prepare failures: \`${retrievalDiagnostics.retrieval_prepare_failed_count ?? 0}\``,
+    `- retrieval prepare max latency ms: \`${retrievalDiagnostics.retrieval_prepare_max_latency_ms ?? 0}\``,
+    `- retrieval candidates: \`${retrievalDiagnostics.candidate_count ?? 0}\``,
+    `- resolved hits: \`${retrievalDiagnostics.resolved_hit_count ?? 0}\``,
+    `- unresolved candidates: \`${retrievalDiagnostics.unresolved_candidate_count ?? 0}\``,
+    ...(retrievalResolutionLines.length ? retrievalResolutionLines : ["- resolution counts: `n/a`"]),
     "",
     "## Packet Quality Deltas",
     "",

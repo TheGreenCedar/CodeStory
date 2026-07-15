@@ -28,7 +28,7 @@ Before proposing an optimization, record:
 | --- | --- |
 | Command | Exact command line, including `--project`, `--refresh`, `--format`, and relevant environment variables. |
 | Commit | Current commit or working-tree label. If the tree is dirty, say so. |
-| Cache state | Cold cache, warm cache, incremental refresh, full sidecar, lexical-only diagnostic, hash semantic diagnostic, or external embedding backend. |
+| Cache state | Cold cache, warm cache, incremental refresh, full retrieval, or lexical-only diagnostic. |
 | Sample size | Number of runs and whether the first run was discarded. |
 | Headline metric | Index seconds, graph phase seconds, semantic phase seconds, per-command seconds, p95/max latency, or benchmark score. |
 | Dominant cost | Measured cost center: graph phase, semantic phase, store reads/writes, repo-text scan, source reads, graph traversal, search scoring, CLI rendering, lock contention, or memory pressure. |
@@ -45,10 +45,9 @@ before drawing conclusions:
 | Semantic embedding | Embedding backend wall time, batch/request shape, and request concurrency setting. |
 | Semantic persistence | Semantic-doc upsert, reload, prune, reuse, pending, embedded, and stale counts. |
 
-For llama.cpp, the default request count remains serial. Compare explicit
-`CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT=<n>` values or the opt-in
-`CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT=auto` path only after the baseline
-shows embedding backend saturation rather than graph/store contention.
+The in-process batching contract is fixed for product comparisons. Profile
+batch internals only after the baseline shows engine saturation rather than
+graph/store contention, and do not promote a runtime tuning switch.
 
 Do not collapse these into one "index got faster/slower" claim unless the
 repo-scale e2e row shows the same project, cache state, semantic backend, and
@@ -60,12 +59,8 @@ Prefer existing gates before adding a new harness:
 cargo build --release --locked -p codestory-cli
 cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture
 cargo test --locked -p codestory-cli --test search_json_output -- --ignored --nocapture search_quality_eval
-cargo test --locked -p codestory-runtime --test retrieval_eval
 cargo check --locked -p codestory-bench --bench <name>
 ```
-
-`retrieval_eval` needs `CODESTORY_RETRIEVAL_EVAL_FULL_TESTS=1` for full sidecar quality assertions;
-without it, the suite checks that non-full retrieval fails closed.
 
 Bench targets opt out of broad workspace test selection, so compile or run them
 with an explicit `--bench <name>` target.
@@ -81,9 +76,9 @@ regression risk, but it is not answer-quality proof.
 | Gate | Current metric or threshold | Command that proves it | Source |
 | --- | --- | --- | --- |
 | Repeat refresh | Promoted stats require `repeat_semantic_docs_embedded == 0` and record wall-clock telemetry with living-baseline warnings. Release evidence separately requires repeat graph `< 20s`, repeat semantic reuse `< 3s`, and full-refresh convergence within the approved machine-profile budget. | Run `cargo build --release --locked -p codestory-cli`, then `cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture` for correctness and telemetry; use `scripts/codestory-release-evidence-gate.mjs` for hardware-bound timing proof. | `crates/codestory-cli/tests/codestory_repo_e2e_stats.rs`, `scripts/codestory-release-evidence-gate.mjs`, `benchmarks/release-evidence/repo-stats-contract.json`, `benchmarks/release-evidence/approved-baselines.json` |
-| Retrieval status | After sidecar indexing, `retrieval_mode == "full"` and `retrieval status --format json` reports current manifest provenance: source root, input hash, generation, schema, graph hash, symbol-doc count, dense-anchor count, degraded modes, and lane provenance. Non-`full` status is diagnostic only. | `codestory-cli retrieval bootstrap --project <repo> --format json`; `codestory-cli retrieval index --project <repo> --refresh full --format json`; `codestory-cli retrieval status --project <repo> --format json` | `docs/ops/retrieval-sidecars.md`, `crates/codestory-retrieval/src/sidecar.rs`, `crates/codestory-runtime/src/agent/retrieval_primary.rs` |
-| Packet runtime | Product sidecar query budget defaults to `1,500ms`; packet batch budget defaults to `18,000ms` and is capped at `120,000ms`; packet runs must report `packet_latency.sla_missed == false` for product evidence. North-star targets are retrieval p50 `<= 250ms`, p90 `<= 600ms`, p99 `<= 1,000ms`, and worst-case packet wall `<= 1,500ms`, but those targets become promotion proof only inside a quality-gated benchmark run. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite local-real --repeats 1 --codestory-cli target/release/codestory-cli --timeout-ms 300000` | `crates/codestory-runtime/src/agent/retrieval_primary.rs`, `crates/codestory-retrieval/src/planner.rs`, `scripts/codestory-agent-ab-benchmark.mjs`, `docs/testing/retrieval-architecture.md` |
-| Benchmark promotion | `--publishable` requires at least 3 repeats, sidecar-primary retrieval, no diagnostic extra probes, no failed rows, token usage, clean preludes, manifest quality gates when present, packet-first compliance, sufficient packets with no unresolved diagnostics, and the explicit `--max-source-reads-after-packet` budget. Holdout/local task quality thresholds live in the task manifests; stats-log timing rows do not promote answer quality. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --packet-runtime-mode cold-cli --task-suite holdout-retrieval --materialize-repos --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli target/release/codestory-cli --timeout-ms 180000` | `scripts/codestory-agent-ab-benchmark.mjs`, `scripts/codestory-benchmark-contract.mjs`, `benchmarks/tasks/`, `docs/testing/retrieval-architecture.md` |
+| Retrieval status | After retrieval indexing, `retrieval_mode == "full"` and `retrieval status --format json` reports current manifest provenance: source root, input hash, generation, schema, graph hash, symbol-doc count, dense-anchor count, degraded modes, and engine identity. Non-`full` status is diagnostic only. | `codestory-cli retrieval index --project <repo> --refresh full --format json`; `codestory-cli retrieval status --project <repo> --format json` | `docs/ops/retrieval-engine.md`, `crates/codestory-retrieval/src/sidecar.rs`, `crates/codestory-runtime/src/agent/retrieval_primary.rs` |
+| Packet runtime | Product retrieval query budget defaults to `1,500ms`; packet batch budget defaults to `18,000ms` and is capped at `120,000ms`; packet runs must report `packet_latency.sla_missed == false` for product evidence. North-star targets are retrieval p50 `<= 250ms`, p90 `<= 600ms`, p99 `<= 1,000ms`, and worst-case packet wall `<= 1,500ms`, but those targets become promotion proof only inside a quality-gated benchmark run. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite local-real --repeats 1 --codestory-cli target/release/codestory-cli --timeout-ms 300000` | `crates/codestory-runtime/src/agent/retrieval_primary.rs`, `crates/codestory-retrieval/src/planner.rs`, `scripts/codestory-agent-ab-benchmark.mjs`, `docs/testing/retrieval-architecture.md` |
+| Benchmark promotion | `--publishable` requires at least 3 repeats, full retrieval, no diagnostic extra probes, no failed rows, token usage, clean preludes, manifest quality gates when present, packet-first compliance, sufficient packets with no unresolved diagnostics, and the explicit `--max-source-reads-after-packet` budget. Holdout/local task quality thresholds live in the task manifests; stats-log timing rows do not promote answer quality. | `node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --packet-runtime-mode cold-cli --task-suite holdout-retrieval --materialize-repos --repeats 3 --publishable --max-source-reads-after-packet 0 --codestory-cli target/release/codestory-cli --timeout-ms 180000` | `scripts/codestory-agent-ab-benchmark.mjs`, `scripts/codestory-benchmark-contract.mjs`, `benchmarks/tasks/`, `docs/testing/retrieval-architecture.md` |
 
 Current telemetry snapshot from `docs/testing/codestory-e2e-stats-log.md`
 (2026-06-18 `d8d59e9e+wt`, #41 hardening row): `retrieval_mode full`,
@@ -149,7 +144,7 @@ list and independently checks every embedded row for pass/quality/sufficiency,
 full retrieval shadow, SLA, the benchmark's shared pinned-repository and
 local-cache provenance validators, and distinct exact `1..N` repeats matching
 the top-level modes/repeat contract. It also
-rechecks the raw stats object's `full_sidecar` tier, index/ground/search modes,
+rechecks the raw stats object's `full_retrieval` tier, index/ground/search modes,
 manifest counts/hash/policy, zero index errors, and zero repeat embeddings.
 The promoted Rust stats run treats wall-clock variation as telemetry and emits
 living-baseline warnings while retaining those correctness assertions. The
@@ -194,9 +189,9 @@ require review.
 | Product launch and setup | Plugin manifests, hooks, MCP launcher, grounding skill guidance/setup scripts, Codex environment/worktree setup, and the Windows installer | Protected; the configured directories are scanned recursively, while test and fixture directories are excluded. |
 | Runtime configuration | Native retrieval backend and model metadata | Protected; new supported text/config files under those directories enter the scan automatically. |
 | Release control | Release/auto-release workflows, version detection/checking, package assembly, the release-evidence evaluator, and shared provenance validation | Protected; required files must exist, and protected non-Rust modules cannot import an explicitly classified corpus/proof harness module. |
-| Explicit corpus and test harnesses | Task manifests, packet/repo benchmark drivers and scorers, holdout provisioning, release-candidate measurement, the retrieval-sidecar contract workflow, the release-detector unit test, and test fixtures | Allowed to load evaluation corpora or exercise protected code; these paths are evidence producers/tests, not product or release-decision logic. Other scripts and workflows remain protected by default. |
-| Environment and generated inputs | Environment values, downloaded manifests/models, generated evidence, and workflow artifacts | Static code paths are protected where listed above. Runtime values and generated bytes require the existing schema, hash, identity, and provenance checks. |
-| External processes | Git, managed embedding servers, and agent executables | Static command construction is protected where it is part of a listed surface. The external executable's internal behavior is outside this repository scan. |
+| Explicit corpus and test harnesses | Task manifests, packet/repo benchmark drivers and scorers, holdout provisioning, release-candidate measurement, the retrieval-engine contract workflow, the release-detector unit test, and test fixtures | Allowed to load evaluation corpora or exercise protected code; these paths are evidence producers/tests, not product or release-decision logic. Other scripts and workflows remain protected by default. |
+| Environment and generated inputs | Environment values, generated evidence, and workflow artifacts | Static code paths are protected where listed above. Runtime values and generated bytes require the existing schema, hash, identity, and provenance checks. |
+| External processes | Git and agent executables | Static command construction is protected where it is part of a listed surface. The external executable's internal behavior is outside this repository scan. |
 
 The release evaluator now imports repository/cache provenance checks from
 `scripts/codestory-evidence-provenance.mjs`, a corpus-neutral module shared with
@@ -208,9 +203,9 @@ values, generated content, or external-process behavior. Those boundaries stay
 fail closed through the release-evidence attestation/runtime checks where a
 machine-verifiable contract exists; otherwise they remain explicit non-claims.
 
-Do not promote importable or rebuildable graph/sidecar artifacts in this slice.
+Do not promote importable or rebuildable graph/retrieval artifacts in this slice.
 A follow-up PR for that idea must require provenance before reuse: source root,
-commit or dirty-tree label, CodeStory CLI version, sidecar schema, sidecar input
+commit or dirty-tree label, CodeStory CLI version, retrieval schema, retrieval input
 hash, graph artifact hash, semantic policy version, embedding backend/dim,
 symbol-doc count, dense-anchor count, dense reason counts, lane artifact paths,
 the exact rebuild command, and a fresh `retrieval status --format json` proof

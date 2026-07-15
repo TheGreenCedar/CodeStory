@@ -73,7 +73,7 @@ impl AppController {
         }
         Err(sidecar_retrieval_unavailable_error(
             self,
-            "sidecar retrieval primary is mandatory for packet lexical batch",
+            "full retrieval is mandatory for packet lexical batch",
         ))
     }
 
@@ -138,7 +138,7 @@ impl AppController {
         }
         Err(sidecar_retrieval_unavailable_error(
             self,
-            "sidecar retrieval primary is mandatory for packet semantic batch",
+            "full retrieval is mandatory for packet semantic batch",
         ))
     }
 
@@ -156,7 +156,7 @@ impl AppController {
         }
         Err(sidecar_retrieval_unavailable_error(
             self,
-            "sidecar retrieval primary is mandatory for packet subquery warmup",
+            "full retrieval is mandatory for packet subquery warmup",
         ))
     }
 }
@@ -205,15 +205,13 @@ mod tests {
             .expect_err("packet warmup must not fall back to the legacy in-process search engine");
 
         assert!(
-            error
-                .message
-                .contains("sidecar retrieval primary requires an open project"),
-            "warmup should report the mandatory sidecar gate, got: {}",
+            error.message.contains("retrieval requires an open project"),
+            "warmup should report the mandatory retrieval gate, got: {}",
             error.message
         );
         assert_eq!(error.code, "retrieval_unavailable");
         let details = error.details.expect("retrieval error details");
-        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_sidecar"));
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_engine"));
         assert!(
             !details.next_commands.is_empty(),
             "warmup should include recovery commands"

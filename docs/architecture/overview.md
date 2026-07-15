@@ -1,7 +1,7 @@
 # Architecture Overview
 
 Seven workspace crates plus `codestory-bench` form a local evidence stack: files
-and symbols in SQLite, optional sidecar indexes for packet/search, thin CLI on
+and symbols in SQLite, optional retrieval indexes for packet/search, thin CLI on
 top of `codestory-runtime`.
 
 The runtime path is:
@@ -11,7 +11,7 @@ flowchart LR
     Repo["repository"] --> Workspace["discover files and refresh plan"]
     Workspace --> Indexer["parse and extract graph"]
     Indexer --> Store["persist SQLite graph and read models"]
-    Store --> Retrieval["build and validate sidecar retrieval artifacts"]
+    Store --> Retrieval["build and validate retrieval retrieval artifacts"]
     Store --> Runtime["assemble search, grounding, trails, and context"]
     Retrieval --> Runtime
     Runtime --> CLI["render CLI, HTTP, and stdio reads"]
@@ -25,7 +25,7 @@ User-visible guarantees come from those boundaries:
 - Full refreshes can publish a staged store; incremental refreshes update the
   live store and refresh derived views.
 - Search, packet, and context output should be traceable back to files,
-  symbols, sidecar readiness, or explicit gaps.
+  symbols, retrieval readiness, or explicit gaps.
 
 ## Layers
 
@@ -80,7 +80,7 @@ Important rules:
 
 - `workspace` does not depend on the store or runtime.
 - `indexer` depends on `store`, not the reverse.
-- `retrieval` depends on `store` and owns sidecar artifacts; runtime and CLI call it instead of reimplementing sidecar rules.
+- `retrieval` depends on `store` and owns retrieval artifacts; runtime and CLI call it instead of reimplementing retrieval rules.
 - `runtime` is the only orchestration layer.
 - `cli` does not import indexing or storage crates directly.
 - `bench` can depend on runtime-facing crates for measurement, but it does not define product contracts.

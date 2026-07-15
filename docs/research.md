@@ -7,12 +7,10 @@ decisions and points to the comparison matrix, not raw run output.
 
 | Area | Decision | Why it matters |
 | --- | --- | --- |
-| Real local embeddings | Use `CODESTORY_EMBED_BACKEND=llamacpp` with the local llama.cpp sidecar. | Product packet/search evidence now requires the sidecar manifest to record the 768-d bge-base backend and `retrieval_mode=full`. |
-| Deterministic diagnostics | `CODESTORY_EMBED_RUNTIME_MODE=hash` is diagnostic-only. | Keeps selected local-dev and CI checks reproducible without model services, but is not agent-facing retrieval evidence. |
-| Default model profile | `CODESTORY_EMBED_PROFILE=bge-base-en-v1.5`. | BGE-base remains the best quality/speed family for the active runtime. |
+| Real local embeddings | Use the linked in-process BGE-base Q8 engine. | Product packet/search evidence requires the exact embedded-model producer identity and `retrieval_mode=full`; CPU is explicit-only. |
 | Default doc shape | Graph-native `symbol_search_doc` for durable symbols plus `CODESTORY_SEMANTIC_DOC_ALIAS_MODE=alias_variant` for selected dense anchors. | Code recall is AST-first; compact aliases help the dense-anchor subset without returning to an all-code vector corpus. |
 | Dense policy | `graph_first_v1` with reasons `public_api`, `entrypoint`, `documented_nontrivial`, `central_graph_node`, `component_report`, and `unstructured_doc`. | Dense vectors are reserved for structurally justified anchors; private trivial code stays discoverable through symbol docs and graph/lexical recall. |
-| Current benchmark baseline | Historical BGE-base Q8 GGUF through llama.cpp/Vulkan remains the last fully scored broad-holdout baseline; the active mandatory sidecar contract needs a fresh coherent benchmark row. | Do not compare new sidecar speed numbers against old mixed-vintage rows without rerunning the quality and cross-repo gates. |
+| Current benchmark baseline | Historical BGE-base Q8 GGUF through llama.cpp/Vulkan remains the last fully scored broad-holdout baseline; the in-process engine needs a fresh coherent benchmark row. | Compare the implementations in the same release build and rerun quality and cross-repository gates. |
 | Peak memory evidence | Segment-2 q8/r6 baseline measured peak descendant working set `828.726562 MB`; repeat sampled `1019.789062 MB`; `peak_vram_mb` was unavailable on this host. | Memory is now measured explicitly, but sampled peak RAM is noisy enough that tiny memory wins need repeats. |
 | Evidence standard | Quality gates and rank profiles come before speed. | A faster row is rejected when MRR, Hit@10, rank1/rank2-10, or misses regress. |
 

@@ -2,7 +2,7 @@ use codestory_contracts::graph::NodeKind;
 use codestory_store::{LlmSymbolDoc, RetrievalIndexManifest, Store};
 use std::collections::BTreeMap;
 
-pub const SIDECAR_SCHEMA_VERSION: i32 = 4;
+pub const SIDECAR_SCHEMA_VERSION: i32 = 5;
 pub const SEMANTIC_POLICY_VERSION: &str = "graph_first_v1";
 pub const SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED: &str =
     "sidecar_semantic_doc_embedding_contract_changed";
@@ -162,7 +162,7 @@ pub fn manifest_staleness_reason_for_runtime(
 
     match storage.max_indexed_file_modification_time() {
         Ok(Some(max_mtime)) if max_mtime > manifest.built_at_epoch_ms => Some(format!(
-            "indexed_file_newer_than_sidecar_manifest: file_mtime={max_mtime} manifest_built_at={}",
+            "indexed_file_newer_than_retrieval_manifest: file_mtime={max_mtime} manifest_built_at={}",
             manifest.built_at_epoch_ms
         )),
         Err(error) => Some(format!("indexed_file_mtime_unavailable: {error}")),
@@ -177,10 +177,10 @@ pub fn manifest_unavailable_reason_for_runtime(
     runtime: &crate::config::SidecarRuntimeConfig,
 ) -> Option<String> {
     if !manifest_has_current_sidecar_contract(project_id, manifest) {
-        return Some("sidecar_manifest_generation_contract_missing".into());
+        return Some("retrieval_manifest_generation_contract_missing".into());
     }
     manifest_staleness_reason_for_runtime(storage, manifest, runtime)
-        .map(|reason| format!("sidecar_manifest_stale: {reason}"))
+        .map(|reason| format!("retrieval_manifest_stale: {reason}"))
 }
 
 pub fn manifest_sidecar_generation(manifest: &RetrievalIndexManifest) -> &str {
@@ -228,13 +228,7 @@ fn sidecar_stored_embedding_is_product_compatible(doc: &LlmSymbolDoc) -> bool {
     if !doc.embedding_model.contains("bge-base-en-v1.5") {
         return false;
     }
-    matches!(
-        doc.embedding_backend
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("llamacpp" | "llama_cpp" | "llama.cpp" | "llama-cpp")
-    )
+    doc.embedding_backend.as_deref() == Some("inprocess")
 }
 
 #[derive(Default)]
@@ -533,7 +527,7 @@ mod tests {
             doc_hash: format!("hash-{node_id}"),
             embedding_profile: Some("bge-base-en-v1.5".into()),
             embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
-            embedding_backend: Some("llamacpp".into()),
+            embedding_backend: Some("inprocess".into()),
             embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
             doc_shape: Some(doc_shape.into()),
             semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.into()),

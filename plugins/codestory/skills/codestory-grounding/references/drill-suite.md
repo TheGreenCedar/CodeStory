@@ -96,7 +96,7 @@ The suite report summarizes per-case mechanical verdicts, freshness,
 retrieval mode, anchor resolution, bridge status, source-truth check counts,
 source-truth target roles/ranking reasons, bridge `evidence_kind`, and next actions. A case can
 be mechanically healthy but still `degraded` when source-truth verification is
-required, bridge evidence is partial, retrieval needs repair, or freshness is
+required, bridge evidence is partial, retrieval is unavailable, or freshness is
 stale. A failed case is recorded as `blocked` instead of aborting the
 whole suite, so other manifest cases still produce evidence.
 

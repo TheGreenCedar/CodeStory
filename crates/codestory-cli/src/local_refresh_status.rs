@@ -6,7 +6,11 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use codestory_retrieval::{ProcessOwnerState, ProcessStartProbe};
 
 const LOCAL_REFRESH_STATUS_FILE: &str = "local-refresh-status.json";
 const LOCAL_REFRESH_LOCK_FILE: &str = "local-refresh.lock";
@@ -52,6 +56,7 @@ pub(crate) struct LocalRefreshBusy {
     pub(crate) started_at_epoch_ms: Option<i64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct LocalRefreshCleanup {
     pub(crate) status: Option<LocalRefreshStatus>,
@@ -237,7 +242,7 @@ pub(crate) fn try_acquire_local_refresh_lock(
 
     let started_at_epoch_ms = now_epoch_ms();
     let pid = std::process::id();
-    let process_start_identity = crate::ready_repair_status::recorded_process_start_identity(pid);
+    let process_start_identity = recorded_process_start_identity(pid);
     let token = format!("{pid}:{started_at_epoch_ms}");
     let lock = LocalRefreshLockFile {
         schema_version: LOCAL_REFRESH_STATUS_SCHEMA_VERSION,
@@ -304,6 +309,7 @@ pub(crate) fn try_acquire_local_refresh_lock(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn wait_for_local_refresh_lock(
     cache_root: &Path,
     project_root: &Path,
@@ -346,7 +352,7 @@ pub(crate) fn write_local_refresh_status(
         project_root: clean_path_text(project_root),
         phase: phase.to_string(),
         pid,
-        process_start_identity: crate::ready_repair_status::recorded_process_start_identity(pid),
+        process_start_identity: recorded_process_start_identity(pid),
         owner_token: None,
         started_at_epoch_ms,
         updated_at_epoch_ms: now_epoch_ms(),
@@ -442,6 +448,7 @@ pub(crate) fn active_local_refresh_status(
     read_local_refresh_status(&local_refresh_status_path(cache_root), project_root, now)
 }
 
+#[cfg(test)]
 pub(crate) fn cleanup_stale_local_refresh_state(
     cache_root: &Path,
     project_root: &Path,
@@ -462,16 +469,13 @@ pub(crate) fn cleanup_stale_local_refresh_state(
         lock.schema_version == LOCAL_REFRESH_STATUS_SCHEMA_VERSION
             && codestory_workspace::same_workspace_path(Path::new(&lock.project_root), project_root)
     });
-    let status_owner_state = status.as_ref().map(|status| {
-        crate::ready_repair_status::process_owner_state(
-            status.pid,
-            status.process_start_identity.as_deref(),
-        )
-    });
-    let status_owner_live = status_owner_state
-        .is_some_and(|state| state != crate::ready_repair_status::ProcessOwnerState::GoneOrReused);
-    let status_owner_dead = status_owner_state
-        .is_some_and(|state| state == crate::ready_repair_status::ProcessOwnerState::GoneOrReused);
+    let status_owner_state = status
+        .as_ref()
+        .map(|status| process_owner_state(status.pid, status.process_start_identity.as_deref()));
+    let status_owner_live =
+        status_owner_state.is_some_and(|state| state != ProcessOwnerState::GoneOrReused);
+    let status_owner_dead =
+        status_owner_state.is_some_and(|state| state == ProcessOwnerState::GoneOrReused);
     let status_lock_mismatch = status.as_ref().is_some_and(|status| {
         status.owner_token.is_some()
             && lock
@@ -598,10 +602,8 @@ fn local_refresh_lock_file_is_stale(
 ) -> bool {
     let now = now_epoch_ms();
     if let Some(lock) = read_local_refresh_lock_file(path) {
-        return crate::ready_repair_status::process_owner_state(
-            lock.pid,
-            lock.process_start_identity.as_deref(),
-        ) == crate::ready_repair_status::ProcessOwnerState::GoneOrReused;
+        return process_owner_state(lock.pid, lock.process_start_identity.as_deref())
+            == ProcessOwnerState::GoneOrReused;
     }
     crate::file_state::file_modified_age_exceeds(path, LOCAL_REFRESH_LOCK_STALE_TTL, now)
 }
@@ -622,10 +624,8 @@ fn read_local_refresh_status(
     if age_ms > LOCAL_REFRESH_STATUS_TTL.as_millis() as i64 {
         return None;
     }
-    if crate::ready_repair_status::process_owner_state(
-        status.pid,
-        status.process_start_identity.as_deref(),
-    ) == crate::ready_repair_status::ProcessOwnerState::GoneOrReused
+    if process_owner_state(status.pid, status.process_start_identity.as_deref())
+        == ProcessOwnerState::GoneOrReused
     {
         return None;
     }
@@ -684,6 +684,18 @@ fn path_fingerprint(path: &Path) -> String {
         }
         Err(_) => format!("{}:missing", path.display()),
     }
+}
+
+fn recorded_process_start_identity(pid: u32) -> Option<String> {
+    match codestory_retrieval::probe_process_start_identity(pid) {
+        ProcessStartProbe::Running { start_identity } => Some(start_identity),
+        ProcessStartProbe::NotRunning | ProcessStartProbe::Unknown { .. } => None,
+    }
+}
+
+fn process_owner_state(pid: u32, expected_start_identity: Option<&str>) -> ProcessOwnerState {
+    let probe = codestory_retrieval::probe_process_start_identity(pid);
+    codestory_retrieval::process_owner_state(&probe, expected_start_identity)
 }
 
 #[cfg(test)]

@@ -55,12 +55,11 @@ Provisioning is idempotent. It:
   versions, then records the complete native package manifest;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
-- streams a checksum-verified BGE model from the standard CodeStory cache when
-  present, otherwise downloads it, then verifies the contract checksum again
-  inside the guest;
+- verifies that the exact candidate contains its checksum-pinned BGE model and
+  linked embedding engine without provisioning either one;
 - prepares a source-backed `serde_json` drill at an exact commit;
 - registers the runner only with `TheGreenCedar/CodeStory`; and
-- keeps Cargo, Rust, temp, XDG, CodeStory, model, drill, work, and artifact state
+- keeps Cargo, Rust, temp, XDG, CodeStory, drill, work, and artifact state
   under the proof-owned volume.
 
 The tracked CodeStory source used by provisioning checks is streamed into the
@@ -69,13 +68,9 @@ the stopped runner, so untracked or modified validation files cannot survive a
 provisioning pass. No source or tool is executed through a host mount. `verify`
 prints the guest mount table and fails if it finds a host-backed VirtioFS, 9p,
 SSHFS, Lima, osxfs, or gRPC FUSE mount; any `/Users` visibility is also a hard
-failure. Provisioning pins the model; the exact candidate under test owns
-managed native llama-server selection and checksum verification.
-
-The model seed also crosses SSH rather than a host mount. Its default source is
-`~/Library/Caches/dev.codestory.codestory/retrieval/models/`; set
-`CODESTORY_RELEASE_EVIDENCE_MODEL_SEED` to an alternate exact file. The host
-and guest both reject bytes that do not match the machine contract.
+failure. The exact candidate under test owns model materialization, digest
+verification, and accelerator selection. Provisioning supplies no model or
+backend asset.
 
 Provisioning first proves that an existing owned runner is idle. It requests a
 GitHub registration token only when the runner is unconfigured, checks the

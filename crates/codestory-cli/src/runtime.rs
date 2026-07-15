@@ -34,9 +34,9 @@ pub(crate) struct OpenedProject {
 
 /// Shared service handles and filesystem roots for a CLI command.
 ///
-/// Runtime construction never promotes installed managed embedding assets into
-/// product defaults. Product packet/search paths set llama.cpp sidecar defaults
-/// explicitly before opening the runtime.
+/// The retrieval runtime carries immutable process defaults and project
+/// artifact paths. Product surfaces initialize the shared embedded engine when
+/// they need semantic work; inspect-only surfaces remain observational.
 pub(crate) struct RuntimeContext {
     pub(crate) project: ProjectService,
     pub(crate) index: IndexService,
@@ -100,12 +100,6 @@ impl RuntimeContext {
         Self::new_with_startup(args, &crate::config::process_startup_config())
     }
 
-    /// Open runtime services for agent-facing packet/search commands.
-    #[cfg(test)]
-    pub(crate) fn new_agent_sidecar(args: &ProjectArgs) -> Result<Self> {
-        Self::new_agent_sidecar_with_selection(args, None, None)
-    }
-
     pub(crate) fn new_agent_sidecar_with_startup(
         args: &ProjectArgs,
         startup: &crate::config::CliStartupConfig,
@@ -150,7 +144,7 @@ impl RuntimeContext {
         Ok(context)
     }
 
-    /// Open runtime services without starting managed embedding processes.
+    /// Open runtime services without initializing the embedded engine.
     pub(crate) fn new_inspect_only(args: &ProjectArgs) -> Result<Self> {
         Self::new(args)
     }
@@ -384,12 +378,12 @@ pub(crate) fn ensure_index_ready(opened: &OpenedProject, subcommand: &str) -> Re
     Ok(())
 }
 
-/// Map runtime API errors into CLI errors with repair commands when available.
+/// Map runtime API errors into CLI errors with recovery commands when available.
 pub(crate) fn map_api_error(error: ApiError) -> anyhow::Error {
     map_api_error_with_project(error, None)
 }
 
-/// Map runtime API errors with project-specific cache repair guidance.
+/// Map runtime API errors with project-specific recovery guidance.
 pub(crate) fn map_api_error_for_project(error: ApiError, project: &Path) -> anyhow::Error {
     map_api_error_with_project(error, Some(project))
 }
@@ -408,7 +402,7 @@ fn map_api_error_with_project(error: ApiError, project: Option<&Path>) -> anyhow
             }
         }
         if !full_repair.is_empty() && full_repair != minimum_next {
-            message.push_str("\n\nFull repair:");
+            message.push_str("\n\nAdditional checks:");
             for command in full_repair {
                 message.push_str("\n  ");
                 message.push_str(command);
@@ -465,7 +459,7 @@ fn cache_busy_message(project: Option<&Path>) -> String {
         .map(quote_command_path)
         .unwrap_or_else(|| "<repo>".to_string());
     format!(
-        "cache_busy: CodeStory cache is busy or locked. Wait for the active indexing/search process to release the SQLite cache, then retry.\n\nMinimum next:\n  codestory-cli ready --project {project} --goal agent\n\nFull repair:\n  codestory-cli ready --project {project} --goal agent\n  codestory-cli doctor --project {project}"
+        "cache_busy: CodeStory cache is busy or locked. Wait for the active indexing/search process to release the SQLite cache, then retry.\n\nMinimum next:\n  codestory-cli ready --project {project} --goal agent\n\nAdditional checks:\n  codestory-cli ready --project {project} --goal agent\n  codestory-cli doctor --project {project}"
     )
 }
 
@@ -478,10 +472,7 @@ mod tests {
     use tempfile::tempdir;
 
     const MANAGED_ENV_VARS: &[&str] = &[
-        "CODESTORY_EMBED_RUNTIME_MODE",
-        "CODESTORY_EMBED_BACKEND",
-        "CODESTORY_EMBED_PORT",
-        "CODESTORY_EMBED_LLAMACPP_URL",
+        "CODESTORY_EMBED_ALLOW_CPU",
         "CODESTORY_LLM_DOC_EMBED_BATCH_SIZE",
         "CODESTORY_SEMANTIC_DOC_MAX_TOKENS",
         "CODESTORY_STORED_VECTOR_ENCODING",
@@ -610,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_startup_snapshots_isolate_concurrent_runtime_paths_and_endpoints() {
+    fn explicit_startup_snapshots_isolate_concurrent_runtime_paths() {
         let temp = tempdir().expect("temp dir");
         let first_project = temp.path().join("first-project");
         let second_project = temp.path().join("second-project");
@@ -618,16 +609,6 @@ mod tests {
         let second_cache = temp.path().join("second-cache");
         fs::create_dir_all(&first_project).expect("create first project");
         fs::create_dir_all(&second_project).expect("create second project");
-        fs::write(
-            first_project.join(".codestory.toml"),
-            r#"embedding_endpoint = "http://127.0.0.1:41001/v1/embeddings""#,
-        )
-        .expect("write first config");
-        fs::write(
-            second_project.join(".codestory.toml"),
-            r#"embedding_endpoint = "http://127.0.0.1:41002/v1/embeddings""#,
-        )
-        .expect("write second config");
         let startup = |cache_root: &Path| crate::config::CliStartupConfig {
             user_home: None,
             project_network_config_allowed: true,
@@ -671,74 +652,5 @@ mod tests {
         assert!(second.storage_path.starts_with(&second_cache));
         assert!(first.sidecar.layout.state_file.starts_with(&first_cache));
         assert!(second.sidecar.layout.state_file.starts_with(&second_cache));
-        assert_eq!(
-            first.sidecar.embedding.endpoint,
-            "http://127.0.0.1:41001/v1/embeddings"
-        );
-        assert_eq!(
-            second.sidecar.embedding.endpoint,
-            "http://127.0.0.1:41002/v1/embeddings"
-        );
-    }
-
-    #[test]
-    fn agent_sidecar_runtime_defaults_to_bundled_llamacpp() {
-        let _env_lock = crate::config::config_env_test_lock();
-        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
-        let temp = tempdir().expect("temp dir");
-        let project = temp.path().join("repo");
-        let cache = temp.path().join("cache");
-        fs::create_dir_all(&project).expect("create project");
-
-        let runtime = RuntimeContext::new_agent_sidecar(&ProjectArgs {
-            project: project.clone(),
-            cache_dir: Some(cache),
-        })
-        .expect("runtime context");
-
-        assert_eq!(
-            runtime.sidecar.profile,
-            codestory_retrieval::SidecarProfile::Agent
-        );
-        assert_eq!(runtime.sidecar.embedding.backend, "llamacpp");
-        assert_eq!(env::var("CODESTORY_EMBED_LLAMACPP_URL").ok(), None);
-        let sidecar = runtime.sidecar.with_profile_and_run_id(
-            Some(&project),
-            codestory_retrieval::SidecarProfile::Agent,
-            Some("ready-repair-test"),
-        );
-        let expected_url =
-            codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
-        assert_eq!(sidecar.embedding.endpoint.as_str(), expected_url.as_str());
-        assert_ne!(expected_url, "http://127.0.0.1:8080/v1/embeddings");
-    }
-
-    #[test]
-    fn bundled_llamacpp_defaults_preserve_explicit_user_env() {
-        let _env_lock = crate::config::config_env_test_lock();
-        let _env_snapshot = EnvSnapshot::clear(MANAGED_ENV_VARS);
-        unsafe {
-            env::set_var("CODESTORY_EMBED_BACKEND", "llamacpp");
-            env::set_var(
-                "CODESTORY_EMBED_LLAMACPP_URL",
-                "http://127.0.0.1:18080/v1/embeddings",
-            );
-        }
-
-        let project = tempfile::tempdir().expect("project");
-        let runtime = RuntimeContext::new_agent_sidecar(&ProjectArgs {
-            project: project.path().to_path_buf(),
-            cache_dir: None,
-        })
-        .expect("runtime context");
-
-        assert_eq!(
-            env::var("CODESTORY_EMBED_BACKEND").ok().as_deref(),
-            Some("llamacpp")
-        );
-        assert_eq!(
-            runtime.sidecar.embedding.endpoint.as_str(),
-            "http://127.0.0.1:18080/v1/embeddings"
-        );
     }
 }

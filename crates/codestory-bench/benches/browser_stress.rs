@@ -200,12 +200,6 @@ fn indexed_fixture(
     let temp = tempfile::tempdir()?;
     write_browser_stress_project(temp.path(), file_count, fanout, graph_shape)?;
 
-    // SAFETY: Criterion runs this benchmark in-process; the deterministic hash runtime is set
-    // before constructing the controller that may lazily initialize retrieval state.
-    unsafe {
-        std::env::set_var("CODESTORY_EMBED_RUNTIME_MODE", "hash");
-    }
-
     let controller = AppController::new();
     let storage_path = temp.path().join("codestory-stress.db");
     controller

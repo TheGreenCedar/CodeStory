@@ -304,7 +304,7 @@ export function managedPluginViolations(job, archiveFragment) {
   for (const fragment of [
     "python .github/scripts/check-packaged-agent-proof.py",
     archiveFragment,
-    "--managed-plugin-handoff",
+    "--plugin-handoff",
   ]) {
     add(violations, run.includes(fragment), `managed plugin proof step must run ${fragment}`);
   }
@@ -366,7 +366,6 @@ function validateLockedSetupSurfaces(violations) {
     [path.join("scripts", "codex-worktree-setup.mjs"), ['["build", "--release", "--locked", "-p", "codestory-cli"]']],
     [path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.sh"), ["cargo build --release --locked -p codestory-cli"]],
     [path.join("plugins", "codestory", "skills", "codestory-grounding", "scripts", "setup.ps1"), ['@("build", "--release", "--locked", "-p", "codestory-cli"']],
-    [path.join("scripts", "setup-retrieval-env.mjs"), ['return ["run", "--locked", ...args]']],
   ]);
   for (const [file, fragments] of contracts) {
     const source = fs.readFileSync(file, "utf8");
@@ -428,13 +427,15 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       ".github/workflows/packaged-platform-pr.yml",
       ".github/workflows/packaged-platform-proof.yml",
       ".github/workflows/macos-metal-proof.yml",
+      ".github/workflows/windows-vulkan-proof.yml",
+      ".github/workflows/retrieval-engine-smoke.yml",
       ".github/workflows/source-proof.yml",
       ".github/workflows/repo-scale-stats.yml",
       "package.json",
       "package-lock.json",
       "scripts/codex-worktree-setup.*",
-      "scripts/setup-retrieval-env.*",
       "scripts/install-codestory.ps1",
+      "scripts/prepare-embedded-model.mjs",
     ];
     for (const event of ["pull_request", "push"]) {
       add(violations, includesAll(at(plugin, "on", event, "paths"), requiredPaths), `${pluginFile} ${event} paths must cover policy and release surfaces`);
@@ -516,7 +517,6 @@ function validateReleaseCoordinator(workflows, violations) {
     proof_key: "release-${{ needs.preflight.outputs.version }}",
     profile: "codestory-release-evidence-linux-arm64-v1",
     drill_manifest: "/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
-    embedding_model_dir: "/srv/codestory-release-evidence/models",
   })) {
     add(violations, object(evidence.with)[key] === value, `${releaseFile} release-evidence with.${key} must equal ${value}`);
   }
@@ -540,8 +540,13 @@ function validateReleaseCoordinator(workflows, violations) {
   add(violations, sameMembers(needs(metal), ["preflight", "packaged-proof"]), `${releaseFile} Metal proof must wait for packaged proof`);
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${releaseFile} Metal proof must use the packaged CLI`);
 
+  const vulkan = requireJob(violations, releaseFile, release, "windows-vulkan-proof");
+  add(violations, vulkan.uses === "./.github/workflows/windows-vulkan-proof.yml", `${releaseFile} must call protected Vulkan proof`);
+  add(violations, sameMembers(needs(vulkan), ["preflight", "packaged-proof"]), `${releaseFile} Vulkan proof must wait for packaged proof`);
+  add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${releaseFile} Vulkan proof must use the packaged CLI`);
+
   const publish = requireJob(violations, releaseFile, release, "publish");
-  add(violations, sameMembers(needs(publish), ["preflight", "packaged-proof", "macos-metal-proof"]), `${releaseFile} publish must wait for all release proofs`);
+  add(violations, sameMembers(needs(publish), ["preflight", "packaged-proof", "macos-metal-proof", "windows-vulkan-proof"]), `${releaseFile} publish must wait for all release proofs`);
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     "--output target/release-assets/release-notes.md",
@@ -606,12 +611,26 @@ function validatePackagedProof(workflows, violations) {
       "rust:1.95.0-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf",
     `${file} must pin the glibc build image`,
   );
+  add(
+    violations,
+    object(workflow.env).LINUX_GLSLC_IMAGE ===
+      "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90",
+    `${file} must pin the glslc build image`,
+  );
   const job = requireJob(violations, file, workflow, "build");
   validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"));
   add(violations, String(job.environment ?? "").includes("macos-release-signing"), `${file} signed Mac cells must use the protected signing environment`);
+  requireStepRun(violations, file, job, "Prepare checksum-pinned embedded model", [
+    "node scripts/prepare-embedded-model.mjs",
+  ]);
+  requireStepRun(violations, file, job, "Install Linux Vulkan build dependencies", [
+    "bash .github/scripts/install-linux-vulkan-build-deps.sh",
+  ]);
   requireStepRun(violations, file, job, "Build Linux x64 at the glibc 2.31 baseline", [
+    ".github/docker/linux-glibc-build.Dockerfile",
     "cargo build --release --locked -p codestory-cli",
     "CARGO_TARGET_DIR=/workspace/target/glibc-2.31",
+    "CXXFLAGS=-std=c++17",
   ]);
   const signing = namedStep(job, "Sign and notarize macOS CLI");
   add(violations, signing !== undefined, `${file} must sign and notarize Mac binaries`);
@@ -638,7 +657,10 @@ function validatePackagedProof(workflows, violations) {
     '"$work_dir/codestory-cli-quarantined"',
   ).map(message => `${file} ${message}`));
   requireStepRun(violations, file, job, "Run Windows installer ownership self-test", ["scripts/install-codestory.ps1 -SelfTest"]);
-  requireStepRun(violations, file, job, "Prove Linux x64 glibc 2.31 baseline", ["bash .github/scripts/check-linux-glibc-baseline.sh"]);
+  requireStepRun(violations, file, job, "Prove Linux x64 glibc 2.31 baseline", [
+    "libvulkan1=1.2.131.2-1",
+    "bash .github/scripts/check-linux-glibc-baseline.sh",
+  ]);
   violations.push(...managedPluginViolations(
     job,
     '--archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"',
@@ -672,7 +694,7 @@ function validatePostPublish(workflows, violations) {
   ]);
   violations.push(...macosCliDistributionViolations(macProof, macProof, '"$bin"').map(message => `${file} ${message}`));
   requireStepRun(violations, file, job, "Run Windows installer ownership self-test", ["scripts/install-codestory.ps1 -SelfTest"]);
-  requireStepRun(violations, file, job, "Prove published Intel macOS backend policy and explicit CPU/external operation", ["--intel-runtime-policy"]);
+  requireStepRun(violations, file, job, "Prove published Intel macOS explicit CPU policy", ["--engine-policy cpu_explicit", "--expected-backend CPU", "--offline"]);
   add(violations, !scalarStrings(workflow).some(value => value.includes("sha256sum")), `${file} must use the portable Python checksum gate`);
 }
 
@@ -707,6 +729,9 @@ function validatePackagedCoordinator(workflows, violations) {
   const metal = requireJob(violations, file, workflow, "macos-metal-proof");
   add(violations, sameMembers(needs(metal), ["route", "packaged-proof"]), `${file} Metal proof must wait for package proof`);
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${file} Metal proof must use the packaged CLI`);
+  const vulkan = requireJob(violations, file, workflow, "windows-vulkan-proof");
+  add(violations, sameMembers(needs(vulkan), ["route", "packaged-proof"]), `${file} Vulkan proof must wait for package proof`);
+  add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${file} Vulkan proof must use the packaged CLI`);
   const closeout = requireJob(violations, file, workflow, "closeout");
   requireStepRun(violations, file, closeout, "Require one coherent accepted proof", ["dev/codestory-next moved from proved head"]);
   add(violations, !scalarStrings(workflow).some(value => value === "./.github/workflows/release.yml"), `${file} must not publish releases`);
@@ -739,6 +764,7 @@ function validateRemainingWorkflows(workflows, violations) {
     add(violations, trigger(evidence, "workflow_dispatch") === undefined, `${evidenceFile} must be coordinator-only`);
     const job = requireJob(violations, evidenceFile, evidence, "measure");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Linux", "ARM64", "codestory-release-evidence"]), `${evidenceFile} must use the protected evidence runner`);
+    requireStepRun(violations, evidenceFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     violations.push(...releaseEvidenceApprovalViolations(
       [
         ["release.yml", at(workflows.get("release.yml"), "jobs", "release-evidence"), true],
@@ -746,7 +772,7 @@ function validateRemainingWorkflows(workflows, violations) {
       ],
       evidence,
     ));
-    requireStepRun(violations, evidenceFile, job, "Produce full-sidecar repo evidence", ["--test-threads=1"]);
+    requireStepRun(violations, evidenceFile, job, "Produce full-retrieval repo evidence", ["--test-threads=1"]);
     requireStepRun(violations, evidenceFile, job, "Download prior rejected evidence for approval re-evaluation", ["actions/runs/$SOURCE_RUN_ID", "actions/runs/$SOURCE_RUN_ID/artifacts"]);
   }
 
@@ -756,15 +782,29 @@ function validateRemainingWorkflows(workflows, violations) {
     violations.push(`${metalFile} must exist`);
   } else {
     add(violations, trigger(metal, "workflow_call") !== undefined && trigger(metal, "workflow_dispatch") !== undefined, `${metalFile} must support reusable and manual proof`);
-    const job = requireJob(violations, metalFile, metal, "packaged-metal-lifecycle");
+    const job = requireJob(violations, metalFile, metal, "packaged-metal");
     add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "macOS", "ARM64", "codestory-metal"]), `${metalFile} must use the protected Apple Silicon runner`);
     add(violations, job.environment === "macos-metal-release", `${metalFile} must use the protected Metal environment`);
+    requireStepRun(violations, metalFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     requireStepRun(violations, metalFile, job, "Capture host evidence", ["python3 --version", 'test "$macos_major" -ge 15']);
-    const lifecycle = namedStep(job, "Prove cold, warm, dead-endpoint, recovery, packet, and plugin lifecycle");
-    requireStepRun(violations, metalFile, job, "Prove cold, warm, dead-endpoint, recovery, packet, and plugin lifecycle", ["--native-accelerator-lifecycle", "--managed-plugin-grounding-convergence"]);
-    add(violations, object(lifecycle?.env).CODESTORY_EMBED_DEVICE_PROVIDER === "metal", `${metalFile} lifecycle must require Metal`);
-    add(violations, object(lifecycle?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${metalFile} lifecycle must reject CPU fallback`);
-    requireStepRun(violations, metalFile, job, "Clean and assert proof-owned hardware state", ["--cleanup-proof-temp-root"]);
+    const engine = namedStep(job, "Prove cold and warm Metal, offline packaging, and multi-repository reuse");
+    requireStepRun(violations, metalFile, job, "Prove cold and warm Metal, offline packaging, and multi-repository reuse", ["--engine-policy accelerated", "--expected-backend Metal", "--offline"]);
+    add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${metalFile} engine proof must reject CPU fallback`);
+  }
+
+  const vulkanFile = "windows-vulkan-proof.yml";
+  const vulkan = workflows.get(vulkanFile);
+  if (!vulkan) {
+    violations.push(`${vulkanFile} must exist`);
+  } else {
+    add(violations, trigger(vulkan, "workflow_call") !== undefined && trigger(vulkan, "workflow_dispatch") !== undefined, `${vulkanFile} must support reusable and manual proof`);
+    const job = requireJob(violations, vulkanFile, vulkan, "packaged-vulkan");
+    add(violations, JSON.stringify(job["runs-on"]) === JSON.stringify(["self-hosted", "Windows", "X64", "codestory-vulkan"]), `${vulkanFile} must use the protected Windows Vulkan runner`);
+    add(violations, job.environment === "windows-vulkan-proof", `${vulkanFile} must use the protected Vulkan environment`);
+    requireStepRun(violations, vulkanFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
+    const engine = namedStep(job, "Prove offline Vulkan and multi-repository reuse");
+    requireStepRun(violations, vulkanFile, job, "Prove offline Vulkan and multi-repository reuse", ["--engine-policy accelerated", "--expected-backend Vulkan", "--offline"]);
+    add(violations, object(engine?.env).CODESTORY_EMBED_ALLOW_CPU === "0", `${vulkanFile} engine proof must reject CPU fallback`);
   }
 
   const statsFile = "repo-scale-stats.yml";
@@ -773,12 +813,13 @@ function validateRemainingWorkflows(workflows, violations) {
     violations.push(`${statsFile} must exist`);
   } else {
     const job = requireJob(violations, statsFile, stats, "stats");
+    requireStepRun(violations, statsFile, job, "Prepare checksum-pinned embedded model", ["node scripts/prepare-embedded-model.mjs"]);
     requireStepRun(violations, statsFile, job, "Build the release CLI", ["cargo build --release --locked -p codestory-cli"]);
     requireStepRun(violations, statsFile, job, "Run mandatory repo-scale stats once", ["cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture"]);
     requireStepUses(violations, statsFile, job, "Upload repo-scale stats output", "actions/upload-artifact@v7.0.1");
   }
 
-  const retrievalFile = "retrieval-sidecar-smoke.yml";
+  const retrievalFile = "retrieval-engine-smoke.yml";
   const retrieval = workflows.get(retrievalFile);
   if (!retrieval) {
     violations.push(`${retrievalFile} must exist`);

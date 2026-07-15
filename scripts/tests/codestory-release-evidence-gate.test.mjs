@@ -176,7 +176,7 @@ test("artifact mutation, identity drift, and short SHA are rejected", () => {
   assert.match(result.stderr, /cache_id does not match/);
 
   stats.commit = "1111111111111111111111111111111111111111";
-  stats.evidence_identity.cache_id = "cold-full-sidecar-v1";
+  stats.evidence_identity.cache_id = "cold-full-retrieval-v1";
   writeFileSync(path.join(dir, "stats.json"), JSON.stringify(stats));
   result = spawnSync(process.execPath, [script, "produce", "--baseline", baseline, "--profile", "ci-contract-v1", "--stats", path.join(dir, "stats.json"), "--packet", path.join(fixture, "candidate-packet.json"), "--out", path.join(dir, "candidate-3.json"), "--expected-sha", stats.commit, "--mode", "contract", "--repo", root], { encoding: "utf8" });
   assert.notEqual(result.status, 0);
@@ -287,7 +287,7 @@ test("failed packet quality and non-full stats cannot produce or evaluate a pass
   writeFileSync(path.join(dir2, "candidate.json"), JSON.stringify(candidate));
   result = run("evaluate", ["--candidate", path.join(dir2, "candidate.json"), "--out", path.join(dir2, "report.json")]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /full-sidecar readiness contract/);
+  assert.match(result.stderr, /full-retrieval readiness contract/);
 });
 
 test("forged provenance, duplicate repeats, and omitted repeat budgets fail", () => {

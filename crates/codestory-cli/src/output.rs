@@ -28,9 +28,9 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::args::{
-    CliTrailMode, DoctorOutput, DrillOutput, FixOutput, IndexDryRunOutput, IndexOutput,
-    OutputFormat, QueryItemOutput, QueryOutput, ReadyOutput, SearchHitOutput, SearchOutput,
-    TrailCommand, VerificationTargetOutput,
+    CliTrailMode, DoctorOutput, DrillOutput, IndexDryRunOutput, IndexOutput, OutputFormat,
+    QueryItemOutput, QueryOutput, ReadyOutput, SearchHitOutput, SearchOutput, TrailCommand,
+    VerificationTargetOutput,
 };
 use crate::display::{
     clean_path_string, default_trail_direction, format_budget, format_direction, format_kind,
@@ -155,7 +155,7 @@ pub(crate) fn render_index_markdown(output: &IndexOutput<'_>) -> String {
     if let Some(timings) = output.phase_timings {
         append_index_phase_timings(&mut markdown, timings);
     }
-    append_readiness_verdicts(&mut markdown, &output.readiness, true);
+    append_readiness_verdicts(&mut markdown, &output.readiness);
     append_index_summary_generation(&mut markdown, output);
     append_next_commands(&mut markdown, &output.next_commands);
     markdown
@@ -174,7 +174,7 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
             let _ = writeln!(markdown, "local_refresh_reason: {reason}");
         }
     }
-    append_readiness_verdicts(&mut markdown, &output.verdicts, true);
+    append_readiness_verdicts(&mut markdown, &output.verdicts);
     if !output.readiness_lanes.is_empty() {
         let _ = writeln!(markdown, "readiness_lanes:");
         for (name, lane) in &output.readiness_lanes {
@@ -183,7 +183,7 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
                 "- {name} [{}]: profile={} mode={} degraded_reason={}",
                 crate::readiness::status_label(lane.status),
                 lane.profile,
-                lane.sidecar_mode,
+                lane.retrieval_mode,
                 lane.degraded_reason.as_deref().unwrap_or("none")
             );
             if let Some(command) = lane.next_command.as_deref() {
@@ -191,102 +191,12 @@ pub(crate) fn render_ready_markdown(output: &ReadyOutput) -> String {
             }
         }
     }
-    if let Some(broker) = output.readiness_broker.as_ref() {
-        append_readiness_broker(&mut markdown, broker);
-    }
-    markdown
-}
-
-fn append_readiness_broker(
-    markdown: &mut String,
-    broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
-) {
-    let _ = writeln!(
-        markdown,
-        "readiness_broker: project_id={} persistence={} operations={} gpu_proof={}",
-        broker.project_id,
-        broker.persistence_status,
-        broker.operations.len(),
-        broker
-            .gpu_proof
-            .as_ref()
-            .map(|proof| proof.proof_status.as_str())
-            .unwrap_or("unknown")
-    );
-    if broker.persistence_status == "failed" {
-        let _ = writeln!(
-            markdown,
-            "readiness_broker_persistence_error: {}",
-            broker.persistence_error.as_deref().unwrap_or("unknown")
-        );
-    }
-    for operation in &broker.operations {
-        let _ = writeln!(
-            markdown,
-            "readiness_broker_operation: kind={} status={} phase={} pid={} run_id={}",
-            operation.operation_kind,
-            operation.status,
-            operation.phase.as_deref().unwrap_or("unknown"),
-            operation
-                .pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            operation.run_id.as_deref().unwrap_or("none")
-        );
-    }
-    if let Some(resource) = broker.resources.get("native_embedding_runtime")
-        && resource.status != "available"
-    {
-        let next = match resource.status.as_str() {
-            "stale" => "retry repair to reclaim stale native embedding lock",
-            "busy" => "wait for active owner repair, or stop an incompatible full owner runtime",
-            _ => "inspect broker snapshot",
-        };
-        let _ = writeln!(
-            markdown,
-            "readiness_broker_resource: native_embedding_runtime status={} owner_project={} owner_pid={} next={}",
-            resource.status,
-            resource.owner_project_id.as_deref().unwrap_or("unknown"),
-            resource
-                .owner_pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            next
-        );
-    }
-    if let Some(proof) = broker.gpu_proof.as_ref()
-        && proof.proof_status != "unknown"
-    {
-        let _ = writeln!(
-            markdown,
-            "readiness_broker_gpu: status={} requested_provider={} requested_device={} observed={} cpu_allowed={}",
-            proof.proof_status,
-            proof.requested_provider.as_deref().unwrap_or("none"),
-            proof.requested_device.as_deref().unwrap_or("none"),
-            proof.observed_state.as_deref().unwrap_or("unknown"),
-            proof.cpu_allowed
-        );
-    }
-}
-
-pub(crate) fn render_fix_markdown(output: &FixOutput) -> String {
-    let mut markdown = String::new();
-    let _ = writeln!(markdown, "# Fix");
-    let _ = writeln!(markdown, "status: `{}`", output.status);
-    let _ = writeln!(markdown, "action: `{}`", output.action);
-    let _ = writeln!(
-        markdown,
-        "goal: `{}`",
-        crate::readiness::goal_label(output.goal)
-    );
-    markdown.push_str(&render_ready_markdown(&output.result));
     markdown
 }
 
 fn append_readiness_verdicts(
     markdown: &mut String,
     verdicts: &[codestory_contracts::api::ReadinessVerdictDto],
-    include_full_repair: bool,
 ) {
     if verdicts.is_empty() {
         return;
@@ -301,9 +211,6 @@ fn append_readiness_verdicts(
             verdict.summary
         );
         append_verdict_commands(markdown, "minimum_next", &verdict.minimum_next);
-        if include_full_repair && verdict.full_repair != verdict.minimum_next {
-            append_verdict_commands(markdown, "full_repair", &verdict.full_repair);
-        }
     }
 }
 
@@ -893,7 +800,7 @@ fn search_operator_proof_tier(output: &SearchOutput) -> &'static str {
         .as_ref()
         .is_some_and(|shadow| shadow.retrieval_mode == "full")
     {
-        "full_sidecar_search"
+        "full_retrieval_search"
     } else if output.retrieval.semantic_ready {
         "local_hybrid_search"
     } else {
@@ -2324,10 +2231,7 @@ pub(crate) fn render_doctor_markdown(output: &DoctorOutput) -> String {
         doctor_local_navigation_readiness(output),
         doctor_agent_packet_search_readiness(output)
     );
-    append_readiness_verdicts(&mut markdown, &output.readiness, true);
-    if let Some(broker) = output.readiness_broker.as_ref() {
-        append_readiness_broker(&mut markdown, broker);
-    }
+    append_readiness_verdicts(&mut markdown, &output.readiness);
     if let Some(retrieval) = output.retrieval.as_ref() {
         let _ = writeln!(
             markdown,
@@ -2419,7 +2323,7 @@ fn doctor_operator_status(output: &DoctorOutput) -> &'static str {
 
 fn doctor_operator_trust(output: &DoctorOutput) -> String {
     format!(
-        "local_navigation={} agent_packet_search={} sidecar_mode={} degraded_reason={} embedding_device_policy={} observed_device={}",
+        "local_navigation={} agent_packet_search={} retrieval_mode={} degraded_reason={} embedding_device_policy={} observed_device={}",
         doctor_local_navigation_readiness(output),
         doctor_agent_packet_search_readiness(output),
         output.retrieval_mode,
@@ -3805,7 +3709,7 @@ mod tests {
             stats: sample_storage_stats(),
             retrieval_mode: "full".to_string(),
             degraded_reason: None,
-            sidecar_retrieval: crate::args::DoctorSidecarStatusOutput {
+            sidecar_retrieval: crate::args::RetrievalStatusOutput {
                 profile: Some("local".to_string()),
                 run_id: None,
                 retrieval_mode: "full".to_string(),
@@ -3830,7 +3734,6 @@ mod tests {
             freshness: None,
             readiness: Vec::new(),
             readiness_lanes: std::collections::BTreeMap::new(),
-            readiness_broker: None,
             checks: Vec::new(),
             next_commands: Vec::new(),
             environment: Vec::new(),

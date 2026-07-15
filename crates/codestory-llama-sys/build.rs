@@ -1,0 +1,124 @@
+use sha2::{Digest, Sha256};
+use std::env;
+use std::fs::{self, File};
+use std::io::{self, BufReader, Read};
+use std::path::{Path, PathBuf};
+
+const MODEL_FILE_NAME: &str = "bge-base-en-v1.5.Q8_0.gguf";
+const MODEL_SIZE: u64 = 117_974_304;
+const MODEL_SHA256: &str = "ad1afe72cd6654a558667a3db10878b049a75bfd72912e1dabb91310d671173c";
+const PRODUCT_EMBEDDING_RUNTIME_FAMILY: &str = "inprocess:bge-base-en-v1.5:q8_0";
+const LLAMA_CPP_CRATE_VERSION: &str = "0.1.151";
+const LLAMA_CPP_SOURCE_COMMIT: &str = "9e3b928fd8c9d14dbf15a8768b9fdd7e5c721d66";
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=CODESTORY_EMBED_MODEL_SOURCE");
+    let target = env::var("TARGET").expect("Cargo sets TARGET");
+    let backend = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("macos") => "metal",
+        Ok("windows" | "linux") => "vulkan",
+        _ => "cpu",
+    };
+    let ggml_build_identity = format!(
+        "llama-cpp-sys-2@{LLAMA_CPP_CRATE_VERSION}+llama.cpp@{LLAMA_CPP_SOURCE_COMMIT}+{backend}+{target}"
+    );
+    let product_embedding_runtime_id = format!(
+        "{PRODUCT_EMBEDDING_RUNTIME_FAMILY}:sha256-{MODEL_SHA256}:llama.cpp-{LLAMA_CPP_SOURCE_COMMIT}"
+    );
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    fs::write(
+        out_dir.join("model_contract.rs"),
+        format!(
+            "pub const MODEL_FILE_NAME: &str = {MODEL_FILE_NAME:?};\n\
+             pub const MODEL_SIZE: u64 = {MODEL_SIZE};\n\
+             pub const MODEL_SHA256: &str = {MODEL_SHA256:?};\n\
+             pub const LLAMA_CPP_CRATE_VERSION: &str = {LLAMA_CPP_CRATE_VERSION:?};\n\
+             pub const LLAMA_CPP_SOURCE_COMMIT: &str = {LLAMA_CPP_SOURCE_COMMIT:?};\n\
+             pub const GGML_BUILD_IDENTITY: &str = {ggml_build_identity:?};\n\
+             pub const PRODUCT_EMBEDDING_RUNTIME_ID: &str = {product_embedding_runtime_id:?};\n"
+        ),
+    )
+    .expect("write embedding model contract");
+    let generated = out_dir.join("embedded_model.rs");
+    let source = env::var_os("CODESTORY_EMBED_MODEL_SOURCE").map(PathBuf::from);
+
+    match source {
+        Some(source) => {
+            println!("cargo:rerun-if-changed={}", source.display());
+            verify_model(&source).unwrap_or_else(|error| {
+                panic!(
+                    "invalid CODESTORY_EMBED_MODEL_SOURCE {}: {error}",
+                    source.display()
+                )
+            });
+
+            let destination = out_dir.join(MODEL_FILE_NAME);
+            fs::copy(&source, &destination).unwrap_or_else(|error| {
+                panic!(
+                    "failed to stage embedded model {}: {error}",
+                    source.display()
+                )
+            });
+            fs::write(
+                &generated,
+                format!(
+                    "pub static EMBEDDED_MODEL_BYTES: &[u8] = include_bytes!(\"{MODEL_FILE_NAME}\");\n\
+                     pub const EMBEDDED_MODEL_COMPILED: bool = true;\n"
+                ),
+            )
+            .expect("write embedded model bindings");
+        }
+        None if env::var("DEBUG").as_deref() == Ok("false") => {
+            panic!(
+                "release builds require CODESTORY_EMBED_MODEL_SOURCE pointing to the checksum-pinned {MODEL_FILE_NAME}"
+            );
+        }
+        None => {
+            fs::write(
+                &generated,
+                "pub static EMBEDDED_MODEL_BYTES: &[u8] = &[];\n\
+                 pub const EMBEDDED_MODEL_COMPILED: bool = false;\n",
+            )
+            .expect("write development embedded model bindings");
+            println!(
+                "cargo:warning=codestory-llama-sys development build has no embedded model; set CODESTORY_EMBED_MODEL_SOURCE to exercise it"
+            );
+        }
+    }
+}
+
+fn verify_model(path: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("path is not a regular file".into());
+    }
+    if metadata.len() != MODEL_SIZE {
+        return Err(format!(
+            "size mismatch: expected {MODEL_SIZE} bytes, found {}",
+            metadata.len()
+        ));
+    }
+
+    let digest = sha256_file(path).map_err(|error| error.to_string())?;
+    if digest != MODEL_SHA256 {
+        return Err(format!(
+            "SHA-256 mismatch: expected {MODEL_SHA256}, found {digest}"
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}

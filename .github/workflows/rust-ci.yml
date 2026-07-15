@@ -7,6 +7,7 @@ on:
       - Cargo.toml
       - crates/**
       - .github/scripts/check-runtime-config-boundary.mjs
+      - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/route-ci-proof.mjs
       - .github/workflows/rust-ci.yml
@@ -33,6 +34,9 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
+      - name: Install Linux Vulkan build dependencies
+        run: bash .github/scripts/install-linux-vulkan-build-deps.sh
+
       - name: Capture Rust cache identity
         id: rust-cache-key
         shell: bash
@@ -50,8 +54,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-draft-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-draft-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-
 
       - name: Check formatting
         run: cargo fmt --check
@@ -72,7 +74,7 @@ jobs:
           cargo test --locked -p codestory-store staged_promotion_abort_recovers_old_or_complete_new_and_cleans_artifacts -- --nocapture
 
       - name: Save Cargo inputs and output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

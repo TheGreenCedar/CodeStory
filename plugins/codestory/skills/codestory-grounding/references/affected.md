@@ -31,7 +31,7 @@ repo gates.
 |------|---------|-----------------|
 | Current diff | `<codestory-cli> affected --project <target-workspace> --format markdown` | Impact summary based on `git diff --name-status HEAD`. |
 | Explicit paths | `<codestory-cli> affected --project <target-workspace> src/lib.rs --depth 3 --format json` | Matched/unmatched paths, impacted symbols, impacted routes/endpoints, likely tests, blind spots, and next commands. |
-| MCP explicit paths | `tools/call affected` with `changed_paths` or `change_records` | Same local-index impact DTO; stdio never discovers git changes, refreshes, indexes, or bootstraps sidecars. |
+| MCP explicit paths | `tools/call affected` with `changed_paths` or `change_records` | Same local-index impact DTO; stdio never discovers git changes, refreshes, indexes, or bootstraps retrievals. |
 | Stdin paths | `git diff --name-only HEAD | <codestory-cli> affected --project <target-workspace> --stdin` | Same analysis using external path selection. |
 | Stdin status | `git diff --name-status HEAD | <codestory-cli> affected --project <target-workspace> --stdin --stdin-format name-status --format json` | Preserves add/modify/delete/rename/copy status in `change_records`. |
 

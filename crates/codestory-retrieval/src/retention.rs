@@ -1195,7 +1195,7 @@ mod tests {
             built_at_epoch_ms,
             disk_bytes: None,
             degraded_modes_json: "[]".into(),
-            embedding_backend: Some("llamacpp:bge-base-en-v1.5".into()),
+            embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
             embedding_dim: Some(768),
             sidecar_schema_version: Some(2),
             sidecar_input_hash: Some(suffix.repeat(4)),
@@ -1252,8 +1252,6 @@ mod tests {
             profile,
             run_id: None,
             namespace: "test".into(),
-            embed_http_port: 0,
-            cleanup_command: String::new(),
             ..SidecarRuntimeConfig::local()
         };
         let local = runtime(
@@ -1263,7 +1261,7 @@ mod tests {
         let agent = runtime(
             SidecarProfile::Agent,
             root.path()
-                .join("sidecars")
+                .join("retrieval")
                 .join("codestory-agent-test")
                 .join("retrieval-sidecars.json"),
         );

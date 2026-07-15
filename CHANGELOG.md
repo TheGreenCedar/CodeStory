@@ -4,38 +4,31 @@
 
 ### Changed
 
-- Managed retrieval stores generation-bound dense vectors in embedded SQLite
-  and uses the checksum-pinned native llama.cpp runtime on every supported
-  platform. Apple Silicon uses Metal; Intel installs the managed CPU runtime
-  automatically and never claims Metal. Search traces describe the semantic
-  capability without exposing its storage engine.
-- Delegated worktree setup now prepares and reports the local repository map
-  without attempting full retrieval or printing backend repair instructions.
-  Maintainers can request that separate proof explicitly with
-  `--full-retrieval-proof` (or `-FullRetrievalProof` in PowerShell).
-- Cold and stale repositories now present `ground`, `files`, and `affected` as
-  direct activation paths. One grounding call builds or refreshes the local map;
-  agents no longer get sent through a status loop before repository navigation.
-- CodeStory now reuses a verified managed search runtime across projects and
-  worktrees without requiring a second project-local model copy. Borrower
-  handoff is serialized with owner shutdown, attached projects cannot stop the
-  shared process, and temporary contention is reported as background search
-  preparation without process or workspace details.
-- Managed search is now automatic and invisible in normal plugin use. Public
-  setup, repair, enable, disable, and consent controls are gone; broad tools
-  prepare their dependencies and return one same-tool retry while work is in
-  progress. Diagnostics remain available when automatic recovery cannot
-  converge.
-- Plugin sessions now expose the stable CodeStory tool catalog before managed
-  installation finishes, route directly from task intent, and inject only one
-  bounded session contract. Status is observational and compact; tool text
-  remains useful on hosts that do not render structured results, while large
-  file, symbol, search, and impact payloads are capped with explicit counts.
-- The pinned search model and native backend are now verified and published in
-  one machine-wide cache. Repositories and worktrees reuse the same immutable
-  assets; concurrent first use is serialized, interrupted or corrupt payloads
-  are quarantined, and normal search preparation downloads missing assets
-  without a setup prompt.
+- CodeStory now links llama.cpp/ggml into the CLI and embeds the checksum-pinned
+  BGE-base-en-v1.5 Q8 model in the release executable. Retrieval performs no
+  model or backend download and starts no helper process.
+- One lazily initialized engine and accelerator context is shared by every
+  repository in a multi-project process. Apple Silicon uses Metal; Windows and
+  supported Linux hardware use Vulkan. CPU requires the explicit
+  `CODESTORY_EMBED_ALLOW_CPU=1` policy and is never a silent fallback.
+- Retrieval health now binds the exact model digest and ggml build, backend and
+  physical adapter, live embedding smoke, policy, process engine identity,
+  model load count, materialization reuse, and accelerator layer-offload proof.
+  Ordinary plugin UX reports only whether retrieval is ready.
+- Existing semantic generations from another producer rebuild once under the
+  in-process identity. Endpoint configuration, downloads, port leases, PID
+  ownership, server logs, repair workers, shutdown supervision, and interactive
+  approval language have been removed.
+- Windows vector publication now flushes a writable durability handle, and
+  model hashing uses heap storage instead of depending on an enlarged build
+  script stack.
+- Packaged proof runs offline from one executable, verifies Metal or Vulkan on
+  protected hardware, exercises two repositories through one warm engine, and
+  proves content-addressed model reuse after restart. Hosted jobs install the
+  pinned Vulkan build contract, use the explicit CPU policy, and make no
+  acceleration claim; Linux x64 proof retains the glibc 2.31 baseline.
+- Delegated worktree setup uses `retrieval index` for its optional full proof
+  and no longer enters an embedding repair lifecycle.
 
 ## 0.15.0
 

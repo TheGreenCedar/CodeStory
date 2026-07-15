@@ -557,16 +557,18 @@ fn packet_search_live_eval_uses_fixed_run_id() {
         live_eval_env(),
         [
             ("CODESTORY_RETRIEVAL_PROFILE", "agent"),
-            ("CODESTORY_SIDECAR_RUN_ID", LIVE_EVAL_RUN_ID)
+            ("CODESTORY_RETRIEVAL_RUN_ID", LIVE_EVAL_RUN_ID)
         ]
     );
     assert_eq!(
         live_eval_ready_args(),
         [
-            "ready",
-            "--goal",
+            "retrieval",
+            "index",
+            "--profile",
             "agent",
-            "--repair",
+            "--refresh",
+            "auto",
             "--run-id",
             LIVE_EVAL_RUN_ID,
             "--format",
@@ -604,7 +606,7 @@ fn packet_search_live_eval_uses_fixed_run_id() {
     assert!(
         search
             .get_envs()
-            .any(|(name, value)| name == "CODESTORY_SIDECAR_RUN_ID"
+            .any(|(name, value)| name == "CODESTORY_RETRIEVAL_RUN_ID"
                 && value == Some(std::ffi::OsStr::new(LIVE_EVAL_RUN_ID))),
         "search subprocess must inherit the fixed live eval run id"
     );
@@ -812,12 +814,14 @@ fn packet_search_eval_live_runs_production_cli_path() {
     );
 }
 
-fn live_eval_ready_args() -> [&'static str; 8] {
+fn live_eval_ready_args() -> [&'static str; 10] {
     [
-        "ready",
-        "--goal",
+        "retrieval",
+        "index",
+        "--profile",
         "agent",
-        "--repair",
+        "--refresh",
+        "auto",
         "--run-id",
         LIVE_EVAL_RUN_ID,
         "--format",
@@ -841,7 +845,7 @@ fn live_eval_status_args() -> [&'static str; 8] {
 fn live_eval_env() -> [(&'static str, &'static str); 2] {
     [
         ("CODESTORY_RETRIEVAL_PROFILE", "agent"),
-        ("CODESTORY_SIDECAR_RUN_ID", LIVE_EVAL_RUN_ID),
+        ("CODESTORY_RETRIEVAL_RUN_ID", LIVE_EVAL_RUN_ID),
     ]
 }
 

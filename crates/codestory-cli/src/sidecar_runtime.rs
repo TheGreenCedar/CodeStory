@@ -6,10 +6,10 @@
 //! to the platform `ProjectDirs` cache.
 
 #[cfg(test)]
+use codestory_retrieval::SidecarProfile;
+#[cfg(test)]
 use codestory_retrieval::SidecarRuntimeDefaults;
-use codestory_retrieval::{
-    SidecarProcessDefaults, SidecarProfile, SidecarRuntimeConfig, SidecarRuntimeOverrides,
-};
+use codestory_retrieval::{SidecarProcessDefaults, SidecarRuntimeConfig, SidecarRuntimeOverrides};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -36,7 +36,7 @@ fn with_default_test_cache_root<T>(task: impl FnOnce() -> T) -> T {
                 let root = std::env::temp_dir()
                     .join("codestory-cli-unit-tests")
                     .join(format!("{}-{nonce}", std::process::id()));
-                std::fs::create_dir_all(root.join("sidecars"))
+                std::fs::create_dir_all(root.join("retrieval"))
                     .expect("create CLI unit-test cache root");
                 root
             })
@@ -63,6 +63,7 @@ pub(crate) fn user_cache_root() -> PathBuf {
     process_defaults().cache_root().to_path_buf()
 }
 
+#[cfg(test)]
 pub(crate) fn local() -> SidecarRuntimeConfig {
     let defaults = process_defaults();
     SidecarRuntimeConfig::for_project_profile_with_process_defaults(
@@ -79,17 +80,7 @@ pub(crate) fn embedding_runtime_id() -> String {
     codestory_retrieval::embedding_runtime_id_for_runtime(&local())
 }
 
-pub(crate) fn for_project(project_root: &Path, profile: SidecarProfile) -> SidecarRuntimeConfig {
-    let defaults = process_defaults();
-    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
-        Some(project_root),
-        profile,
-        None,
-        &defaults,
-        &SidecarRuntimeOverrides::default(),
-    )
-}
-
+#[cfg(test)]
 pub(crate) fn for_project_with_run_id(
     project_root: &Path,
     profile: SidecarProfile,
@@ -120,27 +111,6 @@ pub(crate) fn spawn_with_cache_access<T: Send + 'static>(
 ) -> std::thread::JoinHandle<T> {
     let root = user_cache_root();
     std::thread::spawn(move || codestory_retrieval::with_test_cache_root(&root, task))
-}
-
-#[cfg(test)]
-pub(crate) fn for_project_with_run_id_in_cache(
-    project_root: Option<&Path>,
-    profile: SidecarProfile,
-    run_id: Option<&str>,
-    cache_root: &Path,
-) -> SidecarRuntimeConfig {
-    prepare_cache_access();
-    let defaults = SidecarProcessDefaults::new(
-        cache_root.to_path_buf(),
-        SidecarRuntimeDefaults::from_process_env(),
-    );
-    SidecarRuntimeConfig::for_project_profile_with_process_defaults(
-        project_root,
-        profile,
-        run_id,
-        &defaults,
-        &SidecarRuntimeOverrides::default(),
-    )
 }
 
 #[cfg(test)]

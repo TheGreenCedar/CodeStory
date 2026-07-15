@@ -1210,8 +1210,8 @@ static SYMBOLS_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::string("parent_id", "Parent node id.").with_min_length(1),
         SchemaProperty::integer("limit", "Maximum root symbols returned.")
-            .with_default(ValueLiteral::Integer(50))
-            .with_bounds(1, 200),
+            .with_default(ValueLiteral::Integer(300))
+            .with_bounds(1, 2000),
     ],
     &[],
 );

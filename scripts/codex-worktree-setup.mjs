@@ -572,16 +572,14 @@ function findRehydrateSource(context, projectPath) {
 
 function fullRetrievalProofArguments(projectPath) {
   return [
-    "ready",
-    "--goal",
-    "agent",
-    "--repair",
+    "retrieval",
+    "index",
     "--project",
     projectPath,
+    "--refresh",
+    "full",
     "--format",
     "json",
-    "--run-id",
-    "shared-agent",
   ];
 }
 
@@ -590,19 +588,16 @@ export function setupSummaryLines(doctor, cliVersion, fullRetrievalProof) {
   const local = verdict("local_navigation");
   const agent = verdict("agent_packet_search");
   const repositoryMap = local?.status === "ready" ? "ready" : "needs_attention";
-  const activePreparation = (doctor.readiness_broker?.operations || []).length > 0;
-  const backgroundPreparation = agent?.status === "ready" && doctor.retrieval_mode === "full"
+  const retrieval = agent?.status === "ready" && doctor.retrieval_mode === "full"
     ? "ready"
-    : activePreparation
-      ? "in_progress"
-      : fullRetrievalProof
-        ? "needs_attention"
-        : "not_requested";
+    : fullRetrievalProof
+      ? "needs_attention"
+      : "not_requested";
   const lines = [
     "CodeStory worktree setup complete",
     `  cli_version: ${cliVersion}`,
     `  repository_map: ${repositoryMap}`,
-    `  background_preparation: ${backgroundPreparation}`,
+    `  retrieval: ${retrieval}`,
   ];
   return lines;
 }

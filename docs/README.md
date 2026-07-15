@@ -41,7 +41,7 @@ evidence.
 | Local dev setup and verification lanes | [Contributor setup](contributors/getting-started.md) |
 | Which test proves a claim | [Testing matrix](contributors/testing-matrix.md) |
 | How CodeStory works internally | [Architecture overview](architecture/overview.md) |
-| Sidecar operations and repair | [Retrieval sidecars ops](ops/retrieval-sidecars.md) |
+| In-process retrieval operations | [Retrieval engine](ops/retrieval-engine.md) |
 | Retrieval design and promotion | [Retrieval design](architecture/retrieval-design.md), [Retrieval architecture guide](testing/retrieval-architecture.md) |
 | Language support claims | [Language support](architecture/language-support.md) |
 | Timing and benchmark records | [E2E stats log](testing/codestory-e2e-stats-log.md), [language-expansion holdout stats](testing/language-expansion-holdout-stats.md) |
@@ -53,7 +53,7 @@ evidence.
 | Question | Start here | Then read |
 | --- | --- | --- |
 | Where do I start as a user? | [User guides](users/README.md) | Your host page under `users/` |
-| How do I repair readiness? | [Troubleshooting](users/troubleshooting.md) | [Retrieval sidecars ops](ops/retrieval-sidecars.md) |
+| How do I diagnose readiness? | [Troubleshooting](users/troubleshooting.md) | [Retrieval engine](ops/retrieval-engine.md) |
 | How does CodeStory work internally? | [Architecture overview](architecture/overview.md) | [Runtime execution path](architecture/runtime-execution-path.md) |
 | Which test proves my docs change? | [Testing matrix - Docs-only fast path](contributors/testing-matrix.md#docs-only-fast-path) | [Contributor setup](contributors/getting-started.md) |
 | What does a term mean? | [Glossary](glossary.md) | Linked owner page for that concept |

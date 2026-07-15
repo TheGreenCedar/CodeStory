@@ -109,18 +109,24 @@ export function cacheProvenanceBlockers(result) {
     reasons.push("missing CodeStory cache policy");
   }
   if (provenance.cache_policy === "unprepared-cache-blocked") {
-    reasons.push("CodeStory sidecar cache was not prepared");
+    reasons.push("CodeStory retrieval cache was not prepared");
   }
   if (provenance.retrieval_mode !== "full") {
     reasons.push(`CodeStory retrieval mode=${provenance.retrieval_mode ?? "unknown"}; expected full`);
   }
-  if (!provenance.sidecar_generation) {
-    reasons.push("missing CodeStory sidecar generation");
+  if (!provenance.semantic_generation) {
+    reasons.push("missing CodeStory semantic generation");
   }
-  if (provenance.manifest_embedding_backend !== "llamacpp:bge-base-en-v1.5") {
+  if (!String(provenance.manifest_embedding_backend ?? "").startsWith("inprocess:bge-base-en-v1.5:q8_0:sha256-")) {
     reasons.push(
-      `CodeStory sidecar embedding backend=${provenance.manifest_embedding_backend ?? "unknown"}; expected llamacpp:bge-base-en-v1.5`,
+      `CodeStory embedding runtime=${provenance.manifest_embedding_backend ?? "unknown"}; expected the pinned in-process BGE runtime`,
     );
+  }
+  if (!provenance.embedding_engine_instance_id) {
+    reasons.push("missing CodeStory embedding engine identity");
+  }
+  if (!["accelerated", "cpu_explicit"].includes(provenance.embedding_policy)) {
+    reasons.push(`CodeStory embedding policy=${provenance.embedding_policy ?? "unknown"}; expected accelerated or cpu_explicit`);
   }
   if (provenance.semantic_backend == null) {
     reasons.push("missing CodeStory semantic backend");

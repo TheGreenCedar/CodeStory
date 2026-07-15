@@ -43,7 +43,7 @@ pub struct RetrievalIndexManifest {
     pub built_at_epoch_ms: i64,
     pub disk_bytes: Option<i64>,
     pub degraded_modes_json: String,
-    /// e.g. `llamacpp:bge-base-en-v1.5` or `hash-projection:768`.
+    /// e.g. an in-process model/build identity or a test-only hash projection.
     pub embedding_backend: Option<String>,
     pub embedding_dim: Option<i32>,
     /// Version of the sidecar input hash/generation contract.

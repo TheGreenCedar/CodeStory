@@ -1,17 +1,14 @@
 use anyhow::{Context, Result};
 use codestory_contracts::api::IndexMode;
-use std::time::Duration;
 
 use codestory_retrieval::{
     FinalizeIndexOutcome, QueryRequest, RetrievalIndexManifest, RetrievalStatusReport,
-    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarProfile, SidecarRuntimeConfig,
-    sidecar_up_with_runtime_preserving_launch, strict_sidecar_status_for_runtime,
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarRuntimeConfig, strict_sidecar_status_for_runtime,
 };
 
 use crate::args::{
-    CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalBootstrapCommand,
-    RetrievalCommand, RetrievalIndexCommand, RetrievalInventoryCommand,
-    RetrievalPrewarmAssetsCommand, RetrievalQueryCommand, RetrievalSidecarStateCommand,
+    CliSidecarProfile, OutputFormat, RefreshMode, RetrievalAction, RetrievalCommand,
+    RetrievalIndexCommand, RetrievalInventoryCommand, RetrievalQueryCommand,
     RetrievalStatusCommand,
 };
 use crate::output::{emit, validate_output_file_parent};
@@ -19,130 +16,11 @@ use crate::runtime::{RuntimeContext, ensure_index_ready, map_api_error, resolve_
 
 pub(crate) fn run_retrieval(cmd: RetrievalCommand) -> Result<()> {
     match cmd.action {
-        RetrievalAction::Bootstrap(bootstrap_cmd) => run_retrieval_bootstrap(bootstrap_cmd),
-        RetrievalAction::PrewarmAssets(prewarm_cmd) => run_retrieval_prewarm_assets(prewarm_cmd),
-        RetrievalAction::Up(up_cmd) => run_retrieval_up(up_cmd),
-        RetrievalAction::Down(down_cmd) => run_retrieval_down(down_cmd),
         RetrievalAction::Status(status_cmd) => run_retrieval_status(status_cmd),
         RetrievalAction::Inventory(inventory_cmd) => run_retrieval_inventory(inventory_cmd),
         RetrievalAction::Index(index_cmd) => run_retrieval_index(index_cmd),
         RetrievalAction::Query(query_cmd) => run_retrieval_query(query_cmd),
     }
-}
-
-fn run_retrieval_prewarm_assets(cmd: RetrievalPrewarmAssetsCommand) -> Result<()> {
-    let report = codestory_retrieval::prewarm_managed_assets(
-        cmd.model,
-        cmd.native_backend,
-        cmd.llama_backend.as_deref(),
-    )?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
-}
-
-fn run_retrieval_bootstrap(cmd: RetrievalBootstrapCommand) -> Result<()> {
-    preflight_output(cmd.output_file.as_deref())?;
-    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let sidecar_profile = cmd.profile;
-    let mut sidecar = runtime.sidecar.with_profile_and_run_id(
-        Some(&runtime.project_root),
-        sidecar_profile.into(),
-        cmd.run_id.as_deref(),
-    );
-    let broker_scope = crate::readiness_broker::operation_scope(
-        &runtime.project_root,
-        sidecar.profile.as_str(),
-        sidecar.run_id.as_deref(),
-        "retrieval_bootstrap",
-        env!("CARGO_PKG_VERSION"),
-    );
-    let (report, status) = crate::readiness_broker::run_with_native_embedding_lease_lifecycle(
-        crate::readiness_broker::NativeEmbeddingLeaseLifecycleParams {
-            scope: &broker_scope,
-            sidecar: &mut sidecar,
-            resource: crate::readiness_broker::NATIVE_EMBEDDING_RESOURCE,
-            wait: Duration::from_secs(30),
-            poll: Duration::from_millis(250),
-            bootstrap_context: "retrieval bootstrap",
-            sidecar_cleanup_label: "retrieval sidecar",
-        },
-        |selected_sidecar,
-         allow_native_embedding_spawn,
-         reusable_native_embedding_launch,
-         observe_new_native_launch| {
-            codestory_retrieval::bootstrap_sidecars_with_runtime_progress_and_native_launch_observer(
-                selected_sidecar,
-                codestory_retrieval::BootstrapSidecarsOptions {
-                    wait_timeout: Duration::from_secs(cmd.wait_secs),
-                    allow_native_embedding_spawn,
-                    reusable_native_embedding_launch: reusable_native_embedding_launch.cloned(),
-                },
-                |_| {},
-                observe_new_native_launch,
-            )
-        },
-        |report| &report.state,
-        |report, selected_sidecar| {
-            let status = strict_sidecar_status_for_runtime(
-                &runtime.project_root,
-                Some(&runtime.storage_path),
-                selected_sidecar.clone(),
-            )
-            .context("retrieval status after bootstrap")?;
-            Ok((report, status))
-        },
-    )?;
-    let readiness_broker = crate::readiness_broker::refresh_broker_snapshot(
-        crate::readiness_broker::BrokerSnapshotInput {
-            project_root: runtime.project_root.clone(),
-            cache_root: runtime.cache_root.clone(),
-            agent_run_id: sidecar.run_id.clone(),
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: Some(broker_gpu_proof_input_from_status(&status)),
-            reconciliation: None,
-        },
-    );
-    emit_retrieval_bootstrap(
-        cmd.format,
-        &report,
-        &status,
-        &readiness_broker,
-        cmd.output_file.as_deref(),
-    )
-}
-
-fn run_retrieval_up(cmd: RetrievalSidecarStateCommand) -> Result<()> {
-    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let sidecar = runtime.sidecar.with_profile_and_run_id(
-        Some(&runtime.project_root),
-        cmd.profile.into(),
-        cmd.run_id.as_deref(),
-    );
-    let state = sidecar_up_with_runtime_preserving_launch(&sidecar).context("retrieval up")?;
-    println!("{}", serde_json::to_string_pretty(&state)?);
-    Ok(())
-}
-
-fn run_retrieval_down(cmd: RetrievalSidecarStateCommand) -> Result<()> {
-    let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
-    let sidecar = runtime.sidecar.with_profile_and_run_id(
-        Some(&runtime.project_root),
-        cmd.profile.into(),
-        cmd.run_id.as_deref(),
-    );
-    crate::readiness_broker::sidecar_down_with_native_embedding_handoff(
-        &runtime.cache_root,
-        &sidecar,
-    )
-    .context("retrieval down")?;
-    println!("retrieval sidecar state cleared");
-    Ok(())
-}
-
-fn broker_gpu_proof_input_from_status(
-    status: &RetrievalStatusReport,
-) -> crate::readiness_broker::BrokerGpuProofInput {
-    crate::broker_gpu_proof_input_from_report(status)
 }
 
 pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
@@ -151,16 +29,12 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
     let profile = cmd
         .profile
         .or_else(|| cmd.run_id.as_ref().map(|_| CliSidecarProfile::Agent));
-    let mut agent_run_id = None;
     let report = if let Some(profile) = profile {
         let sidecar = runtime.sidecar.with_profile_and_run_id(
             Some(&runtime.project_root),
             profile.into(),
             cmd.run_id.as_deref(),
         );
-        if profile == CliSidecarProfile::Agent {
-            agent_run_id = sidecar.run_id.clone();
-        }
         codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
@@ -174,22 +48,7 @@ pub(crate) fn run_retrieval_status(cmd: RetrievalStatusCommand) -> Result<()> {
         )
     }
     .context("retrieval status")?;
-    let readiness_broker = crate::readiness_broker::observe_broker_snapshot(
-        crate::readiness_broker::BrokerSnapshotInput {
-            project_root: runtime.project_root.clone(),
-            cache_root: runtime.cache_root.clone(),
-            agent_run_id,
-            cli_version: env!("CARGO_PKG_VERSION").to_string(),
-            gpu_proof: Some(broker_gpu_proof_input_from_status(&report)),
-            reconciliation: None,
-        },
-    );
-    emit_retrieval_status(
-        cmd.format,
-        &report,
-        &readiness_broker,
-        cmd.output_file.as_deref(),
-    )
+    emit_retrieval_status(cmd.format, &report, cmd.output_file.as_deref())
 }
 
 pub(crate) fn run_retrieval_inventory(cmd: RetrievalInventoryCommand) -> Result<()> {
@@ -241,10 +100,6 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     let summary = runtime.open_project_summary()?;
     let refresh_mode = resolve_refresh_request(cmd.refresh, &summary);
     ensure_retrieval_index_embedding_policy(&sidecar)?;
-    if sidecar.profile == SidecarProfile::Agent {
-        codestory_retrieval::ensure_embedding_accelerator_smoke_for_runtime(&sidecar)
-            .context("retrieval index GPU pre-repair gate")?;
-    }
     run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
     let outcome =
         finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar).or_else(|error| {
@@ -258,7 +113,6 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
             finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar)
                 .context("retrieval index finalize after semantic-doc contract repair")
         })?;
-    ensure_local_profile_handoff(&runtime, &sidecar, &outcome)?;
     emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
 }
 
@@ -311,67 +165,6 @@ pub(crate) fn finalize_retrieval_index_for_sidecar_runtime(
         sidecar,
     )
     .context("retrieval index finalize")
-}
-
-fn ensure_local_profile_handoff(
-    runtime: &RuntimeContext,
-    indexed_sidecar: &SidecarRuntimeConfig,
-    outcome: &FinalizeIndexOutcome,
-) -> Result<()> {
-    if indexed_sidecar.profile != SidecarProfile::Local {
-        return Ok(());
-    }
-    let default_sidecar = runtime.sidecar.clone();
-    if let Some(mismatch) = sidecar_runtime_mismatch(indexed_sidecar, &default_sidecar) {
-        anyhow::bail!("{mismatch}");
-    }
-    let status = strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        default_sidecar,
-    )
-    .context("retrieval local/default status after index")?;
-    if !status.is_live_ready() {
-        anyhow::bail!(
-            "retrieval profile handoff failed: local/default status after index is mode={} reason={}; indexed_project_id={} sidecar={}",
-            status.retrieval_mode,
-            status.degraded_reason.as_deref().unwrap_or("unknown"),
-            outcome.project_id,
-            format_sidecar_runtime(indexed_sidecar)
-        );
-    }
-    Ok(())
-}
-
-fn sidecar_runtime_mismatch(
-    indexed: &SidecarRuntimeConfig,
-    default: &SidecarRuntimeConfig,
-) -> Option<String> {
-    let same_paths = indexed.profile == default.profile
-        && indexed.namespace == default.namespace
-        && indexed.layout.lexical_data_dir == default.layout.lexical_data_dir
-        && indexed.layout.semantic_data_dir == default.layout.semantic_data_dir
-        && indexed.layout.scip_artifacts_root == default.layout.scip_artifacts_root
-        && indexed.layout.state_file == default.layout.state_file;
-    (!same_paths).then(|| {
-        format!(
-            "retrieval profile handoff mismatch: indexed local artifacts use {}; default bare retrieval resolves to {}; retrieval index must not report success until local/default namespace and paths match",
-            format_sidecar_runtime(indexed),
-            format_sidecar_runtime(default)
-        )
-    })
-}
-
-pub(crate) fn format_sidecar_runtime(runtime: &SidecarRuntimeConfig) -> String {
-    format!(
-        "profile={} namespace={} state={} lexical={} semantic={} scip={}",
-        runtime.profile.as_str(),
-        runtime.namespace,
-        runtime.layout.state_file.display(),
-        runtime.layout.lexical_data_dir.display(),
-        runtime.layout.semantic_data_dir.display(),
-        runtime.layout.scip_artifacts_root.display()
-    )
 }
 
 fn retrieval_index_should_retry_full_refresh(
@@ -454,69 +247,11 @@ fn emit_retrieval_query(
     emit(format, result, markdown, output_file)
 }
 
-#[derive(serde::Serialize)]
-struct RetrievalBootstrapOutput<'a> {
-    semantic_backend: &'static str,
-    embed_reachable: bool,
-    embed_detail: &'a str,
-    sidecar_state: &'a codestory_retrieval::SidecarStateFile,
-    project_status: &'a RetrievalStatusReport,
-    readiness_broker: &'a crate::readiness_broker::ReadinessBrokerSnapshot,
-}
-
-fn emit_retrieval_bootstrap(
-    format: OutputFormat,
-    report: &codestory_retrieval::BootstrapReport,
-    status: &RetrievalStatusReport,
-    readiness_broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
-    output_file: Option<&std::path::Path>,
-) -> Result<()> {
-    let payload = RetrievalBootstrapOutput {
-        semantic_backend: "embedded_sqlite",
-        embed_reachable: report.infrastructure.embed_reachable,
-        embed_detail: &report.infrastructure.embed_detail,
-        sidecar_state: &report.state,
-        project_status: status,
-        readiness_broker,
-    };
-    let markdown = format!(
-        "# Retrieval bootstrap\n\n- semantic_backend: `{}`\n- embed_reachable: {} ({})\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- retrieval_mode: `{}`",
-        payload.semantic_backend,
-        payload.embed_reachable,
-        payload.embed_detail,
-        report.infrastructure.embedding_device_policy,
-        report.infrastructure.embedding_device_state,
-        report.infrastructure.embedding_device_observation_source,
-        report.infrastructure.embedding_detected_provider.as_deref(),
-        report.infrastructure.embedding_detected_gpu.as_deref(),
-        report.infrastructure.embedding_accelerator_requested,
-        report
-            .infrastructure
-            .embedding_accelerator_request_provider
-            .as_deref(),
-        report
-            .infrastructure
-            .embedding_accelerator_request_device
-            .as_deref(),
-        report.infrastructure.embedding_cpu_allowed,
-        payload.project_status.retrieval_mode,
-    );
-    emit(format, &payload, markdown, output_file)
-}
-
 fn emit_retrieval_status(
     format: OutputFormat,
     report: &RetrievalStatusReport,
-    readiness_broker: &crate::readiness_broker::ReadinessBrokerSnapshot,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
-    let mut payload = serde_json::to_value(report)?;
-    if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "readiness_broker".to_string(),
-            serde_json::to_value(readiness_broker)?,
-        );
-    }
     let manifest_vector_embedding_backend = report
         .manifest_vector_embedding_backend
         .as_deref()
@@ -541,43 +276,8 @@ fn emit_retrieval_status(
             )
         })
         .unwrap_or_default();
-    let repair_note = report
-        .repair
-        .as_ref()
-        .map(|repair| {
-            format!(
-                "- repair: reason=`{}` next_step=\"{}\" next_command=`{}`\n",
-                repair.reason, repair.next_step, repair.next_command
-            )
-        })
-        .unwrap_or_default();
-    let ownership_note = report
-        .ownership
-        .as_ref()
-        .map(|ownership| {
-            format!(
-                "- ownership: owner=`{}` profile=`{}` namespace=`{}` cleanup=`{}` embed_port={}\n",
-                ownership.owner,
-                ownership.profile,
-                ownership.namespace,
-                ownership.cleanup_command,
-                ownership.ports.embed_http,
-            )
-        })
-        .unwrap_or_default();
-    let broker_note = format!(
-        "- readiness_broker: project_id={} persistence={} operations={} gpu_proof={}\n",
-        readiness_broker.project_id,
-        readiness_broker.persistence_status,
-        readiness_broker.operations.len(),
-        readiness_broker
-            .gpu_proof
-            .as_ref()
-            .map(|proof| proof.proof_status.as_str())
-            .unwrap_or("unknown")
-    );
     let markdown = format!(
-        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_embedding_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}{}{}{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
+        "# Retrieval status\n\n- retrieval_mode: `{}`\n- degraded_reason: {:?}\n- query_embedding_backend: `{}`\n- embedding_device_policy: `{}` observed_device=`{}` observation_source=`{}` detected_provider={:?} detected_gpu={:?} accelerator_requested={} accelerator_request_provider={:?} accelerator_request_device={:?} cpu_allowed={}\n- manifest_vector_embedding_backend: `{}` dim={:?}\n- stored_doc_vector_producer: `{}` dim={:?} mixed_backends={:?}\n{}- lexical: {:?} ({:?}) capabilities: lexical={}\n- semantic: {:?} ({:?}) capabilities: semantic={}\n- scip: {:?} ({:?}) capabilities: graph={}\n",
         report.retrieval_mode,
         report.degraded_reason,
         report.query_embedding_backend,
@@ -596,9 +296,6 @@ fn emit_retrieval_status(
         report.stored_doc_vector_dim,
         report.stored_doc_vector_mixed_backends,
         manifest_contract_note,
-        repair_note,
-        ownership_note,
-        broker_note,
         report.lexical.status,
         report.lexical.detail,
         report.lexical.capabilities.lexical,
@@ -609,7 +306,7 @@ fn emit_retrieval_status(
         report.scip.detail,
         report.scip.capabilities.graph,
     );
-    emit(format, &payload, markdown, output_file)
+    emit(format, report, markdown, output_file)
 }
 
 fn emit_retrieval_inventory(
@@ -638,36 +335,6 @@ fn emit_retrieval_inventory(
             ));
         }
     }
-    if report.namespaces.is_empty() {
-        markdown.push_str("\nNo sidecar namespaces found.\n");
-    }
-    for namespace in &report.namespaces {
-        markdown.push_str(&format!(
-            "\n## {}\n\n- state: `{:?}`\n- owner/profile: `{}` / `{}`\n- state_path: `{}`\n- cleanup_command: `{}`\n- age_ms: `{}`\n- model_dir: `{}` required_gguf=`{}` present={}\n",
-            namespace.namespace,
-            namespace.state,
-            namespace.owner.as_deref().unwrap_or("<unknown>"),
-            namespace.profile.as_deref().unwrap_or("<unknown>"),
-            namespace.state_path,
-            namespace.cleanup_command.as_deref().unwrap_or("<none>"),
-            namespace
-                .age_ms
-                .map(|age| age.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string()),
-            namespace.model.model_dir.as_deref().unwrap_or("<none>"),
-            namespace.model.required_gguf,
-            namespace.model.required_gguf_present,
-        ));
-        if !namespace.reasons.is_empty() {
-            markdown.push_str(&format!("- reasons: `{}`\n", namespace.reasons.join("; ")));
-        }
-        if let Some(reason) = namespace.safe_candidate_reason.as_deref() {
-            markdown.push_str(&format!("- safe_candidate_reason: `{reason}`\n"));
-        }
-        if let Some(reason) = namespace.blocking_reason.as_deref() {
-            markdown.push_str(&format!("- blocking_reason: `{reason}`\n"));
-        }
-    }
     emit(format, report, markdown, output_file)
 }
 
@@ -677,11 +344,8 @@ fn emit_retrieval_gc(
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut markdown = format!(
-        "# Retrieval runtime GC\n\n- dry_run: {}\n- cache_root: `{}`\n- removed: {}\n- blocked: {}\n",
-        report.dry_run,
-        report.cache_root,
-        report.removed.len(),
-        report.blocked.len()
+        "# Retrieval runtime GC\n\n- dry_run: {}\n- cache_root: `{}`\n",
+        report.dry_run, report.cache_root,
     );
     if let Some(retention) = report.generation_retention.as_ref() {
         markdown.push_str(&format!(
@@ -702,33 +366,6 @@ fn emit_retrieval_gc(
             ));
         }
     }
-    markdown.push_str("\n## Removed namespaces\n");
-    if report.removed.is_empty() {
-        markdown.push_str("\nNone.\n");
-    }
-    for namespace in &report.removed {
-        markdown.push_str(&format!(
-            "\n- `{}` ({:?}): {}; paths={}\n",
-            namespace.namespace,
-            namespace.state,
-            namespace.reason,
-            namespace.removed_paths.len(),
-        ));
-    }
-    markdown.push_str("\n## Blocked namespaces\n");
-    if report.blocked.is_empty() {
-        markdown.push_str("\nNone.\n");
-    }
-    for namespace in &report.blocked {
-        markdown.push_str(&format!(
-            "\n- `{}` ({:?}): {}",
-            namespace.namespace, namespace.state, namespace.reason
-        ));
-        if !namespace.errors.is_empty() {
-            markdown.push_str(&format!("; errors={}", namespace.errors.join("; ")));
-        }
-        markdown.push('\n');
-    }
     emit(format, report, markdown, output_file)
 }
 
@@ -736,7 +373,6 @@ fn emit_retrieval_gc(
 mod tests {
     use super::*;
     use anyhow::anyhow;
-    use std::ffi::OsString;
 
     #[test]
     fn auto_refresh_retries_full_for_semantic_doc_contract_drift() {
@@ -766,107 +402,5 @@ mod tests {
             RefreshMode::Auto,
             &error
         ));
-    }
-
-    #[test]
-    fn retrieval_index_embedding_policy_blocks_unknown_device_before_refresh() {
-        let _lock = crate::config::config_env_test_lock();
-        let _backend = EnvGuard::set("CODESTORY_EMBED_BACKEND", "llamacpp");
-        let _real = EnvGuard::set("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1");
-        let _allow_cpu = EnvGuard::remove("CODESTORY_EMBED_ALLOW_CPU");
-        let _policy = EnvGuard::remove("CODESTORY_EMBED_DEVICE_POLICY");
-        let _device = EnvGuard::remove("CODESTORY_EMBED_DEVICE_STATE");
-        let _host_detection = EnvGuard::set("CODESTORY_EMBED_DISABLE_HOST_GPU_DETECT", "1");
-        let sidecar = crate::sidecar_runtime::local();
-
-        let error = ensure_retrieval_index_embedding_policy(&sidecar)
-            .expect_err("unknown embedding device must block retrieval index refresh");
-        let message = format!("{error:#}");
-
-        assert!(
-            message.contains("retrieval index embedding device policy"),
-            "error should preserve direct retrieval-index context: {error:#}"
-        );
-        assert!(
-            message.contains("embedding_device_unverified"),
-            "unexpected error: {error:#}"
-        );
-    }
-
-    #[test]
-    fn sidecar_runtime_retains_backend_endpoint_profile_and_run_without_env_mutation() {
-        let _lock = crate::config::config_env_test_lock();
-        let _runtime_mode = EnvGuard::remove("CODESTORY_EMBED_RUNTIME_MODE");
-        let _backend = EnvGuard::remove("CODESTORY_EMBED_BACKEND");
-
-        let project = tempfile::TempDir::new().expect("project");
-        let sidecar = crate::sidecar_runtime::for_project_with_run_id(
-            project.path(),
-            SidecarProfile::Agent,
-            Some("packet-search-eval"),
-        );
-        let expected = codestory_retrieval::SidecarLayout::embed_base_url(sidecar.embed_http_port);
-
-        assert_eq!(sidecar.embedding.backend, "llamacpp");
-        assert_eq!(sidecar.embedding.endpoint, expected);
-        assert_eq!(sidecar.profile, SidecarProfile::Agent);
-        assert_eq!(sidecar.run_id.as_deref(), Some("packet-search-eval"));
-        assert!(std::env::var("CODESTORY_EMBED_BACKEND").is_err());
-        assert!(std::env::var("CODESTORY_EMBED_LLAMACPP_URL").is_err());
-    }
-
-    #[test]
-    fn local_profile_handoff_reports_default_namespace_path_mismatch() {
-        let project = tempfile::TempDir::new().expect("project");
-        let local = crate::sidecar_runtime::for_project(project.path(), SidecarProfile::Local);
-        let agent = crate::sidecar_runtime::for_project_with_run_id(
-            project.path(),
-            SidecarProfile::Agent,
-            Some("issue-534"),
-        );
-
-        let message = sidecar_runtime_mismatch(&local, &agent).expect("mismatch");
-
-        assert!(message.contains("retrieval profile handoff mismatch"));
-        assert!(message.contains("profile=local"));
-        assert!(message.contains("profile=agent"));
-        assert!(message.contains("namespace=codestory-agent"));
-        assert!(message.contains("lexical="));
-        assert!(sidecar_runtime_mismatch(&local, &local).is_none());
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        old: Option<OsString>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let old = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, old }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let old = std::env::var_os(key);
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(value) = self.old.as_ref() {
-                    std::env::set_var(self.key, value);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
     }
 }

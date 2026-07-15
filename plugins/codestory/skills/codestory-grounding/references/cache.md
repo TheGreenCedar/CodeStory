@@ -28,8 +28,8 @@ so the child can use them under its own worktree path.
 2. If status is `rehydrated`, run the printed `doctor` command to inspect index
    freshness under the child worktree path.
 3. Run the printed `retrieval index --refresh full` command before using
-   packet/search as agent-facing sidecar evidence. Retrieval manifests are
-   invalidated because sidecar generation ids are currently project-root
+   packet/search as agent-facing retrieval evidence. Retrieval manifests are
+   invalidated because retrieval generation ids are currently project-root
    derived. Portable v2 index artifact cache rows are preserved; older artifact
    rows are invalidated because they predate the portable-key contract.
 4. If status is `skipped`, use the printed normal rebuild commands.
@@ -40,6 +40,6 @@ Rehydrate requires clean source and target worktrees, matching `origin` URLs,
 matching Git tree ids, a source SQLite schema matching the running CLI, at
 least one indexed source file, and an empty target cache directory. This command
 preserves and rebases SQLite graph/search/doc rows, preserves portable v2 index
-artifact cache rows, and invalidates retrieval sidecars across
+artifact cache rows, and invalidates retrieval retrievals across
 worktree-root-derived project ids. It also does not configure Rust compilation
 cache such as `sccache`.
