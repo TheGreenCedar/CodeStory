@@ -62,6 +62,13 @@ pub fn publish_zero_dense_pinned_query_fixture(
     let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let producer_compatibility_identity =
+        crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_device,
+            None,
+            u32::try_from(embedding_dim).context("negative embedding dimension")?,
+        )?;
     let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
     let publication = storage
         .get_complete_index_publication()
@@ -76,6 +83,7 @@ pub fn publish_zero_dense_pinned_query_fixture(
         &project_id,
         &embedding_backend,
         embedding_dim,
+        &producer_compatibility_identity,
     )?;
     if input.dense_projection_count != 0 {
         bail!("zero-dense pinned query fixture received dense anchors");

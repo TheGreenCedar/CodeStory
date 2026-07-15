@@ -33,12 +33,16 @@ dense-anchor inputs, and the immutable process embedding policy. Outputs are:
 
 ## Concurrency and publication
 
-Writers stage a whole generation, deep-validate it, rescan source at the commit
-fence, and publish the manifest only when every identity still matches.
+Writers stage a whole generation, deep-validate vector bytes, producer evidence,
+exact anchors, and zero-dense evidence, rescan source at the commit fence, and
+publish the manifest only when every identity still matches. Request
+cancellation is checked during embedding and before vector, evidence, and
+SQLite pointer publication.
 Readers use one `PinnedQuerySession` for the core transaction, candidate query,
 numeric-ID resolution, immutable generation leases, manifest/evidence identity,
-engine residency, and final revalidation. Query-time checks stay cheap; deep
-corpus validation is a build, promotion, readiness, or health operation.
+engine residency, and final revalidation. Strict reader admission applies the
+same deep generation-evidence contract as writer reuse and promotion; admitted
+query execution then stays pinned to those verified files.
 
 The embedding engine is process-wide, while manifests and artifacts are
 project-local. An incompatible cache-root or CPU-policy request fails rather

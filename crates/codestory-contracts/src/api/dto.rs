@@ -426,20 +426,7 @@ impl EmbeddingVectorProducerEvidenceDto {
     /// Compare expected evidence with observed evidence, including publication identity.
     pub fn compatibility_with(&self, observed: &Self) -> EmbeddingVectorEvidenceCompatibilityDto {
         let mut mismatches = observed.validation_errors();
-        let migration_disposition = match observed
-            .schema_version
-            .cmp(&EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION)
-        {
-            std::cmp::Ordering::Less => {
-                EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
-            }
-            std::cmp::Ordering::Equal => EmbeddingVectorEvidenceMigrationDispositionDto::Current,
-            std::cmp::Ordering::Greater => {
-                EmbeddingVectorEvidenceMigrationDispositionDto::UnsupportedFutureVersion
-            }
-        };
-        let migration_required =
-            migration_disposition != EmbeddingVectorEvidenceMigrationDispositionDto::Current;
+        let future_schema = observed.schema_version > EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION;
         macro_rules! compare {
             ($field:literal, $left:expr, $right:expr) => {
                 if $left != $right && !mismatches.iter().any(|entry| entry == $field) {
@@ -465,7 +452,26 @@ impl EmbeddingVectorProducerEvidenceDto {
             self.execution.observed_state,
             observed.execution.observed_state
         );
+        compare!(
+            "execution.observation_source",
+            self.execution.observation_source,
+            observed.execution.observation_source
+        );
+        compare!(
+            "execution.smoke_elapsed_ms_presence",
+            self.execution.smoke_elapsed_ms.is_some(),
+            observed.execution.smoke_elapsed_ms.is_some()
+        );
         compare!("publication", self.publication, observed.publication);
+        let migration_disposition = if future_schema {
+            EmbeddingVectorEvidenceMigrationDispositionDto::UnsupportedFutureVersion
+        } else if mismatches.is_empty() {
+            EmbeddingVectorEvidenceMigrationDispositionDto::Current
+        } else {
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        };
+        let migration_required =
+            migration_disposition != EmbeddingVectorEvidenceMigrationDispositionDto::Current;
         EmbeddingVectorEvidenceCompatibilityDto {
             compatible: mismatches.is_empty(),
             migration_required,
@@ -2061,7 +2067,7 @@ pub struct PacketSidecarQueryDiagnosticDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
-    /// Exact complete retrieval publication used for planning through response assembly.
+    /// Exact retrieval publication used by the pinned sidecar query session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
     pub resolved_profile: AgentRetrievalPresetDto,
@@ -2392,6 +2398,7 @@ mod packet_tests {
         let expected = producer_evidence();
         let mut observed = expected.clone();
         observed.execution.observed_at_epoch_ms += 1;
+        observed.execution.smoke_elapsed_ms = Some(99);
         let compatible = expected.compatibility_with(&observed);
         assert!(compatible.compatible);
         assert_eq!(
@@ -2407,7 +2414,52 @@ mod packet_tests {
             compatibility.mismatches,
             vec!["semantics".to_string(), "publication".to_string()]
         );
-        assert!(!compatibility.migration_required);
+        assert!(compatibility.migration_required);
+        assert_eq!(
+            compatibility.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
+
+        let mut execution_mismatch = expected.clone();
+        execution_mismatch.execution.observation_source = "package_probe".to_string();
+        execution_mismatch.execution.smoke_elapsed_ms = None;
+        let compatibility = expected.compatibility_with(&execution_mismatch);
+        assert_eq!(
+            compatibility.mismatches,
+            vec![
+                "execution.observation_source".to_string(),
+                "execution.smoke_elapsed_ms_presence".to_string(),
+            ]
+        );
+        assert_eq!(
+            compatibility.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
+    }
+
+    #[test]
+    fn package_runtime_sidecar_evidence_mismatch_requires_a_complete_rebuild() {
+        let package_expected = producer_evidence();
+        let mut sidecar_observed = package_expected.clone();
+        sidecar_observed.engine.engine_build_id = "different-linked-engine".into();
+        sidecar_observed.engine.device_id = "different-adapter".into();
+        sidecar_observed.execution.observation_source = "different-runtime-probe".into();
+
+        let compatibility = package_expected.compatibility_with(&sidecar_observed);
+
+        assert!(!compatibility.compatible);
+        assert!(compatibility.migration_required);
+        assert_eq!(
+            compatibility.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
+        assert_eq!(
+            compatibility.mismatches,
+            vec![
+                "engine".to_string(),
+                "execution.observation_source".to_string()
+            ]
+        );
     }
 
     #[test]

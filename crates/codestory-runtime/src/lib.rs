@@ -11619,6 +11619,41 @@ fn index_full_for_runtime(
     } else {
         false
     };
+    let has_verified_live_publication = !recovering_incomplete_run
+        && previous_publication.as_ref().is_some_and(|expected| {
+            let live = match Store::open_read_only(storage_path) {
+                Ok(storage) => storage,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %storage_path.display(),
+                        "Live publication could not be opened for verification: {error}"
+                    );
+                    return false;
+                }
+            };
+            match live.get_complete_index_publication() {
+                Ok(Some(publication)) if publication == *expected => {
+                    match live.validate_dense_anchor_publication(&publication) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            tracing::debug!(
+                                path = %storage_path.display(),
+                                "Live dense anchor publication could not be verified: {error}"
+                            );
+                            false
+                        }
+                    }
+                }
+                Ok(_) => false,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %storage_path.display(),
+                        "Live core publication could not be verified: {error}"
+                    );
+                    false
+                }
+            }
+        });
     let workspace = WorkspaceManifest::open(root.to_path_buf())
         .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
     let execution_plan = workspace
@@ -11657,6 +11692,48 @@ fn index_full_for_runtime(
             return Err(ApiError::internal(format!("Indexing failed: {err}")));
         }
     };
+    if has_verified_live_publication {
+        let incomplete_paths = match staged.store_mut().get_files() {
+            Ok(files) => files
+                .into_iter()
+                .filter(|file| !file.complete)
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                let _ = staged.discard();
+                return Err(ApiError::internal(format!(
+                    "Failed to verify staged full-refresh files: {error}"
+                )));
+            }
+        };
+        if !incomplete_paths.is_empty() {
+            let sample = incomplete_paths
+                .iter()
+                .take(3)
+                .map(|path| {
+                    path.strip_prefix(root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remainder = incomplete_paths.len().saturating_sub(3);
+            let sample = if remainder > 0 {
+                format!("{sample}, and {remainder} more")
+            } else {
+                sample
+            };
+            let count = incomplete_paths.len();
+            let _ = staged.discard();
+            return Err(ApiError::new(
+                "index_incomplete",
+                format!(
+                    "Full refresh could not verify {count} scheduled file(s): {sample}. The previous complete publication was preserved; fix unreadable, unstable, or oversized sources and retry."
+                ),
+            ));
+        }
+    }
     if can_copy_forward {
         match staged
             .store_mut()
@@ -17048,6 +17125,92 @@ fn build_llm_symbol_doc_text() -> String {
         let retained_anchors = storage
             .get_dense_anchor_inputs_batch_after(None, 10_000)
             .expect("retained anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(file.id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert_eq!(retained_anchors, first_anchors);
+    }
+
+    #[test]
+    fn incomplete_full_refresh_preserves_the_previous_live_publication() {
+        let mut env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let source_path = workspace.path().join("rust_tictactoe.rs");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("initial full index");
+
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        let first_manifest = first_storage
+            .validate_dense_anchor_publication(&first_publication)
+            .expect("first dense manifest");
+        let first_file = first_storage
+            .get_file_by_path(&source_path)
+            .expect("first file lookup")
+            .expect("indexed Rust source");
+        assert!(first_file.complete, "initial source must be verified");
+        let first_anchors = first_storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("first anchors")
+            .into_iter()
+            .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(first_file.id)))
+            .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))
+            .collect::<HashSet<_>>();
+        assert!(
+            !first_anchors.is_empty(),
+            "fixture needs Rust dense anchors"
+        );
+        drop(first_storage);
+
+        let mut source = fs::read_to_string(&source_path).expect("read source");
+        source.push_str("\n// scheduled but deliberately unreadable to this index run\n");
+        fs::write(&source_path, source).expect("change source");
+        env.push(EnvGuard::set("CODESTORY_INDEX_SOURCE_FILE_BYTE_CAP", "1"));
+        let error = controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect_err("incomplete full refresh must not replace the live publication");
+        assert_eq!(error.code, "index_incomplete");
+        assert!(
+            error
+                .message
+                .contains("previous complete publication was preserved")
+        );
+
+        let storage = Storage::open(&storage_path).expect("preserved live storage");
+        let file = storage
+            .get_file_by_path(&source_path)
+            .expect("preserved file lookup")
+            .expect("preserved source file");
+        assert!(
+            file.complete,
+            "the incomplete candidate must not replace the verified live file row"
+        );
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("preserved publication")
+            .expect("complete preserved publication");
+        assert_eq!(publication, first_publication);
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("preserved dense publication");
+        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        assert_eq!(manifest.anchor_count, first_manifest.anchor_count);
+        let retained_anchors = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("preserved anchors")
             .into_iter()
             .filter(|anchor| anchor.file_node_id == Some(CoreNodeId(file.id)))
             .map(|anchor| (anchor.node_id, anchor.document_hash, anchor.text))

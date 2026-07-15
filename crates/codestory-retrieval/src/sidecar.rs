@@ -70,6 +70,13 @@ fn status_with_runtime(
 ) -> Result<RetrievalStatusReport> {
     let layout = runtime.layout.clone();
     let embedding_snapshot = crate::embeddings::embedding_engine_snapshot_for_runtime(&runtime);
+    let producer_compatibility_identity =
+        crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_snapshot.device,
+            embedding_snapshot.identity.as_ref(),
+            u32::try_from(crate::embeddings::semantic_vector_dim())
+                .context("embedding dimension exceeds evidence contract")?,
+        )?;
     let embedding_probe = strict.then_some(embedding_snapshot.probe);
     let embedding_device = embedding_snapshot.device;
     let project_id = sidecar_project_id_for_runtime(project_root, &runtime)?;
@@ -109,6 +116,7 @@ fn status_with_runtime(
                 &project_id,
                 manifest,
                 &runtime,
+                &producer_compatibility_identity,
             )
             .context("check strict retrieval readiness")?
         {
@@ -224,6 +232,7 @@ pub(crate) fn validate_strict_sidecar_readiness_for_runtime(
     project_root: &Path,
     storage: &Store,
     runtime: &SidecarRuntimeConfig,
+    producer_compatibility_identity: &str,
 ) -> Result<()> {
     crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)
         .context("initialize in-process embedding engine")?;
@@ -240,6 +249,7 @@ pub(crate) fn validate_strict_sidecar_readiness_for_runtime(
         &project_id,
         &manifest,
         runtime,
+        producer_compatibility_identity,
     )? {
         anyhow::bail!("retrieval_manifest_stale: {reason}");
     }
@@ -252,6 +262,7 @@ fn strict_readiness_unavailable_reason_for_runtime(
     project_id: &str,
     manifest: &codestory_store::RetrievalIndexManifest,
     runtime: &SidecarRuntimeConfig,
+    producer_compatibility_identity: &str,
 ) -> Result<Option<String>> {
     if storage
         .has_incomplete_incremental_run()
@@ -295,6 +306,7 @@ fn strict_readiness_unavailable_reason_for_runtime(
         project_id,
         &embedding_backend,
         embedding_dim,
+        producer_compatibility_identity,
     )
     .context("compute strict retrieval input fingerprint")?;
     let stored_files = storage

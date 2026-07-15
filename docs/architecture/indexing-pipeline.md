@@ -263,7 +263,7 @@ Semantic sync does these pieces of work:
 
 Full refresh has an extra copy-forward path: if a previous live database exists, unchanged symbol docs, retrieval artifact nodes, and dense-anchor inputs are copied into the staged database before publish. The later sync can retain content-level reuse while rebinding every selected input to the candidate core publication.
 
-Incremental refresh scopes symbol-doc and dense-anchor invalidation by touched file. Untouched files keep their existing inputs; new, changed, or removed symbols in touched files are written, selected or skipped by policy, or pruned. Vector reuse and rebuild happen only when retrieval finalizes the next immutable generation.
+Incremental refresh scopes symbol-doc and dense-anchor invalidation to changed or removed files plus files connected to them through the graph before or after the refresh. Related-symbol text, edge digests, centrality, and component reports can change at either endpoint, so those graph-dependent files are rebuilt even when their source bytes did not change. Unrelated untouched files keep their existing inputs. Vector reuse and rebuild happen only when retrieval finalizes the next immutable generation.
 
 The default symbol-doc scope is durable symbols: classes, structs, interfaces, annotations, unions, enums, typedefs, functions, methods, macros, global variables, constants, and enum constants. Lower-signal module, namespace, package, field, local variable, and type-parameter docs stay out of dense retrieval by default while remaining present in graph and lexical search. Set `CODESTORY_SEMANTIC_DOC_SCOPE=all` only for investigations.
 
@@ -314,14 +314,15 @@ leaves the prior retrieval publication active if source or core identity drifts.
 
 ### How symbol docs and dense anchors are kept fast
 
-Symbol docs are deterministic graph artifacts persisted in SQLite with generated-text metadata and extracted provenance. Dense anchors are persisted separately as embedding-free inputs. Core reuse is keyed by generated text hash, selection reason, and semantic policy version; the stored source identity still changes to the exact candidate core generation/run before publication. Core publishes the complete anchor count, content digest, policy, migration state, and source identity as one manifest with the graph generation. On full refresh, runtime copies prior retrieval artifact nodes, symbol docs, and dense inputs forward into the staged database before checking them. On incremental refresh, runtime passes a touched-file scope so only inputs belonging to changed files are rebuilt, selected, skipped, or pruned, then rebinds the complete carried-forward set before publication.
+Symbol docs are deterministic graph artifacts persisted in SQLite with generated-text metadata and extracted provenance. Dense anchors are persisted separately as embedding-free inputs. Core reuse is keyed by generated text hash, selection reason, and semantic policy version; the stored source identity still changes to the exact candidate core generation/run before publication. Core publishes the complete anchor count, content digest, policy, migration state, and source identity as one manifest with the graph generation. On full refresh, runtime copies prior retrieval artifact nodes, symbol docs, and dense inputs forward into the staged database before checking them. On incremental refresh, runtime rebuilds inputs for changed and removed files plus files connected to them through the previous or refreshed graph, then rebinds the complete carried-forward set before publication.
 
-Retrieval fingerprints content, provenance, and the complete core
-generation/run identity. Core can reuse unchanged embedding-free anchor inputs,
-but each core publication receives a distinct immutable vector generation and
-producer-evidence identity. Retrieval embeds the selected inputs in bounded
-batches, validates exact anchor/hash coverage and vector properties, and
-publishes the attested generation. Core indexing never loads the model.
+Retrieval fingerprints content, provenance, the complete core generation/run,
+and the stable model/engine/device compatibility identity before selecting a
+generation. Core can reuse unchanged embedding-free anchor inputs, but each
+core or producer-compatibility publication receives a distinct immutable vector
+generation and producer-evidence identity. Retrieval embeds the selected inputs
+in bounded batches, validates exact anchor/hash coverage and vector properties,
+and publishes the attested generation. Core indexing never loads the model.
 
 ### What timing output means
 

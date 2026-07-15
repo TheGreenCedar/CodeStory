@@ -1,5 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codestory_contracts::api::IndexMode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use codestory_retrieval::{
     FinalizeIndexOutcome, QueryRequest, RetrievalIndexManifest, RetrievalStatusReport,
@@ -157,12 +158,25 @@ pub(crate) fn finalize_retrieval_index_for_sidecar_runtime(
     runtime: &RuntimeContext,
     sidecar: &SidecarRuntimeConfig,
 ) -> Result<FinalizeIndexOutcome> {
+    let cancelled = AtomicBool::new(false);
+    finalize_retrieval_index_for_sidecar_runtime_with_cancel(runtime, sidecar, &cancelled)
+}
+
+pub(crate) fn finalize_retrieval_index_for_sidecar_runtime_with_cancel(
+    runtime: &RuntimeContext,
+    sidecar: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
+) -> Result<FinalizeIndexOutcome> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval index cancelled before opening the project runtime");
+    }
     let opened = runtime.ensure_open(crate::args::RefreshMode::None)?;
     ensure_index_ready(&opened, "retrieval index")?;
-    codestory_retrieval::finalize_index_for_runtime(
+    codestory_retrieval::finalize_index_for_runtime_with_cancel(
         &runtime.project_root,
         &runtime.storage_path,
         sidecar,
+        cancelled,
     )
     .context("retrieval index finalize")
 }

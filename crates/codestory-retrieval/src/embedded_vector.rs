@@ -72,6 +72,24 @@ pub(crate) struct ExpectedVectorAnchor {
     pub document_hash: String,
 }
 
+pub(crate) struct AttestedVectorPublication<'a> {
+    pub layout: &'a SidecarLayout,
+    pub collection: &'a str,
+    pub generation: &'a str,
+    pub input_hash: &'a str,
+    pub contract: &'a VectorEvidenceContract,
+    pub expected_anchors: &'a [ExpectedVectorAnchor],
+}
+
+struct VectorDatabasePublication<'a> {
+    layout: &'a SidecarLayout,
+    collection: &'a str,
+    generation: &'a str,
+    input_hash: &'a str,
+    contract: &'a VectorEvidenceContract,
+    expected_anchors: Option<&'a BTreeMap<String, String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VectorEvidenceContract {
     pub embedding_backend: String,
@@ -138,6 +156,11 @@ pub(crate) fn build_vector_producer_evidence(
         .or_else(|| embedding_device.detected_gpu.clone())
         .or_else(|| embedding_device.detected_provider.clone())
         .unwrap_or_else(|| "test-support".to_string());
+    let device_class = live_identity
+        .map(|identity| identity.adapter_description.clone())
+        .filter(|description| !description.trim().is_empty())
+        .or_else(|| embedding_device.detected_provider.clone())
+        .unwrap_or_else(|| "test-support".to_string());
     let smoke_elapsed_ms = live_identity.map(|identity| identity.smoke_ms).or_else(|| {
         (embedding_device.observation_source == "test_support"
             && embedding_device.observed_state == "accelerated")
@@ -176,7 +199,7 @@ pub(crate) fn build_vector_producer_evidence(
             engine_build_id,
             backend,
             device_id,
-            device_class: embedding_device.observed_state.to_string(),
+            device_class,
             accelerator_kind: embedding_device
                 .detected_provider
                 .clone()
@@ -193,27 +216,31 @@ pub(crate) fn build_vector_producer_evidence(
     }
 }
 
+pub(crate) fn vector_producer_compatibility_identity(
+    embedding_device: &EmbeddingDeviceReadiness,
+    live_identity: Option<&ProcessEmbeddingIdentity>,
+    embedding_dim: u32,
+) -> Result<String> {
+    let evidence = build_vector_producer_evidence(
+        embedding_device,
+        live_identity,
+        embedding_dim,
+        EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "compatibility-core".into(),
+            core_run_id: "compatibility-run".into(),
+            retrieval_generation: "compatibility-retrieval".into(),
+            retrieval_input_hash: "compatibility-input".into(),
+            semantic_generation: "compatibility-semantic".into(),
+        },
+    );
+    vector_compatibility_identity(&evidence)
+}
+
 pub(crate) fn producer_evidence_mismatches(
     expected: &EmbeddingVectorProducerEvidenceDto,
     observed: &EmbeddingVectorProducerEvidenceDto,
 ) -> Vec<String> {
-    let mut mismatches = expected.compatibility_with(observed).mismatches;
-    for (field, matches) in [
-        (
-            "execution.observation_source",
-            expected.execution.observation_source == observed.execution.observation_source,
-        ),
-        (
-            "execution.smoke_elapsed_ms_presence",
-            expected.execution.smoke_elapsed_ms.is_some()
-                == observed.execution.smoke_elapsed_ms.is_some(),
-        ),
-    ] {
-        if !matches && !mismatches.iter().any(|entry| entry == field) {
-            mismatches.push(field.to_string());
-        }
-    }
-    mismatches
+    expected.compatibility_with(observed).mismatches
 }
 
 /// Content attestation returned before the candidate database is published.
@@ -514,12 +541,15 @@ impl EmbeddedVectorIndex {
     ) -> Result<u64> {
         let contract = VectorEvidenceContract::legacy(embedding_backend, embedding_dim);
         build_and_publish_database(
-            layout,
-            collection,
-            generation,
-            input_hash,
-            &contract,
-            None,
+            VectorDatabasePublication {
+                layout,
+                collection,
+                generation,
+                input_hash,
+                contract: &contract,
+                expected_anchors: None,
+            },
+            || Ok(()),
             |visit| {
                 produce(&mut |point| {
                     let document_hash = legacy_document_hash(&point);
@@ -538,6 +568,7 @@ impl EmbeddedVectorIndex {
     /// The expected anchors must come from the core publication rather than
     /// being inferred from produced vectors. This makes missing, unexpected,
     /// duplicate, and stale-document vectors publication failures.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn build_attested_with_points(
         layout: &SidecarLayout,
         collection: &str,
@@ -547,14 +578,36 @@ impl EmbeddedVectorIndex {
         expected_anchors: &[ExpectedVectorAnchor],
         produce: impl FnOnce(&mut dyn FnMut(AttestedSemanticPoint) -> Result<()>) -> Result<()>,
     ) -> Result<VectorDatabaseAttestation> {
-        let expected_anchors = expected_anchor_map(expected_anchors)?;
+        Self::build_attested_with_points_with_cancel(
+            AttestedVectorPublication {
+                layout,
+                collection,
+                generation,
+                input_hash,
+                contract,
+                expected_anchors,
+            },
+            || Ok(()),
+            produce,
+        )
+    }
+
+    pub(crate) fn build_attested_with_points_with_cancel(
+        publication: AttestedVectorPublication<'_>,
+        before_publish: impl FnOnce() -> Result<()>,
+        produce: impl FnOnce(&mut dyn FnMut(AttestedSemanticPoint) -> Result<()>) -> Result<()>,
+    ) -> Result<VectorDatabaseAttestation> {
+        let expected_anchors = expected_anchor_map(publication.expected_anchors)?;
         build_and_publish_database(
-            layout,
-            collection,
-            generation,
-            input_hash,
-            contract,
-            Some(&expected_anchors),
+            VectorDatabasePublication {
+                layout: publication.layout,
+                collection: publication.collection,
+                generation: publication.generation,
+                input_hash: publication.input_hash,
+                contract: publication.contract,
+                expected_anchors: Some(&expected_anchors),
+            },
+            before_publish,
             produce,
         )
     }
@@ -584,10 +637,20 @@ impl EmbeddedVectorIndex {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn publish_generation_manifest(
         layout: &SidecarLayout,
         collection: &str,
         manifest: &VectorGenerationManifest,
+    ) -> Result<()> {
+        Self::publish_generation_manifest_with_cancel(layout, collection, manifest, || Ok(()))
+    }
+
+    pub(crate) fn publish_generation_manifest_with_cancel(
+        layout: &SidecarLayout,
+        collection: &str,
+        manifest: &VectorGenerationManifest,
+        before_publish: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         manifest.validate()?;
         let path = generation_manifest_path(layout, collection);
@@ -611,6 +674,7 @@ impl EmbeddedVectorIndex {
                 if &observed != manifest {
                     bail!("temporary vector generation manifest changed before publication");
                 }
+                before_publish()?;
                 Ok(())
             },
         )
@@ -722,14 +786,18 @@ struct DatabaseMetadata {
 }
 
 fn build_and_publish_database(
-    layout: &SidecarLayout,
-    collection: &str,
-    generation: &str,
-    input_hash: &str,
-    contract: &VectorEvidenceContract,
-    expected_anchors: Option<&BTreeMap<String, String>>,
+    publication: VectorDatabasePublication<'_>,
+    before_publish: impl FnOnce() -> Result<()>,
     produce: impl FnOnce(&mut dyn FnMut(AttestedSemanticPoint) -> Result<()>) -> Result<()>,
 ) -> Result<VectorDatabaseAttestation> {
+    let VectorDatabasePublication {
+        layout,
+        collection,
+        generation,
+        input_hash,
+        contract,
+        expected_anchors,
+    } = publication;
     contract.validate()?;
     if generation.trim().is_empty() || input_hash.trim().is_empty() {
         bail!("embedded vector publication identities must be non-empty");
@@ -761,6 +829,7 @@ fn build_and_publish_database(
             authoritative_anchors,
             None,
         )?;
+        before_publish()?;
         codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
         Ok(attestation)
     })();
@@ -1783,6 +1852,99 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_vector_and_evidence_publication_preserves_prior_files() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let evidence = build_vector_producer_evidence(
+            &device,
+            Some(&identity),
+            2,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-generation-v1".into(),
+                core_run_id: "core-run-v1".into(),
+                retrieval_generation: "generation-v1".into(),
+                retrieval_input_hash: "input-v1".into(),
+                semantic_generation: "codestory_cancelled_publication".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility identity"),
+        );
+        let expected = expected_anchors();
+        let attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "codestory_cancelled_publication",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("publish initial vectors");
+        let manifest = VectorGenerationManifest::new(evidence, attestation)
+            .expect("build initial evidence manifest");
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "codestory_cancelled_publication",
+            &manifest,
+        )
+        .expect("publish initial evidence manifest");
+
+        let vector_path = index_path(&layout, "codestory_cancelled_publication");
+        let evidence_path = generation_manifest_path(&layout, "codestory_cancelled_publication");
+        let prior_vectors = std::fs::read(&vector_path).expect("read prior vectors");
+        let prior_evidence = std::fs::read(&evidence_path).expect("read prior evidence");
+
+        let vector_error = EmbeddedVectorIndex::build_attested_with_points_with_cancel(
+            AttestedVectorPublication {
+                layout: &layout,
+                collection: "codestory_cancelled_publication",
+                generation: "generation-v1",
+                input_hash: "input-v1",
+                contract: &contract,
+                expected_anchors: &expected,
+            },
+            || bail!("simulated cancellation before vector database publication"),
+            |visit| {
+                visit(attested_point("1", "document-1", vec![0.0, 1.0]))?;
+                visit(attested_point("2", "document-2", vec![1.0, 0.0]))
+            },
+        )
+        .expect_err("cancelled vector publication must fail");
+        assert!(vector_error.to_string().contains("simulated cancellation"));
+        assert_eq!(
+            std::fs::read(&vector_path).expect("read vectors after cancellation"),
+            prior_vectors,
+            "cancelled vector publication replaced the prior database"
+        );
+
+        let evidence_error = EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            &layout,
+            "codestory_cancelled_publication",
+            &manifest,
+            || bail!("simulated cancellation before evidence publication"),
+        )
+        .expect_err("cancelled evidence publication must fail");
+        assert!(
+            format!("{evidence_error:#}").contains("simulated cancellation"),
+            "unexpected evidence cancellation error: {evidence_error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&evidence_path).expect("read evidence after cancellation"),
+            prior_evidence,
+            "cancelled evidence publication replaced the prior manifest"
+        );
+    }
+
+    #[test]
     fn attested_index_rejects_inexact_anchor_coverage_and_invalid_vectors() {
         let root = tempdir().expect("tempdir");
         let layout = layout(root.path());
@@ -2014,6 +2176,19 @@ mod tests {
             Some(&identity),
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
             publication,
+        );
+        assert_eq!(expected.engine.device_class, identity.adapter_description);
+        assert_ne!(expected.engine.device_class, device.observed_state);
+        let test_support_evidence = build_vector_producer_evidence(
+            &device,
+            None,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            expected.publication.clone(),
+        );
+        assert_eq!(test_support_evidence.engine.device_class, "metal");
+        assert_ne!(
+            test_support_evidence.engine.device_class,
+            device.observed_state
         );
 
         assert_evidence_mismatch(&expected, "model", |evidence| {

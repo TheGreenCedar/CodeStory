@@ -86,8 +86,11 @@ identity, counts, schema and policy versions, and a versioned embedding producer
 evidence contract. That evidence binds model bytes and tokenizer/config
 digests, dimensions and query/document semantics, engine build/backend/device,
 live execution eligibility, and the exact core/retrieval/vector publication.
-A changed compatibility identity causes one transparent generation rebuild; it
-does not select a legacy engine or reuse ambiguous rows.
+A digest of the stable compatibility fields participates in the sidecar input
+fingerprint before generation selection. A changed model, engine, device, or
+execution-proof identity therefore selects a distinct immutable generation and
+causes one transparent rebuild; it does not overwrite the previous generation,
+select a legacy engine, or reuse ambiguous rows.
 
 Some stable DTOs and internal types still use `sidecar` or
 `sidecar_generation` names. These are compatibility vocabulary for the

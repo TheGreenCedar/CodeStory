@@ -100,11 +100,17 @@ pub(crate) async fn run_stdio_server(
                 Some(StdioQueuedWork::Message(message)) => {
                     let mut request_session = session.take().expect("stdio session available");
                     let line = message.line;
+                    let cancelled = message.cancelled;
+                    let worker_cancelled = Arc::clone(&cancelled);
                     active = Some(ActiveStdioRequest {
                         id_key: message.id_key,
-                        cancelled: message.cancelled,
+                        cancelled,
                         task: tokio::task::spawn_blocking(move || {
-                            let response = handle_stdio_message(&mut request_session, &line);
+                            let response = handle_stdio_message(
+                                &mut request_session,
+                                &line,
+                                &worker_cancelled,
+                            );
                             (request_session, response)
                         }),
                     });
@@ -560,7 +566,11 @@ struct StdioWorkspaceMismatch {
     active_root: PathBuf,
 }
 
-fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<serde_json::Value> {
+fn handle_stdio_message(
+    session: &mut StdioServerSession,
+    line: &str,
+    cancelled: &AtomicBool,
+) -> Option<serde_json::Value> {
     let request: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(error) => {
@@ -641,6 +651,7 @@ fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<
                     runtime,
                     &mut session.state,
                     resource.requires_retrieval(),
+                    cancelled,
                 )
             {
                 serde_json::json!({"error": format!("Unable to activate CodeStory before reading `{uri}`: {error}")})
@@ -696,6 +707,7 @@ fn handle_stdio_message(session: &mut StdioServerSession, line: &str) -> Option<
                     runtime,
                     &mut session.state,
                     matches!(name, "ground" | "packet" | "search" | "context"),
+                    cancelled,
                 ) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -998,13 +1010,16 @@ fn activate_stdio_project(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
     requires_retrieval: bool,
+    cancelled: &AtomicBool,
 ) -> Result<StdioActivationOutcome> {
+    ensure_stdio_activation_not_cancelled(cancelled, "activation preflight")?;
     if stdio_workspace_mismatch(runtime).is_some() {
         return Ok(StdioActivationOutcome::CheckReadiness);
     }
     let project = stdio_project_args(runtime);
     let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
     let summary = inspect_runtime.open_project_summary()?;
+    ensure_stdio_activation_not_cancelled(cancelled, "embedding readiness")?;
     let agent_sidecar = stdio_agent_sidecar_for_runtime(runtime);
     let embedding_ready = !requires_retrieval
         || codestory_retrieval::ensure_product_embedding_backend_for_runtime(&agent_sidecar)
@@ -1016,6 +1031,7 @@ fn activate_stdio_project(
         });
         state.recent_local_refresh = refresh;
         state.status_cache = None;
+        ensure_stdio_activation_not_cancelled(cancelled, "local freshness refresh")?;
         if refresh_is_live {
             return Ok(if requires_retrieval {
                 StdioActivationOutcome::RetrievalPreparing
@@ -1035,9 +1051,10 @@ fn activate_stdio_project(
     )
     .is_ok_and(|status| status.is_live_ready());
     if !ready {
-        match crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(
+        match crate::retrieval::finalize_retrieval_index_for_sidecar_runtime_with_cancel(
             runtime,
             &agent_sidecar,
+            cancelled,
         ) {
             Ok(_) => {}
             Err(error)
@@ -1047,6 +1064,7 @@ fn activate_stdio_project(
                 return Ok(StdioActivationOutcome::RetrievalPreparing);
             }
             Err(_) => {
+                ensure_stdio_activation_not_cancelled(cancelled, "core refresh")?;
                 if let Err(error) = runtime
                     .index
                     .run_indexing_blocking(IndexMode::Full)
@@ -1054,14 +1072,19 @@ fn activate_stdio_project(
                 {
                     return Ok(stdio_activation_outcome_for_error(&error));
                 }
-                if let Err(error) = crate::retrieval::finalize_retrieval_index_for_sidecar_runtime(
-                    runtime,
-                    &agent_sidecar,
-                ) {
+                ensure_stdio_activation_not_cancelled(cancelled, "retrieval finalization")?;
+                if let Err(error) =
+                    crate::retrieval::finalize_retrieval_index_for_sidecar_runtime_with_cancel(
+                        runtime,
+                        &agent_sidecar,
+                        cancelled,
+                    )
+                {
                     return Ok(stdio_activation_outcome_for_error(&error));
                 }
             }
         }
+        ensure_stdio_activation_not_cancelled(cancelled, "readiness verification")?;
         let status = match codestory_retrieval::strict_sidecar_status_for_runtime(
             &runtime.project_root,
             Some(&runtime.storage_path),
@@ -1076,6 +1099,16 @@ fn activate_stdio_project(
     }
     state.status_cache = None;
     Ok(StdioActivationOutcome::CheckReadiness)
+}
+
+fn ensure_stdio_activation_not_cancelled(
+    cancelled: &AtomicBool,
+    boundary: &'static str,
+) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("request cancelled before {boundary}");
+    }
+    Ok(())
 }
 
 fn stdio_activation_outcome_for_error(error: &anyhow::Error) -> StdioActivationOutcome {
@@ -5080,6 +5113,25 @@ mod tests {
     }
 
     #[test]
+    fn stdio_activation_honors_the_request_cancellation_signal() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        let runtime = RuntimeContext::new_inspect_only(&crate::args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("inspect runtime");
+        let cancelled = AtomicBool::new(true);
+
+        let error =
+            activate_stdio_project(&runtime, &mut StdioServerState::default(), true, &cancelled)
+                .expect_err("cancelled activation must stop before preparation");
+
+        assert!(error.to_string().contains("request cancelled"));
+        assert!(!runtime.storage_path.exists());
+    }
+
+    #[test]
     fn stdio_workspace_mismatch_status_blocks_repo_repair_guidance() {
         let served = tempfile::tempdir().expect("served");
         let active = tempfile::tempdir().expect("active");
@@ -5928,6 +5980,7 @@ version = "0.11.20"
                 }
             })
             .to_string(),
+            &AtomicBool::new(false),
         )
         .expect("invalid resource response");
 

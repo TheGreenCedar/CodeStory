@@ -3,6 +3,7 @@ use crate::embedded_vector::{
     AttestedSemanticPoint, EmbeddedVectorIndex, ExpectedVectorAnchor, SemanticPoint,
     VectorEvidenceContract, VectorGenerationManifest, build_vector_producer_evidence,
     producer_evidence_mismatches, vector_compatibility_identity,
+    vector_producer_compatibility_identity,
 };
 use crate::generation::{
     SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract,
@@ -35,6 +36,7 @@ use codestory_store::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -64,6 +66,7 @@ pub(crate) struct SidecarInputFingerprint {
 struct SidecarEmbeddingContract<'a> {
     backend: &'a str,
     dimension: i32,
+    producer_compatibility_identity: &'a str,
 }
 
 struct SemanticGeneration<'a> {
@@ -92,6 +95,7 @@ struct GenerationRetentionContext<'a> {
     previous_manifest: Option<&'a RetrievalIndexManifest>,
     embedding_device: &'a crate::embeddings::EmbeddingDeviceReadiness,
     embedding_residency: crate::embeddings::ProductEmbeddingResidencyLease,
+    producer_compatibility_identity: String,
 }
 
 struct PreparedGenerationRetention {
@@ -99,6 +103,16 @@ struct PreparedGenerationRetention {
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
+
+fn ensure_retrieval_index_not_cancelled(
+    cancelled: &AtomicBool,
+    boundary: &'static str,
+) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval index cancelled before {boundary}");
+    }
+    Ok(())
+}
 
 pub fn project_id_for_root(project_root: &Path) -> String {
     codestory_workspace::workspace_id_v3_for_root(project_root)
@@ -130,12 +144,45 @@ pub fn finalize_index_for_runtime(
     finalize_index_for_runtime_with_progress(project_root, storage_path, runtime, |_| {})
 }
 
+pub fn finalize_index_for_runtime_with_cancel(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
+) -> Result<FinalizeIndexOutcome> {
+    finalize_index_for_runtime_with_progress_and_cancel(
+        project_root,
+        storage_path,
+        runtime,
+        cancelled,
+        |_| {},
+    )
+}
+
 pub fn finalize_index_for_runtime_with_progress(
     project_root: &Path,
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
+    progress: impl FnMut(&'static str),
+) -> Result<FinalizeIndexOutcome> {
+    let cancelled = AtomicBool::new(false);
+    finalize_index_for_runtime_with_progress_and_cancel(
+        project_root,
+        storage_path,
+        runtime,
+        &cancelled,
+        progress,
+    )
+}
+
+pub fn finalize_index_for_runtime_with_progress_and_cancel(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(&'static str),
 ) -> Result<FinalizeIndexOutcome> {
+    ensure_retrieval_index_not_cancelled(cancelled, "preflight")?;
     let layout = runtime.layout.clone();
     let project_identity = runtime.validated_project_identity(project_root)?;
     let project_id = project_identity.artifact_scope_id;
@@ -160,6 +207,11 @@ pub fn finalize_index_for_runtime_with_progress(
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let producer_compatibility_identity = vector_producer_compatibility_identity(
+        &embedding_device,
+        embedding_residency.identity(),
+        u32::try_from(embedding_dim).context("negative embedding dimension")?,
+    )?;
 
     let mut storage =
         Store::open(storage_path).context("open storage for retrieval sidecar input")?;
@@ -171,6 +223,7 @@ pub fn finalize_index_for_runtime_with_progress(
     let embedding_contract = SidecarEmbeddingContract {
         backend: &embedding_backend,
         dimension: embedding_dim,
+        producer_compatibility_identity: &producer_compatibility_identity,
     };
     let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
         input_snapshot.storage(),
@@ -185,9 +238,40 @@ pub fn finalize_index_for_runtime_with_progress(
     let previous_manifest = storage
         .get_retrieval_index_manifest(&project_id)
         .context("load previous retrieval_index_manifest")?;
-    let previous_manifest_unavailable_reason = previous_manifest.as_ref().and_then(|manifest| {
-        manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
-    });
+    let mut previous_manifest_unavailable_reason =
+        previous_manifest.as_ref().and_then(|manifest| {
+            manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
+        });
+    if previous_manifest_unavailable_reason.is_none()
+        && let Some(manifest) = previous_manifest.as_ref()
+        && manifest_matches_sidecar_input(
+            manifest,
+            &sidecar_input,
+            &embedding_backend,
+            embedding_dim,
+        )
+    {
+        let validation = storage
+            .get_complete_index_publication()
+            .context("load complete core publication for retrieval reuse")?
+            .context("retrieval reuse requires a complete core publication")
+            .and_then(|publication| {
+                crate::embedded_vector::validate_generation_evidence_for_publication(
+                    &layout,
+                    &storage,
+                    manifest,
+                    &publication,
+                    runtime,
+                    &embedding_device,
+                    embedding_residency.identity(),
+                )
+                .context("deep-validate reusable retrieval generation")
+            });
+        if let Err(error) = validation {
+            previous_manifest_unavailable_reason =
+                Some(format!("retrieval_generation_evidence_invalid: {error:#}"));
+        }
+    }
     drop(storage);
     let retention_context = GenerationRetentionContext {
         runtime,
@@ -196,6 +280,7 @@ pub fn finalize_index_for_runtime_with_progress(
         previous_manifest: previous_manifest.as_ref(),
         embedding_device: &embedding_device,
         embedding_residency,
+        producer_compatibility_identity,
     };
 
     if let Some(previous) = previous_manifest.as_ref() {
@@ -237,6 +322,7 @@ pub fn finalize_index_for_runtime_with_progress(
                             project_root,
                             storage_path,
                             &retention_context,
+                            cancelled,
                             &sidecar_input,
                             project_id,
                             manifest,
@@ -257,6 +343,7 @@ pub fn finalize_index_for_runtime_with_progress(
                     project_root,
                     storage_path,
                     &retention_context,
+                    cancelled,
                     &sidecar_input,
                     project_id,
                     previous.clone(),
@@ -339,6 +426,7 @@ pub fn finalize_index_for_runtime_with_progress(
                 project_root,
                 storage_path,
                 &retention_context,
+                cancelled,
                 &sidecar_input,
                 project_id,
                 manifest,
@@ -370,6 +458,7 @@ pub fn finalize_index_for_runtime_with_progress(
         &semantic_generation,
         semantic_ready_points,
         &retention_context,
+        cancelled,
         &mut progress,
     )?;
 
@@ -394,6 +483,7 @@ pub fn finalize_index_for_runtime_with_progress(
             project_root,
             storage_path,
             &retention_context,
+            cancelled,
             &sidecar_input,
             project_id,
             manifest,
@@ -463,8 +553,10 @@ fn ensure_semantic_index(
     semantic: &SemanticGeneration<'_>,
     semantic_ready_points: Option<u64>,
     retention: &GenerationRetentionContext<'_>,
+    cancelled: &AtomicBool,
     progress: &mut impl FnMut(&'static str),
 ) -> Result<u64> {
+    ensure_retrieval_index_not_cancelled(cancelled, "pinning dense anchor inputs")?;
     let storage = Store::open(storage_path).context("open core storage for dense anchors")?;
     let snapshot = storage
         .read_snapshot()
@@ -563,19 +655,23 @@ fn ensure_semantic_index(
         point_count
     } else {
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
-            EmbeddedVectorIndex::build_attested_with_points(
-                semantic.layout,
-                semantic.collection,
-                semantic.generation,
-                semantic.input_hash,
-                &contract,
-                &expected_anchors,
+            EmbeddedVectorIndex::build_attested_with_points_with_cancel(
+                crate::embedded_vector::AttestedVectorPublication {
+                    layout: semantic.layout,
+                    collection: semantic.collection,
+                    generation: semantic.generation,
+                    input_hash: semantic.input_hash,
+                    contract: &contract,
+                    expected_anchors: &expected_anchors,
+                },
+                || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
                 |visit| {
                     let client =
                         crate::embeddings::InProcessEmbeddingClient::new(retention.runtime);
                     for batch in
                         anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
                     {
+                        ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
                         let texts = batch
                             .iter()
                             .map(|anchor| anchor.text.clone())
@@ -583,6 +679,10 @@ fn ensure_semantic_index(
                         let vectors = client
                             .embed_documents(&texts)
                             .context("embed pinned dense anchor batch")?;
+                        ensure_retrieval_index_not_cancelled(
+                            cancelled,
+                            "persisting an embedding batch",
+                        )?;
                         if vectors.len() != batch.len() {
                             bail!(
                                 "embedding engine returned {} vectors for {} anchors",
@@ -591,6 +691,10 @@ fn ensure_semantic_index(
                             );
                         }
                         for (anchor, vector) in batch.iter().zip(vectors) {
+                            ensure_retrieval_index_not_cancelled(
+                                cancelled,
+                                "persisting an embedded vector",
+                            )?;
                             visit(AttestedSemanticPoint {
                                 point: SemanticPoint {
                                     display_name: anchor
@@ -613,10 +717,16 @@ fn ensure_semantic_index(
         })?;
         let point_count = attestation.point_count;
         let generation_manifest = VectorGenerationManifest::new(evidence, attestation.clone())?;
-        EmbeddedVectorIndex::publish_generation_manifest(
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
             semantic.layout,
             semantic.collection,
             &generation_manifest,
+            || {
+                ensure_retrieval_index_not_cancelled(
+                    cancelled,
+                    "producer-evidence manifest publication",
+                )
+            },
         )?;
         EmbeddedVectorIndex::validate_published_attestation(
             semantic.layout,
@@ -839,6 +949,7 @@ fn persist_finalized_manifest(
     project_root: &Path,
     storage_path: &Path,
     retention_context: &GenerationRetentionContext<'_>,
+    cancelled: &AtomicBool,
     sidecar_input: &SidecarInputFingerprint,
     project_id: String,
     mut manifest: RetrievalIndexManifest,
@@ -856,7 +967,7 @@ fn persist_finalized_manifest(
     let _prepared_retention = with_embedding_publication_residency(
         &retention_context.embedding_residency,
         || {
-            promote_retrieval_manifest(
+            promote_retrieval_manifest_with_cancel(
                 &mut storage,
                 sidecar_input,
                 &manifest,
@@ -866,6 +977,8 @@ fn persist_finalized_manifest(
                     let embedding_contract = SidecarEmbeddingContract {
                         backend: &embedding_backend,
                         dimension: embedding_dim,
+                        producer_compatibility_identity: &retention_context
+                            .producer_compatibility_identity,
                     };
                     let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
                         storage,
@@ -886,18 +999,20 @@ fn persist_finalized_manifest(
                     }
                     Ok(current_input)
                 },
-                || {
+                |storage| {
                     validate_candidate_generation(
                         &project_id,
                         sidecar_input,
                         &manifest,
                         retention_context,
+                        storage,
                     )
                 },
                 |storage| {
                     prepare_generation_retention(retention_context, &project_id, &manifest, storage)
                 },
                 |prepared| Ok(prepared.verified_previous.clone()),
+                || ensure_retrieval_index_not_cancelled(cancelled, "retrieval publication commit"),
             )
         },
     )?;
@@ -948,16 +1063,41 @@ fn ensure_sidecar_input_unchanged(
     Ok(())
 }
 
+#[cfg(test)]
 fn promote_retrieval_manifest<T>(
     storage: &mut Store,
     expected: &SidecarInputFingerprint,
     manifest: &RetrievalIndexManifest,
     current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
-    validate_candidate: impl FnOnce() -> Result<()>,
+    validate_candidate: impl FnOnce(&Store) -> Result<()>,
     prepare_publication: impl FnOnce(&Store) -> Result<T>,
     publication_rollback: impl FnOnce(&T) -> Result<Option<RetrievalIndexRollbackRecord>>,
 ) -> Result<T> {
-    validate_candidate()?;
+    promote_retrieval_manifest_with_cancel(
+        storage,
+        expected,
+        manifest,
+        current_input,
+        validate_candidate,
+        prepare_publication,
+        publication_rollback,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promote_retrieval_manifest_with_cancel<T>(
+    storage: &mut Store,
+    expected: &SidecarInputFingerprint,
+    manifest: &RetrievalIndexManifest,
+    current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
+    validate_candidate: impl FnOnce(&Store) -> Result<()>,
+    prepare_publication: impl FnOnce(&Store) -> Result<T>,
+    publication_rollback: impl FnOnce(&T) -> Result<Option<RetrievalIndexRollbackRecord>>,
+    mut ensure_not_cancelled: impl FnMut() -> Result<()>,
+) -> Result<T> {
+    ensure_not_cancelled()?;
+    validate_candidate(storage)?;
     let prepared = prepare_publication(storage)?;
     let mut publication = storage
         .write_transaction()
@@ -965,10 +1105,12 @@ fn promote_retrieval_manifest<T>(
     let current = current_input(publication.storage())?;
     ensure_sidecar_input_unchanged(expected, &current)?;
     let rollback = publication_rollback(&prepared)?;
+    ensure_not_cancelled()?;
     publication
         .storage_mut()
         .publish_retrieval_index_publication(manifest, rollback.as_ref())
         .context("persist atomic retrieval current and rollback pointers")?;
+    ensure_not_cancelled()?;
     publication
         .finish()
         .context("commit retrieval manifest publication")?;
@@ -1045,7 +1187,7 @@ fn validate_candidate_generation_evidence(
         && sidecar_input.semantic_policy_version.as_deref()
             == Some(crate::generation::SEMANTIC_POLICY_VERSION);
     let semantic_valid = if zero_dense_candidate {
-        evidence.semantic_points.is_none()
+        evidence.semantic_points == Some(0)
             && evidence.semantic_ready
             && evidence.semantic_zero_dense_policy
     } else {
@@ -1125,6 +1267,7 @@ fn validate_candidate_generation(
     sidecar_input: &SidecarInputFingerprint,
     manifest: &RetrievalIndexManifest,
     context: &GenerationRetentionContext<'_>,
+    storage: &Store,
 ) -> Result<()> {
     let generation = manifest
         .sidecar_generation
@@ -1188,9 +1331,7 @@ fn validate_candidate_generation(
         ),
         scip_revision: read_scip_revision(&scip_dir),
         scip_graph: status.scip.capabilities.graph,
-        semantic_points: (sidecar_input.projection_count > 0)
-            .then_some(semantic_points)
-            .flatten(),
+        semantic_points,
         semantic_ready: status.semantic.capabilities.semantic,
         semantic_zero_dense_policy: sidecar_input.projection_count == 0
             && sidecar_input.dense_projection_count == 0
@@ -1211,7 +1352,22 @@ fn validate_candidate_generation(
         manifest,
         context.runtime,
         &evidence,
+    )?;
+    let core_publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication at retrieval publication fence")?
+        .context("retrieval publication requires a complete core publication")?;
+    crate::embedded_vector::validate_generation_evidence_for_publication(
+        context.layout,
+        storage,
+        manifest,
+        &core_publication,
+        context.runtime,
+        &evidence.embedding_device,
+        Some(&evidence.embedding_identity_after),
     )
+    .context("deep-validate vector generation at retrieval publication fence")?;
+    Ok(())
 }
 
 fn prepare_generation_retention(
@@ -1322,11 +1478,13 @@ pub(crate) fn compute_sidecar_input_fingerprint(
     project_id: &str,
     embedding_backend: &str,
     embedding_dim: i32,
+    producer_compatibility_identity: &str,
 ) -> Result<SidecarInputFingerprint> {
     let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
     let embedding_contract = SidecarEmbeddingContract {
         backend: embedding_backend,
         dimension: embedding_dim,
+        producer_compatibility_identity,
     };
     compute_sidecar_input_fingerprint_with_lexical_source(
         storage,
@@ -1348,7 +1506,7 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         .context("hash lexical symbol input")?;
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v9");
+    hash_part(&mut hasher, "codestory-sidecar-input-v10");
     hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
     let core_publication = storage
@@ -1374,6 +1532,7 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
     hash_part(&mut hasher, &lexical.hash);
     hash_part(&mut hasher, embedding.backend);
     hash_part(&mut hasher, &embedding.dimension.to_string());
+    hash_part(&mut hasher, embedding.producer_compatibility_identity);
     hash_part(&mut hasher, "dense-anchor-inputs-v1");
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
@@ -1628,6 +1787,26 @@ mod tests {
     }
 
     #[test]
+    fn pre_cancelled_finalize_stops_before_runtime_or_artifact_mutation() {
+        let project = TempDir::new().expect("project dir");
+        let storage_dir = TempDir::new().expect("storage dir");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let runtime = SidecarRuntimeConfig::local();
+        let cancelled = AtomicBool::new(true);
+
+        let error = finalize_index_for_runtime_with_cancel(
+            project.path(),
+            &storage_path,
+            &runtime,
+            &cancelled,
+        )
+        .expect_err("pre-cancelled finalize must fail before opening storage");
+
+        assert!(error.to_string().contains("cancelled before preflight"));
+        assert!(!storage_path.exists());
+    }
+
+    #[test]
     fn finalize_progress_is_emitted_before_blocking_work() {
         let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let progress_phases = std::rc::Rc::clone(&phases);
@@ -1727,6 +1906,92 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_sqlite_commit_preserves_current_and_rollback_pointers() {
+        let storage_dir = TempDir::new().expect("storage dir");
+        let mut storage = Store::open(storage_dir.path().join("codestory.db"))
+            .expect("open retrieval publication store");
+        let input = |hash: &str| SidecarInputFingerprint {
+            hash: hash.into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: format!("graph-{hash}"),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: format!("lexical-{hash}"),
+            lexical_coverage: Default::default(),
+        };
+        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
+            let mut manifest = retrieval_manifest_for_sidecar(
+                "proj",
+                &sidecar_generation_id("proj", &input.hash),
+                &crate::generation::sidecar_vector_generation("proj", &input.hash),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                input,
+            );
+            manifest.built_at_epoch_ms = built_at_epoch_ms;
+            manifest
+        };
+        let rollback_input = input("11111111111111111111111111111111");
+        let current_input = input("22222222222222222222222222222222");
+        let candidate_input = input("33333333333333333333333333333333");
+        let rollback_manifest = manifest(&rollback_input, 1);
+        let current_manifest = manifest(&current_input, 2);
+        let candidate_manifest = manifest(&candidate_input, 3);
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: rollback_manifest,
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
+            .expect("seed current and rollback pointers");
+        let prior = storage
+            .get_retrieval_index_publication("proj")
+            .expect("read prior publication");
+        let checks = std::cell::Cell::new(0_u8);
+
+        let error = promote_retrieval_manifest_with_cancel(
+            &mut storage,
+            &candidate_input,
+            &candidate_manifest,
+            |_| Ok(candidate_input.clone()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| {
+                Ok(Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest.clone(),
+                    verified_at_epoch_ms: 3,
+                }))
+            },
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if next == 3 {
+                    bail!("simulated cancellation before SQLite commit");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("cancellation before commit must reject publication");
+
+        assert!(error.to_string().contains("simulated cancellation"));
+        assert_eq!(
+            checks.get(),
+            3,
+            "cancellation did not reach the commit fence"
+        );
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read publication after cancellation"),
+            prior,
+            "cancelled transaction changed current or rollback pointers"
+        );
+    }
+
+    #[test]
     fn semantic_projection_excludes_low_value_local_symbols() {
         let row = |kind: NodeKind| SearchSymbolProjectionDetail {
             node_id: codestory_contracts::graph::NodeId(1),
@@ -1775,6 +2040,7 @@ mod tests {
             &first_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("first input");
         let second_input = compute_sidecar_input_fingerprint(
@@ -1783,6 +2049,7 @@ mod tests {
             &second_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("second input");
 
@@ -1790,6 +2057,52 @@ mod tests {
         assert_eq!(
             sidecar_generation_id(&first_project_id, &first_input.hash),
             sidecar_generation_id(&second_project_id, &second_input.hash)
+        );
+    }
+
+    #[test]
+    fn producer_compatibility_change_selects_a_distinct_immutable_generation() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn stable() {}\n").expect("source");
+        let storage = Store::new_in_memory().expect("storage");
+        storage
+            .put_index_publication(&codestory_store::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "core-generation".into(),
+                run_id: "core-run".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("core publication");
+        let project_id = "project";
+        let package_a = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "package-runtime-sidecar-evidence-a",
+        )
+        .expect("package A input");
+        let package_b = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "package-runtime-sidecar-evidence-b",
+        )
+        .expect("package B input");
+
+        assert_ne!(package_a.hash, package_b.hash);
+        assert_ne!(
+            sidecar_generation_id(project_id, &package_a.hash),
+            sidecar_generation_id(project_id, &package_b.hash),
+            "a package/runtime producer change must not overwrite the prior sidecar generation"
+        );
+        assert_ne!(
+            crate::generation::sidecar_vector_generation(project_id, &package_a.hash),
+            crate::generation::sidecar_vector_generation(project_id, &package_b.hash)
         );
     }
 
@@ -1819,6 +2132,7 @@ mod tests {
         let embedding_contract = SidecarEmbeddingContract {
             backend: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             dimension: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            producer_compatibility_identity: "producer-compatibility-v1",
         };
         storage
             .insert_nodes_batch(&[Node {
@@ -1864,6 +2178,7 @@ mod tests {
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("first fingerprint");
         doc.source_identity = "core:g2:r2".into();
@@ -1885,6 +2200,7 @@ mod tests {
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("rebound fingerprint");
         assert_ne!(
@@ -1915,6 +2231,7 @@ mod tests {
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("second fingerprint");
 
@@ -1947,7 +2264,7 @@ mod tests {
                     lexical_source,
                 )
             },
-            || Ok(()),
+            |_| Ok(()),
             |_| Ok(()),
             |_| Ok(None),
         );
@@ -2010,7 +2327,7 @@ mod tests {
         zero_dense_manifest.scip_revision = Some("graph-test".into());
         let mut zero_dense_evidence = passing.clone();
         zero_dense_evidence.scip_revision = zero_dense_manifest.scip_revision.clone();
-        zero_dense_evidence.semantic_points = None;
+        zero_dense_evidence.semantic_points = Some(0);
         zero_dense_evidence.semantic_zero_dense_policy = true;
         validate_candidate_generation_evidence(
             "proj",
@@ -2019,7 +2336,16 @@ mod tests {
             &runtime,
             &zero_dense_evidence,
         )
-        .expect("zero-dense policy accepts an intentionally absent vector generation");
+        .expect("zero-dense policy requires an attested empty vector generation");
+        zero_dense_evidence.semantic_points = None;
+        validate_candidate_generation_evidence(
+            "proj",
+            &zero_dense_input,
+            &zero_dense_manifest,
+            &runtime,
+            &zero_dense_evidence,
+        )
+        .expect_err("a missing zero-dense vector generation must reject promotion");
 
         let mut missing_nonzero_collection = passing.clone();
         missing_nonzero_collection.semantic_points = None;
@@ -2040,6 +2366,7 @@ mod tests {
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("cpu-policy fingerprint");
         let mut cpu_manifest = retrieval_manifest_for_sidecar(
@@ -2124,7 +2451,7 @@ mod tests {
                 &candidate_input,
                 &new_manifest,
                 |_| Ok(candidate_input.clone()),
-                || {
+                |_| {
                     validate_candidate_generation_evidence(
                         "proj",
                         &candidate_input,
@@ -2163,7 +2490,7 @@ mod tests {
                 &second,
                 &new_manifest,
                 |_| Ok(second.clone()),
-                || {
+                |_| {
                     validate_candidate_generation_evidence(
                         "proj",
                         &second,
@@ -2207,7 +2534,7 @@ mod tests {
                     lexical_source,
                 )
             },
-            || {
+            |_| {
                 validate_candidate_generation_evidence(
                     "proj",
                     &second,
@@ -2246,7 +2573,7 @@ mod tests {
                     lexical_source,
                 )
             },
-            || {
+            |_| {
                 validate_candidate_generation_evidence(
                     "proj",
                     &second,
@@ -2297,7 +2624,7 @@ mod tests {
                     lexical_source,
                 )
             },
-            || {
+            |_| {
                 validate_candidate_generation_evidence(
                     "proj",
                     &second,
@@ -2389,6 +2716,12 @@ mod tests {
                 crate::embeddings::acquire_product_embedding_residency_for_runtime(&runtime)
                     .expect("acquire test residency");
             let device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
+            let producer_compatibility_identity = vector_producer_compatibility_identity(
+                &device,
+                residency.identity(),
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            )
+            .expect("producer compatibility identity");
             let context = GenerationRetentionContext {
                 runtime: &runtime,
                 layout: &runtime.layout,
@@ -2396,6 +2729,7 @@ mod tests {
                 previous_manifest: Some(&previous),
                 embedding_device: &device,
                 embedding_residency: residency,
+                producer_compatibility_identity,
             };
             prepare_generation_retention(&context, &previous.project_id, &active, storage)
                 .expect("prepare retention")

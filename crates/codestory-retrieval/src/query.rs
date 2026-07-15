@@ -176,14 +176,24 @@ impl PinnedQuerySession {
         // Acquire residency before strict readiness and keep it through candidate resolution.
         let embedding_residency = acquire_product_embedding_residency_for_runtime(runtime)
             .context("pin retrieval embedding engine")?;
-        if let Err(error) =
-            validate_strict_sidecar_readiness_for_runtime(project_root, &storage, runtime)
-        {
+        let embedding_device = embedding_device_readiness_for_runtime(runtime);
+        let producer_compatibility_identity =
+            crate::embedded_vector::vector_producer_compatibility_identity(
+                &embedding_device,
+                embedding_residency.identity(),
+                u32::try_from(crate::embeddings::semantic_vector_dim())
+                    .context("embedding dimension exceeds evidence contract")?,
+            )?;
+        if let Err(error) = validate_strict_sidecar_readiness_for_runtime(
+            project_root,
+            &storage,
+            runtime,
+            &producer_compatibility_identity,
+        ) {
             bail!(
                 "retrieval sidecar manifest is unavailable ({error}); run retrieval index for project {project_id}"
             );
         }
-        let embedding_device = embedding_device_readiness_for_runtime(runtime);
         let file_roles = storage
             .get_files()
             .map(|files| {
