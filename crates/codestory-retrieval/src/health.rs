@@ -1,7 +1,5 @@
 use crate::capabilities::SidecarCapabilities;
-use crate::config::{
-    SidecarLayout, SidecarOwnership, SidecarProfile, SidecarRuntimeConfig, retrieval_command,
-};
+use crate::config::{SidecarLayout, SidecarRuntimeConfig};
 use crate::embedded_vector::EmbeddedVectorIndex;
 use crate::embeddings::{EmbeddingDeviceReadiness, manifest_embedding_backend_is_product};
 use crate::generation::{manifest_has_current_sidecar_contract, manifest_sidecar_generation};
@@ -61,53 +59,10 @@ fn capabilities_are_empty(cap: &SidecarCapabilities) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetrievalRepairHint {
-    pub reason: String,
-    pub next_step: String,
-    pub next_command: String,
-    pub full_repair: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EmbeddingLaunchMetadata {
-    pub provider: String,
-    pub launch_mode: String,
-    pub endpoint: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spawned_at_epoch_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_start_identity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spawn_protocol: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub launch_args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_fingerprint_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executable_source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executable_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_device: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalStatusReport {
     pub retrieval_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ownership: Option<SidecarOwnership>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repair: Option<RetrievalRepairHint>,
     pub query_embedding_backend: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_vector_embedding_backend: Option<String>,
@@ -133,8 +88,6 @@ pub struct RetrievalStatusReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_accelerator_request_device: Option<String>,
     pub embedding_cpu_allowed: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_launch: Option<EmbeddingLaunchMetadata>,
     pub lexical: ComponentHealth,
     pub semantic: ComponentHealth,
     pub scip: ComponentHealth,
@@ -160,68 +113,6 @@ pub fn attach_manifest_contract(
         .as_ref()
         .map(|manifest| manifest_contract_report(source_root, &report, manifest));
     report
-}
-
-pub fn attach_repair_hint(
-    mut report: RetrievalStatusReport,
-    project_root: &Path,
-    runtime: Option<&SidecarRuntimeConfig>,
-) -> RetrievalStatusReport {
-    if report.is_live_ready() {
-        return report;
-    }
-    let reason = repair_reason_code(
-        report
-            .degraded_reason
-            .as_deref()
-            .unwrap_or("sidecar_retrieval_not_full"),
-    );
-    let profile = runtime
-        .map(|runtime| runtime.profile)
-        .unwrap_or(SidecarProfile::Local);
-    let run_id = runtime.and_then(|runtime| runtime.run_id.as_deref());
-    let full_repair = vec![
-        retrieval_command(
-            "bootstrap",
-            project_root,
-            profile,
-            run_id,
-            Some("--format json"),
-        ),
-        retrieval_command(
-            "index",
-            project_root,
-            profile,
-            run_id,
-            Some("--refresh full --format json"),
-        ),
-        retrieval_command(
-            "status",
-            project_root,
-            profile,
-            run_id,
-            Some("--format json"),
-        ),
-    ];
-    report.repair = Some(RetrievalRepairHint {
-        reason,
-        next_step:
-            "Prepare sidecars, rebuild retrieval indexes with full refresh, then recheck status."
-                .into(),
-        next_command: full_repair[0].clone(),
-        full_repair,
-    });
-    report
-}
-
-fn repair_reason_code(degraded_reason: &str) -> String {
-    if degraded_reason.starts_with("sidecar_manifest_stale:") {
-        return "sidecar_manifest_stale".into();
-    }
-    if degraded_reason.starts_with("embedding_runtime_unavailable:") {
-        return "embedding_runtime_unavailable".into();
-    }
-    degraded_reason.to_string()
 }
 
 fn manifest_contract_report(
@@ -365,6 +256,42 @@ pub struct InfrastructureHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_accelerator_request_device: Option<String>,
     pub embedding_cpu_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_ggml_build_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_adapter_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_execution_devices: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_engine_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_load_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_smoke_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_initialization_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_materialized_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_materialized_reused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_accelerator_execution_verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_adapter_memory_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_adapter_memory_used_by_load: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_layer_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_offloaded_layer_count: Option<u32>,
     pub embed_detail: String,
 }
 
@@ -377,15 +304,6 @@ fn unavailable_component(name: &str, reason: &str) -> ComponentHealth {
         degraded_reason: Some(reason.into()),
         capabilities: SidecarCapabilities::NONE,
     }
-}
-
-#[cfg(test)]
-fn unavailable_status_report(
-    reason: impl Into<String>,
-    manifest: Option<codestory_store::RetrievalIndexManifest>,
-) -> RetrievalStatusReport {
-    let embedding_device = crate::embeddings::embedding_device_readiness();
-    unavailable_status_report_with_embedding_device(reason, manifest, &embedding_device)
 }
 
 pub fn unavailable_status_report_with_embedding_device(
@@ -406,9 +324,7 @@ pub fn unavailable_status_report_with_embedding_device(
         .and_then(|manifest| manifest.embedding_dim);
     RetrievalStatusReport {
         retrieval_mode: retrieval_mode.into(),
-        ownership: None,
         degraded_reason: Some(reason.clone()),
-        repair: None,
         query_embedding_backend: crate::embeddings::embedding_runtime_id(),
         manifest_vector_embedding_backend,
         manifest_vector_embedding_dim,
@@ -426,7 +342,6 @@ pub fn unavailable_status_report_with_embedding_device(
             .clone(),
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
-        embedding_launch: None,
         lexical: unavailable_component("lexical", &reason),
         semantic: unavailable_component("semantic", &reason),
         scip: unavailable_component("scip", &reason),
@@ -437,15 +352,10 @@ pub fn unavailable_status_report_with_embedding_device(
 
 /// Runtime-scoped lexical storage and embedding reachability before a project generation.
 pub fn probe_infrastructure_health(runtime: &SidecarRuntimeConfig) -> InfrastructureHealth {
-    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
-    probe_infrastructure_health_with_embedding_device(runtime, &embedding_device)
-}
-
-pub fn probe_infrastructure_health_with_embedding_device(
-    runtime: &SidecarRuntimeConfig,
-    embedding_device: &EmbeddingDeviceReadiness,
-) -> InfrastructureHealth {
-    let embed_probe = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
+    let snapshot = crate::embeddings::embedding_engine_snapshot_for_runtime(runtime);
+    let embedding_device = &snapshot.device;
+    let embed_probe = snapshot.probe;
+    let identity = snapshot.identity;
     InfrastructureHealth {
         embed_reachable: embed_probe.reachable,
         embedding_device_policy: embedding_device.requested_policy.into(),
@@ -459,6 +369,50 @@ pub fn probe_infrastructure_health_with_embedding_device(
             .clone(),
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
+        embedding_model_sha256: identity
+            .as_ref()
+            .map(|identity| identity.model_digest.to_string()),
+        embedding_ggml_build_identity: identity
+            .as_ref()
+            .map(|identity| identity.ggml_build_identity.to_string()),
+        embedding_backend: identity.as_ref().map(|identity| identity.backend.clone()),
+        embedding_adapter: identity
+            .as_ref()
+            .map(|identity| identity.adapter_name.clone()),
+        embedding_adapter_description: identity
+            .as_ref()
+            .map(|identity| identity.adapter_description.clone()),
+        embedding_execution_devices: identity
+            .as_ref()
+            .map(|identity| identity.execution_device_names.clone()),
+        embedding_policy: identity
+            .as_ref()
+            .map(|identity| identity.policy.to_string()),
+        embedding_engine_instance_id: identity
+            .as_ref()
+            .map(|identity| identity.instance_id.clone()),
+        embedding_model_load_count: identity.as_ref().map(|identity| identity.model_load_count),
+        embedding_smoke_ms: identity.as_ref().map(|identity| identity.smoke_ms),
+        embedding_initialization_ms: identity.as_ref().map(|identity| identity.initialization_ms),
+        embedding_materialized_path: identity
+            .as_ref()
+            .map(|identity| identity.materialized_path.display().to_string()),
+        embedding_materialized_reused: identity
+            .as_ref()
+            .map(|identity| identity.materialized_reused),
+        embedding_accelerator_execution_verified: identity
+            .as_ref()
+            .map(|identity| identity.accelerator_execution_verified),
+        embedding_adapter_memory_total: identity
+            .as_ref()
+            .map(|identity| identity.adapter_memory_total),
+        embedding_adapter_memory_used_by_load: identity
+            .as_ref()
+            .map(|identity| identity.adapter_memory_used_by_load),
+        embedding_model_layer_count: identity.as_ref().map(|identity| identity.model_layer_count),
+        embedding_offloaded_layer_count: identity
+            .as_ref()
+            .map(|identity| identity.offloaded_layer_count),
         embed_detail: embed_probe.detail,
     }
 }
@@ -547,7 +501,7 @@ pub fn probe_sidecar_health_for_runtime(
     if let Some(manifest) = manifest.as_ref() {
         if !manifest_has_current_sidecar_contract(project_id, manifest) {
             return unavailable_status_report_with_embedding_device(
-                "sidecar_manifest_generation_contract_missing",
+                "retrieval_manifest_generation_contract_missing",
                 Some(manifest.clone()),
                 embedding_device,
             );
@@ -634,7 +588,7 @@ pub fn probe_sidecar_health_for_runtime(
             manifest.embedding_backend.as_deref().unwrap_or_default(),
             usize::try_from(manifest.embedding_dim.unwrap_or_default()).unwrap_or_default(),
         );
-        let embedding = crate::embeddings::probe_product_embedding_runtime_for_runtime(runtime);
+        let embedding_reachable = embedding_device.full_retrieval_allowed;
         let product_embedding_backend =
             manifest_embedding_backend_is_product(manifest.embedding_backend.as_deref())
                 && manifest_embedding_backend_is_product(Some(current_embedding_backend.as_str()));
@@ -642,7 +596,7 @@ pub fn probe_sidecar_health_for_runtime(
             Some("embedded_vector_index_unavailable".into())
         } else if !product_embedding_backend {
             Some("semantic_embedding_contract_mismatch".into())
-        } else if !embedding.reachable {
+        } else if !embedding_reachable {
             Some("embedding_runtime_unavailable".into())
         } else if !embedding_device.full_retrieval_allowed {
             embedding_device.degraded_reason.clone()
@@ -659,11 +613,11 @@ pub fn probe_sidecar_health_for_runtime(
                 ComponentStatus::Unavailable
             },
             latency_ms: Some(embedded.latency_ms),
-            detail: format!("{}; {}", embedded.detail, embedding.detail),
+            detail: format!("{}; in-process embedding engine", embedded.detail),
             degraded_reason,
             capabilities: if embedded.ready
                 && product_embedding_backend
-                && embedding.reachable
+                && embedding_reachable
                 && embedding_device.full_retrieval_allowed
             {
                 SidecarCapabilities {
@@ -710,9 +664,7 @@ pub fn probe_sidecar_health_for_runtime(
 
     RetrievalStatusReport {
         retrieval_mode: retrieval_mode.into(),
-        ownership: None,
         degraded_reason,
-        repair: None,
         query_embedding_backend: current_embedding_backend,
         manifest_vector_embedding_backend: manifest.embedding_backend.clone(),
         manifest_vector_embedding_dim: manifest.embedding_dim,
@@ -730,7 +682,6 @@ pub fn probe_sidecar_health_for_runtime(
             .clone(),
         embedding_accelerator_request_device: embedding_device.accelerator_request_device.clone(),
         embedding_cpu_allowed: embedding_device.cpu_allowed,
-        embedding_launch: None,
         lexical,
         semantic,
         scip,
@@ -777,48 +728,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn repair_hint_names_reason_and_full_sidecar_rebuild_sequence() {
-        let report = attach_repair_hint(
-            unavailable_status_report("retrieval_manifest_missing", None),
-            Path::new("C:/repo with spaces"),
-            None,
-        );
-        let repair = report.repair.expect("repair hint");
-
-        assert_eq!(repair.reason, "retrieval_manifest_missing");
-        assert!(
-            repair.next_command.contains("retrieval bootstrap"),
-            "repair should start with sidecar bootstrap: {repair:?}"
-        );
-        assert!(
-            repair.full_repair.iter().any(|command| command
-                .contains("retrieval index --project \"C:/repo with spaces\" --refresh full")),
-            "repair should include full retrieval rebuild with quoted project path: {repair:?}"
-        );
-        assert!(
-            repair
-                .full_repair
-                .last()
-                .is_some_and(|command| command.contains("retrieval status")),
-            "repair should end with retrieval status proof: {repair:?}"
-        );
-    }
-
-    #[test]
-    fn repair_hint_keeps_stale_reason_stable_and_degraded_reason_detailed() {
-        let detailed = "sidecar_manifest_stale: sidecar_input_hash_mismatch current=abc stored=def path=src/lib.rs";
-        let report = attach_repair_hint(
-            unavailable_status_report(detailed, None),
-            Path::new("C:/repo"),
-            None,
-        );
-        let repair = report.repair.expect("repair hint");
-
-        assert_eq!(report.degraded_reason.as_deref(), Some(detailed));
-        assert_eq!(repair.reason, "sidecar_manifest_stale");
-    }
-
-    #[test]
     fn status_reports_unavailable_when_lexical_down() {
         let layout = SidecarLayout::from_env();
         let report = probe_sidecar_health(&layout, "testproject", None);
@@ -861,7 +770,7 @@ mod tests {
         assert_eq!(report.retrieval_mode, "unavailable");
         assert_eq!(
             report.degraded_reason.as_deref(),
-            Some("sidecar_manifest_generation_contract_missing")
+            Some("retrieval_manifest_generation_contract_missing")
         );
         assert_eq!(report.lexical.capabilities, SidecarCapabilities::NONE);
         assert_eq!(report.semantic.capabilities, SidecarCapabilities::NONE);
@@ -972,7 +881,7 @@ mod tests {
         let semantic = zero_dense_semantic_health(&crate::embeddings::EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
             observed_state: "unknown",
-            observation_source: "sidecar_unobserved",
+            observation_source: "retrieval_unobserved",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: false,
@@ -1020,9 +929,9 @@ mod tests {
     #[test]
     fn zero_dense_manifest_allows_explicit_cpu_opt_in() {
         let semantic = zero_dense_semantic_health(&crate::embeddings::EmbeddingDeviceReadiness {
-            requested_policy: "cpu_allowed",
-            observed_state: "cpu",
-            observation_source: "cpu_policy",
+            requested_policy: "cpu_explicit",
+            observed_state: "cpu_explicit",
+            observation_source: "inprocess_engine",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: false,
@@ -1048,7 +957,7 @@ mod tests {
             built_at_epoch_ms: 1,
             disk_bytes: Some(42),
             degraded_modes_json: r#"["embedded_vector_index_unavailable"]"#.into(),
-            embedding_backend: Some("llamacpp:bge-base-en-v1.5".into()),
+            embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
             embedding_dim: Some(768),
             sidecar_schema_version: Some(crate::generation::SIDECAR_SCHEMA_VERSION),
             sidecar_input_hash: Some("input-hash".into()),
@@ -1066,9 +975,8 @@ mod tests {
         };
         let report = RetrievalStatusReport {
             retrieval_mode: "full".into(),
-            ownership: None,
             degraded_reason: None,
-            query_embedding_backend: "llamacpp:bge-base-en-v1.5".into(),
+            query_embedding_backend: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
             manifest_vector_embedding_backend: manifest.embedding_backend.clone(),
             manifest_vector_embedding_dim: manifest.embedding_dim,
             stored_doc_vector_producer_backend: None,
@@ -1076,14 +984,13 @@ mod tests {
             stored_doc_vector_mixed_backends: None,
             embedding_device_policy: "accelerator_required".into(),
             embedding_device_state: "accelerated".into(),
-            embedding_device_observation_source: "manual_env".into(),
+            embedding_device_observation_source: "inprocess_engine".into(),
             embedding_detected_provider: None,
             embedding_detected_gpu: None,
             embedding_accelerator_requested: false,
             embedding_accelerator_request_provider: None,
             embedding_accelerator_request_device: None,
             embedding_cpu_allowed: false,
-            embedding_launch: None,
             lexical: ComponentHealth {
                 name: "lexical".into(),
                 status: ComponentStatus::Healthy,
@@ -1122,7 +1029,6 @@ mod tests {
             },
             manifest_contract: None,
             manifest: Some(manifest),
-            repair: None,
         };
         let source_root = std::env::current_dir().expect("current dir");
 
@@ -1154,7 +1060,7 @@ mod tests {
         }));
         assert!(contract.lanes.iter().any(|lane| {
             lane.lane == "semantic_dense"
-                && lane.producer == "llamacpp:bge-base-en-v1.5"
+                && lane.producer == crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID
                 && lane.provenance == "vector_generation:codestory_testproject_hash"
                 && lane.count == Some(3)
         }));

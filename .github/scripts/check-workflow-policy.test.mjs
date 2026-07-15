@@ -22,7 +22,7 @@ function managedJob() {
         run: [
           "python .github/scripts/check-packaged-agent-proof.py",
           "--archive package.tar.gz",
-          "--managed-plugin-handoff",
+          "--plugin-handoff",
         ].join("\n"),
       },
     ],
@@ -138,8 +138,8 @@ test("managed proof rejects structural bypasses and decoy commands", () => {
     job => { job.if = "always()"; },
     job => { job.steps[0]["continue-on-error"] = true; },
     job => {
-      job.steps[0].run = "python .github/scripts/check-packaged-agent-proof.py\n--archive package.tar.gz\n# --managed-plugin-handoff";
-      job.steps.push({ name: "Decoy", run: "--managed-plugin-handoff" });
+      job.steps[0].run = "python .github/scripts/check-packaged-agent-proof.py\n--archive package.tar.gz\n# --plugin-handoff";
+      job.steps.push({ name: "Decoy", run: "--plugin-handoff" });
     },
   ];
   for (const mutate of mutations) {

@@ -181,12 +181,12 @@ pub(crate) fn status_label(status: ReadinessStatusDto) -> &'static str {
 pub(crate) fn failed_layer(verdict: &ReadinessVerdictDto) -> Option<&'static str> {
     match verdict.status {
         ReadinessStatusDto::Ready => None,
-        ReadinessStatusDto::Repairing => Some("retrieval_sidecar"),
+        ReadinessStatusDto::Repairing => Some("retrieval_engine"),
         ReadinessStatusDto::RepairSetup => Some("runtime_setup"),
         ReadinessStatusDto::RepairIndex => Some("local_index"),
         ReadinessStatusDto::CheckIndex => Some("index_freshness"),
-        ReadinessStatusDto::Blocked => Some("retrieval_sidecar"),
-        ReadinessStatusDto::RepairRetrieval => Some("retrieval_sidecar"),
+        ReadinessStatusDto::Blocked => Some("retrieval_engine"),
+        ReadinessStatusDto::RepairRetrieval => Some("retrieval_engine"),
     }
 }
 
@@ -321,40 +321,9 @@ fn verdict_state(
             .unwrap_or("unavailable");
         let degraded_reason = sidecar.and_then(|sidecar| sidecar.degraded_reason);
         if sidecar_mode != "full" || sidecar_profile != Some("agent") || degraded_reason.is_some() {
-            let device_note = sidecar
-                .and_then(|sidecar| sidecar.embedding_device_policy.zip(sidecar.embedding_device_state).map(|(policy, state)| (sidecar, policy, state)))
-                .map(|(sidecar, policy, state)| {
-                    let detected = sidecar
-                        .embedding_detected_provider
-                        .map(|provider| {
-                            format!(
-                                " detected_provider=`{provider}` detected_gpu=`{}`",
-                                sidecar.embedding_detected_gpu.unwrap_or("unknown")
-                            )
-                        })
-                        .unwrap_or_default();
-                    let request = if sidecar.embedding_accelerator_requested {
-                        format!(
-                            " accelerator_request=`{}:{}`",
-                            sidecar
-                                .embedding_accelerator_request_provider
-                                .unwrap_or("unknown"),
-                            sidecar
-                                .embedding_accelerator_request_device
-                                .unwrap_or("unknown")
-                        )
-                    } else {
-                        String::new()
-                    };
-                    let source = sidecar
-                        .embedding_device_observation_source
-                        .map(|source| format!(" observation_source=`{source}`"))
-                        .unwrap_or_default();
-                    format!(" embedding_device_policy=`{policy}` observed_device=`{state}`{source}{detected}{request}.")
-                })
-                .unwrap_or_default();
-            let full_repair = agent_packet_search_repair_commands(project_arg, sidecar_run_id);
-            let minimum_next = full_repair.iter().take(1).cloned().collect();
+            let next_commands =
+                agent_packet_search_activation_commands(project_arg, sidecar_run_id);
+            let minimum_next = next_commands.iter().take(1).cloned().collect();
             let status = if sidecar_profile == Some("agent")
                 && degraded_reason
                     .is_some_and(|reason| reason.starts_with("embedding_runtime_unavailable:"))
@@ -366,12 +335,12 @@ fn verdict_state(
             return (
                 status,
                 format!(
-                    "Agent packet/search is blocked until full agent sidecar retrieval is live; current profile is `{}`, mode is `{sidecar_mode}`, and degraded reason is `{}`.{device_note}",
+                    "Agent packet/search is waiting for full retrieval; current profile is `{}`, mode is `{sidecar_mode}`, and reason is `{}`.",
                     sidecar_profile.unwrap_or("unknown"),
                     degraded_reason.unwrap_or("none")
                 ),
                 minimum_next,
-                full_repair,
+                next_commands,
             );
         }
     }
@@ -391,7 +360,7 @@ fn verdict_state(
             match goal {
                 ReadinessGoalDto::LocalNavigation => "Local navigation can use the current index.",
                 ReadinessGoalDto::AgentPacketSearch => {
-                    "Agent packet/search can use the current index and sidecar retrieval."
+                    "Agent packet/search can use the current index and retrieval engine."
                 }
             },
             stats,
@@ -413,13 +382,14 @@ fn ready_summary_with_errors(base: &str, stats: &StorageStatsDto) -> String {
     }
 }
 
-fn agent_packet_search_repair_commands(project_arg: &str, run_id: Option<&str>) -> Vec<String> {
-    let mut commands = Vec::new();
-    commands.push(ready_repair_command(
-        ReadinessGoalDto::AgentPacketSearch,
-        project_arg,
-        run_id,
-    ));
+fn agent_packet_search_activation_commands(project_arg: &str, run_id: Option<&str>) -> Vec<String> {
+    let mut activate_command = format!(
+        "codestory-cli retrieval index --project {project_arg} --profile agent --refresh auto --format json"
+    );
+    if let Some(run_id) = run_id {
+        activate_command.push_str(" --run-id ");
+        activate_command.push_str(&quote_command_argument_value(run_id));
+    }
     let mut status_command = format!(
         "codestory-cli retrieval status --project {project_arg} --profile agent --format json"
     );
@@ -427,11 +397,11 @@ fn agent_packet_search_repair_commands(project_arg: &str, run_id: Option<&str>) 
         status_command.push_str(" --run-id ");
         status_command.push_str(&quote_command_argument_value(run_id));
     }
-    commands.extend([
+    vec![
+        activate_command,
         status_command,
         format!("codestory-cli doctor --project {project_arg} --format markdown"),
-    ]);
-    commands
+    ]
 }
 
 fn index_repair_state(
@@ -439,11 +409,18 @@ fn index_repair_state(
     reason: &str,
     project_arg: &str,
 ) -> (ReadinessStatusDto, String, Vec<String>, Vec<String>) {
-    let command = ready_repair_command(goal, project_arg, None);
+    let command = match goal {
+        ReadinessGoalDto::LocalNavigation => {
+            format!("codestory-cli index --project {project_arg} --refresh auto --format json")
+        }
+        ReadinessGoalDto::AgentPacketSearch => format!(
+            "codestory-cli retrieval index --project {project_arg} --profile agent --refresh auto --format json"
+        ),
+    };
     (
         ReadinessStatusDto::RepairIndex,
         format!(
-            "{} {} cannot be trusted until the index is repaired.",
+            "{} {} cannot be trusted until the index is refreshed.",
             reason,
             goal_label(goal)
         ),
@@ -453,27 +430,6 @@ fn index_repair_state(
             format!("codestory-cli doctor --project {project_arg}"),
         ],
     )
-}
-
-fn ready_repair_command(goal: ReadinessGoalDto, project_arg: &str, run_id: Option<&str>) -> String {
-    let mut command = format!(
-        "codestory-cli ready --goal {} --repair --project {project_arg} --format json",
-        ready_goal_cli_label(goal)
-    );
-    if goal == ReadinessGoalDto::AgentPacketSearch
-        && let Some(run_id) = run_id
-    {
-        command.push_str(" --run-id ");
-        command.push_str(&quote_command_argument_value(run_id));
-    }
-    command
-}
-
-fn ready_goal_cli_label(goal: ReadinessGoalDto) -> &'static str {
-    match goal {
-        ReadinessGoalDto::LocalNavigation => "local",
-        ReadinessGoalDto::AgentPacketSearch => "agent",
-    }
 }
 
 fn readiness_index_snapshot(
@@ -653,8 +609,8 @@ mod tests {
             "missing local index should not collapse agent retrieval readiness: {verdicts:?}"
         );
         assert!(
-            verdicts[0].minimum_next[0].contains("ready --goal local --repair"),
-            "missing index repair should request full refresh: {verdicts:?}"
+            verdicts[0].minimum_next[0].contains("index --project"),
+            "missing index should request a refresh: {verdicts:?}"
         );
     }
 
@@ -697,7 +653,7 @@ mod tests {
             "local readiness should explain the recorded fatal index errors: {verdicts:?}"
         );
         assert!(
-            verdicts[0].minimum_next[0].contains("ready --goal"),
+            verdicts[0].minimum_next[0].contains("index --project"),
             "error-bearing indexes should request a full refresh repair: {verdicts:?}"
         );
         let refresh = local_refresh_output(&verdicts[0]);
@@ -770,8 +726,8 @@ mod tests {
         assert!(refresh.blocks_local_surfaces);
         assert_eq!(refresh.changed_file_count, 1);
         assert!(
-            verdict.minimum_next[0].contains("ready --goal local --repair"),
-            "stale index repair should point at the one-command repair path: {verdict:?}"
+            verdict.minimum_next[0].contains("index --project"),
+            "stale index should point at the normal index path: {verdict:?}"
         );
         assert!(verdict.summary.contains("changed, new, or removed files"));
 
@@ -869,7 +825,7 @@ mod tests {
                     degraded_reason: Some("semantic store unavailable"),
                     embedding_device_policy: Some("accelerator_required"),
                     embedding_device_state: Some("unknown"),
-                    embedding_device_observation_source: Some("sidecar_unobserved"),
+                    embedding_device_observation_source: Some("retrieval_unobserved"),
                     embedding_detected_provider: None,
                     embedding_detected_gpu: None,
                     embedding_accelerator_requested: false,
@@ -890,24 +846,14 @@ mod tests {
                 .and_then(|sidecar| sidecar.degraded_reason.as_deref()),
             Some("semantic store unavailable")
         );
-        assert!(
-            degraded
-                .summary
-                .contains("embedding_device_policy=`accelerator_required`"),
-            "blocked full retrieval should expose device policy: {degraded:?}"
-        );
-        assert!(
-            degraded
-                .summary
-                .contains("observation_source=`sidecar_unobserved`"),
-            "blocked full retrieval should expose device observation source: {degraded:?}"
-        );
+        assert!(!degraded.summary.contains("embedding_device_policy"));
+        assert!(!degraded.summary.contains("observation_source"));
         assert!(
             degraded
                 .full_repair
                 .first()
-                .is_some_and(|command| command.contains("ready --goal agent --repair")),
-            "fresh-index sidecar repair should start with the one-command repair path: {degraded:?}"
+                .is_some_and(|command| command.contains("retrieval index")),
+            "fresh-index retrieval activation should start with artifact publication: {degraded:?}"
         );
         assert!(
             degraded
@@ -947,7 +893,7 @@ mod tests {
                 degraded_reason: Some("manifest:<missing>"),
                 embedding_device_policy: Some("accelerator_required"),
                 embedding_device_state: Some("unknown"),
-                embedding_device_observation_source: Some("sidecar_unobserved"),
+                embedding_device_observation_source: Some("retrieval_unobserved"),
                 embedding_detected_provider: None,
                 embedding_detected_gpu: None,
                 embedding_accelerator_requested: false,
@@ -964,57 +910,12 @@ mod tests {
             );
 
             assert_eq!(verdict.status, ReadinessStatusDto::Blocked);
-            assert_eq!(failed_layer(&verdict), Some("retrieval_sidecar"));
+            assert_eq!(failed_layer(&verdict), Some("retrieval_engine"));
             assert_eq!(verdict.minimum_next.len(), 1);
             assert!(
-                verdict.minimum_next[0].contains("ready --goal agent --repair"),
-                "sidecar repair should expose one canonical repair command: {verdict:?}"
+                verdict.minimum_next[0].contains("retrieval index"),
+                "retrieval activation should expose one canonical command: {verdict:?}"
             );
         }
-    }
-
-    #[test]
-    fn dead_agent_endpoint_reports_repair_retrieval_when_freshness_is_unknown() {
-        let stats = stats(3);
-        let verdict = build_readiness_verdict(
-            ReadinessGoalDto::AgentPacketSearch,
-            inputs(
-                &stats,
-                None,
-                Some(ReadinessSidecarInput {
-                    profile: Some("agent"),
-                    run_id: Some("run"),
-                    retrieval_mode: "full",
-                    degraded_reason: Some("embedding_runtime_unavailable: connection refused"),
-                    embedding_device_policy: Some("accelerator_required"),
-                    embedding_device_state: Some("unknown"),
-                    embedding_device_observation_source: Some("sidecar_unobserved"),
-                    embedding_detected_provider: None,
-                    embedding_detected_gpu: None,
-                    embedding_accelerator_requested: false,
-                    embedding_accelerator_request_provider: None,
-                    embedding_accelerator_request_device: None,
-                    embedding_cpu_allowed: false,
-                    manifest_generation: None,
-                    manifest_input_hash: None,
-                }),
-            ),
-        );
-
-        assert_eq!(verdict.status, ReadinessStatusDto::RepairRetrieval);
-        assert!(
-            verdict
-                .full_repair
-                .first()
-                .is_some_and(|command| command.contains("ready --goal agent --repair")),
-            "agent readiness should keep the agent sidecar repair path: {verdict:?}"
-        );
-        assert!(
-            !verdict
-                .full_repair
-                .iter()
-                .any(|command| command == "codestory-cli doctor --project C:/workspace/project"),
-            "unknown local freshness should not inject local graph repair into agent readiness: {verdict:?}"
-        );
     }
 }

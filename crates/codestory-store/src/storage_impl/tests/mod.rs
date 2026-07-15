@@ -197,7 +197,7 @@ fn schema_19_adds_nullable_file_content_hash_without_losing_rows() -> Result<(),
     }
 
     let storage = Storage::open(&path)?;
-    assert_eq!(storage.schema_version()?, 21);
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
     assert_eq!(storage.get_files()?.len(), 1);
     assert_eq!(storage.get_file_content_hash(7)?, None);
 
@@ -876,10 +876,8 @@ fn test_llm_symbol_doc_stats_report_contract_metadata() -> Result<(), StorageErr
         doc_version: 2,
         doc_hash: "semantic-hash-501".to_string(),
         embedding_profile: Some("bge-base-en-v1.5".to_string()),
-        embedding_model:
-            "BAAI/bge-base-en-v1.5-local|backend=llamacpp|pool=Cls|expected_dim=Some(768)"
-                .to_string(),
-        embedding_backend: Some("llamacpp".to_string()),
+        embedding_model: "inprocess:bge-base-en-v1.5:q8_0".to_string(),
+        embedding_backend: Some("inprocess".to_string()),
         embedding_dim: 768,
         doc_shape: Some("semantic_doc_version=2;alias_mode=alias_variant".to_string()),
         semantic_policy_version: Some("graph_first_v1".to_string()),
@@ -1886,10 +1884,10 @@ fn live_open_migrates_v18_manifest_to_lexical_schema_without_losing_rows()
 
 #[test]
 fn current_schema_uses_only_lexical_manifest_column() -> Result<(), StorageError> {
-    let db_path = unique_temp_db_path("v21-lexical-manifest-contract");
+    let db_path = unique_temp_db_path("current-lexical-manifest-contract");
     let _ = std::fs::remove_file(&db_path);
     let storage = Storage::open(&db_path)?;
-    assert_eq!(storage.schema_version()?, 21);
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
     let columns = storage
         .conn
         .prepare("PRAGMA table_info(retrieval_index_manifest)")?

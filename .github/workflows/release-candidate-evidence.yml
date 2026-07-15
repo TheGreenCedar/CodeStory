@@ -16,10 +16,6 @@ on:
         required: false
         type: string
         default: ""
-      embedding_model_dir:
-        required: false
-        type: string
-        default: ""
       source_run_id:
         required: false
         type: string
@@ -54,11 +50,9 @@ jobs:
         env:
           PROFILE: ${{ inputs.profile }}
           DRILL_MANIFEST: ${{ inputs.drill_manifest }}
-          EMBEDDING_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
           set -euo pipefail
           test "$DRILL_MANIFEST" = /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-          test "$EMBEDDING_MODEL_DIR" = /srv/codestory-release-evidence/models
           bash scripts/release-evidence/guest-verify.sh \
             scripts/release-evidence/machine-contract.json
           mkdir -p target/release-evidence
@@ -70,6 +64,10 @@ jobs:
             echo "::error::Requested profile $PROFILE does not match provisioned profile $provisioned_profile."
             exit 1
           }
+
+      - name: Prepare checksum-pinned embedded model
+        if: inputs.source_run_id == ''
+        run: node scripts/prepare-embedded-model.mjs
 
       - name: Build release CLI
         if: inputs.source_run_id == ''
@@ -83,7 +81,7 @@ jobs:
           CODESTORY_RELEASE_EVIDENCE_PROVISIONING: ${{ github.workspace }}/target/release-evidence/provisioning.json
         run: echo "fingerprint=$(node scripts/codestory-release-evidence-gate.mjs fingerprint)" >> "$GITHUB_OUTPUT"
 
-      - name: Produce full-sidecar repo evidence
+      - name: Produce full-retrieval repo evidence
         if: inputs.source_run_id == ''
         shell: bash
         env:
@@ -91,11 +89,10 @@ jobs:
           CODESTORY_RELEASE_EVIDENCE_STATS_PATH: ${{ github.workspace }}/target/release-evidence/stats.json
           CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
           CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
-          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
+          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-inprocess-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
           CODESTORY_REAL_REPO_DRILL_CASES: ${{ inputs.drill_manifest }}
           CODESTORY_EMBED_ALLOW_CPU: "1"
-          CODESTORY_EMBED_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
           set -euo pipefail
           cargo test --locked -p codestory-cli --test codestory_repo_e2e_stats -- --ignored --nocapture --test-threads=1 \
@@ -108,10 +105,9 @@ jobs:
           CODESTORY_RELEASE_EVIDENCE_COMMIT: ${{ inputs.ref }}
           CODESTORY_RELEASE_EVIDENCE_PROFILE: ${{ inputs.profile }}
           CODESTORY_RELEASE_EVIDENCE_CORPUS_ID: codestory-release-corpus-v1
-          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-full-sidecar-v1
+          CODESTORY_RELEASE_EVIDENCE_CACHE_ID: cold-inprocess-v1
           CODESTORY_RELEASE_EVIDENCE_MACHINE_FINGERPRINT: ${{ steps.machine.outputs.fingerprint }}
           CODESTORY_EMBED_ALLOW_CPU: "1"
-          CODESTORY_EMBED_MODEL_DIR: ${{ inputs.embedding_model_dir }}
         run: |
           set -euo pipefail
           node scripts/codestory-agent-ab-benchmark.mjs \

@@ -1,3 +1,4 @@
+#[cfg(any(test, windows, all(unix, not(target_os = "linux"))))]
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -7,13 +8,23 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 #[cfg(target_os = "linux")]
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+use std::process::Command;
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::process::Output;
+#[cfg(any(all(unix, not(target_os = "linux")), all(test, windows)))]
+use std::process::Stdio;
 use std::sync::OnceLock;
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::thread;
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::time::{Duration, Instant};
 
+#[cfg(all(unix, not(target_os = "linux")))]
 const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(all(unix, not(target_os = "linux")))]
 const PROCESS_PROBE_REAP_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(all(unix, not(target_os = "linux")))]
 const PROCESS_PROBE_POLL: Duration = Duration::from_millis(10);
 
 #[cfg(windows)]
@@ -24,8 +35,6 @@ const WINDOWS_ERROR_INVALID_PARAMETER: i32 = 87;
 const WINDOWS_STILL_ACTIVE: u32 = 259;
 #[cfg(windows)]
 const WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH: u64 = 504_911_232_000_000_000;
-#[cfg(windows)]
-const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 
 /// Live-process evidence from the platform start-identity probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,32 +89,19 @@ pub fn probe_process_start_identity(pid: u32) -> ProcessStartProbe {
     probe
 }
 
-/// Return the persisted native embedding identity format used by sidecar state.
-pub fn native_embedding_process_start_identity(pid: u32) -> Result<Option<String>> {
-    if pid == 0 {
-        bail!("native embedding process pid must be greater than zero");
-    }
-    match probe_process_start_identity(pid) {
-        ProcessStartProbe::Running { start_identity } => Ok(Some(start_identity)),
-        ProcessStartProbe::NotRunning => Ok(None),
-        ProcessStartProbe::Unknown { reason } => {
-            bail!("query native embedding start identity for pid {pid}: {reason}")
-        }
-    }
-}
-
-pub(crate) fn bounded_process_command_output(command: &mut Command) -> Result<Output> {
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bounded_process_command_output(command: &mut Command) -> Result<Output> {
     bounded_process_command_output_with_timeout(command, PROCESS_PROBE_TIMEOUT)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "linux")))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PsProbeOutputStatus {
     Success,
     ProcessMissing,
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn classify_ps_probe_output(output: &Output) -> Result<PsProbeOutputStatus> {
     if output.status.success() {
         return Ok(PsProbeOutputStatus::Success);
@@ -120,6 +116,7 @@ pub(crate) fn classify_ps_probe_output(output: &Output) -> Result<PsProbeOutputS
     )
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
 fn bounded_process_command_output_with_timeout(
     command: &mut Command,
     timeout: Duration,
@@ -154,6 +151,7 @@ fn bounded_process_command_output_with_timeout(
     }
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
 fn terminate_bounded_probe(child: &mut std::process::Child) {
     let _ = child.kill();
     let reap_deadline = Instant::now() + PROCESS_PROBE_REAP_TIMEOUT;
@@ -190,7 +188,7 @@ unsafe extern "system" {
 #[cfg(windows)]
 fn windows_running_process_creation_time(pid: u32) -> Result<Option<WindowsFileTime>> {
     if pid == 0 {
-        bail!("native embedding process pid must be greater than zero");
+        bail!("process pid must be greater than zero");
     }
     let raw_handle = unsafe { OpenProcess(WINDOWS_PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if raw_handle.is_null() {
@@ -198,7 +196,7 @@ fn windows_running_process_creation_time(pid: u32) -> Result<Option<WindowsFileT
         if error.raw_os_error() == Some(WINDOWS_ERROR_INVALID_PARAMETER) {
             return Ok(None);
         }
-        return Err(error).with_context(|| format!("open native embedding process {pid}"));
+        return Err(error).with_context(|| format!("open process {pid}"));
     }
     let process = unsafe { OwnedHandle::from_raw_handle(raw_handle) };
     let mut creation_time = WindowsFileTime::default();
@@ -216,12 +214,12 @@ fn windows_running_process_creation_time(pid: u32) -> Result<Option<WindowsFileT
     } == 0
     {
         return Err(io::Error::last_os_error())
-            .with_context(|| format!("query native embedding start identity for pid {pid}"));
+            .with_context(|| format!("query process start identity for pid {pid}"));
     }
     let mut exit_code = 0_u32;
     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit_code) } == 0 {
         return Err(io::Error::last_os_error())
-            .with_context(|| format!("query native embedding exit code for pid {pid}"));
+            .with_context(|| format!("query process exit code for pid {pid}"));
     }
     if !windows_process_is_running(&exit_time, exit_code) {
         return Ok(None);
@@ -248,49 +246,6 @@ fn windows_datetime_ticks_from_filetime(filetime: &WindowsFileTime) -> Result<u6
     legacy_filetime_ticks
         .checked_add(WINDOWS_DATETIME_TICKS_AT_FILETIME_EPOCH)
         .context("convert Windows process creation time to DateTime ticks")
-}
-
-#[cfg(windows)]
-fn windows_epoch_ms_from_filetime(filetime: &WindowsFileTime) -> Result<i64> {
-    let elapsed_ticks = windows_filetime_ticks(filetime)
-        .checked_sub(WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH)
-        .context("convert Windows process creation time to Unix epoch")?;
-    i64::try_from(elapsed_ticks / 10_000)
-        .context("convert Windows process creation time to epoch milliseconds")
-}
-
-#[cfg(windows)]
-pub(crate) fn process_started_at_epoch_ms(pid: u32) -> Result<Option<i64>> {
-    windows_running_process_creation_time(pid)?
-        .as_ref()
-        .map(windows_epoch_ms_from_filetime)
-        .transpose()
-}
-
-#[cfg(not(windows))]
-pub(crate) fn process_started_at_epoch_ms(pid: u32) -> Result<Option<i64>> {
-    let mut command = Command::new("ps");
-    command
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .args(["-p", &pid.to_string(), "-o", "lstart="]);
-    let output = bounded_process_command_output(&mut command)?;
-    match classify_ps_probe_output(&output)? {
-        PsProbeOutputStatus::Success => Ok(process_started_at_epoch_ms_from_lstart(&output.stdout)),
-        PsProbeOutputStatus::ProcessMissing => Ok(None),
-    }
-}
-
-#[cfg(not(windows))]
-fn process_started_at_epoch_ms_from_lstart(output: &[u8]) -> Option<i64> {
-    use chrono::TimeZone;
-
-    let started = chrono::NaiveDateTime::parse_from_str(
-        String::from_utf8_lossy(output).trim(),
-        "%a %b %e %H:%M:%S %Y",
-    )
-    .ok()?;
-    Some(chrono::Utc.from_utc_datetime(&started).timestamp_millis())
 }
 
 #[cfg(windows)]
@@ -416,7 +371,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn ps_status_distinguishes_missing_process_from_probe_failure() {
         use std::os::unix::process::ExitStatusExt;
@@ -489,6 +444,7 @@ mod tests {
     fn windows_identity_format_stays_compatible_with_legacy_cim_ticks() -> Result<()> {
         const DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH: u64 = 621_355_968_000_000_000;
 
+        const WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
         let unix_epoch_with_sub_microsecond_ticks = WINDOWS_FILETIME_TICKS_AT_UNIX_EPOCH + 8;
         let unix_epoch = WindowsFileTime {
             low_date_time: unix_epoch_with_sub_microsecond_ticks as u32,
@@ -498,7 +454,6 @@ mod tests {
             windows_datetime_ticks_from_filetime(&unix_epoch)?,
             DOTNET_DATETIME_TICKS_AT_UNIX_EPOCH
         );
-        assert_eq!(windows_epoch_ms_from_filetime(&unix_epoch)?, 0);
         assert!(windows_process_is_running(
             &WindowsFileTime::default(),
             WINDOWS_STILL_ACTIVE

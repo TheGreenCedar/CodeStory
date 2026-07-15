@@ -49,13 +49,6 @@ fn build_indexed_controller(file_count: usize) -> anyhow::Result<(TempDir, AppCo
     indexer.run_incremental(&mut storage, &refresh_info, &event_bus, None)?;
     drop(storage);
 
-    // SAFETY: Criterion benches are executed in a controlled single-process context here,
-    // and we set env vars before constructing the AppController/runtime that reads them.
-    unsafe {
-        // Benchmark uses deterministic local embeddings to avoid external model setup in CI/dev.
-        std::env::set_var("CODESTORY_EMBED_RUNTIME_MODE", "hash");
-    }
-
     let controller = AppController::new();
     controller
         .open_project(OpenProjectRequest {

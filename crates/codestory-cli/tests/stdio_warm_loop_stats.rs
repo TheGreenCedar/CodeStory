@@ -219,7 +219,7 @@ fn run_cli_json(binary: &Path, workspace: &Path, cache_dir: &Path, args: &[Strin
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run codestory-cli");
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -247,7 +247,7 @@ fn spawn_stdio_server(binary: &Path, fixture: &WarmLoopFixture) -> StdioServer {
         .arg(fixture.workspace.path())
         .arg("--cache-dir")
         .arg(fixture.cache_dir.path())
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

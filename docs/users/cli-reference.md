@@ -16,20 +16,20 @@ cargo build --release --locked -p codestory-cli
 
 Windows: `.\target\release\codestory-cli.exe`.
 
-## Readiness and repair
+## Readiness and retrieval
 
 | Situation | Command |
 | --- | --- |
 | Agent handoff when MCP is down | `codestory-cli agent preflight --project <repo> --format json` |
-| Repair local graph | `codestory-cli ready --goal local --repair --project <repo> --format json` |
-| Repair packet/search | `codestory-cli ready --goal agent --repair --project <repo> --format json` |
+| Refresh local graph | `codestory-cli index --project <repo> --refresh auto --format json` |
+| Build packet/search retrieval | `codestory-cli retrieval index --project <repo> --refresh full --format json` |
 | Health summary | `codestory-cli doctor --project <repo>` |
 | Managed search status | `codestory-cli retrieval status --project <repo> --format json` |
 | Direct stdio MCP (debug) | `codestory-cli serve --project <repo> --stdio --refresh none` |
 
-Preflight exposes `safe_surfaces`, `blocked_surfaces`, and `repair_command`.
+Preflight exposes `safe_surfaces`, `blocked_surfaces`, and the next normal retrieval action.
 `ready --format json` returns `verdicts[]` with per-goal `status`, `summary`,
-`minimum_next`, and `full_repair`. `retrieval status --format json` reports
+and `minimum_next`. `retrieval status --format json` reports
 `retrieval_mode` (trust packet/search only when `full`).
 When MCP is live, prefer `codestory://status` instead.
 
@@ -66,7 +66,7 @@ Degraded retrieval is navigation help only. See [Glossary](../glossary.md#retrie
 ## Stale local cache
 
 ```sh
-codestory-cli ready --goal local --repair --project <repo> --format json
+codestory-cli index --project <repo> --refresh auto --format json
 ```
 
 Read commands default to `--refresh none`. Use `--refresh incremental` when a
@@ -74,7 +74,7 @@ read should refresh an existing cache first.
 
 Reserve `index --refresh full` or moving a cache aside for maintainer-directed
 recovery after status/`doctor` identifies that exact cache and coordinated local
-repair cannot converge. Verify the path is under the active CodeStory cache
+refresh cannot converge. Verify the path is under the active CodeStory cache
 root, preserve the old directory until the replacement is healthy, and never
 clean a user cache merely to make tests pass.
 
@@ -111,9 +111,9 @@ their per-project embedding contract.
 Project `.codestory.toml` cannot choose cache roots. It also cannot choose
 network egress settings by default. A trusted operator may set
 `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG=1` for the whole process to allow every
-project opened by that process to configure summary and embedding endpoints.
-That opt-in can redirect source or query text, so never enable it while opening
-untrusted repositories. Put `cache_dir` in user home `.codestory.toml` or pass
+project opened by that process to configure summary endpoints. That opt-in can
+redirect source text, so never enable it while opening untrusted repositories.
+Embedding never uses a network endpoint. Put `cache_dir` in user home `.codestory.toml` or pass
 `--cache-dir`.
 
 ## Command by situation
@@ -128,7 +128,7 @@ untrusted repositories. Put `cache_dir` in user home `.codestory.toml` or pass
 
 ## Managed search internals
 
-Maintainer-only lifecycle details: [retrieval operations](../ops/retrieval-sidecars.md).
+Maintainer-only engine details: [retrieval operations](../ops/retrieval-engine.md).
 
 ## Environment overrides
 
@@ -138,8 +138,8 @@ Maintainer-only lifecycle details: [retrieval operations](../ops/retrieval-sidec
 | `CODESTORY_IDE_COMMAND` | Optional shell command template for definition-open actions. Supports `{file}`, `{line}`, and `{col}`; set only trusted local templates because the template runs through your shell. |
 | `CODESTORY_NO_TUI` | Disable TUI for `explore` in CI or scripts |
 | `CODESTORY_SUMMARY_ENDPOINT` | Trusted summary endpoint |
-| `CODESTORY_EMBED_LLAMACPP_URL` | Trusted embedding endpoint |
-| `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` | Process-wide opt-in allowing trusted project files to configure network endpoints |
+| `CODESTORY_EMBED_ALLOW_CPU` | Explicitly allow CPU embeddings. Intended for hosted CI and maintainer diagnostics; production does not fall back silently. |
+| `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` | Process-wide opt-in allowing trusted project files to configure summary endpoints |
 
 ## Further reading
 

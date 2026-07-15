@@ -55,7 +55,6 @@ pub(crate) struct SidecarInputFingerprint {
 struct SidecarEmbeddingContract<'a> {
     backend: &'a str,
     dimension: i32,
-    config: &'a crate::config::EmbeddingRuntimeConfig,
 }
 
 struct SemanticGeneration<'a> {
@@ -155,7 +154,6 @@ pub fn finalize_index_for_runtime_with_progress(
     let embedding_contract = SidecarEmbeddingContract {
         backend: &embedding_backend,
         dimension: embedding_dim,
-        config: &runtime.embedding,
     };
     let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
         input_snapshot.storage(),
@@ -683,7 +681,6 @@ fn persist_finalized_manifest(
             let embedding_contract = SidecarEmbeddingContract {
                 backend: &embedding_backend,
                 dimension: embedding_dim,
-                config: &retention_context.runtime.embedding,
             };
             let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
                 storage,
@@ -771,9 +768,8 @@ struct CandidateGenerationEvidence {
     semantic_zero_dense_policy: bool,
     embedding_device: crate::embeddings::EmbeddingDeviceReadiness,
     embedding_accelerator_smoke_elapsed_ms: Option<u64>,
-    embedding_launch_before: Option<crate::health::EmbeddingLaunchMetadata>,
-    embedding_launch_after: Option<crate::health::EmbeddingLaunchMetadata>,
-    expected_embedding_launch: Option<crate::health::EmbeddingLaunchMetadata>,
+    embedding_identity_before: crate::in_process_embedding::ProcessEmbeddingIdentity,
+    embedding_identity_after: crate::in_process_embedding::ProcessEmbeddingIdentity,
     retrieval_mode: String,
     degraded_reason: Option<String>,
 }
@@ -821,40 +817,25 @@ fn validate_candidate_generation_evidence(
     if !semantic_valid {
         bail!("mandatory candidate generation component failed validation: semantic");
     }
-    let native_launch_stable = match (
-        evidence.embedding_launch_before.as_ref(),
-        evidence.embedding_launch_after.as_ref(),
-    ) {
-        (Some(before), Some(after)) => before == after,
-        (None, None) => true,
-        _ => false,
-    };
     if !crate::embeddings::manifest_embedding_backend_is_product(
         manifest.embedding_backend.as_deref(),
-    ) || !embedding_launch_matches_runtime(
-        runtime,
-        evidence.embedding_launch_after.as_ref(),
-        evidence.expected_embedding_launch.as_ref(),
-    ) || !native_launch_stable
-    {
+    ) || !embedding_identity_matches(
+        &evidence.embedding_identity_before,
+        &evidence.embedding_identity_after,
+    ) {
         bail!("mandatory candidate generation component failed validation: embedding_runtime");
     }
-    let runtime_cpu_allowed = runtime
-        .embedding
-        .device_policy
-        .eq_ignore_ascii_case("allow_cpu");
+    let runtime_cpu_allowed = runtime.embedding.allow_cpu;
     let device_policy_valid = if evidence.embedding_device.cpu_allowed && runtime_cpu_allowed {
         evidence.embedding_device.full_retrieval_allowed
-            && evidence.embedding_device.observation_source == "cpu_policy"
+            && evidence.embedding_device.observed_state == "cpu_explicit"
+            && evidence.embedding_device.observation_source == "inprocess_engine"
             && evidence.embedding_accelerator_smoke_elapsed_ms.is_none()
     } else if !evidence.embedding_device.cpu_allowed && !runtime_cpu_allowed {
         evidence.embedding_accelerator_smoke_elapsed_ms.is_some()
             && evidence.embedding_device.accelerator_requested
             && evidence.embedding_device.observed_state == "accelerated"
-            && matches!(
-                evidence.embedding_device.observation_source,
-                "sidecar_log" | "native_log"
-            )
+            && evidence.embedding_device.observation_source == "inprocess_engine"
     } else {
         false
     };
@@ -871,52 +852,19 @@ fn validate_candidate_generation_evidence(
     Ok(())
 }
 
-fn embedding_launch_matches_runtime(
-    runtime: &SidecarRuntimeConfig,
-    observed: Option<&crate::health::EmbeddingLaunchMetadata>,
-    expected: Option<&crate::health::EmbeddingLaunchMetadata>,
+fn embedding_identity_matches(
+    before: &crate::in_process_embedding::ProcessEmbeddingIdentity,
+    after: &crate::in_process_embedding::ProcessEmbeddingIdentity,
 ) -> bool {
-    let native = runtime
-        .embedding
-        .server_launch
-        .as_deref()
-        .is_some_and(|mode| {
-            matches!(
-                mode.trim().to_ascii_lowercase().as_str(),
-                "native" | "native_spawned"
-            )
-        });
-    if !native {
-        return true;
-    }
-    let (Some(observed), Some(expected)) = (observed, expected) else {
-        return false;
-    };
-    let Some(model_path) = observed.model_path.as_deref() else {
-        return false;
-    };
-    let profile = normalize_embedding_model_token(&runtime.embedding.profile);
-    let model_file = Path::new(model_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(normalize_embedding_model_token)
-        .unwrap_or_default();
-    !profile.is_empty()
-        && model_file.contains(&profile)
-        && observed.launch_mode == expected.launch_mode
-        && observed.endpoint == expected.endpoint
-        && observed.launch_fingerprint_sha256 == expected.launch_fingerprint_sha256
-        && observed.executable_path == expected.executable_path
-        && observed.model_path == expected.model_path
-        && observed.requested_device == expected.requested_device
-}
-
-fn normalize_embedding_model_token(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
+    before.instance_id == after.instance_id
+        && before.model_load_count == 1
+        && after.model_load_count == 1
+        && before.model_digest == after.model_digest
+        && before.ggml_build_identity == after.ggml_build_identity
+        && before.backend == after.backend
+        && before.adapter_name == after.adapter_name
+        && before.policy == after.policy
+        && before.accelerator_execution_verified == after.accelerator_execution_verified
 }
 
 fn validate_candidate_generation(
@@ -930,9 +878,11 @@ fn validate_candidate_generation(
         .as_deref()
         .context("mandatory sidecar manifest is missing its generation")?;
     let scip_dir = context.layout.scip_project_dir(generation);
-    let embedding_launch_before =
-        crate::sidecar::live_native_embedding_launch_metadata_for_runtime(context.runtime)
-            .context("validate native embedding identity before final probes")?;
+    let embedding_identity_before = crate::in_process_embedding::process_embedding_identity(
+        &context.runtime.cache_root,
+        context.runtime.embedding.allow_cpu,
+    )
+    .context("validate in-process embedding identity before final probes")?;
     let semantic_generation = SemanticGeneration {
         layout: context.layout,
         collection: &manifest.semantic_generation,
@@ -959,9 +909,11 @@ fn validate_candidate_generation(
         &embedding_device,
         context.runtime,
     );
-    let embedding_launch_after =
-        crate::sidecar::live_native_embedding_launch_metadata_for_runtime(context.runtime)
-            .context("validate native embedding identity after final probes")?;
+    let embedding_identity_after = crate::in_process_embedding::process_embedding_identity(
+        &context.runtime.cache_root,
+        context.runtime.embedding.allow_cpu,
+    )
+    .context("validate in-process embedding identity after final probes")?;
     let evidence = CandidateGenerationEvidence {
         lexical_matches: crate::lexical_index::shard_matches_lexical_input(
             &context.layout.lexical_data_dir,
@@ -984,10 +936,8 @@ fn validate_candidate_generation(
         embedding_device,
         embedding_accelerator_smoke_elapsed_ms: embedding_accelerator_smoke
             .map(|smoke| smoke.elapsed_ms),
-        embedding_launch_before,
-        embedding_launch_after,
-        expected_embedding_launch:
-            crate::native_embedding::expected_native_embedding_launch_metadata(context.runtime)?,
+        embedding_identity_before,
+        embedding_identity_after,
         retrieval_mode: status.retrieval_mode,
         degraded_reason: status.degraded_reason,
     };
@@ -1081,40 +1031,17 @@ fn retain_published_generations(
     Ok((plan, apply))
 }
 
-#[cfg(test)]
 pub(crate) fn compute_sidecar_input_fingerprint(
     storage: &Store,
-    storage_path: &Path,
     project_root: &Path,
     project_id: &str,
     embedding_backend: &str,
     embedding_dim: i32,
-) -> Result<SidecarInputFingerprint> {
-    compute_sidecar_input_fingerprint_for_runtime(
-        storage,
-        storage_path,
-        project_root,
-        project_id,
-        embedding_backend,
-        embedding_dim,
-        &crate::config::SidecarRuntimeConfig::local(),
-    )
-}
-
-pub(crate) fn compute_sidecar_input_fingerprint_for_runtime(
-    storage: &Store,
-    _storage_path: &Path,
-    project_root: &Path,
-    project_id: &str,
-    embedding_backend: &str,
-    embedding_dim: i32,
-    runtime: &SidecarRuntimeConfig,
 ) -> Result<SidecarInputFingerprint> {
     let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
     let embedding_contract = SidecarEmbeddingContract {
         backend: embedding_backend,
         dimension: embedding_dim,
-        config: &runtime.embedding,
     };
     compute_sidecar_input_fingerprint_with_lexical_source(
         storage,
@@ -1136,7 +1063,7 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         .context("hash lexical symbol input")?;
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v6");
+    hash_part(&mut hasher, "codestory-sidecar-input-v7");
     hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
     hash_part(&mut hasher, &SIDECAR_SCHEMA_VERSION.to_string());
@@ -1145,51 +1072,6 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
     hash_part(&mut hasher, &lexical.hash);
     hash_part(&mut hasher, embedding.backend);
     hash_part(&mut hasher, &embedding.dimension.to_string());
-    hash_part(&mut hasher, &embedding.config.profile);
-    hash_part(
-        &mut hasher,
-        embedding.config.model_id.as_deref().unwrap_or(""),
-    );
-    hash_part(
-        &mut hasher,
-        embedding.config.pooling.as_deref().unwrap_or(""),
-    );
-    hash_part(
-        &mut hasher,
-        &embedding
-            .config
-            .layer_norm
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-    );
-    hash_part(
-        &mut hasher,
-        &embedding
-            .config
-            .truncate_dim
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-    );
-    hash_part(
-        &mut hasher,
-        &embedding
-            .config
-            .expected_dim
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-    );
-    hash_part(
-        &mut hasher,
-        embedding.config.server_launch.as_deref().unwrap_or(""),
-    );
-    hash_part(
-        &mut hasher,
-        embedding.config.query_prefix.as_deref().unwrap_or(""),
-    );
-    hash_part(
-        &mut hasher,
-        embedding.config.document_prefix.as_deref().unwrap_or(""),
-    );
     hash_part(&mut hasher, "semantic-vectors-v2");
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
@@ -1453,7 +1335,44 @@ mod tests {
     use super::*;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::SearchSymbolProjectionDetail;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn test_embedding_identity(
+        policy: &'static str,
+    ) -> crate::in_process_embedding::ProcessEmbeddingIdentity {
+        let accelerated = policy == "accelerated";
+        crate::in_process_embedding::ProcessEmbeddingIdentity {
+            instance_id: "inprocess:test".into(),
+            model_load_count: 1,
+            model_digest: codestory_llama_sys::MODEL_SHA256,
+            ggml_build_identity: codestory_llama_sys::GGML_BUILD_IDENTITY,
+            backend: if accelerated { "Metal" } else { "CPU" }.into(),
+            adapter_name: if accelerated {
+                "test accelerator"
+            } else {
+                "CPU"
+            }
+            .into(),
+            adapter_description: "test".into(),
+            policy,
+            embedded_model: true,
+            materialized_path: PathBuf::from("model.gguf"),
+            materialized_reused: true,
+            initialization_ms: 1,
+            smoke_ms: 1,
+            adapter_memory_total: 1,
+            adapter_memory_used_by_load: usize::from(accelerated),
+            execution_device_names: if accelerated {
+                vec!["test accelerator".into()]
+            } else {
+                Vec::new()
+            },
+            model_layer_count: 13,
+            offloaded_layer_count: if accelerated { 13 } else { 0 },
+            accelerator_execution_verified: accelerated,
+        }
+    }
 
     #[test]
     fn finalize_index_fails_before_publication_without_runtime_or_artifacts() {
@@ -1469,7 +1388,9 @@ mod tests {
             .expect_err("empty stores cannot satisfy mandatory sidecar indexing");
         let message = error.to_string();
         assert!(
-            message.contains("mandatory") || message.contains("embedding_device_unverified"),
+            message.contains("mandatory")
+                || message.contains("embedding_device_unverified")
+                || message.contains("without its embedded embedding model"),
             "expected a pre-publication retrieval trust-gate error, got {error:#}"
         );
     }
@@ -1567,7 +1488,7 @@ mod tests {
             doc_version: 4,
             doc_hash: "hash".into(),
             embedding_profile: Some("bge-base-en-v1.5".into()),
-            embedding_model: "BAAI/bge-base-en-v1.5-local|backend=onnx".into(),
+            embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
             embedding_backend: backend.map(str::to_string),
             embedding_dim: dim,
             doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
@@ -1579,17 +1500,17 @@ mod tests {
 
         assert!(!semantic_doc_row(&doc(
             NodeKind::FUNCTION,
-            Some("onnx"),
+            Some("other"),
             768
         )));
         assert!(semantic_doc_row(&doc(
             NodeKind::METHOD,
-            Some("llamacpp"),
+            Some("inprocess"),
             768
         )));
         assert!(!semantic_doc_row(&doc(
             NodeKind::VARIABLE,
-            Some("onnx"),
+            Some("other"),
             768
         )));
         assert!(!semantic_doc_row(&doc(
@@ -1599,7 +1520,7 @@ mod tests {
         )));
         assert!(!semantic_doc_row(&doc(
             NodeKind::FUNCTION,
-            Some("onnx"),
+            Some("other"),
             384
         )));
     }
@@ -1631,7 +1552,6 @@ mod tests {
 
         let first_input = compute_sidecar_input_fingerprint(
             &first_storage,
-            &first_storage_path,
             first_project.path(),
             &first_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
@@ -1640,7 +1560,6 @@ mod tests {
         .expect("first input");
         let second_input = compute_sidecar_input_fingerprint(
             &second_storage,
-            &second_storage_path,
             second_project.path(),
             &second_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
@@ -1677,13 +1596,10 @@ mod tests {
         let storage_dir = TempDir::new().expect("storage dir");
         let storage_path = storage_dir.path().join("codestory.db");
         let mut storage = Store::open(&storage_path).expect("open store");
-        let mut runtime = SidecarRuntimeConfig::local();
-        runtime.embedding.server_launch = None;
-        runtime.embedding.device_policy = "accelerator_required".into();
+        let runtime = SidecarRuntimeConfig::local();
         let embedding_contract = SidecarEmbeddingContract {
             backend: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             dimension: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            config: &runtime.embedding,
         };
         storage
             .insert_nodes_batch(&[Node {
@@ -1706,7 +1622,7 @@ mod tests {
             doc_hash: "hash".into(),
             embedding_profile: Some("bge-base-en-v1.5".into()),
             embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
-            embedding_backend: Some("llamacpp".into()),
+            embedding_backend: Some("inprocess".into()),
             embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
             doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
             semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
@@ -1717,14 +1633,12 @@ mod tests {
         storage
             .upsert_llm_symbol_docs_batch(&[doc.clone()])
             .expect("first doc");
-        let first = compute_sidecar_input_fingerprint_for_runtime(
+        let first = compute_sidecar_input_fingerprint(
             &storage,
-            &storage_path,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            &runtime,
         )
         .expect("first fingerprint");
         let old_manifest = retrieval_manifest_for_sidecar(
@@ -1744,14 +1658,12 @@ mod tests {
             .upsert_llm_symbol_docs_batch(&[doc])
             .expect("second doc");
         drop(concurrent);
-        let second = compute_sidecar_input_fingerprint_for_runtime(
+        let second = compute_sidecar_input_fingerprint(
             &storage,
-            &storage_path,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            &runtime,
         )
         .expect("second fingerprint");
 
@@ -1813,7 +1725,7 @@ mod tests {
             embedding_device: crate::embeddings::EmbeddingDeviceReadiness {
                 requested_policy: "accelerator_required",
                 observed_state: "accelerated",
-                observation_source: "native_log",
+                observation_source: "inprocess_engine",
                 detected_provider: Some("test".into()),
                 detected_gpu: Some("test accelerator".into()),
                 accelerator_requested: true,
@@ -1824,9 +1736,8 @@ mod tests {
                 degraded_reason: None,
             },
             embedding_accelerator_smoke_elapsed_ms: Some(12),
-            embedding_launch_before: None,
-            embedding_launch_after: None,
-            expected_embedding_launch: None,
+            embedding_identity_before: test_embedding_identity("accelerated"),
+            embedding_identity_after: test_embedding_identity("accelerated"),
             retrieval_mode: "full".into(),
             degraded_reason: None,
         };
@@ -1869,15 +1780,13 @@ mod tests {
         .expect_err("a missing nonzero vector generation must reject promotion");
 
         let mut cpu_runtime = runtime.clone();
-        cpu_runtime.embedding.device_policy = "allow_cpu".into();
-        let cpu_input = compute_sidecar_input_fingerprint_for_runtime(
+        cpu_runtime.embedding.allow_cpu = true;
+        let cpu_input = compute_sidecar_input_fingerprint(
             &storage,
-            &storage_path,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            &cpu_runtime,
         )
         .expect("cpu-policy fingerprint");
         let mut cpu_manifest = retrieval_manifest_for_sidecar(
@@ -1892,9 +1801,9 @@ mod tests {
         let mut cpu_evidence = passing.clone();
         cpu_evidence.scip_revision = cpu_manifest.scip_revision.clone();
         cpu_evidence.embedding_device = crate::embeddings::EmbeddingDeviceReadiness {
-            requested_policy: "cpu_allowed",
-            observed_state: "cpu",
-            observation_source: "cpu_policy",
+            requested_policy: "cpu_explicit",
+            observed_state: "cpu_explicit",
+            observation_source: "inprocess_engine",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: false,
@@ -1905,6 +1814,8 @@ mod tests {
             degraded_reason: None,
         };
         cpu_evidence.embedding_accelerator_smoke_elapsed_ms = None;
+        cpu_evidence.embedding_identity_before = test_embedding_identity("cpu_explicit");
+        cpu_evidence.embedding_identity_after = test_embedding_identity("cpu_explicit");
         validate_candidate_generation_evidence(
             "proj",
             &cpu_input,
@@ -1913,77 +1824,6 @@ mod tests {
             &cpu_evidence,
         )
         .expect("explicit CPU policy remains valid");
-        let mut native_runtime = runtime.clone();
-        native_runtime.embedding.server_launch = Some("native_spawned".into());
-        let native_input = compute_sidecar_input_fingerprint_for_runtime(
-            &storage,
-            &storage_path,
-            project.path(),
-            "proj",
-            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            &native_runtime,
-        )
-        .expect("native fingerprint");
-        let mut native_manifest = retrieval_manifest_for_sidecar(
-            "proj",
-            &sidecar_generation_id("proj", &native_input.hash),
-            &crate::generation::sidecar_vector_generation("proj", &native_input.hash),
-            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-            &native_input,
-        );
-        native_manifest.scip_revision = Some("graph-test".into());
-        let mut wrong_native_model = passing.clone();
-        wrong_native_model.scip_revision = native_manifest.scip_revision.clone();
-        let expected_native_launch = crate::health::EmbeddingLaunchMetadata {
-            provider: "test".into(),
-            launch_mode: "native_spawned".into(),
-            endpoint: crate::config::SidecarLayout::embed_base_url(native_runtime.embed_http_port),
-            pid: None,
-            spawned_at_epoch_ms: None,
-            process_start_identity: None,
-            spawn_protocol: None,
-            launch_args: Vec::new(),
-            launch_fingerprint_sha256: Some("expected-fingerprint".into()),
-            executable_source: None,
-            executable_path: Some("llama-server".into()),
-            model_path: Some("bge-base-en-v1.5.gguf".into()),
-            model_sha256: None,
-            log_path: Some("llama-server-native.log".into()),
-            requested_device: None,
-        };
-        let mut stale_native_launch = expected_native_launch.clone();
-        stale_native_launch.launch_fingerprint_sha256 = Some("stale-fingerprint".into());
-        wrong_native_model.embedding_launch_before = Some(stale_native_launch.clone());
-        wrong_native_model.embedding_launch_after = Some(stale_native_launch);
-        wrong_native_model.expected_embedding_launch = Some(expected_native_launch.clone());
-        let native_error = validate_candidate_generation_evidence(
-            "proj",
-            &native_input,
-            &native_manifest,
-            &native_runtime,
-            &wrong_native_model,
-        )
-        .expect_err("wrong native model must fail");
-        assert!(native_error.to_string().contains("embedding_runtime"));
-        let mut replaced_native = passing.clone();
-        replaced_native.scip_revision = native_manifest.scip_revision.clone();
-        replaced_native.embedding_launch_before = Some(expected_native_launch.clone());
-        let mut replacement_launch = expected_native_launch.clone();
-        replacement_launch.pid = Some(4242);
-        replacement_launch.spawned_at_epoch_ms = Some(456);
-        replaced_native.embedding_launch_after = Some(replacement_launch);
-        replaced_native.expected_embedding_launch = Some(expected_native_launch);
-        let replacement_error = validate_candidate_generation_evidence(
-            "proj",
-            &native_input,
-            &native_manifest,
-            &native_runtime,
-            &replaced_native,
-        )
-        .expect_err("native launch replacement across final probes must fail");
-        assert!(replacement_error.to_string().contains("embedding_runtime"));
         let mut rollback_manifest = old_manifest.clone();
         let rollback_hash = "verified-rollback-input";
         rollback_manifest.sidecar_input_hash = Some(rollback_hash.into());
@@ -2015,25 +1855,13 @@ mod tests {
             "accelerator_proof",
         ] {
             let mut failing = passing.clone();
-            let mut candidate_input = second.clone();
-            let mut candidate_runtime = runtime.clone();
+            let candidate_input = second.clone();
             match component {
                 "lexical" => failing.lexical_matches = false,
                 "scip" => failing.scip_revision = Some("wrong-revision".into()),
                 "semantic" => failing.semantic_points = None,
                 "embedding_runtime" => {
-                    candidate_runtime.embedding.model_id = Some("different-768d-model".into());
-                    candidate_input = compute_sidecar_input_fingerprint_for_runtime(
-                        &storage,
-                        &storage_path,
-                        project.path(),
-                        "proj",
-                        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
-                        crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
-                        &candidate_runtime,
-                    )
-                    .expect("mismatched model fingerprint");
-                    assert_ne!(candidate_input.hash, second.hash);
+                    failing.embedding_identity_after.instance_id = "inprocess:replaced".into();
                 }
                 "accelerator_proof" => failing.embedding_accelerator_smoke_elapsed_ms = None,
                 _ => unreachable!(),
@@ -2048,7 +1876,7 @@ mod tests {
                         "proj",
                         &candidate_input,
                         &new_manifest,
-                        &candidate_runtime,
+                        &runtime,
                         &failing,
                     )
                 },
@@ -2200,8 +2028,8 @@ mod tests {
                 doc_version: 4,
                 doc_hash: "hash".into(),
                 embedding_profile: Some("bge-base-en-v1.5".into()),
-                embedding_model: "BAAI/bge-base-en-v1.5-local|backend=onnx".into(),
-                embedding_backend: Some("onnx".into()),
+                embedding_model: "legacy-producer".into(),
+                embedding_backend: Some("legacy".into()),
                 embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
                 doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
                 semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),

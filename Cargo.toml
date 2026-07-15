@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/codestory-llama-sys",
     "crates/codestory-contracts",
     "crates/codestory-workspace",
     "crates/codestory-store",
@@ -13,6 +14,7 @@ members = [
 
 [workspace.dependencies]
 # Internal crates
+codestory-llama-sys = { path = "crates/codestory-llama-sys" }
 codestory-contracts = { path = "crates/codestory-contracts" }
 codestory-workspace = { path = "crates/codestory-workspace" }
 codestory-store = { path = "crates/codestory-store" }
@@ -83,6 +85,7 @@ sha2 = "0.10"
 ring = "0.17.14"
 ureq = "2.12"
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+llama-cpp-2 = { version = "=0.1.151", default-features = false }
 
 criterion = "0.8.2"
 proptest = "1.5"

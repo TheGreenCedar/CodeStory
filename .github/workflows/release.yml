@@ -111,7 +111,6 @@ jobs:
       proof_key: release-${{ needs.preflight.outputs.version }}
       profile: codestory-release-evidence-linux-arm64-v1
       drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-      embedding_model_dir: /srv/codestory-release-evidence/models
       source_run_id: ${{ inputs.source_run_id }}
     secrets:
       CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON: ${{ secrets.CODESTORY_RELEASE_EVIDENCE_APPROVAL_JSON }}
@@ -149,12 +148,24 @@ jobs:
       proof_key: release-${{ needs.preflight.outputs.version }}
       use_packaged_cli_artifact: true
 
+  windows-vulkan-proof:
+    needs:
+      - preflight
+      - packaged-proof
+    uses: ./.github/workflows/windows-vulkan-proof.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ github.sha }}
+      proof_key: release-${{ needs.preflight.outputs.version }}
+      use_packaged_cli_artifact: true
+
   publish:
     name: Publish GitHub release
     needs:
       - preflight
       - packaged-proof
       - macos-metal-proof
+      - windows-vulkan-proof
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -193,10 +204,10 @@ jobs:
 
           This release ships managed CLI assets for Windows x64/arm64, Linux x64/arm64, and macOS x64/arm64.
 
-          - Windows x64 managed install, local ground, and repair handoff are acceptance-smoked; this is not full sidecar or GPU proof.
-          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged managed-Metal cold/warm reuse, dead-endpoint blocking, recovery, packet, and search proof.
+          - Windows x64 managed install and local ground are acceptance-smoked; accelerated retrieval requires the protected Vulkan hardware proof.
+          - Apple Silicon release assets are Developer ID signed, notarized, and gated on packaged in-process Metal cold/warm reuse, packet, and search proof.
           - Intel macOS packaging is acceptance-smoked; it does not make Apple Silicon Metal claims.
-          - Windows arm64 ships a CLI asset but has no managed native accelerated embedding cell.
+          - Windows arm64 ships a CLI asset but has no protected accelerated embedding cell.
           - Linux accelerator claims still require the evidence tiers in `docs/contributors/testing-matrix.md`.
           - Linux x64 is packaged and executed at the glibc 2.31 baseline; this does not claim musl support or Linux arm64 baseline parity.
           EOF

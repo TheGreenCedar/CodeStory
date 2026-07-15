@@ -4859,7 +4859,7 @@ fn retrieval_state_from_storage_for_runtime(
     let stats = storage
         .get_llm_symbol_doc_stats()
         .map_err(|e| ApiError::internal(format!("Failed to query LLM symbol doc stats: {e}")))?;
-    let probe = embedding_runtime_availability_from_config(&runtime.embedding);
+    let probe = embedding_runtime_availability_from_config(runtime);
     let current_embedding = current_embedding_contract_for_runtime(runtime);
     let stored_embedding = stored_semantic_docs_contract_from_stats(&stats);
     let contract_mismatch = stats.doc_count > 0
@@ -6420,7 +6420,7 @@ fn sync_llm_symbol_projection_for_runtime(
         return Ok(stats);
     }
 
-    let embedding_contract = match engine.set_embedding_runtime_from_config(&runtime.embedding) {
+    let embedding_contract = match engine.set_embedding_runtime_for_runtime(runtime) {
         Ok(()) => Some(current_embedding_contract_for_runtime(runtime).ok_or_else(|| {
             ApiError::internal(
                 "Failed to resolve current embedding profile contract after configuring runtime",
@@ -6986,7 +6986,7 @@ fn load_persisted_semantic_docs_for_runtime(
     if !hydrate_semantic_docs || !runtime.retrieval.hybrid_enabled {
         return Ok(stats);
     }
-    if let Err(error) = engine.set_embedding_runtime_from_config(&runtime.embedding) {
+    if let Err(error) = engine.set_embedding_runtime_for_runtime(runtime) {
         tracing::warn!(
             "embedding runtime unavailable while hydrating completed semantic docs: {error}"
         );
@@ -9902,7 +9902,7 @@ impl AppController {
         if !agent::retrieval_primary::sidecar_retrieval_primary_enabled(self) {
             let reason = agent::retrieval_primary::sidecar_retrieval_unavailable_reason(self)
                 .unwrap_or_else(|| {
-                    "sidecar retrieval primary is mandatory; legacy search is disabled".to_string()
+                    "full retrieval is mandatory; legacy search is disabled".to_string()
                 });
             return Err(
                 agent::retrieval_primary::sidecar_retrieval_unavailable_error(self, reason),
@@ -10844,7 +10844,7 @@ impl AppController {
             {
                 if !engine.embedding_runtime_configured()
                     && let Err(error) =
-                        engine.set_embedding_runtime_from_config(&self.runtime_config.embedding)
+                        engine.set_embedding_runtime_for_runtime(&self.runtime_config)
                 {
                     tracing::warn!(
                         "Search embedding runtime unavailable during hybrid load: {error}"
@@ -12869,22 +12869,20 @@ mod tests {
         }
     }
 
-    fn assert_mandatory_sidecar_unavailable(error: &ApiError) {
+    fn assert_mandatory_retrieval_unavailable(error: &ApiError) {
         assert_eq!(error.code, "retrieval_unavailable");
         assert!(
             error
                 .message
-                .contains("sidecar retrieval primary is unavailable or degraded")
-                || error
-                    .message
-                    .contains("sidecar retrieval primary is mandatory"),
-            "expected mandatory sidecar failure, got {error:?}"
+                .contains("retrieval is unavailable or degraded")
+                || error.message.contains("full retrieval is mandatory"),
+            "expected mandatory retrieval failure, got {error:?}"
         );
         let details = error.details.as_ref().expect("retrieval error details");
-        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_sidecar"));
+        assert_eq!(details.failed_layer.as_deref(), Some("retrieval_engine"));
         assert!(
             !details.next_commands.is_empty(),
-            "retrieval error should include repair commands: {error:?}"
+            "retrieval error should include recovery commands: {error:?}"
         );
     }
 
@@ -13033,15 +13031,6 @@ mod tests {
         HybridTestEnv {
             guards: vec![
                 EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "true"),
-                EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, "hash"),
-                EnvGuard::set(EMBEDDING_PROFILE_ENV, "bge-small-en-v1.5"),
-                EnvGuard::remove(EMBEDDING_MODEL_ID_ENV),
-                EnvGuard::remove(EMBEDDING_POOLING_ENV),
-                EnvGuard::remove(EMBEDDING_QUERY_PREFIX_ENV),
-                EnvGuard::remove(EMBEDDING_DOCUMENT_PREFIX_ENV),
-                EnvGuard::remove(EMBEDDING_LAYER_NORM_ENV),
-                EnvGuard::remove(EMBEDDING_TRUNCATE_DIM_ENV),
-                EnvGuard::remove(EMBEDDING_EXPECTED_DIM_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_SCOPE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_ALIAS_MODE_ENV),
                 EnvGuard::remove(SEMANTIC_DOC_MAX_TOKENS_ENV),
@@ -16042,7 +16031,7 @@ pub fn exact_symbol_anchor() {{}}
             "Explain how AppController fits into this repo"
         ));
         assert!(query_has_symbol_or_literal_signal(
-            "Explain `CODESTORY_EMBED_RUNTIME_MODE` in this repo"
+            "Explain `CODESTORY_EMBED_ALLOW_CPU` in this repo"
         ));
         assert!(query_has_symbol_or_literal_signal(
             "Explain crates/codestory-runtime/src/lib.rs in this repo"
@@ -16052,7 +16041,7 @@ pub fn exact_symbol_anchor() {{}}
     #[test]
     fn file_text_matching_prefers_high_signal_identifier_literals() {
         let contents = r#"
-pub const CODESTORY_EMBED_RUNTIME_MODE: &str = "hash";
+pub const CODESTORY_EMBED_ALLOW_CPU: &str = "1";
 
 fn build_llm_symbol_doc_text() -> String {
     String::new()
@@ -16070,8 +16059,8 @@ fn build_llm_symbol_doc_text() -> String {
         assert_eq!(
             file_text_match_line(
                 contents,
-                "What sets CODESTORY_EMBED_RUNTIME_MODE?",
-                &extract_symbol_search_terms("What sets CODESTORY_EMBED_RUNTIME_MODE?")
+                "What sets CODESTORY_EMBED_ALLOW_CPU?",
+                &extract_symbol_search_terms("What sets CODESTORY_EMBED_ALLOW_CPU?")
             ),
             Some(2)
         );
@@ -16539,7 +16528,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
     }
 
     #[test]
@@ -16613,7 +16602,7 @@ fn build_llm_symbol_doc_text() -> String {
                     hybrid_limits: None,
                 })
                 .expect_err("search fixtures should require full sidecars");
-            assert_mandatory_sidecar_unavailable(&error);
+            assert_mandatory_retrieval_unavailable(&error);
         }
     }
 
@@ -16642,7 +16631,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("generic repo explanation search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&generic_error);
+        assert_mandatory_retrieval_unavailable(&generic_error);
 
         let symbol_error = controller
             .search_results(SearchRequest {
@@ -16654,7 +16643,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("symbol-like repo explanation search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&symbol_error);
+        assert_mandatory_retrieval_unavailable(&symbol_error);
     }
 
     #[test]
@@ -16707,7 +16696,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("natural language search should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error_without_plan);
+        assert_mandatory_retrieval_unavailable(&error_without_plan);
 
         let error_with_plan = controller
             .search_results(SearchRequest {
@@ -16719,7 +16708,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("natural language search plan should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error_with_plan);
+        assert_mandatory_retrieval_unavailable(&error_with_plan);
     }
 
     #[test]
@@ -16984,92 +16973,6 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn unchanged_incremental_refresh_repairs_graph_docs_without_embedding_runtime() {
-        let mut env = hybrid_test_env();
-        let workspace = copy_tictactoe_workspace();
-        let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-
-        controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary");
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("initial full index");
-
-        let mut contaminated_docs = Storage::open(&storage_path)
-            .expect("open graph-native docs before schema downgrade")
-            .get_symbol_search_docs_batch_after(None, 10_000)
-            .expect("graph-native docs before schema downgrade");
-        assert!(
-            !contaminated_docs.is_empty(),
-            "fixture should persist graph-native semantic docs"
-        );
-        for doc in &mut contaminated_docs {
-            doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
-            doc.doc_text
-                .push_str("domain_aliases: benchmark-shaped legacy text\n");
-        }
-        let contaminated_count = contaminated_docs.len();
-        Storage::open(&storage_path)
-            .expect("reopen storage for graph-native schema downgrade")
-            .upsert_symbol_search_docs_batch(&contaminated_docs)
-            .expect("persist downgraded graph-native semantic docs");
-
-        env.push(EnvGuard::set(
-            EMBEDDING_RUNTIME_MODE_ENV,
-            "unavailable-test-backend",
-        ));
-        env.push(EnvGuard::set(
-            EMBEDDING_BACKEND_ENV,
-            "unavailable-test-backend",
-        ));
-        let reopened = AppController::new_with_config(test_sidecar_runtime_from_env());
-        reopened
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("reopen project without embedding runtime");
-        let repair_timings = reopened
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("unchanged incremental refresh repairs graph-native docs");
-        assert_eq!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0),
-            0,
-            "unavailable embedding runtime should not fabricate dense semantic rebuilds"
-        );
-        assert!(
-            repair_timings.symbol_search_docs_written.unwrap_or(0)
-                >= clamp_usize_to_u32(contaminated_count),
-            "graph-native schema repair must not depend on a dense embedding runtime"
-        );
-
-        let repaired_docs = Storage::open(&storage_path)
-            .expect("open graph-native docs after no-embedding repair")
-            .get_symbol_search_docs_batch_after(None, 10_000)
-            .expect("graph-native docs after no-embedding repair");
-        assert!(
-            repaired_docs.iter().all(|doc| {
-                doc.doc_version == LLM_SYMBOL_DOC_SCHEMA_VERSION
-                    && !doc.doc_text.contains("domain_aliases:")
-            }),
-            "no-embedding repair should replace every previous-schema graph-native semantic document"
-        );
-        assert!(
-            Storage::open(&storage_path)
-                .expect("open dense docs after no-embedding repair")
-                .get_all_llm_symbol_docs()
-                .expect("dense docs after no-embedding repair")
-                .is_empty(),
-            "an unavailable embedding runtime must not carry stale dense docs into the new core generation"
-        );
-    }
-
-    #[test]
     fn full_refresh_repairs_reused_semantic_docs_missing_contract_metadata() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -17118,68 +17021,11 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("semantic docs after repair");
         assert!(
             repaired_docs.iter().all(|doc| {
-                doc.embedding_profile.as_deref() == Some("bge-small-en-v1.5")
-                    && doc.embedding_backend.as_deref() == Some("hash")
+                doc.embedding_profile.as_deref() == Some("bge-base-en-v1.5")
+                    && doc.embedding_backend.as_deref() == Some("inprocess")
                     && doc.doc_shape.as_deref() == Some(semantic_doc_shape_contract().as_str())
             }),
             "full refresh should backfill reusable docs with the current semantic contract"
-        );
-    }
-
-    #[test]
-    fn full_refresh_rebuilds_semantic_docs_when_embedding_dimension_changes() {
-        let mut env = hybrid_test_env();
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
-        let workspace = copy_tictactoe_workspace();
-        let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-
-        controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary");
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("first full index");
-
-        let first_docs = Storage::open(&storage_path)
-            .expect("open storage after first index")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after first index");
-        assert!(
-            first_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 128 && doc.embedding.len() == 128),
-            "initial hash docs should use the configured dimension"
-        );
-
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "384"));
-        let repair_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-        repair_controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary with updated runtime");
-        let repair_timings = repair_controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("second full index after dimension change");
-        assert!(
-            repair_timings.semantic_docs_embedded.unwrap_or(0) > 0,
-            "dimension drift should rebuild semantic docs instead of reusing stale vectors"
-        );
-
-        let repaired_docs = Storage::open(&storage_path)
-            .expect("open storage after dimension repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after dimension repair");
-        assert!(
-            repaired_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
-            "full refresh should persist semantic docs with the new dimension"
         );
     }
 
@@ -17420,83 +17266,6 @@ fn build_llm_symbol_doc_text() -> String {
     }
 
     #[test]
-    fn incremental_refresh_rebuilds_all_semantic_docs_when_embedding_contract_changes() {
-        let mut env = hybrid_test_env();
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "128"));
-        let workspace = copy_tictactoe_workspace();
-        let storage_path = workspace.path().join(".cache").join("codestory.db");
-        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-
-        controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary");
-        controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
-            .expect("initial full index");
-
-        let before_docs = Storage::open(&storage_path)
-            .expect("open storage before drift")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs before drift");
-        assert!(
-            !before_docs.is_empty(),
-            "fixture should persist semantic docs"
-        );
-        assert!(
-            before_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 128 && doc.embedding.len() == 128),
-            "initial docs should use the first embedding contract"
-        );
-
-        env.push(EnvGuard::set(EMBEDDING_EXPECTED_DIM_ENV, "384"));
-        let rust_fixture = workspace.path().join("rust_tictactoe.rs");
-        let mut source = fs::read_to_string(&rust_fixture).expect("read rust fixture");
-        source.push_str("\nfn codestory_contract_drift_added_hint() -> i32 { 7 }\n");
-        fs::write(&rust_fixture, source).expect("write changed rust fixture");
-
-        let repair_controller = AppController::new_with_config(test_sidecar_runtime_from_env());
-        repair_controller
-            .open_project_summary_with_storage_path(
-                workspace.path().to_path_buf(),
-                storage_path.clone(),
-            )
-            .expect("open project summary with updated runtime");
-        let incremental_timings = repair_controller
-            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
-            .expect("incremental index after contract drift");
-        assert!(
-            incremental_timings.semantic_docs_embedded.unwrap_or(0)
-                >= clamp_usize_to_u32(before_docs.len()),
-            "contract drift should expand incremental semantic sync beyond the touched file"
-        );
-
-        let repaired_docs = Storage::open(&storage_path)
-            .expect("open storage after drift repair")
-            .get_all_llm_symbol_docs()
-            .expect("semantic docs after drift repair");
-        assert!(
-            repaired_docs
-                .iter()
-                .all(|doc| doc.embedding_dim == 384 && doc.embedding.len() == 384),
-            "incremental repair should leave all stored semantic docs on the current contract"
-        );
-        let repaired_symbol_docs = Storage::open(&storage_path)
-            .expect("open storage after drift repair for symbol docs")
-            .get_symbol_search_docs_batch_after(None, 10_000)
-            .expect("symbol docs after drift repair");
-        assert!(
-            repaired_symbol_docs.iter().any(|doc| doc
-                .display_name
-                .contains("codestory_contract_drift_added_hint")),
-            "incremental repair should still include symbol docs from the touched file"
-        );
-    }
-
-    #[test]
     fn grounding_snapshot_from_summary_open_keeps_search_state_cold() {
         let _env = hybrid_test_env();
         let workspace = copy_tictactoe_workspace();
@@ -17634,7 +17403,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("repo-text search should still require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
     }
 
     #[test]
@@ -17713,7 +17482,7 @@ fn build_llm_symbol_doc_text() -> String {
                 hybrid_limits: None,
             })
             .expect_err("repo-text auto fallback should require full sidecars");
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
     }
 
     #[test]
@@ -18111,8 +17880,7 @@ fn build_llm_symbol_doc_text() -> String {
         let mut storage = Storage::new_in_memory().expect("storage");
         insert_semantic_fixture_nodes(&mut storage, &file_path);
 
-        let mut env = hybrid_test_env();
-        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-a"));
+        let _env = hybrid_test_env();
         finalize_staged_semantic_docs(&mut storage, None, None, None)
             .expect("initial finalization");
         assert_eq!(
@@ -18121,7 +17889,7 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("initial doc stats")
                 .embedding_model
                 .as_deref(),
-            Some("model-a")
+            Some(codestory_retrieval::PRODUCT_EMBEDDING_RUNTIME_ID)
         );
         let mut seeded_docs = storage
             .get_all_llm_symbol_docs()
@@ -18150,7 +17918,7 @@ fn build_llm_symbol_doc_text() -> String {
             .execute(
                 "UPDATE llm_symbol_doc
                  SET embedding_model = CASE
-                     WHEN node_id = ?1 THEN 'model-b'
+                     WHEN node_id = ?1 THEN 'legacy-producer'
                      ELSE embedding_model
                  END",
                 [mixed_node_id],
@@ -18164,7 +17932,6 @@ fn build_llm_symbol_doc_text() -> String {
             None
         );
 
-        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "model-b"));
         finalize_staged_semantic_docs(&mut storage, None, None, None)
             .expect("mixed corpus should force finalization");
 
@@ -18173,14 +17940,15 @@ fn build_llm_symbol_doc_text() -> String {
             .expect("reloaded semantic docs");
         assert!(!docs.is_empty(), "expected rebuilt semantic docs");
         assert!(
-            docs.iter().all(|doc| doc.embedding_model == "model-b"),
+            docs.iter().all(|doc| doc.embedding_model
+                == codestory_retrieval::PRODUCT_EMBEDDING_RUNTIME_ID),
             "expected mixed semantic docs to be rebuilt to a uniform model"
         );
     }
 
     #[test]
     fn completed_search_cache_load_does_not_mutate_live_semantic_rows() {
-        let mut env = hybrid_test_env();
+        let _env = hybrid_test_env();
         let temp = tempdir().expect("create temp dir");
         let file_path = write_semantic_fixture(temp.path());
         let storage_path = temp.path().join("codestory.db");
@@ -18223,23 +17991,6 @@ fn build_llm_symbol_doc_text() -> String {
             storage
                 .get_all_llm_symbol_docs()
                 .expect("semantic rows after cache load"),
-            before
-        );
-
-        env.push(EnvGuard::set(EMBEDDING_MODEL_ID_ENV, "incompatible-model"));
-        let mismatched = rebuild_search_state_from_storage(&mut storage, &storage_path, None, true)
-            .expect("reject incompatible semantic cache without persistence");
-        assert_eq!(mismatched.engine.semantic_doc_count(), 0);
-        let retrieval = retrieval_state_from_storage(&storage).expect("mismatched retrieval state");
-        assert_eq!(retrieval.mode, RetrievalModeDto::Symbolic);
-        assert_eq!(
-            retrieval.fallback_reason,
-            Some(RetrievalFallbackReasonDto::DegradedRuntime)
-        );
-        assert_eq!(
-            storage
-                .get_all_llm_symbol_docs()
-                .expect("semantic rows after rejected cache load"),
             before
         );
 
@@ -18775,8 +18526,8 @@ fn build_llm_symbol_doc_text() -> String {
     fn inexact_search_results_deduplicate_repeated_display_keys() {
         let mut hits = vec![
             SearchHit {
-                node_id: NodeId("llamacpp-url-env".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(178),
@@ -18793,8 +18544,8 @@ fn build_llm_symbol_doc_text() -> String {
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("llamacpp-url-env-copy".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id-copy".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(187),
@@ -18811,8 +18562,8 @@ fn build_llm_symbol_doc_text() -> String {
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("endpoint-parser".to_string()),
-                display_name: "LlamaCppEndpoint::parse".to_string(),
+                node_id: NodeId("other-helper".to_string()),
+                display_name: "EmbeddingEngineCache::open".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(194),
@@ -18832,27 +18583,27 @@ fn build_llm_symbol_doc_text() -> String {
 
         hits.sort_by(|left, right| {
             compare_search_hits(
-                "llama.cpp embeddings endpoint URL environment variable configuration",
+                "embedding engine identity parser configuration",
                 left,
                 right,
             )
         });
         dedupe_inexact_search_hits_by_display_key(
-            "llama.cpp embeddings endpoint URL environment variable configuration",
+            "embedding engine identity parser configuration",
             &mut hits,
         );
 
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].node_id, NodeId("endpoint-parser".to_string()));
-        assert_eq!(hits[1].node_id, NodeId("llamacpp-url-env".to_string()));
+        assert_eq!(hits[0].node_id, NodeId("embedding-engine-id".to_string()));
+        assert_eq!(hits[1].node_id, NodeId("other-helper".to_string()));
     }
 
     #[test]
     fn exact_search_results_keep_repeated_display_keys() {
         let mut hits = vec![
             SearchHit {
-                node_id: NodeId("llamacpp-url-env".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(178),
@@ -18869,8 +18620,8 @@ fn build_llm_symbol_doc_text() -> String {
                 score_breakdown: None,
             },
             SearchHit {
-                node_id: NodeId("llamacpp-url-env-copy".to_string()),
-                display_name: "LLAMACPP_EMBEDDINGS_URL_ENV".to_string(),
+                node_id: NodeId("embedding-engine-id-copy".to_string()),
+                display_name: "EMBEDDING_ENGINE_ID".to_string(),
                 kind: codestory_contracts::api::NodeKind::FUNCTION,
                 file_path: Some("src/search/engine.rs".to_string()),
                 line: Some(187),
@@ -18888,7 +18639,7 @@ fn build_llm_symbol_doc_text() -> String {
             },
         ];
 
-        dedupe_inexact_search_hits_by_display_key("LLAMACPP_EMBEDDINGS_URL_ENV", &mut hits);
+        dedupe_inexact_search_hits_by_display_key("EMBEDDING_ENGINE_ID", &mut hits);
 
         assert_eq!(hits.len(), 2);
     }
@@ -20631,7 +20382,7 @@ fn build_llm_symbol_doc_text() -> String {
             })
             .expect_err("search should require full sidecars after summary open");
 
-        assert_mandatory_sidecar_unavailable(&error);
+        assert_mandatory_retrieval_unavailable(&error);
         let state = controller.state.lock();
         assert!(state.search_engine.is_none());
         assert!(state.node_names.is_empty());

@@ -3,7 +3,7 @@
   "commit": "2222222222222222222222222222222222222222",
   "evidence_identity": {
     "corpus_id": "ci-contract-corpus-v1",
-    "cache_id": "cold-full-sidecar-v1",
+    "cache_id": "cold-full-retrieval-v1",
     "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
   },
   "retrieval_status_seconds": 0.8,
@@ -17,19 +17,19 @@
   "search_seconds": 0.8,
   "index_seconds": 8,
   "storage_bytes": 1020,
-  "proof_tier": "full_sidecar",
+  "proof_tier": "full_retrieval",
   "repeat_semantic_docs_embedded": 0,
   "index": {
     "error_count": 0,
-    "sidecar_status_after_retrieval_index": "full"
+    "retrieval_status_after_index": "full"
   },
   "ground": {
-    "sidecar_status_after_retrieval_index": "full"
+    "retrieval_status_after_index": "full"
   },
   "search": {
-    "sidecar_shadow_retrieval_mode": "full"
+    "retrieval_shadow_mode": "full"
   },
-  "sidecar_manifest": {
+  "retrieval_manifest": {
     "symbol_doc_count": 10,
     "dense_projection_count": 4,
     "projection_count": 4,

@@ -97,6 +97,9 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
 
+      - name: Install Linux Vulkan build dependencies
+        run: bash .github/scripts/install-linux-vulkan-build-deps.sh
+
       - name: Capture Rust cache identity
         id: rust-cache-key
         shell: bash
@@ -114,8 +117,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-source-proof-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-source-proof-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-all-targets-all-features-
 
       - name: Test the complete workspace once
         run: cargo test --workspace --locked
@@ -124,7 +125,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Save Cargo inputs and output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

@@ -42,7 +42,6 @@ const protectedNonRustDirs = [
   path.join(repoRoot, ".github"),
   path.join(repoRoot, ".cursor", "rules"),
   path.join(repoRoot, "plugins", "codestory"),
-  path.join(repoRoot, "crates", "codestory-retrieval", "assets"),
 ];
 
 const requiredProtectedNonRustFiles = [
@@ -76,16 +75,12 @@ const corpusHarnessNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "measure-peak-memory.ps1"),
   path.join(repoRoot, "scripts", "prove-drill-packet-parity.mjs"),
   path.join(repoRoot, "scripts", "score-drill-ledger.mjs"),
-  path.join(repoRoot, "scripts", "setup-retrieval-env.mjs"),
-  path.join(repoRoot, "scripts", "setup-retrieval-env.ps1"),
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
   path.join(repoRoot, ".github", "workflows", "release-candidate-evidence.yml"),
-  path.join(repoRoot, ".github", "workflows", "retrieval-sidecar-smoke.yml"),
+  path.join(repoRoot, ".github", "workflows", "retrieval-engine-smoke.yml"),
 ].map((filePath) => path.resolve(filePath)));
 const corpusSupportNonRustFiles = new Set([
   path.join(repoRoot, "scripts", "lint-retrieval-generalization.mjs"),
-  path.join(repoRoot, "scripts", "setup-retrieval-env.mjs"),
-  path.join(repoRoot, "scripts", "setup-retrieval-env.ps1"),
   path.join(repoRoot, ".github", "scripts", "test-detect-codestory-release.py"),
 ].map((filePath) => path.resolve(filePath)));
 const allowedHarnessReferences = [
@@ -96,13 +91,18 @@ const allowedHarnessReferences = [
   ],
   [
     path.join("plugins", "codestory", "skills", "codestory-grounding", "references", "retrieval-rollout.md"),
-    ".github/workflows/retrieval-sidecar-smoke.yml",
-    "| Smoke CI | `.github/workflows/retrieval-sidecar-smoke.yml` plus `docs/ops/retrieval-sidecars.md#preflight-smoke-contract` pass criteria | PRs touching retrieval, runtime/stdio/search wiring, indexer retrieval hooks, managed-backend metadata, docs, scripts, or the workflow | Full sidecar readiness. Hosted smoke proves the manifest-missing fail-closed shape only |",
+    ".github/workflows/retrieval-engine-smoke.yml",
+    "| Hosted engine smoke | `.github/workflows/retrieval-engine-smoke.yml` | Retrieval, runtime, stdio, indexing, engine identity, docs, scripts, or workflow changes | Explicit CPU policy only; no Metal or Vulkan claim |",
   ],
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
-    "retrieval-sidecar-smoke.yml",
-    'const retrievalFile = "retrieval-sidecar-smoke.yml";',
+    "retrieval-engine-smoke.yml",
+    'const retrievalFile = "retrieval-engine-smoke.yml";',
+  ],
+  [
+    path.join(".github", "scripts", "check-workflow-policy.mjs"),
+    ".github/workflows/retrieval-engine-smoke.yml",
+    '".github/workflows/retrieval-engine-smoke.yml",',
   ],
   [
     path.join(".github", "scripts", "check-workflow-policy.mjs"),
@@ -125,9 +125,19 @@ const allowedHarnessReferences = [
     "uses: ./.github/workflows/release-candidate-evidence.yml",
   ],
   [
+    path.join(".github", "workflows", "plugin-static.yml"),
+    ".github/workflows/retrieval-engine-smoke.yml",
+    "- .github/workflows/retrieval-engine-smoke.yml",
+  ],
+  [
+    path.join(".github", "workflows", "plugin-static.yml"),
+    ".github/workflows/retrieval-engine-smoke.yml",
+    "- '.github/workflows/retrieval-engine-smoke.yml'",
+  ],
+  [
     path.join(".github", "scripts", "route-ci-proof.mjs"),
-    ".github/workflows/retrieval-sidecar-smoke.yml",
-    "\".github/workflows/retrieval-sidecar-smoke.yml\",",
+    ".github/workflows/retrieval-engine-smoke.yml",
+    "\".github/workflows/retrieval-engine-smoke.yml\",",
   ],
 ].map(([relativePath, includes, use]) => ({
   relativePath,

@@ -150,7 +150,7 @@ fn indexed_fixture() -> HttpFixture {
         .arg(workspace.path())
         .arg("--cache-dir")
         .arg(cache_dir.path())
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run index");
     assert!(
@@ -189,7 +189,7 @@ fn http_serve_rejects_non_loopback_addr_before_opening_runtime_state() {
         .arg(cache_dir.path())
         .arg("--addr")
         .arg("0.0.0.0:0")
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run serve");
     assert!(
@@ -217,7 +217,7 @@ fn spawn_http_server(fixture: &HttpFixture) -> (HttpServer, String) {
         .arg(fixture.cache_dir.path())
         .arg("--addr")
         .arg(&addr)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -626,7 +626,7 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
             .body
             .pointer("/error/message")
             .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("sidecar retrieval primary")),
+            .is_some_and(|message| message.contains("retrieval")),
         "HTTP /search should explain the sidecar-primary boundary: {}",
         search.body
     );

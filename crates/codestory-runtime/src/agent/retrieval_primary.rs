@@ -229,27 +229,27 @@ fn shadow_env_enabled() -> Option<bool> {
     None
 }
 
-/// Whether sidecar retrieval should serve packet/agent results.
+/// Whether published retrieval should serve packet and search results.
 ///
-/// - `CODESTORY_RETRIEVAL=1` forces a sidecar-primary attempt when the agent sidecar is `full`.
+/// - `CODESTORY_RETRIEVAL=1` requires the published agent retrieval generation.
 /// - `CODESTORY_RETRIEVAL=0` is unsupported; packet paths fail closed.
-/// - Unset: sidecar primary when the manifest exists and the agent sidecar is healthy.
+/// - Unset: retrieval is available when the manifest exists and the in-process engine is healthy.
 pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> bool {
     match retrieval_env_override() {
         Some(false) => {
-            tracing::error!("CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory");
+            tracing::error!("CODESTORY_RETRIEVAL=0 is unsupported; full retrieval is mandatory");
             false
         }
         Some(true) => {
             sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller)
         }
         None => {
-            // Default product path: sidecar primary only from full agent-scoped retrieval.
+            // Default product path: serve only from full agent-scoped retrieval.
             let auto_on =
                 sidecar_retrieval_eligible(controller) && sidecar_mode_is_required_full(controller);
             if auto_on {
                 tracing::info!(
-                    "retrieval primary auto-on (unset CODESTORY_RETRIEVAL; agent sidecar full)"
+                    "retrieval primary auto-on (unset CODESTORY_RETRIEVAL; agent retrieval full)"
                 );
             }
             auto_on
@@ -259,16 +259,16 @@ pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> b
 
 pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -> Option<String> {
     if retrieval_env_override() == Some(false) {
-        return Some("CODESTORY_RETRIEVAL=0 is unsupported; sidecar retrieval is mandatory".into());
+        return Some("CODESTORY_RETRIEVAL=0 is unsupported; full retrieval is mandatory".into());
     }
     if sidecar_retrieval_primary_enabled(controller) {
         return None;
     }
     let Ok(project_root) = controller.require_project_root() else {
-        return Some("sidecar retrieval primary requires an open project".into());
+        return Some("retrieval requires an open project".into());
     };
     let Ok(storage_path) = controller.require_storage_path() else {
-        return Some("sidecar retrieval primary requires an index storage path".into());
+        return Some("retrieval requires an index storage path".into());
     };
     let status =
         sidecar_mode_status_for_runtime(&project_root, &storage_path, &controller.runtime_config);
@@ -278,7 +278,7 @@ pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -
         .unwrap_or_default();
     let profile = status.profile.as_deref().unwrap_or("unknown");
     Some(format!(
-        "sidecar retrieval primary is unavailable or degraded (profile={profile} mode={}); expected profile=agent mode=full{reason}",
+        "retrieval is unavailable or degraded (profile={profile} mode={}); expected profile=agent mode=full{reason}",
         status.mode
     ))
 }
@@ -319,18 +319,19 @@ fn sidecar_retrieval_recovery_commands_for_project(
     agent_run_id: Option<&str>,
 ) -> Vec<String> {
     let project = quote_cli_arg(project);
-    let mut ready = format!("codestory-cli ready --goal agent --repair --project {project}");
+    let mut activate =
+        format!("codestory-cli retrieval index --profile agent --refresh auto --project {project}");
     let mut status = format!("codestory-cli retrieval status --project {project}");
     if let Some(run_id) = agent_run_id {
-        ready.push_str(" --run-id ");
-        ready.push_str(run_id);
+        activate.push_str(" --run-id ");
+        activate.push_str(run_id);
         status.push_str(" --profile agent --run-id ");
         status.push_str(run_id);
     }
-    ready.push_str(" --format json");
+    activate.push_str(" --format json");
     status.push_str(" --format json");
     vec![
-        ready,
+        activate,
         status,
         format!("codestory-cli doctor --project {project} --format markdown"),
     ]
@@ -445,17 +446,14 @@ fn sidecar_mode_status_for_runtime(
 ) -> SidecarModeStatus {
     match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime.clone()) {
         Ok(report) => SidecarModeStatus {
-            profile: report
-                .ownership
-                .as_ref()
-                .map(|ownership| ownership.profile.clone()),
+            profile: Some(runtime.profile.as_str().to_string()),
             mode: report.retrieval_mode,
             degraded_reason: report.degraded_reason,
         },
         Err(error) => SidecarModeStatus {
             profile: None,
             mode: "unavailable".into(),
-            degraded_reason: Some(format!("sidecar_status_error: {error}")),
+            degraded_reason: Some(format!("retrieval_status_error: {error}")),
         },
     }
 }
@@ -676,7 +674,7 @@ pub(crate) fn try_sidecar_primary_search(
             Some(SidecarPrimarySearchOutcome::Retryable { error })
         }
         Err(error) => Some(SidecarPrimarySearchOutcome::Unavailable {
-            reason: format!("sidecar retrieval primary unavailable: {}", error.message),
+            reason: format!("retrieval unavailable: {}", error.message),
         }),
     }
 }
@@ -693,7 +691,7 @@ fn sidecar_primary_search_outcome_from_query_result(
             Err(error) => {
                 return SidecarPrimarySearchOutcome::Unavailable {
                     reason: format!(
-                        "sidecar retrieval primary unavailable: candidate resolution failed: {}",
+                        "retrieval unavailable: candidate resolution failed: {}",
                         error.message
                     ),
                 };
@@ -2667,8 +2665,8 @@ mod tests {
         assert!(
             commands
                 .first()
-                .is_some_and(|command| command.contains("ready --goal agent --repair")),
-            "sidecar recovery should start with the canonical agent repair command: {commands:?}"
+                .is_some_and(|command| command.contains("retrieval index")),
+            "retrieval recovery should start with artifact publication: {commands:?}"
         );
         assert!(
             commands
@@ -2686,9 +2684,9 @@ mod tests {
         assert!(
             commands
                 .first()
-                .is_some_and(|command| command.contains("ready --goal agent --repair")
+                .is_some_and(|command| command.contains("retrieval index")
                     && command.contains("--run-id packet-search-eval")),
-            "ready repair should keep the selected agent run id: {commands:?}"
+            "retrieval activation should keep the selected agent run id: {commands:?}"
         );
         assert!(
             commands
@@ -2779,18 +2777,11 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_mode_status_reports_dead_endpoint_before_stale_manifest() {
+    fn retrieval_status_rejects_stale_manifest_before_engine_start() {
         let project = tempfile::tempdir().expect("project");
         let storage_dir = tempfile::tempdir().expect("storage");
         let storage_path = storage_dir.path().join("codestory.db");
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve dead port");
-        let dead_port = listener.local_addr().expect("dead port address").port();
-        drop(listener);
-        let mut runtime = SidecarRuntimeConfig::for_project_auto(project.path());
-        runtime.embed_http_port = dead_port;
-        runtime.embedding.endpoint = format!("http://127.0.0.1:{dead_port}/v1/embeddings");
-        runtime.embedding.endpoint_origin =
-            codestory_retrieval::EmbeddingEndpointOrigin::ManagedSidecar;
+        let runtime = SidecarRuntimeConfig::for_project_auto(project.path());
         let project_id = project_id_for_root(project.path());
         let hash = "deadbeefcafebabe";
         let mut storage = Store::open(&storage_path).expect("open storage");
@@ -2805,8 +2796,8 @@ mod tests {
         assert_eq!(status.mode, "full");
         let reason = status.degraded_reason.expect("unavailable reason");
         assert!(
-            reason.starts_with("embedding_runtime_unavailable:"),
-            "expected live endpoint failure to precede stale manifest classification, got: {reason}"
+            reason.starts_with("retrieval_manifest_stale:"),
+            "expected static manifest validation before engine startup, got: {reason}"
         );
     }
 

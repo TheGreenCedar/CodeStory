@@ -213,10 +213,7 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-macos-source-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.target }}-workspace-default-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-macos-source-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.target }}-workspace-default-features-
       - run: cargo check --workspace --locked
-      - run: node scripts/setup-retrieval-env.mjs --self-test
       - run: node --test scripts/tests/codex-worktree-setup.test.mjs
       - run: test -x plugins/codestory/skills/codestory-grounding/scripts/setup.sh
 
@@ -237,7 +234,6 @@ jobs:
       proof_key: ${{ needs.route.outputs.proof_key }}
       profile: codestory-release-evidence-linux-arm64-v1
       drill_manifest: /srv/codestory-release-evidence/drills/real-repo-drill-cases.json
-      embedding_model_dir: /srv/codestory-release-evidence/models
       source_run_id: ${{ inputs.source_run_id }}
 
   source-proof:
@@ -283,6 +279,22 @@ jobs:
       proof_key: ${{ needs.route.outputs.proof_key }}
       use_packaged_cli_artifact: true
 
+  windows-vulkan-proof:
+    if: >-
+      always() &&
+      needs.route.result == 'success' &&
+      needs.packaged-proof.result == 'success' &&
+      (needs.route.outputs.scope == 'windows' || needs.route.outputs.scope == 'full')
+    needs:
+      - route
+      - packaged-proof
+    uses: ./.github/workflows/windows-vulkan-proof.yml
+    with:
+      version: ${{ needs.route.outputs.version }}
+      ref: ${{ needs.route.outputs.head_sha }}
+      proof_key: ${{ needs.route.outputs.proof_key }}
+      use_packaged_cli_artifact: true
+
   closeout:
     if: always() && needs.route.result != 'skipped' && needs.route.outputs.mode != 'release-evidence'
     needs:
@@ -292,6 +304,7 @@ jobs:
       - repo-scale-stats
       - packaged-proof
       - macos-metal-proof
+      - windows-vulkan-proof
     runs-on: ubuntu-latest
     steps:
       - name: Require one coherent accepted proof
@@ -307,6 +320,7 @@ jobs:
           STATS_RESULT: ${{ needs.repo-scale-stats.result }}
           PACKAGE_RESULT: ${{ needs.packaged-proof.result }}
           METAL_RESULT: ${{ needs.macos-metal-proof.result }}
+          VULKAN_RESULT: ${{ needs.windows-vulkan-proof.result }}
         run: |
           set -euo pipefail
           require_result() {
@@ -330,12 +344,18 @@ jobs:
           if [ "$SCOPE" = none ]; then
             require_result "$PACKAGE_RESULT" skipped packaged-proof
             require_result "$METAL_RESULT" skipped macos-metal-proof
+            require_result "$VULKAN_RESULT" skipped windows-vulkan-proof
           else
             require_result "$PACKAGE_RESULT" success packaged-proof
             if [ "$SCOPE" = windows ]; then
               require_result "$METAL_RESULT" skipped macos-metal-proof
+              require_result "$VULKAN_RESULT" success windows-vulkan-proof
+            elif [ "$SCOPE" = macos ]; then
+              require_result "$METAL_RESULT" success macos-metal-proof
+              require_result "$VULKAN_RESULT" skipped windows-vulkan-proof
             else
               require_result "$METAL_RESULT" success macos-metal-proof
+              require_result "$VULKAN_RESULT" success windows-vulkan-proof
             fi
           fi
           if [ "$MODE" = integration ]; then

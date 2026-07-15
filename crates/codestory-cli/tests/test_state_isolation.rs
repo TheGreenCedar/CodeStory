@@ -67,14 +67,6 @@ fn cli_state_stays_out_of_controlled_user_cache_fallback() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(inventory(&decoy), before, "decoy user cache changed");
-    assert!(
-        test_support::test_state_root()
-            .join("cache")
-            .join("sidecars")
-            .join("port-allocations.sqlite3")
-            .is_file(),
-        "agent port registry must stay under the injected state root"
-    );
 }
 
 fn cli_command_with_decoy(decoy: &Path) -> Command {

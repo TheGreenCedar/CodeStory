@@ -200,7 +200,7 @@ test("default setup rehydrates, indexes, and reports a local result without full
   assert.ok(logs.includes("CodeStory worktree setup complete"));
   assert.ok(logs.includes("  cli_version: 0.15.0"));
   assert.ok(logs.includes("  repository_map: ready"));
-  assert.ok(logs.includes("  background_preparation: ready"));
+  assert.ok(logs.includes("  retrieval: ready"));
 });
 
 test("Cargo fallback is locked and still feeds the shared setup path", () => {
@@ -266,27 +266,25 @@ test("maintainer proof flag is the only setup path that prepares full retrieval"
       return result(1);
     },
   });
-  assert.deepEqual(calls.map(args => args[0]), ["index", "ready", "doctor"]);
+  assert.deepEqual(calls.map(args => args[0]), ["index", "retrieval", "doctor"]);
   assert.deepEqual(calls[1], [
-    "ready",
-    "--goal",
-    "agent",
-    "--repair",
+    "retrieval",
+    "index",
     "--project",
     realpathSync(project),
+    "--refresh",
+    "full",
     "--format",
     "json",
-    "--run-id",
-    "shared-agent",
   ]);
-  assert.ok(logs.includes("  background_preparation: ready"));
+  assert.ok(logs.includes("  retrieval: ready"));
   assert.deepEqual(
     setupSummaryLines({ readiness: [{ goal: "local_navigation", status: "ready" }] }, "0.15.0", false),
     [
       "CodeStory worktree setup complete",
       "  cli_version: 0.15.0",
       "  repository_map: ready",
-      "  background_preparation: not_requested",
+      "  retrieval: not_requested",
     ],
   );
 });

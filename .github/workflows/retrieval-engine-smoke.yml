@@ -1,59 +1,64 @@
-# Retrieval smoke: Linux carries generic contracts; Windows keeps manifest-missing shape coverage.
-# Contract: docs/ops/retrieval-sidecars.md#preflight-smoke-contract
+# Retrieval smoke: hosted jobs use the explicit CPU policy. Hardware workflows
+# own Metal and Vulkan claims.
+# Contract: docs/ops/retrieval-engine.md#proof-boundary
 
-name: retrieval-sidecar-smoke
+name: retrieval-engine-smoke
 
 on:
   pull_request:
     paths:
-      - .codex/environments/**
-      - .cursor/rules/**
-      - .github/actions/**
-      - .github/scripts/**
-      - .github/workflows/**
-      - benchmarks/**
-      - crates/**
-      - docs/architecture/language-support.md
-      - docs/architecture/retrieval-*
+      - Cargo.toml
+      - Cargo.lock
+      - crates/codestory-llama-sys/**
+      - crates/codestory-retrieval/src/embeddings.rs
+      - crates/codestory-retrieval/src/health.rs
+      - crates/codestory-retrieval/src/in_process_embedding.rs
+      - crates/codestory-retrieval/src/index.rs
+      - crates/codestory-retrieval/src/query.rs
+      - crates/codestory-cli/src/readiness.rs
+      - crates/codestory-cli/src/stdio_transport.rs
+      - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/workflows/retrieval-engine-smoke.yml
+      - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
-      - docs/ops/retrieval-sidecars.md
-      - docs/testing/codestory-e2e-stats-log.md
-      - docs/testing/performance-review-playbook.md
+      - docs/ops/retrieval-engine.md
       - docs/testing/retrieval-architecture.md
-      - plugins/codestory/**
-      - scripts/**
   # Base-branch runs seed caches that sibling PRs are allowed to restore.
   push:
     branches:
       - main
       - dev/codestory-next
     paths:
-      - .codex/environments/**
-      - .cursor/rules/**
-      - .github/actions/**
-      - .github/scripts/**
-      - .github/workflows/**
-      - benchmarks/**
-      - crates/**
-      - docs/architecture/language-support.md
-      - docs/architecture/retrieval-*
+      - Cargo.toml
+      - Cargo.lock
+      - crates/codestory-llama-sys/**
+      - crates/codestory-retrieval/src/embeddings.rs
+      - crates/codestory-retrieval/src/health.rs
+      - crates/codestory-retrieval/src/in_process_embedding.rs
+      - crates/codestory-retrieval/src/index.rs
+      - crates/codestory-retrieval/src/query.rs
+      - crates/codestory-cli/src/readiness.rs
+      - crates/codestory-cli/src/stdio_transport.rs
+      - .github/scripts/check-packaged-agent-proof.py
+      - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/workflows/retrieval-engine-smoke.yml
+      - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
-      - docs/ops/retrieval-sidecars.md
-      - docs/testing/codestory-e2e-stats-log.md
-      - docs/testing/performance-review-playbook.md
+      - docs/ops/retrieval-engine.md
       - docs/testing/retrieval-architecture.md
-      - plugins/codestory/**
-      - scripts/**
   workflow_dispatch:
 
 concurrency:
-  group: retrieval-sidecar-smoke-${{ github.event.pull_request.number || github.ref }}
+  group: retrieval-engine-smoke-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   linux-contracts:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CODESTORY_EMBED_ALLOW_CPU: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -73,6 +78,9 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Install Linux Vulkan build dependencies
+        run: bash .github/scripts/install-linux-vulkan-build-deps.sh
+
       - name: Capture Rust cache key
         id: rust-cache-key
         shell: bash
@@ -90,20 +98,18 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-
 
       - name: Generalization lint regression contracts
         run: cargo test --locked -p codestory-runtime --test retrieval_generalization_guard
 
-      - name: Runtime sidecar and packet contract tests
+      - name: Runtime retrieval and packet contract tests
         run: |
           cargo test --locked -p codestory-runtime --lib agent::retrieval_primary::tests
           cargo test --locked -p codestory-runtime --lib agent::packet_search::tests
           cargo test --locked -p codestory-runtime --lib agent::packet_claim_profiles::tests
-          cargo test --locked -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_sidecars
-          cargo test --locked -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_sidecars
-          cargo test --locked -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_sidecars
+          cargo test --locked -p codestory-runtime --lib search_rejects_natural_language_queries_without_full_retrievals
+          cargo test --locked -p codestory-runtime --lib search_results_ignores_repo_text_hits_without_full_retrievals
+          cargo test --locked -p codestory-runtime --lib repo_text_auto_fallback_is_not_product_search_without_full_retrievals
 
       - name: Stdio protocol contract tests
         run: cargo test --locked -p codestory-cli --test stdio_protocol_contracts
@@ -118,7 +124,7 @@ jobs:
         run: cargo test --locked -p codestory-retrieval
 
       - name: Save Cargo registry, git sources, and build output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
         with:
@@ -132,6 +138,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      CODESTORY_EMBED_ALLOW_CPU: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -158,14 +166,12 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-bootstrap-default-features-
 
       - name: Retrieval readiness manifest-missing contract
         run: cargo test --locked -p codestory-cli --test ready_command
 
       - name: Save Cargo registry, git sources, and build output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

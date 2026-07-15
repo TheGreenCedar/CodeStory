@@ -72,7 +72,7 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     assert_eq!(wait_json["local_refresh"]["reason"], "already_fresh");
     assert_eq!(
         wait_json["verdicts"][0]["sidecar"]["degraded_reason"], "retrieval_manifest_missing",
-        "local wait-fresh must not bootstrap retrieval sidecars: {wait_json_text}"
+        "local wait-fresh must not initialize retrieval: {wait_json_text}"
     );
 
     let markdown = run_cli(
@@ -83,13 +83,11 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     assert!(markdown.contains("# Readiness"));
     assert!(markdown.contains("agent_packet_search"));
     assert!(markdown.contains("minimum_next:"));
-    assert!(markdown.contains("full_repair:"));
-    assert!(markdown.contains("codestory-cli ready --goal agent --repair --project"));
+    assert!(markdown.contains("codestory-cli retrieval index --project"));
     assert!(markdown.contains("--run-id"));
     assert!(markdown.contains("shared-agent"));
-    assert!(markdown.contains("codestory-cli retrieval status --project"));
-    assert!(markdown.contains("codestory-cli doctor --project"));
-    assert!(markdown.contains("--format markdown"));
+    assert!(!markdown.contains("--repair"));
+    assert!(!markdown.to_ascii_lowercase().contains("sidecar"));
     assert!(
         !markdown.contains("codestory-cli index --project"),
         "fresh-index agent readiness should not recommend a full core reindex: {markdown}"
@@ -113,11 +111,11 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
             .is_some_and(
                 |commands| commands.iter().any(|command| command
                     .as_str()
-                    .is_some_and(|text| text.contains("ready --goal agent --repair")
+                    .is_some_and(|text| text.contains("retrieval index")
                         && text.contains("--run-id")
                         && text.contains("shared-agent")))
             ),
-        "missing sidecars should point at the agent-owned repair command: {agent_json_text}"
+        "missing retrieval should point at automatic artifact publication: {agent_json_text}"
     );
     assert!(
         agent["full_repair"]
@@ -130,7 +128,7 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
                         .is_some_and(|text| text.contains("retrieval status")
                             && text.contains("--format json")))
             ),
-        "missing sidecars should finish with status proof guidance: {agent_json_text}"
+        "missing retrieval should finish with status proof guidance: {agent_json_text}"
     );
     assert_eq!(
         agent_json["readiness_lanes"]["local_default"]["profile"],
@@ -175,7 +173,7 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
     );
     assert_eq!(
         explicit_agent_json["verdicts"][0]["sidecar"]["retrieval_mode"],
-        explicit_agent_json["readiness_lanes"]["agent_packet_search"]["sidecar_mode"],
+        explicit_agent_json["readiness_lanes"]["agent_packet_search"]["retrieval_mode"],
         "explicit ready agent verdict and rendered lane should agree on full-vs-degraded state: {explicit_agent_json_text}"
     );
     assert!(
@@ -184,11 +182,11 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
             .is_some_and(
                 |commands| commands.iter().any(|command| command
                     .as_str()
-                    .is_some_and(|text| text.contains("ready --goal agent --repair")
+                    .is_some_and(|text| text.contains("retrieval index")
                         && text.contains("--run-id")
                         && text.contains("isolated-proof")))
             ),
-        "explicit run id should stay in agent repair guidance: {explicit_agent_json_text}"
+        "explicit run id should stay in agent activation guidance: {explicit_agent_json_text}"
     );
     assert!(
         explicit_agent_json["verdicts"][0]["full_repair"]
@@ -203,34 +201,6 @@ fn ready_command_emits_compact_verdicts_and_filters_goal() {
                         && text.contains("isolated-proof")))
             ),
         "explicit run id should stay in agent status proof guidance: {explicit_agent_json_text}"
-    );
-}
-
-#[test]
-fn ready_repair_indexes_fresh_workspace_for_local_navigation() {
-    let workspace = tempdir().expect("workspace dir");
-    let cache_dir = tempdir().expect("cache dir");
-    write_tiny_rust_workspace(workspace.path());
-
-    let json_text = run_cli(
-        workspace.path(),
-        cache_dir.path(),
-        &["ready", "--goal", "local", "--repair", "--format", "json"],
-    );
-    let json: Value = serde_json::from_str(&json_text).expect("ready repair json");
-    let verdicts = json["verdicts"]
-        .as_array()
-        .expect("ready repair verdicts should be an array");
-
-    assert_eq!(verdicts.len(), 1);
-    assert_eq!(verdicts[0]["goal"], "local_navigation");
-    assert_eq!(verdicts[0]["status"], "ready");
-    assert!(
-        verdicts[0]["minimum_next"][0]
-            .as_str()
-            .expect("minimum next command")
-            .contains("codestory-cli ground --project"),
-        "repaired local readiness should point at grounding, not another index repair: {json_text}"
     );
 }
 
@@ -293,7 +263,7 @@ fn helper(value: &str) -> String {
     );
     assert_eq!(
         wait_json["verdicts"][0]["sidecar"]["degraded_reason"], "retrieval_manifest_missing",
-        "wait-fresh should leave packet/search sidecars separately gated: {wait_json_text}"
+        "wait-fresh should leave packet/search retrieval separately gated: {wait_json_text}"
     );
 }
 
@@ -304,7 +274,7 @@ fn run_cli(workspace: &Path, cache_dir: &Path, args: &[&str]) -> String {
         .arg(workspace)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run codestory-cli");
     assert!(

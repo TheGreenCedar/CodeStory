@@ -39,11 +39,8 @@ The most useful fields are:
 | `runtime_truth` | Compact references to the canonical readiness and runtime fields. |
 | `index_publication` | Complete core database generation currently being served. |
 | `local_refresh` | Local map state and the complete publication retained during refresh. |
-| `managed_retrieval` | Automatic broad-search lifecycle state. This is diagnostic, not a user control. |
 | `retrieval_mode` | Persisted broad-search classification; `full` is required for trustworthy broad results. |
 | `readiness_lanes.agent_packet_search` | Current broad-search capability state. |
-| `readiness_broker` | Maintainer evidence for ownership, liveness, and accelerator proof. |
-| `retrieval_diagnostics` | Detailed managed-runtime evidence for debugging. |
 | `runtime_update` | Non-blocking installed-runtime update advisory. |
 
 Reuse a status result until repository, runtime, or index state changes. Follow
@@ -55,16 +52,16 @@ truths.
 Local navigation is useful while broad search prepares, but it is not full
 retrieval proof. Trust a broad result only when the requested tool succeeds
 against a current complete publication. Under accelerator-required policy,
-maintainer proof additionally requires a live selected endpoint, matching
-process identity, and verified accelerator work.
-
-Stale ownership remains fail-closed. Heartbeat age alone does not prove that a
-process is abandoned, and CodeStory does not terminate an owner on that basis.
+maintainer proof additionally requires the exact engine/model identity, a
+physical non-software adapter, and verified accelerator work.
 
 ## Maintainer recovery
 
-CLI status, doctor, install records, process IDs, ports, model paths, and backend
-logs are maintainer diagnostics. They are not the normal agent or user repair
-path. Use them only after automatic retries stop converging or when collecting
-an explicit proof transcript. `CODESTORY_CLI` remains a local-development
-override; installed plugin sessions use the managed launcher.
+CLI status, doctor, install records, and
+`codestory://diagnostics/retrieval-engine` are maintainer surfaces. The engine
+diagnostic reports the live model digest, linked ggml build, selected adapter,
+policy, smoke timing, and process-wide model-load identity. It is intentionally
+absent from the normal resource catalog and user flow. Use these surfaces only
+after automatic retries stop converging or when collecting an explicit proof
+transcript. `CODESTORY_CLI` remains a local-development override; installed
+plugin sessions use the managed launcher.

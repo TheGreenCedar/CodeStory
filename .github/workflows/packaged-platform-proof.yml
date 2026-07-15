@@ -51,6 +51,7 @@ concurrency:
 env:
   RELEASE_RUST_TOOLCHAIN: "1.95.0"
   LINUX_GLIBC_BUILD_IMAGE: "rust:1.95.0-bullseye@sha256:28afaeb8445f2a2e7d878bd34ed39ba02bb517efb29986188cbd59b7cf4f2fdf"
+  LINUX_GLSLC_IMAGE: "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
   LINUX_GLIBC_BASELINE_IMAGE: "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"
   APPLE_DEVELOPER_TEAM_ID: "PKUJNR8D6F"
 
@@ -100,8 +101,13 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-
+
+      - name: Prepare checksum-pinned embedded model
+        run: node scripts/prepare-embedded-model.mjs
+
+      - name: Install Linux Vulkan build dependencies
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/install-linux-vulkan-build-deps.sh
 
       - name: Build codestory-cli
         if: matrix.asset_target != 'linux-x64'
@@ -110,14 +116,23 @@ jobs:
       - name: Build Linux x64 at the glibc 2.31 baseline
         if: matrix.asset_target == 'linux-x64'
         run: |
+          model_relative="${CODESTORY_EMBED_MODEL_SOURCE#"$PWD/"}"
+          docker build --platform linux/amd64 \
+            --build-arg "BUILD_IMAGE=${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
+            --build-arg "GLSLC_IMAGE=${{ env.LINUX_GLSLC_IMAGE }}" \
+            --file .github/docker/linux-glibc-build.Dockerfile \
+            --tag codestory-linux-glibc-build \
+            .github/docker
           docker run --rm --platform linux/amd64 \
             --user "$(id -u):$(id -g)" \
             --env CARGO_HOME=/cargo \
             --env CARGO_TARGET_DIR=/workspace/target/glibc-2.31 \
+            --env CODESTORY_EMBED_MODEL_SOURCE="/workspace/$model_relative" \
+            --env CXXFLAGS=-std=c++17 \
             --volume "$HOME/.cargo:/cargo" \
             --volume "$PWD:/workspace" \
             --workdir /workspace \
-            "${{ env.LINUX_GLIBC_BUILD_IMAGE }}" \
+            codestory-linux-glibc-build \
             cargo build --release --locked -p codestory-cli --target "${{ matrix.rust_target }}"
           mkdir -p "target/${{ matrix.rust_target }}/release"
           cp "target/glibc-2.31/${{ matrix.rust_target }}/release/codestory-cli" \
@@ -342,7 +357,13 @@ jobs:
             --volume "$PWD:/workspace" \
             --workdir /workspace \
             "${{ env.LINUX_GLIBC_BASELINE_IMAGE }}" \
-            bash .github/scripts/check-linux-glibc-baseline.sh \
+            bash -lc '
+              set -euo pipefail
+              apt-get update >/dev/null
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                libvulkan1=1.2.131.2-1 >/dev/null
+              bash .github/scripts/check-linux-glibc-baseline.sh "$@"
+            ' bash \
               "target/release-dist/codestory-cli-v${{ inputs.version }}-linux-x64.tar.gz" \
               "${{ inputs.version }}" \
               target/linux-glibc-baseline \
@@ -366,11 +387,7 @@ jobs:
             --version-only \
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
-      - name: Fetch retrieval embedding model
-        if: matrix.asset_target == 'linux-x64'
-        run: node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
-
-      - name: Packaged full-sidecar agent proof
+      - name: Packaged in-process retrieval proof
         if: matrix.asset_target == 'linux-x64'
         env:
           CODESTORY_EMBED_ALLOW_CPU: "1"
@@ -381,6 +398,10 @@ jobs:
             --expected-version "${{ inputs.version }}" \
             --project "${{ github.workspace }}" \
             --plugin-root plugins/codestory \
+            --plugin-handoff \
+            --engine-policy cpu_explicit \
+            --expected-backend CPU \
+            --offline \
             --out-dir target/packaged-agent-proof
 
       - name: Upload packaged agent proof artifacts
@@ -413,15 +434,19 @@ jobs:
             --version-only `
             --out-dir "target/packaged-version-smoke/${{ matrix.asset_target }}"
 
-      - name: Prove Intel macOS backend policy and explicit CPU/external operation
+      - name: Prove Intel macOS explicit CPU policy
         if: matrix.asset_target == 'macos-x64'
+        env:
+          CODESTORY_EMBED_ALLOW_CPU: "1"
         run: >-
           python3 .github/scripts/check-packaged-agent-proof.py
           --archive "target/release-dist/codestory-cli-v${{ inputs.version }}-macos-x64.tar.gz"
           --checksum-file target/release-dist/SHA256SUMS.txt
           --expected-version "${{ inputs.version }}"
           --project "${{ github.workspace }}"
-          --intel-runtime-policy
+          --engine-policy cpu_explicit
+          --expected-backend CPU
+          --offline
           --out-dir target/packaged-intel-policy-proof
 
       - name: Upload Intel macOS policy proof
@@ -453,7 +478,7 @@ jobs:
           --expected-version "${{ inputs.version }}"
           --project "${{ github.workspace }}"
           --plugin-root plugins/codestory
-          --managed-plugin-handoff
+          --plugin-handoff
           --out-dir target/packaged-managed-proof
 
       - name: Upload managed plugin proof
@@ -491,7 +516,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/codestory-notary-${{ matrix.asset_target }}"
 
       - name: Save Cargo registry, git sources, and build output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

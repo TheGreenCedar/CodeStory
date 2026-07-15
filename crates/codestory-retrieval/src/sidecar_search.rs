@@ -183,7 +183,7 @@ impl LiveSidecarSearch {
             &vector_generation,
             &sidecar_generation,
             &sidecar_input_hash,
-            crate::embeddings::LlamaCppEmbeddingClient::new(&runtime.embedding)?,
+            crate::embeddings::InProcessEmbeddingClient::new(runtime),
         );
         Ok(Self {
             runtime: runtime.clone(),
@@ -403,7 +403,7 @@ mod tests {
         EmbeddingDeviceReadiness {
             requested_policy: "accelerator_required",
             observed_state: "accelerated",
-            observation_source: "native_log",
+            observation_source: "inprocess_engine",
             detected_provider: None,
             detected_gpu: None,
             accelerator_requested: true,

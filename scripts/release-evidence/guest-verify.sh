@@ -10,8 +10,6 @@ repository=$(get '.repository')
 runner_name=$(get '.runner.name')
 runner_version=$(get '.runner.version')
 runner_root=$(get '.runner.root')
-model_name=$(get '.assets.model.name')
-model_sha=$(get '.assets.model.sha256')
 drill_commit=$(get '.drill.commit')
 
 mount_table=$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | sort)
@@ -105,7 +103,6 @@ jq -e --arg profile_id "$profile_id" --arg repository "$repository" \
   .runner_id == $agent_id
   ' "$ownership" >/dev/null
 
-printf '%s  %s\n' "$model_sha" "$runner_root/models/$model_name" | sha256sum -c -
 test "$(git -C "$runner_root/drills/serde-json" rev-parse HEAD)" = "$drill_commit"
 test -z "$(git -C "$runner_root/drills/serde-json" status --porcelain)"
 jq -e '.cases[0].anchors == ["from_reader", "Deserializer::from_reader", "Value"]' \
@@ -117,7 +114,6 @@ printf '%s\n' "$source_sha" | grep -Eq '^[0-9a-f]{40}$'
 
 memory_bytes=$(awk '/MemTotal/{printf "%.0f", $2 * 1024}' /proc/meminfo)
 workspace_free_bytes=$(df --output=avail -B1 "$runner_root" | tail -1 | tr -d ' ')
-model_bytes=$(stat -c %s "$runner_root/models/$model_name")
 manifest_sha=$(sha256sum "$runner_root/drills/real-repo-drill-cases.json" | awk '{print $1}')
 os_pretty=$(sed -n 's/^PRETTY_NAME="\(.*\)"/\1/p' /etc/os-release)
 node_version=$(node --version)
@@ -145,8 +141,6 @@ jq -n --slurpfile observed "$observed_identity" \
   --arg observed_identity_sha "$observed_identity_sha" \
   --arg repository "$repository" --arg runner_name "$runner_name" \
   --arg runner_version "$runner_version" --argjson runner_id "$agent_id" \
-  --arg model_name "$model_name" --arg model_sha "$model_sha" \
-  --argjson model_bytes "$model_bytes" \
   --arg drill_commit "$drill_commit" --arg manifest_sha "$manifest_sha" \
   --arg source_sha "$source_sha" --argjson memory_bytes "$memory_bytes" \
   --argjson workspace_free_bytes "$workspace_free_bytes" '
@@ -157,7 +151,6 @@ jq -n --slurpfile observed "$observed_identity" \
     runner:{repository:$repository,name:$runner_name,id:$runner_id,version:$runner_version,
       labels:["self-hosted","Linux","ARM64","codestory-release-evidence"],automatic_updates:false},
     capacity:{observed_memory_bytes:$memory_bytes,observed_workspace_free_bytes:$workspace_free_bytes},
-    assets:{model:{name:$model_name,sha256:$model_sha,bytes:$model_bytes}},
     drill:{repository:"https://github.com/serde-rs/json.git",commit:$drill_commit,
       manifest:"/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
       manifest_sha256:$manifest_sha},

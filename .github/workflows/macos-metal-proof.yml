@@ -44,8 +44,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  packaged-metal-lifecycle:
-    name: Packaged Apple Silicon Metal lifecycle
+  packaged-metal:
+    name: Packaged Apple Silicon Metal engine
     runs-on: [self-hosted, macOS, ARM64, codestory-metal]
     # Configure this environment with release protection rules and restrict the
     # matching self-hosted runner/runner group to this evidence workflow.
@@ -82,6 +82,10 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
 
+      - name: Prepare checksum-pinned embedded model
+        if: ${{ !inputs.use_packaged_cli_artifact }}
+        run: node scripts/prepare-embedded-model.mjs
+
       - name: Build and package native CLI
         if: ${{ !inputs.use_packaged_cli_artifact }}
         shell: bash
@@ -104,87 +108,28 @@ jobs:
           name: codestory-cli-macos-arm64
           path: target/release-dist
 
-      - name: Verify retrieval setup contracts and fetch model
-        shell: bash
-        env:
-          CODESTORY_EMBED_MODEL_DIR: ${{ runner.temp }}/codestory-metal-models
-        run: |
-          set -euo pipefail
-          node scripts/setup-retrieval-env.mjs --self-test
-          node scripts/setup-retrieval-env.mjs --fetch-embed-model --fetch-only
-
-      - name: Clean marker-owned state from an interrupted earlier hardware attempt
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          index=0
-          failed=0
-          for root in "$RUNNER_TEMP"/codestory-metal-proof-owned-*; do
-            marker="$root/.codestory-macos-metal-proof-owner.json"
-            archives=("$root"/codestory-cli-v*-macos-arm64.tar.gz)
-            if [ ! -f "$marker" ] || [ "${#archives[@]}" -ne 1 ]; then
-              continue
-            fi
-            if ! python3 .github/scripts/check-packaged-agent-proof.py \
-                --project "${{ github.workspace }}" \
-                --cleanup-proof-temp-root "$root" \
-                --out-dir "target/macos-metal-proof/prior-attempt-cleanup-$index"
-            then
-              failed=1
-            fi
-            index=$((index + 1))
-          done
-          exit "$failed"
-
-      - name: Prove cold, warm, dead-endpoint, recovery, packet, and plugin lifecycle
+      - name: Prove cold and warm Metal, offline packaging, and multi-repository reuse
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
-          CODESTORY_EMBED_MODEL_DIR: ${{ runner.temp }}/codestory-metal-models
-          CODESTORY_EMBED_DEVICE_PROVIDER: metal
           CODESTORY_EMBED_ALLOW_CPU: "0"
-          CODESTORY_PROOF_TEMP_ROOT: ${{ runner.temp }}/codestory-metal-proof-owned-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           version="${VERSION#v}"
-          mkdir -p "$CODESTORY_PROOF_TEMP_ROOT/tmp with spaces ü"
-          cp "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
-            "$CODESTORY_PROOF_TEMP_ROOT/"
-          export TMPDIR="$CODESTORY_PROOF_TEMP_ROOT/tmp with spaces ü"
+          export TMPDIR="${RUNNER_TEMP}/codestory metal proof ü"
+          mkdir -p "$TMPDIR"
           python3 .github/scripts/check-packaged-agent-proof.py \
             --archive "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz" \
             --checksum-file "target/release-dist/codestory-cli-v${version}-macos-arm64.tar.gz.sha256" \
             --expected-version "$version" \
             --project "${{ github.workspace }}" \
             --plugin-root plugins/codestory \
-            --native-accelerator-lifecycle \
-            --managed-plugin-grounding-convergence \
+            --plugin-handoff \
+            --engine-policy accelerated \
+            --expected-backend Metal \
+            --offline \
             --timeout-secs 1800 \
             --out-dir target/macos-metal-proof/packaged-agent
-
-      - name: Clean and assert proof-owned hardware state
-        if: always()
-        shell: bash
-        env:
-          VERSION: ${{ inputs.version }}
-          CODESTORY_PROOF_TEMP_ROOT: ${{ runner.temp }}/codestory-metal-proof-owned-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          version="${VERSION#v}"
-          archive="$CODESTORY_PROOF_TEMP_ROOT/codestory-cli-v${version}-macos-arm64.tar.gz"
-          marker="$CODESTORY_PROOF_TEMP_ROOT/.codestory-macos-metal-proof-owner.json"
-          if [ ! -f "$marker" ]; then
-            mkdir -p target/macos-metal-proof/final-cleanup
-            printf '%s\n' '{"status":"not_started","reason":"proof ownership marker was never written"}' \
-              > target/macos-metal-proof/final-cleanup/proof-owned-cleanup.json
-            exit 0
-          fi
-          test -f "$archive"
-          python3 .github/scripts/check-packaged-agent-proof.py \
-            --project "${{ github.workspace }}" \
-            --cleanup-proof-temp-root "$CODESTORY_PROOF_TEMP_ROOT" \
-            --out-dir target/macos-metal-proof/final-cleanup
 
       - name: Upload Metal proof artifacts
         if: always()

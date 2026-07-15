@@ -8,6 +8,7 @@ on:
       - crates/**
       - docs/contributors/getting-started.md
       - docs/contributors/testing-matrix.md
+      - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/workflows/rustdoc.yml
   # Base-branch runs seed caches that sibling PRs are allowed to restore.
   push:
@@ -20,6 +21,7 @@ on:
       - crates/**
       - docs/contributors/getting-started.md
       - docs/contributors/testing-matrix.md
+      - .github/scripts/install-linux-vulkan-build-deps.sh
       - .github/workflows/rustdoc.yml
   workflow_dispatch:
 
@@ -43,6 +45,9 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Install Linux Vulkan build dependencies
+        run: bash .github/scripts/install-linux-vulkan-build-deps.sh
+
       - name: Capture Rust cache key
         id: rust-cache-key
         shell: bash
@@ -60,8 +65,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-doc-default-features-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-rustdoc-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-doc-default-features-
 
       - name: Deny rustdoc warnings
         env:
@@ -69,7 +72,7 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
 
       - name: Save Cargo registry, git sources, and build output
-        if: always() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
+        if: success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''
         uses: actions/cache/save@v5
         continue-on-error: true
         with:

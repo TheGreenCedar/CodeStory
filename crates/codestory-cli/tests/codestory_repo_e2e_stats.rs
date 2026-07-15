@@ -54,7 +54,7 @@ struct RepoE2eStats {
     repeat_semantic_docs_stale: u64,
     retrieval_index_seconds: f64,
     retrieval_status_seconds: f64,
-    sidecar_manifest: SidecarManifestStats,
+    retrieval_manifest: RetrievalManifestStats,
     ground_seconds: f64,
     search_seconds: f64,
     symbol_seconds: f64,
@@ -78,7 +78,7 @@ struct EvidenceIdentity {
 }
 
 #[derive(Debug, Serialize)]
-struct SidecarManifestStats {
+struct RetrievalManifestStats {
     symbol_doc_count: u64,
     dense_projection_count: u64,
     projection_count: u64,
@@ -109,14 +109,14 @@ struct IndexStats {
     edge_count: u64,
     file_count: u64,
     error_count: u64,
-    sidecar_status_after_retrieval_index: String,
+    retrieval_status_after_index: String,
     legacy_index_retrieval_mode: String,
     semantic_doc_count: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct GroundStats {
-    sidecar_status_after_retrieval_index: String,
+    retrieval_status_after_index: String,
     legacy_ground_retrieval_mode: String,
     root_symbols: usize,
     file_digests: usize,
@@ -126,7 +126,7 @@ struct GroundStats {
 #[derive(Debug, Serialize)]
 struct SearchStats {
     query: String,
-    sidecar_shadow_retrieval_mode: String,
+    retrieval_shadow_mode: String,
     legacy_search_retrieval_mode: String,
     semantic_doc_count: u64,
     indexed_symbol_hits: usize,
@@ -167,15 +167,15 @@ struct ReportStats {
 }
 
 const PROOF_TIER_STATS_ONLY: &str = "stats_only";
-const PROOF_TIER_FULL_SIDECAR: &str = "full_sidecar";
+const PROOF_TIER_FULL_RETRIEVAL: &str = "full_retrieval";
 const RELEASE_WARNING_REGRESSION_FACTOR: f64 = 1.25;
 
 fn release_readiness_proof_tier(
-    sidecar_status_after_retrieval_index: &str,
-    search_shadow_sidecar_mode: &str,
+    retrieval_status_after_index: &str,
+    search_retrieval_shadow_mode: &str,
 ) -> &'static str {
-    if sidecar_status_after_retrieval_index == "full" && search_shadow_sidecar_mode == "full" {
-        PROOF_TIER_FULL_SIDECAR
+    if retrieval_status_after_index == "full" && search_retrieval_shadow_mode == "full" {
+        PROOF_TIER_FULL_RETRIEVAL
     } else {
         PROOF_TIER_STATS_ONLY
     }
@@ -372,10 +372,10 @@ struct DrillRepoCaseConfig {
 }
 
 #[test]
-fn release_readiness_proof_tier_requires_full_sidecar_evidence() {
+fn release_readiness_proof_tier_requires_full_retrieval_evidence() {
     assert_eq!(
         release_readiness_proof_tier("full", "full"),
-        PROOF_TIER_FULL_SIDECAR
+        PROOF_TIER_FULL_RETRIEVAL
     );
     assert_eq!(
         release_readiness_proof_tier("full", "degraded"),
@@ -391,7 +391,7 @@ fn release_readiness_proof_tier_requires_full_sidecar_evidence() {
 fn release_readiness_proof_tier_does_not_claim_drill_or_promotion() {
     let proof_tier = release_readiness_proof_tier("full", "full");
 
-    assert_eq!(proof_tier, PROOF_TIER_FULL_SIDECAR);
+    assert_eq!(proof_tier, PROOF_TIER_FULL_RETRIEVAL);
     assert_ne!(proof_tier, "real_repo_drill");
     assert_ne!(proof_tier, "promotion_grade");
 }
@@ -485,95 +485,6 @@ fn search_dir_for_storage(storage_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.search-generations"))
 }
 
-struct ReleaseE2eSidecarCleanup {
-    binary: PathBuf,
-    project_root: PathBuf,
-    cache_dir: PathBuf,
-    sidecar_cache_root: PathBuf,
-    run_id: String,
-    armed: bool,
-}
-
-impl ReleaseE2eSidecarCleanup {
-    fn down(&self) -> std::io::Result<std::process::Output> {
-        test_support::command(&self.binary)
-            .current_dir(&self.project_root)
-            .args(["retrieval", "down", "--profile", "agent", "--run-id"])
-            .arg(&self.run_id)
-            .arg("--project")
-            .arg(&self.project_root)
-            .arg("--cache-dir")
-            .arg(&self.cache_dir)
-            .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
-            .env_remove("CODESTORY_STDIO_CACHE_ROOT")
-            .env("CODESTORY_CACHE_ROOT", &self.sidecar_cache_root)
-            .env("CODESTORY_EMBED_BACKEND", "llamacpp")
-            .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
-            .output()
-    }
-
-    fn teardown(&mut self) {
-        let (_, status_json) = run_cli_json_with_sidecar_cache_root(
-            &self.binary,
-            &self.project_root,
-            &self.cache_dir,
-            &self.sidecar_cache_root,
-            &[
-                "retrieval".to_string(),
-                "status".to_string(),
-                "--profile".to_string(),
-                "agent".to_string(),
-                "--run-id".to_string(),
-                self.run_id.clone(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-        );
-        let namespace = string_field(&status_json, &["ownership", "namespace"]).to_string();
-
-        let down = self.down().expect("tear down release evidence sidecar");
-        assert!(
-            down.status.success(),
-            "release evidence sidecar teardown failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&down.stdout),
-            String::from_utf8_lossy(&down.stderr)
-        );
-
-        let (_, inventory_json) = run_cli_json_with_sidecar_cache_root(
-            &self.binary,
-            &self.project_root,
-            &self.cache_dir,
-            &self.sidecar_cache_root,
-            &[
-                "retrieval".to_string(),
-                "inventory".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-        );
-        let namespaces = json_path(&inventory_json, &["namespaces"])
-            .as_array()
-            .expect("release evidence sidecar inventory namespaces");
-        if let Some(entry) = namespaces
-            .iter()
-            .find(|entry| entry["namespace"].as_str() == Some(namespace.as_str()))
-        {
-            assert_eq!(entry["state_exists"].as_bool(), Some(false));
-            assert_eq!(entry["containers"].as_array().map(Vec::len), Some(0));
-            assert_eq!(entry["networks"].as_array().map(Vec::len), Some(0));
-        }
-        self.armed = false;
-    }
-}
-
-impl Drop for ReleaseE2eSidecarCleanup {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.down();
-        }
-    }
-}
-
 fn path_bytes(path: &Path) -> u64 {
     let Ok(metadata) = fs::metadata(path) else {
         return 0;
@@ -642,11 +553,9 @@ fn run_cli_output_with_sidecar_cache_root(
         .arg(project_root)
         .arg("--cache-dir")
         .arg(cache_dir)
-        .env_remove("CODESTORY_EMBED_RUNTIME_MODE")
         .env_remove("CODESTORY_STDIO_CACHE_ROOT")
         .env("CODESTORY_CACHE_ROOT", sidecar_cache_root)
-        .env("CODESTORY_EMBED_BACKEND", "llamacpp")
-        .env("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS", "1")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .output()
         .expect("run codestory-cli");
     let seconds = started.elapsed().as_secs_f64();
@@ -808,14 +717,6 @@ fn codestory_repo_release_e2e_emits_stats() {
     );
 
     let cache_dir = tempdir().expect("cache dir");
-    let mut sidecar_cleanup = ReleaseE2eSidecarCleanup {
-        binary: binary.clone(),
-        project_root: project_root.clone(),
-        cache_dir: cache_dir.path().to_path_buf(),
-        sidecar_cache_root: cache_dir.path().to_path_buf(),
-        run_id: sidecar_run_id.to_string(),
-        armed: true,
-    };
 
     let (index_seconds, index_json) = run_cli_json(
         &binary,
@@ -846,31 +747,17 @@ fn codestory_repo_release_e2e_emits_stats() {
         ],
     );
 
-    let (_retrieval_bootstrap_seconds, _retrieval_bootstrap_json) = run_cli_json(
-        &binary,
-        project_root.as_path(),
-        cache_dir.path(),
-        &[
-            "retrieval".to_string(),
-            "bootstrap".to_string(),
-            "--profile".to_string(),
-            "agent".to_string(),
-            "--run-id".to_string(),
-            sidecar_run_id.to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-        ],
-    );
-
     let (_ready_repair_seconds, _ready_repair_json) = run_cli_json(
         &binary,
         project_root.as_path(),
         cache_dir.path(),
         &[
-            "ready".to_string(),
-            "--goal".to_string(),
+            "retrieval".to_string(),
+            "index".to_string(),
+            "--profile".to_string(),
             "agent".to_string(),
-            "--repair".to_string(),
+            "--refresh".to_string(),
+            "auto".to_string(),
             "--run-id".to_string(),
             sidecar_run_id.to_string(),
             "--format".to_string(),
@@ -1092,14 +979,14 @@ fn codestory_repo_release_e2e_emits_stats() {
         + repeat_semantic_reload_ms
         + repeat_semantic_prune_ms;
     let semantic_phase_seconds = semantic_phase_ms as f64 / 1000.0;
-    let search_sidecar_shadow_retrieval_mode =
+    let search_retrieval_shadow_mode =
         string_field(&search_json, &["retrieval_shadow", "retrieval_mode"]).to_string();
     let dense_reason_counts_json = string_field(
         &retrieval_status_json,
         &["manifest", "dense_reason_counts_json"],
     )
     .to_string();
-    let sidecar_manifest = SidecarManifestStats {
+    let retrieval_manifest = RetrievalManifestStats {
         symbol_doc_count: u64_field(&retrieval_status_json, &["manifest", "symbol_doc_count"]),
         dense_projection_count: u64_field(
             &retrieval_status_json,
@@ -1122,7 +1009,7 @@ fn codestory_repo_release_e2e_emits_stats() {
     };
     let proof_tier = release_readiness_proof_tier(
         sidecar_retrieval_mode.as_str(),
-        search_sidecar_shadow_retrieval_mode.as_str(),
+        search_retrieval_shadow_mode.as_str(),
     )
     .to_string();
     let stats_baseline = latest_phase_stats_baseline(project_root.as_path());
@@ -1253,7 +1140,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         ),
         retrieval_index_seconds,
         retrieval_status_seconds,
-        sidecar_manifest,
+        retrieval_manifest,
         ground_seconds,
         search_seconds,
         symbol_seconds,
@@ -1265,13 +1152,13 @@ fn codestory_repo_release_e2e_emits_stats() {
             edge_count: u64_field(&index_json, &["summary", "stats", "edge_count"]),
             file_count: u64_field(&index_json, &["summary", "stats", "file_count"]),
             error_count: u64_field(&index_json, &["summary", "stats", "error_count"]),
-            sidecar_status_after_retrieval_index: sidecar_retrieval_mode.clone(),
+            retrieval_status_after_index: sidecar_retrieval_mode.clone(),
             legacy_index_retrieval_mode: string_field(&index_json, &["retrieval", "mode"])
                 .to_string(),
             semantic_doc_count: u64_field(&index_json, &["retrieval", "semantic_doc_count"]),
         },
         ground: GroundStats {
-            sidecar_status_after_retrieval_index: sidecar_retrieval_mode.clone(),
+            retrieval_status_after_index: sidecar_retrieval_mode.clone(),
             legacy_ground_retrieval_mode: string_field(&ground_json, &["retrieval", "mode"])
                 .to_string(),
             root_symbols: array_len(&ground_json, &["root_symbols"]),
@@ -1280,7 +1167,7 @@ fn codestory_repo_release_e2e_emits_stats() {
         },
         search: SearchStats {
             query: string_field(&search_json, &["query"]).to_string(),
-            sidecar_shadow_retrieval_mode: search_sidecar_shadow_retrieval_mode,
+            retrieval_shadow_mode: search_retrieval_shadow_mode,
             legacy_search_retrieval_mode: string_field(&search_json, &["retrieval", "mode"])
                 .to_string(),
             semantic_doc_count: u64_field(&search_json, &["retrieval", "semantic_doc_count"]),
@@ -1334,44 +1221,44 @@ fn codestory_repo_release_e2e_emits_stats() {
         "full repo index should finish without errors"
     );
     assert_eq!(
-        stats.index.sidecar_status_after_retrieval_index, "full",
+        stats.index.retrieval_status_after_index, "full",
         "retrieval status after retrieval index should be full before trusting index/ground/search evidence"
     );
     assert_eq!(
-        stats.proof_tier, PROOF_TIER_FULL_SIDECAR,
-        "repo e2e stats harness proves full sidecar evidence but does not run real-repo drill cases"
+        stats.proof_tier, PROOF_TIER_FULL_RETRIEVAL,
+        "repo e2e stats harness proves full retrieval evidence but does not run real-repo drill cases"
     );
     assert_eq!(
-        stats.ground.sidecar_status_after_retrieval_index, "full",
-        "strict grounding should reuse the prepared full sidecar retrieval state"
+        stats.ground.retrieval_status_after_index, "full",
+        "strict grounding should reuse the prepared full retrieval state"
     );
     assert_eq!(
-        stats.search.sidecar_shadow_retrieval_mode, "full",
-        "search should expose full sidecar retrieval shadow"
+        stats.search.retrieval_shadow_mode, "full",
+        "search should expose full retrieval shadow"
     );
     assert!(
-        stats.sidecar_manifest.symbol_doc_count > 0,
-        "full sidecar manifest should record graph-native symbol docs"
+        stats.retrieval_manifest.symbol_doc_count > 0,
+        "full retrieval manifest should record graph-native symbol docs"
     );
     assert!(
-        stats.sidecar_manifest.dense_projection_count > 0,
+        stats.retrieval_manifest.dense_projection_count > 0,
         "CodeStory product run should select dense anchors"
     );
     assert_eq!(
-        stats.sidecar_manifest.dense_projection_count, stats.sidecar_manifest.projection_count,
+        stats.retrieval_manifest.dense_projection_count, stats.retrieval_manifest.projection_count,
         "legacy projection_count should mirror dense_projection_count under graph_first_v1"
     );
     assert_eq!(
-        stats.sidecar_manifest.semantic_policy_version, "graph_first_v1",
-        "full sidecar manifest should record the active dense policy"
+        stats.retrieval_manifest.semantic_policy_version, "graph_first_v1",
+        "full retrieval manifest should record the active dense policy"
     );
     assert!(
-        stats.sidecar_manifest.graph_artifact_hash_present,
-        "full sidecar manifest should record a graph artifact hash"
+        stats.retrieval_manifest.graph_artifact_hash_present,
+        "full retrieval manifest should record a graph artifact hash"
     );
     assert_eq!(
-        stats.sidecar_manifest.dense_reason_count_total,
-        stats.sidecar_manifest.dense_projection_count,
+        stats.retrieval_manifest.dense_reason_count_total,
+        stats.retrieval_manifest.dense_projection_count,
         "dense reason counts should account for every dense anchor"
     );
     assert!(
@@ -1411,7 +1298,6 @@ fn codestory_repo_release_e2e_emits_stats() {
         stats.search_dir_unchanged,
         "plain read commands should not recreate the persisted search dir"
     );
-    sidecar_cleanup.teardown();
 }
 
 #[test]
@@ -1466,37 +1352,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             missing.join(", ")
         );
     }
-    let mut sidecar_cleanup = cases
-        .iter()
-        .map(|case| ReleaseE2eSidecarCleanup {
-            binary: binary.clone(),
-            project_root: case.project_root.clone(),
-            cache_dir: cache_dir.path().join(&case.name),
-            sidecar_cache_root: cache_dir.path().to_path_buf(),
-            run_id: codestory_retrieval::DEFAULT_AGENT_RUN_ID.to_string(),
-            armed: true,
-        })
-        .collect::<Vec<_>>();
-
-    for cleanup in &sidecar_cleanup {
-        run_cli_json_with_sidecar_cache_root(
-            &binary,
-            &cleanup.project_root,
-            &cleanup.cache_dir,
-            &cleanup.sidecar_cache_root,
-            &[
-                "retrieval".to_string(),
-                "bootstrap".to_string(),
-                "--profile".to_string(),
-                "agent".to_string(),
-                "--run-id".to_string(),
-                cleanup.run_id.clone(),
-                "--format".to_string(),
-                "json".to_string(),
-            ],
-        );
-    }
-
     let (_seconds, suite_json) = run_cli_json_with_sidecar_cache_root(
         &binary,
         repo_root().as_path(),
@@ -1683,9 +1538,6 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
         }
 
         assert_manifest_anchor_expectations(case, repo_json);
-    }
-    for cleanup in &mut sidecar_cleanup {
-        cleanup.teardown();
     }
 }
 

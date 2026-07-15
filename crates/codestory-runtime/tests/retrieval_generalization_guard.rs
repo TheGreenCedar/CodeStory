@@ -482,7 +482,7 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         ),
         (
             "unapproved-policy-reference.mjs",
-            "const workflows = [\".github/workflows/retrieval-sidecar-smoke.yml\", \"unrelated.yml\"];\n",
+            "const workflows = [\".github/workflows/retrieval-engine-smoke.yml\", \"unrelated.yml\"];\n",
         ),
         (
             "plugins/codestory/skills/codestory-grounding/SKILL.md",
@@ -521,7 +521,7 @@ fn linter_rejects_direct_and_split_non_rust_corpus_dependencies() {
         ),
         (
             "unapproved-policy-reference.mjs",
-            "retrieval-sidecar-smoke.yml",
+            "retrieval-engine-smoke.yml",
         ),
         ("skill.md", "fetch-holdout-repos.mjs"),
         ("codestory.mdc", "benchmarks/tasks"),
@@ -594,11 +594,11 @@ fn linter_binds_policy_allowances_to_the_exact_approved_use() {
     let allowed = run_lint_with_non_rust_fixtures(&[
         (
             ".github/scripts/route-ci-proof.mjs",
-            "        \".github/workflows/retrieval-sidecar-smoke.yml\",\n",
+            "        \".github/workflows/retrieval-engine-smoke.yml\",\n",
         ),
         (
             ".github/scripts/check-workflow-policy.mjs",
-            "const retrievalFile = \"retrieval-sidecar-smoke.yml\";\n",
+            "const retrievalFile = \"retrieval-engine-smoke.yml\";\n",
         ),
     ]);
     let allowed_stderr = String::from_utf8_lossy(&allowed.stderr);
@@ -610,11 +610,11 @@ fn linter_binds_policy_allowances_to_the_exact_approved_use() {
     let rejected = run_lint_with_non_rust_fixtures(&[
         (
             ".github/scripts/route-ci-proof.mjs",
-            "        \".github/workflows/retrieval-sidecar-smoke.yml\",\n        \".github/workflows/retrieval-sidecar-smoke.yml\",\nawait import(\".github/workflows/retrieval-sidecar-smoke.yml\");\n",
+            "        \".github/workflows/retrieval-engine-smoke.yml\",\n        \".github/workflows/retrieval-engine-smoke.yml\",\nawait import(\".github/workflows/retrieval-engine-smoke.yml\");\n",
         ),
         (
             ".github/scripts/check-workflow-policy.mjs",
-            "const retrievalFile = \"retrieval-sidecar-smoke.yml\";\nconst hostile = \".github/workflows/retrieval-\" + \"sidecar-smoke.yml\";\n",
+            "const retrievalFile = \"retrieval-engine-smoke.yml\";\nconst hostile = \".github/workflows/retrieval-\" + \"engine-smoke.yml\";\n",
         ),
     ]);
     let rejected_stderr = String::from_utf8_lossy(&rejected.stderr).to_ascii_lowercase();
@@ -625,7 +625,7 @@ fn linter_binds_policy_allowances_to_the_exact_approved_use() {
     assert!(
         rejected_stderr.contains("route-ci-proof.mjs:3:await import")
             && rejected_stderr.contains("check-workflow-policy.mjs:2:")
-            && rejected_stderr.contains("githubworkflowsretrievalsidecarsmokeyml"),
+            && rejected_stderr.contains("githubworkflowsretrievalenginesmokeyml"),
         "lint must identify both the hostile direct and split uses; stderr={rejected_stderr}"
     );
 }

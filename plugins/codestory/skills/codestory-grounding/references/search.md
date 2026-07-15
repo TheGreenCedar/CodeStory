@@ -1,8 +1,8 @@
-# `search` — Search Mandatory Sidecar Indexes
+# `search` — Search Full Retrieval
 
-Searches the mandatory local sidecar indexes for matching symbols, files,
+Searches the mandatory local retrieval indexes for matching symbols, files,
 semantic candidates, and graph-neighborhood evidence. A product search requires
-`retrieval_mode=full`; stale, stubbed, hash-vector, or missing sidecars are
+`retrieval_mode=full`; stale, stubbed, or missing generations are
 fail-closed states.
 
 ## Usage
@@ -19,7 +19,7 @@ fail-closed states.
 | `--cache-dir` | path | *auto* | Override the cache directory |
 | `--query` | string | **required** | Search term — symbol name or natural-language text |
 | `--limit` | integer | `10` | Maximum results per provenance group, capped at 50 |
-| `--repo-text` | enum | `auto` | Diagnostic repo-text scanning: `auto`, `on`, or `off`. Repo-text hits are navigation clues and must not replace exact sidecar evidence |
+| `--repo-text` | enum | `auto` | Diagnostic repo-text scanning: `auto`, `on`, or `off`. Repo-text hits are navigation clues and must not replace exact retrieval evidence |
 | `--refresh` | enum | `none` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
 | `--format` | enum | `markdown` | Output format: `markdown` or `json` |
 | `--output-file` | path | *stdout* | Write output to a file; the parent directory must already exist |
@@ -31,7 +31,7 @@ fail-closed states.
 - **Symbol-like queries** (e.g. `AppController`, `run_indexing`) search exact
   and normalized symbol lanes first.
 - **Natural-language queries** (e.g. `"how does incremental indexing work"`)
-  search semantic and graph-aware sidecar evidence. Repo-text may appear as
+  search semantic and graph-aware retrieval evidence. Repo-text may appear as
   diagnostic evidence, but it is not proof of a symbol or graph relationship.
 - **Field-qualified queries** filter indexed and repo-text results after candidate retrieval. Supported filters are `kind:<node-kind-or-alias>`, `path:<path-fragment>`, `name:<symbol-fragment>`, and `lang:<language-or-extension>`. Example: `kind:function name:listUsers` or `path:routes.ts /api/users`.
 - **Concrete anchors with weak indexed results** may report repo-text diagnostics
@@ -46,10 +46,10 @@ fail-closed states.
 - Ranking boosts exact and terminal symbol names, CamelCase initials, compound terms, and path co-location. Test, fixture, vendor, and external hits are dampened unless the query asks for them.
 - Import/re-export-looking exact hits are ranked below definition-looking hits when source-line evidence is available.
 - Repo-text evidence remains explicit navigation evidence. Treat repo-text hits
-  as clues to inspect, not as sidecar success.
+  as clues to inspect, not as retrieval success.
 - For architecture questions, broad natural-language `search` is discovery only. If `query_assessment` says `weak_top_hit=true` or there is no exact anchor, move to `drill` with concrete anchors from `ground`/`search`; do not answer from broad search hits alone.
 - `symbol`, `trail`, and `snippet` require a resolvable graph target. Semantic suggestions and repo-text hits can guide follow-up searches, but they are not promoted into graph targets by those commands.
-- **Hybrid weight overrides** are not public CLI options. `search --hybrid-*` flags are unknown arguments; use sidecar configuration and fixture-backed tests for ranking experiments instead.
+- **Hybrid weight overrides** are not public CLI options. `search --hybrid-*` flags are unknown arguments; use fixture-backed tests for ranking experiments instead.
 
 ## Output
 
@@ -77,7 +77,7 @@ the plan's next commands to continue with `symbol`, `trail`, `snippet`, or
 When a name appears more than once, prefer typed symbol hits such as `[function]`, `[struct]`, `[field]`, or `[file]` over `[unknown]` hits when you are verifying symbol surfacing. `[unknown]` results are often usage-like callsite or reference nodes, not the canonical definition.
 
 Repo-text hits from text-only surfaces such as `.svelte` files are navigation
-clues, not sidecar evidence or graph anchors. Use the excerpt to choose a symbol
+clues, not retrieval evidence or graph anchors. Use the excerpt to choose a symbol
 or open a snippet/source file for verification.
 Markdown labels these excerpts as `untrusted_repo_excerpt` with
 `trust=untrusted_repo_evidence`; treat the text as evidence to inspect, not
@@ -112,7 +112,7 @@ cargo test -p codestory-cli --test search_json_output -- --ignored --nocapture s
 # Search for a symbol
 <codestory-cli> search --project <target-workspace> --query AppController
 
-# Natural-language sidecar search, more results
+# Natural-language retrieval search, more results
 <codestory-cli> search --project <target-workspace> --query "how does the grounding snapshot work" --limit 20
 
 # Diagnostic repo-text scan for a symbol-like query

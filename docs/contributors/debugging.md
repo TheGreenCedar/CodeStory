@@ -85,27 +85,22 @@ Check:
 - whether the symbol exists in store-backed search docs
 - whether runtime rebuilt its search state after indexing
 - what retrieval mode `index`, `ground`, or `search` reported for the current run
-- whether dense-anchor retrieval is disabled, sidecars are not full, or symbol docs / dense anchors are missing
-- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, `CODESTORY_EMBED_RUNTIME_MODE`, or `CODESTORY_EMBED_BACKEND` changed between runs
+- whether retrieval is not full or symbol docs / dense anchors are missing
+- whether `CODESTORY_HYBRID_RETRIEVAL_ENABLED`, `CODESTORY_SEMANTIC_DOC_SCOPE`, or explicit CPU policy changed between runs
 - whether graph-based boosts are overwhelming lexical matches
 
 Recovery order:
 
 1. Confirm whether the miss is in `indexed_symbol_hits`, `repo_text_hits`, or both.
 2. Confirm the reported retrieval mode and degraded-state reason before touching search ranking code.
-3. For product sidecar evidence, run
-   `codestory-cli retrieval bootstrap --project .`; it prepares the pinned
-   machine-wide assets when needed. Set
-   `CODESTORY_EMBED_BACKEND=llamacpp` and `CODESTORY_EMBED_LLAMACPP_URL` only
-   when your local sidecar endpoint differs from the default.
-4. Rebuild once with `codestory-cli index --project . --refresh full`, then
+3. Rebuild once with `codestory-cli index --project . --refresh full`, then
    `codestory-cli retrieval index --project . --refresh full`.
-5. Require `codestory-cli retrieval status --project . --format json` to report
+4. Require `codestory-cli retrieval status --project . --format json` to report
    `retrieval_mode: "full"` before trusting packet/search evidence.
-6. If `doctor` reports missing or unreachable embeddings, repair the llama.cpp
-   sidecar path with `codestory-cli retrieval bootstrap` and
-   `codestory-cli retrieval index --project . --refresh full`.
-7. If semantic retrieval is still the only failing part, inspect the reported degraded-state reason before touching lexical ranking or CLI rendering.
+5. If `doctor` reports an engine failure, inspect its model digest, ggml build,
+   backend, adapter, policy, and live-smoke fields. Do not enable CPU merely to
+   hide an acceleration failure.
+6. If semantic retrieval is still the only failing part, inspect the reported degraded-state reason before touching lexical ranking or CLI rendering.
 
 ## If Cold Indexing Is Slow
 
@@ -130,19 +125,17 @@ Check:
 - whether `CODESTORY_SEMANTIC_DOC_SCOPE=all` is forcing the broad all-symbol symbol-doc set
 - whether `CODESTORY_SEMANTIC_DOC_ALIAS_MODE` was changed from the profiled default of `alias_variant`
 - whether `CODESTORY_LLM_DOC_EMBED_BATCH_SIZE` was changed from the profiled default of `128`
-- whether mandatory sidecars report `retrieval_mode=full` according to `doctor`
+- whether retrieval reports `retrieval_mode=full` according to `doctor`
   and `retrieval status`
-- whether `CODESTORY_EMBED_BACKEND=llamacpp` and the local
-  `CODESTORY_EMBED_LLAMACPP_URL` endpoint match the manifest embedding backend
-- whether a hash or other diagnostic comparison is clearly labeled and
-  excluded from agent-facing sidecar evidence
+- whether engine initialization, batch embedding, or materialization dominates
+  the cold row
 
 Recovery order:
 
 1. Run one measured cold E2E and append the headline numbers to `docs/testing/codestory-e2e-stats-log.md`.
 2. Compare symbol-doc counts, dense skipped/reason counts, and dense embedded/reused counts before changing graph code.
 3. For reuse regressions, inspect semantic doc version, generated text hash, embedding profile/backend/model/dimension, document prefix, and semantic policy version.
-4. For cold-only regressions, inspect durable symbol scope, dense-anchor policy, length-bucket ordering, embedding batch size, sidecar health, and local embedding endpoint latency.
+4. For cold-only regressions, inspect durable symbol scope, dense-anchor policy, length-bucket ordering, embedding batch size, model materialization, and engine initialization.
 5. For backend experiments, first verify the runtime is using the backend under test, then rerun the speed and quality comparisons documented in `docs/testing/embedding-backend-benchmarks.md`.
 
 ## If Grounding Is Wrong
@@ -234,4 +227,4 @@ node plugins/codestory/hooks/codestory-dirty-hook.cjs uninstall --project <targe
 `foreign_hook_present` means existing hook content was preserved.
 `uninstall_required` means an older CodeStory-managed block should be removed
 before reinstalling. Dirty markers affect local graph freshness only; packet,
-search, and context remain gated on full sidecar readiness.
+search, and context remain gated on full retrieval readiness.

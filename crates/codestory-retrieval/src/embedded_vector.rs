@@ -1,6 +1,6 @@
 use crate::candidate::{CandidateHit, CandidateSource};
 use crate::config::SidecarLayout;
-use crate::embeddings::LlamaCppEmbeddingClient;
+use crate::embeddings::InProcessEmbeddingClient;
 use crate::sidecar_search::SearchExecutionContext;
 use anyhow::{Context, Result, bail};
 use codestory_store::FileRole;
@@ -43,7 +43,7 @@ pub(crate) struct EmbeddedVectorIndex {
     path: PathBuf,
     generation: String,
     input_hash: String,
-    embedding: LlamaCppEmbeddingClient,
+    embedding: InProcessEmbeddingClient,
 }
 
 impl EmbeddedVectorIndex {
@@ -52,7 +52,7 @@ impl EmbeddedVectorIndex {
         collection: &str,
         generation: &str,
         input_hash: &str,
-        embedding: LlamaCppEmbeddingClient,
+        embedding: InProcessEmbeddingClient,
     ) -> Self {
         Self {
             path: index_path(layout, collection),
@@ -153,9 +153,8 @@ impl EmbeddedVectorIndex {
         limit: usize,
         context: &SearchExecutionContext,
     ) -> Result<Vec<CandidateHit>> {
-        let vector = self
-            .embedding
-            .embed_query_with_timeout(query, context.timeout(std::time::Duration::from_secs(2))?)?;
+        context.timeout(std::time::Duration::from_secs(2))?;
+        let vector = self.embedding.embed_query(query)?;
         context.check_cancelled()?;
         let context = context.clone();
         search_database(
@@ -250,7 +249,12 @@ fn write_database(
     transaction.commit()?;
     connection.execute_batch("PRAGMA optimize;")?;
     drop(connection);
-    std::fs::File::open(path)?.sync_all()?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open embedded vector index for sync {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync embedded vector index {}", path.display()))?;
     Ok(point_count)
 }
 
@@ -515,7 +519,7 @@ mod tests {
                 &collection,
                 "measurement-generation",
                 "measurement-input",
-                "llamacpp:bge-base-en-v1.5",
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
                 DIMENSION,
                 |visit| {
                     for index in 0..point_count {

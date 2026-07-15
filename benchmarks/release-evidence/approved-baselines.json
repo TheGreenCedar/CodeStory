@@ -9,7 +9,7 @@
       "git_state": "clean",
       "identity": {
         "corpus_id": "ci-contract-corpus-v1",
-        "cache_id": "cold-full-sidecar-v1",
+        "cache_id": "cold-full-retrieval-v1",
         "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
       },
       "approval": {
@@ -20,15 +20,15 @@
       "artifacts": [
         {
           "path": "fixtures/baseline-raw.json",
-          "sha256": "045099bc10d243f1f94ccf8a853fdce11fda012c90fe52bbc7302dce373073fc"
+          "sha256": "f65c5fffaa5815164141645ee4c96d7ad02ff2a261e065b00f5f81d9846b79de"
         }
       ],
       "metrics": {
-        "status_seconds": { "reference": 1, "threshold": 1.25, "unit": "seconds", "aggregation": "full-sidecar command wall time", "direction": "max", "source": "baseline-raw.json" },
-        "local_grounding_seconds": { "reference": 1, "threshold": 1.25, "unit": "seconds", "aggregation": "full-sidecar command wall time", "direction": "max", "source": "baseline-raw.json" },
+        "status_seconds": { "reference": 1, "threshold": 1.25, "unit": "seconds", "aggregation": "full-retrieval command wall time", "direction": "max", "source": "baseline-raw.json" },
+        "local_grounding_seconds": { "reference": 1, "threshold": 1.25, "unit": "seconds", "aggregation": "full-retrieval command wall time", "direction": "max", "source": "baseline-raw.json" },
         "convergence_seconds": { "reference": 10, "threshold": 11.5, "unit": "seconds", "aggregation": "unchanged-corpus repeat full-refresh wall time", "direction": "max", "source": "baseline-raw.json" },
         "packet_seconds": { "reference": 1, "threshold": 1.1, "unit": "seconds", "aggregation": "worst quality-gated packet median wall time", "direction": "max", "source": "baseline-raw.json" },
-        "search_seconds": { "reference": 1, "threshold": 1.25, "unit": "seconds", "aggregation": "full-sidecar command wall time", "direction": "max", "source": "baseline-raw.json" },
+        "search_seconds": { "reference": 1, "threshold": 1.25, "unit": "seconds", "aggregation": "full-retrieval command wall time", "direction": "max", "source": "baseline-raw.json" },
         "indexing_seconds": { "reference": 10, "threshold": 12.5, "unit": "seconds", "aggregation": "cold full-refresh wall time", "direction": "max", "source": "baseline-raw.json" },
         "storage_growth_ratio": { "reference": 1, "threshold": 1.1, "reference_bytes": 1000, "unit": "ratio", "aggregation": "candidate bytes divided by approved same-corpus bytes", "direction": "max", "source": "baseline-raw.json" }
       }

@@ -10,8 +10,10 @@ use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32String};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+#[cfg(any(test, feature = "test-support"))]
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 use tantivy::collector::TopDocs;
 use tantivy::doc;
@@ -20,28 +22,10 @@ use tantivy::schema::Value;
 use tantivy::schema::{FAST, INDEXED, STORED, Schema, TEXT};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 
-pub const EMBEDDING_DIM: usize = 384;
+pub const EMBEDDING_DIM: usize = codestory_retrieval::RETRIEVAL_EMBEDDING_DIM;
 const SEARCH_WRITER_HEAP_BYTES: usize = 20_000_000;
-pub const EMBEDDING_MODEL_ID_ENV: &str = "CODESTORY_EMBED_MODEL_ID";
-pub const EMBEDDING_RUNTIME_MODE_ENV: &str = "CODESTORY_EMBED_RUNTIME_MODE";
-pub const EMBEDDING_BACKEND_ENV: &str = "CODESTORY_EMBED_BACKEND";
-pub const EMBEDDING_PROFILE_ENV: &str = "CODESTORY_EMBED_PROFILE";
-pub const EMBEDDING_POOLING_ENV: &str = "CODESTORY_EMBED_POOLING";
-pub const EMBEDDING_QUERY_PREFIX_ENV: &str = "CODESTORY_EMBED_QUERY_PREFIX";
-pub const EMBEDDING_DOCUMENT_PREFIX_ENV: &str = "CODESTORY_EMBED_DOCUMENT_PREFIX";
-pub const EMBEDDING_LAYER_NORM_ENV: &str = "CODESTORY_EMBED_LAYER_NORM";
-pub const EMBEDDING_TRUNCATE_DIM_ENV: &str = "CODESTORY_EMBED_TRUNCATE_DIM";
-pub const EMBEDDING_EXPECTED_DIM_ENV: &str = "CODESTORY_EMBED_EXPECTED_DIM";
-#[cfg(test)]
-const REMOVED_ONNX_ENV_VARS: &[&str] = &[
-    "CODESTORY_EMBED_ONNX_MODEL",
-    "CODESTORY_EMBED_ONNX_TOKENIZER",
-    "CODESTORY_EMBED_ONNX_PROVIDER",
-    "CODESTORY_EMBED_ONNX_THREADS",
-    "CODESTORY_EMBED_ONNX_BATCH_TOKENS",
-];
-pub const LLAMACPP_EMBEDDINGS_URL_ENV: &str = "CODESTORY_EMBED_LLAMACPP_URL";
-pub const LLAMACPP_REQUEST_COUNT_ENV: &str = "CODESTORY_EMBED_LLAMACPP_REQUEST_COUNT";
+const EMBEDDING_PROFILE: &str = "bge-base-en-v1.5";
+const EMBEDDING_MODEL_ID: &str = "BAAI/bge-base-en-v1.5";
 pub const STORED_VECTOR_ENCODING_ENV: &str = "CODESTORY_STORED_VECTOR_ENCODING";
 pub const SYMBOL_FULL_TEXT_INDEX_ENV: &str = "CODESTORY_SYMBOL_FULL_TEXT_INDEX";
 #[cfg(test)]
@@ -71,360 +55,54 @@ pub struct EmbeddingProfileContract {
     pub dimension: Option<u32>,
 }
 
-fn env_bool_override(key: &str) -> Option<bool> {
-    std::env::var(key).ok().and_then(|raw| {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        }
-    })
-}
-
-fn symbol_full_text_index_enabled_from_env() -> bool {
-    env_bool_override(SYMBOL_FULL_TEXT_INDEX_ENV).unwrap_or(true)
-}
-
-#[cfg(test)]
-fn embedding_parallel_chunk_size(text_count: usize, worker_count: usize) -> usize {
-    let workers = worker_count.max(1).min(text_count.max(1));
-    text_count.max(1).div_ceil(workers).max(1)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingBackendSelection {
-    LlamaCpp,
-    HashProjection,
-}
-
-impl EmbeddingBackendSelection {
-    #[cfg(test)]
-    fn from_env() -> Result<Self> {
-        if let Some(name) = REMOVED_ONNX_ENV_VARS
-            .iter()
-            .find(|name| std::env::var_os(name).is_some())
-        {
-            bail!(
-                "{name} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
-            );
-        }
-        if let Ok(runtime_mode) = std::env::var(EMBEDDING_RUNTIME_MODE_ENV)
-            && matches!(
-                runtime_mode.trim().to_ascii_lowercase().as_str(),
-                "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
-            )
-        {
-            bail!(
-                "{EMBEDDING_RUNTIME_MODE_ENV}={runtime_mode} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
-            );
-        }
-        Self::from_config(&crate::test_sidecar_runtime_from_env().embedding)
-    }
-
-    fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
-        let runtime_mode = config.backend.trim().to_ascii_lowercase();
-        if matches!(
-            runtime_mode.as_str(),
-            "onnx" | "ort" | "onnxruntime" | "onnx-runtime"
-        ) {
-            bail!(
-                "{EMBEDDING_RUNTIME_MODE_ENV}={runtime_mode} is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
-            );
-        }
-        if runtime_mode == "hash" || runtime_mode == "hash_projection" {
-            return Ok(Self::HashProjection);
-        }
-
-        match runtime_mode.as_str() {
-            "" | "auto" => Ok(Self::LlamaCpp),
-            "onnx" | "ort" | "onnxruntime" | "onnx-runtime" => Err(anyhow!(
-                "embedding backend `{runtime_mode}` is no longer supported; CodeStory retrieval requires the llama.cpp sidecar"
-            )),
-            "llamacpp" | "llama.cpp" | "llama-cpp" | "gguf" => Ok(Self::LlamaCpp),
-            "hash" | "hash_projection" => Ok(Self::HashProjection),
-            other => Err(anyhow!(
-                "unsupported embedding backend `{other}` (set {EMBEDDING_BACKEND_ENV}=llamacpp or hash)"
-            )),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::LlamaCpp => "llamacpp",
-            Self::HashProjection => "hash",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmbeddingPooling {
-    Mean,
-    Cls,
-    LastToken,
-}
-
-impl EmbeddingPooling {
-    fn from_value(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "mean" | "avg" | "average" => Some(Self::Mean),
-            "cls" | "first" => Some(Self::Cls),
-            "last" | "last_token" | "last-token" => Some(Self::LastToken),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct EmbeddingProfile {
-    name: String,
-    model_id: String,
-    pooling: EmbeddingPooling,
-    query_prefix: String,
-    document_prefix: String,
-    layer_norm: bool,
-    truncate_dim: Option<usize>,
-    expected_dim: Option<usize>,
-}
-
-impl EmbeddingProfile {
-    #[cfg(test)]
-    fn from_env() -> Result<Self> {
-        Self::from_config(&crate::test_sidecar_runtime_from_env().embedding)
-    }
-
-    fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
-        let name = config.profile.trim().to_ascii_lowercase();
-
-        let mut profile = match name.as_str() {
-            "" | "minilm" | "all-minilm-l6-v2" => Self {
-                name: "minilm".to_string(),
-                model_id: "sentence-transformers/all-MiniLM-L6-v2-local".to_string(),
-                pooling: EmbeddingPooling::Mean,
-                query_prefix: String::new(),
-                document_prefix: String::new(),
-                layer_norm: false,
-                truncate_dim: None,
-                expected_dim: Some(384),
-            },
-            "bge-small" | "bge-small-en-v1.5" => Self {
-                name: "bge-small-en-v1.5".to_string(),
-                model_id: "BAAI/bge-small-en-v1.5-local".to_string(),
-                pooling: EmbeddingPooling::Cls,
-                query_prefix: "Represent this sentence for searching relevant passages: "
-                    .to_string(),
-                document_prefix: String::new(),
-                layer_norm: false,
-                truncate_dim: None,
-                expected_dim: Some(384),
-            },
-            "bge-base" | "bge-base-en-v1.5" => Self {
-                name: "bge-base-en-v1.5".to_string(),
-                model_id: "BAAI/bge-base-en-v1.5-local".to_string(),
-                pooling: EmbeddingPooling::Cls,
-                query_prefix: "Represent this sentence for searching relevant passages: "
-                    .to_string(),
-                document_prefix: String::new(),
-                layer_norm: false,
-                truncate_dim: None,
-                expected_dim: Some(768),
-            },
-            "qwen" | "qwen3" | "qwen3-embedding-0.6b" => Self {
-                name: "qwen3-embedding-0.6b".to_string(),
-                model_id: "Qwen/Qwen3-Embedding-0.6B-local".to_string(),
-                pooling: EmbeddingPooling::LastToken,
-                query_prefix:
-                    "Instruct: Retrieve relevant code symbols and implementation details\nQuery: "
-                        .to_string(),
-                document_prefix: String::new(),
-                layer_norm: false,
-                truncate_dim: None,
-                expected_dim: Some(1024),
-            },
-            "embeddinggemma" | "embeddinggemma-300m" | "gemma" | "gemma-embedding-300m" => Self {
-                name: "embeddinggemma-300m".to_string(),
-                model_id: "google/embeddinggemma-300m-local".to_string(),
-                pooling: EmbeddingPooling::Mean,
-                query_prefix: "task: search result | query: ".to_string(),
-                document_prefix: "title: none | text: ".to_string(),
-                layer_norm: false,
-                truncate_dim: None,
-                expected_dim: Some(768),
-            },
-            "nomic" | "nomic-v1.5" | "nomic-embed-text-v1.5" => Self {
-                name: "nomic-embed-text-v1.5".to_string(),
-                model_id: "nomic-ai/nomic-embed-text-v1.5-local".to_string(),
-                pooling: EmbeddingPooling::Mean,
-                query_prefix: "search_query: ".to_string(),
-                document_prefix: "search_document: ".to_string(),
-                layer_norm: true,
-                truncate_dim: None,
-                expected_dim: Some(768),
-            },
-            "nomic-v2" | "nomic-embed-text-v2" | "nomic-embed-text-v2-moe" => Self {
-                name: "nomic-embed-text-v2-moe".to_string(),
-                model_id: "nomic-ai/nomic-embed-text-v2-moe-local".to_string(),
-                pooling: EmbeddingPooling::Mean,
-                query_prefix: "search_query: ".to_string(),
-                document_prefix: "search_document: ".to_string(),
-                layer_norm: true,
-                truncate_dim: None,
-                expected_dim: Some(768),
-            },
-            "custom" => Self {
-                name: "custom".to_string(),
-                model_id: "custom-local".to_string(),
-                pooling: EmbeddingPooling::Mean,
-                query_prefix: String::new(),
-                document_prefix: String::new(),
-                layer_norm: false,
-                truncate_dim: None,
-                expected_dim: None,
-            },
-            other => {
-                return Err(anyhow!(
-                    "unsupported embedding profile `{other}` (set {EMBEDDING_PROFILE_ENV}=minilm, bge-small-en-v1.5, bge-base-en-v1.5, qwen3-embedding-0.6b, embeddinggemma-300m, nomic-embed-text-v1.5, nomic-embed-text-v2-moe, or custom)"
-                ));
-            }
-        };
-
-        if let Some(model_id) = config.model_id.as_ref() {
-            profile.model_id = model_id.clone();
-        }
-        if let Some(raw) = config.pooling.as_ref() {
-            profile.pooling = EmbeddingPooling::from_value(raw)
-                .ok_or_else(|| anyhow!("unsupported {EMBEDDING_POOLING_ENV} value `{raw}`"))?;
-        }
-        if let Some(prefix) = config.query_prefix.as_ref() {
-            profile.query_prefix = prefix.clone();
-        }
-        if let Some(prefix) = config.document_prefix.as_ref() {
-            profile.document_prefix = prefix.clone();
-        }
-        if let Some(layer_norm) = config.layer_norm {
-            profile.layer_norm = layer_norm;
-        }
-        if let Some(truncate_dim) = config.truncate_dim {
-            profile.truncate_dim = Some(truncate_dim);
-            profile.expected_dim = Some(truncate_dim);
-        }
-        if let Some(expected_dim) = config.expected_dim {
-            profile.expected_dim = Some(expected_dim);
-        }
-
-        Ok(profile)
-    }
-
-    fn cache_model_id(&self, backend: EmbeddingBackendSelection) -> String {
-        if backend == EmbeddingBackendSelection::HashProjection {
-            return self.model_id.clone();
-        }
-
-        format!(
-            "{}|backend={}|pool={:?}|query_prefix={}|document_prefix={}|layer_norm={}|truncate_dim={:?}|expected_dim={:?}",
-            self.model_id,
-            backend.as_str(),
-            self.pooling,
-            self.query_prefix,
-            self.document_prefix,
-            self.layer_norm,
-            self.truncate_dim,
-            self.expected_dim
-        )
+fn fixed_embedding_contract() -> EmbeddingProfileContract {
+    EmbeddingProfileContract {
+        profile: EMBEDDING_PROFILE.into(),
+        backend: "inprocess".into(),
+        model_id: EMBEDDING_MODEL_ID.into(),
+        cache_key: codestory_retrieval::embedding_runtime_id(),
+        dimension: Some(EMBEDDING_DIM as u32),
     }
 }
 
 pub fn embedding_runtime_availability_from_env() -> EmbeddingRuntimeAvailability {
-    embedding_runtime_availability_from_config(
-        &codestory_retrieval::SidecarRuntimeConfig::local().embedding,
-    )
+    let runtime = codestory_retrieval::SidecarRuntimeConfig::local();
+    embedding_runtime_availability_from_config(&runtime)
 }
 
 pub fn embedding_runtime_availability_from_config(
-    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> EmbeddingRuntimeAvailability {
-    let profile = match EmbeddingProfile::from_config(config) {
-        Ok(profile) => profile,
-        Err(error) => {
-            return unavailable_embedding_runtime(None, error);
-        }
-    };
-    let backend = match EmbeddingBackendSelection::from_config(config) {
-        Ok(backend) => backend,
-        Err(error) => {
-            return unavailable_embedding_runtime(Some(profile.model_id.clone()), error);
-        }
-    };
-    let model_id = profile.cache_model_id(backend);
-
-    if backend == EmbeddingBackendSelection::HashProjection {
-        return available_embedding_runtime(model_id);
-    }
-
-    if let Err(error) = ensure_embedding_backend_available(backend, config) {
-        return unavailable_embedding_runtime(Some(model_id), error);
-    }
-
-    available_embedding_runtime(model_id)
-}
-
-fn available_embedding_runtime(model_id: String) -> EmbeddingRuntimeAvailability {
+    let probe = codestory_retrieval::probe_product_embedding_runtime_for_runtime(runtime);
     EmbeddingRuntimeAvailability {
-        available: true,
-        model_id: Some(model_id),
-        fallback_message: None,
-    }
-}
-
-fn unavailable_embedding_runtime(
-    model_id: Option<String>,
-    error: impl std::fmt::Display,
-) -> EmbeddingRuntimeAvailability {
-    EmbeddingRuntimeAvailability {
-        available: false,
-        model_id,
-        fallback_message: Some(error.to_string()),
-    }
-}
-
-fn ensure_embedding_backend_available(
-    backend: EmbeddingBackendSelection,
-    config: &codestory_retrieval::EmbeddingRuntimeConfig,
-) -> Result<()> {
-    match backend {
-        EmbeddingBackendSelection::LlamaCpp => {
-            let probe = codestory_retrieval::LlamaCppEmbeddingClient::new(config)?.probe();
-            if probe.reachable {
-                Ok(())
-            } else {
-                bail!("{}", probe.detail)
-            }
-        }
-        EmbeddingBackendSelection::HashProjection => Ok(()),
+        available: probe.reachable,
+        model_id: Some(codestory_retrieval::embedding_runtime_id()),
+        fallback_message: (!probe.reachable).then_some(probe.detail),
     }
 }
 
 pub fn embedding_profile_contract_from_env() -> Result<EmbeddingProfileContract> {
-    embedding_profile_contract_from_config(
-        &codestory_retrieval::SidecarRuntimeConfig::local().embedding,
-    )
+    Ok(fixed_embedding_contract())
 }
 
 pub fn embedding_profile_contract_from_config(
-    config: &codestory_retrieval::EmbeddingRuntimeConfig,
+    _config: &codestory_retrieval::EmbeddingRuntimeConfig,
 ) -> Result<EmbeddingProfileContract> {
-    let profile = EmbeddingProfile::from_config(config)?;
-    let backend = EmbeddingBackendSelection::from_config(config)?;
-    let cache_key = profile.cache_model_id(backend);
-    Ok(EmbeddingProfileContract {
-        profile: profile.name.clone(),
-        backend: backend.as_str().to_string(),
-        model_id: profile.model_id.clone(),
-        cache_key,
-        dimension: profile
-            .expected_dim
-            .map(|value| value.min(u32::MAX as usize) as u32),
-    })
+    Ok(fixed_embedding_contract())
+}
+
+fn env_bool_override(key: &str) -> Option<bool> {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn symbol_full_text_index_enabled_from_env() -> bool {
+    env_bool_override(SYMBOL_FULL_TEXT_INDEX_ENV).unwrap_or(true)
 }
 
 #[derive(Debug, Clone)]
@@ -433,12 +111,6 @@ pub struct LlmSearchDoc {
     pub file_role: RetrievalFileRole,
     pub doc_text: String,
     pub embedding: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-pub struct EmbeddingRuntimeProbe {
-    pub model_path: PathBuf,
-    pub model_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -460,6 +132,32 @@ pub struct HybridSearchConfig {
     pub semantic_limit: usize,
 }
 
+impl Default for HybridSearchConfig {
+    fn default() -> Self {
+        Self {
+            max_results: 20,
+            lexical_weight: 0.0,
+            semantic_weight: 1.0,
+            graph_weight: 0.0,
+            lexical_limit: 0,
+            semantic_limit: 20,
+        }
+    }
+}
+
+impl HybridSearchConfig {
+    pub fn lexical_first() -> Self {
+        Self {
+            max_results: 20,
+            lexical_weight: 1.0,
+            semantic_weight: 0.0,
+            graph_weight: 0.0,
+            lexical_limit: 200,
+            semantic_limit: 20,
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredVectorEncoding {
@@ -473,17 +171,18 @@ enum StoredVectorEncoding {
 #[cfg(test)]
 impl StoredVectorEncoding {
     fn from_env() -> Result<Self> {
-        let raw = std::env::var(STORED_VECTOR_ENCODING_ENV).unwrap_or_default();
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
+        match std::env::var(STORED_VECTOR_ENCODING_ENV)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "" | "float32" | "none" => Ok(Self::Float32),
             "int8" => Ok(Self::Int8),
             "uint8" => Ok(Self::Uint8),
             "binary" => Ok(Self::Binary),
             "ubinary" => Ok(Self::Ubinary),
-            other => Err(anyhow!(
-                "unsupported stored vector encoding `{other}` (set {STORED_VECTOR_ENCODING_ENV}=float32, int8, uint8, binary, or ubinary)"
-            )),
+            other => bail!("unsupported stored vector encoding `{other}`"),
         }
     }
 
@@ -519,30 +218,21 @@ enum QuantizedEmbedding {
 
 #[cfg(test)]
 impl QuantizedEmbedding {
-    fn approximate_cosine(&self, query_embedding: &[f32]) -> f32 {
+    fn approximate_cosine(&self, query: &[f32]) -> f32 {
         match self {
-            Self::Int8(values) => {
-                if values.len() != query_embedding.len() || values.is_empty() {
-                    return 0.0;
-                }
-                query_embedding
-                    .iter()
-                    .zip(values)
-                    .map(|(query, doc)| query * (*doc as f32 / 127.0))
-                    .sum()
-            }
-            Self::Uint8(values) => {
-                if values.len() != query_embedding.len() || values.is_empty() {
-                    return 0.0;
-                }
-                query_embedding
-                    .iter()
-                    .zip(values)
-                    .map(|(query, doc)| query * ((*doc as f32 / 127.5) - 1.0))
-                    .sum()
-            }
-            Self::Binary(bits) => signed_binary_cosine(query_embedding, bits),
-            Self::Ubinary(bits) => unsigned_binary_cosine(query_embedding, bits),
+            Self::Int8(values) if values.len() == query.len() => query
+                .iter()
+                .zip(values)
+                .map(|(query, doc)| query * (*doc as f32 / 127.0))
+                .sum(),
+            Self::Uint8(values) if values.len() == query.len() => query
+                .iter()
+                .zip(values)
+                .map(|(query, doc)| query * ((*doc as f32 / 127.5) - 1.0))
+                .sum(),
+            Self::Binary(bits) => signed_binary_cosine(query, bits),
+            Self::Ubinary(bits) => unsigned_binary_cosine(query, bits),
+            _ => 0.0,
         }
     }
 }
@@ -557,175 +247,94 @@ struct PackedSignBits {
 
 #[cfg(test)]
 fn pack_sign_bits(values: &[f32]) -> PackedSignBits {
-    let mut bytes = vec![0_u8; values.len().div_ceil(8)];
-    let mut positives = 0;
+    let mut bits = PackedSignBits {
+        bytes: vec![0; values.len().div_ceil(8)],
+        len: values.len(),
+        positives: 0,
+    };
     for (index, value) in values.iter().enumerate() {
         if *value >= 0.0 {
-            bytes[index / 8] |= 1 << (index % 8);
-            positives += 1;
+            bits.bytes[index / 8] |= 1 << (index % 8);
+            bits.positives += 1;
         }
     }
-    PackedSignBits {
-        bytes,
-        len: values.len(),
-        positives,
-    }
+    bits
 }
 
 #[cfg(test)]
 fn sign_bit(bits: &PackedSignBits, index: usize) -> bool {
-    let Some(byte) = bits.bytes.get(index / 8) else {
-        return false;
-    };
-    (byte & (1 << (index % 8))) != 0
+    bits.bytes
+        .get(index / 8)
+        .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
 }
 
 #[cfg(test)]
-fn signed_binary_cosine(query_embedding: &[f32], bits: &PackedSignBits) -> f32 {
-    if query_embedding.len() != bits.len || bits.len == 0 {
+fn signed_binary_cosine(query: &[f32], bits: &PackedSignBits) -> f32 {
+    if query.len() != bits.len || bits.len == 0 {
         return 0.0;
     }
-    let mut score = 0_i32;
-    for (index, query) in query_embedding.iter().enumerate() {
-        let same_sign = (*query >= 0.0) == sign_bit(bits, index);
-        score += if same_sign { 1 } else { -1 };
-    }
-    score as f32 / bits.len as f32
-}
-
-#[cfg(test)]
-fn unsigned_binary_cosine(query_embedding: &[f32], bits: &PackedSignBits) -> f32 {
-    if query_embedding.len() != bits.len || bits.len == 0 {
-        return 0.0;
-    }
-    let mut query_positives = 0_usize;
-    let mut intersection = 0_usize;
-    for (index, query) in query_embedding.iter().enumerate() {
-        if *query >= 0.0 {
-            query_positives += 1;
-            if sign_bit(bits, index) {
-                intersection += 1;
+    query
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if (*value >= 0.0) == sign_bit(bits, index) {
+                1_i32
+            } else {
+                -1
             }
-        }
-    }
-    if query_positives == 0 || bits.positives == 0 {
+        })
+        .sum::<i32>() as f32
+        / bits.len as f32
+}
+
+#[cfg(test)]
+fn unsigned_binary_cosine(query: &[f32], bits: &PackedSignBits) -> f32 {
+    if query.len() != bits.len || bits.len == 0 {
         return 0.0;
     }
-    intersection as f32 / ((query_positives * bits.positives) as f32).sqrt()
-}
-
-impl Default for HybridSearchConfig {
-    fn default() -> Self {
-        Self {
-            max_results: 20,
-            lexical_weight: 0.0,
-            semantic_weight: 1.0,
-            graph_weight: 0.0,
-            lexical_limit: 0,
-            semantic_limit: 20,
-        }
-    }
-}
-
-impl HybridSearchConfig {
-    /// Lexical-first hybrid policy for packet subqueries and exact-anchor paths.
-    pub fn lexical_first() -> Self {
-        Self {
-            max_results: 20,
-            lexical_weight: 1.0,
-            semantic_weight: 0.0,
-            graph_weight: 0.0,
-            lexical_limit: 200,
-            semantic_limit: 20,
-        }
+    let positives = query.iter().filter(|value| **value >= 0.0).count();
+    let intersection = query
+        .iter()
+        .enumerate()
+        .filter(|(index, value)| **value >= 0.0 && sign_bit(bits, *index))
+        .count();
+    if positives == 0 || bits.positives == 0 {
+        0.0
+    } else {
+        intersection as f32 / ((positives * bits.positives) as f32).sqrt()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingRuntime {
-    model_path: PathBuf,
     model_id: String,
-    profile: EmbeddingProfile,
     backend: EmbeddingBackend,
 }
 
 #[derive(Debug, Clone)]
 enum EmbeddingBackend {
-    LlamaCpp(Arc<LlamaCppEmbeddingRuntime>),
+    #[cfg(not(any(test, feature = "test-support")))]
+    InProcess(codestory_retrieval::InProcessEmbeddingClient),
+    #[cfg(any(test, feature = "test-support"))]
     HashProjection,
 }
 
-#[derive(Debug)]
-struct LlamaCppEmbeddingRuntime {
-    client: codestory_retrieval::LlamaCppEmbeddingClient,
-}
-
-impl LlamaCppEmbeddingRuntime {
-    fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.client.embed_prepared_texts(texts)
-    }
-}
-
 impl EmbeddingRuntime {
-    pub fn probe_from_env() -> Result<EmbeddingRuntimeProbe> {
-        let config = codestory_retrieval::SidecarRuntimeConfig::local().embedding;
-        let profile = EmbeddingProfile::from_config(&config)?;
-        let backend = EmbeddingBackendSelection::from_config(&config)?;
-        let model_id = profile.cache_model_id(backend);
-
-        if backend == EmbeddingBackendSelection::HashProjection {
-            return Ok(EmbeddingRuntimeProbe {
-                model_path: PathBuf::from("hash-projection"),
-                model_id,
-            });
+    pub fn from_runtime(runtime: &codestory_retrieval::SidecarRuntimeConfig) -> Result<Self> {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let _ = runtime;
+            Ok(Self::test_runtime())
         }
-
-        if backend == EmbeddingBackendSelection::LlamaCpp {
-            let client = codestory_retrieval::LlamaCppEmbeddingClient::new(&config)?;
-            let probe = client.probe();
-            if !probe.reachable {
-                bail!("{}", probe.detail);
-            }
-            return Ok(EmbeddingRuntimeProbe {
-                model_path: PathBuf::from(client.endpoint()),
-                model_id,
-            });
-        }
-
-        unreachable!("all embedding backends are handled above")
-    }
-
-    pub fn from_env() -> Result<Self> {
-        Self::from_config(&codestory_retrieval::SidecarRuntimeConfig::local().embedding)
-    }
-
-    pub fn from_config(config: &codestory_retrieval::EmbeddingRuntimeConfig) -> Result<Self> {
-        let profile = EmbeddingProfile::from_config(config)?;
-        let backend = EmbeddingBackendSelection::from_config(config)?;
-        let model_id = profile.cache_model_id(backend);
-
-        match backend {
-            EmbeddingBackendSelection::HashProjection => Ok(Self {
-                model_path: PathBuf::from("hash-projection"),
-                model_id,
-                profile,
-                backend: EmbeddingBackend::HashProjection,
-            }),
-            EmbeddingBackendSelection::LlamaCpp => {
-                let client = codestory_retrieval::LlamaCppEmbeddingClient::new(config)?;
-                let probe = client.probe();
-                if !probe.reachable {
-                    bail!("{}", probe.detail);
-                }
-                Ok(Self {
-                    model_path: PathBuf::from(client.endpoint()),
-                    model_id,
-                    profile,
-                    backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
-                        client,
-                    })),
-                })
-            }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            codestory_retrieval::ensure_product_embedding_backend_for_runtime(runtime)?;
+            Ok(Self {
+                model_id: codestory_retrieval::embedding_runtime_id(),
+                backend: EmbeddingBackend::InProcess(
+                    codestory_retrieval::InProcessEmbeddingClient::new(runtime),
+                ),
+            })
         }
     }
 
@@ -733,78 +342,45 @@ impl EmbeddingRuntime {
         &self.model_id
     }
 
-    pub fn model_path(&self) -> &Path {
-        &self.model_path
-    }
-
     pub fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
         if query.trim().is_empty() {
-            return Err(anyhow!("query cannot be empty for semantic retrieval"));
+            bail!("query cannot be empty for semantic retrieval");
         }
-        let prepared = format!("{}{}", self.profile.query_prefix, query);
-        let mut vectors = self.embed_prepared_texts(&[prepared])?;
-        vectors
-            .pop()
-            .ok_or_else(|| anyhow!("embedding runtime returned no query embedding"))
+        match &self.backend {
+            #[cfg(not(any(test, feature = "test-support")))]
+            EmbeddingBackend::InProcess(client) => client.embed_query(query),
+            #[cfg(any(test, feature = "test-support"))]
+            EmbeddingBackend::HashProjection => {
+                Ok(embed_text_with_hash_projection(query, EMBEDDING_DIM))
+            }
+        }
     }
 
     pub fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let prepared = texts
-            .iter()
-            .map(|text| format!("{}{}", self.profile.document_prefix, text))
-            .collect::<Vec<_>>();
-        self.embed_prepared_texts(&prepared)
+        match &self.backend {
+            #[cfg(not(any(test, feature = "test-support")))]
+            EmbeddingBackend::InProcess(client) => client.embed_documents(texts),
+            #[cfg(any(test, feature = "test-support"))]
+            EmbeddingBackend::HashProjection => Ok(texts
+                .iter()
+                .map(|text| embed_text_with_hash_projection(text, EMBEDDING_DIM))
+                .collect()),
+        }
     }
 
     pub fn embed_text_refs(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let prepared = texts
-            .iter()
-            .map(|text| format!("{}{}", self.profile.document_prefix, text))
-            .collect::<Vec<_>>();
-        self.embed_prepared_texts(&prepared)
+        self.embed_texts(
+            &texts
+                .iter()
+                .map(|text| (*text).to_string())
+                .collect::<Vec<_>>(),
+        )
     }
 
-    fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut embeddings = match &self.backend {
-            EmbeddingBackend::HashProjection => {
-                let mut out = Vec::with_capacity(texts.len());
-                for text in texts {
-                    if text.trim().is_empty() {
-                        out.push(vec![
-                            0.0;
-                            self.profile.expected_dim.unwrap_or(EMBEDDING_DIM)
-                        ]);
-                    } else {
-                        out.push(embed_text_with_hash_projection(
-                            text,
-                            self.profile.expected_dim.unwrap_or(EMBEDDING_DIM),
-                        ));
-                    }
-                }
-                Ok(out)
-            }
-            EmbeddingBackend::LlamaCpp(runtime) => runtime.embed_texts(texts),
-        }?;
-        postprocess_embeddings(&mut embeddings, &self.profile)?;
-        Ok(embeddings)
-    }
-
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_runtime() -> Self {
-        let profile = EmbeddingProfile {
-            name: "test".to_string(),
-            model_id: "test-model".to_string(),
-            pooling: EmbeddingPooling::Mean,
-            query_prefix: String::new(),
-            document_prefix: String::new(),
-            layer_norm: false,
-            truncate_dim: None,
-            expected_dim: Some(EMBEDDING_DIM),
-        };
         Self {
-            model_path: PathBuf::from("hash-projection"),
-            model_id: "test-model".to_string(),
-            profile,
+            model_id: codestory_retrieval::embedding_runtime_id(),
             backend: EmbeddingBackend::HashProjection,
         }
     }
@@ -1184,11 +760,11 @@ impl SearchEngine {
         self.embedding_runtime = Some(runtime);
     }
 
-    pub fn set_embedding_runtime_from_config(
+    pub fn set_embedding_runtime_for_runtime(
         &mut self,
-        config: &codestory_retrieval::EmbeddingRuntimeConfig,
+        runtime: &codestory_retrieval::SidecarRuntimeConfig,
     ) -> Result<()> {
-        self.embedding_runtime = Some(EmbeddingRuntime::from_config(config)?);
+        self.embedding_runtime = Some(EmbeddingRuntime::from_runtime(runtime)?);
         Ok(())
     }
 
@@ -1553,6 +1129,7 @@ fn recreate_search_storage_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn embed_text_with_hash_projection(text: &str, dim: usize) -> Vec<f32> {
     let mut vector = vec![0.0_f32; dim];
 
@@ -1578,56 +1155,7 @@ fn embed_text_with_hash_projection(text: &str, dim: usize) -> Vec<f32> {
     vector
 }
 
-fn postprocess_embeddings(embeddings: &mut [Vec<f32>], profile: &EmbeddingProfile) -> Result<()> {
-    for embedding in embeddings {
-        if let Some(truncate_dim) = profile.truncate_dim {
-            if embedding.len() < truncate_dim {
-                return Err(anyhow!(
-                    "embedding from profile `{}` has dimension {}, cannot truncate to {}",
-                    profile.name,
-                    embedding.len(),
-                    truncate_dim
-                ));
-            }
-            embedding.truncate(truncate_dim);
-        }
-        if let Some(expected_dim) = profile.expected_dim
-            && embedding.len() != expected_dim
-        {
-            return Err(anyhow!(
-                "embedding from profile `{}` has dimension {}, expected {}",
-                profile.name,
-                embedding.len(),
-                expected_dim
-            ));
-        }
-        if profile.layer_norm {
-            layer_normalize(embedding);
-        }
-        l2_normalize(embedding);
-    }
-    Ok(())
-}
-
-fn layer_normalize(values: &mut [f32]) {
-    if values.is_empty() {
-        return;
-    }
-    let mean = values.iter().sum::<f32>() / values.len() as f32;
-    let variance = values
-        .iter()
-        .map(|value| {
-            let centered = *value - mean;
-            centered * centered
-        })
-        .sum::<f32>()
-        / values.len() as f32;
-    let denom = (variance + 1.0e-12).sqrt();
-    for value in values {
-        *value = (*value - mean) / denom;
-    }
-}
-
+#[cfg(any(test, feature = "test-support"))]
 fn l2_normalize(values: &mut [f32]) {
     let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
     if norm <= f32::EPSILON {
@@ -2045,9 +1573,6 @@ fn truncate_node_scores(scored: &mut Vec<(NodeId, f32)>, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::thread;
     use tempfile::tempdir;
 
     fn test_axis_embedding(axis: usize) -> Vec<f32> {
@@ -2069,14 +1594,6 @@ mod tests {
             }
             Self { key, previous }
         }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, previous }
-        }
     }
 
     impl Drop for EnvGuard {
@@ -2089,330 +1606,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn embedding_profile_defaults_to_bge_base() -> Result<()> {
-        let _lock = crate::process_env_test_lock();
-        let _guard = EnvGuard::remove(EMBEDDING_PROFILE_ENV);
-
-        let profile = EmbeddingProfile::from_env()?;
-
-        assert_eq!(profile.name, "bge-base-en-v1.5");
-        assert_eq!(profile.model_id, "BAAI/bge-base-en-v1.5-local");
-        assert_eq!(profile.expected_dim, Some(768));
-        Ok(())
-    }
-
-    #[test]
-    fn mandatory_sidecar_defaults_to_llamacpp_backend_when_backend_is_unset() -> Result<()> {
-        let _lock = crate::process_env_test_lock();
-        let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
-        let _backend = EnvGuard::remove(EMBEDDING_BACKEND_ENV);
-        let _url = EnvGuard::remove(LLAMACPP_EMBEDDINGS_URL_ENV);
-        let _real_embeddings = EnvGuard::remove("CODESTORY_RETRIEVAL_REAL_EMBEDDINGS");
-
-        assert_eq!(
-            EmbeddingBackendSelection::from_env()?,
-            EmbeddingBackendSelection::LlamaCpp
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn removed_onnx_configuration_fails_explicitly() {
-        let _lock = crate::process_env_test_lock();
-        let _mode = EnvGuard::remove(EMBEDDING_RUNTIME_MODE_ENV);
-        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "onnx");
-
-        let error = EmbeddingBackendSelection::from_env()
-            .expect_err("removed ONNX backend must not be accepted");
-
-        assert!(error.to_string().contains("no longer supported"));
-    }
-
-    #[test]
-    fn removed_onnx_runtime_mode_fails_even_with_llamacpp_backend() {
-        let _lock = crate::process_env_test_lock();
-        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
-
-        for alias in ["onnx", "ort", "onnxruntime", "onnx-runtime"] {
-            let mode = EnvGuard::set(EMBEDDING_RUNTIME_MODE_ENV, alias);
-            let error = EmbeddingBackendSelection::from_env()
-                .expect_err("removed ONNX runtime mode must not be overridden");
-
-            assert!(error.to_string().contains(EMBEDDING_RUNTIME_MODE_ENV));
-            assert!(error.to_string().contains("no longer supported"));
-            drop(mode);
-        }
-    }
-
-    #[test]
-    fn removed_onnx_environment_fails_even_with_llamacpp_selected() {
-        let _lock = crate::process_env_test_lock();
-        let _backend = EnvGuard::set(EMBEDDING_BACKEND_ENV, "llamacpp");
-        let _legacy = EnvGuard::set("CODESTORY_EMBED_ONNX_MODEL", "legacy.onnx");
-
-        let error = EmbeddingBackendSelection::from_env()
-            .expect_err("removed ONNX environment must not be ignored");
-
-        assert!(error.to_string().contains("CODESTORY_EMBED_ONNX_MODEL"));
-        assert!(error.to_string().contains("no longer supported"));
-    }
-
-    #[test]
-    fn embedding_parallel_chunk_size_spreads_batches_across_workers() {
-        assert_eq!(embedding_parallel_chunk_size(64, 4), 16);
-        assert_eq!(embedding_parallel_chunk_size(65, 4), 17);
-        assert_eq!(embedding_parallel_chunk_size(7, 16), 1);
-        assert_eq!(embedding_parallel_chunk_size(0, 4), 1);
-    }
-
-    fn run_one_fake_embedding_server(
-        status: &'static str,
-        response_headers: &'static str,
-        response_body: String,
-    ) -> Result<(String, thread::JoinHandle<String>)> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let addr = listener.local_addr()?;
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept fake embedding request");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            let mut expected_len = None;
-            loop {
-                let read = stream
-                    .read(&mut buffer)
-                    .expect("read fake embedding request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                if expected_len.is_none()
-                    && let Some(header_end) =
-                        request.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_len = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (key, value) = line.split_once(':')?;
-                            if key.eq_ignore_ascii_case("content-length") {
-                                value.trim().parse::<usize>().ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0);
-                    expected_len = Some(header_end + 4 + content_len);
-                }
-                if let Some(expected_len) = expected_len
-                    && request.len() >= expected_len
-                {
-                    break;
-                }
-            }
-
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{response_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write fake embedding response");
-            String::from_utf8_lossy(&request).to_string()
-        });
-        Ok((format!("http://{addr}/v1/embeddings"), handle))
-    }
-
-    #[test]
-    fn llamacpp_backend_uses_openai_embedding_endpoint() -> Result<()> {
-        let response = r#"{"data":[{"index":0,"embedding":[1.0,0.0,0.0]},{"index":1,"embedding":[0.0,2.0,0.0]}]}"#;
-        let (url, handle) = run_one_fake_embedding_server("200 OK", "", response.to_string())?;
-        let profile = EmbeddingProfile {
-            name: "custom".to_string(),
-            model_id: "custom-local".to_string(),
-            pooling: EmbeddingPooling::Mean,
-            query_prefix: String::new(),
-            document_prefix: "doc: ".to_string(),
-            layer_norm: false,
-            truncate_dim: None,
-            expected_dim: Some(3),
-        };
-        let mut client_config = crate::test_sidecar_runtime_from_env().embedding;
-        client_config.endpoint = url.clone();
-        client_config.endpoint_origin =
-            codestory_retrieval::EmbeddingEndpointOrigin::TrustedProjectConfig;
-        client_config.expected_dim = Some(3);
-        client_config.request_count = 1;
-        let runtime = EmbeddingRuntime {
-            model_path: PathBuf::from(&url),
-            model_id: profile.cache_model_id(EmbeddingBackendSelection::LlamaCpp),
-            profile,
-            backend: EmbeddingBackend::LlamaCpp(Arc::new(LlamaCppEmbeddingRuntime {
-                client: codestory_retrieval::LlamaCppEmbeddingClient::new(&client_config)?,
-            })),
-        };
-        let embeddings = runtime.embed_texts(&["alpha".to_string(), "beta".to_string()])?;
-        let request = handle.join().expect("fake embedding server should finish");
-
-        assert_eq!(embeddings.len(), 2);
-        assert_eq!(embeddings[0], vec![1.0, 0.0, 0.0]);
-        assert_eq!(embeddings[1], vec![0.0, 1.0, 0.0]);
-        assert!(
-            request.contains("doc: alpha") && request.contains("doc: beta"),
-            "request did not include document prefixes: {request}"
-        );
-        assert_eq!(
-            runtime.model_id(),
-            "custom-local|backend=llamacpp|pool=Mean|query_prefix=|document_prefix=doc: |layer_norm=false|truncate_dim=None|expected_dim=Some(3)"
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore]
-    fn embedding_identity_probe_from_env() -> Result<()> {
-        let _lock = crate::process_env_test_lock();
-        let query = std::env::var("CODESTORY_EMBED_IDENTITY_PROBE_QUERY").unwrap_or_else(|_| {
-            "Where is the retrieval sidecar embedding contract enforced?".into()
-        });
-        let docs = std::env::var("CODESTORY_EMBED_IDENTITY_PROBE_DOCS_JSON")
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-            .filter(|docs| !docs.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    "llama.cpp embedding sidecar is mandatory for product retrieval_mode full."
-                        .into(),
-                    "Stored vectors from unsupported embedding producers must be refreshed.".into(),
-                    "Hash projection is deterministic but not semantic product readiness.".into(),
-                    "Packet and search readiness require full sidecar retrieval evidence.".into(),
-                ]
-            });
-
-        let load_started = std::time::Instant::now();
-        let runtime = match EmbeddingRuntime::from_env() {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                println!(
-                    "CODESTORY_EMBEDDING_IDENTITY_PROBE_JSON={}",
-                    serde_json::to_string(&serde_json::json!({
-                        "ok": false,
-                        "failure_text": error.to_string(),
-                        "backend_env": std::env::var(EMBEDDING_BACKEND_ENV).ok(),
-                        "profile_env": std::env::var(EMBEDDING_PROFILE_ENV).ok(),
-                        "url_env": std::env::var(LLAMACPP_EMBEDDINGS_URL_ENV).ok(),
-                    }))?
-                );
-                return Ok(());
-            }
-        };
-        let model_load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
-
-        let query_started = std::time::Instant::now();
-        let query_embedding = runtime.embed_query(&query)?;
-        let query_embedding_ms = query_started.elapsed().as_secs_f64() * 1000.0;
-
-        let batch_started = std::time::Instant::now();
-        let document_embeddings = runtime.embed_texts(&docs)?;
-        let batch_document_embedding_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
-
-        let mut scored = document_embeddings
-            .iter()
-            .enumerate()
-            .map(|(index, embedding)| (index, dot_product(&query_embedding, embedding)))
-            .collect::<Vec<_>>();
-        scored.sort_by(|left, right| {
-            right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-
-        let model_path = runtime.model_path();
-        let cache_bytes = file_len(model_path).unwrap_or(0);
-        let cache_bytes = if cache_bytes == 0 {
-            None
-        } else {
-            Some(cache_bytes)
-        };
-
-        println!(
-            "CODESTORY_EMBEDDING_IDENTITY_PROBE_JSON={}",
-            serde_json::to_string(&serde_json::json!({
-                "ok": true,
-                "model_id": runtime.model_id(),
-                "model_path": model_path.to_string_lossy(),
-                "model_load_ms": model_load_ms,
-                "query_embedding_ms": query_embedding_ms,
-                "batch_document_embedding_ms": batch_document_embedding_ms,
-                "cache_bytes": cache_bytes,
-                "vector_dimension": query_embedding.len(),
-                "finite_vector_check": all_finite(&query_embedding) && document_embeddings.iter().all(|vector| all_finite(vector)),
-                "l2_normalized_vector_check": l2_normalized(&query_embedding) && document_embeddings.iter().all(|vector| l2_normalized(vector)),
-                "document_count": docs.len(),
-                "top_k": scored.iter().take(3).map(|(index, score)| serde_json::json!({
-                    "index": index,
-                    "score": score,
-                    "text": docs.get(*index).cloned().unwrap_or_default(),
-                })).collect::<Vec<_>>(),
-            }))?
-        );
-        Ok(())
-    }
-
-    fn file_len(path: &std::path::Path) -> Option<u64> {
-        std::fs::metadata(path).ok().map(|metadata| metadata.len())
-    }
-
-    fn dot_product(left: &[f32], right: &[f32]) -> f32 {
-        left.iter()
-            .zip(right.iter())
-            .map(|(left, right)| left * right)
-            .sum()
-    }
-
-    fn all_finite(vector: &[f32]) -> bool {
-        !vector.is_empty() && vector.iter().all(|value| value.is_finite())
-    }
-
-    fn l2_normalized(vector: &[f32]) -> bool {
-        let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-        (norm - 1.0).abs() <= 0.05
-    }
-
-    #[test]
-    fn test_search_engine() -> Result<()> {
-        let mut engine = SearchEngine::new(None)?;
-
-        let nodes = vec![
-            (NodeId(1), "MyClass".to_string()),
-            (NodeId(2), "my_function".to_string()),
-            (NodeId(3), "another_function".to_string()),
-        ];
-
-        engine.index_nodes(nodes)?;
-
-        let results = engine.search_symbol("MyC");
-        assert!(!results.is_empty(), "Should find at least one match");
-        assert_eq!(
-            results[0],
-            NodeId(1),
-            "MyClass should be the best match for 'MyC'"
-        );
-
-        let results = engine.search_symbol("func");
-        assert_eq!(results.len(), 2);
-
-        let results = engine.search_full_text("another")?;
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0], NodeId(3));
-
-        Ok(())
     }
 
     #[test]

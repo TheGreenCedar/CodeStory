@@ -3,7 +3,7 @@
   "commit": "1111111111111111111111111111111111111111",
   "evidence_identity": {
     "corpus_id": "ci-contract-corpus-v1",
-    "cache_id": "cold-full-sidecar-v1",
+    "cache_id": "cold-full-retrieval-v1",
     "machine_fingerprint": "ci-contract/windows-x64/8/test-cpu/16GiB"
   },
   "metrics": {

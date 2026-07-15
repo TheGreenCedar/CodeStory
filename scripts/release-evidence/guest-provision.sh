@@ -6,8 +6,6 @@ expected_contract_sha=${2:?machine contract checksum is required}
 source_sha=${3:?validation source SHA is required}
 bootstrap_snapshot=${4:?APT snapshot is required}
 bootstrap_jq_version=${5:?jq version is required}
-model_seed=${6:--}
-test "$model_seed" = - || test "$model_seed" = /tmp/codestory-release-evidence-model-seed
 
 actual_contract_sha=$(sha256sum "$contract" | awk '{print $1}')
 test "$actual_contract_sha" = "$expected_contract_sha"
@@ -39,8 +37,6 @@ gh_sha=$(get '.guest.github_cli.sha256')
 rust_version=$(get '.guest.rust.version')
 rustup_sha=$(get '.guest.rust.rustup_init_sha256')
 snapshot=$(get '.guest.apt_snapshot')
-model_name=$(get '.assets.model.name')
-model_sha=$(get '.assets.model.sha256')
 drill_repository=$(get '.drill.repository')
 drill_commit=$(get '.drill.commit')
 
@@ -74,7 +70,7 @@ fi
 sudo install -d -o codestory-runner -g codestory-runner -m 0750 \
   "$runner_root/actions-runner" "$runner_root/cache" \
   "$runner_root/cargo" "$runner_root/rustup" "$runner_root/sccache" \
-  "$runner_root/home" "$runner_root/tmp" "$runner_root/models" \
+  "$runner_root/home" "$runner_root/tmp" \
   "$runner_root/drills" "$runner_root/artifacts" "$runner_root/validation"
 sudo rm -rf "$runner_root/validation/codestory"
 sudo install -d -o codestory-runner -g codestory-runner -m 0750 \
@@ -87,7 +83,6 @@ printf '%s\n' "$source_sha" \
 tmp=$(mktemp -d)
 cleanup() {
   rm -rf "$tmp"
-  if test "$model_seed" != -; then sudo rm -f "$model_seed"; fi
 }
 trap cleanup EXIT
 
@@ -159,29 +154,6 @@ if test -z "$installed_runner_version"; then
 fi
 test "$(sudo -u codestory-runner "$runner/bin/Runner.Listener" --version)" = "$runner_version"
 
-model="$runner_root/models/$model_name"
-if ! sudo -u codestory-runner test -f "$model" \
-    || ! printf '%s  %s\n' "$model_sha" "$model" | sudo -u codestory-runner sha256sum -c -; then
-  sudo rm -f "$model.partial"
-  if test "$model_seed" != - && test -f "$model_seed"; then
-    sudo install -o codestory-runner -g codestory-runner -m 0640 \
-      "$model_seed" "$model.partial"
-  else
-    downloaded=false
-    for url in \
-      https://huggingface.co/BAAI/bge-base-en-v1.5-GGUF/resolve/main/bge-base-en-v1.5.Q8_0.gguf \
-      https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/resolve/main/bge-base-en-v1.5-q8_0.gguf; do
-      if sudo -u codestory-runner curl -fL --retry 3 -o "$model.partial" "$url"; then
-        downloaded=true
-        break
-      fi
-    done
-    test "$downloaded" = true
-  fi
-  printf '%s  %s\n' "$model_sha" "$model.partial" | sudo -u codestory-runner sha256sum -c -
-  sudo -u codestory-runner mv "$model.partial" "$model"
-fi
-
 drill_repo="$runner_root/drills/serde-json"
 if ! sudo -u codestory-runner test -d "$drill_repo/.git"; then
   sudo -u codestory-runner git clone --filter=blob:none --no-checkout \
@@ -212,11 +184,6 @@ sudo -u codestory-runner jq -n --arg project "$drill_repo" '{
 }' | sudo -u codestory-runner tee "$manifest" >/dev/null
 
 test "$(sudo -u codestory-runner sed -n '1p' "$runner_root/validation/source-sha")" = "$source_sha"
-sudo -u codestory-runner env \
-  HOME="$runner_root/home" CARGO_HOME="$runner_root/cargo" \
-  RUSTUP_HOME="$runner_root/rustup" XDG_CACHE_HOME="$runner_root/cache/xdg" \
-  CODESTORY_EMBED_MODEL_DIR="$runner_root/models" \
-  node "$runner_root/validation/codestory/scripts/setup-retrieval-env.mjs" --check-only
 
 dpkg-query -W -f='${binary:Package}\t${Version}\n' | sort \
   | sudo -u codestory-runner tee "$runner_root/artifacts/native-packages.tsv" >/dev/null

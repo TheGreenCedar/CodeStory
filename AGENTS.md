@@ -124,7 +124,7 @@ adapter to compensate for incorrect upstream state.
   independently accepted exact head.
 - CLI integration tests must launch through
   `tests/test_support::cli_command` or its supplied-binary variant, use
-  isolated cache/install/plugin state roots, and drain spawned repair workers.
+  isolated cache/install/plugin state roots.
   Never clean or write the real user cache to make a test pass, and never
   serialize the suite to hide state leakage.
 - Docs-only scope is `README.md`, `docs/**`, `plugins/codestory/README.md`,
@@ -195,7 +195,7 @@ adapter to compensate for incorrect upstream state.
   `main` triggers the release workflow that creates the tag, GitHub release,
   native archives, and `SHA256SUMS.txt`.
 - Source checks, built binaries, packaged archives, installed plugin launchers,
-  fresh host sessions, and live full-sidecar behavior are distinct proof tiers.
+  fresh host sessions, and live full-retrieval behavior are distinct proof tiers.
   A lower tier cannot support a higher-tier claim. Use the named testing-matrix
   lane for packet/search readiness, accelerator execution, signing/notarization
   and Gatekeeper, restart survival, host visibility, or another architecture.
@@ -232,7 +232,7 @@ adapter to compensate for incorrect upstream state.
   `docs/contributors/testing-matrix.md`
 - Retrieval design and operations: `docs/architecture/retrieval-design.md`,
   `docs/testing/retrieval-architecture.md`, and
-  `docs/ops/retrieval-sidecars.md`
+  `docs/ops/retrieval-engine.md`
 - Language claim tiers: `docs/architecture/language-support.md`
 - Agent operational contract:
   `plugins/codestory/skills/codestory-grounding/SKILL.md` and its references

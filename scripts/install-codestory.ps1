@@ -538,7 +538,7 @@ function Invoke-SelfTest {
     Assert-SelfTest (-not $stale.AgentPacketSearch.ready) "stale index must not report agent packet/search ready"
     Assert-SelfTest ($stale.RepairCommands -contains "codestory-cli index --project C:/repo --refresh incremental") "stale index repair command missing"
 
-    $missingSidecarDoctor = @'
+    $missingRetrievalDoctor = @'
 {
   "retrieval_mode": "unavailable",
   "degraded_reason": "retrieval_manifest_missing",
@@ -553,19 +553,19 @@ function Invoke-SelfTest {
     {
       "goal": "agent_packet_search",
       "status": "repair_retrieval",
-      "summary": "Agent packet/search needs full sidecar retrieval; current mode is `unavailable`.",
-      "minimum_next": ["codestory-cli retrieval bootstrap --project C:/repo --format json", "codestory-cli retrieval index --project C:/repo --refresh full --format json"],
-      "full_repair": ["codestory-cli retrieval bootstrap --project C:/repo --format json", "codestory-cli retrieval index --project C:/repo --refresh full --format json", "codestory-cli retrieval status --project C:/repo --format json", "codestory-cli doctor --project C:/repo --format markdown"]
+      "summary": "Agent packet/search needs full retrieval; current mode is `unavailable`.",
+      "minimum_next": ["codestory-cli retrieval index --project C:/repo --refresh full --format json"],
+      "full_repair": ["codestory-cli retrieval index --project C:/repo --refresh full --format json", "codestory-cli retrieval status --project C:/repo --format json", "codestory-cli doctor --project C:/repo --format markdown"]
     }
   ],
   "next_commands": []
 }
 '@ | ConvertFrom-Json
-    $sidecar = Convert-DoctorToReadinessState $missingSidecarDoctor "C:/tools/codestory-cli.exe" "codestory-cli 0.11.1" "existing"
-    Assert-SelfTest $sidecar.LocalNavigation.ready "fresh local index should report local navigation ready"
-    Assert-SelfTest (-not $sidecar.AgentPacketSearch.ready) "missing sidecars must not report agent packet/search ready"
-    Assert-SelfTest ($sidecar.RepairCommands -contains "codestory-cli retrieval status --project C:/repo --format json") "missing sidecar repair command missing"
-    Assert-SelfTest (-not (($sidecar.RepairCommands -join "`n") -match "codestory-cli (packet|search)")) "repair commands must not attempt broad packet/search fallback"
+    $retrieval = Convert-DoctorToReadinessState $missingRetrievalDoctor "C:/tools/codestory-cli.exe" "codestory-cli 0.11.1" "existing"
+    Assert-SelfTest $retrieval.LocalNavigation.ready "fresh local index should report local navigation ready"
+    Assert-SelfTest (-not $retrieval.AgentPacketSearch.ready) "missing full retrieval must not report agent packet/search ready"
+    Assert-SelfTest ($retrieval.RepairCommands -contains "codestory-cli retrieval status --project C:/repo --format json") "retrieval status command missing"
+    Assert-SelfTest (-not (($retrieval.RepairCommands -join "`n") -match "codestory-cli (packet|search)")) "repair commands must not attempt broad packet/search fallback"
 
     Write-Host "install-codestory self-test: ok"
 }

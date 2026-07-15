@@ -303,7 +303,7 @@ mod tests {
             built_at_epoch_ms: 0,
             disk_bytes: None,
             degraded_modes_json: "[]".into(),
-            embedding_backend: Some("llamacpp:bge-base".into()),
+            embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
             embedding_dim: Some(768),
             sidecar_schema_version: Some(1),
             sidecar_input_hash: Some("hash-a".into()),

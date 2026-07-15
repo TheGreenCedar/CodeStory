@@ -221,19 +221,19 @@ function statsContractFrom(repoRoot) {
 function validateRawProvenance(stats, packet, commit, profileName, identity, statsContract) {
   if (fullSha(stats.commit, "stats.commit") !== commit) fail("raw stats commit does not match candidate");
   if (JSON.stringify(stats.evidence_identity) !== JSON.stringify(identity)) fail("raw stats identity does not match profile");
-  if (stats.proof_tier !== "full_sidecar"
+  if (stats.proof_tier !== "full_retrieval"
       || stats.index?.error_count !== 0
-      || stats.index?.sidecar_status_after_retrieval_index !== "full"
-      || stats.ground?.sidecar_status_after_retrieval_index !== "full"
-      || stats.search?.sidecar_shadow_retrieval_mode !== "full"
-      || !(stats.sidecar_manifest?.symbol_doc_count > 0)
-      || !(stats.sidecar_manifest?.dense_projection_count > 0)
-      || stats.sidecar_manifest?.dense_projection_count !== stats.sidecar_manifest?.projection_count
-      || stats.sidecar_manifest?.semantic_policy_version !== "graph_first_v1"
-      || stats.sidecar_manifest?.graph_artifact_hash_present !== true
-      || stats.sidecar_manifest?.dense_reason_count_total !== stats.sidecar_manifest?.dense_projection_count
+      || stats.index?.retrieval_status_after_index !== "full"
+      || stats.ground?.retrieval_status_after_index !== "full"
+      || stats.search?.retrieval_shadow_mode !== "full"
+      || !(stats.retrieval_manifest?.symbol_doc_count > 0)
+      || !(stats.retrieval_manifest?.dense_projection_count > 0)
+      || stats.retrieval_manifest?.dense_projection_count !== stats.retrieval_manifest?.projection_count
+      || stats.retrieval_manifest?.semantic_policy_version !== "graph_first_v1"
+      || stats.retrieval_manifest?.graph_artifact_hash_present !== true
+      || stats.retrieval_manifest?.dense_reason_count_total !== stats.retrieval_manifest?.dense_projection_count
       || stats.repeat_semantic_docs_embedded !== 0) {
-    fail("raw stats artifact does not prove the full-sidecar readiness contract");
+    fail("raw stats artifact does not prove the full-retrieval readiness contract");
   }
   const repeatBaseline = stats.stats_baseline?.repeat_full_refresh_seconds;
   if (!(stats.repeat_graph_phase_seconds < statsContract.repeat_graph_phase_seconds_max)

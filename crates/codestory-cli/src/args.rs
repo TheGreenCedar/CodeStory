@@ -34,7 +34,7 @@ Common lanes:
   Broad question: codestory-cli packet --project <repo> --question \"How does this system work?\"
   Exact target:  codestory-cli context --project <repo> --query <symbol-or-file>
 
-For agent packet/search readiness, first run retrieval bootstrap + retrieval index and require retrieval status to report retrieval_mode=full.";
+Packet and search initialize the embedded retrieval engine automatically and require retrieval_mode=full.";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Skill-first repo grounding runtime", long_about = CLI_LONG_ABOUT)]
@@ -72,11 +72,9 @@ pub(crate) enum Command {
     Doctor(DoctorCommand),
     #[command(about = "Print compact readiness verdicts for local navigation or agent search.")]
     Ready(ReadyCommand),
-    #[command(about = "Run the single supported readiness repair entrypoint.")]
-    Fix(FixCommand),
     #[command(about = "Run a machine-readable smoke profile for CI and agent images.")]
     Smoke(SmokeCommand),
-    #[command(about = "Agent-facing readiness and repair helpers.")]
+    #[command(about = "Agent-facing retrieval helpers.")]
     Agent(AgentCommand),
     #[command(about = "Prepare or inspect local cache artifacts.")]
     Cache(CacheCommand),
@@ -116,10 +114,8 @@ pub(crate) enum Command {
     Serve(ServeCommand),
     #[command(about = "Generate shell completions.")]
     GenerateCompletions(GenerateCompletionsCommand),
-    #[command(about = "Manage retrieval sidecar data.")]
+    #[command(about = "Manage retrieval artifacts.")]
     Retrieval(RetrievalCommand),
-    #[command(about = "Show retrieval sidecar status.")]
-    Sidecar(SidecarCommand),
     #[command(name = "internal-owned-delete", hide = true)]
     InternalOwnedDelete(InternalOwnedDeleteCommand),
 }
@@ -586,41 +582,16 @@ pub(crate) struct ReadyCommand {
     pub(crate) goal: Option<ReadyGoal>,
     #[arg(
         long,
-        help = "Repair readiness before reporting it. Local repairs refresh the index; agent repairs also bootstrap and rebuild retrieval sidecars."
-    )]
-    pub(crate) repair: bool,
-    #[arg(
-        long,
         help = "For local graph freshness, no-op when fresh and run at most one incremental refresh when stale or unchecked."
     )]
     pub(crate) wait_fresh: bool,
     #[arg(
         long,
         value_name = "ID",
-        help = "Use a specific agent sidecar run id when checking or repairing agent readiness."
+        help = "Inspect a specific agent retrieval run."
     )]
     pub(crate) run_id: Option<String>,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "markdown")]
-    pub(crate) format: OutputFormat,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Write command output to this file instead of stdout. The parent directory must already exist."
-    )]
-    pub(crate) output_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct FixCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(
-        long,
-        value_name = "ID",
-        help = "Use a specific agent sidecar run id when repairing agent readiness."
-    )]
-    pub(crate) run_id: Option<String>,
-    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(
         long,
@@ -738,36 +709,14 @@ pub(crate) struct RetrievalCommand {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RetrievalAction {
-    /// Prepare managed retrieval services and wait for health.
-    Bootstrap(RetrievalBootstrapCommand),
-    #[command(name = "prewarm-assets", hide = true)]
-    PrewarmAssets(RetrievalPrewarmAssetsCommand),
-    /// Prepare local retrieval data directories and write runtime state.
-    Up(RetrievalSidecarStateCommand),
-    /// Remove local sidecar state file (does not stop external processes).
-    Down(RetrievalSidecarStateCommand),
     /// Validate lexical, semantic, and graph retrieval for the project.
     Status(RetrievalStatusCommand),
-    /// List owned sidecar namespaces and dry-run cleanup eligibility.
+    /// List owned retrieval generations and dry-run cleanup eligibility.
     Inventory(RetrievalInventoryCommand),
-    /// Run workspace index then persist retrieval_index_manifest sidecar metadata.
+    /// Run workspace index then publish a retrieval manifest.
     Index(RetrievalIndexCommand),
-    /// Execute a standalone sidecar retrieval query against indexed sidecar metadata.
+    /// Execute a standalone query against published retrieval artifacts.
     Query(RetrievalQueryCommand),
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct RetrievalPrewarmAssetsCommand {
-    #[arg(long, help = "Prewarm the pinned machine-wide embedding model.")]
-    pub(crate) model: bool,
-    #[arg(long, help = "Prewarm the managed native llama-server for this host.")]
-    pub(crate) native_backend: bool,
-    #[arg(
-        long,
-        value_name = "ID",
-        help = "Select a specific managed native llama-server backend."
-    )]
-    pub(crate) llama_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -786,20 +735,6 @@ impl From<CliSidecarProfile> for codestory_retrieval::SidecarProfile {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct RetrievalSidecarStateCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
-    pub(crate) profile: CliSidecarProfile,
-    #[arg(
-        long,
-        value_name = "ID",
-        help = "Agent profile run id to reuse for status or cleanup. If omitted, agent profile creates a fresh run namespace."
-    )]
-    pub(crate) run_id: Option<String>,
-}
-
-#[derive(Args, Debug)]
 pub(crate) struct RetrievalQueryCommand {
     /// Natural-language, symbol, or path query string.
     pub(crate) query: String,
@@ -811,31 +746,6 @@ pub(crate) struct RetrievalQueryCommand {
         help = "Hard deadline for the staged retrieval plan."
     )]
     pub(crate) budget_ms: Option<u64>,
-    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
-    pub(crate) format: OutputFormat,
-    #[arg(long, value_name = "PATH")]
-    pub(crate) output_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-pub(crate) struct RetrievalBootstrapCommand {
-    #[command(flatten)]
-    pub(crate) project: ProjectArgs,
-    #[arg(long, value_enum, default_value_t = CliSidecarProfile::Local)]
-    pub(crate) profile: CliSidecarProfile,
-    #[arg(
-        long,
-        value_name = "ID",
-        help = "Agent profile run id to reuse for status or cleanup. If omitted, agent profile creates a fresh run namespace."
-    )]
-    pub(crate) run_id: Option<String>,
-    #[arg(
-        long,
-        value_name = "SECS",
-        default_value_t = 90,
-        help = "Seconds to wait for managed retrieval health (0 = no wait)."
-    )]
-    pub(crate) wait_secs: u64,
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(long, value_name = "PATH")]
@@ -876,22 +786,6 @@ pub(crate) struct RetrievalInventoryCommand {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct SidecarCommand {
-    #[command(subcommand)]
-    pub(crate) action: SidecarAction,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum SidecarAction {
-    /// Alias for `retrieval status`.
-    Status(RetrievalStatusCommand),
-    /// Alias for `retrieval inventory`.
-    Inventory(RetrievalInventoryCommand),
-    #[command(external_subcommand)]
-    Unknown(Vec<String>),
-}
-
-#[derive(Args, Debug)]
 pub(crate) struct RetrievalIndexCommand {
     #[command(flatten)]
     pub(crate) project: ProjectArgs,
@@ -900,7 +794,7 @@ pub(crate) struct RetrievalIndexCommand {
     #[arg(
         long,
         value_name = "ID",
-        help = "Agent profile run id to reuse while finalizing sidecar artifacts."
+        help = "Agent retrieval run id to reuse while publishing artifacts."
     )]
     pub(crate) run_id: Option<String>,
     #[arg(long, value_enum, default_value_t = RefreshMode::Auto, help = INDEX_REFRESH_HELP)]
@@ -1555,17 +1449,6 @@ pub(crate) struct ReadyOutput {
     pub(crate) local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) readiness_broker: Option<crate::readiness_broker::ReadinessBrokerSnapshot>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct FixOutput {
-    pub(crate) status: &'static str,
-    pub(crate) ready: bool,
-    pub(crate) goal: ReadinessGoalDto,
-    pub(crate) action: &'static str,
-    pub(crate) result: ReadyOutput,
 }
 
 #[derive(Debug, Serialize)]
@@ -1606,7 +1489,7 @@ pub(crate) struct ReadinessLaneOutput {
     pub(crate) phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repair_updated_at_epoch_ms: Option<i64>,
-    pub(crate) sidecar_mode: String,
+    pub(crate) retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1623,10 +1506,9 @@ pub(crate) struct AgentPreflightOutput {
     pub(crate) local_default: ReadinessLaneOutput,
     pub(crate) agent_packet_search: ReadinessLaneOutput,
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
-    pub(crate) sidecar_setup: serde_json::Value,
     pub(crate) safe_surfaces: Vec<String>,
     pub(crate) blocked_surfaces: Vec<String>,
-    pub(crate) repair_command: Option<String>,
+    pub(crate) next_command: Option<String>,
     pub(crate) human_summary: String,
 }
 
@@ -1697,7 +1579,7 @@ pub(crate) struct VerificationTargetOutput {
 /// JSON contract for `search`.
 ///
 /// Retrieval readiness and repo-text mode are explicit so consumers can
-/// distinguish full sidecar evidence from degraded or fallback search paths.
+/// distinguish full retrieval evidence from degraded or fallback search paths.
 pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
@@ -2313,7 +2195,7 @@ pub(crate) struct DoctorCheckOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DoctorSidecarStatusOutput {
+pub(crate) struct RetrievalStatusOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2361,7 +2243,7 @@ pub(crate) struct DoctorOutput {
     pub(crate) retrieval_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) degraded_reason: Option<String>,
-    pub(crate) sidecar_retrieval: DoctorSidecarStatusOutput,
+    pub(crate) sidecar_retrieval: RetrievalStatusOutput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retrieval: Option<RetrievalStateDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2370,8 +2252,6 @@ pub(crate) struct DoctorOutput {
     pub(crate) readiness: Vec<ReadinessVerdictDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) readiness_lanes: BTreeMap<String, ReadinessLaneOutput>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) readiness_broker: Option<crate::readiness_broker::ReadinessBrokerSnapshot>,
     pub(crate) checks: Vec<DoctorCheckOutput>,
     pub(crate) next_commands: Vec<String>,
     pub(crate) environment: Vec<DoctorCheckOutput>,
@@ -2533,29 +2413,6 @@ mod tests {
             .find_subcommand_mut(name)
             .expect("subcommand should exist");
         subcommand.render_long_help().to_string()
-    }
-
-    #[test]
-    fn fix_command_parses_as_single_repair_entrypoint() {
-        let cli = Cli::try_parse_from([
-            "codestory-cli",
-            "fix",
-            "--project",
-            "C:/repo",
-            "--format",
-            "json",
-            "--run-id",
-            "shared-agent",
-        ])
-        .expect("fix command should parse");
-        match cli.command {
-            Command::Fix(cmd) => {
-                assert_eq!(cmd.project.project, PathBuf::from("C:/repo"));
-                assert_eq!(cmd.run_id.as_deref(), Some("shared-agent"));
-                assert_eq!(cmd.format, OutputFormat::Json);
-            }
-            _ => panic!("expected fix command"),
-        }
     }
 
     #[test]
@@ -2830,13 +2687,13 @@ mod tests {
             _ => panic!("expected retrieval inventory command"),
         }
 
-        let apply = Cli::try_parse_from(["codestory-cli", "sidecar", "inventory", "--apply"])
-            .expect("sidecar inventory --apply should parse");
+        let apply = Cli::try_parse_from(["codestory-cli", "retrieval", "inventory", "--apply"])
+            .expect("retrieval inventory --apply should parse");
         match apply.command {
-            Command::Sidecar(SidecarCommand {
-                action: SidecarAction::Inventory(cmd),
+            Command::Retrieval(RetrievalCommand {
+                action: RetrievalAction::Inventory(cmd),
             }) => assert!(cmd.apply),
-            _ => panic!("expected sidecar inventory command"),
+            _ => panic!("expected retrieval inventory command"),
         }
     }
 

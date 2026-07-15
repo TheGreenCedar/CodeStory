@@ -11,6 +11,8 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/docker/**
       - package.json
       - package-lock.json
       - .github/scripts/route-ci-proof.mjs
@@ -22,13 +24,16 @@ on:
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/windows-vulkan-proof.yml
+      - '.github/workflows/retrieval-engine-smoke.yml'
       - .github/workflows/source-proof.yml
       - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
+      - scripts/prepare-embedded-model.mjs
+      - scripts/release-evidence/machine-contract.json
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
-      - scripts/setup-retrieval-env.*
       - .codex/environments/environment.toml
   push:
     branches:
@@ -43,6 +48,8 @@ on:
       - .github/scripts/package-codestory-release.py
       - .github/scripts/check-workflow-policy.mjs
       - .github/scripts/check-workflow-policy.test.mjs
+      - .github/scripts/install-linux-vulkan-build-deps.sh
+      - .github/docker/**
       - package.json
       - package-lock.json
       - .github/scripts/route-ci-proof.mjs
@@ -54,13 +61,16 @@ on:
       - .github/workflows/packaged-platform-pr.yml
       - .github/workflows/packaged-platform-proof.yml
       - .github/workflows/macos-metal-proof.yml
+      - .github/workflows/windows-vulkan-proof.yml
+      - .github/workflows/retrieval-engine-smoke.yml
       - .github/workflows/source-proof.yml
       - .github/workflows/repo-scale-stats.yml
       - .github/workflows/plugin-static.yml
       - scripts/install-codestory.ps1
+      - scripts/prepare-embedded-model.mjs
+      - scripts/release-evidence/machine-contract.json
       - scripts/codex-worktree-setup.*
       - scripts/tests/codex-worktree-setup.test.mjs
-      - scripts/setup-retrieval-env.*
       - .codex/environments/environment.toml
   workflow_dispatch:
 

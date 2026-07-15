@@ -3506,100 +3506,96 @@ fn execute_retrieval(
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, resolved_profile.max_search_results) as usize;
 
-    let (mut scored_hits, hits) = match try_sidecar_primary_search(
-        controller,
-        prompt,
-        max_results,
-        req.latency_budget_ms,
-    ) {
-        Some(SidecarPrimarySearchOutcome::Served {
-            hits,
-            scored_hits,
-            shadow,
-        }) => {
-            trace.set_retrieval_shadow(shadow.clone());
-            trace.annotate(format!(
-                "retrieval_sidecar_primary mode={} candidates={} resolved_hits={}",
-                shadow.retrieval_mode,
-                shadow.candidate_count,
-                hits.len()
-            ));
-            let search_step = trace.start_step(
-                AgentRetrievalStepKindDto::Search,
-                vec![
-                    field("query_chars", prompt.len().to_string()),
-                    field("retrieval_path", "sidecar"),
-                ],
-            );
-            trace.finish_ok_with_duration_ms(
-                search_step,
-                vec![
-                    field("hits", hits.len().to_string()),
-                    field("sidecar_candidates", shadow.candidate_count.to_string()),
-                    field(
-                        "sidecar_resolved_hits",
-                        shadow.resolved_hit_count.to_string(),
-                    ),
-                    field("accepted_hits", hits.len().to_string()),
-                    field("max_results", max_results.to_string()),
-                    field("repo_text", "off_initial"),
-                    field("mode", "packet_initial_sidecar_query"),
-                    field("sidecar_query_ms", shadow.retrieval_total_ms.to_string()),
-                ],
-                shadow.retrieval_total_ms,
-            );
-            let semantic_query_step = trace.start_step(
-                AgentRetrievalStepKindDto::SemanticQueryEmbedding,
-                vec![field("required", semantic_required.to_string())],
-            );
-            let semantic_candidates_step = trace.start_step(
-                AgentRetrievalStepKindDto::SemanticCandidateRetrieval,
-                vec![field("required", semantic_required.to_string())],
-            );
-            let hybrid_rerank_step = trace.start_step(
-                AgentRetrievalStepKindDto::HybridRerank,
-                vec![field("required", semantic_required.to_string())],
-            );
-            trace.finish_skipped(
-                semantic_query_step,
-                "Semantic embedding skipped on sidecar retrieval path.",
-                Vec::new(),
-            );
-            trace.finish_skipped(
-                semantic_candidates_step,
-                "Semantic candidate scan skipped on sidecar retrieval path.",
-                Vec::new(),
-            );
-            trace.finish_ok(
-                hybrid_rerank_step,
-                vec![field("ranked", hits.len().to_string())],
-            );
-            (scored_hits, hits)
-        }
-        Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
-            trace.set_retrieval_shadow(shadow);
-            trace.annotate(format!(
-                "retrieval_sidecar_primary rejected=true fail_closed=true reason={reason}"
-            ));
-            return Err(sidecar_retrieval_unavailable_error(
-                controller,
-                format!("sidecar retrieval primary rejected query: {reason}"),
-            ));
-        }
-        Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
-            trace.annotate(format!(
-                "retrieval_sidecar_primary unavailable=true fail_closed=true reason={reason}"
-            ));
-            return Err(sidecar_retrieval_unavailable_error(controller, reason));
-        }
-        Some(SidecarPrimarySearchOutcome::Retryable { error }) => return Err(error),
-        None => {
-            return Err(sidecar_retrieval_unavailable_error(
-                controller,
-                "sidecar retrieval primary is mandatory; non-sidecar initial search is disabled",
-            ));
-        }
-    };
+    let (mut scored_hits, hits) =
+        match try_sidecar_primary_search(controller, prompt, max_results, req.latency_budget_ms) {
+            Some(SidecarPrimarySearchOutcome::Served {
+                hits,
+                scored_hits,
+                shadow,
+            }) => {
+                trace.set_retrieval_shadow(shadow.clone());
+                trace.annotate(format!(
+                    "retrieval_primary mode={} candidates={} resolved_hits={}",
+                    shadow.retrieval_mode,
+                    shadow.candidate_count,
+                    hits.len()
+                ));
+                let search_step = trace.start_step(
+                    AgentRetrievalStepKindDto::Search,
+                    vec![
+                        field("query_chars", prompt.len().to_string()),
+                        field("retrieval_path", "sidecar"),
+                    ],
+                );
+                trace.finish_ok_with_duration_ms(
+                    search_step,
+                    vec![
+                        field("hits", hits.len().to_string()),
+                        field("sidecar_candidates", shadow.candidate_count.to_string()),
+                        field(
+                            "sidecar_resolved_hits",
+                            shadow.resolved_hit_count.to_string(),
+                        ),
+                        field("accepted_hits", hits.len().to_string()),
+                        field("max_results", max_results.to_string()),
+                        field("repo_text", "off_initial"),
+                        field("mode", "packet_initial_sidecar_query"),
+                        field("sidecar_query_ms", shadow.retrieval_total_ms.to_string()),
+                    ],
+                    shadow.retrieval_total_ms,
+                );
+                let semantic_query_step = trace.start_step(
+                    AgentRetrievalStepKindDto::SemanticQueryEmbedding,
+                    vec![field("required", semantic_required.to_string())],
+                );
+                let semantic_candidates_step = trace.start_step(
+                    AgentRetrievalStepKindDto::SemanticCandidateRetrieval,
+                    vec![field("required", semantic_required.to_string())],
+                );
+                let hybrid_rerank_step = trace.start_step(
+                    AgentRetrievalStepKindDto::HybridRerank,
+                    vec![field("required", semantic_required.to_string())],
+                );
+                trace.finish_skipped(
+                    semantic_query_step,
+                    "Semantic embedding skipped on sidecar retrieval path.",
+                    Vec::new(),
+                );
+                trace.finish_skipped(
+                    semantic_candidates_step,
+                    "Semantic candidate scan skipped on sidecar retrieval path.",
+                    Vec::new(),
+                );
+                trace.finish_ok(
+                    hybrid_rerank_step,
+                    vec![field("ranked", hits.len().to_string())],
+                );
+                (scored_hits, hits)
+            }
+            Some(SidecarPrimarySearchOutcome::Rejected { shadow, reason }) => {
+                trace.set_retrieval_shadow(shadow);
+                trace.annotate(format!(
+                    "retrieval_primary rejected=true fail_closed=true reason={reason}"
+                ));
+                return Err(sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!("retrieval rejected query: {reason}"),
+                ));
+            }
+            Some(SidecarPrimarySearchOutcome::Unavailable { reason }) => {
+                trace.annotate(format!(
+                    "retrieval_primary unavailable=true fail_closed=true reason={reason}"
+                ));
+                return Err(sidecar_retrieval_unavailable_error(controller, reason));
+            }
+            Some(SidecarPrimarySearchOutcome::Retryable { error }) => return Err(error),
+            None => {
+                return Err(sidecar_retrieval_unavailable_error(
+                    controller,
+                    "full retrieval is mandatory; legacy initial search is disabled",
+                ));
+            }
+        };
 
     let initial_hit_count = hits.len();
     let mut hits = hits;
@@ -3611,7 +3607,7 @@ fn execute_retrieval(
         sidecar_retrieval_blocks_nucleo_supplement(controller, hits.len());
     if block_nucleo_supplement && weak_initial_hits(prompt, &hits) {
         trace.annotate(
-            "retrieval_sidecar_primary skipped local nucleo investigation supplement on weak hits",
+            "retrieval_primary skipped local nucleo investigation supplement on weak hits",
         );
     }
     if should_investigate(resolved_profile)

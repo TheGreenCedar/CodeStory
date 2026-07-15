@@ -97,6 +97,6 @@
     "generalization"
   ],
   "notes": [
-    "Generalization holdout for sidecar retrieval (L-tier). Do not tune planner or ranker heuristics against this manifest."
+    "Generalization holdout for retrieval retrieval (L-tier). Do not tune planner or ranker heuristics against this manifest."
   ]
 }

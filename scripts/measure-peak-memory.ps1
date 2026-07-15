@@ -92,9 +92,6 @@ function Update-Peaks {
     if ($process.ProcessName -eq "codestory-cli" -and $script:PeakCodestoryCliWorkingSetBytes -lt [int64]$process.WorkingSet64) {
       $script:PeakCodestoryCliWorkingSetBytes = [int64]$process.WorkingSet64
     }
-    if ($process.ProcessName -eq "llama-server" -and $script:PeakLlamaServerWorkingSetBytes -lt [int64]$process.WorkingSet64) {
-      $script:PeakLlamaServerWorkingSetBytes = [int64]$process.WorkingSet64
-    }
   }
   if ($script:PeakDescendantWorkingSetBytes -lt $descendantBytes) {
     $script:PeakDescendantWorkingSetBytes = $descendantBytes
@@ -114,7 +111,6 @@ function Format-MetricMb {
 $script:PeakDescendantWorkingSetBytes = 0L
 $script:PeakProcessWorkingSetBytes = 0L
 $script:PeakCodestoryCliWorkingSetBytes = 0L
-$script:PeakLlamaServerWorkingSetBytes = 0L
 $script:PeakVramBytes = $null
 
 $started = Get-Date
@@ -166,7 +162,6 @@ $summary = [ordered]@{
   peak_descendant_working_set_mb = Format-MetricMb $script:PeakDescendantWorkingSetBytes
   peak_process_working_set_mb = Format-MetricMb $script:PeakProcessWorkingSetBytes
   peak_codestory_cli_working_set_mb = Format-MetricMb $script:PeakCodestoryCliWorkingSetBytes
-  peak_llama_server_working_set_mb = Format-MetricMb $script:PeakLlamaServerWorkingSetBytes
   peak_vram_mb = if ($null -eq $script:PeakVramBytes) { $null } else { Format-MetricMb $script:PeakVramBytes }
   stdout_path = $stdoutPath
   stderr_path = $stderrPath
@@ -178,7 +173,6 @@ Write-Output "memory summary: $summaryPath"
 Write-Output "METRIC peak_descendant_working_set_mb=$($summary.peak_descendant_working_set_mb)"
 Write-Output "METRIC peak_process_working_set_mb=$($summary.peak_process_working_set_mb)"
 Write-Output "METRIC peak_codestory_cli_working_set_mb=$($summary.peak_codestory_cli_working_set_mb)"
-Write-Output "METRIC peak_llama_server_working_set_mb=$($summary.peak_llama_server_working_set_mb)"
 if ($null -ne $summary.peak_vram_mb) {
   Write-Output "METRIC peak_vram_mb=$($summary.peak_vram_mb)"
 } else {

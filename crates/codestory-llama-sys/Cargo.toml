@@ -1,0 +1,26 @@
+[package]
+name = "codestory-llama-sys"
+version = "0.15.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+crossbeam-channel = { workspace = true }
+fs4 = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { workspace = true, features = ["metal"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+llama-cpp-2 = { workspace = true, features = ["vulkan"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))'.dependencies]
+llama-cpp-2 = { workspace = true }

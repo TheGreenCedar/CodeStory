@@ -65,7 +65,7 @@ Start with `drill-summary.json` for compact health, retrieval/freshness state, d
 
 Consumer summaries inspect direct incoming production consumers for the selected anchor first. Related payload/API/native targets are searched only when the selected anchor has no visible graph consumers, so ordinary drills do not pay broad related-target search costs unless the direct graph evidence is missing.
 
-If `drill-summary.json` reports stale freshness, refresh the index before promoting claims. If retrieval is not full or semantic diagnostics report degraded state, repair sidecars before trusting broad natural-language recall; use symbol, trail, snippet, and source-truth files deliberately while the run is degraded.
+If `drill-summary.json` reports stale freshness, refresh the index before promoting claims. If retrieval is not full or semantic diagnostics report degraded state, wait for a complete publication or run the maintainer-directed rebuild before trusting broad natural-language recall; use symbol, trail, snippet, and source-truth files deliberately while broad retrieval is unavailable.
 
 `--jobs` is default-off and read-only. Use it only with `--refresh none` after
 the index is fresh, and measure the run: multi-case suites can benefit from

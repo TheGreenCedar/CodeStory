@@ -1,20 +1,19 @@
+mod test_support;
+
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 struct StdioFixture {
-    workspace: PreservableTempDir,
-    cache_dir: PreservableTempDir,
+    workspace: TempDir,
+    cache_dir: TempDir,
     hash_embeddings: bool,
     latest_release_version: Option<String>,
     disable_release_probe: bool,
@@ -24,412 +23,19 @@ struct StdioFixture {
     dirty_marker_path: Option<PathBuf>,
     dirty_marker_project_root: Option<PathBuf>,
     local_refresh_timeout_ms: Option<u64>,
-    ready_repair_worker_probe_exit_code: Option<i32>,
-    managed_retrieval_preparation: bool,
 }
 
 struct StdioServer {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    worker_roots: Vec<PathBuf>,
-    preserve_fixture_roots: Option<Arc<AtomicBool>>,
 }
-
-struct PreservableTempDir {
-    inner: Option<TempDir>,
-    preserve: Arc<AtomicBool>,
-}
-
-struct FakeEmbeddingEndpoint {
-    url: String,
-    response_vector: Vec<f32>,
-    requests: Arc<Mutex<Vec<String>>>,
-    stop: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl FakeEmbeddingEndpoint {
-    fn spawn(vector: Vec<f32>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake embedding endpoint");
-        listener
-            .set_nonblocking(true)
-            .expect("set fake endpoint nonblocking");
-        let address = listener.local_addr().expect("fake endpoint address");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_requests = Arc::clone(&requests);
-        let worker_stop = Arc::clone(&stop);
-        let response_vector = vector.clone();
-        let worker = thread::spawn(move || {
-            while !worker_stop.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream
-                            .set_nonblocking(false)
-                            .expect("make accepted fake endpoint stream blocking");
-                        let body = read_http_request_body(&mut stream);
-                        let input_count = serde_json::from_str::<Value>(&body)
-                            .ok()
-                            .and_then(|request| {
-                                request.get("input").and_then(Value::as_array).map(Vec::len)
-                            })
-                            .expect("embedding request input array");
-                        worker_requests.lock().expect("request log").push(body);
-                        let response_body = json!({
-                            "data": (0..input_count)
-                                .map(|index| json!({"index": index, "embedding": &vector}))
-                                .collect::<Vec<_>>(),
-                        })
-                        .to_string();
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            response_body.len(),
-                            response_body
-                        )
-                        .expect("write fake embedding response");
-                        stream.flush().expect("flush fake embedding response");
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("accept fake embedding request: {error}"),
-                }
-            }
-        });
-        Self {
-            url: format!("http://{address}/v1/embeddings"),
-            response_vector,
-            requests,
-            stop,
-            worker: Some(worker),
-        }
-    }
-
-    fn snapshot(&self) -> Vec<String> {
-        self.requests.lock().expect("request log").clone()
-    }
-}
-
-impl Drop for FakeEmbeddingEndpoint {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            worker.join().expect("join fake embedding endpoint");
-        }
-    }
-}
-
-fn read_http_request_body(stream: &mut TcpStream) -> String {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set fake endpoint read timeout");
-    let mut request = Vec::new();
-    let mut byte = [0_u8; 1];
-    while !request.ends_with(b"\r\n\r\n") {
-        stream.read_exact(&mut byte).expect("read request header");
-        request.push(byte[0]);
-        assert!(request.len() < 64 * 1024, "request header too large");
-    }
-    let header = String::from_utf8_lossy(&request);
-    let content_length = header
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().expect("content length"))
-        })
-        .unwrap_or(0);
-    let mut body = vec![0_u8; content_length];
-    stream.read_exact(&mut body).expect("read request body");
-    String::from_utf8(body).expect("embedding request utf8")
-}
-
-impl PreservableTempDir {
-    fn new(inner: TempDir, preserve: Arc<AtomicBool>) -> Self {
-        Self {
-            inner: Some(inner),
-            preserve,
-        }
-    }
-}
-
-impl std::ops::Deref for PreservableTempDir {
-    type Target = TempDir;
-
-    fn deref(&self) -> &Self::Target {
-        self.inner.as_ref().expect("fixture root")
-    }
-}
-
-impl Drop for PreservableTempDir {
-    fn drop(&mut self) {
-        if self.preserve.load(Ordering::Acquire)
-            && let Some(root) = self.inner.take()
-        {
-            let _ = root.keep();
-        }
-    }
-}
-
-const FIXTURE_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Drop for StdioServer {
     fn drop(&mut self) {
-        let timed_out = !wait_for_fixture_workers(&self.worker_roots, FIXTURE_WORKER_DRAIN_TIMEOUT);
-        let timeout_cleanup = timed_out.then(|| {
-            if let Some(preserve) = self.preserve_fixture_roots.as_ref() {
-                preserve.store(true, Ordering::Release);
-            }
-            let reservations = fixture_worker_reservations(&self.worker_roots);
-            let termination = terminate_fixture_process_tree(self.child.id());
-            (reservations, termination)
-        });
-
         let _ = self.child.kill();
         let _ = self.child.wait();
-
-        if let Some((reservations, mut termination)) = timeout_cleanup {
-            let first_survivors = termination
-                .tracked_pids
-                .iter()
-                .copied()
-                .filter(|pid| process_is_running(*pid))
-                .collect::<Vec<_>>();
-            termination.attempts.extend(
-                first_survivors
-                    .iter()
-                    .map(|pid| force_terminate_process(*pid)),
-            );
-            if !first_survivors.is_empty() {
-                thread::sleep(Duration::from_millis(100));
-            }
-            let surviving_pids = termination
-                .tracked_pids
-                .iter()
-                .copied()
-                .filter(|pid| process_is_running(*pid))
-                .collect::<Vec<_>>();
-            let remaining_reservations = fixture_worker_reservations(&self.worker_roots);
-            let detail = format!(
-                "fixture-owned ready-repair workers did not drain within {:?}; preserved fixture roots; reservations={reservations:?}; termination_attempts={:?}; surviving_pids={surviving_pids:?}; remaining_reservations={remaining_reservations:?}",
-                FIXTURE_WORKER_DRAIN_TIMEOUT, termination.attempts
-            );
-            if thread::panicking() {
-                eprintln!("stdio fixture teardown failure while unwinding: {detail}");
-            } else {
-                panic!("stdio fixture teardown failure: {detail}");
-            }
-        }
     }
-}
-
-fn wait_for_fixture_workers(roots: &[PathBuf], timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if fixture_worker_reservations(roots).is_empty() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn fixture_worker_reservations(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut reservations = Vec::new();
-    for root in roots {
-        let mut pending = vec![root.clone()];
-        while let Some(path) = pending.pop() {
-            let Ok(children) = fs::read_dir(path) else {
-                continue;
-            };
-            for child in children.flatten() {
-                let path = child.path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.file_name().and_then(|name| name.to_str())
-                    == Some("ready-repair-enqueue.lock")
-                {
-                    reservations.push(path);
-                }
-            }
-        }
-    }
-    reservations
-}
-
-#[test]
-fn fixture_worker_wait_tracks_nested_reservations() {
-    let root = tempfile::tempdir().expect("fixture worker root");
-    let nested = root.path().join("sidecars").join("project");
-    fs::create_dir_all(&nested).expect("nested worker state");
-    let reservation = nested.join("ready-repair-enqueue.lock");
-    fs::write(&reservation, "fixture worker").expect("worker reservation");
-
-    assert!(!wait_for_fixture_workers(
-        &[root.path().to_path_buf()],
-        Duration::ZERO
-    ));
-    fs::remove_file(reservation).expect("remove worker reservation");
-    assert!(wait_for_fixture_workers(
-        &[root.path().to_path_buf()],
-        Duration::ZERO
-    ));
-}
-
-#[derive(Debug)]
-struct ProcessTreeTermination {
-    tracked_pids: Vec<u32>,
-    attempts: Vec<String>,
-}
-
-#[cfg(windows)]
-fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
-    let pid = pid.to_string();
-    let mut attempts = vec![run_taskkill(&pid, false)];
-    thread::sleep(Duration::from_millis(100));
-    for _ in 0..2 {
-        if !process_is_running(pid.parse().expect("numeric process id")) {
-            break;
-        }
-        attempts.push(run_taskkill(&pid, true));
-        thread::sleep(Duration::from_millis(100));
-    }
-    ProcessTreeTermination {
-        tracked_pids: vec![pid.parse().expect("numeric process id")],
-        attempts,
-    }
-}
-
-#[cfg(windows)]
-fn run_taskkill(pid: &str, force: bool) -> String {
-    let mut command = Command::new("taskkill");
-    command.args(["/PID", pid, "/T"]);
-    if force {
-        command.arg("/F");
-    }
-    match command.output() {
-        Ok(output) => format!(
-            "taskkill pid={pid} force={force} status={} stderr={}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => format!("taskkill pid={pid} force={force} failed: {error}"),
-    }
-}
-
-#[cfg(windows)]
-fn force_terminate_process(pid: u32) -> String {
-    run_taskkill(&pid.to_string(), true)
-}
-
-#[cfg(unix)]
-fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
-    let mut descendants = Vec::new();
-    collect_descendant_processes(pid, &mut descendants);
-    let mut tracked_pids = vec![pid];
-    tracked_pids.extend(descendants.iter().copied());
-    let mut attempts = tracked_pids
-        .iter()
-        .map(|pid| run_unix_kill("-TERM", *pid))
-        .collect::<Vec<_>>();
-    thread::sleep(Duration::from_millis(100));
-    for descendant in descendants.iter().rev() {
-        if process_is_running(*descendant) {
-            attempts.push(run_unix_kill("-KILL", *descendant));
-        }
-    }
-    if process_is_running(pid) {
-        attempts.push(run_unix_kill("-KILL", pid));
-    }
-    ProcessTreeTermination {
-        tracked_pids,
-        attempts,
-    }
-}
-
-#[cfg(unix)]
-fn collect_descendant_processes(parent: u32, descendants: &mut Vec<u32>) {
-    let Ok(output) = Command::new("pgrep")
-        .args(["-P", &parent.to_string()])
-        .output()
-    else {
-        return;
-    };
-    for child in String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-    {
-        if descendants.contains(&child) {
-            continue;
-        }
-        descendants.push(child);
-        collect_descendant_processes(child, descendants);
-    }
-}
-
-#[cfg(unix)]
-fn run_unix_kill(signal: &str, pid: u32) -> String {
-    match Command::new("kill")
-        .args([signal, &pid.to_string()])
-        .status()
-    {
-        Ok(status) => format!("kill {signal} {pid}: {status}"),
-        Err(error) => format!("kill {signal} {pid} failed: {error}"),
-    }
-}
-
-#[cfg(unix)]
-fn force_terminate_process(pid: u32) -> String {
-    run_unix_kill("-KILL", pid)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_fixture_process_tree(pid: u32) -> ProcessTreeTermination {
-    ProcessTreeTermination {
-        tracked_pids: vec![pid],
-        attempts: vec![format!(
-            "process-tree termination is unsupported on this platform for pid={pid}"
-        )],
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn force_terminate_process(pid: u32) -> String {
-    format!("forced process termination is unsupported on this platform for pid={pid}")
-}
-
-#[cfg(windows)]
-fn process_is_running(pid: u32) -> bool {
-    let pid = pid.to_string();
-    let Ok(output) = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-    else {
-        return true;
-    };
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-        line.split(',')
-            .nth(1)
-            .map(|value| value.trim().trim_matches('"'))
-            == Some(pid.as_str())
-    })
-}
-
-#[cfg(unix)]
-fn process_is_running(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_is_running(_pid: u32) -> bool {
-    true
 }
 
 fn write_tiny_rust_workspace(root: &Path) {
@@ -536,15 +142,8 @@ fn refresh_fixture_index(fixture: &StdioFixture) {
 }
 
 fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
-    let preserve = Arc::new(AtomicBool::new(false));
-    let workspace = PreservableTempDir::new(
-        tempfile::tempdir().expect("workspace dir"),
-        Arc::clone(&preserve),
-    );
-    let cache_dir = PreservableTempDir::new(
-        tempfile::tempdir().expect("cache dir"),
-        Arc::clone(&preserve),
-    );
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
 
     let mut command = test_support::cli_command();
@@ -579,21 +178,12 @@ fn indexed_fixture_with_embedding_mode(hash_embeddings: bool) -> StdioFixture {
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
-        ready_repair_worker_probe_exit_code: None,
-        managed_retrieval_preparation: false,
     }
 }
 
 fn unindexed_fixture() -> StdioFixture {
-    let preserve = Arc::new(AtomicBool::new(false));
-    let workspace = PreservableTempDir::new(
-        tempfile::tempdir().expect("workspace dir"),
-        Arc::clone(&preserve),
-    );
-    let cache_dir = PreservableTempDir::new(
-        tempfile::tempdir().expect("cache dir"),
-        Arc::clone(&preserve),
-    );
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
 
     StdioFixture {
@@ -608,71 +198,7 @@ fn unindexed_fixture() -> StdioFixture {
         dirty_marker_path: None,
         dirty_marker_project_root: None,
         local_refresh_timeout_ms: None,
-        ready_repair_worker_probe_exit_code: None,
-        managed_retrieval_preparation: false,
     }
-}
-
-fn full_retrieval_fixture() -> Result<Option<StdioFixture>, String> {
-    if !env_flag("CODESTORY_STDIO_FULL_RETRIEVAL_TESTS") {
-        return Ok(None);
-    }
-    let fixture = indexed_fixture_with_embedding_mode(false);
-    let output = test_support::cli_command()
-        .arg("retrieval")
-        .arg("index")
-        .arg("--refresh")
-        .arg("none")
-        .arg("--format")
-        .arg("json")
-        .arg("--project")
-        .arg(fixture.workspace.path())
-        .arg("--cache-dir")
-        .arg(fixture.cache_dir.path())
-        .output()
-        .expect("run retrieval index");
-    if !output.status.success() {
-        return Err(format!(
-            "full-retrieval stdio contract setup failed: retrieval index failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let status = test_support::cli_command()
-        .arg("retrieval")
-        .arg("status")
-        .arg("--format")
-        .arg("json")
-        .arg("--project")
-        .arg(fixture.workspace.path())
-        .arg("--cache-dir")
-        .arg(fixture.cache_dir.path())
-        .output()
-        .expect("run retrieval status");
-    if !status.status.success() {
-        return Err(format!(
-            "full-retrieval stdio contract setup failed: retrieval status failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&status.stdout),
-            String::from_utf8_lossy(&status.stderr)
-        ));
-    }
-    let status_json: Value = serde_json::from_slice(&status.stdout)
-        .map_err(|error| format!("full-retrieval status emitted invalid json: {error}"))?;
-    if status_json["retrieval_mode"] != json!("full") {
-        return Err(format!(
-            "full-retrieval stdio contract setup failed: retrieval status was not full: {status_json:#}"
-        ));
-    }
-    Ok(Some(fixture))
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
 
 fn write_managed_cli_fixture(plugin_data: &Path, version: &str) -> PathBuf {
@@ -702,7 +228,7 @@ fn write_managed_cli_fixture(plugin_data: &Path, version: &str) -> PathBuf {
 
 fn apply_fixture_embedding_env(command: &mut Command, hash_embeddings: bool) {
     if hash_embeddings {
-        command.env("CODESTORY_EMBED_RUNTIME_MODE", "hash");
+        command.env("CODESTORY_EMBED_ALLOW_CPU", "1");
     }
 }
 
@@ -723,15 +249,7 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         .stderr(Stdio::piped())
         .env("CODESTORY_CACHE_ROOT", state_root.join("cache"))
         .env("CODESTORY_STDIO_CACHE_ROOT", state_root.join("stdio-cache"))
-        .env("CODESTORY_PLUGIN_DATA", state_root.join("plugin-data"))
-        .env(
-            "CODESTORY_TEST_MANAGED_RETRIEVAL_PREPARATION",
-            if fixture.managed_retrieval_preparation {
-                "1"
-            } else {
-                "0"
-            },
-        );
+        .env("CODESTORY_PLUGIN_DATA", state_root.join("plugin-data"));
     apply_fixture_embedding_env(&mut command, fixture.hash_embeddings);
     if let Some(version) = &fixture.latest_release_version {
         command.env("CODESTORY_LATEST_RELEASE_VERSION", version);
@@ -760,12 +278,6 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
             timeout_ms.to_string(),
         );
     }
-    if let Some(exit_code) = fixture.ready_repair_worker_probe_exit_code {
-        command.env(
-            "CODESTORY_TEST_READY_REPAIR_WORKER_EXIT_CODE",
-            exit_code.to_string(),
-        );
-    }
     let mut child = command.spawn().expect("spawn stdio server");
 
     let stdin = child.stdin.take().expect("stdio stdin");
@@ -774,8 +286,6 @@ fn spawn_stdio_server(fixture: &StdioFixture) -> StdioServer {
         child,
         stdin,
         stdout,
-        worker_roots: vec![fixture.cache_dir.path().to_path_buf()],
-        preserve_fixture_roots: Some(Arc::clone(&fixture.workspace.preserve)),
     }
 }
 
@@ -789,10 +299,9 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("CODESTORY_EMBED_RUNTIME_MODE", "hash")
+        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
         .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
         .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
-        .env("CODESTORY_TEST_MANAGED_RETRIEVAL_PREPARATION", "0")
         .spawn()
         .expect("spawn multi-project stdio server");
     let stdin = child.stdin.take().expect("multi-project stdio stdin");
@@ -801,36 +310,6 @@ fn spawn_multi_project_stdio_server(cache_root: &Path) -> StdioServer {
         child,
         stdin,
         stdout,
-        worker_roots: vec![cache_root.to_path_buf()],
-        preserve_fixture_roots: None,
-    }
-}
-
-fn spawn_multi_project_stdio_server_with_project_network_config(cache_root: &Path) -> StdioServer {
-    let mut child = test_support::cli_command()
-        .arg("serve")
-        .arg("--stdio")
-        .arg("--multi-project")
-        .arg("--refresh")
-        .arg("full")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG", "1")
-        .env("CODESTORY_EMBED_ALLOW_CPU", "1")
-        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root)
-        .env("CODESTORY_PLUGIN_MULTI_PROJECT", "1")
-        .env("CODESTORY_TEST_MANAGED_RETRIEVAL_PREPARATION", "0")
-        .spawn()
-        .expect("spawn multi-project network-config stdio server");
-    let stdin = child.stdin.take().expect("multi-project stdio stdin");
-    let stdout = BufReader::new(child.stdout.take().expect("multi-project stdio stdout"));
-    StdioServer {
-        child,
-        stdin,
-        stdout,
-        worker_roots: vec![cache_root.to_path_buf()],
-        preserve_fixture_roots: None,
     }
 }
 
@@ -876,48 +355,6 @@ fn assert_tool_success(response: &Value, id: Value) -> &Value {
         .expect("tools/call success should include structuredContent")
 }
 
-fn assert_structured_citations_have_no_evidence(value: &Value) {
-    fn visit(value: &Value, citation_count: &mut usize) {
-        match value {
-            Value::Object(map) => {
-                if map.contains_key("node_id")
-                    && map.contains_key("display_name")
-                    && map.contains_key("score")
-                {
-                    *citation_count += 1;
-                    assert!(
-                        map.get("evidence_edge_ids")
-                            .and_then(Value::as_array)
-                            .is_none_or(|edges| edges.is_empty()),
-                        "citation should omit evidence edge ids when include_evidence=false: {value}"
-                    );
-                    assert!(
-                        map.get("retrieval_score_breakdown")
-                            .is_none_or(Value::is_null),
-                        "citation should omit retrieval score breakdown when include_evidence=false: {value}"
-                    );
-                }
-                for child in map.values() {
-                    visit(child, citation_count);
-                }
-            }
-            Value::Array(items) => {
-                for child in items {
-                    visit(child, citation_count);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut citation_count = 0;
-    visit(value, &mut citation_count);
-    assert!(
-        citation_count > 0,
-        "test fixture should return citations to prove evidence stripping: {value}"
-    );
-}
-
 fn assert_tool_error(response: &Value, id: Value) -> &Value {
     let result = assert_success_envelope(response, id);
     assert_eq!(
@@ -942,33 +379,6 @@ fn assert_tool_text_content<'a>(result: &'a Value, response: &Value) -> &'a str 
         })
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| panic!("tools/call result should include text content: {response}"))
-}
-
-fn assert_error_envelope(response: &Value, id: Value) -> &Value {
-    assert_eq!(response.get("jsonrpc"), Some(&json!("2.0")));
-    assert_eq!(response.get("id"), Some(&id));
-    assert!(
-        response.get("result").is_none(),
-        "error response should not include result: {response}"
-    );
-    let error = response.get("error").expect("error object");
-    assert!(
-        error.get("code").and_then(Value::as_i64).is_some(),
-        "error should include numeric code: {response}"
-    );
-    assert!(
-        error.get("message").and_then(Value::as_str).is_some(),
-        "error should include message: {response}"
-    );
-    error
-}
-
-fn assert_error_code(error: &Value, code: i64) {
-    assert_eq!(
-        error.get("code").and_then(Value::as_i64),
-        Some(code),
-        "unexpected JSON-RPC error code: {error}"
-    );
 }
 
 fn sorted_field_values<'a>(items: &'a Value, array_field: &str, field: &str) -> Vec<&'a str> {
@@ -1194,11 +604,10 @@ fn assert_allowed_surface(
     if expected_allowed {
         assert_eq!(verdict["status"], "ready");
     } else {
-        assert!(
-            verdict["minimum_next"]
-                .as_array()
-                .is_some_and(|commands| !commands.is_empty()),
-            "canonical verdict should include minimum repair guidance: {verdict}"
+        assert_eq!(
+            verdict.get("minimum_next"),
+            None,
+            "normal status must not ask the user to prepare retrieval manually: {verdict}"
         );
     }
 }
@@ -1210,10 +619,10 @@ fn assert_activation_surface(status: &Value, surface: &str) {
     assert_eq!(surface_status["allowed"], json!(true));
     assert_eq!(surface_status["activation_required"], json!(true));
     assert_eq!(surface_status["readiness_goal"], json!("local_navigation"));
-    assert_eq!(surface_status["failed_layer"], json!("local_index"));
+    assert!(surface_status.get("failed_layer").is_none());
     assert_eq!(
         status["readiness"][0]["status"],
-        json!("repair_index"),
+        json!("unavailable"),
         "callable bootstrap surfaces must not misreport the publication as ready: {status}"
     );
 }
@@ -1264,142 +673,6 @@ fn json_resource_content(result: &Value, uri: &str) -> Value {
         .unwrap_or_else(|| panic!("resource {uri} content should include JSON text: {content}"));
     serde_json::from_str(text)
         .unwrap_or_else(|error| panic!("resource {uri} should be parseable JSON: {error}\n{text}"))
-}
-
-fn write_active_repair_status_fixture(
-    fixture: &StdioFixture,
-    run_id: &str,
-    phase: &str,
-) -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as i64;
-    write_repair_status_fixture(fixture, run_id, phase, now, std::process::id())
-}
-
-fn write_abandoned_repair_status_fixture(
-    fixture: &StdioFixture,
-    run_id: &str,
-    phase: &str,
-) -> PathBuf {
-    let updated_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as i64
-        - 60_000;
-    write_repair_status_fixture(fixture, run_id, phase, updated_at, u32::MAX)
-}
-
-fn write_stale_live_repair_status_fixture(
-    fixture: &StdioFixture,
-    run_id: &str,
-    phase: &str,
-) -> PathBuf {
-    let updated_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_millis() as i64
-        - 60_000;
-    write_repair_status_fixture(fixture, run_id, phase, updated_at, std::process::id())
-}
-
-fn write_repair_status_fixture(
-    fixture: &StdioFixture,
-    run_id: &str,
-    phase: &str,
-    updated_at_epoch_ms: i64,
-    pid: u32,
-) -> PathBuf {
-    let canonical_root =
-        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let sidecar = test_sidecar_runtime(fixture, &canonical_root, run_id);
-    let status_path = sidecar
-        .layout
-        .state_file
-        .with_file_name("ready-repair-status.json");
-    let status_dir = status_path
-        .parent()
-        .expect("repair status parent")
-        .to_path_buf();
-    fs::create_dir_all(&status_dir).expect("create repair status dir");
-    let project_root = canonical_root
-        .to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    fs::write(
-        &status_path,
-        json!({
-            "schema_version": 1,
-            "status": "repairing",
-            "project_root": project_root,
-            "profile": "agent",
-            "run_id": run_id,
-            "attempt_id": format!("attempt:{run_id}"),
-            "namespace": sidecar.namespace,
-            "phase": phase,
-            "pid": pid,
-            "started_at_epoch_ms": updated_at_epoch_ms,
-            "updated_at_epoch_ms": updated_at_epoch_ms
-        })
-        .to_string(),
-    )
-    .expect("write repair status fixture");
-    status_path
-}
-
-fn test_sidecar_runtime(
-    fixture: &StdioFixture,
-    project: &Path,
-    run_id: &str,
-) -> codestory_retrieval::SidecarRuntimeConfig {
-    test_sidecar_runtime_in_cache(
-        project,
-        run_id,
-        &fixture
-            .cache_dir
-            .path()
-            .join("test-state")
-            .join("stdio-cache"),
-    )
-}
-
-fn test_sidecar_runtime_in_cache(
-    project: &Path,
-    run_id: &str,
-    cache_root: &Path,
-) -> codestory_retrieval::SidecarRuntimeConfig {
-    let defaults = codestory_retrieval::SidecarProcessDefaults::new(
-        cache_root.to_path_buf(),
-        codestory_retrieval::SidecarRuntimeDefaults::from_process_env(),
-    );
-    codestory_retrieval::SidecarRuntimeConfig::for_project_profile_with_process_defaults(
-        Some(project),
-        codestory_retrieval::SidecarProfile::Agent,
-        Some(run_id),
-        &defaults,
-        &codestory_retrieval::SidecarRuntimeOverrides::default(),
-    )
-}
-
-fn continuation_uris_for(node_id: &str) -> Vec<String> {
-    ["symbol", "snippet", "references", "trail"]
-        .iter()
-        .map(|kind| format!("codestory://{kind}/{node_id}"))
-        .collect()
-}
-
-fn assert_continuation_links(value: &Value, node_id: &str, context: &str) {
-    let mut strings = Vec::new();
-    string_values_recursive(value, &mut strings);
-    for expected in continuation_uris_for(node_id) {
-        assert!(
-            strings.iter().any(|candidate| *candidate == expected),
-            "{context} should expose continuation link {expected}: {value}"
-        );
-    }
 }
 
 fn assert_tool_safety_metadata(tool: &Value) {
@@ -1550,7 +823,7 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     let status_result = assert_success_envelope(&status_response, json!("status-unindexed"));
     let status = json_resource_content(status_result, "codestory://status");
 
-    assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
+    assert_eq!(status["readiness"][0]["status"], json!("unavailable"));
     assert!(status["index_publication"].is_null());
     assert_eq!(
         status["readiness"][0]["index"]["indexed_file_count"],
@@ -1559,8 +832,14 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
     for surface in ["ground", "files", "affected"] {
         assert_activation_surface(&status, surface);
     }
-    assert_allowed_surface(&status, "symbol", false, "local_navigation", "repair_index");
-    assert_allowed_surface(&status, "search", false, "agent_packet_search", "blocked");
+    assert_allowed_surface(&status, "symbol", false, "local_navigation", "unavailable");
+    assert_allowed_surface(
+        &status,
+        "search",
+        false,
+        "agent_packet_search",
+        "unavailable",
+    );
     assert_ground_activation_call(&status);
 
     let ground = send_json(
@@ -1779,209 +1058,15 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
             *expected_root,
             "status crossed project roots: {status}"
         );
-        assert!(
-            status["readiness_broker"]["operations"]
-                .as_array()
-                .is_some_and(|operations| operations.iter().all(|operation| {
-                    operation["workspace_root"].as_str().is_none_or(|root| {
-                        fs::canonicalize(root).is_ok_and(|observed| observed == *expected_root)
-                    })
-                })),
-            "readiness operation crossed project roots: {status}"
-        );
     }
     assert_ne!(first_status["storage_path"], second_status["storage_path"]);
-    assert_eq!(
-        first_status["readiness_broker"]["identity"]["project_identity_schema_version"],
-        3
-    );
-    assert_eq!(
-        second_status["readiness_broker"]["identity"]["project_identity_schema_version"],
-        3
-    );
-    assert_ne!(
-        first_status["readiness_broker"]["identity"]["project_id"],
-        second_status["readiness_broker"]["identity"]["project_id"]
-    );
-    assert_ne!(
-        first_status["readiness_broker"]["identity"]["workspace_id"],
-        second_status["readiness_broker"]["identity"]["workspace_id"]
-    );
-    assert_ne!(
-        first_status["retrieval_diagnostics"]["ownership"]["labels"]["dev.codestory.workspace_id"],
-        second_status["retrieval_diagnostics"]["ownership"]["labels"]["dev.codestory.workspace_id"]
-    );
-    assert_eq!(
-        first_status["retrieval_diagnostics"]["ownership"]["profile"],
-        second_status["retrieval_diagnostics"]["ownership"]["profile"],
-        "multi-project routing changed sidecar profile"
-    );
-    for pointer in [
-        "/project_root",
-        "/storage_path",
-        "/readiness_broker/identity/project_id",
-        "/readiness_broker/identity/workspace_id",
-        "/retrieval_diagnostics/ownership/labels/dev.codestory.workspace_id",
-        "/retrieval_diagnostics/ownership/profile",
-    ] {
+    for pointer in ["/project_root", "/storage_path", "/retrieval_mode"] {
         assert_eq!(
             first_status.pointer(pointer),
             first_status_again.pointer(pointer),
             "A/B/A status identity drifted at {pointer}"
         );
     }
-}
-
-#[test]
-fn multi_project_stdio_startup_snapshot_keeps_embedding_endpoints_isolated_across_a_b_a() {
-    let first = tempfile::tempdir().expect("first workspace");
-    let second = tempfile::tempdir().expect("second workspace");
-    let cache_root = tempfile::tempdir().expect("multi-project cache root");
-    let first_endpoint = FakeEmbeddingEndpoint::spawn(vec![1.0; 768]);
-    let second_endpoint = FakeEmbeddingEndpoint::spawn(vec![-1.0; 768]);
-    write_tiny_rust_workspace(first.path());
-    write_tiny_rust_workspace(second.path());
-    fs::write(
-        first.path().join(".codestory.toml"),
-        format!(
-            "embedding_endpoint = {:?}\nembedding_query_prefix = \"project-a:\"\nembedding_document_prefix = \"project-a:\"\n",
-            first_endpoint.url
-        ),
-    )
-    .expect("write first runtime config");
-    fs::write(
-        second.path().join(".codestory.toml"),
-        format!(
-            "embedding_endpoint = {:?}\nembedding_query_prefix = \"project-b:\"\nembedding_document_prefix = \"project-b:\"\n",
-            second_endpoint.url
-        ),
-    )
-    .expect("write second runtime config");
-
-    let mut server =
-        spawn_multi_project_stdio_server_with_project_network_config(cache_root.path());
-    let ground_request = |id: &str, project: &Path| {
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": {"name": "ground", "arguments": {"project": project, "budget": "strict"}}
-        })
-    };
-    writeln!(server.stdin, "{}", ground_request("config-a", first.path()))
-        .expect("queue project A activation");
-    writeln!(
-        server.stdin,
-        "{}",
-        ground_request("config-b", second.path())
-    )
-    .expect("queue project B activation");
-    server.stdin.flush().expect("flush A/B activation requests");
-    assert_tool_success(&read_json(&mut server), json!("config-a"));
-    assert_tool_success(&read_json(&mut server), json!("config-b"));
-
-    let first_before = first_endpoint.snapshot();
-    let second_before = second_endpoint.snapshot();
-    assert!(!first_before.is_empty(), "project A endpoint was not used");
-    assert!(!second_before.is_empty(), "project B endpoint was not used");
-    assert!(
-        first_before
-            .iter()
-            .all(|request| request.contains("project-a:") && !request.contains("project-b:")),
-        "project A endpoint received cross-project input: {first_before:?}"
-    );
-    assert!(
-        second_before
-            .iter()
-            .all(|request| request.contains("project-b:") && !request.contains("project-a:")),
-        "project B endpoint received cross-project input: {second_before:?}"
-    );
-
-    assert_tool_success(
-        &send_json(&mut server, ground_request("config-a-again", first.path())),
-        json!("config-a-again"),
-    );
-    let first_after = first_endpoint.snapshot();
-    let second_after = second_endpoint.snapshot();
-    assert!(
-        first_after.len() > first_before.len(),
-        "A again must reuse project A's retained endpoint"
-    );
-    assert_eq!(
-        second_after.len(),
-        second_before.len(),
-        "A again must not touch project B's endpoint"
-    );
-
-    let persisted_embeddings = |project: &Path| {
-        let canonical = fs::canonicalize(project).expect("canonical project");
-        let mut hash = 0xcbf29ce484222325_u64;
-        for byte in canonical.to_string_lossy().as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        let storage_path = cache_root
-            .path()
-            .join(format!("{hash:016x}"))
-            .join("codestory.db");
-        codestory_runtime::stored_semantic_embeddings_for_test(&storage_path)
-            .expect("read persisted semantic documents through runtime boundary")
-    };
-    let first_vectors = persisted_embeddings(first.path());
-    let second_vectors = persisted_embeddings(second.path());
-    assert!(
-        !first_vectors.is_empty(),
-        "project A persisted no embeddings"
-    );
-    assert!(
-        !second_vectors.is_empty(),
-        "project B persisted no embeddings"
-    );
-    assert!(
-        first_vectors
-            .iter()
-            .all(|vector| vector.len() == 768 && vector.iter().all(|value| *value > 0.0)),
-        "project A did not persist vectors returned by endpoint A"
-    );
-    assert!(
-        second_vectors
-            .iter()
-            .all(|vector| vector.len() == 768 && vector.iter().all(|value| *value < 0.0)),
-        "project B did not persist vectors returned by endpoint B"
-    );
-
-    assert!(
-        first_after
-            .iter()
-            .any(|request| request.contains("project-a:codestory health probe")),
-        "project A retained config never routed its semantic health query"
-    );
-    assert!(
-        second_after
-            .iter()
-            .any(|request| request.contains("project-b:codestory health probe")),
-        "project B retained config never routed its semantic health query"
-    );
-    let first_query = &first_endpoint.response_vector;
-    let second_query = &second_endpoint.response_vector;
-    let cosine = |left: &[f32], right: &[f32]| {
-        let dot = left
-            .iter()
-            .zip(right)
-            .map(|(left, right)| left * right)
-            .sum::<f32>();
-        let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
-        let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
-        dot / (left_norm * right_norm)
-    };
-    assert!(
-        cosine(first_query, &first_vectors[0]) > cosine(first_query, &second_vectors[0]),
-        "project A semantic query must prefer project A's persisted vectors"
-    );
-    assert!(
-        cosine(second_query, &second_vectors[0]) > cosine(second_query, &first_vectors[0]),
-        "project B semantic query must prefer project B's persisted vectors"
-    );
 }
 
 #[test]
@@ -2332,8 +1417,8 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
     );
     assert_eq!(
         symbols_limit.get("default"),
-        Some(&json!(50)),
-        "symbols.limit should document the compact root-symbol browse default: {symbols}"
+        Some(&json!(300)),
+        "symbols.limit should document the root-symbol browse default: {symbols}"
     );
     assert_eq!(
         symbols_limit.get("minimum"),
@@ -2342,7 +1427,7 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
     );
     assert_eq!(
         symbols_limit.get("maximum"),
-        Some(&json!(200)),
+        Some(&json!(2000)),
         "symbols.limit should document the stdio hard cap: {symbols}"
     );
 
@@ -3211,12 +2296,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "{compact}"
     );
     assert_eq!(compact["diagnostics_uri"], json!("codestory://status"));
-    for diagnostic in [
-        "allowed_surfaces",
-        "readiness_broker",
-        "retrieval_diagnostics",
-        "managed_retrieval",
-    ] {
+    for diagnostic in ["allowed_surfaces", "retrieval_diagnostics"] {
         assert!(compact.get(diagnostic).is_none(), "{compact}");
     }
     let compact_text = assert_tool_text_content(
@@ -3227,7 +2307,7 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     assert!(compact_text.contains("state: working_locally"));
     assert!(compact_text.contains("capability.local_navigation: ready"));
     assert!(compact_text.contains("next_action:"));
-    let local_summary = "Local navigation can use the current index.";
+    let local_summary = "Local repository navigation is ready.";
     assert_eq!(
         status.to_string().matches(local_summary).count(),
         1,
@@ -3255,8 +2335,8 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "status should expose the retrieval contract version: {status}"
     );
     assert!(
-        status["retrieval_diagnostics"]["sidecar_contract_version"].is_number(),
-        "retrieval diagnostics should expose the internal contract version: {status}"
+        status.get("retrieval_diagnostics").is_none(),
+        "normal status must keep engine diagnostics private: {status}"
     );
     assert!(
         status["server_executable"]
@@ -3293,23 +2373,9 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         "runtime truth should reuse plugin runtime launch evidence: {status}"
     );
     assert_eq!(
-        status["runtime_truth"]["managed_retrieval"],
-        json!("automatic"),
-        "runtime truth should make managed retrieval automatic: {status}"
-    );
-    assert_eq!(
         status["runtime_truth"]["retrieval_status_ref"],
         json!("readiness_lanes.agent_packet_search"),
         "runtime truth should reference the canonical agent readiness lane: {status}"
-    );
-    assert_eq!(
-        status["runtime_truth"]["readiness_broker_ref"],
-        json!("readiness_broker"),
-        "runtime truth should reference rather than clone broker diagnostics: {status}"
-    );
-    assert!(
-        status["runtime_truth"].get("readiness_broker").is_none(),
-        "runtime truth must not duplicate the variable-sized broker payload: {status}"
     );
     assert!(
         status
@@ -3345,30 +2411,25 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         json!(false),
         "fresh local graph state should not block local graph surfaces: {status}"
     );
+    assert!(status.get("retrieval_diagnostics").is_none());
+    assert!(status.get("legacy_semantic_diagnostics").is_none());
     assert!(
-        status["retrieval_diagnostics"]["retrieval_mode"].is_string(),
-        "status should expose retrieval diagnostics: {status}"
+        !contains_key_recursive(&status, &["sidecar", "full_repair"]),
+        "normal status must not expose engine lifecycle or repair fields: {status}"
     );
-    assert_eq!(
-        status["legacy_semantic_diagnostics"]["diagnostic_only"],
-        json!(true),
-        "legacy semantic readiness should be nested as diagnostic-only: {status}"
-    );
-    assert!(
-        contains_key_recursive(
-            &status,
-            &[
-                "semantic",
-                "semantic_readiness",
-                "semantic_ready",
-                "semantic_doc_count",
-                "doc_count",
-                "fallback",
-                "fallback_reason",
-            ],
-        ),
-        "status should include semantic readiness/doc count/fallback information: {status}"
-    );
+    for maintainer_only_field in [
+        "embedding_backend",
+        "embedding_device",
+        "adapter_identity",
+        "ggml_build_identity",
+        "semantic_doc_count",
+        "fallback_reason",
+    ] {
+        assert!(
+            !contains_key_recursive(&status, &[maintainer_only_field]),
+            "normal status must not expose maintainer-only engine details: {status}"
+        );
+    }
     let next_call_text = status["recommended_next_calls"].to_string();
     let readiness = status["readiness"]
         .as_array()
@@ -3379,46 +2440,22 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
     let local_default = readiness_lanes
         .get("local_default")
         .unwrap_or_else(|| panic!("status should include local_default lane: {status}"));
-    assert_eq!(
-        local_default["profile"],
-        json!("local"),
-        "local/default lane should report the local profile: {status}"
-    );
     assert!(
-        local_default["sidecar_mode"].is_string(),
-        "local/default lane should report sidecar mode: {status}"
+        local_default["retrieval_mode"].is_string(),
+        "local/default lane should report retrieval mode: {status}"
     );
-    assert!(
-        local_default["next_command"]
-            .as_str()
-            .is_some_and(|command| command.contains("--profile local")),
-        "local/default lane should expose a local-scoped next command: {status}"
-    );
+    assert_eq!(local_default["status"], json!("unavailable"));
+    assert_eq!(local_default.as_object().map(serde_json::Map::len), Some(2));
     let agent_lane = readiness_lanes
         .get("agent_packet_search")
         .unwrap_or_else(|| panic!("status should include agent_packet_search lane: {status}"));
     assert_eq!(
         agent_lane["status"],
-        json!("blocked"),
-        "agent lane should report blocked packet/search readiness: {status}"
+        json!("unavailable"),
+        "agent lane should report broad retrieval capability: {status}"
     );
-    assert_eq!(
-        agent_lane["profile"],
-        json!("agent"),
-        "agent lane must not collapse to local when no agent run exists: {status}"
-    );
-    assert!(
-        agent_lane["run_id"]
-            .as_str()
-            .is_some_and(|run_id| !run_id.is_empty()),
-        "agent lane should report a non-empty agent run id: {status}"
-    );
-    assert!(
-        agent_lane["next_command"]
-            .as_str()
-            .is_some_and(|command| command.contains("ready --goal agent --repair")),
-        "agent lane should expose the agent-scoped next command: {status}"
-    );
+    assert!(agent_lane["retrieval_mode"].is_string());
+    assert_eq!(agent_lane.as_object().map(serde_json::Map::len), Some(2));
     assert_eq!(
         status["runtime_truth"]["readiness_refs"]["local_graph"],
         json!("readiness[goal=local_navigation]"),
@@ -3455,26 +2492,28 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         assert_allowed_surface(&status, surface, true, "local_navigation", "ready");
     }
     for surface in ["packet", "search", "context"] {
-        assert_allowed_surface(&status, surface, false, "agent_packet_search", "blocked");
-        assert_eq!(
+        assert_allowed_surface(
+            &status,
+            surface,
+            false,
+            "agent_packet_search",
+            "unavailable",
+        );
+        assert!(
             status
                 .pointer(&format!("/allowed_surfaces/{surface}/repair_reason"))
-                .and_then(Value::as_str),
-            Some("retrieval_manifest_missing"),
-            "blocked agent surface should expose typed sidecar repair reason: {status}"
+                .is_none(),
+            "normal status should hide retrieval lifecycle reasons: {status}"
         );
     }
     assert!(
-        readiness
-            .iter()
-            .any(|verdict| verdict["goal"] == "agent_packet_search"
-                && verdict["minimum_next"]
-                    .as_array()
-                    .is_some_and(|commands| !commands.is_empty())
-                && verdict["full_repair"]
-                    .as_array()
-                    .is_some_and(|commands| !commands.is_empty())),
-        "status should expose agent readiness with minimum_next/full_repair: {status}"
+        readiness.iter().any(|verdict| {
+            verdict["goal"] == "agent_packet_search"
+                && verdict["status"] == "unavailable"
+                && verdict.get("minimum_next").is_none()
+                && verdict.get("full_repair").is_none()
+        }),
+        "status should expose capability state without manual retrieval instructions: {status}"
     );
     assert!(
         !next_call_text.contains("\"tool\":\"packet\"")
@@ -3485,350 +2524,6 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         status["recommended_next_calls"],
         json!([]),
         "diagnostics should not send agents through a repair loop; direct tools own preparation: {status}"
-    );
-}
-
-#[test]
-fn resources_read_status_reports_active_agent_repair_phase() {
-    let fixture = indexed_fixture();
-    let status_path =
-        write_active_repair_status_fixture(&fixture, "issue-661-proof", "Semantic finalize");
-    assert!(status_path.exists(), "repair status fixture should exist");
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "status-repairing",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-
-    let result = assert_success_envelope(&response, json!("status-repairing"));
-    let status = json_resource_content(result, "codestory://status");
-    let agent_lane = &status["readiness_lanes"]["agent_packet_search"];
-    assert_eq!(agent_lane["status"], json!("repairing"), "{status}");
-    assert_eq!(agent_lane["profile"], json!("agent"), "{status}");
-    assert_eq!(agent_lane["run_id"], json!("issue-661-proof"), "{status}");
-    assert_eq!(agent_lane["phase"], json!("Semantic finalize"), "{status}");
-    let broker_operation = status["readiness_broker"]["operations"]
-        .as_array()
-        .and_then(|operations| {
-            operations.iter().find(|operation| {
-                operation["operation_kind"] == json!("agent_repair")
-                    && operation["status"] == json!("running")
-            })
-        })
-        .unwrap_or_else(|| {
-            panic!("active repair lane requires matching broker operation: {status}")
-        });
-    assert_eq!(broker_operation["run_id"], agent_lane["run_id"], "{status}");
-    assert_eq!(broker_operation["phase"], agent_lane["phase"], "{status}");
-    assert!(
-        agent_lane["namespace"]
-            .as_str()
-            .is_some_and(|namespace| namespace.contains("issue-661-proof")),
-        "repairing status should include the active namespace: {status}"
-    );
-    assert_eq!(
-        status["runtime_truth"]["retrieval_status_ref"],
-        json!("readiness_lanes.agent_packet_search"),
-        "{status}"
-    );
-    assert!(
-        agent_lane["next_command"]
-            .as_str()
-            .is_some_and(|command| command.contains("retrieval status")
-                && command.contains("--profile agent")
-                && command.contains("--run-id")
-                && command.contains("issue-661-proof")),
-        "repairing lane should point at status proof, not a second repair: {status}"
-    );
-}
-
-#[test]
-fn resources_read_status_reports_abandoned_agent_repair_actions() {
-    let fixture = indexed_fixture();
-    let status_path =
-        write_abandoned_repair_status_fixture(&fixture, "aborted-run", "Embedding documents");
-    assert!(status_path.exists(), "repair status fixture should exist");
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "status-abandoned-repair",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-    let result = assert_success_envelope(&response, json!("status-abandoned-repair"));
-    let status = json_resource_content(result, "codestory://status");
-    assert_eq!(status["managed_retrieval"]["active_repair"], Value::Null);
-    assert_eq!(
-        status["managed_retrieval"]["abandoned_repair"]["status"],
-        json!("abandoned"),
-        "{status}"
-    );
-    assert_eq!(
-        status["managed_retrieval"]["abandoned_repair"]["run_id"],
-        json!("aborted-run"),
-        "{status}"
-    );
-    assert!(
-        status["managed_retrieval"]["abandoned_repair"]["inspect_command"]
-            .as_str()
-            .is_some_and(|command| command.contains("retrieval status")
-                && command.contains("--run-id")
-                && command.contains("aborted-run")),
-        "abandoned repair should include a bounded inspect command: {status}"
-    );
-    assert!(
-        status["managed_retrieval"]["abandoned_repair"]["cleanup_command"]
-            .as_str()
-            .is_some_and(|command| command.contains("retrieval down")
-                && command.contains("--run-id")
-                && command.contains("aborted-run")),
-        "abandoned repair should include an explicit cleanup command: {status}"
-    );
-
-    // The explicit MCP repair action retries past abandoned records. Do not call
-    // it from this contract test: it intentionally launches a real repair
-    // worker, which belongs in the live MCP proof lane rather than the cheap
-    // status-shape suite.
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn ground_activation_enqueues_managed_retrieval_preparation() {
-    let mut fixture = indexed_fixture();
-    fixture.managed_retrieval_preparation = true;
-    fixture.ready_repair_worker_probe_exit_code = Some(0);
-    let canonical_root =
-        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let result_path = test_sidecar_runtime(
-        &fixture,
-        &canonical_root,
-        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
-    )
-    .layout
-    .state_file
-    .with_file_name("ready-repair-result.json");
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "ground-auto-agent-repair",
-            "method": "tools/call",
-            "params": {"name": "ground", "arguments": {"budget": "strict"}}
-        }),
-    );
-    assert_tool_success(&response, json!("ground-auto-agent-repair"));
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !result_path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "enabled grounding activation did not enqueue the broker-backed worker"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-    let result: Value = serde_json::from_str(
-        &fs::read_to_string(&result_path).expect("automatic repair worker result"),
-    )
-    .expect("automatic repair worker result json");
-    assert_eq!(result["outcome"], json!("succeeded"), "{result}");
-    assert_eq!(
-        result["run_id"],
-        json!(codestory_retrieval::DEFAULT_AGENT_RUN_ID)
-    );
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn repeated_grounding_cools_down_identical_failed_agent_repair_across_servers() {
-    let mut fixture = indexed_fixture();
-    fixture.managed_retrieval_preparation = true;
-    fixture.ready_repair_worker_probe_exit_code = Some(17);
-    let canonical_root =
-        fs::canonicalize(fixture.workspace.path()).expect("canonical fixture root");
-    let result_path = test_sidecar_runtime(
-        &fixture,
-        &canonical_root,
-        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
-    )
-    .layout
-    .state_file
-    .with_file_name("ready-repair-result.json");
-
-    let ground = |server: &mut StdioServer, id: &str| {
-        let response = send_json(
-            server,
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/call",
-                "params": {"name": "ground", "arguments": {"budget": "strict"}}
-            }),
-        );
-        assert_tool_success(&response, json!(id));
-    };
-    let mut first_server = spawn_stdio_server(&fixture);
-    ground(&mut first_server, "ground-failed-repair-first");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !result_path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "first automatic repair did not finish"
-        );
-        thread::sleep(Duration::from_millis(25));
-    }
-    let first: Value = serde_json::from_str(
-        &fs::read_to_string(&result_path).expect("first automatic repair result"),
-    )
-    .expect("first automatic repair result json");
-    assert_eq!(first["outcome"], json!("failed"), "{first}");
-    assert!(first["auto_retry_fingerprint"].is_string(), "{first}");
-    let first_attempt = first["attempt_id"].clone();
-    drop(first_server);
-
-    let mut second_server = spawn_stdio_server(&fixture);
-    ground(&mut second_server, "ground-failed-repair-second");
-    thread::sleep(Duration::from_millis(250));
-    let second: Value = serde_json::from_str(
-        &fs::read_to_string(&result_path).expect("cooled-down automatic repair result"),
-    )
-    .expect("cooled-down automatic repair result json");
-    assert_eq!(second["attempt_id"], first_attempt, "{second}");
-
-    let unavailable = send_json(
-        &mut second_server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "search-after-terminal-preparation-failure",
-            "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {"query": "AppController"}
-            }
-        }),
-    );
-    let error = assert_tool_error(
-        &unavailable,
-        json!("search-after-terminal-preparation-failure"),
-    );
-    assert_eq!(error["code"], json!("codestory_unavailable"), "{error}");
-    assert_eq!(error["state"], json!("unavailable"), "{error}");
-    assert!(error.get("retry_tool").is_none(), "{error}");
-    assert!(error.get("retry_after_ms").is_none(), "{error}");
-
-    write_active_repair_status_fixture(
-        &fixture,
-        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
-        "retrying",
-    );
-    let mut retrying_server = spawn_stdio_server(&fixture);
-    let retrying = send_json(
-        &mut retrying_server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "search-during-retry-after-terminal-failure",
-            "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {"query": "AppController"}
-            }
-        }),
-    );
-    let retrying_error = assert_tool_error(
-        &retrying,
-        json!("search-during-retry-after-terminal-failure"),
-    );
-    assert_eq!(
-        retrying_error["code"],
-        json!("codestory_preparing"),
-        "{retrying_error}"
-    );
-    assert_eq!(retrying_error["state"], json!("preparing"));
-    assert!(
-        retrying_error["operation"]["id"]
-            .as_str()
-            .is_some_and(|id| !id.is_empty()),
-        "active preparation should return one retryable operation id: {retrying_error}"
-    );
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn resources_read_status_surfaces_stale_live_repair_without_mutation() {
-    let fixture = indexed_fixture();
-    let status_path = write_stale_live_repair_status_fixture(
-        &fixture,
-        codestory_retrieval::DEFAULT_AGENT_RUN_ID,
-        "Embedding documents",
-    );
-    let status_before = fs::read(&status_path).expect("stale-live status before read");
-    let state_dir = status_path.parent().expect("status parent");
-    let reservation_path = state_dir.join("ready-repair-enqueue.lock");
-    let result_path = state_dir.join("ready-repair-result.json");
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "status-stale-live-observational",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-    let status = json_resource_content(
-        assert_success_envelope(&response, json!("status-stale-live-observational")),
-        "codestory://status",
-    );
-
-    assert_eq!(
-        status["managed_retrieval"]["stale_live_repair"]["status"],
-        json!("stale_live"),
-        "{status}"
-    );
-    assert_eq!(
-        status["managed_retrieval"]["stale_live_repair"]["pid"],
-        json!(std::process::id()),
-        "{status}"
-    );
-    assert_eq!(
-        status["managed_retrieval"]["stale_live_repair"]["phase"],
-        json!("Embedding documents"),
-        "{status}"
-    );
-    assert!(
-        status["managed_retrieval"]["stale_live_repair"]
-            .get("cleanup_command")
-            .is_none(),
-        "live ownership must not expose destructive cleanup guidance: {status}"
-    );
-    assert!(
-        status["managed_retrieval"]["stale_live_repair"]["inspect_command"].is_string(),
-        "stale-live evidence should retain read-only inspection guidance: {status}"
-    );
-    assert_eq!(
-        fs::read(&status_path).expect("stale-live status after read"),
-        status_before,
-        "status read must not rewrite stale-live ownership"
-    );
-    assert!(
-        !reservation_path.exists(),
-        "status read must not reserve repair"
-    );
-    assert!(
-        !result_path.exists(),
-        "status read must not record a worker result"
     );
 }
 
@@ -3883,9 +2578,15 @@ fn resources_read_status_reports_dirty_marker_as_stale_local_index() {
         status["local_refresh"]["blocks_local_surfaces"],
         json!(true)
     );
-    assert_eq!(status["readiness"][0]["status"], json!("repair_index"));
+    assert_eq!(status["readiness"][0]["status"], json!("unavailable"));
     assert_activation_surface(&status, "ground");
-    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "unavailable",
+    );
 }
 
 #[test]
@@ -3929,7 +2630,13 @@ fn resources_read_status_uses_full_storage_state_for_dirty_marker_freshness() {
     );
     assert_fresh_freshness_counts(&status, "dirty marker older than full storage state");
     assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "unavailable",
+    );
 }
 
 #[test]
@@ -3966,7 +2673,13 @@ fn resources_read_status_reports_unknown_dirty_marker_without_blocking_local_ind
     );
     assert_fresh_freshness_counts(&status, "status with unknown dirty marker");
     assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "unavailable",
+    );
 }
 
 #[test]
@@ -4063,7 +2776,13 @@ fn resources_read_status_dirty_marker_fail_open_matrix() {
         }
         assert_fresh_freshness_counts(&status, name);
         assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
-        assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
+        assert_allowed_surface(
+            &status,
+            "packet",
+            false,
+            "agent_packet_search",
+            "unavailable",
+        );
     }
 }
 
@@ -4118,7 +2837,13 @@ fn update_available_is_advisory_and_preserves_compatible_surfaces() {
     assert!(status["readiness"][0].get("setup").is_none());
     assert_allowed_surface(&status, "ground", true, "local_navigation", "ready");
     assert_allowed_surface(&status, "files", true, "local_navigation", "ready");
-    assert_allowed_surface(&status, "packet", false, "agent_packet_search", "blocked");
+    assert_allowed_surface(
+        &status,
+        "packet",
+        false,
+        "agent_packet_search",
+        "unavailable",
+    );
     let next_call_text = status["recommended_next_calls"].to_string();
     assert!(
         !next_call_text.contains("install-codestory.ps1") && !next_call_text.contains("999.0.0"),
@@ -4263,7 +2988,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
     for surface in ["ground", "files", "affected"] {
         assert_activation_surface(&stale, surface);
     }
-    assert_allowed_surface(&stale, "symbol", false, "local_navigation", "repair_index");
+    assert_allowed_surface(&stale, "symbol", false, "local_navigation", "unavailable");
     assert_ground_activation_call(&stale);
 
     let activation = send_json(
@@ -4324,7 +3049,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
     );
     assert_eq!(
         refreshed_status["readiness_lanes"]["agent_packet_search"]["status"],
-        json!("blocked"),
+        json!("unavailable"),
         "packet/search should stay gated by the agent retrieval lane after local refresh: {refreshed_status}"
     );
     let status_next_call_text = refreshed_status["recommended_next_calls"].to_string();
@@ -4875,7 +3600,7 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     );
     assert_eq!(
         status["readiness_lanes"]["agent_packet_search"]["status"],
-        json!("blocked"),
+        json!("unavailable"),
         "local graph refresh must not make packet/search readiness claims: {status}"
     );
 
@@ -4993,10 +3718,12 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
     );
     let search_error =
         assert_tool_error(&search_response, json!("tool-refresh-search-still-blocked"));
-    assert_eq!(
-        search_error.pointer("/code").and_then(Value::as_str),
-        Some("codestory_preparing"),
-        "broad search should prepare automatically after local graph refresh: {search_response}"
+    assert!(
+        matches!(
+            search_error.pointer("/code").and_then(Value::as_str),
+            Some("codestory_preparing" | "codestory_unavailable")
+        ),
+        "broad search should use the normal readiness response after local graph refresh: {search_response}"
     );
 }
 
@@ -5172,189 +3899,6 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
 }
 
 #[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn resources_read_status_keeps_dirty_marker_separate_from_full_sidecar_readiness() {
-    let Some(mut fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}"))
-    else {
-        return;
-    };
-    let marker_path = write_dirty_marker_fixture(
-        &fixture,
-        "dirty-marker-full-sidecar.json",
-        json!({
-            "schema_version": 1,
-            "project_root": fixture.workspace.path().to_string_lossy(),
-            "dirty": true,
-            "updated_at": "2026-06-25T00:00:00.000Z",
-            "source": "test-hook",
-            "path_sample": ["src/runtime.rs"]
-        }),
-    );
-    fixture.dirty_marker_path = Some(marker_path);
-    fixture.dirty_marker_project_root = Some(fixture.workspace.path().to_path_buf());
-    let mut server = spawn_stdio_server(&fixture);
-
-    let status_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "full-retrieval-dirty-marker-status",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-    let status_result = assert_success_envelope(
-        &status_response,
-        json!("full-retrieval-dirty-marker-status"),
-    );
-    let status = json_resource_content(status_result, "codestory://status");
-
-    assert_eq!(status["dirty_marker"]["status"], json!("dirty_stale"));
-    assert_activation_surface(&status, "ground");
-    for surface in ["packet", "search", "context"] {
-        assert_allowed_surface(&status, surface, true, "agent_packet_search", "ready");
-    }
-}
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn transcript_calls_search_tool() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let status_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "full-retrieval-status",
-            "method": "resources/read",
-            "params": {"uri": "codestory://status"}
-        }),
-    );
-    let status_result = assert_success_envelope(&status_response, json!("full-retrieval-status"));
-    let status = json_resource_content(status_result, "codestory://status");
-    for surface in ["packet", "search", "context"] {
-        assert_allowed_surface(&status, surface, true, "agent_packet_search", "ready");
-    }
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 10,
-            "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {"query": "AppController"}
-            }
-        }),
-    );
-
-    let result = assert_tool_success(&response, json!(10));
-    assert!(
-        result["hits"].as_array().is_some_and(|hits| hits
-            .iter()
-            .any(|hit| hit["display_name"] == "AppController")),
-        "search tool should return AppController hit: {result}"
-    );
-    let app_controller_hit = result["hits"]
-        .as_array()
-        .expect("merged search hits")
-        .iter()
-        .find(|hit| hit["display_name"] == "AppController")
-        .unwrap_or_else(|| panic!("missing AppController hit: {result}"));
-    assert_eq!(
-        app_controller_hit["match_quality"],
-        json!("exact"),
-        "stdio search hits should satisfy the advertised match_quality schema: {app_controller_hit}"
-    );
-    let app_controller_id = app_controller_hit["node_id"]
-        .as_str()
-        .expect("AppController node id")
-        .to_string();
-
-    let snippet_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "snippet-schema-fields",
-            "method": "tools/call",
-            "params": {
-                "name": "snippet",
-                "arguments": {"id": app_controller_id}
-            }
-        }),
-    );
-    let snippet_result = assert_tool_success(&snippet_response, json!("snippet-schema-fields"));
-    assert_eq!(
-        snippet_result["scope"],
-        json!("line_context"),
-        "stdio snippet should emit its scope: {snippet_result}"
-    );
-    assert_eq!(
-        snippet_result["requested_context"],
-        json!(4),
-        "stdio snippet should emit requested_context: {snippet_result}"
-    );
-    assert!(
-        snippet_result["snippet_truncated"].is_boolean(),
-        "stdio snippet should emit snippet_truncated: {snippet_result}"
-    );
-
-    let symbol_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "symbol-related-hits",
-            "method": "tools/call",
-            "params": {
-                "name": "symbol",
-                "arguments": {"query": "configure", "choose": 1}
-            }
-        }),
-    );
-    let symbol_result = assert_tool_success(&symbol_response, json!("symbol-related-hits"));
-    let related_hits = symbol_result["related_hits"]
-        .as_array()
-        .unwrap_or_else(|| panic!("symbol related_hits should be an array: {symbol_result}"));
-    assert!(
-        related_hits
-            .iter()
-            .any(|hit| hit.get("match_quality").is_none()),
-        "stdio symbol related_hits should exercise optional match_quality omission: {symbol_result}"
-    );
-
-    let symbols_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "symbols-structured",
-            "method": "tools/call",
-            "params": {
-                "name": "symbols",
-                "arguments": {"limit": 2}
-            }
-        }),
-    );
-
-    let symbols_result = assert_tool_success(&symbols_response, json!("symbols-structured"));
-    let symbols = symbols_result["symbols"].as_array().unwrap_or_else(|| {
-        panic!("symbols tool should return an object with symbols: {symbols_result}")
-    });
-    assert!(
-        !symbols.is_empty() && symbols.len() <= 2,
-        "symbols tool should respect the requested cap: {symbols_result}"
-    );
-    assert_eq!(
-        symbols_result["returned_count"],
-        json!(symbols.len()),
-        "symbols should report how many rows are in the bounded response: {symbols_result}"
-    );
-}
-
-#[test]
 fn search_tool_retries_only_while_managed_preparation_is_live() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
@@ -5415,610 +3959,3 @@ fn search_tool_retries_only_while_managed_preparation_is_live() {
         );
     }
 }
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn context_tool_maps_target_id_to_deep_browser_request() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let search_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "context-focus-search",
-            "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {"query": "AppController"}
-            }
-        }),
-    );
-    let search_result = assert_tool_success(&search_response, json!("context-focus-search"));
-    let node_id = search_result["hits"]
-        .as_array()
-        .expect("merged search hits")
-        .iter()
-        .find(|hit| hit["display_name"] == "AppController")
-        .and_then(|hit| hit["node_id"].as_str())
-        .unwrap_or_else(|| panic!("missing AppController node id: {search_result}"))
-        .to_string();
-
-    let context_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "context-focus",
-            "method": "tools/call",
-            "params": {
-                "name": "context",
-                "arguments": {
-                    "id": node_id,
-                    "max_results": 4
-                }
-            }
-        }),
-    );
-
-    let packet = assert_tool_success(&context_response, json!("context-focus"));
-    assert_eq!(
-        packet.pointer("/retrieval_trace/resolved_profile"),
-        Some(&json!("investigate")),
-        "stdio context should use the investigation preset by default: {packet}"
-    );
-    assert!(
-        packet
-            .get("summary")
-            .and_then(Value::as_str)
-            .is_some_and(|summary| summary.contains("DB-first retrieval")),
-        "stdio context should return the DB-first labeled packet after local-agent removal: {packet}"
-    );
-    assert!(
-        !packet.to_string().contains("local_agent"),
-        "stdio context should not leak removed local-agent fields: {packet}"
-    );
-    let neighborhood_step = packet
-        .pointer("/retrieval_trace/steps")
-        .and_then(Value::as_array)
-        .and_then(|steps| steps.iter().find(|step| step["kind"] == "neighborhood"))
-        .unwrap_or_else(|| panic!("missing neighborhood step in context trace: {packet}"));
-    assert!(
-        neighborhood_step
-            .get("input")
-            .and_then(Value::as_array)
-            .is_some_and(|fields| fields
-                .iter()
-                .any(|field| field["key"] == "center_id" && field["value"] == node_id)),
-        "stdio context.id should seed the browser focus node: {neighborhood_step}"
-    );
-}
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn packet_tool_returns_budgeted_sufficiency_contract() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "packet-contract",
-            "method": "tools/call",
-            "params": {
-                "name": "packet",
-                "arguments": {
-                    "question": "Explain how AppController routes repository indexing",
-                    "budget": "tiny",
-                    "task_class": "architecture_explanation"
-                }
-            }
-        }),
-    );
-
-    let packet = assert_tool_success(&response, json!("packet-contract"));
-    let text = response
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("stdio packet should include readable text content: {response}"));
-    assert!(
-        text.contains("packet_id:") && text.contains("sufficiency:"),
-        "stdio packet text should summarize packet identity and sufficiency: {text}"
-    );
-    for expected in [
-        "budget:",
-        "truncated:",
-        "unsafe_to_claim:",
-        "pagination:",
-        "repo_content_boundary:",
-        "gaps:",
-        "open_next:",
-        "follow_up_commands:",
-    ] {
-        assert!(
-            text.contains(expected),
-            "stdio packet text should name {expected}: {text}"
-        );
-    }
-    assert!(
-        !text.trim_start().starts_with('{'),
-        "stdio packet text should be a digest, not duplicated JSON: {text}"
-    );
-    assert!(
-        !text.contains("\"retrieval_trace\""),
-        "stdio packet text should leave full traces in structuredContent only: {text}"
-    );
-    assert_eq!(
-        packet["question"], "Explain how AppController routes repository indexing",
-        "stdio packet should preserve the requested question: {packet}"
-    );
-    assert_eq!(
-        packet["budget"]["requested"], "tiny",
-        "stdio packet should honor the requested budget: {packet}"
-    );
-    let packet_bytes = serde_json::to_vec(packet)
-        .expect("serialize packet content")
-        .len();
-    let used_output_bytes = packet
-        .pointer("/budget/used/output_bytes")
-        .and_then(Value::as_u64)
-        .expect("packet budget should include output byte usage");
-    let max_output_bytes = packet
-        .pointer("/budget/limits/max_output_bytes")
-        .and_then(Value::as_u64)
-        .expect("packet budget should include output byte limit");
-    assert!(
-        used_output_bytes <= max_output_bytes,
-        "packet should fit inside its advertised output budget: {packet}"
-    );
-    assert!(
-        packet_bytes <= max_output_bytes as usize,
-        "stdio structured packet should fit inside its advertised output budget: {packet}"
-    );
-    assert_eq!(
-        packet["plan"]["task_class"], "architecture_explanation",
-        "stdio packet should expose the planner task class: {packet}"
-    );
-    assert!(
-        packet["plan"]["queries"]
-            .as_array()
-            .is_some_and(|queries| !queries.is_empty()),
-        "stdio packet should expose planned retrieval queries: {packet}"
-    );
-    assert!(
-        packet
-            .pointer("/answer/retrieval_trace/steps")
-            .and_then(Value::as_array)
-            .is_some_and(|steps| !steps.is_empty()),
-        "stdio packet should expose the underlying retrieval trace: {packet}"
-    );
-    assert!(
-        packet
-            .pointer("/sufficiency/status")
-            .and_then(Value::as_str)
-            .is_some(),
-        "stdio packet should include a sufficiency status: {packet}"
-    );
-    assert!(
-        packet
-            .pointer("/retrieval_trace_summary/source_read_steps")
-            .and_then(Value::as_u64)
-            .is_some(),
-        "stdio packet should include retrieval trace summary counters: {packet}"
-    );
-
-    let repeated_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "packet-contract-repeat",
-            "method": "tools/call",
-            "params": {
-                "name": "packet",
-                "arguments": {
-                    "question": "Explain how AppController routes repository indexing",
-                    "budget": "tiny",
-                    "task_class": "architecture_explanation"
-                }
-            }
-        }),
-    );
-    let repeated_packet = assert_tool_success(&repeated_response, json!("packet-contract-repeat"));
-    assert_eq!(
-        repeated_packet, packet,
-        "identical stdio packet requests should reuse the warm packet response without changing the structured payload"
-    );
-}
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn structured_packet_and_context_honor_include_evidence_false() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let packet_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "packet-no-evidence",
-            "method": "tools/call",
-            "params": {
-                "name": "packet",
-                "arguments": {
-                    "question": "Explain how AppController routes repository indexing",
-                    "budget": "tiny",
-                    "task_class": "architecture_explanation",
-                    "include_evidence": false
-                }
-            }
-        }),
-    );
-    let packet = assert_tool_success(&packet_response, json!("packet-no-evidence"));
-    assert_structured_citations_have_no_evidence(packet);
-
-    let context_response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "context-no-evidence",
-            "method": "tools/call",
-            "params": {
-                "name": "context",
-                "arguments": {
-                    "query": "AppController",
-                    "include_evidence": false
-                }
-            }
-        }),
-    );
-    let context = assert_tool_success(&context_response, json!("context-no-evidence"));
-    assert_structured_citations_have_no_evidence(context);
-}
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn search_tool_exposes_continuation_links_and_clamps_tiny_payloads() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "search-continuations",
-            "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {"query": "AppController", "limit": 500}
-            }
-        }),
-    );
-
-    let result = assert_tool_success(&response, json!("search-continuations"));
-    assert!(
-        result["limit_per_source"]
-            .as_u64()
-            .is_some_and(|limit| limit <= 50),
-        "search limit should be clamped to the documented max: {result}"
-    );
-    let response_size = serde_json::to_vec(&response)
-        .expect("serialize response")
-        .len();
-    assert!(
-        response_size < 64 * 1024,
-        "tiny fixture search response should stay bounded, got {response_size} bytes: {result}"
-    );
-    let hits = result["hits"].as_array().expect("merged search hits");
-    assert!(
-        hits.len() <= 50,
-        "search indexed hits should respect the documented page cap: {result}"
-    );
-    let hit = hits
-        .iter()
-        .find(|hit| hit["display_name"] == "AppController")
-        .unwrap_or_else(|| panic!("missing AppController hit: {result}"));
-    let node_id = hit["node_id"].as_str().expect("hit node id");
-    assert_continuation_links(hit, node_id, "search hit");
-}
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn search_tool_does_not_offer_symbol_links_for_non_resolvable_repo_text_hits() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "repo-text-continuations",
-            "method": "tools/call",
-            "params": {
-                "name": "search",
-                "arguments": {
-                    "query": "workspace:{project_name}",
-                    "repo_text": "on",
-                    "limit": 10
-                }
-            }
-        }),
-    );
-
-    let result = assert_tool_success(&response, json!("repo-text-continuations"));
-    let hits = result["hits"].as_array().expect("merged search hits");
-    let non_resolvable_hit = hits
-        .iter()
-        .find(|hit| hit["resolvable"] == json!(false))
-        .unwrap_or_else(|| panic!("expected a non-resolvable repo-text hit: {result}"));
-    assert!(
-        non_resolvable_hit.get("links").is_none(),
-        "non-resolvable repo-text hits should not advertise symbol/snippet/trail continuations: {non_resolvable_hit}"
-    );
-    assert_eq!(
-        non_resolvable_hit["trust"], "untrusted_repo_evidence",
-        "repo-text hits should carry the trust-boundary marker: {non_resolvable_hit}"
-    );
-    assert!(
-        non_resolvable_hit.get("untrusted_repo_excerpt").is_some(),
-        "repo-text hits with excerpts should expose the labeled excerpt field: {non_resolvable_hit}"
-    );
-}
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn definition_tool_exposes_symbol_snippet_references_and_trail_links() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "definition-continuations",
-            "method": "tools/call",
-            "params": {
-                "name": "definition",
-                "arguments": {"query": "AppController"}
-            }
-        }),
-    );
-
-    let result = assert_tool_success(&response, json!("definition-continuations"));
-    let node_id = result
-        .pointer("/definition/node_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            result
-                .pointer("/resolution/resolved/node_id")
-                .and_then(Value::as_str)
-        })
-        .expect("definition result node id");
-    assert_continuation_links(result, node_id, "definition result");
-}
-
-#[test]
-#[ignore = "live full-retrieval stdio success contract; set CODESTORY_STDIO_FULL_RETRIEVAL_TESTS=1 after preparing real sidecars"]
-fn symbol_tool_reports_ambiguous_targets_and_choose_resolves_displayed_number() {
-    let Some(fixture) = full_retrieval_fixture().unwrap_or_else(|error| panic!("{error}")) else {
-        return;
-    };
-    let mut server = spawn_stdio_server(&fixture);
-
-    let ambiguous = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "ambiguous-symbol",
-            "method": "tools/call",
-            "params": {
-                "name": "symbol",
-                "arguments": {"query": "configure"}
-            }
-        }),
-    );
-    let error = assert_tool_error(&ambiguous, json!("ambiguous-symbol"));
-    assert_eq!(
-        error.pointer("/code").and_then(Value::as_str),
-        Some("ambiguous_target"),
-        "stdio symbol ambiguity should expose structured error data: {ambiguous}"
-    );
-    let alternatives = error
-        .pointer("/alternatives")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("ambiguous alternatives: {ambiguous}"));
-    assert!(alternatives.len() >= 2);
-    let second_id = alternatives[1]
-        .get("node_id")
-        .and_then(Value::as_str)
-        .expect("second alternative node id")
-        .to_string();
-
-    let chosen = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": "chosen-symbol",
-            "method": "tools/call",
-            "params": {
-                "name": "symbol",
-                "arguments": {"query": "configure", "choose": 2}
-            }
-        }),
-    );
-    let result = assert_tool_success(&chosen, json!("chosen-symbol"));
-    assert_eq!(
-        result.pointer("/node/id").and_then(Value::as_str),
-        Some(second_id.as_str()),
-        "stdio symbol choose should resolve displayed alternative #2: {chosen}"
-    );
-}
-
-#[test]
-fn unknown_method_returns_jsonrpc_error() {
-    let fixture = indexed_fixture();
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({"jsonrpc": "2.0", "id": 20, "method": "codestory/nope"}),
-    );
-
-    let error = assert_error_envelope(&response, json!(20));
-    assert_error_code(error, -32601);
-    let message = error["message"]
-        .as_str()
-        .expect("error message")
-        .to_ascii_lowercase();
-    assert!(
-        message.contains("method not found") || message.contains("unknown method"),
-        "unknown method message should be stable: {response}"
-    );
-}
-
-#[test]
-fn invalid_json_returns_parse_error_with_null_id() {
-    let fixture = indexed_fixture();
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_line(
-        &mut server,
-        r#"{"jsonrpc":"2.0","id":21,"method":"tools/list""#,
-    );
-
-    let error = assert_error_envelope(&response, Value::Null);
-    assert_error_code(error, -32700);
-    let message = error["message"]
-        .as_str()
-        .expect("error message")
-        .to_ascii_lowercase();
-    assert!(
-        message.contains("parse error") || message.contains("json"),
-        "invalid JSON message should mention parsing: {response}"
-    );
-}
-
-#[test]
-fn oversized_stdio_frame_returns_structured_protocol_error() {
-    let fixture = indexed_fixture();
-    let mut server = spawn_stdio_server(&fixture);
-    let oversized = "x".repeat(1024 * 1024 + 1);
-
-    let response = send_line(&mut server, &oversized);
-
-    let error = assert_error_envelope(&response, Value::Null);
-    assert_error_code(error, -32700);
-    assert_eq!(
-        error.pointer("/data/code").and_then(Value::as_str),
-        Some("stdio_frame_too_large"),
-        "oversized frame should use a structured protocol error: {response}"
-    );
-    assert_eq!(
-        error
-            .pointer("/data/max_frame_bytes")
-            .and_then(Value::as_u64),
-        Some(1024 * 1024),
-        "oversized frame error should report the configured byte limit: {response}"
-    );
-    assert!(
-        error
-            .pointer("/data/line_bytes")
-            .and_then(Value::as_u64)
-            .is_some_and(|bytes| bytes > 1024 * 1024),
-        "oversized frame error should report observed line bytes: {response}"
-    );
-
-    let follow_up = send_json(
-        &mut server,
-        json!({"jsonrpc": "2.0", "id": "after-oversized", "method": "initialize"}),
-    );
-    assert_success_envelope(&follow_up, json!("after-oversized"));
-}
-
-#[test]
-fn bad_tool_call_args_return_jsonrpc_error() {
-    let fixture = indexed_fixture();
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 22,
-            "method": "tools/call",
-            "params": {"arguments": {"query": "AppController"}}
-        }),
-    );
-
-    let error = assert_error_envelope(&response, json!(22));
-    assert_error_code(error, -32602);
-    assert!(
-        error["message"]
-            .as_str()
-            .expect("error message")
-            .contains("tool"),
-        "bad tools/call args should name the tool problem: {response}"
-    );
-}
-
-#[test]
-fn not_found_resource_returns_jsonrpc_error() {
-    let fixture = indexed_fixture();
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 23,
-            "method": "resources/read",
-            "params": {"uri": "codestory://missing/resource"}
-        }),
-    );
-
-    let error = assert_error_envelope(&response, json!(23));
-    assert_error_code(error, -32602);
-    let message = error["message"].as_str().expect("error message");
-    assert!(
-        message.contains("unknown resource") || message.contains("not found"),
-        "not-found resource message should be stable: {response}"
-    );
-}
-
-#[test]
-fn unknown_prompt_returns_jsonrpc_error() {
-    let fixture = indexed_fixture();
-    let mut server = spawn_stdio_server(&fixture);
-
-    let response = send_json(
-        &mut server,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 24,
-            "method": "prompts/get",
-            "params": {"name": "not_a_prompt"}
-        }),
-    );
-
-    let error = assert_error_envelope(&response, json!(24));
-    assert_error_code(error, -32602);
-    assert!(
-        error["message"]
-            .as_str()
-            .expect("error message")
-            .contains("Unknown prompt"),
-        "unknown prompt message should identify the missing prompt: {response}"
-    );
-}
-mod test_support;
