@@ -128,8 +128,8 @@ candidate never weakens the last known-good publication.
 ## Reader protocol
 
 1. Open one matching core SQLite read transaction.
-2. Cheaply validate immutable manifest, vector attestation, producer evidence,
-   and the live engine identity.
+2. Validate the immutable manifest, exact vector database bytes and canonical
+   row digest, anchor coverage, producer evidence, and live engine identity.
 3. Retain the referenced lexical/vector/SCIP generations and engine residency.
 4. Execute candidate work and resolve files, roles, and node IDs through that
    same session.
@@ -138,8 +138,9 @@ candidate never weakens the last known-good publication.
 Query and resolution share one pinned session; they never reopen “whatever is
 current” for numeric candidate resolution. A publication change yields the
 typed `publication_changed` error and permits one whole-operation runtime retry.
-Deep corpus validation belongs at build, promotion, readiness, or explicit
-health boundaries, not on every query.
+The complete response owns one admission check and pin even when packet or
+agent planning issues several retrieval subqueries. No nested adapter repeats
+the attestation scan or opens another generation.
 
 ## Readiness
 

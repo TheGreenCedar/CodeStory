@@ -6268,13 +6268,6 @@ fn sync_llm_symbol_projection_for_runtime(
         return Err(indexing_cancelled_error());
     }
 
-    if !runtime.retrieval.hybrid_enabled {
-        if hydrate_semantic_docs {
-            engine.index_llm_symbol_docs(Vec::new());
-        }
-        return Ok(stats);
-    }
-
     let updated_at_epoch_ms = current_epoch_ms();
 
     let existing_docs = storage
@@ -9860,6 +9853,7 @@ impl AppController {
 
         Ok(SearchResultsDto {
             query: original_query,
+            retrieval_publication: None,
             retrieval,
             retrieval_shadow,
             freshness,
@@ -11685,6 +11679,15 @@ fn index_full_for_runtime(
         let _ = staged.discard();
         return Err(error);
     }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete dense anchor inputs: {error}"
+        )));
+    }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
         return Err(ApiError::internal(format!(
@@ -12158,6 +12161,15 @@ where
     {
         let _ = staged.discard();
         return Err(error);
+    }
+    if let Err(error) = staged
+        .store_mut()
+        .publish_dense_anchor_generation(&publication, SEMANTIC_POLICY_VERSION)
+    {
+        let _ = staged.discard();
+        return Err(ApiError::internal(format!(
+            "Failed to publish complete dense anchor inputs: {error}"
+        )));
     }
     if let Err(error) = staged.store_mut().put_index_publication(&publication) {
         let _ = staged.discard();
@@ -16620,6 +16632,14 @@ fn build_llm_symbol_doc_text() -> String {
                 && anchor.source_identity.starts_with("core:")
                 && !anchor.text.is_empty()
         }));
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("core publication")
+            .expect("complete core publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("complete dense anchor manifest");
+        assert_eq!(manifest.anchor_count as usize, anchors.len());
         assert!(
             storage
                 .get_all_llm_symbol_docs()
@@ -16627,6 +16647,95 @@ fn build_llm_symbol_doc_text() -> String {
                 .is_empty(),
             "core indexing must not persist vectors"
         );
+    }
+
+    #[test]
+    fn unchanged_incremental_refresh_rebinds_the_complete_dense_anchor_generation() {
+        let _env = hybrid_test_env();
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("full index");
+        let first_storage = Storage::open(&storage_path).expect("first storage");
+        let first_publication = first_storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        let first_manifest = first_storage
+            .validate_dense_anchor_publication(&first_publication)
+            .expect("first dense manifest");
+        drop(first_storage);
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("unchanged incremental index");
+        let storage = Storage::open(&storage_path).expect("incremental storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("incremental publication")
+            .expect("complete incremental publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("incremental dense manifest");
+        assert_eq!(manifest.anchor_digest, first_manifest.anchor_digest);
+        assert_ne!(manifest.core_run_id, first_manifest.core_run_id);
+        let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        assert!(
+            storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("carried dense anchors")
+                .iter()
+                .all(|anchor| anchor.source_identity == expected_source)
+        );
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn core_dense_anchor_publication_ignores_disabled_retrieval_intent() {
+        let _lock = process_env_test_lock();
+        let _hybrid = EnvGuard::set(HYBRID_RETRIEVAL_ENABLED_ENV, "false");
+        let workspace = copy_tictactoe_workspace();
+        let storage_path = workspace.path().join(".cache").join("codestory.db");
+        let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                workspace.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("open project summary");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("core index without retrieval activation");
+
+        let storage = Storage::open(&storage_path).expect("core storage");
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("core publication")
+            .expect("complete core publication");
+        let manifest = storage
+            .validate_dense_anchor_publication(&publication)
+            .expect("dense anchors are complete without retrieval activation");
+        assert!(manifest.anchor_count > 0);
+        assert!(
+            storage
+                .get_all_llm_symbol_docs()
+                .expect("legacy docs")
+                .is_empty()
+        );
+        assert!(controller.state.lock().search_engine.is_none());
     }
 
     #[test]

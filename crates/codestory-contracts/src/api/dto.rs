@@ -318,7 +318,18 @@ pub struct EmbeddingVectorProducerEvidenceDto {
 pub struct EmbeddingVectorEvidenceCompatibilityDto {
     pub compatible: bool,
     pub migration_required: bool,
+    pub migration_disposition: EmbeddingVectorEvidenceMigrationDispositionDto,
     pub mismatches: Vec<String>,
+}
+
+/// The only supported migration for immutable vector evidence is rebuilding a
+/// complete generation. Unknown future evidence is never rewritten or guessed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingVectorEvidenceMigrationDispositionDto {
+    Current,
+    RebuildRequired,
+    UnsupportedFutureVersion,
 }
 
 impl EmbeddingVectorProducerEvidenceDto {
@@ -415,8 +426,20 @@ impl EmbeddingVectorProducerEvidenceDto {
     /// Compare expected evidence with observed evidence, including publication identity.
     pub fn compatibility_with(&self, observed: &Self) -> EmbeddingVectorEvidenceCompatibilityDto {
         let mut mismatches = observed.validation_errors();
+        let migration_disposition = match observed
+            .schema_version
+            .cmp(&EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION)
+        {
+            std::cmp::Ordering::Less => {
+                EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+            }
+            std::cmp::Ordering::Equal => EmbeddingVectorEvidenceMigrationDispositionDto::Current,
+            std::cmp::Ordering::Greater => {
+                EmbeddingVectorEvidenceMigrationDispositionDto::UnsupportedFutureVersion
+            }
+        };
         let migration_required =
-            observed.schema_version != EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION;
+            migration_disposition != EmbeddingVectorEvidenceMigrationDispositionDto::Current;
         macro_rules! compare {
             ($field:literal, $left:expr, $right:expr) => {
                 if $left != $right && !mismatches.iter().any(|entry| entry == $field) {
@@ -446,6 +469,7 @@ impl EmbeddingVectorProducerEvidenceDto {
         EmbeddingVectorEvidenceCompatibilityDto {
             compatible: mismatches.is_empty(),
             migration_required,
+            migration_disposition,
             mismatches,
         }
     }
@@ -865,6 +889,9 @@ pub struct SearchPlanDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchResultsDto {
     pub query: String,
+    /// Exact complete retrieval publication used to build this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
     pub retrieval: RetrievalStateDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_shadow: Option<RetrievalShadowDto>,
@@ -2034,6 +2061,9 @@ pub struct PacketSidecarQueryDiagnosticDto {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AgentRetrievalTraceDto {
     pub request_id: String,
+    /// Exact complete retrieval publication used for planning through response assembly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
     pub resolved_profile: AgentRetrievalPresetDto,
     pub policy_mode: AgentRetrievalPolicyModeDto,
     pub total_latency_ms: u32,
@@ -2326,7 +2356,8 @@ mod packet_tests {
 
     #[test]
     fn vector_producer_evidence_fails_closed_on_incomplete_or_unknown_contracts() {
-        let mut evidence = producer_evidence();
+        let expected = producer_evidence();
+        let mut evidence = expected.clone();
         evidence.schema_version += 1;
         evidence.model.model_sha256 = "not-a-digest".to_string();
         evidence.publication.core_run_id.clear();
@@ -2339,6 +2370,21 @@ mod packet_tests {
                 "model.model_sha256".to_string(),
             ]
         );
+        let future = expected.compatibility_with(&evidence);
+        assert!(future.migration_required);
+        assert_eq!(
+            future.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::UnsupportedFutureVersion
+        );
+
+        let mut legacy = expected.clone();
+        legacy.schema_version = 0;
+        let legacy = expected.compatibility_with(&legacy);
+        assert!(legacy.migration_required);
+        assert_eq!(
+            legacy.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::RebuildRequired
+        );
     }
 
     #[test]
@@ -2346,7 +2392,12 @@ mod packet_tests {
         let expected = producer_evidence();
         let mut observed = expected.clone();
         observed.execution.observed_at_epoch_ms += 1;
-        assert!(expected.compatibility_with(&observed).compatible);
+        let compatible = expected.compatibility_with(&observed);
+        assert!(compatible.compatible);
+        assert_eq!(
+            compatible.migration_disposition,
+            EmbeddingVectorEvidenceMigrationDispositionDto::Current
+        );
 
         observed.semantics.dimension += 1;
         observed.publication.semantic_generation = "semantic-2".to_string();
@@ -2476,6 +2527,13 @@ mod packet_tests {
     fn agent_retrieval_trace_round_trips_retrieval_shadow() {
         let trace = AgentRetrievalTraceDto {
             request_id: "r1".to_string(),
+            retrieval_publication: Some(EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-generation".to_string(),
+                core_run_id: "core-run".to_string(),
+                retrieval_generation: "retrieval-generation".to_string(),
+                retrieval_input_hash: "retrieval-input".to_string(),
+                semantic_generation: "semantic-generation".to_string(),
+            }),
             resolved_profile: AgentRetrievalPresetDto::Architecture,
             policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
             total_latency_ms: 10,
@@ -2505,8 +2563,19 @@ mod packet_tests {
             }),
         };
         let value = serde_json::to_value(&trace).expect("serialize");
+        assert_eq!(
+            value["retrieval_publication"]["retrieval_generation"],
+            "retrieval-generation"
+        );
         assert_eq!(value["retrieval_shadow"]["retrieval_mode"], "unavailable");
         let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
+        let publication = parsed
+            .retrieval_publication
+            .as_ref()
+            .expect("retrieval publication round trip");
+        assert_eq!(publication.core_generation_id, "core-generation");
+        assert_eq!(publication.retrieval_generation, "retrieval-generation");
+        assert_eq!(publication.semantic_generation, "semantic-generation");
         assert_eq!(
             parsed
                 .retrieval_shadow

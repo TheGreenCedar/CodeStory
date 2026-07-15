@@ -141,6 +141,18 @@ const TABLE_STATEMENTS: &[&str] = &[
         FOREIGN KEY(node_id) REFERENCES node(id),
         FOREIGN KEY(file_node_id) REFERENCES node(id)
     )",
+    "CREATE TABLE IF NOT EXISTS dense_anchor_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        schema_version INTEGER NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
+        anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+        migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+    )",
     "CREATE TABLE IF NOT EXISTS symbol_search_doc (
         node_id INTEGER PRIMARY KEY,
         file_node_id INTEGER,
@@ -496,6 +508,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 23 {
         storage.set_schema_version(23)?;
     }
+    migrate_v24_dense_anchor_publication(&storage.conn)?;
+    if stored_version < 24 {
+        storage.set_schema_version(24)?;
+    }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -795,6 +811,25 @@ pub(super) fn migrate_v23_dense_anchor_input(conn: &Connection) -> Result<(), St
             updated_at_epoch_ms INTEGER NOT NULL,
             FOREIGN KEY(node_id) REFERENCES node(id),
             FOREIGN KEY(file_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v24_dense_anchor_publication(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dense_anchor_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
+            anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+            policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+            migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
         )",
         [],
     )?;

@@ -896,14 +896,74 @@ fn dense_anchor_inputs_round_trip_prune_and_copy_with_node_ownership() -> Result
 }
 
 #[test]
+fn dense_anchor_manifest_rebinds_carry_forward_and_detects_mutation() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        file_node(700, "src/lib.rs"),
+        Node {
+            id: NodeId(701),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "function_701".to_string(),
+            file_node_id: Some(NodeId(700)),
+            ..Default::default()
+        },
+    ])?;
+    storage.upsert_dense_anchor_inputs_batch(&[dense_anchor(
+        701,
+        Some(700),
+        "core:previous:run",
+    )])?;
+    let first_publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "generation-1".into(),
+        run_id: "run-1".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    let first = storage.publish_dense_anchor_generation(&first_publication, "dense-anchor-v1")?;
+    storage.put_index_publication(&first_publication)?;
+    assert_eq!(
+        storage.validate_dense_anchor_publication(&first_publication)?,
+        first
+    );
+    assert_eq!(first.anchor_count, 1);
+    assert_eq!(first.anchor_digest.len(), 64);
+    assert_eq!(
+        storage.get_dense_anchor_inputs_batch_after(None, 10)?[0].source_identity,
+        "core:generation-1:run-1"
+    );
+
+    let second_publication = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "generation-2".into(),
+        run_id: "run-2".into(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 2,
+    };
+    let second = storage.publish_dense_anchor_generation(&second_publication, "dense-anchor-v1")?;
+    assert_eq!(second.anchor_digest, first.anchor_digest);
+    assert_eq!(
+        storage.get_dense_anchor_inputs_batch_after(None, 10)?[0].source_identity,
+        "core:generation-2:run-2"
+    );
+
+    let mut changed = storage.get_dense_anchor_inputs_batch_after(None, 10)?;
+    changed[0].text.push_str(" changed");
+    storage.upsert_dense_anchor_inputs_batch(&changed)?;
+    assert!(storage.get_dense_anchor_publication_manifest()?.is_none());
+    Ok(())
+}
+
+#[test]
 fn schema_22_migrates_to_dense_anchor_inputs_without_synthesizing_rows() -> Result<(), StorageError>
 {
     let path = unique_temp_db_path("dense-anchor-v23-migration");
     {
         let storage = Storage::open(&path)?;
-        storage
-            .get_connection()
-            .execute_batch("DROP TABLE dense_anchor_input;")?;
+        storage.get_connection().execute_batch(
+            "DROP TABLE dense_anchor_publication;
+                 DROP TABLE dense_anchor_input;",
+        )?;
         storage.set_schema_version(22)?;
     }
 
@@ -914,6 +974,7 @@ fn schema_22_migrates_to_dense_anchor_inputs_without_synthesizing_rows() -> Resu
             .get_dense_anchor_inputs_batch_after(None, 10)?
             .is_empty()
     );
+    assert!(storage.get_dense_anchor_publication_manifest()?.is_none());
     let indexes = storage
         .get_connection()
         .prepare("PRAGMA index_list(dense_anchor_input)")?

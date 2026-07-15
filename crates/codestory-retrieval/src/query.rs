@@ -201,8 +201,11 @@ impl PinnedQuerySession {
             .context("pinned retrieval query requires a complete core publication")?;
         crate::embedded_vector::validate_generation_evidence_for_publication(
             &runtime.layout,
+            &storage,
             &manifest,
             &core_publication,
+            runtime,
+            &embedding_device,
             embedding_residency.identity(),
         )
         .context("validate attested vector generation")?;

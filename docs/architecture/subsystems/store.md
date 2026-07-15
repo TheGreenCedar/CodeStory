@@ -8,7 +8,7 @@ recovery.
 
 - file, node, edge, occurrence, component, callable, bookmark, and trail rows;
 - grounding snapshots and search projections;
-- graph-native symbol documents, component reports, and reusable embedding-free dense-anchor inputs;
+- graph-native symbol documents, component reports, reusable embedding-free dense-anchor inputs, and their complete publication manifest;
 - core `generation_id`/`run_id` and retrieval-manifest records;
 - schema migrations and a versioned promotion journal.
 
@@ -25,6 +25,11 @@ in place. Readers that need publication coherence use store read snapshots and
 compare the recorded generation/run identity; retrieval owns the session that
 combines that transaction with immutable generation leases before returning
 evidence.
+
+The dense-anchor manifest is part of the core publication boundary. It binds
+the complete row count and digest, policy version, migration state, and every
+row's source identity to the current core generation/run. A migrated cache has
+no complete manifest until core indexing republishes it.
 
 ## Entry points
 

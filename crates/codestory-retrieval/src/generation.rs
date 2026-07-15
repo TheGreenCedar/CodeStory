@@ -1,5 +1,6 @@
+#[cfg(test)]
 use codestory_contracts::graph::NodeKind;
-use codestory_store::{LlmSymbolDoc, RetrievalIndexManifest, Store};
+use codestory_store::{RetrievalIndexManifest, Store};
 use std::collections::BTreeMap;
 
 pub const SIDECAR_SCHEMA_VERSION: i32 = 5;
@@ -111,36 +112,22 @@ pub fn manifest_staleness_reason_for_runtime(
         .dense_projection_count
         .or(manifest.projection_count)
     {
-        match collect_sidecar_semantic_doc_stats(storage) {
+        match collect_dense_anchor_stats(storage) {
             Ok(stats) => {
                 if expected_count > 0 && stats.doc_count == 0 {
                     return Some(
-                        "sidecar_semantic_doc_count_unavailable: no sidecar-eligible stored docs"
-                            .into(),
+                        "sidecar_dense_anchor_count_unavailable: no published dense anchors".into(),
                     );
                 }
                 if expected_count > 0
-                    && (stats.mixed_embedding_profiles
-                        || stats.mixed_embedding_models
-                        || stats.mixed_embedding_backends
-                        || stats.mixed_dimensions
-                        || stats.mixed_doc_shapes
-                        || stats.mixed_semantic_policy_versions
-                        || stats.semantic_policy_version.as_deref()
-                            != Some(SEMANTIC_POLICY_VERSION)
-                        || stats.embedding_profile.as_deref() != Some("coderank-embed")
-                        || stats.embedding_dim
-                            != Some(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32)
-                        || !stats
-                            .embedding_model
-                            .as_deref()
-                            .is_some_and(|model| model.contains("coderank-embed")))
+                    && (stats.mixed_policy_versions
+                        || stats.policy_version.as_deref() != Some(SEMANTIC_POLICY_VERSION))
                 {
                     return Some(SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED.into());
                 }
                 if i64::from(stats.doc_count) != expected_count {
                     return Some(format!(
-                        "sidecar_semantic_doc_count_changed: manifest={expected_count} current={}",
+                        "sidecar_dense_anchor_count_changed: manifest={expected_count} current={}",
                         stats.doc_count
                     ));
                 }
@@ -155,7 +142,7 @@ pub fn manifest_staleness_reason_for_runtime(
                 }
             }
             Err(error) => {
-                return Some(format!("sidecar_semantic_doc_count_unavailable: {error}"));
+                return Some(format!("sidecar_dense_anchor_count_unavailable: {error}"));
             }
         }
     }
@@ -190,12 +177,7 @@ pub fn manifest_sidecar_generation(manifest: &RetrievalIndexManifest) -> &str {
         .expect("validated sidecar manifest has a generation id")
 }
 
-pub(crate) fn sidecar_semantic_doc_is_product_eligible(doc: &LlmSymbolDoc) -> bool {
-    (sidecar_semantic_node_kind(doc.kind)
-        || doc.dense_reason.as_deref() == Some("component_report"))
-        && sidecar_stored_embedding_is_product_compatible(doc)
-}
-
+#[cfg(test)]
 pub(crate) fn sidecar_semantic_node_kind(kind: NodeKind) -> bool {
     matches!(
         kind,
@@ -215,101 +197,39 @@ pub(crate) fn sidecar_semantic_node_kind(kind: NodeKind) -> bool {
     )
 }
 
-fn sidecar_stored_embedding_is_product_compatible(doc: &LlmSymbolDoc) -> bool {
-    if doc.embedding_dim as usize != crate::embeddings::RETRIEVAL_EMBEDDING_DIM
-        || doc.embedding.len() != crate::embeddings::RETRIEVAL_EMBEDDING_DIM
-        || doc.embedding.iter().any(|value| !value.is_finite())
-    {
-        return false;
-    }
-    if doc.embedding_profile.as_deref() != Some("coderank-embed") {
-        return false;
-    }
-    if !doc.embedding_model.contains("coderank-embed") {
-        return false;
-    }
-    doc.embedding_backend.as_deref() == Some("inprocess")
-}
-
 #[derive(Default)]
-struct SidecarSemanticDocStats {
+struct DenseAnchorStats {
     doc_count: u32,
-    embedding_profile: Option<String>,
-    embedding_model: Option<String>,
-    embedding_backend: Option<String>,
-    embedding_dim: Option<u32>,
-    doc_shape: Option<String>,
-    semantic_policy_version: Option<String>,
+    policy_version: Option<String>,
     dense_reason_counts: BTreeMap<String, u32>,
-    mixed_embedding_profiles: bool,
-    mixed_embedding_models: bool,
-    mixed_embedding_backends: bool,
-    mixed_dimensions: bool,
-    mixed_doc_shapes: bool,
-    mixed_semantic_policy_versions: bool,
+    mixed_policy_versions: bool,
 }
 
-fn collect_sidecar_semantic_doc_stats(storage: &Store) -> Result<SidecarSemanticDocStats, String> {
-    let mut stats = SidecarSemanticDocStats::default();
-    let mut first_profile: Option<Option<String>> = None;
-    let mut first_model: Option<Option<String>> = None;
-    let mut first_backend: Option<Option<String>> = None;
-    let mut first_dim: Option<Option<u32>> = None;
-    let mut first_shape: Option<Option<String>> = None;
+fn collect_dense_anchor_stats(storage: &Store) -> Result<DenseAnchorStats, String> {
+    let mut stats = DenseAnchorStats::default();
     let mut first_policy: Option<Option<String>> = None;
     let mut after = None;
 
     loop {
-        let docs = storage
-            .get_llm_symbol_docs_batch_after(after, STALENESS_DOC_BATCH_SIZE)
+        let anchors = storage
+            .get_dense_anchor_inputs_batch_after(after, STALENESS_DOC_BATCH_SIZE)
             .map_err(|error| error.to_string())?;
-        if docs.is_empty() {
+        if anchors.is_empty() {
             break;
         }
-        after = docs.last().map(|doc| doc.node_id);
-        for doc in docs
-            .into_iter()
-            .filter(sidecar_semantic_doc_is_product_eligible)
-        {
+        after = anchors.last().map(|anchor| anchor.node_id);
+        for anchor in anchors {
             stats.doc_count = stats.doc_count.saturating_add(1);
             observe_optional_string(
-                &mut first_profile,
-                &mut stats.embedding_profile,
-                &mut stats.mixed_embedding_profiles,
-                doc.embedding_profile.as_deref(),
-            );
-            observe_optional_string(
-                &mut first_model,
-                &mut stats.embedding_model,
-                &mut stats.mixed_embedding_models,
-                Some(&doc.embedding_model),
-            );
-            observe_optional_string(
-                &mut first_backend,
-                &mut stats.embedding_backend,
-                &mut stats.mixed_embedding_backends,
-                doc.embedding_backend.as_deref(),
-            );
-            observe_optional_u32(
-                &mut first_dim,
-                &mut stats.embedding_dim,
-                &mut stats.mixed_dimensions,
-                Some(doc.embedding_dim),
-            );
-            observe_optional_string(
-                &mut first_shape,
-                &mut stats.doc_shape,
-                &mut stats.mixed_doc_shapes,
-                doc.doc_shape.as_deref(),
-            );
-            observe_optional_string(
                 &mut first_policy,
-                &mut stats.semantic_policy_version,
-                &mut stats.mixed_semantic_policy_versions,
-                doc.semantic_policy_version.as_deref(),
+                &mut stats.policy_version,
+                &mut stats.mixed_policy_versions,
+                Some(&anchor.policy_version),
             );
-            let reason = doc.dense_reason.unwrap_or_else(|| "unknown".into());
-            *stats.dense_reason_counts.entry(reason).or_insert(0) += 1;
+            *stats
+                .dense_reason_counts
+                .entry(anchor.selection_reason)
+                .or_insert(0) += 1;
         }
     }
 
@@ -333,26 +253,11 @@ fn observe_optional_string(
     }
 }
 
-fn observe_optional_u32(
-    first: &mut Option<Option<u32>>,
-    value: &mut Option<u32>,
-    mixed: &mut bool,
-    current: Option<u32>,
-) {
-    match first {
-        Some(first) if first != &current => *mixed = true,
-        Some(_) => {}
-        None => {
-            *value = current;
-            *first = Some(current);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_store::{DenseAnchorInput, FileRole};
     use tempfile::TempDir;
 
     fn manifest(project_id: &str, hash: &str) -> RetrievalIndexManifest {
@@ -428,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_staleness_rejects_mixed_semantic_doc_shapes() {
+    fn manifest_staleness_rejects_mixed_dense_anchor_policies() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");
         let mut storage = Store::open(&storage_path).expect("open store");
@@ -449,27 +354,26 @@ mod tests {
             ])
             .expect("nodes");
         storage
-            .upsert_llm_symbol_docs_batch(&[
-                semantic_doc(1, "semantic_doc_version=4;scope=durable_symbols"),
-                semantic_doc(
-                    2,
-                    "semantic_doc_version=4;scope=durable_symbols;alias_mode=alias_variant",
-                ),
+            .upsert_dense_anchor_inputs_batch(&[
+                dense_anchor(1, NodeKind::FUNCTION, SEMANTIC_POLICY_VERSION),
+                dense_anchor(2, NodeKind::FUNCTION, "graph_first_v0"),
             ])
-            .expect("docs");
+            .expect("dense anchors");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
         manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
         manifest.embedding_dim = Some(crate::embeddings::semantic_vector_dim() as i32);
+        manifest.projection_count = Some(2);
+        manifest.dense_projection_count = Some(2);
         manifest.dense_reason_counts_json = Some("{\"public_api\":2}".into());
 
-        let reason =
-            manifest_staleness_reason(&storage, &manifest).expect("mixed shapes should stale");
+        let reason = manifest_staleness_reason(&storage, &manifest)
+            .expect("mixed dense-anchor policies should stale");
 
         assert_eq!(reason, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED);
     }
 
     #[test]
-    fn manifest_staleness_counts_only_sidecar_eligible_semantic_docs() {
+    fn manifest_staleness_uses_dense_anchor_inputs_not_legacy_vector_rows() {
         let project = TempDir::new().expect("project");
         let storage_path = project.path().join("codestory.db");
         let mut storage = Store::open(&storage_path).expect("open store");
@@ -490,17 +394,12 @@ mod tests {
             ])
             .expect("nodes");
         storage
-            .upsert_llm_symbol_docs_batch(&[
-                semantic_doc(1, "semantic_doc_version=4;scope=durable_symbols"),
-                LlmSymbolDoc {
-                    kind: NodeKind::VARIABLE,
-                    doc_shape: Some(
-                        "semantic_doc_version=4;scope=local_symbol;variable=true".into(),
-                    ),
-                    ..semantic_doc(2, "semantic_doc_version=4;scope=local_symbol")
-                },
-            ])
-            .expect("docs");
+            .upsert_dense_anchor_inputs_batch(&[dense_anchor(
+                2,
+                NodeKind::VARIABLE,
+                SEMANTIC_POLICY_VERSION,
+            )])
+            .expect("dense anchor");
         let mut manifest = manifest("proj", "deadbeefcafebabe1234");
         manifest.embedding_backend = Some(crate::embeddings::embedding_runtime_id());
         manifest.embedding_dim = Some(crate::embeddings::semantic_vector_dim() as i32);
@@ -513,26 +412,23 @@ mod tests {
         assert_eq!(reason, None);
     }
 
-    fn semantic_doc(node_id: i64, doc_shape: &str) -> LlmSymbolDoc {
-        LlmSymbolDoc {
+    fn dense_anchor(node_id: i64, kind: NodeKind, policy_version: &str) -> DenseAnchorInput {
+        DenseAnchorInput {
             node_id: NodeId(node_id),
             file_node_id: None,
-            kind: NodeKind::FUNCTION,
+            kind,
             display_name: format!("do_work_{node_id}"),
             qualified_name: Some(format!("pkg::do_work_{node_id}")),
             file_path: Some("src/lib.rs".into()),
             start_line: Some(1),
-            doc_text: "semantic_doc_version: 4\nsymbol_kind: FUNCTION\nname: do_work".into(),
-            doc_version: 4,
-            doc_hash: format!("hash-{node_id}"),
-            embedding_profile: Some("coderank-embed".into()),
-            embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
-            embedding_backend: Some("inprocess".into()),
-            embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
-            doc_shape: Some(doc_shape.into()),
-            semantic_policy_version: Some(SEMANTIC_POLICY_VERSION.into()),
-            dense_reason: Some("public_api".into()),
-            embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
+            end_line: Some(2),
+            file_role: FileRole::Source,
+            source_provenance: "extracted".into(),
+            text: "semantic_doc_version: 6\nname: do_work".into(),
+            document_hash: format!("hash-{node_id}"),
+            selection_reason: "public_api".into(),
+            policy_version: policy_version.into(),
+            source_identity: "core:generation:run".into(),
             updated_at_epoch_ms: 123,
         }
     }

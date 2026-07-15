@@ -146,8 +146,11 @@ fn status_with_runtime(
                 .and_then(|publication| {
                     crate::embedded_vector::validate_generation_evidence_for_publication(
                         &layout,
+                        &storage,
                         manifest,
                         &publication,
+                        &runtime,
+                        &embedding_device,
                         embedding_snapshot.identity.as_ref(),
                     )
                     .map(|_| ())

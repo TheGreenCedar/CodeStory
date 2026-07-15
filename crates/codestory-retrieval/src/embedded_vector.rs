@@ -1,9 +1,16 @@
 use crate::candidate::{CandidateHit, CandidateSource};
-use crate::config::SidecarLayout;
-use crate::embeddings::InProcessEmbeddingClient;
+use crate::config::{SidecarLayout, SidecarRuntimeConfig};
+use crate::embeddings::{EmbeddingDeviceReadiness, InProcessEmbeddingClient};
+use crate::in_process_embedding::ProcessEmbeddingIdentity;
 use crate::sidecar_search::SearchExecutionContext;
 use anyhow::{Context, Result, bail};
-use codestory_store::FileRole;
+use chrono::Utc;
+use codestory_contracts::api::{
+    EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION, EmbeddingEngineIdentityDto,
+    EmbeddingExecutionEvidenceDto, EmbeddingModelIdentityDto, EmbeddingVectorProducerEvidenceDto,
+    EmbeddingVectorPublicationIdentityDto, EmbeddingVectorSemanticsDto,
+};
+use codestory_store::{FileRole, Store};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -112,6 +119,103 @@ impl VectorEvidenceContract {
     }
 }
 
+pub(crate) fn build_vector_producer_evidence(
+    embedding_device: &EmbeddingDeviceReadiness,
+    live_identity: Option<&ProcessEmbeddingIdentity>,
+    embedding_dim: u32,
+    publication: EmbeddingVectorPublicationIdentityDto,
+) -> EmbeddingVectorProducerEvidenceDto {
+    let engine_build_id = live_identity
+        .map(|identity| identity.ggml_build_identity.to_string())
+        .unwrap_or_else(|| codestory_llama_sys::PRODUCT_EMBEDDING_RUNTIME_ID.to_string());
+    let backend = live_identity
+        .map(|identity| identity.backend.clone())
+        .or_else(|| embedding_device.detected_provider.clone())
+        .unwrap_or_else(|| "test-support".to_string());
+    let device_id = live_identity
+        .map(|identity| identity.execution_device_names.join(","))
+        .filter(|device| !device.is_empty())
+        .or_else(|| embedding_device.detected_gpu.clone())
+        .or_else(|| embedding_device.detected_provider.clone())
+        .unwrap_or_else(|| "test-support".to_string());
+    let smoke_elapsed_ms = live_identity.map(|identity| identity.smoke_ms).or_else(|| {
+        (embedding_device.observation_source == "test_support"
+            && embedding_device.observed_state == "accelerated")
+            .then_some(0)
+    });
+
+    EmbeddingVectorProducerEvidenceDto {
+        schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
+        model: EmbeddingModelIdentityDto {
+            model_id: codestory_llama_sys::MODEL_FILE_NAME.to_string(),
+            model_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
+            model_size_bytes: codestory_llama_sys::MODEL_SIZE,
+            tokenizer_sha256: evidence_contract_digest(
+                "tokenizer",
+                codestory_llama_sys::MODEL_SHA256,
+            ),
+            config_sha256: evidence_contract_digest(
+                "config",
+                &format!(
+                    "{}:{embedding_dim}:mean:l2",
+                    codestory_llama_sys::MODEL_SHA256
+                ),
+            ),
+        },
+        semantics: EmbeddingVectorSemanticsDto {
+            dimension: embedding_dim,
+            query_prefix: crate::embeddings::CODERANK_QUERY_PREFIX_DEFAULT.to_string(),
+            document_prefix: String::new(),
+            pooling: "mean".to_string(),
+            normalization: "l2".to_string(),
+            element_type: "f32_le".to_string(),
+            vector_schema_version: VECTOR_INDEX_SCHEMA_VERSION as u32,
+        },
+        engine: EmbeddingEngineIdentityDto {
+            engine: "llama.cpp".to_string(),
+            engine_build_id,
+            backend,
+            device_id,
+            device_class: embedding_device.observed_state.to_string(),
+            accelerator_kind: embedding_device
+                .detected_provider
+                .clone()
+                .unwrap_or_else(|| embedding_device.requested_policy.to_string()),
+        },
+        execution: EmbeddingExecutionEvidenceDto {
+            eligibility: embedding_device.requested_policy.to_string(),
+            observed_state: embedding_device.observed_state.to_string(),
+            observation_source: embedding_device.observation_source.to_string(),
+            smoke_elapsed_ms,
+            observed_at_epoch_ms: Utc::now().timestamp_millis(),
+        },
+        publication,
+    }
+}
+
+pub(crate) fn producer_evidence_mismatches(
+    expected: &EmbeddingVectorProducerEvidenceDto,
+    observed: &EmbeddingVectorProducerEvidenceDto,
+) -> Vec<String> {
+    let mut mismatches = expected.compatibility_with(observed).mismatches;
+    for (field, matches) in [
+        (
+            "execution.observation_source",
+            expected.execution.observation_source == observed.execution.observation_source,
+        ),
+        (
+            "execution.smoke_elapsed_ms_presence",
+            expected.execution.smoke_elapsed_ms.is_some()
+                == observed.execution.smoke_elapsed_ms.is_some(),
+        ),
+    ] {
+        if !matches && !mismatches.iter().any(|entry| entry == field) {
+            mismatches.push(field.to_string());
+        }
+    }
+    mismatches
+}
+
 /// Content attestation returned before the candidate database is published.
 ///
 /// `vector_digest` is independent of SQLite layout and hashes canonical rows
@@ -186,9 +290,12 @@ impl VectorGenerationManifest {
 
 pub(crate) fn validate_generation_evidence_for_publication(
     layout: &SidecarLayout,
+    storage: &Store,
     manifest: &codestory_store::RetrievalIndexManifest,
     publication: &codestory_store::IndexPublicationRecord,
-    live_identity: Option<&crate::in_process_embedding::ProcessEmbeddingIdentity>,
+    runtime: &SidecarRuntimeConfig,
+    embedding_device: &EmbeddingDeviceReadiness,
+    live_identity: Option<&ProcessEmbeddingIdentity>,
 ) -> Result<VectorGenerationManifest> {
     let generation = manifest
         .sidecar_generation
@@ -207,18 +314,29 @@ pub(crate) fn validate_generation_evidence_for_publication(
         .or(manifest.projection_count)
         .and_then(|count| u64::try_from(count).ok())
         .context("retrieval manifest has an invalid dense-anchor count")?;
-    if evidence.model.model_sha256 != codestory_llama_sys::MODEL_SHA256
-        || evidence.model.model_size_bytes != codestory_llama_sys::MODEL_SIZE
-        || evidence.semantics.dimension as usize != crate::embeddings::RETRIEVAL_EMBEDDING_DIM
-        || evidence.semantics.query_prefix != crate::embeddings::CODERANK_QUERY_PREFIX_DEFAULT
-        || evidence.semantics.normalization != "l2"
-        || evidence.semantics.element_type != "f32_le"
-        || evidence.publication.core_generation_id != publication.generation_id
-        || evidence.publication.core_run_id != publication.run_id
-        || evidence.publication.retrieval_generation != generation
-        || evidence.publication.retrieval_input_hash != input_hash
-        || evidence.publication.semantic_generation != manifest.semantic_generation
-        || vectors.generation != generation
+    let embedding_dim = u32::try_from(crate::embeddings::RETRIEVAL_EMBEDDING_DIM)
+        .context("retrieval embedding dimension overflow")?;
+    let expected_evidence = build_vector_producer_evidence(
+        embedding_device,
+        live_identity,
+        embedding_dim,
+        EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            retrieval_generation: generation.to_string(),
+            retrieval_input_hash: input_hash.to_string(),
+            semantic_generation: manifest.semantic_generation.clone(),
+        },
+    );
+    let mismatches = producer_evidence_mismatches(&expected_evidence, evidence);
+    if !mismatches.is_empty() {
+        bail!(
+            "retrieval vector producer evidence is incompatible with the runtime: {}",
+            mismatches.join(", ")
+        );
+    }
+    validate_execution_evidence_for_runtime(evidence, runtime, embedding_device, live_identity)?;
+    if vectors.generation != generation
         || vectors.input_hash != input_hash
         || vectors.embedding_backend != manifest.embedding_backend.as_deref().unwrap_or_default()
         || vectors.embedding_dim as i32 != manifest.embedding_dim.unwrap_or_default()
@@ -226,28 +344,120 @@ pub(crate) fn validate_generation_evidence_for_publication(
     {
         bail!("retrieval vector generation evidence is incompatible with the publication");
     }
-    if let Some(identity) = live_identity
-        && (evidence.engine.engine_build_id != identity.ggml_build_identity
-            || evidence.model.model_sha256 != identity.model_digest)
-    {
-        bail!("retrieval vector generation evidence is incompatible with the live engine");
+    let dense_publication = storage
+        .validate_dense_anchor_publication(publication)
+        .context("validate dense-anchor publication for vector admission")?;
+    if dense_publication.anchor_count != expected_points {
+        bail!(
+            "retrieval vector anchor cardinality mismatch: manifest={expected_points} core={}",
+            dense_publication.anchor_count
+        );
     }
-    let health = EmbeddedVectorIndex::health(
+    let expected_anchors = expected_vector_anchors(storage, publication)?;
+    if u64::try_from(expected_anchors.len()).unwrap_or(u64::MAX) != expected_points {
+        bail!(
+            "retrieval vector anchor cardinality mismatch: manifest={expected_points} core={}",
+            expected_anchors.len()
+        );
+    }
+    let compatibility_identity = vector_compatibility_identity(evidence)?;
+    let contract = VectorEvidenceContract::new(
+        manifest.embedding_backend.as_deref().unwrap_or_default(),
+        usize::try_from(manifest.embedding_dim.unwrap_or_default()).unwrap_or_default(),
+        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+        compatibility_identity,
+    );
+    EmbeddedVectorIndex::validate_published_attestation(
         layout,
         &manifest.semantic_generation,
         generation,
         input_hash,
-        expected_points,
-        manifest.embedding_backend.as_deref().unwrap_or_default(),
-        usize::try_from(manifest.embedding_dim.unwrap_or_default()).unwrap_or_default(),
-    );
-    if !health.ready {
-        bail!(
-            "retrieval vector generation database is incompatible: {}",
-            health.detail
-        );
-    }
+        &contract,
+        &expected_anchors,
+        vectors,
+    )?;
     Ok(vector_manifest)
+}
+
+fn expected_vector_anchors(
+    storage: &Store,
+    publication: &codestory_store::IndexPublicationRecord,
+) -> Result<Vec<ExpectedVectorAnchor>> {
+    let expected_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
+    let mut anchors = Vec::new();
+    let mut after = None;
+    loop {
+        let batch = storage
+            .get_dense_anchor_inputs_batch_after(after, 4_096)
+            .context("load dense anchors for vector attestation")?;
+        if batch.is_empty() {
+            break;
+        }
+        after = batch.last().map(|anchor| anchor.node_id);
+        for anchor in batch {
+            if anchor.source_identity != expected_source_identity {
+                bail!(
+                    "dense anchor {} belongs to source identity {}, expected {}",
+                    anchor.node_id.0,
+                    anchor.source_identity,
+                    expected_source_identity
+                );
+            }
+            anchors.push(ExpectedVectorAnchor {
+                node_id: anchor.node_id.0.to_string(),
+                document_hash: anchor.document_hash,
+            });
+        }
+    }
+    Ok(anchors)
+}
+
+fn validate_execution_evidence_for_runtime(
+    evidence: &EmbeddingVectorProducerEvidenceDto,
+    runtime: &SidecarRuntimeConfig,
+    embedding_device: &EmbeddingDeviceReadiness,
+    live_identity: Option<&ProcessEmbeddingIdentity>,
+) -> Result<()> {
+    if !embedding_device.full_retrieval_allowed {
+        bail!("current embedding execution is not eligible for full retrieval");
+    }
+    match evidence.execution.observed_state.as_str() {
+        "accelerated" => {
+            if runtime.embedding.allow_cpu
+                || !embedding_device.accelerator_requested
+                || evidence.execution.smoke_elapsed_ms.is_none()
+            {
+                bail!("accelerated vector evidence is missing execution proof");
+            }
+        }
+        "cpu_explicit" => {
+            if !runtime.embedding.allow_cpu || !embedding_device.cpu_allowed {
+                bail!("CPU vector evidence was not produced under explicit CPU policy");
+            }
+        }
+        observed => bail!("unsupported vector execution evidence state {observed}"),
+    }
+
+    if let Some(identity) = live_identity {
+        if !matches!(identity.residency, "resident" | "sleeping")
+            || !identity.worker_alive
+            || identity.load_error.is_some()
+            || !identity.embedded_model
+            || identity.model_digest != codestory_llama_sys::MODEL_SHA256
+            || identity.ggml_build_identity != codestory_llama_sys::GGML_BUILD_IDENTITY
+            || identity.policy != evidence.execution.observed_state
+            || (identity.policy == "accelerated"
+                && (!identity.accelerator_execution_verified
+                    || identity.execution_device_names.is_empty()
+                    || identity.offloaded_layer_count != identity.model_layer_count))
+        {
+            bail!("live embedding engine does not satisfy persisted execution evidence");
+        }
+    } else if !cfg!(feature = "test-support") {
+        bail!("live embedding engine identity is required for vector admission");
+    }
+    Ok(())
 }
 
 pub(crate) fn vector_compatibility_identity(
@@ -257,9 +467,11 @@ pub(crate) fn vector_compatibility_identity(
         evidence.schema_version,
         &evidence.model,
         &evidence.semantics,
-        evidence.engine.engine.as_str(),
-        evidence.engine.engine_build_id.as_str(),
+        &evidence.engine,
         evidence.execution.eligibility.as_str(),
+        evidence.execution.observed_state.as_str(),
+        evidence.execution.observation_source.as_str(),
+        evidence.execution.smoke_elapsed_ms.is_some(),
     );
     Ok(hex_digest(Sha256::digest(
         serde_json::to_vec(&compatible).context("serialize vector compatibility identity")?,
@@ -1002,6 +1214,13 @@ fn hash_len_prefixed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update(bytes);
 }
 
+fn evidence_contract_digest(domain: &str, value: &str) -> String {
+    let mut digest = Sha256::new();
+    hash_len_prefixed(&mut digest, domain.as_bytes());
+    hash_len_prefixed(&mut digest, value.as_bytes());
+    hex_digest(digest.finalize())
+}
+
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     bytes
         .as_ref()
@@ -1156,8 +1375,13 @@ fn cosine_similarity_bytes(query: &[f32], query_norm: f64, bytes: &[u8]) -> Resu
 mod tests {
     use super::*;
     use crate::config::SidecarLayout;
-    use codestory_store::FileRole;
+    use codestory_contracts::graph::{Node, NodeId, NodeKind};
+    use codestory_store::{
+        DenseAnchorInput, FileRole, IndexPublicationMode, IndexPublicationRecord,
+        RetrievalIndexManifest,
+    };
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn layout(root: &Path) -> SidecarLayout {
@@ -1206,6 +1430,219 @@ mod tests {
                 document_hash: "document-2".into(),
             },
         ]
+    }
+
+    fn accelerated_device() -> EmbeddingDeviceReadiness {
+        EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "inprocess_engine",
+            detected_provider: Some("metal".into()),
+            detected_gpu: Some("test accelerator".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("metal".into()),
+            accelerator_request_device: Some("test accelerator".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        }
+    }
+
+    fn accelerated_identity() -> ProcessEmbeddingIdentity {
+        ProcessEmbeddingIdentity {
+            instance_id: "inprocess:test".into(),
+            load_generation: 1,
+            model_load_count: 1,
+            residency: "resident",
+            worker_alive: true,
+            load_error: None,
+            model_digest: codestory_llama_sys::MODEL_SHA256,
+            ggml_build_identity: codestory_llama_sys::GGML_BUILD_IDENTITY,
+            backend: "Metal".into(),
+            adapter_name: "test accelerator".into(),
+            adapter_description: "test".into(),
+            policy: "accelerated",
+            embedded_model: true,
+            materialized_path: PathBuf::from("model.gguf"),
+            materialized_reused: true,
+            initialization_ms: 1,
+            smoke_ms: 1,
+            adapter_memory_total: 1,
+            adapter_memory_used_by_load: 1,
+            execution_device_names: vec!["test accelerator".into()],
+            model_layer_count: 13,
+            offloaded_layer_count: 13,
+            accelerator_execution_verified: true,
+        }
+    }
+
+    fn reader_runtime(root: &Path, layout: &SidecarLayout) -> SidecarRuntimeConfig {
+        let mut runtime = SidecarRuntimeConfig::local();
+        runtime.cache_root = root.join("cache");
+        runtime.layout = layout.clone();
+        runtime.embedding.allow_cpu = false;
+        runtime
+    }
+
+    fn reader_publication() -> IndexPublicationRecord {
+        IndexPublicationRecord {
+            generation: 1,
+            generation_id: "core-generation-v1".into(),
+            run_id: "core-run-v1".into(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        }
+    }
+
+    fn reader_manifest(embedding_backend: &str) -> RetrievalIndexManifest {
+        RetrievalIndexManifest {
+            project_id: "reader-project".into(),
+            lexical_version: crate::lexical_index::LEXICAL_INDEX_VERSION.into(),
+            semantic_generation: "codestory_reader_admission".into(),
+            scip_revision: Some("reader-revision".into()),
+            built_at_epoch_ms: 1,
+            disk_bytes: None,
+            degraded_modes_json: "[]".into(),
+            embedding_backend: Some(embedding_backend.into()),
+            embedding_dim: Some(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32),
+            sidecar_schema_version: Some(crate::generation::SIDECAR_SCHEMA_VERSION),
+            sidecar_input_hash: Some("reader-input-v1".into()),
+            sidecar_generation: Some("reader-generation-v1".into()),
+            projection_count: Some(1),
+            symbol_doc_count: Some(1),
+            dense_projection_count: Some(1),
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: Some("reader-graph-v1".into()),
+            dense_reason_counts_json: Some("{\"public_api\":1}".into()),
+            precise_semantic_import_status: None,
+            precise_semantic_import_reason: None,
+            precise_semantic_import_revision: None,
+            precise_semantic_import_producer: None,
+        }
+    }
+
+    fn seed_reader_store(path: &Path, publication: &IndexPublicationRecord) -> Store {
+        let mut storage = Store::open(path).expect("open reader store");
+        storage
+            .insert_nodes_batch(&[Node {
+                id: NodeId(1),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "reader_symbol".into(),
+                ..Default::default()
+            }])
+            .expect("insert reader node");
+        storage
+            .upsert_dense_anchor_inputs_batch(&[DenseAnchorInput {
+                node_id: NodeId(1),
+                file_node_id: None,
+                kind: NodeKind::FUNCTION,
+                display_name: "reader_symbol".into(),
+                qualified_name: Some("reader::symbol".into()),
+                file_path: Some("src/lib.rs".into()),
+                start_line: Some(1),
+                end_line: Some(2),
+                file_role: FileRole::Source,
+                source_provenance: "parser".into(),
+                text: "reader semantic document".into(),
+                document_hash: "reader-document-v1".into(),
+                selection_reason: "public_api".into(),
+                policy_version: crate::generation::SEMANTIC_POLICY_VERSION.into(),
+                source_identity: "core:unpublished:unpublished".into(),
+                updated_at_epoch_ms: 1,
+            }])
+            .expect("insert dense anchor");
+        storage
+            .publish_dense_anchor_generation(
+                publication,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .expect("publish dense anchors");
+        storage
+            .put_index_publication(publication)
+            .expect("publish core generation");
+        storage
+    }
+
+    fn publish_reader_generation(
+        layout: &SidecarLayout,
+        storage: &Store,
+        manifest: &RetrievalIndexManifest,
+        publication: &IndexPublicationRecord,
+        device: &EmbeddingDeviceReadiness,
+        identity: &ProcessEmbeddingIdentity,
+        mutate_evidence: impl FnOnce(&mut EmbeddingVectorProducerEvidenceDto),
+    ) -> VectorGenerationManifest {
+        let mut evidence = build_vector_producer_evidence(
+            device,
+            Some(identity),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: publication.generation_id.clone(),
+                core_run_id: publication.run_id.clone(),
+                retrieval_generation: manifest
+                    .sidecar_generation
+                    .clone()
+                    .expect("retrieval generation"),
+                retrieval_input_hash: manifest
+                    .sidecar_input_hash
+                    .clone()
+                    .expect("retrieval input"),
+                semantic_generation: manifest.semantic_generation.clone(),
+            },
+        );
+        mutate_evidence(&mut evidence);
+        let contract = VectorEvidenceContract::new(
+            manifest
+                .embedding_backend
+                .clone()
+                .expect("embedding backend"),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            vector_compatibility_identity(&evidence).expect("compatibility identity"),
+        );
+        let expected = expected_vector_anchors(storage, publication).expect("expected anchors");
+        let mut vector = vec![0.0_f32; crate::embeddings::RETRIEVAL_EMBEDDING_DIM];
+        vector[0] = 1.0;
+        let attestation = EmbeddedVectorIndex::build_attested_with_points(
+            layout,
+            &manifest.semantic_generation,
+            manifest
+                .sidecar_generation
+                .as_deref()
+                .expect("retrieval generation"),
+            manifest
+                .sidecar_input_hash
+                .as_deref()
+                .expect("retrieval input"),
+            &contract,
+            &expected,
+            |visit| visit(attested_point("1", "reader-document-v1", vector)),
+        )
+        .expect("build reader vector database");
+        let generation_manifest =
+            VectorGenerationManifest::new(evidence, attestation).expect("generation manifest");
+        EmbeddedVectorIndex::publish_generation_manifest(
+            layout,
+            &manifest.semantic_generation,
+            &generation_manifest,
+        )
+        .expect("publish generation manifest");
+        generation_manifest
+    }
+
+    fn assert_evidence_mismatch(
+        expected: &EmbeddingVectorProducerEvidenceDto,
+        field: &str,
+        mutate: impl FnOnce(&mut EmbeddingVectorProducerEvidenceDto),
+    ) {
+        let mut observed = expected.clone();
+        mutate(&mut observed);
+        assert!(
+            producer_evidence_mismatches(expected, &observed)
+                .iter()
+                .any(|mismatch| mismatch == field),
+            "missing compatibility check for {field}"
+        );
     }
 
     #[test]
@@ -1457,6 +1894,192 @@ mod tests {
                 &attestation,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn reader_admission_revalidates_database_sha_digest_hashes_and_cardinality() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let runtime = reader_runtime(root.path(), &layout);
+        let publication = reader_publication();
+        let storage = seed_reader_store(&root.path().join("core.sqlite3"), &publication);
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let manifest = reader_manifest(&crate::embeddings::embedding_runtime_id_for_runtime(
+            &runtime,
+        ));
+        let validate = || {
+            validate_generation_evidence_for_publication(
+                &layout,
+                &storage,
+                &manifest,
+                &publication,
+                &runtime,
+                &device,
+                Some(&identity),
+            )
+        };
+
+        publish_reader_generation(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &device,
+            &identity,
+            |_| {},
+        );
+        validate().expect("admit complete reader generation");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(index_path(&layout, &manifest.semantic_generation))
+            .expect("open database for exact-byte drift")
+            .write_all(b"byte-drift")
+            .expect("append exact-byte drift");
+        let error = validate().expect_err("database SHA drift must fail admission");
+        assert!(format!("{error:#}").contains("attestation"));
+
+        publish_reader_generation(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &device,
+            &identity,
+            |_| {},
+        );
+        let mut changed_vector = vec![0.0_f32; crate::embeddings::RETRIEVAL_EMBEDDING_DIM];
+        changed_vector[1] = 1.0;
+        Connection::open(index_path(&layout, &manifest.semantic_generation))
+            .expect("open database for vector drift")
+            .execute(
+                "UPDATE vectors SET vector = ?1 WHERE node_id = '1'",
+                params![vector_bytes(&changed_vector)],
+            )
+            .expect("change stored vector");
+        let error = validate().expect_err("canonical vector drift must fail admission");
+        assert!(format!("{error:#}").contains("canonical digest"));
+
+        publish_reader_generation(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &device,
+            &identity,
+            |_| {},
+        );
+        Connection::open(index_path(&layout, &manifest.semantic_generation))
+            .expect("open database for document drift")
+            .execute(
+                "UPDATE vectors SET document_hash = 'stale-document' WHERE node_id = '1'",
+                [],
+            )
+            .expect("change document hash");
+        let error = validate().expect_err("document hash drift must fail admission");
+        assert!(format!("{error:#}").contains("document hash mismatch"));
+
+        publish_reader_generation(
+            &layout,
+            &storage,
+            &manifest,
+            &publication,
+            &device,
+            &identity,
+            |_| {},
+        );
+        Connection::open(index_path(&layout, &manifest.semantic_generation))
+            .expect("open database for cardinality drift")
+            .execute("DELETE FROM vectors WHERE node_id = '1'", [])
+            .expect("remove vector row");
+        let error = validate().expect_err("vector cardinality drift must fail admission");
+        assert!(format!("{error:#}").contains("count mismatch"));
+    }
+
+    #[test]
+    fn producer_compatibility_covers_every_evidence_group_and_execution_proof() {
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-generation".into(),
+            core_run_id: "core-run".into(),
+            retrieval_generation: "retrieval-generation".into(),
+            retrieval_input_hash: "retrieval-input".into(),
+            semantic_generation: "semantic-generation".into(),
+        };
+        let expected = build_vector_producer_evidence(
+            &device,
+            Some(&identity),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            publication,
+        );
+
+        assert_evidence_mismatch(&expected, "model", |evidence| {
+            evidence.model.model_id.push_str("-changed");
+        });
+        assert_evidence_mismatch(&expected, "semantics", |evidence| {
+            evidence.semantics.document_prefix.push_str("changed: ");
+        });
+        assert_evidence_mismatch(&expected, "engine", |evidence| {
+            evidence.engine.engine_build_id.push_str("-changed");
+        });
+        assert_evidence_mismatch(&expected, "execution.eligibility", |evidence| {
+            evidence.execution.eligibility = "cpu_explicit".into();
+        });
+        assert_evidence_mismatch(&expected, "execution.observed_state", |evidence| {
+            evidence.execution.observed_state = "cpu_explicit".into();
+        });
+        assert_evidence_mismatch(&expected, "execution.observation_source", |evidence| {
+            evidence.execution.observation_source = "metadata_only".into();
+        });
+        assert_evidence_mismatch(
+            &expected,
+            "execution.smoke_elapsed_ms_presence",
+            |evidence| {
+                evidence.execution.smoke_elapsed_ms = None;
+            },
+        );
+        assert_evidence_mismatch(&expected, "publication", |evidence| {
+            evidence
+                .publication
+                .retrieval_input_hash
+                .push_str("-changed");
+        });
+
+        validate_execution_evidence_for_runtime(
+            &expected,
+            &reader_runtime(Path::new("."), &layout(Path::new("."))),
+            &device,
+            Some(&identity),
+        )
+        .expect("complete accelerator evidence");
+        let mut incomplete = expected.clone();
+        incomplete.execution.smoke_elapsed_ms = None;
+        assert!(
+            validate_execution_evidence_for_runtime(
+                &incomplete,
+                &reader_runtime(Path::new("."), &layout(Path::new("."))),
+                &device,
+                Some(&identity),
+            )
+            .expect_err("missing smoke proof must fail")
+            .to_string()
+            .contains("missing execution proof")
+        );
+        let mut partial_offload = identity;
+        partial_offload.offloaded_layer_count -= 1;
+        assert!(
+            validate_execution_evidence_for_runtime(
+                &expected,
+                &reader_runtime(Path::new("."), &layout(Path::new("."))),
+                &device,
+                Some(&partial_offload),
+            )
+            .expect_err("partial accelerator execution must fail")
+            .to_string()
+            .contains("live embedding engine")
         );
     }
 

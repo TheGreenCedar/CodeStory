@@ -21,6 +21,20 @@ pub(crate) struct LexicalBatchOutcome {
     pub sidecar_diagnostics: Vec<PacketSidecarQueryDiagnosticDto>,
 }
 
+fn packet_batch_error(controller: &AppController, error: ApiError, context: &str) -> ApiError {
+    if error.code == "publication_changed" {
+        error
+    } else {
+        sidecar_retrieval_unavailable_error(
+            controller,
+            format!(
+                "{context}: {}; sidecar retrieval is mandatory",
+                error.message
+            ),
+        )
+    }
+}
+
 impl AppController {
     pub(crate) fn search_symbolic_packet_anchor_batch(
         &self,
@@ -59,12 +73,10 @@ impl AppController {
                         "sidecar retrieval packet lexical batch unavailable; fail-closed: {}",
                         error.message
                     );
-                    return Err(sidecar_retrieval_unavailable_error(
+                    return Err(packet_batch_error(
                         self,
-                        format!(
-                            "sidecar retrieval packet lexical batch unavailable: {}; sidecar retrieval is mandatory",
-                            error.message
-                        ),
+                        error,
+                        "sidecar retrieval packet lexical batch unavailable",
                     ));
                 }
             }
@@ -124,12 +136,10 @@ impl AppController {
                         "sidecar retrieval packet semantic batch unavailable; fail-closed: {}",
                         error.message
                     );
-                    return Err(sidecar_retrieval_unavailable_error(
+                    return Err(packet_batch_error(
                         self,
-                        format!(
-                            "sidecar retrieval packet semantic batch unavailable: {}; sidecar retrieval is mandatory",
-                            error.message
-                        ),
+                        error,
+                        "sidecar retrieval packet semantic batch unavailable",
                     ));
                 }
             }
@@ -164,6 +174,18 @@ impl AppController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_batch_preserves_publication_changed_for_operation_retry() {
+        let error = packet_batch_error(
+            &AppController::new(),
+            ApiError::new("publication_changed", "generation drift"),
+            "packet batch",
+        );
+
+        assert_eq!(error.code, "publication_changed");
+        assert_eq!(error.message, "generation drift");
+    }
 
     struct EnvVarGuard {
         key: &'static str,

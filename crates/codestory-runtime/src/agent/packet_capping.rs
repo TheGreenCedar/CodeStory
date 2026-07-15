@@ -1276,6 +1276,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "packet-capping-test".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,

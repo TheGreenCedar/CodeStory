@@ -1,9 +1,5 @@
 use anyhow::{Context, Result, bail};
-use codestory_contracts::api::{
-    EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION, EmbeddingEngineIdentityDto,
-    EmbeddingExecutionEvidenceDto, EmbeddingModelIdentityDto, EmbeddingVectorProducerEvidenceDto,
-    EmbeddingVectorPublicationIdentityDto, EmbeddingVectorSemanticsDto,
-};
+use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
 use codestory_store::{RetrievalIndexManifest, Store};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
@@ -67,6 +63,13 @@ pub fn publish_zero_dense_pinned_query_fixture(
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load pinned query fixture publication")?
+        .context("pinned query fixture requires a complete core publication")?;
+    storage
+        .publish_dense_anchor_generation(&publication, crate::generation::SEMANTIC_POLICY_VERSION)
+        .context("publish pinned query fixture dense-anchor manifest")?;
     let input = crate::index::compute_sidecar_input_fingerprint(
         &storage,
         project_root,
@@ -77,10 +80,6 @@ pub fn publish_zero_dense_pinned_query_fixture(
     if input.dense_projection_count != 0 {
         bail!("zero-dense pinned query fixture received dense anchors");
     }
-    let publication = storage
-        .get_complete_index_publication()
-        .context("load pinned query fixture publication")?
-        .context("pinned query fixture requires a complete core publication")?;
     let mut manifest = retrieval_manifest_fixture(&project_id, &input.hash);
     manifest.built_at_epoch_ms = chrono::Utc::now().timestamp_millis();
     manifest.projection_count = Some(input.projection_count);
@@ -121,47 +120,19 @@ fn publish_zero_dense_vector_evidence(
             .context("fixture embedding dimension")?,
     )
     .context("negative fixture embedding dimension")?;
-    let evidence = EmbeddingVectorProducerEvidenceDto {
-        schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
-        model: EmbeddingModelIdentityDto {
-            model_id: codestory_llama_sys::MODEL_FILE_NAME.to_string(),
-            model_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
-            model_size_bytes: codestory_llama_sys::MODEL_SIZE,
-            tokenizer_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
-            config_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
-        },
-        semantics: EmbeddingVectorSemanticsDto {
-            dimension: u32::try_from(embedding_dim).context("fixture vector dimension overflow")?,
-            query_prefix: crate::embeddings::CODERANK_QUERY_PREFIX_DEFAULT.to_string(),
-            document_prefix: String::new(),
-            pooling: "mean".to_string(),
-            normalization: "l2".to_string(),
-            element_type: "f32_le".to_string(),
-            vector_schema_version: 2,
-        },
-        engine: EmbeddingEngineIdentityDto {
-            engine: "llama.cpp".to_string(),
-            engine_build_id: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.to_string(),
-            backend: "test-support".to_string(),
-            device_id: "test-support".to_string(),
-            device_class: "accelerated".to_string(),
-            accelerator_kind: "test-support".to_string(),
-        },
-        execution: EmbeddingExecutionEvidenceDto {
-            eligibility: "accelerated".to_string(),
-            observed_state: "accelerated".to_string(),
-            observation_source: "test_support".to_string(),
-            smoke_elapsed_ms: Some(0),
-            observed_at_epoch_ms: chrono::Utc::now().timestamp_millis(),
-        },
-        publication: EmbeddingVectorPublicationIdentityDto {
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let evidence = crate::embedded_vector::build_vector_producer_evidence(
+        &embedding_device,
+        None,
+        u32::try_from(embedding_dim).context("fixture vector dimension overflow")?,
+        EmbeddingVectorPublicationIdentityDto {
             core_generation_id: publication.generation_id.clone(),
             core_run_id: publication.run_id.clone(),
             retrieval_generation: retrieval_generation.to_string(),
             retrieval_input_hash: retrieval_input_hash.to_string(),
             semantic_generation: manifest.semantic_generation.clone(),
         },
-    };
+    );
     let compatibility = crate::embedded_vector::vector_compatibility_identity(&evidence)?;
     let contract = crate::embedded_vector::VectorEvidenceContract::new(
         embedding_backend,

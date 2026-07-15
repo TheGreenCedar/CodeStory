@@ -1,7 +1,8 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
 use crate::embedded_vector::{
     AttestedSemanticPoint, EmbeddedVectorIndex, ExpectedVectorAnchor, SemanticPoint,
-    VectorEvidenceContract, VectorGenerationManifest, vector_compatibility_identity,
+    VectorEvidenceContract, VectorGenerationManifest, build_vector_producer_evidence,
+    producer_evidence_mismatches, vector_compatibility_identity,
 };
 use crate::generation::{
     SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract,
@@ -25,11 +26,7 @@ use crate::scip_index::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use codestory_contracts::api::{
-    EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION, EmbeddingEngineIdentityDto,
-    EmbeddingExecutionEvidenceDto, EmbeddingModelIdentityDto, EmbeddingVectorProducerEvidenceDto,
-    EmbeddingVectorPublicationIdentityDto, EmbeddingVectorSemanticsDto,
-};
+use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
 #[cfg(test)]
 use codestory_store::LlmSymbolDoc;
 use codestory_store::{DenseAnchorInput, FileRole, RetrievalIndexManifest, Store, SymbolSearchDoc};
@@ -93,6 +90,11 @@ struct GenerationRetentionContext<'a> {
     previous_manifest: Option<&'a RetrievalIndexManifest>,
     embedding_device: &'a crate::embeddings::EmbeddingDeviceReadiness,
     embedding_residency: crate::embeddings::ProductEmbeddingResidencyLease,
+}
+
+struct PreparedGenerationRetention {
+    marker: GenerationRetentionMarker,
+    verified_previous: Option<VerifiedRollbackManifest>,
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
@@ -503,7 +505,18 @@ fn ensure_semantic_index(
             anchors.len()
         );
     }
-    let evidence = vector_producer_evidence(retention, semantic, &publication)?;
+    let evidence = build_vector_producer_evidence(
+        retention.embedding_device,
+        retention.embedding_residency.identity(),
+        u32::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
+        EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            retrieval_generation: semantic.generation.to_string(),
+            retrieval_input_hash: semantic.input_hash.to_string(),
+            semantic_generation: semantic.collection.to_string(),
+        },
+    );
     let compatibility_identity = vector_compatibility_identity(&evidence)?;
     let dimension =
         usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?;
@@ -524,11 +537,11 @@ fn ensure_semantic_index(
     let point_count = if let Some(point_count) = semantic_ready_points {
         let manifest =
             EmbeddedVectorIndex::load_generation_manifest(semantic.layout, semantic.collection)?;
-        let compatibility = evidence.compatibility_with(&manifest.evidence);
-        if !compatibility.compatible {
+        let mismatches = producer_evidence_mismatches(&evidence, &manifest.evidence);
+        if !mismatches.is_empty() {
             bail!(
                 "stored vector producer evidence is incompatible: {}",
-                compatibility.mismatches.join(", ")
+                mismatches.join(", ")
             );
         }
         EmbeddedVectorIndex::validate_published_attestation(
@@ -649,95 +662,6 @@ fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
         *value = (f64::from(*value) / norm) as f32;
     }
     Ok(vector)
-}
-
-fn vector_producer_evidence(
-    retention: &GenerationRetentionContext<'_>,
-    semantic: &SemanticGeneration<'_>,
-    publication: &codestory_store::IndexPublicationRecord,
-) -> Result<EmbeddingVectorProducerEvidenceDto> {
-    let identity = retention.embedding_residency.identity();
-    let engine_build_id = identity
-        .map(|identity| identity.ggml_build_identity.to_string())
-        .unwrap_or_else(|| codestory_llama_sys::PRODUCT_EMBEDDING_RUNTIME_ID.to_string());
-    let backend = identity
-        .map(|identity| identity.backend.clone())
-        .or_else(|| retention.embedding_device.detected_provider.clone())
-        .unwrap_or_else(|| "test-support".to_string());
-    let device_id = identity
-        .map(|identity| identity.execution_device_names.join(","))
-        .filter(|device| !device.is_empty())
-        .or_else(|| retention.embedding_device.detected_gpu.clone())
-        .or_else(|| retention.embedding_device.detected_provider.clone())
-        .unwrap_or_else(|| "test-support".to_string());
-    let evidence = EmbeddingVectorProducerEvidenceDto {
-        schema_version: EMBEDDING_VECTOR_PRODUCER_EVIDENCE_VERSION,
-        model: EmbeddingModelIdentityDto {
-            model_id: codestory_llama_sys::MODEL_FILE_NAME.to_string(),
-            model_sha256: codestory_llama_sys::MODEL_SHA256.to_string(),
-            model_size_bytes: codestory_llama_sys::MODEL_SIZE,
-            tokenizer_sha256: contract_digest("tokenizer", codestory_llama_sys::MODEL_SHA256),
-            config_sha256: contract_digest(
-                "config",
-                &format!(
-                    "{}:{}:mean:l2",
-                    codestory_llama_sys::MODEL_SHA256,
-                    crate::embeddings::RETRIEVAL_EMBEDDING_DIM
-                ),
-            ),
-        },
-        semantics: EmbeddingVectorSemanticsDto {
-            dimension: u32::try_from(semantic.embedding_dim)
-                .context("negative embedding dimension")?,
-            query_prefix: crate::embeddings::CODERANK_QUERY_PREFIX_DEFAULT.to_string(),
-            document_prefix: String::new(),
-            pooling: "mean".to_string(),
-            normalization: "l2".to_string(),
-            element_type: "f32_le".to_string(),
-            vector_schema_version: 2,
-        },
-        engine: EmbeddingEngineIdentityDto {
-            engine: "llama.cpp".to_string(),
-            engine_build_id,
-            backend,
-            device_id,
-            device_class: retention.embedding_device.observed_state.to_string(),
-            accelerator_kind: retention
-                .embedding_device
-                .detected_provider
-                .clone()
-                .unwrap_or_else(|| retention.embedding_device.requested_policy.to_string()),
-        },
-        execution: EmbeddingExecutionEvidenceDto {
-            eligibility: retention.embedding_device.requested_policy.to_string(),
-            observed_state: retention.embedding_device.observed_state.to_string(),
-            observation_source: retention.embedding_device.observation_source.to_string(),
-            smoke_elapsed_ms: identity.map(|identity| identity.smoke_ms),
-            observed_at_epoch_ms: Utc::now().timestamp_millis(),
-        },
-        publication: EmbeddingVectorPublicationIdentityDto {
-            core_generation_id: publication.generation_id.clone(),
-            core_run_id: publication.run_id.clone(),
-            retrieval_generation: semantic.generation.to_string(),
-            retrieval_input_hash: semantic.input_hash.to_string(),
-            semantic_generation: semantic.collection.to_string(),
-        },
-    };
-    let errors = evidence.validation_errors();
-    if !errors.is_empty() {
-        bail!(
-            "vector producer evidence is incomplete: {}",
-            errors.join(", ")
-        );
-    }
-    Ok(evidence)
-}
-
-fn contract_digest(domain: &str, value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hash_part(&mut hasher, domain);
-    hash_part(&mut hasher, value);
-    format!("{:x}", hasher.finalize())
 }
 
 fn ensure_scip_artifacts(
@@ -928,50 +852,63 @@ fn persist_finalized_manifest(
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    with_embedding_publication_residency(&retention_context.embedding_residency, || {
-        promote_retrieval_manifest(
-            &mut storage,
-            sidecar_input,
-            &manifest,
-            |storage| {
-                let lexical_source = lexical_source_input(project_root)
-                    .context("rescan lexical source at publication fence")?;
-                let embedding_contract = SidecarEmbeddingContract {
-                    backend: &embedding_backend,
-                    dimension: embedding_dim,
-                };
-                let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
-                    storage,
-                    project_root,
-                    &project_id,
-                    &embedding_contract,
-                    lexical_source,
-                )?;
-                if let Some(reason) = manifest_unavailable_reason_for_runtime(
-                    &project_id,
-                    storage,
-                    &manifest,
-                    retention_context.runtime,
-                ) {
-                    bail!(
-                        "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
-                    );
-                }
-                Ok(current_input)
-            },
-            || {
-                validate_candidate_generation(
-                    &project_id,
-                    sidecar_input,
-                    &manifest,
-                    retention_context,
-                )
-            },
-        )
-    })?;
+    let prepared_retention = with_embedding_publication_residency(
+        &retention_context.embedding_residency,
+        || {
+            promote_retrieval_manifest(
+                &mut storage,
+                sidecar_input,
+                &manifest,
+                |storage| {
+                    let lexical_source = lexical_source_input(project_root)
+                        .context("rescan lexical source at publication fence")?;
+                    let embedding_contract = SidecarEmbeddingContract {
+                        backend: &embedding_backend,
+                        dimension: embedding_dim,
+                    };
+                    let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
+                        storage,
+                        project_root,
+                        &project_id,
+                        &embedding_contract,
+                        lexical_source,
+                    )?;
+                    if let Some(reason) = manifest_unavailable_reason_for_runtime(
+                        &project_id,
+                        storage,
+                        &manifest,
+                        retention_context.runtime,
+                    ) {
+                        bail!(
+                            "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
+                        );
+                    }
+                    Ok(current_input)
+                },
+                || {
+                    validate_candidate_generation(
+                        &project_id,
+                        sidecar_input,
+                        &manifest,
+                        retention_context,
+                    )
+                },
+                || prepare_generation_retention(retention_context, &project_id, &manifest),
+                |prepared| {
+                    write_retention_marker(&retention_context.layout.state_file, &prepared.marker)
+                        .context("publish generation retention marker before current manifest")?;
+                    Ok(())
+                },
+            )
+        },
+    )?;
 
-    let (generation_retention_plan, generation_retention) =
-        retain_published_generations(storage_path, retention_context, &project_id, &manifest)?;
+    let (generation_retention_plan, generation_retention) = retain_published_generations(
+        storage_path,
+        retention_context,
+        &project_id,
+        &prepared_retention,
+    )?;
 
     info!(
         project_id = %project_id,
@@ -1002,26 +939,31 @@ fn ensure_sidecar_input_unchanged(
     Ok(())
 }
 
-fn promote_retrieval_manifest(
+fn promote_retrieval_manifest<T>(
     storage: &mut Store,
     expected: &SidecarInputFingerprint,
     manifest: &RetrievalIndexManifest,
     current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
     validate_candidate: impl FnOnce() -> Result<()>,
-) -> Result<()> {
+    prepare_publication: impl FnOnce() -> Result<T>,
+    publish_retention_pointer: impl FnOnce(&T) -> Result<()>,
+) -> Result<T> {
     validate_candidate()?;
+    let prepared = prepare_publication()?;
     let mut publication = storage
         .write_transaction()
         .context("lock sidecar input and manifest publication")?;
     let current = current_input(publication.storage())?;
     ensure_sidecar_input_unchanged(expected, &current)?;
+    publish_retention_pointer(&prepared)?;
     publication
         .storage_mut()
         .upsert_retrieval_index_manifest(manifest)
         .context("persist retrieval_index_manifest")?;
     publication
         .finish()
-        .context("commit retrieval manifest publication")
+        .context("commit retrieval manifest publication")?;
+    Ok(prepared)
 }
 
 #[derive(Clone)]
@@ -1241,22 +1183,14 @@ fn validate_candidate_generation(
     )
 }
 
-fn retain_published_generations(
-    storage_path: &Path,
+fn prepare_generation_retention(
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
     active: &RetrievalIndexManifest,
-) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
+) -> Result<PreparedGenerationRetention> {
     let now = Utc::now().timestamp_millis();
-    let mut errors = Vec::new();
-    let existing_marker =
-        match read_retention_marker(&context.layout.state_file, context.workspace_id) {
-            Ok(marker) => marker,
-            Err(error) => {
-                errors.push(format!("read generation retention marker: {error:#}"));
-                None
-            }
-        };
+    let existing_marker = read_retention_marker(&context.layout.state_file, context.workspace_id)
+        .context("read generation retention marker before publication")?;
     let active_generation = active.sidecar_generation.as_deref();
     let mut candidates = Vec::new();
     if let Some(previous) = context.previous_manifest {
@@ -1294,28 +1228,32 @@ fn retain_published_generations(
         active.clone(),
         verified_previous.clone(),
         now,
-    );
-    match marker {
-        Ok(marker) => {
-            if let Err(error) = write_retention_marker(&context.layout.state_file, &marker) {
-                errors.push(format!("write generation retention marker: {error:#}"));
-            }
-        }
-        Err(error) => errors.push(format!("build generation retention marker: {error:#}")),
-    }
+    )
+    .context("build generation retention marker before publication")?;
 
+    Ok(PreparedGenerationRetention {
+        marker,
+        verified_previous,
+    })
+}
+
+fn retain_published_generations(
+    storage_path: &Path,
+    context: &GenerationRetentionContext<'_>,
+    project_id: &str,
+    prepared: &PreparedGenerationRetention,
+) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
     let mut protection = scan_retention_protection(
         &crate::config::user_cache_root(),
         Some(storage_path),
         &context.layout.state_file,
     );
-    if let Some(rollback) = verified_previous {
+    if let Some(rollback) = prepared.verified_previous.as_ref() {
         protection
             .authoritative_rollback
             .push(rollback.manifest.clone());
-        protection.rollback.push(rollback.manifest);
+        protection.rollback.push(rollback.manifest.clone());
     }
-    protection.errors.extend(errors);
     let plan = plan_generation_retention(context.layout, project_id, &protection);
     let mut remover = FsGenerationRemover::new(context.layout)?;
     let apply = apply_generation_retention(&plan, &mut remover);
@@ -1354,7 +1292,7 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         .context("hash lexical symbol input")?;
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v7");
+    hash_part(&mut hasher, "codestory-sidecar-input-v8");
     hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
     hash_part(&mut hasher, &SIDECAR_SCHEMA_VERSION.to_string());
@@ -1515,7 +1453,6 @@ fn hash_dense_anchor_input(hasher: &mut Sha256, project_root: &Path, doc: &Dense
     hash_part(hasher, &doc.document_hash);
     hash_part(hasher, &doc.selection_reason);
     hash_part(hasher, &doc.policy_version);
-    hash_part(hasher, &doc.source_identity);
 }
 
 #[cfg(test)]
@@ -1845,6 +1782,22 @@ mod tests {
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
         )
         .expect("first fingerprint");
+        doc.source_identity = "core:g2:r2".into();
+        storage
+            .upsert_dense_anchor_inputs_batch(&[doc.clone()])
+            .expect("rebind unchanged doc");
+        let rebound = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            "proj",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+        )
+        .expect("rebound fingerprint");
+        assert_eq!(
+            first.hash, rebound.hash,
+            "publication identity must not invalidate content-addressed vector reuse"
+        );
         let old_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &first.hash),
@@ -1902,6 +1855,8 @@ mod tests {
                 )
             },
             || Ok(()),
+            || Ok(()),
+            |_| Ok(()),
         );
         assert!(rejected.is_err());
         assert_eq!(
@@ -2085,6 +2040,8 @@ mod tests {
                         &failing,
                     )
                 },
+                || Ok(()),
+                |_| Ok(()),
             )
             .expect_err("component failure must reject promotion");
             assert!(
@@ -2123,6 +2080,8 @@ mod tests {
                     )?;
                     panic!("simulated crash before candidate promotion")
                 },
+                || Ok(()),
+                |_| Ok(()),
             );
         }));
         assert!(crashed.is_err());
@@ -2166,6 +2125,8 @@ mod tests {
                 std::fs::write(&source_path, "pub fn changed_during_validation() {}\n")?;
                 Ok(())
             },
+            || Ok(()),
+            |_| Ok(()),
         )
         .expect_err("source drift during validation must reject publication");
         assert!(drifted.to_string().contains("input changed"));
@@ -2176,6 +2137,49 @@ mod tests {
             Some(old_manifest.clone())
         );
         std::fs::write(&source_path, "pub fn do_work() {}\n").expect("restore source");
+
+        let pointer_fault = promote_retrieval_manifest(
+            &mut storage,
+            &second,
+            &new_manifest,
+            |snapshot| {
+                let lexical_source =
+                    lexical_source_input(project.path()).expect("fresh lexical source");
+                compute_sidecar_input_fingerprint_with_lexical_source(
+                    snapshot,
+                    project.path(),
+                    "proj",
+                    &embedding_contract,
+                    lexical_source,
+                )
+            },
+            || {
+                validate_candidate_generation_evidence(
+                    "proj",
+                    &second,
+                    &new_manifest,
+                    &runtime,
+                    &passing,
+                )
+            },
+            || Ok(()),
+            |_| bail!("simulated retention pointer write failure"),
+        )
+        .expect_err("retention pointer failure must reject publication");
+        assert!(pointer_fault.to_string().contains("retention pointer"));
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")
+                .expect("current manifest after retention pointer fault"),
+            Some(old_manifest.clone())
+        );
+        assert_eq!(
+            read_retention_marker(&state_file, "workspace")
+                .expect("read marker")
+                .expect("marker exists"),
+            marker_before,
+            "retention pointer failure changed rollback state"
+        );
 
         promote_retrieval_manifest(
             &mut storage,
@@ -2201,6 +2205,8 @@ mod tests {
                     &passing,
                 )
             },
+            || Ok(()),
+            |_| Ok(()),
         )
         .expect("unchanged input promotes manifest");
         assert_eq!(

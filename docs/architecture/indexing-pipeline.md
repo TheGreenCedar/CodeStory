@@ -314,11 +314,13 @@ leaves the prior retrieval publication active if source or core identity drifts.
 
 ### How symbol docs and dense anchors are kept fast
 
-Symbol docs are deterministic graph artifacts persisted in SQLite with generated-text metadata and extracted provenance. Dense anchors are persisted separately as embedding-free inputs. Core reuse is keyed by generated text hash, selection reason, and semantic policy version; the stored source identity still changes to the exact candidate core generation/run before publication. On full refresh, runtime copies prior retrieval artifact nodes, symbol docs, and dense inputs forward into the staged database before checking them. On incremental refresh, runtime passes a touched-file scope so only inputs belonging to changed files are rebuilt, selected, skipped, or pruned.
+Symbol docs are deterministic graph artifacts persisted in SQLite with generated-text metadata and extracted provenance. Dense anchors are persisted separately as embedding-free inputs. Core reuse is keyed by generated text hash, selection reason, and semantic policy version; the stored source identity still changes to the exact candidate core generation/run before publication. Core publishes the complete anchor count, content digest, policy, migration state, and source identity as one manifest with the graph generation. On full refresh, runtime copies prior retrieval artifact nodes, symbol docs, and dense inputs forward into the staged database before checking them. On incremental refresh, runtime passes a touched-file scope so only inputs belonging to changed files are rebuilt, selected, skipped, or pruned, then rebinds the complete carried-forward set before publication.
 
-Retrieval fingerprints the complete anchor set and reuses an immutable vector
-generation only when its input and producer-evidence compatibility identities
-match. Otherwise it embeds the selected inputs in bounded batches, validates
+Retrieval fingerprints content and provenance without treating the new core
+generation/run spelling as changed vector input. It can therefore reuse an
+immutable vector generation when the anchor content and producer-evidence
+compatibility identities match, while publishing evidence for the new core
+identity. Otherwise it embeds the selected inputs in bounded batches, validates
 exact anchor/hash coverage and vector properties, and publishes a new attested
 generation. Core indexing never loads the model.
 
