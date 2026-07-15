@@ -17,7 +17,7 @@ The approved host shape for the 0.16 in-process retrieval baseline is:
 | Colima | 0.10.3 |
 | Capacity | 4 vCPU, 17 GiB configured memory, 80 GiB data disk |
 | Host mounts | none; the runner cannot see or write `/Users` or the macOS home directory |
-| Guest container runtime | containerd; the host context is never activated |
+| Guest container runtime | containerd from the checksum-pinned Colima image; the host context is never activated |
 | Stable profile ID | `codestory-release-evidence-linux-arm64-v2` |
 | Machine contract | `scripts/release-evidence/machine-contract.json` |
 | Runner volume | `/srv/codestory-release-evidence` |
@@ -52,6 +52,7 @@ Provisioning is idempotent. It:
 - verifies the checksum-pinned Colima base image before VM creation;
 - installs native packages from a fixed Ubuntu archive snapshot at exact
   versions, then records the complete native package manifest;
+- uses the containerd runtime already owned by the checksum-pinned VM image;
 - verifies checksums before installing Node, Rust, GitHub CLI, and the Actions runner;
 - disables automatic runner updates so baseline changes are deliberate;
 - verifies that the exact candidate contains its checksum-pinned CodeRankEmbed model and

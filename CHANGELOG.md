@@ -53,7 +53,9 @@
 - Windows vector publication now flushes a writable durability handle, and the
   release model hash no longer depends on an enlarged build-script stack.
 - Release evidence is routed through the in-process Linux ARM64 machine profile.
-  Mac signing and notarization remain publication-only gates, not PR blockers.
+  Its pinned VM image supplies containerd directly, without retaining a Docker
+  repository package dependency. Mac signing and notarization remain
+  publication-only gates, not PR blockers.
 
 ### Upgrade note
 
