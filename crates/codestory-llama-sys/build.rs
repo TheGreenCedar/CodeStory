@@ -3,6 +3,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const MODEL_FILE_NAME: &str = "coderankembed.Q8_0.gguf";
 const MODEL_SIZE: u64 = 146_029_792;
@@ -41,14 +42,14 @@ fn main() {
     )
     .expect("write embedding model contract");
     let generated = out_dir.join("embedded_model.rs");
-    let source = env::var_os("CODESTORY_EMBED_MODEL_SOURCE").map(PathBuf::from);
+    let source = resolve_model_source();
 
     match source {
         Some(source) => {
             println!("cargo:rerun-if-changed={}", source.display());
             verify_model(&source).unwrap_or_else(|error| {
                 panic!(
-                    "invalid CODESTORY_EMBED_MODEL_SOURCE {}: {error}",
+                    "invalid embedded model source {}: {error}",
                     source.display()
                 )
             });
@@ -69,11 +70,6 @@ fn main() {
             )
             .expect("write embedded model bindings");
         }
-        None if env::var("DEBUG").as_deref() == Ok("false") => {
-            panic!(
-                "release builds require CODESTORY_EMBED_MODEL_SOURCE pointing to the checksum-pinned {MODEL_FILE_NAME}"
-            );
-        }
         None => {
             fs::write(
                 &generated,
@@ -86,6 +82,51 @@ fn main() {
             );
         }
     }
+}
+
+fn resolve_model_source() -> Option<PathBuf> {
+    if let Some(source) = env::var_os("CODESTORY_EMBED_MODEL_SOURCE") {
+        return Some(PathBuf::from(source));
+    }
+    if env::var("DEBUG").as_deref() != Ok("false") {
+        return None;
+    }
+
+    Some(prepare_release_model())
+}
+
+fn prepare_release_model() -> PathBuf {
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("codestory-llama-sys lives under the workspace crates directory");
+    let script = workspace_root.join("scripts/prepare-embedded-model.mjs");
+    println!("cargo:rerun-if-changed={}", script.display());
+    let output = Command::new("node")
+        .arg(&script)
+        .current_dir(workspace_root)
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to start automatic embedded-model preparation with Node.js: {error}")
+        });
+    if !output.status.success() {
+        panic!(
+            "automatic embedded-model preparation failed (status {}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let source = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    verify_model(&source).unwrap_or_else(|error| {
+        panic!(
+            "automatic embedded-model preparation produced invalid {}: {error}",
+            source.display()
+        )
+    });
+    source
 }
 
 fn verify_model(path: &Path) -> Result<(), String> {

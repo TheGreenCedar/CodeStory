@@ -7,9 +7,13 @@ CodeStory release executable. It has no public product or network surface.
 ## Build identity
 
 `build.rs` pins the model filename, size, SHA-256, llama source revision, and
-ggml build identity. Release builds require the model source at build time and
-embed its bytes. Development builds may omit it so source checks remain
-practical, but such a binary cannot claim full product retrieval.
+ggml build identity. Release builds invoke the checksum-pinned preparation
+script, which reuses or prepares the verified workspace build asset before Rust
+independently verifies and embeds its bytes.
+`CODESTORY_EMBED_MODEL_SOURCE` remains an optional explicit input for hermetic
+or offline builds and fails closed when invalid. Development builds may omit the
+model so source checks remain practical, but such a binary cannot claim full
+product retrieval.
 
 Native features select Metal on macOS and Vulkan on Windows/Linux. CPU
 execution remains available only through the caller's explicit
