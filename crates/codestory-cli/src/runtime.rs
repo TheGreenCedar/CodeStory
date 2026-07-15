@@ -153,6 +153,14 @@ impl RuntimeContext {
         Self::new(args)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_inspect_only_with_startup(
+        args: &ProjectArgs,
+        startup: &crate::config::CliStartupConfig,
+    ) -> Result<Self> {
+        Self::new_with_startup(args, startup)
+    }
+
     fn new_with_startup(
         args: &ProjectArgs,
         startup: &crate::config::CliStartupConfig,

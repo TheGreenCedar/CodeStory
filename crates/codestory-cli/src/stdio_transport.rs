@@ -5936,10 +5936,22 @@ version = "0.11.20"
     fn stdio_status_cache_key_uses_publication_instead_of_volatile_wal_metadata() {
         let project = tempfile::tempdir().expect("project");
         let cache = tempfile::tempdir().expect("cache");
-        let runtime = crate::runtime::RuntimeContext::new_inspect_only(&crate::args::ProjectArgs {
-            project: project.path().to_path_buf(),
-            cache_dir: Some(cache.path().to_path_buf()),
-        })
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+        let runtime = crate::runtime::RuntimeContext::new_inspect_only_with_startup(
+            &crate::args::ProjectArgs {
+                project: project.path().to_path_buf(),
+                cache_dir: Some(cache.path().to_path_buf()),
+            },
+            &startup,
+        )
         .expect("inspect runtime");
         std::fs::create_dir_all(runtime.storage_path.parent().expect("storage parent"))
             .expect("create storage parent");
