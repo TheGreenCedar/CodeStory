@@ -444,7 +444,7 @@ fn http_routes_and_stdio_tools_keep_aligned_default_contracts() {
     let http_handler = source_between(
         &http,
         "pub(crate) fn handle_http_request",
-        "fn resolve_http_target_from_params",
+        "fn run_http_target_operation",
     );
     let shared_browser_defaults = source_between(
         &http,
@@ -640,6 +640,15 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
         definition["resolution"].is_object() && definition["definition"].is_object(),
         "/definition should preserve resolution and definition objects: {definition}"
     );
+    assert!(
+        definition["_meta"]["codestory_publication"]["core_publication"].is_object()
+            && definition["_meta"]["codestory_publication"]["operation"]["operation_id"]
+                .is_string()
+            && definition["_meta"]["codestory_publication"]
+                .as_object()
+                .is_some_and(|metadata| metadata.contains_key("retrieval_publication")),
+        "/definition query resolution and graph assembly must retain one complete publication identity and an explicit retrieval identity slot: {definition}"
+    );
 
     let symbols = get_json(&addr, "/symbols");
     let symbol_count = symbols
@@ -665,6 +674,10 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     assert!(
         references["resolution"].is_object() && references["references"]["focus"].is_object(),
         "/references should preserve resolution and references context: {references}"
+    );
+    assert!(
+        references["_meta"]["codestory_publication"]["core_publication"].is_object(),
+        "/references should retain the complete core publication through response assembly: {references}"
     );
     assert_nonempty_array(&references, "/references/trail/nodes");
     let reference_labels = graph_node_labels(&references, "/references/trail/nodes");

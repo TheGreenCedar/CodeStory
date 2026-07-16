@@ -11,7 +11,7 @@ use codestory_contracts::api::{
 };
 use codestory_runtime::{
     ActivationService, BookmarkService, GroundingService, IndexService, ProjectService,
-    PublicOperationService, ReadOnlyBrowserService, Runtime, TargetResolution,
+    PublicOperation, PublicOperationService, ReadOnlyBrowserService, Runtime, TargetResolution,
 };
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -294,8 +294,17 @@ impl RuntimeContext {
     pub(crate) fn run_public_response<T>(
         &self,
         operation: &str,
-        mut build: impl FnMut() -> Result<T>,
+        build: impl FnMut() -> Result<T>,
     ) -> Result<T> {
+        self.run_public_operation(operation, build)
+            .map(|operation| operation.value)
+    }
+
+    pub(crate) fn run_public_operation<T>(
+        &self,
+        operation: &str,
+        mut build: impl FnMut() -> Result<T>,
+    ) -> Result<PublicOperation<T>> {
         let mut build_error = None;
         let result = self.public_operation.run_with_cancel(
             operation,
@@ -310,7 +319,7 @@ impl RuntimeContext {
             },
         );
         match result {
-            Ok(operation) => Ok(operation.value),
+            Ok(operation) => Ok(operation),
             Err(error) if error.code == "cli_public_operation_failed" => {
                 Err(build_error.expect("CLI operation error was retained"))
             }
@@ -900,6 +909,69 @@ mod tests {
         let after = canonicalize_configuration_path(&missing).expect("existing path identity");
 
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn ordinary_cli_graph_response_retries_the_whole_operation_after_publication_change() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
+        let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
+        unsafe {
+            env::set_var("CODESTORY_EMBED_ALLOW_CPU", "1");
+        }
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(project.join("src")).expect("create source dir");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"publication-change-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write manifest");
+        let source = project.join("src/lib.rs");
+        fs::write(&source, "pub fn pinned_symbol() -> u32 { 1 }\n").expect("write source");
+        let args = ProjectArgs {
+            project: project.clone(),
+            cache_dir: Some(cache),
+        };
+        let reader = RuntimeContext::new_inspect_only(&args).expect("reader runtime");
+        reader
+            .ensure_open(RefreshMode::Full)
+            .expect("publish initial core generation");
+        let publisher = RuntimeContext::new_inspect_only(&args).expect("publisher runtime");
+        publisher
+            .open_project_summary()
+            .expect("bind publisher to existing project");
+
+        let mut attempts = 0_u32;
+        let served_generation = reader
+            .run_public_response("graph", || {
+                attempts += 1;
+                let pinned = reader
+                    .public_operation
+                    .active_publication()
+                    .expect("ordinary CLI response has a core pin")
+                    .core_publication
+                    .generation;
+                if attempts == 1 {
+                    fs::write(&source, "pub fn pinned_symbol() -> u32 { 2 }\n")
+                        .expect("change source during response construction");
+                    publisher
+                        .ensure_open(RefreshMode::Full)
+                        .expect("publish replacement generation during response construction");
+                }
+                Ok(pinned)
+            })
+            .expect("whole ordinary CLI response should retry once");
+        let current_generation = publisher
+            .project
+            .complete_index_publication_at(&publisher.storage_path)
+            .expect("read current publication")
+            .expect("current publication")
+            .generation;
+
+        assert_eq!(attempts, 2, "only the complete response may be retried");
+        assert_eq!(served_generation, current_generation);
     }
 
     #[cfg(unix)]

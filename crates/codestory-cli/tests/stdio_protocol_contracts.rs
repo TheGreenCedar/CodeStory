@@ -3346,6 +3346,12 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
         symbol_result["_meta"]["codestory_publication"]["publication"]["generation"],
         json!(served_generation)
     );
+    assert!(
+        symbol_result["_meta"]["codestory_publication"]
+            .as_object()
+            .is_some_and(|metadata| metadata.contains_key("retrieval_publication")),
+        "query-resolved graph responses must retain an explicit retrieval publication identity slot: {symbol_response}"
+    );
 
     let root_symbols_response = send_json(
         &mut ground_client,

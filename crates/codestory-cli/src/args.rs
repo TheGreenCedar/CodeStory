@@ -2257,7 +2257,7 @@ pub(crate) struct DoctorOutput {
     pub(crate) environment: Vec<DoctorCheckOutput>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum TargetSelection {
     Id(NodeId),
     Query {

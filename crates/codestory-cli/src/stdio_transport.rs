@@ -766,6 +766,7 @@ fn handle_stdio_message(
                 return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
             }
             let (runtime, state) = session.active_project_mut();
+            let public_operation = stdio_public_operation_name(name, &request);
             if stdio_tool_reads_publication(name) {
                 if let Some(mismatch) = stdio_workspace_mismatch(runtime) {
                     let error = serde_json::json!({
@@ -792,7 +793,10 @@ fn handle_stdio_message(
                     if error.code == "cancelled" || !allowed {
                         let preparing = matches!(
                             error.code.as_str(),
-                            "activation_retryable" | "cache_busy" | "publication_changed"
+                            "activation_preparing"
+                                | "activation_retryable"
+                                | "cache_busy"
+                                | "publication_changed"
                         );
                         let error = serde_json::json!({
                             "code": if error.code == "cancelled" {
@@ -829,7 +833,7 @@ fn handle_stdio_message(
             let (response, core_publication, retrieval_publication, operation_id, attempt) =
                 if stdio_tool_reads_publication(name) {
                     match runtime.public_operation.run_with_cancel(
-                        name,
+                        public_operation,
                         Arc::clone(cancelled),
                         || Ok(handle_stdio_tool_call(runtime, state, &request)),
                     ) {
@@ -1026,6 +1030,35 @@ fn stdio_jsonrpc_tool_call_from_legacy(
 
 fn stdio_tool_reads_publication(name: &str) -> bool {
     name != "status"
+}
+
+fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
+    if matches!(
+        name,
+        "symbol"
+            | "trail"
+            | "callers"
+            | "callees"
+            | "trace"
+            | "get_node"
+            | "neighbors"
+            | "query_subgraph"
+            | "definition"
+            | "references"
+            | "snippet"
+    ) {
+        if request
+            .pointer("/params/arguments/query")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|query| !query.trim().is_empty())
+        {
+            "graph_assisted"
+        } else {
+            "graph"
+        }
+    } else {
+        name
+    }
 }
 
 fn stdio_served_publication_meta(
@@ -4729,6 +4762,43 @@ fn read_stdio_template_resource(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn query_resolved_graph_tools_use_the_complete_retrieval_operation() {
+        for tool in [
+            "symbol",
+            "trail",
+            "callers",
+            "callees",
+            "trace",
+            "get_node",
+            "neighbors",
+            "query_subgraph",
+            "definition",
+            "references",
+            "snippet",
+        ] {
+            let query = json!({
+                "params": {"name": tool, "arguments": {"query": "AppController"}}
+            });
+            let id = json!({
+                "params": {"name": tool, "arguments": {"id": "node-1"}}
+            });
+            assert_eq!(
+                stdio_public_operation_name(tool, &query),
+                "graph_assisted",
+                "{tool} query resolution must keep one retrieval pin through response assembly"
+            );
+            assert_eq!(stdio_public_operation_name(tool, &id), "graph");
+        }
+        assert_eq!(
+            stdio_public_operation_name(
+                "packet",
+                &json!({"params": {"arguments": {"question": "architecture"}}})
+            ),
+            "packet"
+        );
+    }
 
     #[test]
     fn status_response_must_match_the_current_complete_publication() {
