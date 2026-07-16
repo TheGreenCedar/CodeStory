@@ -273,6 +273,135 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
   }
 });
 
+test("draft source workflow freezes its complete top-level contract", async (t) => {
+  assert.deepEqual(draftWorkflowPolicyViolations(draftSourceWorkflow()), []);
+  const reordered = draftSourceWorkflow();
+  [reordered.on.pull_request.paths[0], reordered.on.pull_request.paths[1]]
+    = [reordered.on.pull_request.paths[1], reordered.on.pull_request.paths[0]];
+  assert.deepEqual(
+    draftWorkflowPolicyViolations(reordered),
+    [],
+    "path membership is exact but order-insensitive",
+  );
+
+  const mutations = [
+    ["workflow name", workflow => { workflow.name = "Draft checks"; }],
+    ["missing pull request trigger", workflow => { delete workflow.on.pull_request; }],
+    ["extra push trigger", workflow => { workflow.on.push = { branches: ["main"] }; }],
+    ["missing path", workflow => { workflow.on.pull_request.paths.pop(); }],
+    ["duplicate path", workflow => {
+      workflow.on.pull_request.paths[1] = workflow.on.pull_request.paths[0];
+    }],
+    ["extra path", workflow => { workflow.on.pull_request.paths.push("scripts/**"); }],
+    ["dispatch inputs", workflow => {
+      workflow.on.workflow_dispatch = { inputs: { ref: { required: false, type: "string" } } };
+    }],
+    ["missing dispatch", workflow => { delete workflow.on.workflow_dispatch; }],
+    ["write permission", workflow => { workflow.permissions.contents = "write"; }],
+    ["extra permission", workflow => { workflow.permissions.actions = "read"; }],
+    ["concurrency group", workflow => { workflow.concurrency.group = "draft-${{ github.ref }}"; }],
+    ["disabled concurrency cancellation", workflow => {
+      workflow.concurrency["cancel-in-progress"] = false;
+    }],
+    ["extra concurrency field", workflow => { workflow.concurrency.limit = 1; }],
+    ["top-level env", workflow => { workflow.env = { CARGO_TERM_COLOR: "always" }; }],
+    ["top-level defaults", workflow => {
+      workflow.defaults = { run: { shell: "bash" } };
+    }],
+    ["missing jobs", workflow => { delete workflow.jobs; }],
+    ["cloned job", workflow => {
+      workflow.jobs["extra-draft-lane"] = structuredClone(workflow.jobs["linux-draft"]);
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const candidate = draftSourceWorkflow();
+      mutate(candidate);
+      assert.notDeepEqual(draftWorkflowPolicyViolations(candidate), []);
+    });
+  }
+});
+
+test("draft source job rejects every alternate execution surface", async (t) => {
+  assert.deepEqual(draftSourcePolicyViolations(draftSourceJob(), retrievalSourceJob()), []);
+
+  const mutations = [
+    ["job name", job => { job.name = "Draft source"; }],
+    ["runner", job => { job["runs-on"] = "ubuntu-24.04"; }],
+    ["timeout", job => { job["timeout-minutes"] = 60; }],
+    ["if", job => { job.if = "always()"; }],
+    ["needs", job => { job.needs = ["untrusted"]; }],
+    ["permissions", job => { job.permissions = { contents: "write" }; }],
+    ["continue-on-error", job => { job["continue-on-error"] = true; }],
+    ["strategy", job => { job.strategy = { matrix: { shard: [1, 2] } }; }],
+    ["env", job => { job.env = { RUSTFLAGS: "-Awarnings" }; }],
+    ["defaults", job => { job.defaults = { run: { shell: "bash" } }; }],
+    ["environment", job => { job.environment = "release"; }],
+    ["container", job => { job.container = "ubuntu:latest"; }],
+    ["services", job => { job.services = { cache: { image: "redis" } }; }],
+    ["outputs", job => { job.outputs = { result: "${{ steps.proof.outputs.result }}" }; }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const candidate = draftSourceJob();
+      mutate(candidate);
+      assert.notDeepEqual(draftSourcePolicyViolations(candidate, retrievalSourceJob()), []);
+    });
+  }
+});
+
+test("draft source steps reject checkout and proof bypass mutations", async (t) => {
+  const checkout = job => job.steps[0];
+  const proof = job => draftStep(job, "Prove focused publication contracts");
+  const mutations = [
+    ["checkout ref", job => { checkout(job).with = { ref: "refs/heads/main" }; }],
+    ["checkout persisted credentials", job => {
+      checkout(job).with = { "persist-credentials": true };
+    }],
+    ["checkout if", job => { checkout(job).if = "always()"; }],
+    ["checkout continue-on-error", job => { checkout(job)["continue-on-error"] = true; }],
+    ["checkout env", job => { checkout(job).env = { GH_TOKEN: "token" }; }],
+    ["checkout id", job => { checkout(job).id = "checkout"; }],
+    ["checkout action", job => { checkout(job).uses = "actions/checkout@v4"; }],
+    ["cloned step", job => { job.steps.push(structuredClone(checkout(job))); }],
+    ["deleted step", job => { job.steps.splice(5, 1); }],
+    ["reordered steps", job => {
+      [job.steps[5], job.steps[6]] = [job.steps[6], job.steps[5]];
+    }],
+    ["run step shell", job => { draftStep(job, "Check formatting").shell = "bash"; }],
+    ["restore extra input", job => {
+      draftStep(job, "Restore Cargo inputs and output").with["fail-on-cache-miss"] = false;
+    }],
+    ["save extra input", job => {
+      draftStep(job, "Save Cargo inputs and output").with["restore-keys"] = "decoy";
+    }],
+    ["proof if", job => { proof(job).if = "always()"; }],
+    ["proof continue-on-error", job => { proof(job)["continue-on-error"] = true; }],
+    ["proof env", job => { proof(job).env = { RUST_BACKTRACE: "1" }; }],
+    ["native staging proof removed", job => {
+      proof(job).run = proof(job).run
+        .split("\n")
+        .filter(command => !command.includes("--test native_staging"))
+        .join("\n");
+    }],
+    ["native staging proof reordered", job => {
+      const commands = proof(job).run.trim().split("\n");
+      [commands[0], commands[1]] = [commands[1], commands[0]];
+      proof(job).run = commands.join("\n");
+    }],
+  ];
+
+  for (const [name, mutate] of mutations) {
+    await t.test(name, () => {
+      const candidate = draftSourceJob();
+      mutate(candidate);
+      assert.notDeepEqual(draftSourcePolicyViolations(candidate, retrievalSourceJob()), []);
+    });
+  }
+});
+
 test("draft source workflow rejects cloned top-level jobs", () => {
   const workflows = loadWorkflows();
   const workflow = draftSourceWorkflow();

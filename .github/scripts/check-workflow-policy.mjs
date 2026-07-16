@@ -112,19 +112,39 @@ const draftCacheRestoreKeys = [
   "${{ runner.os }}-draft-v2-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-workspace-default-features-",
   "${{ runner.os }}-cargo-stable-${{ steps.rust-cache-key.outputs.version }}-${{ steps.rust-cache-key.outputs.target }}-retrieval-contracts-default-features-",
 ];
+const draftWorkflowPaths = [
+  "Cargo.lock",
+  "Cargo.toml",
+  "crates/**",
+  ".github/scripts/check-runtime-config-boundary.mjs",
+  ".github/scripts/install-linux-vulkan-build-deps.sh",
+  ".github/scripts/check-workflow-policy.mjs",
+  ".github/scripts/route-ci-proof.mjs",
+  ".github/workflows/rust-ci.yml",
+  ".github/workflows/source-proof.yml",
+  "plugins/codestory/generated-mcp-catalog.json",
+  "plugins/codestory/skills/codestory-grounding/**",
+  "scripts/generate-codestory-skill-syntax.mjs",
+];
 const draftStepSequence = [
-  { uses: "actions/checkout@v5" },
-  { name: "Install Rust stable" },
-  { name: "Install Linux Vulkan build dependencies" },
-  { name: "Capture Rust cache identity" },
-  { name: "Restore Cargo inputs and output" },
-  { name: "Check formatting" },
-  { name: "Check immutable runtime configuration boundary" },
-  { name: "Check the workspace" },
-  { name: "Check generated CodeStory syntax and MCP catalog" },
-  { name: "Lint workspace libraries" },
-  { name: "Prove focused publication contracts" },
-  { name: "Save Cargo inputs and output" },
+  { uses: "actions/checkout@v5", keys: ["uses"] },
+  { name: "Install Rust stable", keys: ["name", "run"] },
+  { name: "Install Linux Vulkan build dependencies", keys: ["name", "run"] },
+  { name: "Capture Rust cache identity", keys: ["name", "id", "shell", "run"] },
+  {
+    name: "Restore Cargo inputs and output",
+    keys: ["name", "id", "uses", "continue-on-error", "with"],
+  },
+  { name: "Check formatting", keys: ["name", "run"] },
+  { name: "Check immutable runtime configuration boundary", keys: ["name", "run"] },
+  { name: "Check the workspace", keys: ["name", "run"] },
+  { name: "Check generated CodeStory syntax and MCP catalog", keys: ["name", "run"] },
+  { name: "Lint workspace libraries", keys: ["name", "run"] },
+  { name: "Prove focused publication contracts", keys: ["name", "run"] },
+  {
+    name: "Save Cargo inputs and output",
+    keys: ["name", "if", "uses", "continue-on-error", "with"],
+  },
 ];
 const draftRunCommands = new Map([
   ["Install Rust stable", [
@@ -170,11 +190,64 @@ function sameStrings(actual, expected) {
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
+function hasExactKeys(value, expected) {
+  return sameMembers(Object.keys(object(value)), expected);
+}
+
 export function draftWorkflowPolicyViolations(workflowValue) {
-  const jobs = Object.keys(object(object(workflowValue).jobs));
-  return sameStrings(jobs, ["linux-draft"])
-    ? []
-    : ["draft source workflow must contain exactly the linux-draft job"];
+  const violations = [];
+  const workflow = object(workflowValue);
+  const triggers = object(workflow.on);
+  const pullRequest = object(triggers.pull_request);
+  const permissions = object(workflow.permissions);
+  const concurrency = object(workflow.concurrency);
+  const jobs = object(workflow.jobs);
+
+  add(
+    violations,
+    hasExactKeys(workflow, ["name", "on", "permissions", "concurrency", "jobs"]),
+    "draft source workflow must keep its exact top-level policy shape",
+  );
+  add(
+    violations,
+    workflow.name === "Draft source checks",
+    "draft source workflow name must remain Draft source checks",
+  );
+  add(
+    violations,
+    hasExactKeys(triggers, ["pull_request", "workflow_dispatch"]),
+    "draft source workflow must use only pull_request and workflow_dispatch",
+  );
+  add(
+    violations,
+    hasExactKeys(pullRequest, ["paths"])
+      && list(pullRequest.paths).length === draftWorkflowPaths.length
+      && sameMembers(pullRequest.paths, draftWorkflowPaths),
+    "draft source pull_request trigger must keep the exact path set",
+  );
+  add(
+    violations,
+    triggers.workflow_dispatch === null,
+    "draft source workflow_dispatch trigger must remain input-free",
+  );
+  add(
+    violations,
+    hasExactKeys(permissions, ["contents"]) && permissions.contents === "read",
+    "draft source workflow permissions must remain contents: read only",
+  );
+  add(
+    violations,
+    hasExactKeys(concurrency, ["group", "cancel-in-progress"])
+      && concurrency.group === "rust-ci-${{ github.event.pull_request.number || github.ref }}"
+      && concurrency["cancel-in-progress"] === true,
+    "draft source workflow concurrency must keep its exact PR/ref cancellation contract",
+  );
+  add(
+    violations,
+    hasExactKeys(jobs, ["linux-draft"]),
+    "draft source workflow must contain exactly the linux-draft job",
+  );
+  return violations;
 }
 
 export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
@@ -183,6 +256,16 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   const retrievalJob = object(retrievalJobValue);
   const steps = list(job.steps).map(object);
 
+  add(
+    violations,
+    hasExactKeys(job, ["name", "runs-on", "timeout-minutes", "steps"]),
+    "draft source job must keep its exact required serial shape",
+  );
+  add(
+    violations,
+    job.name === "Ubuntu draft source checks",
+    "draft source job name must remain Ubuntu draft source checks",
+  );
   add(violations, job["runs-on"] === "ubuntu-latest", "draft source job must use ubuntu-latest");
   add(violations, job["timeout-minutes"] === 45, "draft source job timeout must remain 45 minutes");
   add(violations, job.env === undefined && job.defaults === undefined, "draft source job must not override the proof environment or defaults");
@@ -194,6 +277,11 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
       ? step?.uses === expected.uses
       : step?.name === expected.name;
     add(violations, matches, `draft source step ${index + 1} must remain ${expected.name ?? expected.uses}`);
+    add(
+      violations,
+      hasExactKeys(step, expected.keys),
+      `draft source step ${index + 1} must keep the exact ${expected.name ?? expected.uses} key shape`,
+    );
   }
 
   for (const [name, commands] of draftRunCommands) {
@@ -212,6 +300,11 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   add(violations, restore?.id === "cargo-cache-restore", "draft source cache restore must keep its stable step id");
   add(violations, restore?.uses === "actions/cache/restore@v5", "draft source cache restore must use actions/cache/restore@v5");
   add(violations, restore?.["continue-on-error"] === true && restore?.if === undefined, "draft source cache restore must remain optional without conditional bypasses");
+  add(
+    violations,
+    hasExactKeys(restoreWith, ["path", "key", "restore-keys"]),
+    "draft source cache restore inputs must keep their exact key shape",
+  );
   add(violations, sameStrings(nonCommentLines(restoreWith.path), draftCachePaths), "draft source cache restore must use only the Cargo registry, git, and default target paths");
   add(violations, restoreWith.key === draftCachePrimary, "draft source cache primary must bind the v2 platform, toolchain, feature, lock, and manifest identity");
   add(violations, sameStrings(nonCommentLines(restoreWith["restore-keys"]), draftCacheRestoreKeys), "draft source cache fallbacks must keep the exact retrieval, prior draft, then prior retrieval order");
@@ -228,6 +321,11 @@ export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   const saveWith = object(save?.with);
   add(violations, save?.uses === "actions/cache/save@v5", "draft source cache promotion must use actions/cache/save@v5");
   add(violations, save?.["continue-on-error"] === true, "draft source cache promotion must remain non-blocking");
+  add(
+    violations,
+    hasExactKeys(saveWith, ["path", "key"]),
+    "draft source cache promotion inputs must keep their exact key shape",
+  );
   add(
     violations,
     save?.if === "success() && steps.cargo-cache-restore.outputs.cache-hit != 'true' && steps.cargo-cache-restore.outputs.cache-primary-key != ''",
