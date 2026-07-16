@@ -4,6 +4,10 @@ CodeStory ships semantic retrieval inside the native CLI. The release
 executable contains the checksum-pinned CodeRankEmbed Q8 model and links the
 llama.cpp/ggml engine. There is no embedding server, network endpoint, backend
 download, port lease, PID supervisor, or user-controlled repair lifecycle.
+Each release archive also contains `codestory-native-manifest.json`, which binds
+the executable digest, native format and architecture, static linkage, compiled
+backend set, model, llama source, and producer. It records capability only;
+live accelerator execution still requires protected hardware evidence.
 
 This page is for maintainers collecting diagnostics or changing retrieval. The
 normal plugin contract is simpler: call the intended repository tool and retry
@@ -26,6 +30,12 @@ opened by that CLI process share its model and accelerator context. Repository
 configuration, caches, generations, and publication leases remain isolated.
 Every MCP request carries an absolute `project` root; no global active-project
 file routes requests.
+
+Retrieval chooses one explicit backend/device-class request and supplies model,
+pooling, dimension, batching, and smoke parameters to the native binding. The
+binding reports compiled/runtime capabilities and executes that request
+exactly. It never chooses a product fallback. Retrieval applies and validates
+the product's L2 vector normalization after native execution.
 
 When llama.cpp needs a path for memory mapping, CodeStory verifies the embedded
 bytes and atomically materializes them under a content-addressed cache name. A

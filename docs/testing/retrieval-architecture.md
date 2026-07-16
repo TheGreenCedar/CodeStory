@@ -10,8 +10,8 @@ measurements live in
 | Tier | Required evidence | Supported claim |
 | --- | --- | --- |
 | Source | locked checks and focused crate tests | source compiles and contracts hold |
-| Hosted package | packaged executable, offline isolated cache, explicit CPU policy | package is self-contained; no acceleration claim |
-| Protected hardware | same package, CPU disallowed, physical backend/adapter, timed smoke and full offload | Metal or Vulkan works on that machine |
+| Hosted package | executable format/architecture, static engine manifest, offline isolated cache, explicit CPU policy | package contract is self-consistent and self-contained; no acceleration claim |
+| Protected hardware | same manifest-bound package, CPU disallowed, physical backend/adapter, timed smoke and full offload | Metal or Vulkan works on that machine |
 | Product runtime | plugin launcher, full retrieval, packet/search, two projects sharing one engine | installed agent path is coherent |
 | Restart | new process reuses verified materialized model content | content-addressed cache reuse works |
 | Performance/quality | same-run measurements and holdout gates | an engine change is promotion-eligible |
@@ -40,13 +40,20 @@ does not imply permission.
 for its environment:
 
 1. archive checksum, safe extraction, one native executable, version, and help;
-2. clean offline cache with no model, backend, or helper download;
-3. core indexing and retrieval publication to `retrieval_mode=full`;
-4. exact engine identity and policy;
-5. packet and search through the plugin launcher;
-6. two repositories using one engine instance and one model load;
-7. process restart and content-addressed model reuse;
-8. absence of embedding-server, port, lease, and consent state.
+2. one native manifest bound to the binary digest, format, architecture, static
+   linkage, target, compiled backends, model, llama source, and producer;
+3. clean offline cache with no model, backend, or helper download;
+4. core indexing and retrieval publication to `retrieval_mode=full`;
+5. exact manifest-matching engine/model/backend identity and policy before and
+   after restart;
+6. packet and search through the plugin launcher;
+7. two repositories using one engine instance and one model load;
+8. process restart and content-addressed model reuse;
+9. absence of embedding-server, port, lease, and consent state.
+
+The package manifest proves compiled capability only. Accelerator execution is
+a separate protected-hardware result, and neither package nor execution proof
+is an answer-quality claim. Linux packages remain an explicit GPU non-claim.
 
 ## Workflow ownership
 

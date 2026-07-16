@@ -39,6 +39,7 @@
 ### Search quality and reliability
 
 - Updated `serde_with` to 3.21.0, removing the affected `KeyValueMap` panic advisory while preserving CodeStory's existing double-option DTO encoding.
+- The llama.cpp binding now exposes compiled and runtime capabilities and executes an exact caller request; retrieval owns model, pooling, normalization, dimension, batching, and explicit CPU/accelerator policy. Native failures carry stable reason codes and never trigger implicit CPU fallback. Release packaging rejects binary format, architecture, static-linkage, backend, embedded-model, llama-source, or producer drift and ships a deterministic manifest bound to the executable; package evidence proves compiled capability only, protected hardware proves execution, and Linux remains a GPU non-claim.
 - Tree-sitter and every wired language grammar now use their current compatible crate releases, including the vendored graph runtime's Tree-sitter 0.26 compatibility pin.
 - Windows contributor setup now names the LLVM/libclang, Vulkan, developer-shell, Ninja, and short-path requirements used by source builds.
 - Rust 2024 sources, including `unsafe extern` blocks and let-chains, now remain parser-complete. CodeStory uses the current Rust grammar and a compatible Tree-sitter runtime instead of rejecting valid modern Rust files and withholding a full publication.

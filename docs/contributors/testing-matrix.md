@@ -116,9 +116,15 @@ They must report `cpu_explicit` and make no acceleration claim.
 ### Packaged proof
 
 `.github/scripts/check-packaged-agent-proof.py` verifies a checksum-pinned
-archive in an isolated offline environment. It requires one native executable,
-version/help, full retrieval, plugin packet/search, multi-repository engine
-reuse, restart/materialization reuse, and no helper-process lifecycle state.
+archive in an isolated offline environment. Packaging first inspects the
+executable format and architecture and requires a statically linked native
+engine marker matching the asset target, embedded model contract, compiled
+backends, llama source, and producer version. The resulting
+`codestory-native-manifest.json` records compiled capability without claiming
+runtime accelerator execution. Packaged proof binds that manifest to the exact
+binary digest, live model/build/backend identity, process restart, version/help,
+full retrieval, plugin packet/search, multi-repository engine reuse,
+restart/materialization reuse, and absence of helper-process lifecycle state.
 
 Protected hardware proof also passes `--idle-residency-proof`. It records an
 uninitialized process-memory baseline, verifies the owner becomes `sleeping`

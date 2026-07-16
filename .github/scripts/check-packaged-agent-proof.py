@@ -15,6 +15,7 @@ import queue
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -39,6 +40,71 @@ LEGACY_TOKENS = (
     "sidecars",
 )
 LEGACY_HELP_TOKENS = ("llama-server", "sidecar", "repair", "consent", "download")
+NATIVE_MANIFEST_FILE = "codestory-native-manifest.json"
+NATIVE_ENGINE_MARKER_PREFIX = "codestory-native-engine-v1|"
+NATIVE_ENGINE_MARKER_SUFFIX = "|end"
+TARGET_CONTRACTS = {
+    "linux-x64": {
+        "binary_name": "codestory-cli",
+        "binary_format": "elf",
+        "target_triple": "x86_64-unknown-linux-gnu",
+        "target_os": "linux",
+        "target_arch": "x86_64",
+        "compiled_backends": ["cpu", "vulkan"],
+        "expected_protected_backend": None,
+        "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
+    },
+    "linux-arm64": {
+        "binary_name": "codestory-cli",
+        "binary_format": "elf",
+        "target_triple": "aarch64-unknown-linux-gnu",
+        "target_os": "linux",
+        "target_arch": "aarch64",
+        "compiled_backends": ["cpu", "vulkan"],
+        "expected_protected_backend": None,
+        "non_claim_reason": "linux_gpu_execution_is_not_a_release_claim",
+    },
+    "windows-x64": {
+        "binary_name": "codestory-cli.exe",
+        "binary_format": "pe",
+        "target_triple": "x86_64-pc-windows-msvc",
+        "target_os": "windows",
+        "target_arch": "x86_64",
+        "compiled_backends": ["cpu", "vulkan"],
+        "expected_protected_backend": "vulkan",
+        "non_claim_reason": None,
+    },
+    "windows-arm64": {
+        "binary_name": "codestory-cli.exe",
+        "binary_format": "pe",
+        "target_triple": "aarch64-pc-windows-msvc",
+        "target_os": "windows",
+        "target_arch": "aarch64",
+        "compiled_backends": ["cpu", "vulkan"],
+        "expected_protected_backend": None,
+        "non_claim_reason": "windows_arm64_accelerator_execution_is_not_protected",
+    },
+    "macos-x64": {
+        "binary_name": "codestory-cli",
+        "binary_format": "mach-o",
+        "target_triple": "x86_64-apple-darwin",
+        "target_os": "macos",
+        "target_arch": "x86_64",
+        "compiled_backends": ["cpu", "metal"],
+        "expected_protected_backend": None,
+        "non_claim_reason": "macos_x64_accelerator_execution_is_not_protected",
+    },
+    "macos-arm64": {
+        "binary_name": "codestory-cli",
+        "binary_format": "mach-o",
+        "target_triple": "aarch64-apple-darwin",
+        "target_os": "macos",
+        "target_arch": "aarch64",
+        "compiled_backends": ["cpu", "metal"],
+        "expected_protected_backend": "metal",
+        "non_claim_reason": None,
+    },
+}
 
 
 class ProofFailure(RuntimeError):
@@ -108,6 +174,385 @@ def find_cli(root: Path) -> Path:
     cli = matches[0]
     cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
     return cli
+
+
+def inspect_binary_format(path: Path) -> dict[str, str]:
+    with path.open("rb") as handle:
+        header = handle.read(4096)
+        if header.startswith(b"\x7fELF"):
+            require(len(header) >= 20, "ELF binary header is truncated")
+            require(header[4] == 2, "ELF binary is not 64-bit")
+            require(header[5] == 1, "ELF binary is not little-endian")
+            machine = struct.unpack_from("<H", header, 18)[0]
+            arch = {62: "x86_64", 183: "aarch64"}.get(machine)
+            require(arch is not None, f"unsupported ELF machine: {machine}")
+            return {"format": "elf", "arch": arch}
+        if header.startswith(b"MZ"):
+            require(len(header) >= 64, "PE binary header is truncated")
+            pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
+            handle.seek(pe_offset)
+            pe_header = handle.read(6)
+            require(len(pe_header) == 6 and pe_header.startswith(b"PE\0\0"), "PE header is invalid")
+            machine = struct.unpack_from("<H", pe_header, 4)[0]
+            arch = {0x8664: "x86_64", 0xAA64: "aarch64"}.get(machine)
+            require(arch is not None, f"unsupported PE machine: {machine:#x}")
+            return {"format": "pe", "arch": arch}
+        if header.startswith(b"\xcf\xfa\xed\xfe"):
+            require(len(header) >= 8, "Mach-O binary header is truncated")
+            cpu_type = struct.unpack_from("<I", header, 4)[0]
+            arch = {0x01000007: "x86_64", 0x0100000C: "aarch64"}.get(cpu_type)
+            require(arch is not None, f"unsupported Mach-O CPU type: {cpu_type:#x}")
+            return {"format": "mach-o", "arch": arch}
+    raise ProofFailure("packaged executable is not a supported ELF, PE, or Mach-O binary")
+
+
+def native_engine_markers(path: Path) -> list[str]:
+    prefix = NATIVE_ENGINE_MARKER_PREFIX.encode("ascii")
+    suffix = NATIVE_ENGINE_MARKER_SUFFIX.encode("ascii")
+    markers: set[bytes] = set()
+    overlap = b""
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            block = overlap + chunk
+            offset = 0
+            while True:
+                start = block.find(prefix, offset)
+                if start < 0:
+                    break
+                end = block.find(suffix, start)
+                if end < 0:
+                    break
+                end += len(suffix)
+                markers.add(block[start:end])
+                offset = end
+            overlap = block[-4096:]
+    decoded = []
+    for marker in sorted(markers):
+        try:
+            decoded.append(marker.decode("ascii"))
+        except UnicodeDecodeError as exc:
+            raise ProofFailure("packaged native engine marker is not ASCII") from exc
+    return decoded
+
+
+def ordered_contract_digest(domain: str, values: list[str]) -> str:
+    digest = hashlib.sha256()
+    for value in [domain, *values]:
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def embedding_contract_digest(model: dict, embedding: dict, tokenizer: dict) -> str:
+    string_fields = [
+        (model, "file_name", False),
+        (model, "sha256", False),
+        (embedding, "family", False),
+        (embedding, "query_prefix", False),
+        (embedding, "document_prefix", True),
+        (embedding, "pooling", False),
+        (embedding, "normalization", False),
+        (embedding, "element_type", False),
+        (tokenizer, "container", False),
+        (tokenizer, "tokenizer_sha256", False),
+        (tokenizer, "config_sha256", False),
+    ]
+    for owner, field, allow_empty in string_fields:
+        value = owner.get(field)
+        require(
+            isinstance(value, str) and (allow_empty or bool(value)),
+            f"native embedding contract field {field} is invalid",
+        )
+    for owner, field in (
+        (model, "size_bytes"),
+        (embedding, "dimension"),
+        (embedding, "vector_schema_version"),
+    ):
+        require(
+            type(owner.get(field)) is int and owner[field] > 0,
+            f"native embedding contract field {field} is invalid",
+        )
+    return ordered_contract_digest(
+        "codestory-native-embedding-contract-v1",
+        [
+            model["file_name"],
+            str(model["size_bytes"]),
+            model["sha256"],
+            embedding["family"],
+            str(embedding["dimension"]),
+            embedding["query_prefix"],
+            embedding["document_prefix"],
+            embedding["pooling"],
+            embedding["normalization"],
+            embedding["element_type"],
+            str(embedding["vector_schema_version"]),
+            tokenizer["container"],
+            tokenizer["tokenizer_sha256"],
+            tokenizer["config_sha256"],
+        ],
+    )
+
+
+def parse_native_build_identity(identity: str) -> dict[str, str]:
+    parts = identity.split("|")
+    require(parts[0] == "codestory-native-engine-v1", "native engine build schema is unsupported")
+    require(parts[-1] == "end", "native engine build identity terminator is missing")
+    fields: dict[str, str] = {}
+    for part in parts[1:-1]:
+        require("=" in part, f"malformed native engine build field: {part!r}")
+        key, value = part.split("=", 1)
+        require(bool(key) and bool(value), f"empty native engine build field: {part!r}")
+        require(key not in fields, f"duplicate native engine build field: {key}")
+        fields[key] = value
+    required = {
+        "target",
+        "os",
+        "arch",
+        "linkage",
+        "backends",
+        "llama_cpp_crate",
+        "llama_cpp_commit",
+        "model_sha256",
+        "embedding_contract_sha256",
+        "model_embedded",
+        "producer",
+    }
+    missing = sorted(required - fields.keys())
+    require(not missing, "native engine build identity is missing fields: " + ", ".join(missing))
+    return fields
+
+
+def load_native_manifest(root: Path, cli: Path, expected_version: str) -> dict:
+    matches = [path for path in root.rglob(NATIVE_MANIFEST_FILE) if path.is_file()]
+    require(
+        len(matches) == 1,
+        f"archive must contain exactly one native engine manifest; found {len(matches)}",
+    )
+    try:
+        manifest = json.loads(matches[0].read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ProofFailure(f"native engine manifest is not valid JSON: {exc}") from exc
+    require(isinstance(manifest, dict), "native engine manifest is not an object")
+    require(manifest.get("schema_version") == 1, "native engine manifest schema is unsupported")
+    require(
+        manifest.get("release_version") == expected_version,
+        "native engine manifest version does not match expected release",
+    )
+    asset_target = manifest.get("asset_target")
+    target_contract = TARGET_CONTRACTS.get(asset_target)
+    require(target_contract is not None, f"native manifest has unsupported asset target: {asset_target}")
+
+    binary = manifest.get("binary")
+    engine = manifest.get("engine")
+    model = manifest.get("model")
+    embedding = manifest.get("embedding")
+    tokenizer = manifest.get("tokenizer_config")
+    accelerator = manifest.get("accelerator")
+    require(isinstance(binary, dict), "native engine manifest has no binary descriptor")
+    require(isinstance(engine, dict), "native engine manifest has no engine descriptor")
+    require(isinstance(model, dict), "native engine manifest has no model descriptor")
+    require(isinstance(embedding, dict), "native engine manifest has no embedding descriptor")
+    require(isinstance(tokenizer, dict), "native engine manifest has no tokenizer descriptor")
+    require(isinstance(accelerator, dict), "native engine manifest has no accelerator descriptor")
+    require(
+        cli.name == target_contract["binary_name"],
+        "packaged executable name does not match asset target",
+    )
+    require(binary.get("name") == cli.name, "native engine manifest names a different binary")
+    cli_sha256 = sha256(cli)
+    require(binary.get("sha256") == cli_sha256, "packaged binary digest does not match native manifest")
+    binary_identity = inspect_binary_format(cli)
+    require(binary == {
+        "name": cli.name,
+        "sha256": cli_sha256,
+        "format": binary_identity["format"],
+        "arch": binary_identity["arch"],
+    }, "native manifest binary descriptor does not match the executable")
+    require(
+        binary_identity["format"] == target_contract["binary_format"],
+        "packaged executable format does not match asset target",
+    )
+    require(
+        binary_identity["arch"] == target_contract["target_arch"],
+        "packaged executable architecture does not match asset target",
+    )
+    require(engine.get("build_contract_schema_version") == 1, "native engine build contract is unsupported")
+    build_identity = engine.get("build_identity")
+    require(
+        isinstance(build_identity, str)
+        and build_identity.startswith(NATIVE_ENGINE_MARKER_PREFIX)
+        and build_identity.endswith("|end"),
+        "native engine build identity is malformed",
+    )
+    build_fields = parse_native_build_identity(build_identity)
+    binary_markers = native_engine_markers(cli)
+    require(
+        binary_markers == [build_identity],
+        "packaged executable native engine marker does not match manifest",
+    )
+    require(engine.get("linkage") == "static", "packaged native engine is not statically linked")
+    require(build_fields["linkage"] == engine["linkage"], "native build linkage contradicts manifest")
+    compiled_backends = engine.get("compiled_backends")
+    require(
+        isinstance(compiled_backends, list)
+        and compiled_backends
+        and all(isinstance(item, str) and item for item in compiled_backends),
+        "native manifest has no compiled backend set",
+    )
+    require(compiled_backends[0] == "cpu", "native manifest does not make CPU capability explicit")
+    require(
+        build_fields["backends"].split(",") == compiled_backends,
+        "native build backend set contradicts manifest",
+    )
+    for manifest_field, build_field in (
+        ("target_triple", "target"),
+        ("target_os", "os"),
+        ("target_arch", "arch"),
+        ("llama_cpp_crate_version", "llama_cpp_crate"),
+        ("llama_cpp_source_commit", "llama_cpp_commit"),
+    ):
+        require(
+            engine.get(manifest_field) == build_fields[build_field],
+            f"native build {build_field} contradicts manifest",
+        )
+    for manifest_field, expected in (
+        ("target_triple", target_contract["target_triple"]),
+        ("target_os", target_contract["target_os"]),
+        ("target_arch", target_contract["target_arch"]),
+    ):
+        require(
+            engine.get(manifest_field) == expected,
+            f"native manifest {manifest_field} does not match asset target",
+        )
+    require(
+        compiled_backends == target_contract["compiled_backends"],
+        "native manifest backend set does not match asset target",
+    )
+    model_digest = model.get("sha256")
+    require(
+        isinstance(model_digest, str)
+        and len(model_digest) == 64
+        and all(char in "0123456789abcdefABCDEF" for char in model_digest),
+        "native manifest lacks an exact model digest",
+    )
+    require(model.get("embedded") is True, "native manifest does not prove an embedded model")
+    require(build_fields["model_embedded"] == "true", "native build marker says the model is absent")
+    require(build_fields["model_sha256"] == model_digest, "native build model digest contradicts manifest")
+    contract_sha256 = embedding_contract_digest(model, embedding, tokenizer)
+    require(
+        build_fields["embedding_contract_sha256"] == contract_sha256,
+        "native build embedding contract contradicts manifest",
+    )
+    require(
+        engine.get("embedding_contract_sha256") == contract_sha256,
+        "native engine embedding contract digest contradicts manifest",
+    )
+    producer = model.get("producer")
+    require(isinstance(producer, dict), "native manifest lacks model producer identity")
+    require(
+        build_fields["producer"] == f"{producer.get('name')}@{producer.get('version')}",
+        "native build producer contradicts manifest",
+    )
+    require(
+        producer.get("version") == expected_version,
+        "native model producer version does not match expected release",
+    )
+    require(
+        accelerator.get("cpu_fallback") == "explicit_only",
+        "native manifest permits implicit CPU fallback",
+    )
+    require(
+        accelerator.get("package_claim") == "compiled_capability_only",
+        "native manifest overstates package-time accelerator proof",
+    )
+    require(
+        accelerator.get("runtime_execution") == "not_proven_by_package",
+        "native manifest overstates package-time execution proof",
+    )
+    expected_backend = accelerator.get("expected_protected_backend")
+    require(
+        expected_backend == target_contract["expected_protected_backend"],
+        "native manifest protected backend does not match asset target",
+    )
+    require(
+        accelerator.get("non_claim_reason") == target_contract["non_claim_reason"],
+        "native manifest accelerator non-claim does not match asset target",
+    )
+    return manifest
+
+
+def normalized_backend(value: object) -> str:
+    backend = str(value or "").strip().lower()
+    if backend == "mtl":
+        return "metal"
+    if backend.startswith("vulkan"):
+        return "vulkan"
+    return backend
+
+
+def verify_runtime_against_manifest(
+    manifest: dict,
+    runtime: dict,
+    expected_policy: str | None,
+) -> dict:
+    identities = [runtime.get("identity"), runtime.get("restart_identity")]
+    require(all(isinstance(identity, dict) for identity in identities), "runtime proof omitted engine identity")
+    engine = manifest["engine"]
+    model = manifest["model"]
+    accelerator = manifest["accelerator"]
+    compiled_backends = engine["compiled_backends"]
+    observed_backend = ""
+    for label, identity in zip(("first process", "restart"), identities):
+        require(
+            identity.get("embedding_ggml_build_identity") == engine["build_identity"],
+            f"{label} loaded a different native engine build than the package manifest",
+        )
+        require(
+            identity.get("embedding_model_sha256") == model["sha256"],
+            f"{label} loaded a different embedding model than the package manifest",
+        )
+        current_backend = normalized_backend(identity.get("embedding_backend"))
+        require(
+            current_backend in compiled_backends,
+            f"{label} selected backend {current_backend!r} outside the compiled package contract",
+        )
+        if not observed_backend:
+            observed_backend = current_backend
+        require(current_backend == observed_backend, "native backend changed across process restart")
+
+    policy = str(identities[0].get("embedding_policy") or "")
+    require(policy == expected_policy, "runtime policy does not match the requested proof lane")
+    if policy == "accelerated":
+        expected_backend = accelerator.get("expected_protected_backend")
+        require(
+            isinstance(expected_backend, str) and bool(expected_backend),
+            "this package target has no protected accelerator execution claim",
+        )
+        require(
+            observed_backend == expected_backend,
+            "runtime accelerator backend does not match the protected package contract",
+        )
+        execution = "proven_by_live_runtime"
+        non_claim_reason = None
+    else:
+        require(policy == "cpu_explicit", "runtime used neither protected acceleration nor explicit CPU")
+        require(observed_backend == "cpu", "explicit CPU proof selected a non-CPU backend")
+        execution = "explicit_cpu_execution"
+        non_claim_reason = (
+            accelerator.get("non_claim_reason")
+            or "explicit_cpu_execution_does_not_prove_acceleration"
+        )
+
+    return {
+        "build_identity": engine["build_identity"],
+        "model_sha256": model["sha256"],
+        "policy": policy,
+        "backend": observed_backend,
+        "execution": execution,
+        "answer_quality_claim": False,
+        "non_claim_reason": non_claim_reason,
+    }
 
 
 def run(command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> dict:
@@ -745,14 +1190,88 @@ def self_test() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         payload = root / "artifact.zip"
+        binary_header = bytearray(64)
+        binary_header[:4] = b"\xcf\xfa\xed\xfe"
+        struct.pack_into("<I", binary_header, 4, 0x0100000C)
+        model = {
+            "file_name": "test.gguf",
+            "size_bytes": 4,
+            "sha256": "a" * 64,
+            "embedded": True,
+            "producer": {"name": "test", "version": "0.0.0"},
+        }
+        embedding = {
+            "family": "inprocess:test",
+            "dimension": 768,
+            "query_prefix": "query: ",
+            "document_prefix": "",
+            "pooling": "cls",
+            "normalization": "l2",
+            "element_type": "f32_le",
+            "vector_schema_version": 2,
+        }
+        tokenizer = {
+            "container": "gguf",
+            "tokenizer_sha256": "b" * 64,
+            "config_sha256": "c" * 64,
+        }
+        contract_sha256 = embedding_contract_digest(model, embedding, tokenizer)
+        build_identity = (
+            "codestory-native-engine-v1|target=aarch64-apple-darwin|os=macos|"
+            "arch=aarch64|linkage=static|backends=cpu,metal|llama_cpp_crate=test|"
+            f"llama_cpp_commit=test|model_sha256={'a' * 64}|"
+            f"embedding_contract_sha256={contract_sha256}|model_embedded=true|"
+            "producer=test@0.0.0|end"
+        )
+        binary_payload = bytes(binary_header) + b"\0" + build_identity.encode("ascii") + b"\0"
+        valid_manifest = {
+            "schema_version": 1,
+            "release_version": "0.0.0",
+            "asset_target": "macos-arm64",
+            "binary": {
+                "name": "codestory-cli",
+                "sha256": hashlib.sha256(binary_payload).hexdigest(),
+                "format": "mach-o",
+                "arch": "aarch64",
+            },
+            "engine": {
+                "build_contract_schema_version": 1,
+                "build_identity": build_identity,
+                "target_triple": "aarch64-apple-darwin",
+                "target_os": "macos",
+                "target_arch": "aarch64",
+                "linkage": "static",
+                "compiled_backends": ["cpu", "metal"],
+                "llama_cpp_crate_version": "test",
+                "llama_cpp_source_commit": "test",
+                "embedding_contract_sha256": contract_sha256,
+            },
+            "model": model,
+            "embedding": embedding,
+            "tokenizer_config": tokenizer,
+            "accelerator": {
+                "cpu_fallback": "explicit_only",
+                "package_claim": "compiled_capability_only",
+                "runtime_execution": "not_proven_by_package",
+                "expected_protected_backend": "metal",
+                "non_claim_reason": None,
+            },
+        }
         with zipfile.ZipFile(payload, "w") as handle:
-            handle.writestr("codestory-cli", b"binary")
+            handle.writestr("codestory-cli", binary_payload)
+            handle.writestr(
+                NATIVE_MANIFEST_FILE,
+                json.dumps(valid_manifest, indent=2, sort_keys=True) + "\n",
+            )
         checksum = root / "SHA256SUMS.txt"
         checksum.write_text(f"{sha256(payload)}  {payload.name}\n", encoding="utf-8")
         require(expected_archive_digest(checksum, payload) == sha256(payload), "checksum parser failed")
         unpacked = root / "unpacked"
         unpack_archive(payload, unpacked)
-        require(find_cli(unpacked).name == "codestory-cli", "CLI discovery failed")
+        cli = find_cli(unpacked)
+        require(cli.name == "codestory-cli", "CLI discovery failed")
+        manifest = load_native_manifest(unpacked, cli, "0.0.0")
+        require(manifest["engine"]["linkage"] == "static", "manifest validation failed")
         malicious = root / "malicious.zip"
         with zipfile.ZipFile(malicious, "w") as handle:
             handle.writestr("../outside", b"bad")
@@ -764,7 +1283,7 @@ def self_test() -> None:
             raise ProofFailure("archive traversal was accepted")
         valid = {
             "embedding_model_sha256": "a" * 64,
-            "embedding_ggml_build_identity": "ggml:test",
+            "embedding_ggml_build_identity": manifest["engine"]["build_identity"],
             "embedding_backend": "Metal",
             "embedding_adapter": "Apple GPU",
             "embedding_policy": "accelerated",
@@ -779,6 +1298,9 @@ def self_test() -> None:
             "embedding_offloaded_layer_count": 13,
         }
         engine_identity(valid, "accelerated", "Metal")
+        runtime = {"identity": valid, "restart_identity": valid.copy()}
+        evidence = verify_runtime_against_manifest(manifest, runtime, "accelerated")
+        require(evidence["execution"] == "proven_by_live_runtime", "runtime contract proof failed")
         invalid = {**valid, "embedding_adapter": "llvmpipe"}
         try:
             engine_identity(invalid, "accelerated", "Metal")
@@ -786,6 +1308,52 @@ def self_test() -> None:
             pass
         else:
             raise ProofFailure("software adapter was accepted")
+
+        hostile_root = root / "hostile-manifest"
+        hostile_root.mkdir()
+        hostile_cli = hostile_root / "codestory-cli"
+        hostile_cli.write_bytes(binary_payload)
+        hostile_manifest = json.loads(json.dumps(valid_manifest))
+        hostile_manifest["binary"]["sha256"] = "0" * 64
+        write_json(hostile_root / NATIVE_MANIFEST_FILE, hostile_manifest)
+        try:
+            load_native_manifest(hostile_root, hostile_cli, "0.0.0")
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("binary/manifest digest mismatch was accepted")
+
+        wrong_target = json.loads(json.dumps(valid_manifest))
+        wrong_target["asset_target"] = "macos-x64"
+        write_json(hostile_root / NATIVE_MANIFEST_FILE, wrong_target)
+        try:
+            load_native_manifest(hostile_root, hostile_cli, "0.0.0")
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("asset target/binary architecture mismatch was accepted")
+
+        stale_contract = json.loads(json.dumps(valid_manifest))
+        stale_contract["embedding"]["query_prefix"] = "changed query: "
+        write_json(hostile_root / NATIVE_MANIFEST_FILE, stale_contract)
+        try:
+            load_native_manifest(hostile_root, hostile_cli, "0.0.0")
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("stale binary embedding contract was accepted")
+
+        marker_mismatch = json.loads(json.dumps(valid_manifest))
+        marker_mismatch["engine"]["build_identity"] = build_identity.replace(
+            "|end", "|note=fabricated|end"
+        )
+        write_json(hostile_root / NATIVE_MANIFEST_FILE, marker_mismatch)
+        try:
+            load_native_manifest(hostile_root, hostile_cli, "0.0.0")
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("binary/manifest native marker mismatch was accepted")
     print("packaged in-process embedding proof self-test passed")
 
 
@@ -827,6 +1395,7 @@ def main() -> int:
         root = Path(raw)
         unpack_archive(args.archive, root / "unpacked")
         cli = find_cli(root / "unpacked")
+        manifest = load_native_manifest(root / "unpacked", cli, args.expected_version)
         env = isolated_environment(root, args.engine_policy, args.offline)
         version = run([str(cli), "--version"], env=env, cwd=root, timeout=args.timeout_secs)
         require(args.expected_version in version["stdout"], f"CLI version does not contain {args.expected_version}")
@@ -836,10 +1405,22 @@ def main() -> int:
             not any(token in help_text for token in LEGACY_HELP_TOKENS),
             "top-level help exposes deleted embedding lifecycle terminology",
         )
-        summary: dict[str, object] = {"version": version, "help": help_result}
+        summary: dict[str, object] = {
+            "version": version,
+            "help": help_result,
+            "package_contract": {
+                "manifest": manifest,
+                "answer_quality_claim": False,
+            },
+        }
         if not args.version_only:
             require(args.project is not None, "--project is required for the runtime proof")
-            summary["runtime"] = prove_runtime(args, cli, env, root, args.out_dir)
+            require(args.engine_policy is not None, "--engine-policy is required for the runtime proof")
+            runtime = prove_runtime(args, cli, env, root, args.out_dir)
+            summary["runtime"] = runtime
+            summary["package_contract"]["runtime_evidence"] = verify_runtime_against_manifest(
+                manifest, runtime, args.engine_policy
+            )
         write_json(args.out_dir / "summary.json", summary)
     print(f"packaged CodeStory proof passed: {args.out_dir / 'summary.json'}")
     return 0
