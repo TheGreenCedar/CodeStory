@@ -489,6 +489,7 @@ dependencies = [
  "anyhow",
  "codestory-contracts",
  "codestory-indexer",
+ "codestory-retrieval",
  "codestory-runtime",
  "codestory-store",
  "codestory-workspace",

@@ -72,6 +72,7 @@ nonzero, and L2-normalized within `1e-3`. Its shape is:
     {
       "query_id": "symbol-query-001",
       "kind": "symbol",
+      "query_text": "Where is the published vector generation validated?",
       "vector": [1.0],
       "expected": [{ "node_id": "...", "document_hash": "..." }]
     }
@@ -83,8 +84,60 @@ nonzero, and L2-normalized within `1e-3`. Its shape is:
 ```
 
 The abbreviated vectors above illustrate the schema only; real vectors contain
-768 values. Run each predeclared vector count from a clean, exact, release-built
-Git tree on the approved Windows x64 production host:
+768 values. `query_text` is required for decision fixtures; older synthetic
+smoke fixtures may omit it.
+
+Create the source publication under an isolated cache root. The retrieval index
+command is the existing product publication path; the spike does not export or
+rewrite production state:
+
+```powershell
+$env:CODESTORY_CACHE_ROOT = 'C:\evidence\codestory-cache'
+cargo run --release --locked -p codestory-cli -- index --project 'C:\source\representative-repo' --refresh full --format json
+cargo run --release --locked -p codestory-cli -- retrieval index --project 'C:\source\representative-repo' --refresh full --format json
+Get-ChildItem -LiteralPath $env:CODESTORY_CACHE_ROOT -Recurse -Filter vector-generation-manifest.json
+```
+
+Select the intended `vector-generation-manifest.json` from that isolated root;
+its adjacent `vectors.sqlite3` is the source. An independently reviewed query
+catalog supplies only source-truth labels, never vectors or model neighbors:
+
+```json
+{
+  "schema_version": 1,
+  "queries": [
+    {
+      "query_id": "symbol-query-001",
+      "kind": "symbol",
+      "query_text": "Where is the published vector generation validated?",
+      "expected_node_ids": ["..."]
+    }
+  ]
+}
+```
+
+The entry above is illustrative; the decision catalog must contain the 30
+predeclared representative and symbol queries.
+
+Freeze the fixture with the linked production query embedder. The source must
+contain the requested base rows plus the real ordered tail rows; the generator
+fails instead of synthesizing missing increments or expected identities:
+
+```powershell
+$env:CODESTORY_VECTOR_SPIKE_SOURCE_SQLITE = 'C:\evidence\codestory-cache\semantic\collections\<generation>\vectors.sqlite3'
+$env:CODESTORY_VECTOR_SPIKE_QUERY_CATALOG_JSON = 'C:\evidence\vector-spike-query-catalog.json'
+$env:CODESTORY_VECTOR_SPIKE_FIXTURE_JSON = 'C:\evidence\vector-spike-fixture.json'
+$env:CODESTORY_VECTOR_SPIKE_VECTOR_COUNT = '100000'
+$env:CODESTORY_VECTOR_SPIKE_INCREMENTAL_COUNT = '100'
+cargo test --release --locked --no-default-features --features fixture-generator -p codestory-bench --test vector_backend_spike prepare_vector_backend_fixture -- --ignored --exact --nocapture
+```
+
+`CODESTORY_VECTOR_SPIKE_FIXTURE_JSON` must name a new file whose parent already
+exists outside both the source generation and `CODESTORY_CACHE_ROOT`. Fixture
+publication never replaces an existing destination.
+
+Run each predeclared vector count from a clean, exact, release-built Git tree on
+the approved Windows x64 production host:
 
 ```powershell
 $env:CODESTORY_VECTOR_SPIKE_PROFILE = 'decision'

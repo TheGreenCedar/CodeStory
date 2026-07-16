@@ -1,6 +1,8 @@
 use crate::candidate::{CandidateHit, CandidateSource};
 use crate::config::{SidecarLayout, SidecarRuntimeConfig};
-use crate::embeddings::{EmbeddingDeviceReadiness, InProcessEmbeddingClient};
+use crate::embeddings::{
+    EmbeddingDeviceReadiness, InProcessEmbeddingClient, ProductEmbeddingResidencyLease,
+};
 use crate::in_process_embedding::ProcessEmbeddingIdentity;
 use crate::sidecar_search::SearchExecutionContext;
 use anyhow::{Context, Result, bail};
@@ -255,7 +257,7 @@ pub(crate) fn producer_evidence_mismatches(
 /// atomically renamed into the generation and is intended to be copied into
 /// the retrieval manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct VectorDatabaseAttestation {
+pub struct VectorDatabaseAttestation {
     pub schema_version: i64,
     pub generation: String,
     pub input_hash: String,
@@ -318,6 +320,185 @@ impl VectorGenerationManifest {
         }
         Ok(())
     }
+}
+
+/// One ordered record sampled from a production-validated vector generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorFixtureRecord {
+    pub node_id: String,
+    pub document_hash: String,
+    pub vector: Vec<f32>,
+}
+
+/// A pinned, production-validated record sample and its publication attestation.
+#[derive(Debug)]
+pub struct ValidatedVectorFixtureSample {
+    attestation: VectorDatabaseAttestation,
+    records: Vec<VectorFixtureRecord>,
+}
+
+impl ValidatedVectorFixtureSample {
+    pub fn attestation(&self) -> &VectorDatabaseAttestation {
+        &self.attestation
+    }
+
+    pub fn records(&self) -> &[VectorFixtureRecord] {
+        &self.records
+    }
+}
+
+/// A production-validated source for freezing vector-backend comparison queries.
+pub struct ValidatedVectorFixtureSource {
+    sample: ValidatedVectorFixtureSample,
+    embedding: InProcessEmbeddingClient,
+    _residency: ProductEmbeddingResidencyLease,
+}
+
+impl ValidatedVectorFixtureSource {
+    pub fn attestation(&self) -> &VectorDatabaseAttestation {
+        self.sample.attestation()
+    }
+
+    pub fn records(&self) -> &[VectorFixtureRecord] {
+        self.sample.records()
+    }
+
+    pub fn embed_query(&self, query_text: &str) -> Result<Vec<f32>> {
+        self.embedding.embed_query(query_text)
+    }
+}
+
+/// Sample an immutable production vector generation through its canonical manifest contract.
+pub fn load_validated_vector_fixture_sample(
+    source_sqlite: &Path,
+    record_limit: usize,
+) -> Result<ValidatedVectorFixtureSample> {
+    load_validated_vector_fixture_sample_with_hook(source_sqlite, record_limit, || Ok(()))
+        .map(|(sample, _)| sample)
+}
+
+/// Open an immutable production vector generation and retain the exact compatible query engine.
+pub fn open_validated_vector_fixture_source_for_runtime(
+    source_sqlite: &Path,
+    runtime: &SidecarRuntimeConfig,
+    record_limit: usize,
+) -> Result<ValidatedVectorFixtureSource> {
+    let (sample, manifest) =
+        load_validated_vector_fixture_sample_with_hook(source_sqlite, record_limit, || Ok(()))?;
+
+    let residency = crate::embeddings::acquire_product_embedding_residency_for_runtime(runtime)
+        .context("initialize the production fixture query engine")?;
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let current_evidence = build_vector_producer_evidence(
+        &embedding_device,
+        residency.identity(),
+        u32::try_from(crate::embeddings::RETRIEVAL_EMBEDDING_DIM)
+            .context("retrieval embedding dimension overflow")?,
+        manifest.evidence.publication.clone(),
+    );
+    validate_fixture_producer_contract(&manifest, &current_evidence)?;
+    validate_execution_evidence_for_runtime(
+        &manifest.evidence,
+        runtime,
+        &embedding_device,
+        residency.identity(),
+    )?;
+
+    Ok(ValidatedVectorFixtureSource {
+        sample,
+        embedding: InProcessEmbeddingClient::new(runtime),
+        _residency: residency,
+    })
+}
+
+fn load_validated_vector_fixture_sample_with_hook(
+    source_sqlite: &Path,
+    record_limit: usize,
+    before_sample: impl FnOnce() -> Result<()>,
+) -> Result<(ValidatedVectorFixtureSample, VectorGenerationManifest)> {
+    if source_sqlite.file_name().and_then(|name| name.to_str()) != Some(VECTOR_INDEX_FILE) {
+        bail!("vector fixture source must be a production {VECTOR_INDEX_FILE}");
+    }
+    if record_limit == 0 {
+        bail!("vector fixture record limit must be positive");
+    }
+    let source_dir = source_sqlite
+        .parent()
+        .context("production vector fixture source has no generation directory")?;
+    let manifest = read_generation_manifest(&source_dir.join(VECTOR_GENERATION_MANIFEST_FILE))?;
+    ensure_no_sqlite_sidecars(source_sqlite)?;
+    let connection = open_read_only(source_sqlite)?;
+    connection.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+    let result = (|| -> Result<_> {
+        let expected_anchors = read_fixture_source_anchors(&connection)?;
+        let persisted_contract = VectorEvidenceContract::new(
+            manifest.vectors.embedding_backend.clone(),
+            manifest.vectors.embedding_dim,
+            manifest.vectors.producer_identity.clone(),
+            manifest.vectors.evidence_contract_identity.clone(),
+        );
+        let attestation = validate_database_connection(
+            source_sqlite,
+            &connection,
+            &manifest.vectors.generation,
+            &manifest.vectors.input_hash,
+            &persisted_contract,
+            &expected_anchors,
+            Some(&manifest.vectors),
+        )?;
+        let record_limit_u64 =
+            u64::try_from(record_limit).context("vector fixture record limit overflow")?;
+        if attestation.point_count < record_limit_u64 {
+            bail!(
+                "production vector fixture source has {} points but {record_limit} were requested",
+                attestation.point_count
+            );
+        }
+        before_sample()?;
+        let records = sample_fixture_records(&connection, record_limit, attestation.embedding_dim)?;
+        if records.len() != record_limit {
+            bail!(
+                "production vector fixture source yielded {} of {record_limit} requested records",
+                records.len()
+            );
+        }
+        if sha256_file(source_sqlite)? != attestation.database_sha256 {
+            bail!("production vector fixture source changed while its pinned sample was read");
+        }
+        ensure_no_sqlite_sidecars(source_sqlite)?;
+        Ok(ValidatedVectorFixtureSample {
+            attestation,
+            records,
+        })
+    })();
+    let rollback = connection.execute_batch("ROLLBACK");
+    if result.is_ok() {
+        rollback.context("release pinned production vector fixture source")?;
+    }
+    result.map(|sample| (sample, manifest))
+}
+
+fn validate_fixture_producer_contract(
+    manifest: &VectorGenerationManifest,
+    current_evidence: &EmbeddingVectorProducerEvidenceDto,
+) -> Result<()> {
+    let mismatches = producer_evidence_mismatches(current_evidence, &manifest.evidence);
+    if !mismatches.is_empty() {
+        bail!(
+            "vector fixture source is incompatible with the current query engine: {}",
+            mismatches.join(", ")
+        );
+    }
+    let compatibility = vector_compatibility_identity(current_evidence)?;
+    if compatibility != manifest.compatibility_sha256
+        || compatibility != manifest.vectors.evidence_contract_identity
+        || manifest.vectors.embedding_backend != crate::embeddings::embedding_backend_label()
+        || manifest.vectors.embedding_dim != crate::embeddings::RETRIEVAL_EMBEDDING_DIM
+        || manifest.vectors.producer_identity != crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID
+    {
+        bail!("vector fixture source does not match the current production embedding contract");
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_generation_evidence_for_publication(
@@ -692,13 +873,7 @@ impl EmbeddedVectorIndex {
         collection: &str,
     ) -> Result<VectorGenerationManifest> {
         let path = generation_manifest_path(layout, collection);
-        let manifest = serde_json::from_slice::<VectorGenerationManifest>(
-            &std::fs::read(&path)
-                .with_context(|| format!("read vector generation manifest {}", path.display()))?,
-        )
-        .with_context(|| format!("parse vector generation manifest {}", path.display()))?;
-        manifest.validate()?;
-        Ok(manifest)
+        read_generation_manifest(&path)
     }
 
     pub(crate) fn health(
@@ -776,6 +951,87 @@ fn generation_manifest_path(layout: &SidecarLayout, collection: &str) -> PathBuf
         .parent()
         .expect("vector index path always has a collection parent")
         .join(VECTOR_GENERATION_MANIFEST_FILE)
+}
+
+fn read_generation_manifest(path: &Path) -> Result<VectorGenerationManifest> {
+    let manifest = serde_json::from_slice::<VectorGenerationManifest>(
+        &std::fs::read(path)
+            .with_context(|| format!("read vector generation manifest {}", path.display()))?,
+    )
+    .with_context(|| format!("parse vector generation manifest {}", path.display()))?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+fn read_fixture_source_anchors(connection: &Connection) -> Result<BTreeMap<String, String>> {
+    validate_sqlite_quick_check(connection)?;
+    let mut statement =
+        connection.prepare("SELECT node_id, document_hash FROM vectors ORDER BY node_id ASC")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut anchors = BTreeMap::new();
+    for row in rows {
+        let (node_id, document_hash) = row?;
+        if node_id.trim().is_empty() || document_hash.trim().is_empty() {
+            bail!("embedded vector row identities must be non-empty");
+        }
+        if anchors.insert(node_id.clone(), document_hash).is_some() {
+            bail!("duplicate embedded vector row {node_id}");
+        }
+    }
+    Ok(anchors)
+}
+
+fn sample_fixture_records(
+    connection: &Connection,
+    record_limit: usize,
+    embedding_dim: usize,
+) -> Result<Vec<VectorFixtureRecord>> {
+    let limit = i64::try_from(record_limit).context("vector fixture record limit overflow")?;
+    let mut statement = connection.prepare(
+        "SELECT node_id, document_hash, vector FROM vectors ORDER BY node_id ASC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (node_id, document_hash, bytes) = row?;
+        validate_vector_bytes(&node_id, &bytes, embedding_dim)?;
+        let vector = bytes
+            .chunks_exact(4)
+            .map(|chunk| {
+                f32::from_bits(u32::from_le_bytes(
+                    chunk.try_into().expect("four-byte vector chunk"),
+                ))
+            })
+            .collect();
+        Ok(VectorFixtureRecord {
+            node_id,
+            document_hash,
+            vector,
+        })
+    })
+    .collect()
+}
+
+fn ensure_no_sqlite_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            bail!(
+                "production vector fixture source has an unbound SQLite sidecar: {}",
+                sidecar.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -980,10 +1236,30 @@ fn validate_database(
     expected_anchors: &BTreeMap<String, String>,
     expected_attestation: Option<&VectorDatabaseAttestation>,
 ) -> Result<VectorDatabaseAttestation> {
-    contract.validate()?;
     let connection = open_read_only(path)?;
-    validate_sqlite_quick_check(&connection)?;
-    let metadata = read_metadata(&connection)?;
+    validate_database_connection(
+        path,
+        &connection,
+        generation,
+        input_hash,
+        contract,
+        expected_anchors,
+        expected_attestation,
+    )
+}
+
+fn validate_database_connection(
+    path: &Path,
+    connection: &Connection,
+    generation: &str,
+    input_hash: &str,
+    contract: &VectorEvidenceContract,
+    expected_anchors: &BTreeMap<String, String>,
+    expected_attestation: Option<&VectorDatabaseAttestation>,
+) -> Result<VectorDatabaseAttestation> {
+    contract.validate()?;
+    validate_sqlite_quick_check(connection)?;
+    let metadata = read_metadata(connection)?;
     if metadata.schema_version != VECTOR_INDEX_SCHEMA_VERSION
         || metadata.generation != generation
         || metadata.input_hash != input_hash
@@ -1006,7 +1282,7 @@ fn validate_database(
         );
     }
     let (vector_digest, actual_anchors) =
-        validate_and_digest_vectors(&connection, contract.embedding_dim, expected_anchors)?;
+        validate_and_digest_vectors(connection, contract.embedding_dim, expected_anchors)?;
     if actual_anchors != expected_anchors.len() || vector_digest != metadata.vector_digest {
         bail!("embedded vector canonical digest does not match metadata");
     }
@@ -1710,6 +1986,163 @@ mod tests {
                 .iter()
                 .any(|mismatch| mismatch == field),
             "missing compatibility check for {field}"
+        );
+    }
+
+    #[test]
+    fn vector_fixture_source_rejects_current_query_engine_contract_drift() {
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "fixture-core".into(),
+                core_run_id: "fixture-run".into(),
+                retrieval_generation: "fixture-retrieval".into(),
+                retrieval_input_hash: "fixture-input".into(),
+                semantic_generation: "fixture-semantic".into(),
+            },
+        );
+        let compatibility =
+            vector_compatibility_identity(&evidence).expect("fixture compatibility identity");
+        let manifest = VectorGenerationManifest::new(
+            evidence.clone(),
+            VectorDatabaseAttestation {
+                schema_version: VECTOR_INDEX_SCHEMA_VERSION,
+                generation: "fixture-retrieval".into(),
+                input_hash: "fixture-input".into(),
+                embedding_backend: crate::embeddings::embedding_backend_label().into(),
+                embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM,
+                point_count: 1,
+                producer_identity: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
+                evidence_contract_identity: compatibility,
+                vector_digest: "0".repeat(64),
+                database_sha256: "1".repeat(64),
+            },
+        )
+        .expect("fixture manifest");
+        validate_fixture_producer_contract(&manifest, &evidence)
+            .expect("matching current engine contract");
+
+        for mutate in [
+            |current: &mut EmbeddingVectorProducerEvidenceDto| {
+                current.model.model_sha256 = "2".repeat(64);
+            },
+            |current: &mut EmbeddingVectorProducerEvidenceDto| {
+                current.semantics.query_prefix.push_str("drift");
+            },
+            |current: &mut EmbeddingVectorProducerEvidenceDto| {
+                current.engine.backend.push_str("-drift");
+            },
+            |current: &mut EmbeddingVectorProducerEvidenceDto| {
+                current.execution.eligibility.push_str("-drift");
+            },
+        ] {
+            let mut current = evidence.clone();
+            mutate(&mut current);
+            let error = validate_fixture_producer_contract(&manifest, &current)
+                .expect_err("current query engine drift must fail closed");
+            assert!(error.to_string().contains("incompatible"));
+        }
+    }
+
+    #[test]
+    fn vector_fixture_sampling_is_ordered_and_fails_closed_on_wal_drift() {
+        let root = tempdir().expect("tempdir");
+        let generation_dir = root.path().join("fixture-generation");
+        std::fs::create_dir_all(&generation_dir).expect("create fixture generation");
+        let path = generation_dir.join(VECTOR_INDEX_FILE);
+        let evidence = build_vector_producer_evidence(
+            &accelerated_device(),
+            Some(&accelerated_identity()),
+            2,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "fixture-core".into(),
+                core_run_id: "fixture-run".into(),
+                retrieval_generation: "fixture-generation".into(),
+                retrieval_input_hash: "fixture-input".into(),
+                semantic_generation: "fixture-semantic".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            crate::embeddings::embedding_backend_label(),
+            2,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            vector_compatibility_identity(&evidence).expect("compatibility identity"),
+        );
+        let expected = BTreeMap::from([
+            ("node-a".to_string(), "document-a".to_string()),
+            ("node-b".to_string(), "document-b".to_string()),
+        ]);
+        write_database(
+            &path,
+            "fixture-generation",
+            "fixture-input",
+            &contract,
+            Some(&expected),
+            |visit| {
+                visit(attested_point("node-b", "document-b", vec![0.0, 1.0]))?;
+                visit(attested_point("node-a", "document-a", vec![1.0, 0.0]))
+            },
+        )
+        .expect("write fixture source");
+        let attestation = validate_database(
+            &path,
+            "fixture-generation",
+            "fixture-input",
+            &contract,
+            &expected,
+            None,
+        )
+        .expect("attest fixture source");
+        let mut manifest =
+            VectorGenerationManifest::new(evidence, attestation).expect("fixture manifest");
+        let manifest_path = generation_dir.join(VECTOR_GENERATION_MANIFEST_FILE);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize fixture manifest"),
+        )
+        .expect("write fixture manifest");
+
+        let sample = load_validated_vector_fixture_sample(&path, 2)
+            .expect("sample validated fixture source");
+        assert_eq!(sample.attestation(), &manifest.vectors);
+        assert_eq!(
+            sample
+                .records()
+                .iter()
+                .map(|record| record.node_id.as_str())
+                .collect::<Vec<_>>(),
+            ["node-a", "node-b"]
+        );
+
+        let connection = Connection::open(&path).expect("open fixture source for WAL mode");
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .expect("enable WAL mode");
+        assert_eq!(journal_mode, "wal");
+        drop(connection);
+        ensure_no_sqlite_sidecars(&path).expect("closed WAL source has no sidecars");
+        manifest.vectors.database_sha256 = sha256_file(&path).expect("rehash WAL source");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize updated fixture manifest"),
+        )
+        .expect("update fixture manifest");
+        let writer_path = path.clone();
+        let error = load_validated_vector_fixture_sample_with_hook(&path, 2, move || {
+            let writer = Connection::open(&writer_path)?;
+            writer.execute(
+                "UPDATE vectors SET document_hash = 'drift' WHERE node_id = 'node-a'",
+                [],
+            )?;
+            drop(writer);
+            Ok(())
+        })
+        .expect_err("WAL drift during pinned sampling must fail closed");
+        assert!(
+            format!("{error:#}").contains("unbound SQLite sidecar"),
+            "unexpected drift rejection: {error:#}"
         );
     }
 

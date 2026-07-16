@@ -2,6 +2,8 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "fixture-generator")]
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -18,7 +20,6 @@ const DECISION_QUERIES: usize = 30;
 const DECISION_WARMUPS: usize = 5;
 const DECISION_COUNTS: [usize; 4] = [1_000, 10_000, 25_000, 100_000];
 const VECTOR_NORM_TOLERANCE: f64 = 1.0e-3;
-const VECTOR_DIGEST_DOMAIN: &[u8] = b"codestory-vector-digest-v1\0";
 const PRODUCTION_VECTOR_SCHEMA_VERSION: i64 = 2;
 const REPETITIONS: usize = 2;
 
@@ -228,6 +229,8 @@ enum QueryKind {
 struct FrozenQuery {
     query_id: String,
     kind: QueryKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    query_text: String,
     vector: Vec<f32>,
     expected: Vec<Identity>,
 }
@@ -239,13 +242,29 @@ struct FrozenVectorRecord {
     vector: Vec<f32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct FrozenFixture {
     schema_version: u32,
     source_attestation: ProductionSourceAttestation,
     incremental_set_id: String,
     queries: Vec<FrozenQuery>,
     incremental_records: Vec<FrozenVectorRecord>,
+}
+
+#[cfg(feature = "fixture-generator")]
+#[derive(Deserialize)]
+struct FixtureQueryCatalog {
+    schema_version: u32,
+    queries: Vec<FixtureCatalogQuery>,
+}
+
+#[cfg(feature = "fixture-generator")]
+#[derive(Deserialize)]
+struct FixtureCatalogQuery {
+    query_id: String,
+    kind: QueryKind,
+    query_text: String,
+    expected_node_ids: Vec<String>,
 }
 
 struct Dataset {
@@ -275,7 +294,7 @@ impl Dataset {
             match (&config.source_sqlite, &loaded_fixture) {
                 (Some(path), Some(loaded)) => {
                     let (records, publication, source_label, source_artifact_sha256) =
-                        load_published_vectors(
+                        load_validated_source_sample(
                             path,
                             config.vector_count,
                             &loaded.fixture.source_attestation,
@@ -353,6 +372,12 @@ impl Dataset {
                 !incremental_set_id.trim().is_empty(),
                 "decision incremental set identity must be non-empty"
             );
+            ensure!(
+                queries
+                    .iter()
+                    .all(|query| !query.query_text.trim().is_empty()),
+                "decision fixture queries must retain their source query text"
+            );
         }
 
         Ok(Self {
@@ -370,177 +395,38 @@ impl Dataset {
     }
 }
 
-fn load_published_vectors(
+fn load_validated_source_sample(
     path: &Path,
     limit: usize,
     expected_attestation: &ProductionSourceAttestation,
-) -> Result<(Vec<VectorRecord>, PublicationIdentity, String, String)> {
-    load_published_vectors_with_hook(path, limit, expected_attestation, || Ok(()))
-}
-
-fn load_published_vectors_with_hook(
-    path: &Path,
-    limit: usize,
-    expected_attestation: &ProductionSourceAttestation,
-    before_sample: impl FnOnce() -> Result<()>,
 ) -> Result<(Vec<VectorRecord>, PublicationIdentity, String, String)> {
     expected_attestation.validate()?;
-    ensure_no_sqlite_sidecars(path)?;
-    let database_sha256 = sha256_file(path)
-        .with_context(|| format!("hash attested vector database {}", path.display()))?;
+    let sample = codestory_retrieval::load_validated_vector_fixture_sample(path, limit)?;
+    let source_attestation = fixture_source_attestation(sample.attestation())?;
     ensure!(
-        database_sha256 == expected_attestation.database_sha256,
-        "vector database SHA-256 does not match the predeclared source attestation"
+        &source_attestation == expected_attestation,
+        "production vector source does not match the predeclared fixture attestation"
     );
-    let connection = open_sqlite_read_only(path)?;
-    connection.execute_batch("BEGIN DEFERRED TRANSACTION")?;
-    let quick_check: String =
-        connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    ensure!(
-        quick_check == "ok",
-        "source SQLite quick_check failed: {quick_check}"
-    );
-    let metadata_rows: i64 =
-        connection.query_row("SELECT count(*) FROM metadata", [], |row| row.get(0))?;
-    ensure!(
-        metadata_rows == 1,
-        "source metadata must contain exactly one row"
-    );
-    let metadata = connection
-        .query_row(
-            "SELECT schema_version, generation, input_hash, embedding_backend,
-                    embedding_dim, point_count, producer_identity,
-                    evidence_contract_identity, vector_digest
-             FROM metadata WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
-            },
-        )
-        .with_context(|| format!("read publication identity from {}", path.display()))?;
-    let publication = PublicationIdentity {
-        schema_version: metadata.0,
-        generation: metadata.1,
-        input_hash: metadata.2,
-        embedding_backend: metadata.3,
-        embedding_dim: usize::try_from(metadata.4)
-            .context("publication embedding dimension must fit usize")?,
-        point_count: usize::try_from(metadata.5)
-            .context("publication point count must fit usize")?,
-        producer_identity: metadata.6,
-        evidence_contract_identity: metadata.7,
-        vector_digest: metadata.8,
-    };
-    publication.validate()?;
-    ensure!(
-        publication == expected_attestation.publication,
-        "source metadata does not match the predeclared publication identity"
-    );
-    let actual_count: i64 =
-        connection.query_row("SELECT count(*) FROM vectors", [], |row| row.get(0))?;
-    ensure!(
-        actual_count == publication.point_count as i64,
-        "publication metadata point count {} does not match complete table count {actual_count}",
-        publication.point_count
-    );
-    ensure!(
-        publication.point_count >= limit,
-        "publication has {} points but the run requires {limit}",
-        publication.point_count
-    );
-
-    let (canonical_digest, canonical_count) =
-        canonical_source_vector_digest(&connection, publication.embedding_dim)?;
-    ensure!(
-        canonical_count == publication.point_count,
-        "canonical source coverage expected {} rows, found {canonical_count}",
-        publication.point_count
-    );
-    ensure!(
-        canonical_digest == expected_attestation.publication.vector_digest,
-        "canonical source vector digest does not match the predeclared attestation"
-    );
-    before_sample()?;
-
-    let mut statement = connection.prepare(
-        "SELECT node_id, document_hash, vector FROM vectors ORDER BY node_id ASC LIMIT ?1",
-    )?;
-    let rows = statement.query_map([limit as i64], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    })?;
-    let mut records = Vec::with_capacity(limit);
-    for row in rows {
-        let (node_id, document_hash, bytes) = row?;
-        records.push(VectorRecord {
-            identity: Identity {
-                node_id: node_id.clone(),
-                document_hash,
-            },
-            vector: decode_vector(&node_id, &bytes, publication.embedding_dim)?,
-        });
-    }
-    drop(statement);
-    let database_sha256_after_sampling = sha256_file(path)
-        .with_context(|| format!("rehash attested vector database {}", path.display()))?;
-    ensure!(
-        database_sha256_after_sampling == expected_attestation.database_sha256,
-        "vector database changed while its pinned source snapshot was sampled"
-    );
-    ensure_no_sqlite_sidecars(path)?;
-    connection.execute_batch("ROLLBACK")?;
-    drop(connection);
+    let records = fixture_records(sample.records());
     Ok((
         records,
-        publication,
+        source_attestation.publication,
         format!("CodeStory publication {}", path.display()),
-        expected_attestation.database_sha256.clone(),
+        source_attestation.database_sha256,
     ))
 }
 
-fn canonical_source_vector_digest(
-    connection: &Connection,
-    embedding_dim: usize,
-) -> Result<(String, usize)> {
-    let mut statement = connection
-        .prepare("SELECT node_id, document_hash, vector FROM vectors ORDER BY node_id ASC")?;
-    let mut rows = statement.query([])?;
-    let mut digest = Sha256::new();
-    digest.update(VECTOR_DIGEST_DOMAIN);
-    let mut seen = HashSet::new();
-    let mut count = 0_usize;
-    while let Some(row) = rows.next()? {
-        let node_id: String = row.get(0)?;
-        let document_hash: String = row.get(1)?;
-        let vector: Vec<u8> = row.get(2)?;
-        ensure!(
-            seen.insert(node_id.clone()),
-            "duplicate source vector row {node_id}"
-        );
-        ensure!(
-            !node_id.trim().is_empty() && !document_hash.trim().is_empty(),
-            "source vector row identities must be non-empty"
-        );
-        decode_vector(&node_id, &vector, embedding_dim)?;
-        hash_len_prefixed(&mut digest, node_id.as_bytes());
-        hash_len_prefixed(&mut digest, document_hash.as_bytes());
-        hash_len_prefixed(&mut digest, &vector);
-        count += 1;
-    }
-    Ok((format!("{:x}", digest.finalize()), count))
+fn fixture_records(records: &[codestory_retrieval::VectorFixtureRecord]) -> Vec<VectorRecord> {
+    records
+        .iter()
+        .map(|record| VectorRecord {
+            identity: Identity {
+                node_id: record.node_id.clone(),
+                document_hash: record.document_hash.clone(),
+            },
+            vector: record.vector.clone(),
+        })
+        .collect()
 }
 
 type FixtureParts = (Vec<FrozenQuery>, Vec<VectorRecord>, String, String, String);
@@ -607,6 +493,131 @@ fn select_frozen_fixture(
     ))
 }
 
+#[cfg(feature = "fixture-generator")]
+fn split_fixture_records(
+    mut records: Vec<VectorRecord>,
+    base_count: usize,
+    incremental_count: usize,
+) -> Result<(Vec<VectorRecord>, Vec<VectorRecord>)> {
+    let required = base_count
+        .checked_add(incremental_count)
+        .context("fixture base plus tail count overflow")?;
+    ensure!(
+        records.len() == required,
+        "fixture source needs {required} base-plus-tail rows, found {}",
+        records.len()
+    );
+    let incremental = records.split_off(base_count);
+    Ok((records, incremental))
+}
+
+#[cfg(feature = "fixture-generator")]
+fn build_frozen_fixture(
+    source_attestation: &ProductionSourceAttestation,
+    catalog: &FixtureQueryCatalog,
+    base_records: &[VectorRecord],
+    incremental_records: &[VectorRecord],
+    dimensions: usize,
+    mut embed_query: impl FnMut(&str) -> Result<Vec<f32>>,
+) -> Result<FrozenFixture> {
+    source_attestation.validate()?;
+    ensure!(
+        catalog.schema_version == 1,
+        "fixture query catalog schema must be 1"
+    );
+    ensure!(
+        !catalog.queries.is_empty(),
+        "fixture query catalog is empty"
+    );
+    validate_records(base_records, dimensions)?;
+    validate_records(incremental_records, dimensions)?;
+    let base_by_node = base_records
+        .iter()
+        .map(|record| (record.identity.node_id.as_str(), &record.identity))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        incremental_records
+            .iter()
+            .all(|record| !base_by_node.contains_key(record.identity.node_id.as_str())),
+        "fixture incremental rows overlap the selected base publication"
+    );
+
+    let mut query_ids = HashSet::new();
+    let queries = catalog
+        .queries
+        .iter()
+        .map(|query| -> Result<FrozenQuery> {
+            ensure!(
+                !query.query_id.trim().is_empty() && query_ids.insert(&query.query_id),
+                "fixture query identities must be non-empty and unique"
+            );
+            ensure!(
+                !query.query_text.trim().is_empty(),
+                "fixture query {} has empty query text",
+                query.query_id
+            );
+            ensure!(
+                !query.expected_node_ids.is_empty(),
+                "fixture query {} needs expected node ids",
+                query.query_id
+            );
+            let mut expected_node_ids = HashSet::new();
+            let expected = query
+                .expected_node_ids
+                .iter()
+                .map(|node_id| {
+                    ensure!(
+                        expected_node_ids.insert(node_id),
+                        "fixture query {} repeats expected node id {node_id}",
+                        query.query_id
+                    );
+                    base_by_node
+                        .get(node_id.as_str())
+                        .map(|identity| (*identity).clone())
+                        .with_context(|| {
+                            format!(
+                                "fixture query {} expects node {node_id} outside the selected source rows",
+                                query.query_id
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(FrozenQuery {
+                query_id: query.query_id.clone(),
+                kind: query.kind,
+                query_text: query.query_text.clone(),
+                vector: checked_vector(
+                    &query.query_id,
+                    embed_query(&query.query_text)?,
+                    dimensions,
+                )?,
+                expected,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_queries(&queries, base_records, dimensions)?;
+
+    let incremental_set_id = format!(
+        "production-tail-{}-{}",
+        base_records.len(),
+        &records_sha256(incremental_records)[..16]
+    );
+    Ok(FrozenFixture {
+        schema_version: 2,
+        source_attestation: source_attestation.clone(),
+        incremental_set_id,
+        queries,
+        incremental_records: incremental_records
+            .iter()
+            .map(|record| FrozenVectorRecord {
+                node_id: record.identity.node_id.clone(),
+                document_hash: record.identity.document_hash.clone(),
+                vector: record.vector.clone(),
+            })
+            .collect(),
+    })
+}
+
 fn synthetic_publication(
     count: usize,
     dimensions: usize,
@@ -655,6 +666,7 @@ fn synthetic_fixture(
                 } else {
                     QueryKind::Symbol
                 },
+                query_text: String::new(),
                 vector: record.vector.clone(),
                 expected: vec![record.identity.clone()],
             }
@@ -692,21 +704,6 @@ fn frozen_record(record: FrozenVectorRecord, dimensions: usize) -> Result<Vector
         },
         vector: checked_vector(&record.node_id, record.vector, dimensions)?,
     })
-}
-
-fn decode_vector(node_id: &str, bytes: &[u8], dimensions: usize) -> Result<Vec<f32>> {
-    ensure!(
-        bytes.len() == dimensions * 4,
-        "vector byte length for {node_id} does not match {dimensions} dimensions"
-    );
-    checked_vector(
-        node_id,
-        bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
-            .collect(),
-        dimensions,
-    )
 }
 
 fn checked_vector(label: &str, vector: Vec<f32>, dimensions: usize) -> Result<Vec<f32>> {
@@ -1118,50 +1115,7 @@ fn vector_contract_rejects_invalid_norms_and_values() {
 }
 
 #[test]
-fn production_source_requires_and_revalidates_predeclared_attestation() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let path = temp.path().join("vectors.sqlite3");
-    let attestation = write_test_source_database(&path)?;
-
-    let (records, publication, _, database_sha256) =
-        load_published_vectors(&path, 2, &attestation)?;
-    assert_eq!(records.len(), 2);
-    assert_eq!(publication, attestation.publication);
-    assert_eq!(database_sha256, attestation.database_sha256);
-
-    let mut wrong_database = attestation.clone();
-    wrong_database.database_sha256 = "0".repeat(64);
-    let error = load_published_vectors(&path, 2, &wrong_database)
-        .expect_err("mismatched predeclared database hash must fail");
-    assert!(format!("{error:#}").contains("predeclared source attestation"));
-
-    let wrong_digest = "1".repeat(64);
-    let connection = Connection::open(&path)?;
-    connection.execute(
-        "UPDATE metadata SET vector_digest = ?1 WHERE singleton = 1",
-        [&wrong_digest],
-    )?;
-    drop(connection);
-    let mut copied_metadata = attestation.clone();
-    copied_metadata.publication.vector_digest = wrong_digest;
-    copied_metadata.database_sha256 = sha256_file(&path)?;
-    let error = load_published_vectors(&path, 2, &copied_metadata)
-        .expect_err("copied metadata with a fresh database hash must not replace canonical proof");
-    assert!(format!("{error:#}").contains("canonical source vector digest"));
-
-    let connection = Connection::open(&path)?;
-    connection.execute(
-        "UPDATE metadata SET vector_digest = ?1, point_count = 1 WHERE singleton = 1",
-        [&attestation.publication.vector_digest],
-    )?;
-    drop(connection);
-    let mut incomplete_coverage = attestation.clone();
-    incomplete_coverage.publication.point_count = 1;
-    incomplete_coverage.database_sha256 = sha256_file(&path)?;
-    let error = load_published_vectors(&path, 1, &incomplete_coverage)
-        .expect_err("inexact complete-row coverage must fail");
-    assert!(format!("{error:#}").contains("complete table count"));
-
+fn decision_fixture_requires_source_attestation() {
     let missing_attestation = serde_json::json!({
         "schema_version": 2,
         "incremental_set_id": "missing-attestation",
@@ -1169,105 +1123,455 @@ fn production_source_requires_and_revalidates_predeclared_attestation() -> Resul
         "incremental_records": []
     });
     assert!(serde_json::from_value::<FrozenFixture>(missing_attestation).is_err());
-    Ok(())
 }
 
-#[test]
-fn pinned_source_snapshot_rejects_concurrent_wal_drift_before_sampling() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let path = temp.path().join("vectors.sqlite3");
-    let mut attestation = write_test_source_database(&path)?;
-    let connection = Connection::open(&path)?;
-    let journal_mode: String =
-        connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-    ensure!(
-        journal_mode == "wal",
-        "test database did not enter WAL mode"
-    );
-    drop(connection);
-    ensure_no_sqlite_sidecars(&path)?;
-    attestation.database_sha256 = sha256_file(&path)?;
-
-    let writer_path = path.clone();
-    let error = load_published_vectors_with_hook(&path, 2, &attestation, move || {
-        let writer = Connection::open(&writer_path)?;
-        writer.execute(
-            "UPDATE vectors SET document_hash = ?1 WHERE node_id = 'node-a'",
-            [sha256_bytes(b"concurrent-drift")],
-        )?;
-        drop(writer);
-        Ok(())
-    })
-    .expect_err("WAL drift between attestation and sampling must fail closed");
-    assert!(
-        format!("{error:#}").contains("unbound sidecar"),
-        "unexpected drift rejection: {error:#}"
-    );
-    Ok(())
+#[cfg(feature = "fixture-generator")]
+fn required_env_path(name: &str) -> Result<PathBuf> {
+    let value = std::env::var_os(name).with_context(|| format!("{name} is required"))?;
+    ensure!(!value.is_empty(), "{name} must not be empty");
+    let path = PathBuf::from(value);
+    ensure!(path.is_absolute(), "{name} must be an absolute path");
+    Ok(path)
 }
 
-fn write_test_source_database(path: &Path) -> Result<ProductionSourceAttestation> {
-    let connection = Connection::open(path)?;
-    connection.execute_batch(
-        "CREATE TABLE metadata (
-             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-             schema_version INTEGER NOT NULL,
-             generation TEXT NOT NULL,
-             input_hash TEXT NOT NULL,
-             embedding_backend TEXT NOT NULL,
-             embedding_dim INTEGER NOT NULL,
-             point_count INTEGER NOT NULL,
-             producer_identity TEXT NOT NULL,
-             evidence_contract_identity TEXT NOT NULL,
-             vector_digest TEXT NOT NULL
-         );
-         CREATE TABLE vectors (
-             node_id TEXT PRIMARY KEY NOT NULL,
-             document_hash TEXT NOT NULL,
-             vector BLOB NOT NULL
-         );",
-    )?;
-    let rows = [
-        ("node-a", sha256_bytes(b"document-a"), vec![1.0_f32, 0.0]),
-        ("node-b", sha256_bytes(b"document-b"), vec![0.0_f32, 1.0]),
-    ];
-    for (node_id, document_hash, vector) in &rows {
-        connection.execute(
-            "INSERT INTO vectors (node_id, document_hash, vector) VALUES (?1, ?2, ?3)",
-            params![node_id, document_hash, vector_blob(vector)],
-        )?;
-    }
-    let (vector_digest, point_count) = canonical_source_vector_digest(&connection, 2)?;
-    let publication = PublicationIdentity {
-        schema_version: 2,
-        generation: "test-generation".to_owned(),
-        input_hash: sha256_bytes(b"test-input"),
-        embedding_backend: "test-backend".to_owned(),
-        embedding_dim: 2,
-        point_count,
-        producer_identity: "test-producer".to_owned(),
-        evidence_contract_identity: sha256_bytes(b"test-evidence-contract"),
-        vector_digest,
-    };
-    connection.execute(
-        "INSERT INTO metadata VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![
-            publication.schema_version,
-            publication.generation,
-            publication.input_hash,
-            publication.embedding_backend,
-            publication.embedding_dim as i64,
-            publication.point_count as i64,
-            publication.producer_identity,
-            publication.evidence_contract_identity,
-            publication.vector_digest,
-        ],
-    )?;
-    drop(connection);
+fn fixture_source_attestation(
+    source: &codestory_retrieval::VectorDatabaseAttestation,
+) -> Result<ProductionSourceAttestation> {
     Ok(ProductionSourceAttestation {
-        publication,
-        database_sha256: sha256_file(path)?,
+        publication: PublicationIdentity {
+            schema_version: source.schema_version,
+            generation: source.generation.clone(),
+            input_hash: source.input_hash.clone(),
+            embedding_backend: source.embedding_backend.clone(),
+            embedding_dim: source.embedding_dim,
+            point_count: usize::try_from(source.point_count)
+                .context("production vector point count must fit usize")?,
+            producer_identity: source.producer_identity.clone(),
+            evidence_contract_identity: source.evidence_contract_identity.clone(),
+            vector_digest: source.vector_digest.clone(),
+        },
+        database_sha256: source.database_sha256.clone(),
     })
+}
+
+#[cfg(feature = "fixture-generator")]
+struct ValidatedFixtureOutput {
+    requested_parent: PathBuf,
+    destination: PathBuf,
+    parent_identity: PathBuf,
+    source_generation_path: PathBuf,
+    source_generation_identity: PathBuf,
+    cache_root_path: PathBuf,
+    cache_root_identity: PathBuf,
+}
+
+#[cfg(feature = "fixture-generator")]
+impl ValidatedFixtureOutput {
+    fn revalidate_destination(&self) -> Result<&Path> {
+        let parent = self.requested_parent.canonicalize().with_context(|| {
+            format!(
+                "revalidate fixture output parent {}",
+                self.requested_parent.display()
+            )
+        })?;
+        ensure!(
+            codestory_workspace::same_workspace_path(&parent, &self.parent_identity),
+            "fixture output parent identity changed during preparation"
+        );
+        let source_generation = self
+            .source_generation_path
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "revalidate source generation {}",
+                    self.source_generation_path.display()
+                )
+            })?;
+        let cache_root = self
+            .cache_root_path
+            .canonicalize()
+            .with_context(|| format!("revalidate cache root {}", self.cache_root_path.display()))?;
+        ensure!(
+            codestory_workspace::same_workspace_path(
+                &source_generation,
+                &self.source_generation_identity,
+            ) && codestory_workspace::same_workspace_path(&cache_root, &self.cache_root_identity),
+            "fixture source or cache root identity changed during preparation"
+        );
+        validate_fixture_destination_roots(&self.destination, &source_generation, &cache_root)?;
+        ensure!(
+            !self.destination.try_exists().with_context(|| format!(
+                "inspect fixture output destination {}",
+                self.destination.display()
+            ))?,
+            "fixture output must be a new path"
+        );
+        Ok(&self.destination)
+    }
+}
+
+#[cfg(feature = "fixture-generator")]
+fn validate_fixture_output_path(
+    output: &Path,
+    source_sqlite: &Path,
+    cache_root: &Path,
+) -> Result<ValidatedFixtureOutput> {
+    let source_generation = source_sqlite
+        .parent()
+        .context("production vector database has no generation directory")?;
+    let output_parent = output.parent().context("fixture output has no parent")?;
+    ensure!(
+        output_parent.is_dir(),
+        "fixture output parent must already exist"
+    );
+    let parent_identity = output_parent
+        .canonicalize()
+        .with_context(|| format!("resolve fixture output parent {}", output_parent.display()))?;
+    let file_name = output
+        .file_name()
+        .context("fixture output has no file name")?;
+    let destination = parent_identity.join(file_name);
+    let source_generation_identity = source_generation
+        .canonicalize()
+        .with_context(|| format!("resolve source generation {}", source_generation.display()))?;
+    let cache_root_identity = cache_root
+        .canonicalize()
+        .with_context(|| format!("resolve cache root {}", cache_root.display()))?;
+    validate_fixture_destination_roots(
+        &destination,
+        &source_generation_identity,
+        &cache_root_identity,
+    )?;
+    let validated = ValidatedFixtureOutput {
+        requested_parent: output_parent.to_path_buf(),
+        destination,
+        parent_identity,
+        source_generation_path: source_generation.to_path_buf(),
+        source_generation_identity,
+        cache_root_path: cache_root.to_path_buf(),
+        cache_root_identity,
+    };
+    validated.revalidate_destination()?;
+    Ok(validated)
+}
+
+#[cfg(feature = "fixture-generator")]
+fn validate_fixture_destination_roots(
+    destination: &Path,
+    source_generation: &Path,
+    cache_root: &Path,
+) -> Result<()> {
+    ensure!(
+        codestory_workspace::workspace_relative_path(source_generation, destination).is_none(),
+        "fixture output must be outside the source generation"
+    );
+    ensure!(
+        codestory_workspace::workspace_relative_path(cache_root, destination).is_none(),
+        "fixture output must be outside CODESTORY_CACHE_ROOT"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "fixture-generator")]
+fn write_fixture_no_replace(output: &ValidatedFixtureOutput, bytes: &[u8]) -> Result<()> {
+    let path = output.revalidate_destination()?;
+    let (temp_path, mut file) =
+        codestory_workspace::atomic_file::create_unique_temp_file(path, "vector-backend-fixture")?;
+    let write_result = (|| -> Result<()> {
+        file.write_all(bytes)
+            .context("write fixture temporary file")?;
+        file.sync_all().context("sync fixture temporary file")
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    let result = (|| -> Result<()> {
+        ensure!(
+            fs::read(&temp_path)? == bytes,
+            "fixture temporary file validation failed"
+        );
+        let path = output.revalidate_destination()?;
+        fs::hard_link(&temp_path, path)
+            .with_context(|| format!("publish new fixture {}", path.display()))?;
+        let _ = fs::remove_file(&temp_path);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(feature = "fixture-generator")]
+#[test]
+fn fixture_builder_is_deterministic_and_uses_source_truth() -> Result<()> {
+    let source_attestation = ProductionSourceAttestation {
+        publication: PublicationIdentity {
+            schema_version: 2,
+            generation: "fixture-generation".to_owned(),
+            input_hash: sha256_bytes(b"fixture-input"),
+            embedding_backend: "fixture-backend".to_owned(),
+            embedding_dim: 2,
+            point_count: 3,
+            producer_identity: "fixture-producer".to_owned(),
+            evidence_contract_identity: sha256_bytes(b"fixture-contract"),
+            vector_digest: sha256_bytes(b"fixture-vectors"),
+        },
+        database_sha256: sha256_bytes(b"fixture-database"),
+    };
+    let base = vec![
+        VectorRecord {
+            identity: Identity {
+                node_id: "node-a".to_owned(),
+                document_hash: "document-a".to_owned(),
+            },
+            vector: vec![1.0, 0.0],
+        },
+        VectorRecord {
+            identity: Identity {
+                node_id: "node-b".to_owned(),
+                document_hash: "document-b".to_owned(),
+            },
+            vector: vec![0.0, 1.0],
+        },
+    ];
+    let tail = vec![VectorRecord {
+        identity: Identity {
+            node_id: "node-c".to_owned(),
+            document_hash: "document-c".to_owned(),
+        },
+        vector: vec![-1.0, 0.0],
+    }];
+    let catalog = FixtureQueryCatalog {
+        schema_version: 1,
+        queries: vec![
+            FixtureCatalogQuery {
+                query_id: "representative-001".to_owned(),
+                kind: QueryKind::Representative,
+                query_text: "representative query".to_owned(),
+                expected_node_ids: vec!["node-b".to_owned()],
+            },
+            FixtureCatalogQuery {
+                query_id: "symbol-001".to_owned(),
+                kind: QueryKind::Symbol,
+                query_text: "symbol query".to_owned(),
+                expected_node_ids: vec!["node-a".to_owned()],
+            },
+        ],
+    };
+    let embed = |text: &str| -> Result<Vec<f32>> {
+        Ok(match text {
+            "representative query" => vec![0.0, 1.0],
+            "symbol query" => vec![1.0, 0.0],
+            _ => anyhow::bail!("unexpected query text"),
+        })
+    };
+
+    let first = build_frozen_fixture(&source_attestation, &catalog, &base, &tail, 2, embed)?;
+    let second = build_frozen_fixture(&source_attestation, &catalog, &base, &tail, 2, embed)?;
+    assert_eq!(
+        serde_json::to_vec(&first)?,
+        serde_json::to_vec(&second)?,
+        "the same source and catalog must freeze identically"
+    );
+    assert_eq!(first.schema_version, 2);
+    assert_eq!(first.queries[0].expected[0].node_id, "node-b");
+    assert_eq!(first.queries[0].expected[0].document_hash, "document-b");
+    assert_eq!(first.incremental_records[0].node_id, "node-c");
+    assert!(split_fixture_records(base.clone(), 2, 1).is_err());
+    Ok(())
+}
+
+#[cfg(feature = "fixture-generator")]
+#[test]
+fn fixture_output_rejects_source_generation_and_cache_root() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let cache_root = temp.path().join("cache");
+    let source_generation = cache_root
+        .join("semantic")
+        .join("collections")
+        .join("generation");
+    let outside = temp.path().join("evidence");
+    fs::create_dir_all(&source_generation)?;
+    fs::create_dir_all(&outside)?;
+    let source_sqlite = source_generation.join("vectors.sqlite3");
+    File::create(&source_sqlite)?;
+
+    assert!(
+        validate_fixture_output_path(
+            &source_generation.join("fixture.json"),
+            &source_sqlite,
+            &cache_root,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_fixture_output_path(
+            &cache_root.join("fixture.json"),
+            &source_sqlite,
+            &cache_root,
+        )
+        .is_err()
+    );
+    assert!(!source_generation.join("fixture.json").exists());
+    assert!(!cache_root.join("fixture.json").exists());
+    validate_fixture_output_path(&outside.join("fixture.json"), &source_sqlite, &cache_root)?;
+    Ok(())
+}
+
+#[cfg(feature = "fixture-generator")]
+#[test]
+fn fixture_publication_never_replaces_an_existing_path() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let cache_root = temp.path().join("cache");
+    let source_generation = cache_root.join("source");
+    let output_parent = temp.path().join("evidence");
+    fs::create_dir_all(&source_generation)?;
+    fs::create_dir_all(&output_parent)?;
+    let source_sqlite = source_generation.join("vectors.sqlite3");
+    File::create(&source_sqlite)?;
+    let output_path = output_parent.join("fixture.json");
+    let output = validate_fixture_output_path(&output_path, &source_sqlite, &cache_root)?;
+    write_fixture_no_replace(&output, b"first")?;
+    let error = write_fixture_no_replace(&output, b"second")
+        .expect_err("fixture publication must use create-new semantics");
+    assert!(error.to_string().contains("new path"));
+    assert_eq!(fs::read(&output_path)?, b"first");
+    assert_eq!(fs::read_dir(&output_parent)?.count(), 1);
+    Ok(())
+}
+
+#[cfg(all(feature = "fixture-generator", windows))]
+fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[cfg(all(feature = "fixture-generator", windows))]
+fn remove_directory_link(link: &Path) -> std::io::Result<()> {
+    fs::remove_dir(link)
+}
+
+#[cfg(all(feature = "fixture-generator", unix))]
+fn create_directory_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(all(feature = "fixture-generator", unix))]
+fn remove_directory_link(link: &Path) -> std::io::Result<()> {
+    fs::remove_file(link)
+}
+
+#[cfg(all(feature = "fixture-generator", any(windows, unix)))]
+#[test]
+fn fixture_publication_rejects_changed_parent_identity() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let cache_root = temp.path().join("cache");
+    let source_generation = cache_root.join("source");
+    let safe_parent = temp.path().join("safe-evidence");
+    let parent_link = temp.path().join("evidence-link");
+    fs::create_dir_all(&source_generation)?;
+    fs::create_dir_all(&safe_parent)?;
+    let source_sqlite = source_generation.join("vectors.sqlite3");
+    File::create(&source_sqlite)?;
+    if let Err(error) = create_directory_link(&safe_parent, &parent_link) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    let output_path = parent_link.join("fixture.json");
+    let output = validate_fixture_output_path(&output_path, &source_sqlite, &cache_root)?;
+    remove_directory_link(&parent_link)?;
+    create_directory_link(&cache_root, &parent_link)?;
+
+    let error = write_fixture_no_replace(&output, b"blocked")
+        .expect_err("changed output parent identity must fail closed");
+    assert!(error.to_string().contains("parent identity changed"));
+    assert!(!safe_parent.join("fixture.json").exists());
+    assert!(!cache_root.join("fixture.json").exists());
+    Ok(())
+}
+
+#[cfg(feature = "fixture-generator")]
+#[test]
+#[ignore = "fixture preparation lane; run explicitly against an isolated production publication"]
+fn prepare_vector_backend_fixture() -> Result<()> {
+    let source_sqlite = required_env_path("CODESTORY_VECTOR_SPIKE_SOURCE_SQLITE")?;
+    let catalog_path = required_env_path("CODESTORY_VECTOR_SPIKE_QUERY_CATALOG_JSON")?;
+    let output_path = required_env_path("CODESTORY_VECTOR_SPIKE_FIXTURE_JSON")?;
+    let configured_cache_root = required_env_path("CODESTORY_CACHE_ROOT")?;
+    let output =
+        validate_fixture_output_path(&output_path, &source_sqlite, &configured_cache_root)?;
+    let runtime = codestory_retrieval::SidecarRuntimeConfig::local();
+    ensure!(
+        codestory_workspace::same_workspace_path(&runtime.cache_root, &configured_cache_root),
+        "retrieval runtime did not retain the explicit isolated CODESTORY_CACHE_ROOT"
+    );
+    let base_count = parse_env_usize(
+        "CODESTORY_VECTOR_SPIKE_VECTOR_COUNT",
+        *DECISION_COUNTS
+            .last()
+            .expect("decision counts are non-empty"),
+    )?;
+    let incremental_count = parse_env_usize("CODESTORY_VECTOR_SPIKE_INCREMENTAL_COUNT", 100)?;
+    ensure!(
+        base_count
+            == *DECISION_COUNTS
+                .last()
+                .expect("decision counts are non-empty"),
+        "fixture generator base count must cover the largest predeclared decision workload"
+    );
+    ensure!(
+        incremental_count > 0,
+        "fixture incremental tail count must be positive"
+    );
+    let required = base_count
+        .checked_add(incremental_count)
+        .context("fixture base plus tail count overflow")?;
+
+    let source = codestory_retrieval::open_validated_vector_fixture_source_for_runtime(
+        &source_sqlite,
+        &runtime,
+        required,
+    )?;
+    let source_attestation = fixture_source_attestation(source.attestation())?;
+    let publication = source_attestation.publication.clone();
+    let records = fixture_records(source.records());
+    let (base, incremental) = split_fixture_records(records, base_count, incremental_count)?;
+
+    let catalog_bytes = fs::read(&catalog_path)
+        .with_context(|| format!("read fixture query catalog {}", catalog_path.display()))?;
+    let catalog: FixtureQueryCatalog = serde_json::from_slice(&catalog_bytes)
+        .with_context(|| format!("parse fixture query catalog {}", catalog_path.display()))?;
+    ensure!(
+        catalog.queries.len() == DECISION_QUERIES,
+        "decision fixture catalog must contain exactly {DECISION_QUERIES} queries"
+    );
+    let fixture = build_frozen_fixture(
+        &source_attestation,
+        &catalog,
+        &base,
+        &incremental,
+        publication.embedding_dim,
+        |query_text| source.embed_query(query_text),
+    )?;
+    for vector_count in DECISION_COUNTS {
+        validate_queries(
+            &fixture.queries,
+            &base[..vector_count],
+            publication.embedding_dim,
+        )
+        .with_context(|| {
+            format!("fixture query truth is not covered by the {vector_count}-row workload")
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(&fixture)?;
+    write_fixture_no_replace(&output, &bytes)?;
+    println!("vector backend fixture: {}", output_path.display());
+    println!("fixture SHA-256: {}", sha256_bytes(&bytes));
+    Ok(())
 }
 
 #[test]
@@ -2814,20 +3118,6 @@ fn sha256_file(path: &Path) -> Result<String> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("{:x}", digest.finalize()))
-}
-
-fn ensure_no_sqlite_sidecars(path: &Path) -> Result<()> {
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = path.as_os_str().to_owned();
-        sidecar.push(suffix);
-        let sidecar = PathBuf::from(sidecar);
-        ensure!(
-            !sidecar.exists(),
-            "attested SQLite source has an unbound sidecar: {}",
-            sidecar.display()
-        );
-    }
-    Ok(())
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

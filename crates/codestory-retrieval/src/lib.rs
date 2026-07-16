@@ -52,6 +52,12 @@ pub use config::{
 pub use config::{
     active_test_cache_root, enable_automatic_test_cache_root_for_process, with_test_cache_root,
 };
+#[doc(hidden)]
+pub use embedded_vector::{
+    ValidatedVectorFixtureSample, ValidatedVectorFixtureSource, VectorDatabaseAttestation,
+    VectorFixtureRecord, load_validated_vector_fixture_sample,
+    open_validated_vector_fixture_source_for_runtime,
+};
 #[cfg(feature = "test-support")]
 pub use embeddings::TEST_EMBEDDING_UNAVAILABLE_MARKER;
 pub use embeddings::{

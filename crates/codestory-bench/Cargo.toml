@@ -6,11 +6,13 @@ publish = false
 
 [features]
 default = ["runtime-bench"]
+fixture-generator = []
 runtime-bench = ["dep:codestory-runtime"]
 
 [dependencies]
 codestory-contracts = { workspace = true }
 codestory-indexer = { workspace = true }
+codestory-retrieval = { workspace = true }
 codestory-runtime = { workspace = true, optional = true }
 codestory-store = { workspace = true }
 codestory-workspace = { workspace = true }
