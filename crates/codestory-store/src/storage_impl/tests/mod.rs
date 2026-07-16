@@ -52,6 +52,20 @@ fn assert_no_sqlite_sidecars(path: &Path) {
     assert!(!PathBuf::from(format!("{}-journal", path.display())).exists());
 }
 
+fn durable_sqlite_state(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    [path.to_path_buf(), sqlite_sidecar_path(path, "-wal")]
+        .into_iter()
+        .map(|path| {
+            let bytes = if path.is_file() {
+                Some(fs::read(&path).expect("read durable SQLite state"))
+            } else {
+                None
+            };
+            (path, bytes)
+        })
+        .collect()
+}
+
 #[test]
 fn observational_open_preserves_current_database_bytes_without_sidecars() {
     let path = unique_temp_db_path("observational-current");
@@ -72,6 +86,143 @@ fn observational_open_preserves_current_database_bytes_without_sidecars() {
     );
     assert_no_sqlite_sidecars(&path);
     fs::remove_file(path).expect("remove current fixture");
+}
+
+#[test]
+fn freshness_observational_open_accepts_current_schema_without_mutation() {
+    let path = unique_temp_db_path("freshness-observational-current");
+    {
+        let storage = Storage::open(&path).expect("create migrated current fixture");
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = storage
+            .get_connection()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("checkpoint current fixture");
+        assert_eq!(busy, 0, "current fixture checkpoint remained busy");
+        assert_eq!(log_frames, checkpointed_frames);
+    }
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    if wal_path.exists() {
+        assert_eq!(
+            fs::metadata(&wal_path)
+                .expect("inspect checkpointed WAL")
+                .len(),
+            0,
+            "current fixture retained uncheckpointed WAL bytes"
+        );
+        fs::remove_file(&wal_path).expect("remove empty checkpointed WAL");
+    }
+    let shm_path = sqlite_sidecar_path(&path, "-shm");
+    if shm_path.exists() {
+        fs::remove_file(&shm_path).expect("remove closed checkpoint SHM");
+    }
+    let before = durable_sqlite_state(&path);
+    assert_no_sqlite_sidecars(&path);
+
+    let observed = Storage::open_freshness_observational(&path)
+        .expect("freshness observer should accept the current schema");
+    assert_eq!(
+        observed.schema_version().expect("read observed schema"),
+        SCHEMA_VERSION
+    );
+    assert!(
+        !observed
+            .has_incomplete_incremental_run()
+            .expect("read current marker")
+    );
+    drop(observed);
+
+    assert_eq!(durable_sqlite_state(&path), before);
+    assert_no_sqlite_sidecars(&path);
+    fs::remove_file(path).expect("remove current freshness fixture");
+}
+
+#[test]
+fn freshness_observational_open_accepts_only_a_durably_marked_incomplete_sentinel() {
+    let path = unique_temp_db_path("freshness-observational-fenced");
+    {
+        let storage = Storage::open(&path).expect("open fenced fixture");
+        storage
+            .begin_incremental_run()
+            .expect("install incomplete-run fence");
+    }
+    let read_only_error = Storage::open_read_only(&path)
+        .err()
+        .expect("ordinary read-only open must reject the sentinel");
+    assert!(
+        read_only_error
+            .to_string()
+            .contains("requires schema version"),
+        "{read_only_error}"
+    );
+    let observational_error = Storage::open_observational(&path)
+        .err()
+        .expect("ordinary observation must reject the sentinel");
+    assert!(
+        observational_error
+            .to_string()
+            .contains("requires schema version"),
+        "{observational_error}"
+    );
+
+    let before = durable_sqlite_state(&path);
+    let observed = Storage::open_freshness_observational(&path)
+        .expect("freshness observer should accept the fenced sentinel");
+    assert_eq!(
+        observed.schema_version().expect("read fenced schema"),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(
+        observed
+            .has_incomplete_incremental_run()
+            .expect("read durable incomplete marker")
+    );
+    drop(observed);
+
+    assert_eq!(durable_sqlite_state(&path), before);
+    let verification = Storage::open(&path).expect("reopen fenced fixture");
+    assert_eq!(
+        verification.schema_version().expect("verify fenced schema"),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(
+        verification
+            .has_incomplete_incremental_run()
+            .expect("verify durable marker")
+    );
+    drop(verification);
+    let _ = cleanup_sqlite_sidecars(&path);
+}
+
+#[test]
+fn freshness_observational_open_rejects_unmarked_sentinel_and_arbitrary_schemas_without_mutation() {
+    for (label, version, expected_error) in [
+        (
+            "unmarked-sentinel",
+            INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
+            "durable incomplete-run marker",
+        ),
+        ("old-schema", SCHEMA_VERSION - 1, "requires schema version"),
+        (
+            "future-schema",
+            SCHEMA_VERSION + 1,
+            "requires schema version",
+        ),
+    ] {
+        let path = unique_temp_db_path(label);
+        create_versioned_observation_fixture(&path, version);
+        let before = durable_sqlite_state(&path);
+        assert_no_sqlite_sidecars(&path);
+
+        let error = Storage::open_freshness_observational(&path)
+            .err()
+            .expect("unsupported freshness schema must fail closed");
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert_eq!(durable_sqlite_state(&path), before);
+        assert_no_sqlite_sidecars(&path);
+        fs::remove_file(path).expect("remove rejected freshness fixture");
+    }
 }
 
 #[test]
@@ -133,6 +284,57 @@ fn observational_open_reads_committed_wal_without_mutating_durable_sqlite_state(
         fs::remove_file(&shm_path).expect("remove SHM fixture");
     }
     fs::remove_file(path).expect("remove WAL database fixture");
+}
+
+#[test]
+fn freshness_observational_open_preserves_fenced_wal_state_and_marker() {
+    let path = unique_temp_db_path("freshness-observational-fenced-wal");
+    let storage = Storage::open(&path).expect("open fenced WAL fixture");
+    storage
+        .begin_incremental_run()
+        .expect("install fenced WAL marker");
+    let wal_path = sqlite_sidecar_path(&path, "-wal");
+    let shm_path = sqlite_sidecar_path(&path, "-shm");
+    assert!(wal_path.is_file(), "fixture must retain fenced WAL state");
+    assert!(shm_path.is_file(), "fixture must retain its WAL index");
+    let before = durable_sqlite_state(&path);
+    let shm_len_before = fs::metadata(&shm_path)
+        .expect("inspect fenced SHM before observation")
+        .len();
+
+    let observed = Storage::open_freshness_observational(&path)
+        .expect("freshness observer should read the fenced WAL snapshot");
+    assert_eq!(
+        observed.schema_version().expect("read fenced WAL schema"),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(
+        observed
+            .has_incomplete_incremental_run()
+            .expect("read fenced WAL marker")
+    );
+    drop(observed);
+
+    assert_eq!(durable_sqlite_state(&path), before);
+    assert_eq!(
+        fs::metadata(&shm_path)
+            .expect("SHM must remain after freshness observation")
+            .len(),
+        shm_len_before,
+        "freshness observation materialized or resized the existing SHM wal-index"
+    );
+    assert_eq!(
+        storage.schema_version().expect("verify live fenced schema"),
+        INCOMPLETE_INCREMENTAL_SCHEMA_VERSION
+    );
+    assert!(
+        storage
+            .has_incomplete_incremental_run()
+            .expect("verify live fenced marker")
+    );
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
 }
 
 #[test]
@@ -227,6 +429,14 @@ fn observational_open_reports_incomplete_wal_pair_without_materializing_shm() {
         .err()
         .expect("incomplete WAL pair must fail closed");
     assert!(error.to_string().contains("incomplete WAL sidecar pair"));
+    let freshness_error = Storage::open_freshness_observational(&path)
+        .err()
+        .expect("freshness observation must reject an incomplete WAL pair");
+    assert!(
+        freshness_error
+            .to_string()
+            .contains("incomplete WAL sidecar pair")
+    );
 
     assert_eq!(fs::read(&path).expect("reread database"), database_before);
     assert_eq!(fs::read(&wal_path).expect("reread WAL"), wal_before);
@@ -248,6 +458,14 @@ fn observational_open_reports_rollback_journal_without_recovery() {
         .err()
         .expect("rollback recovery must fail closed");
     assert!(error.to_string().contains("rollback recovery is pending"));
+    let freshness_error = Storage::open_freshness_observational(&path)
+        .err()
+        .expect("freshness observation must reject rollback recovery");
+    assert!(
+        freshness_error
+            .to_string()
+            .contains("rollback recovery is pending")
+    );
 
     assert_eq!(fs::read(&path).expect("reread database"), database_before);
     assert_eq!(
@@ -295,6 +513,13 @@ fn observational_open_reports_pending_promotion_without_recovery() {
         .err()
         .expect("pending recovery must fail closed");
     assert!(error.to_string().contains("recovery is pending"), "{error}");
+    let freshness_error = Storage::open_freshness_observational(&path)
+        .err()
+        .expect("freshness observation must reject pending promotion");
+    assert!(
+        freshness_error.to_string().contains("recovery is pending"),
+        "{freshness_error}"
+    );
 
     assert_eq!(
         fs::read(&path).expect("read promotion database after observation"),

@@ -1620,6 +1620,12 @@ pub struct SymbolSummaryRecord {
     pub updated_at_epoch_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonmutatingOpenPolicy {
+    StrictCurrentSchema,
+    FreshnessFence,
+}
+
 impl Storage {
     /// Open a live store, applying schema migrations and secondary indexes.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
@@ -1655,7 +1661,20 @@ impl Storage {
     /// materializing SQLite sidecars. Recovery and schema changes belong to an
     /// activating writer; an observer reports those states instead.
     pub fn open_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
-        let path = path.as_ref();
+        Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
+    }
+
+    /// Open storage only to inspect index freshness without repairing,
+    /// migrating, or exposing a fenced database as a readable publication.
+    ///
+    /// This narrow observer accepts the current schema or the exact incomplete
+    /// incremental sentinel when its durable marker exists. General read and
+    /// observational entry points remain current-schema-only.
+    pub fn open_freshness_observational<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::FreshnessFence)
+    }
+
+    fn open_nonmutating(path: &Path, policy: NonmutatingOpenPolicy) -> Result<Self, StorageError> {
         if promotion_artifacts_exist(path) {
             return Err(StorageError::Other(format!(
                 "Observational storage cannot inspect {} while promotion recovery is pending",
@@ -1696,12 +1715,37 @@ impl Storage {
             uri,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        if policy == NonmutatingOpenPolicy::FreshnessFence {
+            // The freshness decision combines the schema sentinel, durable
+            // fence, stored inventory, and workspace comparison. Pin one
+            // SQLite snapshot before the first read so a concurrent writer
+            // cannot split those database observations across generations.
+            // Closing the read-only connection releases this transaction.
+            conn.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+        }
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
-        if version != SCHEMA_VERSION {
-            return Err(StorageError::Other(format!(
-                "Observational storage requires schema version {SCHEMA_VERSION}, found {version}"
-            )));
+        match policy {
+            NonmutatingOpenPolicy::StrictCurrentSchema if version != SCHEMA_VERSION => {
+                return Err(StorageError::Other(format!(
+                    "Observational storage requires schema version {SCHEMA_VERSION}, found {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::FreshnessFence
+                if version == INCOMPLETE_INCREMENTAL_SCHEMA_VERSION =>
+            {
+                if !has_incomplete_incremental_marker(&conn)? {
+                    return Err(StorageError::Other(format!(
+                        "Freshness observation requires the durable incomplete-run marker for schema sentinel {version}"
+                    )));
+                }
+            }
+            NonmutatingOpenPolicy::FreshnessFence if version != SCHEMA_VERSION => {
+                return Err(StorageError::Other(format!(
+                    "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
+                )));
+            }
+            _ => {}
         }
         Ok(Self {
             conn,

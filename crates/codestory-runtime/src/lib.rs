@@ -3657,6 +3657,25 @@ const INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS: u64 = 60;
 #[cfg(test)]
 const EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP: usize = 80;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_after_index_freshness_fence_test_hook(hook: impl FnOnce() + 'static) {
+    AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_index_freshness_fence_test_hook() {
+    let hook = AFTER_INDEX_FRESHNESS_FENCE_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn not_checked_index_freshness(
     reason: impl Into<String>,
     indexed_file_count: u32,
@@ -3704,17 +3723,6 @@ fn index_freshness_from_storage(
     storage: &Storage,
 ) -> IndexFreshnessDto {
     let started_at = Instant::now();
-    let files = match storage.get_files() {
-        Ok(files) => files,
-        Err(error) => {
-            return not_checked_index_freshness(
-                format!("failed to read indexed file inventory: {error}"),
-                0,
-                started_at,
-            );
-        }
-    };
-    let indexed_file_count = clamp_usize_to_u32(files.len());
     match storage.has_incomplete_incremental_run() {
         Ok(true) => {
             return IndexFreshnessDto {
@@ -3723,7 +3731,7 @@ fn index_freshness_from_storage(
                 new_file_count: 0,
                 removed_file_count: 0,
                 checked_file_count: 0,
-                indexed_file_count,
+                indexed_file_count: 0,
                 duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
                 reason: Some(
                     "previous_incremental_run_incomplete_full_refresh_required".to_string(),
@@ -3735,11 +3743,24 @@ fn index_freshness_from_storage(
         Err(error) => {
             return not_checked_index_freshness(
                 format!("failed to inspect incomplete index marker: {error}"),
-                indexed_file_count,
+                0,
                 started_at,
             );
         }
     }
+    #[cfg(test)]
+    run_after_index_freshness_fence_test_hook();
+    let files = match storage.get_files() {
+        Ok(files) => files,
+        Err(error) => {
+            return not_checked_index_freshness(
+                format!("failed to read indexed file inventory: {error}"),
+                0,
+                started_at,
+            );
+        }
+    };
+    let indexed_file_count = clamp_usize_to_u32(files.len());
     if files.is_empty() {
         return not_checked_index_freshness(
             "no indexed file inventory is available yet",
@@ -8232,6 +8253,26 @@ impl AppController {
         open_existing_storage_for_read(&storage_path).map(ReadStorage::Owned)
     }
 
+    fn open_storage_for_freshness(&self) -> Result<ReadStorage, ApiError> {
+        if let Some(storage) = ACTIVE_CORE_READ.with(|active| {
+            active
+                .borrow()
+                .as_ref()
+                .filter(|active| active.controller_identity == self.identity())
+                .map(|active| Rc::clone(&active.storage))
+        }) {
+            return Ok(ReadStorage::Pinned(storage));
+        }
+        let storage_path = self.require_storage_path()?;
+        Storage::open_freshness_observational(&storage_path)
+            .map(ReadStorage::Owned)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to open storage for freshness observation: {error}"
+                ))
+            })
+    }
+
     fn active_core_publication(&self) -> Option<IndexPublicationRecord> {
         ACTIVE_CORE_READ.with(|active| {
             active
@@ -8312,7 +8353,7 @@ impl AppController {
 
     fn index_freshness_uncached(&self) -> Result<IndexFreshnessDto, ApiError> {
         let root = self.require_project_root()?;
-        let storage = self.open_storage_read_only()?;
+        let storage = self.open_storage_for_freshness()?;
         let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
         Ok(index_freshness_from_storage(&root, &workspace, &storage))
@@ -10794,7 +10835,7 @@ impl AppController {
     pub(crate) fn index_freshness(&self) -> Result<IndexFreshnessDto, ApiError> {
         let root = self.require_project_root()?;
         let storage_path = self.require_storage_path()?;
-        let storage = self.open_storage_read_only()?;
+        let storage = self.open_storage_for_freshness()?;
         let workspace = WorkspaceManifest::open(root.clone())
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
         let freshness =
@@ -13213,6 +13254,138 @@ mod tests {
             !indexable_source_path(Path::new("target/run-output.log")),
             "runtime freshness should not count unsupported output artifacts"
         );
+    }
+
+    #[test]
+    fn incomplete_run_fence_wins_before_indexed_inventory() {
+        let project = tempdir().expect("project");
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        storage
+            .begin_incremental_run()
+            .expect("install incomplete-run fence");
+        storage
+            .get_connection()
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable fixture foreign keys");
+        storage
+            .get_connection()
+            .execute("DROP TABLE file", [])
+            .expect("remove indexed inventory");
+        storage
+            .get_connection()
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore fixture foreign keys");
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(
+            freshness.reason.as_deref(),
+            Some("previous_incremental_run_incomplete_full_refresh_required")
+        );
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 0);
+        assert_eq!(freshness.removed_file_count, 0);
+        assert_eq!(freshness.checked_file_count, 0);
+        assert_eq!(freshness.indexed_file_count, 0);
+        assert!(freshness.samples.is_empty());
+    }
+
+    #[test]
+    fn owned_freshness_observation_pins_fence_and_inventory_across_a_concurrent_writer() {
+        let project = tempdir().expect("project");
+        let source_path = project.path().join("lib.rs");
+        fs::write(&source_path, "pub fn indexed() {}\n").expect("write source");
+        let modification_time = fs::metadata(&source_path)
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let database = tempdir().expect("database directory");
+        let storage_path = database.path().join("codestory.db");
+        let keeper = Storage::open(&storage_path).expect("open fixture storage");
+        keeper
+            .insert_file(&FileInfo {
+                id: 1,
+                path: source_path,
+                language: "rust".into(),
+                modification_time,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert coherent file projection");
+        assert!(
+            storage_path.with_extension("db-wal").is_file(),
+            "fixture must retain WAL state"
+        );
+        assert!(
+            storage_path.with_extension("db-shm").is_file(),
+            "fixture must retain its WAL index"
+        );
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let observed = Storage::open_freshness_observational(&storage_path)
+            .expect("open owned freshness snapshot");
+
+        let (release_writer, writer_released) = std::sync::mpsc::channel();
+        let (writer_done, await_writer) = std::sync::mpsc::channel();
+        let writer_storage_path = storage_path.clone();
+        let projected_after_fence = project.path().join("removed-after-fence.rs");
+        let writer = std::thread::spawn(move || {
+            writer_released.recv().expect("release concurrent writer");
+            let storage = Storage::open(&writer_storage_path).expect("open concurrent writer");
+            storage
+                .begin_incremental_run()
+                .expect("install concurrent incomplete fence");
+            storage
+                .insert_file(&FileInfo {
+                    id: 2,
+                    path: projected_after_fence,
+                    language: "rust".into(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("mutate projection after the fence read");
+            writer_done.send(()).expect("signal writer completion");
+        });
+        arm_after_index_freshness_fence_test_hook(move || {
+            release_writer.send(()).expect("start concurrent writer");
+            await_writer.recv().expect("wait for concurrent writer");
+        });
+
+        let before = index_freshness_from_storage(project.path(), &workspace, &observed);
+        writer.join().expect("join concurrent writer");
+        assert_eq!(before.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(before.changed_file_count, 0);
+        assert_eq!(before.new_file_count, 0);
+        assert_eq!(before.removed_file_count, 0);
+        assert_eq!(before.indexed_file_count, 1);
+        assert!(before.samples.is_empty());
+        drop(observed);
+
+        let fenced = Storage::open_freshness_observational(&storage_path)
+            .expect("open post-writer freshness snapshot");
+        let after = index_freshness_from_storage(project.path(), &workspace, &fenced);
+        assert_eq!(after.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(
+            after.reason.as_deref(),
+            Some("previous_incremental_run_incomplete_full_refresh_required")
+        );
+        assert_eq!(after.changed_file_count, 0);
+        assert_eq!(after.new_file_count, 0);
+        assert_eq!(after.removed_file_count, 0);
+        assert_eq!(after.indexed_file_count, 0);
+        assert!(after.samples.is_empty());
+        drop(fenced);
+        drop(keeper);
     }
 
     #[test]
@@ -20373,16 +20546,82 @@ fn build_llm_symbol_doc_text() -> String {
                 .expect("live detail readiness"),
             "pre-publication failure must preserve the live detail snapshot"
         );
-        assert_ne!(
-            Storage::database_schema_version(&storage_path).expect("replacement schema"),
-            codestory_store::CURRENT_SCHEMA_VERSION
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE incomplete_index_run
+                 SET started_at_epoch_ms = started_at_epoch_ms
+                 WHERE id = 1",
+                [],
+            )
+            .expect("retain the fence in committed WAL state");
+        let fenced_schema =
+            Storage::database_schema_version(&storage_path).expect("replacement schema");
+        assert_ne!(fenced_schema, codestory_store::CURRENT_SCHEMA_VERSION);
+        let wal_path = storage_path.with_extension("db-wal");
+        assert!(wal_path.is_file(), "fenced fixture must retain WAL state");
+        let database_before =
+            fs::read(&storage_path).expect("read fenced database before freshness");
+        let wal_before = fs::read(&wal_path).expect("read fenced WAL before freshness");
+
+        let cached = controller
+            .index_freshness()
+            .expect("cached recovery freshness");
+        let uncached = controller
+            .index_freshness_uncached()
+            .expect("uncached recovery freshness");
+        for freshness in [&cached, &uncached] {
+            assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
+            assert_eq!(
+                freshness.reason.as_deref(),
+                Some("previous_incremental_run_incomplete_full_refresh_required")
+            );
+            assert_eq!(freshness.changed_file_count, 0);
+            assert_eq!(freshness.new_file_count, 0);
+            assert_eq!(freshness.removed_file_count, 0);
+            assert_eq!(freshness.checked_file_count, 0);
+            assert_eq!(freshness.indexed_file_count, 0);
+            assert!(freshness.samples.is_empty());
+        }
+        assert_eq!(
+            fs::read(&storage_path).expect("read fenced database after freshness"),
+            database_before
         );
         assert_eq!(
-            controller
-                .index_freshness()
-                .expect("recovery freshness")
-                .status,
-            IndexFreshnessStatusDto::Stale
+            fs::read(&wal_path).expect("read fenced WAL after freshness"),
+            wal_before
+        );
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("schema after freshness"),
+            fenced_schema
+        );
+        assert!(
+            storage
+                .has_incomplete_incremental_run()
+                .expect("marker after freshness"),
+            "freshness observation must preserve the durable fence"
+        );
+
+        drop(storage);
+        fs::remove_file(&search_path).expect("remove search rebuild blocker");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("successful full recovery");
+        assert_eq!(
+            Storage::database_schema_version(&storage_path).expect("recovered schema"),
+            codestory_store::CURRENT_SCHEMA_VERSION
+        );
+        let readable = Storage::open_read_only(&storage_path).expect("open recovered publication");
+        assert!(
+            !readable
+                .has_incomplete_incremental_run()
+                .expect("read recovered marker")
+        );
+        assert!(
+            readable
+                .get_complete_index_publication()
+                .expect("read recovered publication")
+                .is_some()
         );
     }
 
