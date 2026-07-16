@@ -907,6 +907,8 @@ struct Artifact {
     criteria_sha256: String,
     profile: String,
     decision_profile: bool,
+    decision_scope: &'static str,
+    blocking_platform: &'static str,
     timing_comparable: bool,
     timing_protocol: &'static str,
     build: BuildIdentity,
@@ -1018,6 +1020,7 @@ struct QueryMeasurements {
 fn decision_criteria_are_predeclared() {
     let criteria: serde_json::Value = serde_json::from_str(CRITERIA).expect("criteria JSON");
     assert_eq!(criteria["issue"], 1202);
+    assert_eq!(criteria["schema_version"], 4);
     assert_eq!(
         criteria["decision_status"],
         "blocked_pending_required_evidence"
@@ -1033,6 +1036,23 @@ fn decision_criteria_are_predeclared() {
         criteria["shared_workload"]["vector_counts"],
         serde_json::json!(DECISION_COUNTS)
     );
+    assert_eq!(
+        criteria["required_platforms"],
+        serde_json::json!(["windows-x86_64"])
+    );
+    let adoption_follow_up = criteria["non_blocking_adoption_follow_up"]
+        .as_array()
+        .expect("non-blocking adoption follow-up list");
+    assert!(adoption_follow_up.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|value| value.contains("Linux x64"))
+    }));
+    assert!(adoption_follow_up.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|value| value.contains("macOS arm64"))
+    }));
     let required = criteria["required_measurements"]
         .as_array()
         .expect("required measurement list");
@@ -1278,12 +1298,14 @@ fn compare_vector_backends() -> Result<()> {
     }
 
     let artifact = Artifact {
-        schema_version: 3,
+        schema_version: 4,
         issue: 1202,
         generated_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         criteria_sha256: sha256_bytes(CRITERIA.as_bytes()),
         profile: config.profile.clone(),
         decision_profile: config.profile == "decision",
+        decision_scope: "approved Windows x64 production comparison only; no backend adoption",
+        blocking_platform: "windows-x86_64",
         timing_comparable: false,
         timing_protocol: "two same-process repetitions with reversed candidate order; timings remain diagnostic until isolated clean-host runs exist",
         build,
@@ -1315,7 +1337,8 @@ fn compare_vector_backends() -> Result<()> {
         runs,
         limitations: vec![
             "same-process smoke timings are diagnostic and not candidate-comparison evidence",
-            "cold-cache latency, isolated RSS, cancellation, deep validation, current-scan regression, offline build, archive size, license, and native package checks remain external evidence",
+            "cold-cache latency, isolated RSS, cancellation, deep validation, and current-scan regression remain required Windows x64 decision evidence",
+            "Linux/macOS proof, cross-platform offline/native packaging, archive size, license review, and implementation fallback proof are non-blocking adoption follow-up",
             "one artifact covers only its recorded host, source publication, fixture, and vector count",
         ],
     };
@@ -1357,6 +1380,12 @@ fn validate_decision_identity(
     ensure!(
         !build.target.is_empty(),
         "decision target triple is unavailable"
+    );
+    ensure!(
+        host.os == "windows"
+            && host.architecture == "x86_64"
+            && build.target.starts_with("x86_64-pc-windows-"),
+        "decision profile requires the approved Windows x64 production host"
     );
     ensure!(
         host.cpu_model.is_some(),

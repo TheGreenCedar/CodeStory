@@ -2,8 +2,9 @@
 
 This directory owns the predeclared decision criteria and the reproducible
 comparison harness for issue #1202. It deliberately does not select or adopt a
-backend. The current decision remains blocked until every required platform and
-production-representative evidence item in `criteria.json` is present.
+backend. The current decision remains blocked until the approved Windows x64
+production evidence in `criteria.json` is present. For this non-adopting
+comparison, Windows x64 is the only blocking platform.
 
 ## Harness
 
@@ -83,7 +84,7 @@ nonzero, and L2-normalized within `1e-3`. Its shape is:
 
 The abbreviated vectors above illustrate the schema only; real vectors contain
 768 values. Run each predeclared vector count from a clean, exact, release-built
-Git tree on each required platform:
+Git tree on the approved Windows x64 production host:
 
 ```powershell
 $env:CODESTORY_VECTOR_SPIKE_PROFILE = 'decision'
@@ -105,9 +106,11 @@ evidence. Isolated clean-host timing remains required.
 
 USearch's own lower-bound memory estimate is reported, while sqlite-vec memory
 is marked unmeasured. Cold-cache latency, isolated RSS, cancellation,
-deep-validation time, the existing-scan regression baseline, package/archive
-size, offline builds, license review, and native packaging remain explicit
-external evidence gaps rather than inferred values.
+deep-validation time, and the existing-scan regression baseline remain required
+Windows x64 decision evidence rather than inferred values.
 
-Do not turn these results into an implementation issue until all criteria are
-satisfied. If neither candidate clears them, keep the existing embedded scan.
+Linux and macOS proof, cross-platform offline builds and native packaging,
+archive-size measurement, license review, and implementation fallback proof do
+not block this comparison PR. If the Windows x64 decision selects a candidate,
+track those items in the later adoption implementation. If neither candidate
+clears the Windows x64 criteria, keep the existing embedded scan.

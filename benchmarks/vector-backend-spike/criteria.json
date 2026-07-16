@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "issue": 1202,
   "decision_status": "blocked_pending_required_evidence",
   "non_goal": "This spike does not adopt either backend.",
@@ -22,9 +22,7 @@
     "inputs": "one complete immutable CodeStory vectors.sqlite3 with no unbound SQLite sidecars plus a predeclared production attestation containing its exact database SHA-256 and complete publication identity, and one attestation-bound fixture containing frozen representative and symbol query identities and frozen incremental records, reused byte-for-byte for both candidates; validation and sampling use one pinned read transaction and rehash after sampling"
   },
   "required_platforms": [
-    "windows-x86_64",
-    "linux-x86_64",
-    "macos-aarch64"
+    "windows-x86_64"
   ],
   "required_measurements": [
     "build_ms",
@@ -64,18 +62,22 @@
     "warm_rss_growth_mib_max": 96,
     "replacement_speedup_100000_min_fraction": 0.30,
     "current_repo_p95_regression_max_fraction": 0.05,
-    "memory_storage_and_package_regression_max_fraction": 0.10
+    "memory_and_storage_regression_max_fraction": 0.10
   },
-  "adoption_requires": [
-    "all required platform artifacts pass the same quality and publication gates",
+  "decision_requires": [
+    "the approved Windows x64 production artifacts pass the declared quality and publication gates",
     "artifacts bind the criteria hash, predeclared source database SHA-256, complete source publication and evidence identity, fixture identity, exact Git tree, toolchain, build profile, target, CPU, RAM, and ISA envelope",
     "comparative timing comes from isolated clean-host runs; same-process smoke timing is diagnostic only",
     "the 100000-vector workload clears the replacement speedup gate",
     "current-repository retrieval p95 does not regress beyond the declared limit",
-    "memory, storage, and packaged archive size remain within the declared limit",
-    "offline build and native packaging checks pass on every shipped architecture",
-    "license and native dependency review is complete",
-    "a reversible fallback to the existing embedded scan remains available"
+    "Windows x64 memory and storage remain within the declared limit"
+  ],
+  "non_blocking_adoption_follow_up": [
+    "Linux x64 and macOS arm64 quality and publication proof",
+    "offline build and native packaging checks on every shipped architecture",
+    "packaged archive size measurement",
+    "license and native dependency review",
+    "a reversible fallback to the existing embedded scan in the adoption implementation"
   ],
   "synthetic_smoke_is_decision_evidence": false
 }
