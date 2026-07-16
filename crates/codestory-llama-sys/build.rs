@@ -1,6 +1,8 @@
 mod model_staging;
+mod native_staging;
 
 use model_staging::{ExpectedModel, stage_model, verify_model};
+use native_staging::stage_linux_shared_libraries;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::env;
@@ -36,6 +38,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CODESTORY_EMBED_MODEL_SOURCE");
     println!("cargo:rerun-if-changed={MODEL_CONTRACT_FILE}");
     println!("cargo:rerun-if-changed=model_staging.rs");
+    println!("cargo:rerun-if-changed=native_staging.rs");
 
     let contract = load_model_contract();
     let target = env::var("TARGET").expect("Cargo sets TARGET");
@@ -222,6 +225,24 @@ fn stage_dynamic_runtime(target_os: &str, out_dir: &std::path::Path) {
             panic!(
                 "failed to stage native runtime artifact {}: {error}",
                 source.display()
+            )
+        });
+    }
+    if target_os == "linux" {
+        let runtime_sources = runtime_files
+            .iter()
+            .map(|(_, source, _)| source.as_path())
+            .collect::<Vec<_>>();
+        let build_support_source = core_dir.join("libllama-common.so");
+        stage_linux_shared_libraries(
+            &runtime_sources,
+            &[build_support_source.as_path()],
+            profile_dir,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to stage Linux shared runtime from {}: {error}",
+                native_out.display()
             )
         });
     }
