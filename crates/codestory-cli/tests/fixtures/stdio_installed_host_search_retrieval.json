@@ -1,0 +1,9 @@
+{
+  "input": {
+    "fallback_reason": "missing_semantic_docs",
+    "mode": "symbolic"
+  },
+  "projected": {
+    "state": "ready"
+  }
+}

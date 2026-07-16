@@ -831,6 +831,7 @@ class McpProcess:
         threading.Thread(target=self._reader, args=(self.process.stdout, self.lines), daemon=True).start()
         threading.Thread(target=self._stderr_reader, daemon=True).start()
         self.transcript: list[dict] = []
+        self.tool_attempt_counts: dict[str, int] = {}
 
     @staticmethod
     def _reader(stream, output: queue.Queue[str | None]) -> None:
@@ -898,20 +899,74 @@ class McpProcess:
         attempt = 0
         while True:
             attempt += 1
+            self.tool_attempt_counts[request_id] = attempt
             response = self.tool(name, arguments, f"{request_id}-{attempt}")
-            result = response.get("result", {})
-            if result.get("isError") is not True:
-                return response, attempt
-            state = result.get("structuredContent", {})
+            result = response.get("result")
             require(
-                state.get("code") in {"codestory_preparing", "codestory_updating"},
-                f"MCP {name} did not converge: {state}",
+                isinstance(result, dict),
+                f"MCP {name} attempt {attempt} returned a non-object result: {result!r}",
             )
-            require(state.get("retry_tool") == name, f"MCP {name} returned the wrong retry tool: {state}")
+            state = result.get("structuredContent")
+            require(
+                isinstance(state, dict),
+                f"MCP {name} attempt {attempt} returned non-object structuredContent: {result!r}",
+            )
+            is_error = result.get("isError")
+            if "isError" not in result or is_error is False:
+                return response, attempt
+            require(
+                is_error is True,
+                f"MCP {name} attempt {attempt} returned invalid isError={is_error!r}: {result!r}",
+            )
+            retry_state = (state.get("code"), state.get("state"))
+            require(
+                retry_state
+                in (
+                    ("codestory_preparing", "preparing"),
+                    ("codestory_updating", "updating"),
+                ),
+                f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
+            )
+            require(
+                state.get("retry_tool") == name,
+                f"MCP {name} attempt {attempt} returned the wrong retry tool: {state!r}",
+            )
+            retry_after_ms = state.get("retry_after_ms")
+            require(
+                isinstance(retry_after_ms, int)
+                and not isinstance(retry_after_ms, bool)
+                and retry_after_ms >= 0,
+                f"MCP {name} attempt {attempt} returned invalid retry_after_ms: {state!r}",
+            )
             remaining = deadline - time.monotonic()
-            require(remaining > 0, f"MCP {name} did not become ready")
-            delay = max(1, int(state.get("retry_after_ms", 1))) / 1000
-            time.sleep(min(delay, remaining))
+            require(
+                remaining > 0,
+                f"MCP {name} did not become ready after attempt {attempt}: {state!r}",
+            )
+            delay_ms = min(retry_after_ms, max(0, int(remaining * 1000)))
+            time.sleep(delay_ms / 1000)
+
+    def search_until_ready(self, arguments: dict, request_id: str) -> tuple[dict, int]:
+        response, attempts = self.tool_until_ready("search", arguments, request_id)
+        result = response["result"]
+        state = result["structuredContent"]
+        query = arguments.get("query")
+        require(
+            isinstance(query, str) and state.get("query") == query,
+            f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
+        )
+        require(
+            isinstance(state.get("hits"), list),
+            f"MCP search returned non-array hits: {state!r}",
+        )
+        retrieval = state.get("retrieval")
+        require(
+            isinstance(retrieval, dict) and retrieval.get("state") == "ready",
+            f"MCP search did not return the ready installed retrieval projection: {state!r}",
+        )
+        # The installed result is deliberately compact. Full retrieval remains
+        # proven separately by public status and activation diagnostics.
+        return response, attempts
 
     def close(self) -> None:
         if self.process.stdin:
@@ -1263,13 +1318,29 @@ def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root
         )
 
     restart = McpProcess([str(cli), "serve", "--stdio", "--multi-project", "--refresh", "none"], env=env, cwd=project, timeout=args.timeout_secs)
+    restart_search_attempts = 0
     try:
         restart.initialize()
-        restart.tool("search", {"project": str(project), "query": args.query, "why": True}, "restart-search")
+        _, restart_search_attempts = restart.search_until_ready(
+            {"project": str(project), "query": args.query, "why": True},
+            "restart-search",
+        )
         restart_status = restart.engine_diagnostics(project, "restart-diagnostics")
         restart_identity = engine_identity(restart_status, args.engine_policy, args.expected_backend)
     finally:
-        restart.close()
+        try:
+            restart.close()
+        finally:
+            restart_search_attempts = restart.tool_attempt_counts.get(
+                "restart-search", restart_search_attempts
+            )
+            write_json(
+                out_dir / "restart-mcp.json",
+                {
+                    "restart_search_attempts": restart_search_attempts,
+                    "transcript": restart.transcript,
+                },
+            )
     require(Path(str(restart_identity["embedding_materialized_path"])).resolve() == materialized.resolve(), "restart used a different materialized model")
     require(restart_identity["embedding_materialized_reused"] is True, "restart did not report content-addressed model reuse")
     require(materialized.stat().st_mtime_ns == before_mtime, "restart rewrote the materialized model")
@@ -1279,11 +1350,135 @@ def prove_runtime(args: argparse.Namespace, cli: Path, env: dict[str, str], root
         "identity": identity,
         "idle_residency": idle_residency,
         "restart_identity": restart_identity,
+        "restart_search_attempts": restart_search_attempts,
     }
 
 
 def self_test() -> None:
     require(parse_byte_quantity("24.1M") == 25_270_682, "memory quantity parser failed")
+
+    class ScriptedMcpProcess(McpProcess):
+        def __init__(self, responses: list[dict]):
+            self.timeout = 1
+            self.responses = iter(responses)
+            self.calls: list[tuple[str, dict, str]] = []
+            self.tool_attempt_counts: dict[str, int] = {}
+
+        def tool(self, name: str, arguments: dict, request_id: str) -> dict:
+            self.calls.append((name, arguments, request_id))
+            try:
+                return next(self.responses)
+            except StopIteration as exc:
+                raise ProofFailure("scripted MCP response sequence was exhausted") from exc
+
+    projection_fixture_path = (
+        Path(__file__).resolve().parents[2]
+        / "crates"
+        / "codestory-cli"
+        / "tests"
+        / "fixtures"
+        / "stdio_installed_host_search_retrieval.json"
+    )
+    projection_fixture = json.loads(projection_fixture_path.read_text(encoding="utf-8"))
+    require(
+        isinstance(projection_fixture, dict),
+        f"installed search projection fixture is not an object: {projection_fixture!r}",
+    )
+    ready_retrieval = projection_fixture.get("projected")
+    require(
+        isinstance(ready_retrieval, dict),
+        f"installed search projection fixture is missing projected retrieval: {projection_fixture!r}",
+    )
+
+    query = "scripted-search"
+    preparing = {
+        "result": {
+            "isError": True,
+            "structuredContent": {
+                "code": "codestory_preparing",
+                "state": "preparing",
+                "retry_tool": "search",
+                "retry_after_ms": 0,
+            },
+        }
+    }
+    ready = {
+        "result": {
+            "structuredContent": {
+                "query": query,
+                "hits": [],
+                "retrieval": ready_retrieval,
+            }
+        }
+    }
+    scripted = ScriptedMcpProcess([preparing, ready])
+    _, attempts = scripted.search_until_ready({"query": query}, "self-test-search")
+    require(attempts == 2, "preparing search did not converge on its second attempt")
+    require(
+        scripted.tool_attempt_counts.get("self-test-search") == 2,
+        "preparing search attempt count was not retained",
+    )
+
+    unavailable = ScriptedMcpProcess([
+        {
+            "result": {
+                "isError": True,
+                "structuredContent": {
+                    "code": "codestory_unavailable",
+                    "state": "unavailable",
+                    "message": "hostile terminal response",
+                },
+            }
+        }
+    ])
+    try:
+        unavailable.search_until_ready({"query": query}, "self-test-unavailable")
+    except ProofFailure as exc:
+        require(
+            "codestory_unavailable" in str(exc),
+            f"terminal MCP failure omitted its diagnostics: {exc}",
+        )
+    else:
+        raise ProofFailure("terminal MCP unavailable response was retried or accepted")
+    require(len(unavailable.calls) == 1, "terminal MCP unavailable response was retried")
+
+    hostile_search_results = [
+        (
+            "legacy mode=full",
+            {"query": query, "hits": [], "retrieval": {"mode": "full"}},
+            "ready installed retrieval projection",
+        ),
+        (
+            "preparing retrieval projection",
+            {"query": query, "hits": [], "retrieval": {"state": "preparing"}},
+            "ready installed retrieval projection",
+        ),
+        (
+            "missing retrieval projection",
+            {"query": query, "hits": []},
+            "ready installed retrieval projection",
+        ),
+        (
+            "non-array hits",
+            {"query": query, "hits": {}, "retrieval": ready_retrieval},
+            "non-array hits",
+        ),
+    ]
+    for label, structured_content, expected_diagnostic in hostile_search_results:
+        hostile = ScriptedMcpProcess(
+            [{"result": {"structuredContent": structured_content}}]
+        )
+        try:
+            hostile.search_until_ready({"query": query}, f"self-test-{label}")
+        except ProofFailure as exc:
+            require(
+                expected_diagnostic in str(exc),
+                f"{label} failure omitted its diagnostics: {exc}",
+            )
+        else:
+            raise ProofFailure(f"{label} search result was accepted")
+        require(len(hostile.calls) == 1, f"{label} search result was retried")
+
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         payload = root / "artifact.zip"
