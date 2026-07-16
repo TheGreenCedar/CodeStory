@@ -5,25 +5,27 @@
 //! is surfaced as diagnostics or errors, not as product-equivalent answer evidence.
 
 use codestory_contracts::api::{
-    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedAnalysisBoundsDto, AffectedAnalysisCompletenessDto, AffectedAnalysisDto,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedFollowUpDto, AffectedFollowUpInvocationDto, AffectedInputClassificationDto,
     AffectedMatchedFileDto, AffectedRouteDto, AffectedSymbolDto, AffectedTestFileDto,
-    AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest, AgentHybridWeightsDto,
-    AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload, BookmarkCategoryDto,
-    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId, EdgeKind,
-    EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto, GraphEdgeDto,
-    GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto, GroundingCoverageBucketDto,
-    GroundingFileDigestDto, GroundingSnapshotDto, GroundingSymbolDigestDto, IndexDryRunDto,
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexMode, IndexPublicationDto, IndexPublicationModeDto,
-    IndexedFileDto, IndexedFileIncompleteReasonCountDto, IndexedFileLanguageCountDto,
-    IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest, IndexedFilesSummaryDto,
-    IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest, MemberAccess,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
-    OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest, ProjectSummary,
-    ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto, RetrievalFallbackReasonDto,
-    RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto, RouteEndpointHandlerDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
+    AffectedUncoveredInputDto, AffectedUnmatchedPathDto, AgentAnswerDto, AgentAskRequest,
+    AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, EdgeId,
+    EdgeKind, EdgeOccurrencesRequest, EmbeddingProfileContractDto, FrameworkRouteCoverageDto,
+    GraphEdgeDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
+    GroundingCoverageBucketDto, GroundingFileDigestDto, GroundingSnapshotDto,
+    GroundingSymbolDigestDto, IndexDryRunDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto,
+    IndexPublicationModeDto, IndexedFileDto, IndexedFileIncompleteReasonCountDto,
+    IndexedFileLanguageCountDto, IndexedFileRoleDto, IndexedFilesDto, IndexedFilesRequest,
+    IndexedFilesSummaryDto, IndexingPhaseTimings, ListChildrenSymbolsRequest,
+    ListRootSymbolsRequest, MemberAccess, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, OpenContainingFolderRequest, OpenDefinitionRequest, OpenProjectRequest,
+    ProjectSummary, ReadFileTextRequest, ReadFileTextResponse, RepoTextScanStatsDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
+    RouteEndpointHandlerDto, RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit,
+    SearchHitOrigin, SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
     SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
     SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
     SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
@@ -368,22 +370,57 @@ struct AffectedGraphEvidence {
     confidence: String,
 }
 
-fn normalized_affected_change_records(
-    req: &AffectedAnalysisRequest,
-) -> Vec<AffectedChangeRecordDto> {
-    if !req.change_records.is_empty() {
-        return req.change_records.clone();
+fn normalized_affected_input(
+    input: &AffectedAnalysisInput,
+) -> Result<(Vec<String>, Vec<AffectedChangeRecordDto>), ApiError> {
+    let count = match input {
+        AffectedAnalysisInput::Paths(paths) => paths.len(),
+        AffectedAnalysisInput::ChangeRecords(records) => records.len(),
+    };
+    if !(1..=200).contains(&count) {
+        return Err(ApiError::invalid_argument(
+            "affected analysis requires between 1 and 200 path records",
+        ));
     }
-    req.changed_paths
-        .iter()
-        .filter(|path| !path.trim().is_empty())
-        .map(|path| AffectedChangeRecordDto {
-            path: path.trim().to_string(),
-            kind: AffectedChangeKindDto::Unknown,
-            status: "path".to_string(),
-            previous_path: None,
-        })
-        .collect()
+
+    match input {
+        AffectedAnalysisInput::Paths(paths) => {
+            let changed_paths = paths
+                .iter()
+                .map(|path| path.trim())
+                .map(|path| {
+                    if path.is_empty() {
+                        Err(ApiError::invalid_argument(
+                            "affected paths must be non-empty strings",
+                        ))
+                    } else {
+                        Ok(path.to_string())
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let change_records = changed_paths
+                .iter()
+                .map(|path| AffectedChangeRecordDto {
+                    path: path.clone(),
+                    kind: AffectedChangeKindDto::Unknown,
+                    status: "path".to_string(),
+                    previous_path: None,
+                })
+                .collect();
+            Ok((changed_paths, change_records))
+        }
+        AffectedAnalysisInput::ChangeRecords(records) => {
+            if records.iter().any(|record| record.path.trim().is_empty()) {
+                return Err(ApiError::invalid_argument(
+                    "affected change record paths must be non-empty strings",
+                ));
+            }
+            Ok((
+                records.iter().map(|record| record.path.clone()).collect(),
+                records.clone(),
+            ))
+        }
+    }
 }
 
 fn affected_change_record_paths(root: &Path, record: &AffectedChangeRecordDto) -> Vec<PathBuf> {
@@ -520,22 +557,360 @@ where
     }
 }
 
-fn affected_unmatched_reason(record: &AffectedChangeRecordDto) -> String {
-    match record.kind {
-        AffectedChangeKindDto::Deleted => {
-            "deleted path did not match any indexed file; the index may already be stale or the path was never indexed"
-                .to_string()
+#[derive(Debug, Clone)]
+struct AffectedResolvedInput {
+    current: PathBuf,
+    previous: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct IndexFreshnessObservation {
+    freshness: IndexFreshnessDto,
+    inventory_complete: bool,
+    admitted_paths: Vec<PathBuf>,
+    stale_paths: Vec<PathBuf>,
+}
+
+impl IndexFreshnessObservation {
+    fn incomplete(freshness: IndexFreshnessDto) -> Self {
+        Self {
+            freshness,
+            inventory_complete: false,
+            admitted_paths: Vec::new(),
+            stale_paths: Vec::new(),
         }
-        AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied => {
-            "renamed/copied path did not match current or previous indexed file path; reindex if the file moved"
-                .to_string()
-        }
-        AffectedChangeKindDto::Untracked => {
-            "untracked path is not in the index yet; run index --refresh incremental before graph traversal"
-                .to_string()
-        }
-        _ => "path did not match any indexed file; reindex or pass repo-relative paths".to_string(),
     }
+
+    fn path_is_admitted(&self, path: &Path) -> bool {
+        self.admitted_paths
+            .iter()
+            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
+    }
+
+    fn path_is_stale(&self, path: &Path) -> bool {
+        self.stale_paths
+            .iter()
+            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
+    }
+}
+
+#[derive(Debug)]
+enum AffectedPathMetadataObservation {
+    RegularFile,
+    NonRegular,
+    Missing,
+    Unavailable {
+        kind: io::ErrorKind,
+        message: String,
+    },
+}
+
+fn affected_path_metadata(path: &Path) -> AffectedPathMetadataObservation {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            AffectedPathMetadataObservation::RegularFile
+        }
+        Ok(_) => AffectedPathMetadataObservation::NonRegular,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            AffectedPathMetadataObservation::Missing
+        }
+        Err(error) => AffectedPathMetadataObservation::Unavailable {
+            kind: error.kind(),
+            message: error.to_string(),
+        },
+    }
+}
+
+fn classify_unmatched_affected_input(
+    root: &Path,
+    record: &AffectedChangeRecordDto,
+    resolved: &AffectedResolvedInput,
+    freshness: &IndexFreshnessObservation,
+) -> (AffectedInputClassificationDto, String, Vec<String>) {
+    classify_unmatched_affected_input_with_metadata(
+        root,
+        record,
+        resolved,
+        freshness,
+        affected_path_metadata(&resolved.current),
+    )
+}
+
+fn classify_unmatched_affected_input_with_metadata(
+    _root: &Path,
+    record: &AffectedChangeRecordDto,
+    resolved: &AffectedResolvedInput,
+    freshness: &IndexFreshnessObservation,
+    metadata: AffectedPathMetadataObservation,
+) -> (AffectedInputClassificationDto, String, Vec<String>) {
+    let mut evidence = Vec::new();
+    let path = &resolved.current;
+    let regular_file = match metadata {
+        AffectedPathMetadataObservation::RegularFile => {
+            evidence.push(format!(
+                "resolved existing regular project file: {}",
+                path.display()
+            ));
+            true
+        }
+        AffectedPathMetadataObservation::NonRegular => {
+            evidence.push(format!(
+                "resolved existing non-regular project path: {}",
+                path.display()
+            ));
+            return (
+                AffectedInputClassificationDto::Malformed,
+                "resolved project path is not a regular file".to_string(),
+                evidence,
+            );
+        }
+        AffectedPathMetadataObservation::Missing => {
+            evidence.push(format!("resolved missing project path: {}", path.display()));
+            false
+        }
+        AffectedPathMetadataObservation::Unavailable { kind, message } => {
+            evidence.push(format!(
+                "metadata read failed for resolved project path {}: kind={kind:?} error={message}",
+                path.display()
+            ));
+            return (
+                AffectedInputClassificationDto::UnavailableEvidence,
+                "resolved project path metadata was unavailable, so existence and regular-file status could not be established"
+                    .to_string(),
+                evidence,
+            );
+        }
+    };
+
+    if regular_file {
+        if !indexable_source_path(path) {
+            return (
+                AffectedInputClassificationDto::ValidUncovered,
+                "regular file exists inside the project but is outside current graph/index coverage"
+                    .to_string(),
+                evidence,
+            );
+        }
+        if freshness.path_is_stale(path) {
+            evidence
+                .push("complete freshness evidence identifies this path as changed or new".into());
+            return (
+                AffectedInputClassificationDto::StaleIndex,
+                "path is indexable and complete freshness evidence shows the publication is stale for it"
+                    .to_string(),
+                evidence,
+            );
+        }
+        if freshness.inventory_complete && !freshness.path_is_admitted(path) {
+            evidence.push(
+                "complete workspace inventory excludes this path from the admitted index set"
+                    .into(),
+            );
+            return (
+                AffectedInputClassificationDto::ValidUncovered,
+                "regular file exists inside the project but is excluded from current graph/index coverage"
+                    .to_string(),
+                evidence,
+            );
+        }
+        evidence.push(
+            "path is indexable, but no indexed row or exact stale/error evidence was available"
+                .into(),
+        );
+        return (
+            AffectedInputClassificationDto::UnavailableEvidence,
+            "path exists and is indexable, but current evidence cannot explain its absence from the graph"
+                .to_string(),
+            evidence,
+        );
+    }
+
+    match record.kind {
+        AffectedChangeKindDto::Deleted => (
+            AffectedInputClassificationDto::ExpectedDeleted,
+            "deleted path is absent from both the workspace and indexed file inventory".to_string(),
+            evidence,
+        ),
+        AffectedChangeKindDto::Renamed | AffectedChangeKindDto::Copied => {
+            if let Some(previous) = resolved.previous.as_deref() {
+                match affected_path_metadata(previous) {
+                    AffectedPathMetadataObservation::RegularFile => {
+                        evidence.push("previous path exists as a regular file".to_string());
+                    }
+                    AffectedPathMetadataObservation::NonRegular => {
+                        evidence.push("previous path exists but is not a regular file".to_string());
+                    }
+                    AffectedPathMetadataObservation::Missing => {
+                        evidence.push("previous path is missing".to_string());
+                    }
+                    AffectedPathMetadataObservation::Unavailable { kind, message } => {
+                        evidence.push(format!(
+                            "metadata read failed for resolved previous project path {}: kind={kind:?} error={message}",
+                            previous.display()
+                        ));
+                        return (
+                            AffectedInputClassificationDto::UnavailableEvidence,
+                            "previous rename/copy path metadata was unavailable, so its file state could not be established"
+                                .to_string(),
+                            evidence,
+                        );
+                    }
+                }
+            }
+            (
+                AffectedInputClassificationDto::RenameUnresolved,
+                "neither the current nor previous rename/copy path matched indexed file identity"
+                    .to_string(),
+                evidence,
+            )
+        }
+        _ => (
+            AffectedInputClassificationDto::Missing,
+            "path does not exist inside the project and did not match indexed file identity"
+                .to_string(),
+            evidence,
+        ),
+    }
+}
+
+fn classify_matched_affected_input(
+    file: &AffectedMatchedFileDto,
+    stale: bool,
+) -> Option<(AffectedInputClassificationDto, String, Vec<String>)> {
+    if file.indexed && file.complete && file.error_count == 0 && !stale {
+        return None;
+    }
+    if file.error_count > 0 {
+        return Some((
+            AffectedInputClassificationDto::Malformed,
+            "indexed path has exact recorded parse/index errors".to_string(),
+            vec![format!("indexed file error_count={}", file.error_count)],
+        ));
+    }
+    if stale {
+        return Some((
+            AffectedInputClassificationDto::StaleIndex,
+            "matched path has exact complete-inventory evidence of stale publication".to_string(),
+            vec!["complete freshness evidence identifies this path as stale".to_string()],
+        ));
+    }
+    Some((
+        AffectedInputClassificationDto::UnavailableEvidence,
+        "matched file is incomplete or not indexed without an exact recorded error".to_string(),
+        vec![format!(
+            "indexed={} complete={} error_count={}",
+            file.indexed, file.complete, file.error_count
+        )],
+    ))
+}
+
+fn affected_files_follow_up_invocation(project: &str, path: &str) -> AffectedFollowUpInvocationDto {
+    AffectedFollowUpInvocationDto {
+        program: "codestory-cli".to_string(),
+        args: vec![
+            "files".to_string(),
+            "--project".to_string(),
+            project.to_string(),
+            "--path".to_string(),
+            path.to_string(),
+            "--format".to_string(),
+            "markdown".to_string(),
+        ],
+    }
+}
+
+fn affected_follow_ups(
+    project: &str,
+    uncovered_inputs: &[AffectedUncoveredInputDto],
+) -> Vec<AffectedFollowUpDto> {
+    let mut follow_ups = Vec::new();
+    for input in uncovered_inputs {
+        match input.classification {
+            AffectedInputClassificationDto::ValidUncovered => {
+                follow_ups.push(AffectedFollowUpDto {
+                    action: "inspect_graph_boundary".to_string(),
+                    reason: format!(
+                        "{} is a valid project file outside current graph coverage; source inspection is the relevant next step",
+                        input.path
+                    ),
+                    confidence: "direct".to_string(),
+                    invocation: None,
+                });
+            }
+            AffectedInputClassificationDto::StaleIndex => {
+                follow_ups.push(AffectedFollowUpDto {
+                    action: "refresh_stale_index".to_string(),
+                    reason: format!(
+                        "complete freshness evidence shows the publication is stale for {}",
+                        input.path
+                    ),
+                    confidence: "direct".to_string(),
+                    invocation: Some(AffectedFollowUpInvocationDto {
+                        program: "codestory-cli".to_string(),
+                        args: vec![
+                            "index".to_string(),
+                            "--project".to_string(),
+                            project.to_string(),
+                            "--refresh".to_string(),
+                            "incremental".to_string(),
+                        ],
+                    }),
+                });
+            }
+            AffectedInputClassificationDto::Missing
+            | AffectedInputClassificationDto::RenameUnresolved
+            | AffectedInputClassificationDto::ExpectedDeleted => {
+                follow_ups.push(AffectedFollowUpDto {
+                    action: "locate_input_path".to_string(),
+                    reason: format!(
+                        "confirm the exact project-relative spelling and file state for {}",
+                        input.path
+                    ),
+                    confidence: "direct".to_string(),
+                    invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
+                });
+            }
+            AffectedInputClassificationDto::Malformed => {
+                let recorded_error = input
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.starts_with("indexed file error_count="));
+                follow_ups.push(AffectedFollowUpDto {
+                    action: if recorded_error {
+                        "inspect_recorded_index_error"
+                    } else {
+                        "inspect_malformed_input"
+                    }
+                    .to_string(),
+                    reason: if recorded_error {
+                        format!(
+                            "inspect the exact recorded parse/index error for {} before retrying impact analysis",
+                            input.path
+                        )
+                    } else {
+                        format!(
+                            "confirm {} is a regular project file before retrying impact analysis",
+                            input.path
+                        )
+                    },
+                    confidence: "direct".to_string(),
+                    invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
+                });
+            }
+            AffectedInputClassificationDto::UnavailableEvidence => {
+                follow_ups.push(AffectedFollowUpDto {
+                    action: "inspect_input_evidence".to_string(),
+                    reason: format!(
+                        "inspect the focused inventory row for {}; current evidence cannot classify its graph absence more strongly",
+                        input.path
+                    ),
+                    confidence: "bounded".to_string(),
+                    invocation: Some(affected_files_follow_up_invocation(project, &input.path)),
+                });
+            }
+        }
+    }
+    follow_ups
 }
 
 fn affected_edge_kind_label(kind: codestory_contracts::graph::EdgeKind) -> &'static str {
@@ -3837,15 +4212,15 @@ fn looks_like_openapi_source_path(path: &Path) -> bool {
     codestory_indexer::looks_like_openapi_schema(&source)
 }
 
-fn index_freshness_from_storage(
+fn index_freshness_observation_from_storage(
     root: &Path,
     workspace: &WorkspaceManifest,
     storage: &Storage,
-) -> IndexFreshnessDto {
+) -> IndexFreshnessObservation {
     let started_at = Instant::now();
     match storage.has_incomplete_incremental_run() {
         Ok(true) => {
-            return IndexFreshnessDto {
+            return IndexFreshnessObservation::incomplete(IndexFreshnessDto {
                 status: IndexFreshnessStatusDto::Stale,
                 changed_file_count: 0,
                 new_file_count: 0,
@@ -3857,15 +4232,15 @@ fn index_freshness_from_storage(
                     "previous_incremental_run_incomplete_full_refresh_required".to_string(),
                 ),
                 samples: Vec::new(),
-            };
+            });
         }
         Ok(false) => {}
         Err(error) => {
-            return not_checked_index_freshness(
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 format!("failed to inspect incomplete index marker: {error}"),
                 0,
                 started_at,
-            );
+            ));
         }
     }
     #[cfg(test)]
@@ -3873,23 +4248,23 @@ fn index_freshness_from_storage(
     let files = match storage.get_files() {
         Ok(files) => files,
         Err(error) => {
-            return not_checked_index_freshness(
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 format!("failed to read indexed file inventory: {error}"),
                 0,
                 started_at,
-            );
+            ));
         }
     };
     let indexed_file_count = clamp_usize_to_u32(files.len());
     if files.is_empty() {
-        return not_checked_index_freshness(
+        return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
             "no indexed file inventory is available yet",
             indexed_file_count,
             started_at,
-        );
+        ));
     }
     if files.len() > INDEX_FRESHNESS_INDEXED_FILE_CAP {
-        return not_checked_index_freshness(
+        return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
             format!(
                 "indexed file inventory exceeds bounded freshness cap ({} > {})",
                 files.len(),
@@ -3897,17 +4272,17 @@ fn index_freshness_from_storage(
             ),
             indexed_file_count,
             started_at,
-        );
+        ));
     }
 
     let stored_files = match storage.files().inventory() {
         Ok(files) => files,
         Err(error) => {
-            return not_checked_index_freshness(
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 format!("failed to read refresh inventory: {error}"),
                 indexed_file_count,
                 started_at,
-            );
+            ));
         }
     };
     let removed_paths = files
@@ -3923,11 +4298,11 @@ fn index_freshness_from_storage(
     {
         Ok(refresh) => refresh,
         Err(error) => {
-            return not_checked_index_freshness(
+            return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
                 format!("failed to check workspace inventory: {error}"),
                 indexed_file_count,
                 started_at,
-            );
+            ));
         }
     };
     if refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
@@ -3935,7 +4310,7 @@ fn index_freshness_from_storage(
             .inventory_issues
             .first()
             .map(|issue| format!("{}: {}", issue.path.display(), issue.message));
-        return not_checked_index_freshness(
+        return IndexFreshnessObservation::incomplete(not_checked_index_freshness(
             match detail {
                 Some(detail) => format!(
                     "current workspace inventory is {:?}: {detail}",
@@ -3948,7 +4323,7 @@ fn index_freshness_from_storage(
             },
             indexed_file_count,
             started_at,
-        );
+        ));
     }
     let plan = refresh.plan;
 
@@ -3997,17 +4372,60 @@ fn index_freshness_from_storage(
         .saturating_sub(removed_file_count)
         .saturating_add(new_file_count);
 
-    IndexFreshnessDto {
-        status,
-        changed_file_count,
-        new_file_count,
-        removed_file_count,
-        checked_file_count,
-        indexed_file_count,
-        duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
-        reason: None,
-        samples,
+    let mut admitted_paths: Vec<PathBuf> = Vec::with_capacity(
+        plan.existing_file_ids
+            .len()
+            .saturating_add(plan.files_to_index.len()),
+    );
+    for path in plan
+        .existing_file_ids
+        .keys()
+        .chain(plan.files_to_index.iter())
+    {
+        if !admitted_paths
+            .iter()
+            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
+        {
+            admitted_paths.push(path.to_path_buf());
+        }
     }
+    let mut stale_paths = plan.files_to_index.clone();
+    for removed_id in &plan.files_to_remove {
+        let Some(path) = removed_paths.get(removed_id) else {
+            continue;
+        };
+        if !stale_paths
+            .iter()
+            .any(|candidate| codestory_workspace::same_workspace_path(path, candidate))
+        {
+            stale_paths.push(path.clone());
+        }
+    }
+
+    IndexFreshnessObservation {
+        freshness: IndexFreshnessDto {
+            status,
+            changed_file_count,
+            new_file_count,
+            removed_file_count,
+            checked_file_count,
+            indexed_file_count,
+            duration_ms: clamp_u128_to_u32(started_at.elapsed().as_millis()),
+            reason: None,
+            samples,
+        },
+        inventory_complete: true,
+        admitted_paths,
+        stale_paths,
+    }
+}
+
+fn index_freshness_from_storage(
+    root: &Path,
+    workspace: &WorkspaceManifest,
+    storage: &Storage,
+) -> IndexFreshnessDto {
+    index_freshness_observation_from_storage(root, workspace, storage).freshness
 }
 
 fn workspace_member_index_summaries(
@@ -10499,6 +10917,19 @@ impl AppController {
         let root = self.require_project_root()?;
         let depth = req.depth.unwrap_or(2).clamp(1, 8);
         let filter = req.filter.as_deref().map(normalize_path_key);
+        let (changed_paths, change_records) = normalized_affected_input(&req.input)?;
+        let resolved_inputs = change_records
+            .iter()
+            .map(|record| {
+                let current = self.resolve_project_file_path(&record.path, true)?;
+                let previous = record
+                    .previous_path
+                    .as_deref()
+                    .map(|path| self.resolve_project_file_path(path, true))
+                    .transpose()?;
+                Ok(AffectedResolvedInput { current, previous })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
         let storage = self.open_storage_read_only()?;
         let files = storage
             .get_files()
@@ -10519,7 +10950,11 @@ impl AppController {
             }
         }
 
-        let change_records = normalized_affected_change_records(&req);
+        let workspace = WorkspaceManifest::open(root.clone())
+            .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
+        let freshness_observation =
+            index_freshness_observation_from_storage(&root, &workspace, &storage);
+        let freshness = &freshness_observation.freshness;
         let mut path_identities = OperationPathIdentityResolver::native();
         let identity_matches = match_affected_file_identities(
             &root,
@@ -10566,15 +11001,49 @@ impl AppController {
         let unmatched_paths = change_records
             .iter()
             .enumerate()
-            .filter(|(record_index, _)| !matched_record_indexes.contains(record_index))
-            .map(|(_, record)| AffectedUnmatchedPathDto {
-                path: record.path.clone(),
-                reason: affected_unmatched_reason(record),
-                change_kind: Some(record.kind.clone()),
-                change_status: Some(record.status.clone()),
-                previous_path: record.previous_path.clone(),
+            .filter(|(index, _)| !matched_record_indexes.contains(index))
+            .map(|(index, record)| {
+                let (classification, reason, evidence) = classify_unmatched_affected_input(
+                    &root,
+                    record,
+                    &resolved_inputs[index],
+                    &freshness_observation,
+                );
+                AffectedUnmatchedPathDto {
+                    path: record.path.clone(),
+                    classification,
+                    reason,
+                    evidence,
+                    change_kind: Some(record.kind.clone()),
+                    change_status: Some(record.status.clone()),
+                    previous_path: record.previous_path.clone(),
+                }
             })
             .collect::<Vec<_>>();
+        let mut uncovered_inputs = unmatched_paths
+            .iter()
+            .map(|input| AffectedUncoveredInputDto {
+                path: input.path.clone(),
+                classification: input.classification.clone(),
+                reason: input.reason.clone(),
+                evidence: input.evidence.clone(),
+            })
+            .collect::<Vec<_>>();
+        for file in &matched_files {
+            let absolute_path = root.join(&file.path);
+            let stale = freshness_observation.path_is_stale(&absolute_path);
+            let Some((classification, reason, evidence)) =
+                classify_matched_affected_input(file, stale)
+            else {
+                continue;
+            };
+            uncovered_inputs.push(AffectedUncoveredInputDto {
+                path: file.path.clone(),
+                classification,
+                reason,
+                evidence,
+            });
+        }
 
         let mut labels = self.cached_labels(nodes.iter().map(|node| node.id));
         for node in &nodes {
@@ -10625,6 +11094,7 @@ impl AppController {
         let mut distances = HashMap::<GraphNodeId, u32>::new();
         let mut evidence = HashMap::<GraphNodeId, AffectedGraphEvidence>::new();
         let mut queue = VecDeque::<(GraphNodeId, u32)>::new();
+        let mut visited_edge_count = 0usize;
         for seed in seeds {
             distances.insert(seed, 0);
             let seed_reason = nodes_by_id
@@ -10652,6 +11122,7 @@ impl AppController {
                 continue;
             }
             for (dependent, edge_id) in reverse_dependents.get(&node_id).into_iter().flatten() {
+                visited_edge_count = visited_edge_count.saturating_add(1);
                 let next_distance = distance + 1;
                 if distances
                     .get(dependent)
@@ -10717,12 +11188,22 @@ impl AppController {
                 })
             })
             .collect::<Vec<_>>();
+        let direct_impact_count = impacted_symbols
+            .iter()
+            .filter(|symbol| symbol.distance == 0)
+            .count();
+        let propagated_impact_count = impacted_symbols
+            .iter()
+            .filter(|symbol| symbol.distance > 0)
+            .count();
         impacted_symbols.sort_by(|left, right| {
             left.distance
                 .cmp(&right.distance)
                 .then(left.file_path.cmp(&right.file_path))
                 .then(left.display_name.cmp(&right.display_name))
         });
+        let impacted_symbol_total = impacted_symbols.len();
+        let impacted_symbols_truncated = impacted_symbol_total > 200;
         impacted_symbols.truncate(200);
 
         let mut impacted_routes = distances
@@ -10787,6 +11268,8 @@ impl AppController {
                 .then(left.file_path.cmp(&right.file_path))
                 .then(left.display_name.cmp(&right.display_name))
         });
+        let impacted_route_total = impacted_routes.len();
+        let impacted_routes_truncated = impacted_route_total > 100;
         impacted_routes.truncate(100);
 
         let mut impacted_by_test_file = BTreeMap::<String, (u32, u32, String)>::new();
@@ -10824,9 +11307,8 @@ impl AppController {
         let mut notes = Vec::new();
         let mut blind_spots = Vec::new();
         if matched_file_ids.is_empty() {
-            let note =
-                "no changed paths matched indexed files; pass repo-relative paths or reindex first"
-                    .to_string();
+            let note = "no inputs matched indexed file identity; inspect the typed uncovered-input evidence"
+                .to_string();
             notes.push(note.clone());
             blind_spots.push(note);
         } else {
@@ -10837,7 +11319,7 @@ impl AppController {
         }
         if !unmatched_paths.is_empty() {
             blind_spots.push(format!(
-                "{} changed paths were unmatched and excluded from graph traversal",
+                "{} inputs were unmatched and excluded from graph traversal",
                 unmatched_paths.len()
             ));
         }
@@ -10874,26 +11356,100 @@ impl AppController {
         if impacted_tests.is_empty() {
             notes.push("no impacted test-like files found in the indexed graph".to_string());
         }
+        let mut truncation_reasons = Vec::new();
+        if impacted_symbols_truncated {
+            truncation_reasons.push(format!(
+                "impacted_symbols retained 200 of {impacted_symbol_total} results"
+            ));
+        }
+        if impacted_routes_truncated {
+            truncation_reasons.push(format!(
+                "impacted_routes retained 100 of {impacted_route_total} results"
+            ));
+        }
+        let truncated = !truncation_reasons.is_empty();
+        if truncated {
+            blind_spots.extend(truncation_reasons.iter().cloned());
+        }
+
         let project = root.to_string_lossy().to_string();
-        let next_commands = vec![
-            format!("codestory-cli files --project \"{project}\" --format markdown"),
-            format!("codestory-cli doctor --project \"{project}\" --format markdown"),
-            format!("codestory-cli index --project \"{project}\" --refresh full"),
-        ];
+        let mut follow_ups = affected_follow_ups(&project, &uncovered_inputs);
+        if freshness.status == IndexFreshnessStatusDto::Stale
+            && !uncovered_inputs
+                .iter()
+                .any(|input| input.classification == AffectedInputClassificationDto::StaleIndex)
+        {
+            blind_spots.push(
+                "the workspace has unrelated stale index state, but no requested input was classified stale"
+                    .to_string(),
+            );
+        }
+        if freshness.status == IndexFreshnessStatusDto::NotChecked {
+            blind_spots.push(
+                "bounded index freshness evidence was unavailable; no complete no-impact claim is possible"
+                    .to_string(),
+            );
+            follow_ups.push(AffectedFollowUpDto {
+                action: "establish_freshness_evidence".to_string(),
+                reason: "inspect the observational index status because bounded freshness could not be established"
+                    .to_string(),
+                confidence: "bounded".to_string(),
+                invocation: Some(AffectedFollowUpInvocationDto {
+                    program: "codestory-cli".to_string(),
+                    args: vec![
+                        "doctor".to_string(),
+                        "--project".to_string(),
+                        project.clone(),
+                        "--format".to_string(),
+                        "markdown".to_string(),
+                    ],
+                }),
+            });
+        }
+        let freshness_complete = freshness.status == IndexFreshnessStatusDto::Fresh;
+        let unavailable_evidence_count = uncovered_inputs
+            .iter()
+            .filter(|input| {
+                input.classification == AffectedInputClassificationDto::UnavailableEvidence
+            })
+            .count();
+        let complete = uncovered_inputs.is_empty() && !truncated && freshness_complete;
+        let completeness = AffectedAnalysisCompletenessDto {
+            complete,
+            confidence: if complete { "complete" } else { "bounded" }.to_string(),
+            direct_impact_count: clamp_usize_to_u32(direct_impact_count),
+            propagated_impact_count: clamp_usize_to_u32(propagated_impact_count),
+            candidate_test_count: clamp_usize_to_u32(impacted_tests.len()),
+            uncovered_input_count: clamp_usize_to_u32(uncovered_inputs.len()),
+            unavailable_evidence_count: clamp_usize_to_u32(unavailable_evidence_count),
+            truncated,
+            truncation_reasons,
+        };
+        let bounds = AffectedAnalysisBoundsDto {
+            requested_depth: depth,
+            maximum_depth: 8,
+            visited_node_count: clamp_usize_to_u32(distances.len()),
+            visited_edge_count: clamp_usize_to_u32(visited_edge_count),
+            impacted_symbol_limit: 200,
+            impacted_route_limit: 100,
+        };
 
         Ok(AffectedAnalysisDto {
             project_root: project,
-            changed_paths: req.changed_paths,
+            changed_paths,
             change_records,
             matched_files,
             unmatched_paths,
+            uncovered_inputs,
             matched_file_count: matched_file_ids.len().min(u32::MAX as usize) as u32,
             depth,
             impacted_symbols,
             impacted_routes,
             impacted_tests,
+            bounds,
+            completeness,
             blind_spots,
-            next_commands,
+            follow_ups,
             notes,
         })
     }
@@ -13448,6 +14004,433 @@ mod tests {
         assert!(
             !details.next_commands.is_empty(),
             "retrieval error should include recovery commands: {error:?}"
+        );
+    }
+
+    fn affected_test_freshness(
+        root: &Path,
+        status: IndexFreshnessStatusDto,
+        samples: Vec<IndexFreshnessSampleDto>,
+    ) -> IndexFreshnessObservation {
+        let stale_paths = samples
+            .iter()
+            .map(|sample| root.join(&sample.path))
+            .collect::<Vec<_>>();
+        IndexFreshnessObservation {
+            freshness: IndexFreshnessDto {
+                status,
+                changed_file_count: 0,
+                new_file_count: 0,
+                removed_file_count: 0,
+                checked_file_count: 1,
+                indexed_file_count: 1,
+                duration_ms: 0,
+                reason: None,
+                samples,
+            },
+            inventory_complete: status != IndexFreshnessStatusDto::NotChecked,
+            admitted_paths: stale_paths.clone(),
+            stale_paths,
+        }
+    }
+
+    fn affected_test_record(kind: AffectedChangeKindDto, path: &str) -> AffectedChangeRecordDto {
+        AffectedChangeRecordDto {
+            path: path.to_string(),
+            kind,
+            status: "test".to_string(),
+            previous_path: None,
+        }
+    }
+
+    #[test]
+    fn affected_unmatched_classification_uses_positive_path_and_freshness_evidence() {
+        let project = tempdir().expect("project");
+        let svg = project.path().join("desk.svg");
+        fs::write(&svg, "<svg/>").expect("write svg");
+        let fresh =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+        let resolved_svg = AffectedResolvedInput {
+            current: svg.clone(),
+            previous: None,
+        };
+        let (classification, _, _) = classify_unmatched_affected_input(
+            project.path(),
+            &affected_test_record(AffectedChangeKindDto::Modified, "desk.svg"),
+            &resolved_svg,
+            &fresh,
+        );
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+
+        let source = project.path().join("new.rs");
+        fs::write(&source, "pub fn new_source() {}\n").expect("write source");
+        let stale = affected_test_freshness(
+            project.path(),
+            IndexFreshnessStatusDto::Stale,
+            vec![IndexFreshnessSampleDto {
+                kind: IndexFreshnessChangeKindDto::New,
+                path: "new.rs".to_string(),
+            }],
+        );
+        let resolved_source = AffectedResolvedInput {
+            current: source,
+            previous: None,
+        };
+        let (classification, _, evidence) = classify_unmatched_affected_input(
+            project.path(),
+            &affected_test_record(AffectedChangeKindDto::Added, "new.rs"),
+            &resolved_source,
+            &stale,
+        );
+        assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
+        assert!(
+            evidence
+                .iter()
+                .any(|entry| entry.contains("freshness evidence"))
+        );
+    }
+
+    #[test]
+    fn affected_unmatched_classification_distinguishes_missing_delete_and_rename() {
+        let project = tempdir().expect("project");
+        let missing = project.path().join("missing.rs");
+        let resolved = AffectedResolvedInput {
+            current: missing,
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+        for (kind, expected) in [
+            (
+                AffectedChangeKindDto::Modified,
+                AffectedInputClassificationDto::Missing,
+            ),
+            (
+                AffectedChangeKindDto::Deleted,
+                AffectedInputClassificationDto::ExpectedDeleted,
+            ),
+            (
+                AffectedChangeKindDto::Renamed,
+                AffectedInputClassificationDto::RenameUnresolved,
+            ),
+        ] {
+            let (classification, _, _) = classify_unmatched_affected_input(
+                project.path(),
+                &affected_test_record(kind, "missing.rs"),
+                &resolved,
+                &freshness,
+            );
+            assert_eq!(classification, expected);
+        }
+    }
+
+    #[test]
+    fn affected_unmatched_directory_is_malformed_not_valid_uncovered() {
+        let project = tempdir().expect("project");
+        let directory = project.path().join("assets");
+        fs::create_dir(&directory).expect("create directory");
+        let resolved = AffectedResolvedInput {
+            current: directory,
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+
+        let (classification, reason, _) = classify_unmatched_affected_input(
+            project.path(),
+            &affected_test_record(AffectedChangeKindDto::Modified, "assets"),
+            &resolved,
+            &freshness,
+        );
+
+        assert_eq!(classification, AffectedInputClassificationDto::Malformed);
+        assert!(reason.contains("regular file"));
+    }
+
+    #[test]
+    fn affected_unmatched_metadata_error_is_unavailable_not_missing() {
+        let project = tempdir().expect("project");
+        let resolved = AffectedResolvedInput {
+            current: project.path().join("unreadable.rs"),
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+
+        let (classification, reason, evidence) = classify_unmatched_affected_input_with_metadata(
+            project.path(),
+            &affected_test_record(AffectedChangeKindDto::Modified, "unreadable.rs"),
+            &resolved,
+            &freshness,
+            AffectedPathMetadataObservation::Unavailable {
+                kind: io::ErrorKind::PermissionDenied,
+                message: "injected metadata denial".to_string(),
+            },
+        );
+
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::UnavailableEvidence
+        );
+        assert!(reason.contains("metadata was unavailable"));
+        assert!(evidence.iter().any(|item| {
+            item.contains("kind=PermissionDenied") && item.contains("injected metadata denial")
+        }));
+        assert!(evidence.iter().all(|item| !item.contains("missing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn affected_unmatched_broken_symlink_is_malformed_not_missing() {
+        let project = tempdir().expect("project");
+        let broken_link = project.path().join("broken.rs");
+        std::os::unix::fs::symlink(project.path().join("absent-target.rs"), &broken_link)
+            .expect("create broken symlink");
+        let resolved = AffectedResolvedInput {
+            current: broken_link,
+            previous: None,
+        };
+        let freshness =
+            affected_test_freshness(project.path(), IndexFreshnessStatusDto::Fresh, Vec::new());
+
+        let (classification, reason, _) = classify_unmatched_affected_input(
+            project.path(),
+            &affected_test_record(AffectedChangeKindDto::Modified, "broken.rs"),
+            &resolved,
+            &freshness,
+        );
+
+        assert_eq!(classification, AffectedInputClassificationDto::Malformed);
+        assert!(reason.contains("regular file"));
+    }
+
+    #[test]
+    fn affected_matched_recorded_error_takes_precedence_over_stale_evidence() {
+        let mut file = AffectedMatchedFileDto {
+            path: "src/lib.rs".to_string(),
+            role: IndexedFileRoleDto::Source,
+            indexed: true,
+            complete: false,
+            change_kind: Some(AffectedChangeKindDto::Modified),
+            change_status: Some("M".to_string()),
+            previous_path: None,
+            error_count: 1,
+        };
+
+        let (classification, _, evidence) =
+            classify_matched_affected_input(&file, true).expect("incomplete evidence");
+        assert_eq!(classification, AffectedInputClassificationDto::Malformed);
+        assert!(evidence.iter().any(|item| item.contains("error_count=1")));
+
+        file.error_count = 0;
+        let (classification, _, _) =
+            classify_matched_affected_input(&file, true).expect("stale evidence");
+        assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
+    }
+
+    #[test]
+    fn affected_indexable_absence_uses_complete_inventory_and_exact_staleness() {
+        let project = tempdir().expect("project");
+        let excluded = project.path().join("target/excluded.rs");
+        fs::create_dir_all(excluded.parent().expect("excluded parent")).expect("create target");
+        fs::write(&excluded, "pub fn excluded() {}\n").expect("write excluded source");
+        let resolved = AffectedResolvedInput {
+            current: excluded.clone(),
+            previous: None,
+        };
+        let record = affected_test_record(AffectedChangeKindDto::Modified, "target/excluded.rs");
+
+        let complete_excluded = IndexFreshnessObservation {
+            freshness: affected_test_freshness(
+                project.path(),
+                IndexFreshnessStatusDto::Stale,
+                Vec::new(),
+            )
+            .freshness,
+            inventory_complete: true,
+            admitted_paths: vec![project.path().join("src/lib.rs")],
+            stale_paths: vec![project.path().join("src/unrelated.rs")],
+        };
+        let (classification, _, evidence) = classify_unmatched_affected_input(
+            project.path(),
+            &record,
+            &resolved,
+            &complete_excluded,
+        );
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::ValidUncovered
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.contains("inventory excludes"))
+        );
+
+        let exact_stale = IndexFreshnessObservation {
+            admitted_paths: vec![excluded.clone()],
+            stale_paths: vec![excluded.clone()],
+            ..complete_excluded.clone()
+        };
+        let (classification, _, _) =
+            classify_unmatched_affected_input(project.path(), &record, &resolved, &exact_stale);
+        assert_eq!(classification, AffectedInputClassificationDto::StaleIndex);
+
+        let incomplete = IndexFreshnessObservation::incomplete(not_checked_index_freshness(
+            "bounded inventory",
+            1,
+            Instant::now(),
+        ));
+        let (classification, _, _) =
+            classify_unmatched_affected_input(project.path(), &record, &resolved, &incomplete);
+        assert_eq!(
+            classification,
+            AffectedInputClassificationDto::UnavailableEvidence
+        );
+    }
+
+    #[test]
+    fn affected_refresh_follow_up_requires_requested_stale_classification() {
+        let unrelated_stale = AffectedUncoveredInputDto {
+            path: "target/excluded.rs".to_string(),
+            classification: AffectedInputClassificationDto::ValidUncovered,
+            reason: "excluded by complete inventory".to_string(),
+            evidence: Vec::new(),
+        };
+        let follow_ups = affected_follow_ups("/project", &[unrelated_stale]);
+        assert!(
+            follow_ups
+                .iter()
+                .all(|follow_up| follow_up.action != "refresh_stale_index")
+        );
+
+        let requested_stale = AffectedUncoveredInputDto {
+            path: "src/lib.rs".to_string(),
+            classification: AffectedInputClassificationDto::StaleIndex,
+            reason: "exact stale path".to_string(),
+            evidence: Vec::new(),
+        };
+        let follow_ups = affected_follow_ups("/project", &[requested_stale]);
+        assert_eq!(
+            follow_ups
+                .iter()
+                .filter(|follow_up| follow_up.action == "refresh_stale_index")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn affected_graph_cycle_terminates_and_result_caps_are_enforced() {
+        let project = tempdir().expect("project");
+        let source_dir = project.path().join("src");
+        fs::create_dir_all(&source_dir).expect("create source directory");
+        let source_path = source_dir.join("lib.rs");
+        fs::write(&source_path, "pub fn seed() {}\n").expect("write source");
+        let modification_time = fs::metadata(&source_path)
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+
+        {
+            let mut storage =
+                Storage::open(project.path().join("codestory.db")).expect("open storage");
+            storage
+                .insert_file(&FileInfo {
+                    id: 1,
+                    path: source_path.clone(),
+                    language: "rust".to_string(),
+                    modification_time,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: codestory_store::FileRole::Source,
+                })
+                .expect("insert source file");
+            let mut nodes = vec![
+                Node {
+                    id: CoreNodeId(1),
+                    kind: NodeKind::FILE,
+                    serialized_name: source_path.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+                Node {
+                    id: CoreNodeId(2),
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: "seed".to_string(),
+                    file_node_id: Some(CoreNodeId(1)),
+                    start_line: Some(1),
+                    ..Default::default()
+                },
+            ];
+            let mut edges = Vec::new();
+            for index in 0..220_i64 {
+                let node_id = CoreNodeId(1_000 + index);
+                nodes.push(Node {
+                    id: node_id,
+                    kind: NodeKind::FUNCTION,
+                    serialized_name: format!("route_{index}"),
+                    canonical_id: Some(format!("openapi:endpoint:GET /route/{index}")),
+                    start_line: Some(1),
+                    ..Default::default()
+                });
+                edges.push(Edge {
+                    id: EdgeId(2_000 + index),
+                    source: node_id,
+                    target: CoreNodeId(2),
+                    kind: EdgeKind::CALL,
+                    ..Default::default()
+                });
+            }
+            edges.push(Edge {
+                id: EdgeId(9_999),
+                source: CoreNodeId(2),
+                target: CoreNodeId(1_000),
+                kind: EdgeKind::CALL,
+                ..Default::default()
+            });
+            storage.insert_nodes_batch(&nodes).expect("insert nodes");
+            storage.insert_edges_batch(&edges).expect("insert edges");
+        }
+
+        let controller = AppController::new();
+        controller
+            .open_project(OpenProjectRequest {
+                path: project.path().to_string_lossy().to_string(),
+            })
+            .expect("open project");
+        let result = controller
+            .affected_analysis(AffectedAnalysisRequest {
+                input: AffectedAnalysisInput::Paths(vec!["src/lib.rs".to_string()]),
+                depth: Some(8),
+                filter: None,
+            })
+            .expect("affected analysis");
+
+        assert_eq!(result.impacted_symbols.len(), 200);
+        assert_eq!(result.impacted_routes.len(), 100);
+        assert!(result.completeness.truncated);
+        assert!(!result.completeness.complete);
+        assert_eq!(result.bounds.impacted_symbol_limit, 200);
+        assert_eq!(result.bounds.impacted_route_limit, 100);
+        assert!(
+            result.bounds.visited_node_count <= 222,
+            "cycle should not revisit nodes without bound: {:?}",
+            result.bounds
+        );
+        assert_eq!(
+            result.completeness.truncation_reasons,
+            vec![
+                "impacted_symbols retained 200 of 221 results".to_string(),
+                "impacted_routes retained 100 of 220 results".to_string(),
+            ]
         );
     }
 

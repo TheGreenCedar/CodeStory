@@ -112,6 +112,16 @@ impl ReadOnlyBrowserService {
             .map(|operation| operation.value)
     }
 
+    fn run_observational<T>(
+        &self,
+        operation: &str,
+        build: impl FnMut() -> Result<T, ApiError>,
+    ) -> Result<T, ApiError> {
+        self.public_operation
+            .run_observational_with_cancel(operation, Arc::new(AtomicBool::new(false)), build)
+            .map(|operation| operation.value)
+    }
+
     pub fn ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
         self.run_public("context", || self.controller.agent_ask(req.clone()))
     }
@@ -174,7 +184,9 @@ impl ReadOnlyBrowserService {
         &self,
         req: AffectedAnalysisRequest,
     ) -> Result<AffectedAnalysisDto, ApiError> {
-        self.run_public("graph", || self.controller.affected_analysis(req.clone()))
+        self.run_observational("affected", || {
+            self.controller.affected_analysis(req.clone())
+        })
     }
 
     pub fn search_hybrid(

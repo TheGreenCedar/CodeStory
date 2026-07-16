@@ -1059,10 +1059,15 @@ pub struct AffectedChangeRecordDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedAnalysisInput {
+    Paths(Vec<String>),
+    ChangeRecords(Vec<AffectedChangeRecordDto>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AffectedAnalysisRequest {
-    pub changed_paths: Vec<String>,
-    #[serde(default)]
-    pub change_records: Vec<AffectedChangeRecordDto>,
+    pub input: AffectedAnalysisInput,
     #[serde(default)]
     pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1101,16 +1106,80 @@ pub struct AffectedMatchedFileDto {
     pub error_count: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AffectedInputClassificationDto {
+    ValidUncovered,
+    Missing,
+    ExpectedDeleted,
+    RenameUnresolved,
+    StaleIndex,
+    Malformed,
+    UnavailableEvidence,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct AffectedUnmatchedPathDto {
     pub path: String,
+    pub classification: AffectedInputClassificationDto,
     pub reason: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_kind: Option<AffectedChangeKindDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedUncoveredInputDto {
+    pub path: String,
+    pub classification: AffectedInputClassificationDto,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedAnalysisBoundsDto {
+    pub requested_depth: u32,
+    pub maximum_depth: u32,
+    pub visited_node_count: u32,
+    pub visited_edge_count: u32,
+    pub impacted_symbol_limit: u32,
+    pub impacted_route_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedAnalysisCompletenessDto {
+    pub complete: bool,
+    pub confidence: String,
+    pub direct_impact_count: u32,
+    pub propagated_impact_count: u32,
+    pub candidate_test_count: u32,
+    pub uncovered_input_count: u32,
+    pub unavailable_evidence_count: u32,
+    pub truncated: bool,
+    #[serde(default)]
+    pub truncation_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedFollowUpInvocationDto {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct AffectedFollowUpDto {
+    pub action: String,
+    pub reason: String,
+    pub confidence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<AffectedFollowUpInvocationDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1150,16 +1219,20 @@ pub struct AffectedAnalysisDto {
     pub matched_files: Vec<AffectedMatchedFileDto>,
     #[serde(default)]
     pub unmatched_paths: Vec<AffectedUnmatchedPathDto>,
+    #[serde(default)]
+    pub uncovered_inputs: Vec<AffectedUncoveredInputDto>,
     pub matched_file_count: u32,
     pub depth: u32,
     pub impacted_symbols: Vec<AffectedSymbolDto>,
     #[serde(default)]
     pub impacted_routes: Vec<AffectedRouteDto>,
     pub impacted_tests: Vec<AffectedTestFileDto>,
+    pub bounds: AffectedAnalysisBoundsDto,
+    pub completeness: AffectedAnalysisCompletenessDto,
     #[serde(default)]
     pub blind_spots: Vec<String>,
     #[serde(default)]
-    pub next_commands: Vec<String>,
+    pub follow_ups: Vec<AffectedFollowUpDto>,
     #[serde(default)]
     pub notes: Vec<String>,
 }

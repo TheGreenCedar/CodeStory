@@ -1741,20 +1741,29 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             })),
         "affected JSON should expand changed files to symbols with graph evidence: {affected:#}"
     );
-    if let Some(tests) = affected["impacted_tests"].as_array()
-        && !tests.is_empty()
-    {
-        assert!(
-            tests.iter().all(|item| {
-                item["graph_depth"].is_number()
-                    && item["reason"]
-                        .as_str()
-                        .is_some_and(|reason| reason.contains("focused test hint"))
-                    && item["confidence"].is_string()
-            }),
-            "affected test hints should expose graph evidence and caveat language: {affected:#}"
-        );
-    }
+    let tests = affected["impacted_tests"]
+        .as_array()
+        .expect("affected impacted_tests array");
+    assert!(
+        tests.iter().any(|item| {
+            item["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("tests/app_controller_test.rs"))
+        }),
+        "the controlled AppController change should select its integration test: {affected:#}"
+    );
+    assert!(
+        tests.iter().all(|item| {
+            item["graph_depth"].is_number()
+                && item["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("focused test hint"))
+                && item["confidence"]
+                    .as_str()
+                    .is_some_and(|confidence| !confidence.is_empty())
+        }),
+        "affected test hints should expose graph evidence, confidence, and caveat language: {affected:#}"
+    );
 
     let affected_stdin = run_cli_with_stdin(
         workspace,
@@ -1807,7 +1816,7 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
 }
 
 #[test]
-fn affected_git_fallback_refreshes_stale_core_explicitly() {
+fn affected_git_fallback_distinguishes_stale_observation_from_explicit_refresh() {
     let workspace = tempdir().expect("workspace dir");
     let cache_dir = tempdir().expect("cache dir");
     write_tiny_rust_workspace(workspace.path());
@@ -1849,21 +1858,94 @@ pub fn changed_after_index() -> bool {
     )
     .expect("modify runtime fixture for git diff fallback");
 
-    let affected = run_cli_json(
+    let affected_git = run_cli_json(
         workspace.path(),
         cache_dir.path(),
-        &["affected", "--refresh", "incremental", "--format", "json"],
+        &["affected", "--refresh", "none", "--format", "json"],
     );
 
     assert!(
-        affected["changed_paths"]
+        affected_git["changed_paths"]
             .as_array()
             .expect("changed paths")
             .iter()
             .any(|path| path == "src/runtime.rs"),
-        "affected should default to git diff --name-only HEAD: {affected:#}"
+        "affected should default to git diff --name-only HEAD: {affected_git:#}"
     );
-    assert_eq!(affected["matched_file_count"], 1, "{affected:#}");
+    assert_eq!(
+        affected_git["completeness"]["complete"], false,
+        "a source change after publication must not produce a complete impact claim: {affected_git:#}"
+    );
+    assert!(
+        affected_git["uncovered_inputs"]
+            .as_array()
+            .is_some_and(|inputs| inputs.iter().any(|input| {
+                input["path"] == "src/runtime.rs" && input["classification"] == "stale_index"
+            })),
+        "the exact modified source should carry a stale-index classification: {affected_git:#}"
+    );
+    assert!(affected_git.get("next_commands").is_none());
+    assert!(
+        affected_git["follow_ups"]
+            .as_array()
+            .is_some_and(|follow_ups| follow_ups.iter().any(|follow_up| {
+                follow_up["action"] == "refresh_stale_index"
+                    && follow_up["invocation"]["program"] == "codestory-cli"
+                    && follow_up["invocation"]["args"]
+                        .as_array()
+                        .is_some_and(|args| {
+                            args.windows(2)
+                                .any(|pair| pair[0] == "--refresh" && pair[1] == "incremental")
+                        })
+            })),
+        "positive stale evidence should recommend the focused structured incremental repair: {affected_git:#}"
+    );
+    assert!(
+        !affected_git.to_string().contains("--refresh full")
+            && !affected_git.to_string().contains("doctor --project"),
+        "proven source drift should not emit generic full-refresh or doctor advice: {affected_git:#}"
+    );
+
+    let query = run_cli(
+        workspace,
+        cache_dir,
+        &[
+            "query",
+            "trail(symbol: 'AppController')",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !query.status.success(),
+        "ordinary graph queries must not inherit affected's stale-source admission"
+    );
+    let query_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&query.stdout),
+        String::from_utf8_lossy(&query.stderr)
+    );
+    assert!(
+        query_output.contains("graph requires a fresh complete core publication"),
+        "query must remain fail-closed on the stale source after affected observation: {query_output}"
+    );
+
+    let refreshed = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["affected", "--refresh", "incremental", "--format", "json"],
+    );
+    assert!(
+        refreshed["changed_paths"]
+            .as_array()
+            .expect("changed paths")
+            .iter()
+            .any(|path| path == "src/runtime.rs"),
+        "explicit incremental refresh should preserve git-diff input: {refreshed:#}"
+    );
+    assert_eq!(refreshed["matched_file_count"], 1, "{refreshed:#}");
 }
 
 fn run_git(workspace: &Path, args: &[&str]) {

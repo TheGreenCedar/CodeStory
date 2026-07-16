@@ -14,10 +14,11 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use codestory_contracts::api::{
-    AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAnswerDto,
-    AgentAskRequest, AgentCitationDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, ApiError, ApiErrorDetails,
-    AppEventPayload, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CommandFailureEnvelope,
+    AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
+    AffectedFollowUpInvocationDto, AgentAnswerDto, AgentAskRequest, AgentCitationDto,
+    AgentPacketDto, AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
+    AgentRetrievalProfileSelectionDto, ApiError, ApiErrorDetails, AppEventPayload,
+    BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, CommandFailureEnvelope,
     CreateBookmarkCategoryRequest, CreateBookmarkRequest, FrameworkRouteCoverageDto,
     GraphArtifactDto, GroundingBudgetDto, IndexFreshnessDto, IndexFreshnessStatusDto, IndexMode,
     IndexedFilesRequest, NodeId, NodeKind, NodeOccurrencesRequest, PacketBudgetModeDto,
@@ -1039,12 +1040,11 @@ fn run_ci_agent_smoke(project: &ProjectArgs) -> SmokeOutput {
     let start = Instant::now();
     let fake_path = "__codestory_smoke_fake_change__.rs";
     match runtime.browser.affected_analysis(AffectedAnalysisRequest {
-        changed_paths: vec![fake_path.to_string()],
-        change_records: vec![affected_path_record(
+        input: AffectedAnalysisInput::ChangeRecords(vec![affected_path_record(
             fake_path,
             AffectedChangeKindDto::Unknown,
             "smoke",
-        )],
+        )]),
         depth: Some(1),
         filter: None,
     }) {
@@ -5193,16 +5193,11 @@ fn run_affected(cmd: AffectedCommand) -> Result<()> {
     ensure_index_ready(&opened, "affected")?;
     let change_records =
         affected_change_records(&cmd).map_err(|error| affected_discovery_error(&cmd, error))?;
-    let changed_paths = change_records
-        .iter()
-        .map(|record| record.path.clone())
-        .collect::<Vec<_>>();
-    let operation = runtime.run_public_operation("graph", || {
+    let operation = runtime.run_observational_public_operation("affected", || {
         let output = runtime
             .browser
             .affected_analysis(AffectedAnalysisRequest {
-                changed_paths: changed_paths.clone(),
-                change_records: change_records.clone(),
+                input: AffectedAnalysisInput::ChangeRecords(change_records.clone()),
                 depth: Some(cmd.depth),
                 filter: cmd.filter.clone(),
             })
@@ -5646,6 +5641,27 @@ fn render_affected_summary(
         output.impacted_routes.len(),
         output.impacted_tests.len()
     );
+    let _ = writeln!(
+        markdown,
+        "- completeness: complete={} confidence={} direct={} propagated={} uncovered={} unavailable={} truncated={}",
+        output.completeness.complete,
+        output.completeness.confidence,
+        output.completeness.direct_impact_count,
+        output.completeness.propagated_impact_count,
+        output.completeness.uncovered_input_count,
+        output.completeness.unavailable_evidence_count,
+        output.completeness.truncated
+    );
+    let _ = writeln!(
+        markdown,
+        "- bounds: requested_depth={} maximum_depth={} visited_nodes={} visited_edges={} symbol_limit={} route_limit={}",
+        output.bounds.requested_depth,
+        output.bounds.maximum_depth,
+        output.bounds.visited_node_count,
+        output.bounds.visited_edge_count,
+        output.bounds.impacted_symbol_limit,
+        output.bounds.impacted_route_limit
+    );
     if !output.changed_paths.is_empty() {
         markdown.push_str("- changed paths:\n");
         for path in &output.changed_paths {
@@ -5706,7 +5722,7 @@ fn render_affected_matched_files(
     if !output.unmatched_paths.is_empty() {
         markdown.push_str("\nunmatched paths:\n");
         for path in &output.unmatched_paths {
-            let mut markers = Vec::new();
+            let mut markers = vec![format!("classification={:?}", path.classification)];
             if let Some(kind) = path.change_kind.as_ref() {
                 markers.push(format!("change={kind:?}"));
             }
@@ -5815,6 +5831,18 @@ fn render_affected_symbols(
     }
 }
 
+fn render_affected_invocation(invocation: &AffectedFollowUpInvocationDto) -> String {
+    std::iter::once(invocation.program.clone())
+        .chain(
+            invocation
+                .args
+                .iter()
+                .map(|arg| quote_command_argument_value(arg)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_affected_footer(
     markdown: &mut String,
     output: &codestory_contracts::api::AffectedAnalysisDto,
@@ -5825,10 +5853,20 @@ fn render_affected_footer(
             let _ = writeln!(markdown, "- {blind_spot}");
         }
     }
-    if !output.next_commands.is_empty() {
-        markdown.push_str("\nnext_commands:\n");
-        for command in &output.next_commands {
-            let _ = writeln!(markdown, "- `{command}`");
+    if !output.follow_ups.is_empty() {
+        markdown.push_str("\nfollow-ups:\n");
+        for follow_up in &output.follow_ups {
+            let invocation = follow_up
+                .invocation
+                .as_ref()
+                .map(render_affected_invocation)
+                .map(|invocation| format!(" invocation=`{invocation}`"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                markdown,
+                "- {} [{}]: {}{}",
+                follow_up.action, follow_up.confidence, follow_up.reason, invocation
+            );
         }
     }
 }
@@ -10104,6 +10142,26 @@ mod tests {
             "'C:/repo/quoted\"path'"
         );
         assert_eq!(quote_command_path(Path::new("C:/repo")), "\"C:/repo\"");
+    }
+
+    #[test]
+    fn affected_structured_invocation_is_quoted_only_when_cli_renders_it() {
+        let invocation = AffectedFollowUpInvocationDto {
+            program: "codestory-cli".to_string(),
+            args: vec![
+                "files".to_string(),
+                "--project".to_string(),
+                "C:/repo/$hidden".to_string(),
+                "--path".to_string(),
+                "src/quoted'file.rs".to_string(),
+            ],
+        };
+
+        let rendered = render_affected_invocation(&invocation);
+        assert!(rendered.starts_with("codestory-cli "));
+        assert!(rendered.contains(&quote_command_argument_value("C:/repo/$hidden")));
+        assert!(rendered.contains(&quote_command_argument_value("src/quoted'file.rs")));
+        assert!(!rendered.contains("{program}"));
     }
 
     #[test]

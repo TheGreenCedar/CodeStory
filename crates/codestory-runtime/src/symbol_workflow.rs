@@ -2,10 +2,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use codestory_contracts::api::{
-    AffectedAnalysisDto, AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto,
-    ApiError, EdgeKind, GraphNodeDto, LayoutDirection, NodeId, NodeOccurrencesRequest,
-    SourceOccurrenceDto, SymbolContextDto, TrailCallerScope, TrailConfigDto, TrailContextDto,
-    TrailDirection, TrailMode,
+    AffectedAnalysisDto, AffectedAnalysisInput, AffectedAnalysisRequest, AffectedChangeKindDto,
+    AffectedChangeRecordDto, ApiError, EdgeKind, GraphNodeDto, LayoutDirection, NodeId,
+    NodeOccurrencesRequest, SourceOccurrenceDto, SymbolContextDto, TrailCallerScope,
+    TrailConfigDto, TrailContextDto, TrailDirection, TrailMode,
 };
 use serde::Serialize;
 
@@ -171,13 +171,12 @@ impl AppController {
             .as_ref()
             .map(|path| {
                 self.affected_analysis(AffectedAnalysisRequest {
-                    changed_paths: vec![path.clone()],
-                    change_records: vec![AffectedChangeRecordDto {
+                    input: AffectedAnalysisInput::ChangeRecords(vec![AffectedChangeRecordDto {
                         path: path.clone(),
                         kind: AffectedChangeKindDto::Unknown,
                         status: "symbol_file".to_string(),
                         previous_path: None,
-                    }],
+                    }]),
                     depth: Some(depth),
                     filter: None,
                 })

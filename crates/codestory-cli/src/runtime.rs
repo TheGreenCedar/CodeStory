@@ -317,6 +317,36 @@ impl RuntimeContext {
         }
     }
 
+    /// Pin one complete publication without requiring current source
+    /// freshness. This is reserved for surfaces such as `affected` whose job
+    /// is to explain drift from that publication.
+    pub(crate) fn run_observational_public_operation<T>(
+        &self,
+        operation: &str,
+        mut build: impl FnMut() -> Result<T>,
+    ) -> Result<PublicOperation<T>> {
+        let mut build_error = None;
+        let result = self.public_operation.run_observational_with_cancel(
+            operation,
+            Arc::new(AtomicBool::new(false)),
+            || match build() {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    let message = error.to_string();
+                    build_error = Some(error);
+                    Err(ApiError::new("cli_public_operation_failed", message))
+                }
+            },
+        );
+        match result {
+            Ok(operation) => Ok(operation),
+            Err(error) if error.code == "cli_public_operation_failed" => {
+                Err(build_error.expect("CLI operation error was retained"))
+            }
+            Err(error) => Err(map_api_error_for_project(error, &self.project_root)),
+        }
+    }
+
     pub(crate) fn active_project_summary(&self) -> Result<ProjectSummary> {
         self.public_operation
             .active_project_summary()
@@ -1296,6 +1326,113 @@ mod tests {
 
         assert_eq!(attempts, 2, "only the complete response may be retried");
         assert_eq!(served_generation, current_generation);
+    }
+
+    #[test]
+    fn observational_cli_response_allows_stale_source_and_retries_one_core_swap() {
+        let _env_lock = crate::config::config_env_test_lock();
+        let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
+        let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
+        unsafe {
+            env::set_var("CODESTORY_EMBED_ALLOW_CPU", "1");
+        }
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(project.join("src")).expect("create source dir");
+        fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"observational-publication-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write manifest");
+        let source = project.join("src/lib.rs");
+        fs::write(&source, "pub fn pinned_symbol() -> u32 { 1 }\n").expect("write source");
+        let args = ProjectArgs {
+            project: project.clone(),
+            cache_dir: Some(cache),
+        };
+        let reader = RuntimeContext::new_inspect_only(&args).expect("reader runtime");
+        reader
+            .ensure_open(RefreshMode::Full)
+            .expect("publish initial core generation");
+        let publisher = RuntimeContext::new_inspect_only(&args).expect("publisher runtime");
+        publisher
+            .open_project_summary()
+            .expect("bind publisher to existing project");
+
+        fs::write(&source, "pub fn pinned_symbol() -> u32 { 2 }\n")
+            .expect("make initial publication stale");
+        let mut attempts = 0_u32;
+        let operation = reader
+            .run_observational_public_operation("affected", || {
+                attempts += 1;
+                let pinned = reader
+                    .public_operation
+                    .active_publication()
+                    .expect("observational response has a core pin")
+                    .core_publication
+                    .generation;
+                if attempts == 1 {
+                    fs::write(&source, "pub fn pinned_symbol() -> u32 { 3 }\n")
+                        .expect("change source during response construction");
+                    publisher
+                        .ensure_open(RefreshMode::Full)
+                        .expect("publish replacement generation during response construction");
+                }
+                Ok(pinned)
+            })
+            .expect("observational response should retry one core replacement");
+        let current_generation = publisher
+            .project
+            .complete_index_publication_at(&publisher.storage_path)
+            .expect("read current publication")
+            .expect("current publication")
+            .generation;
+
+        assert_eq!(attempts, 2);
+        assert_eq!(operation.attempt, 2);
+        assert_eq!(operation.value, current_generation);
+
+        let mut churn_attempts = 0_u32;
+        let error = reader
+            .run_observational_public_operation("affected", || {
+                churn_attempts += 1;
+                let pinned = reader
+                    .public_operation
+                    .active_publication()
+                    .expect("churning response has a core pin")
+                    .core_publication
+                    .generation;
+                fs::write(
+                    &source,
+                    format!(
+                        "pub fn pinned_symbol() -> u32 {{ {} }}\n",
+                        churn_attempts + 3
+                    ),
+                )
+                .expect("change source during every attempt");
+                publisher
+                    .ensure_open(RefreshMode::Full)
+                    .expect("publish a replacement during every attempt");
+                Ok(pinned)
+            })
+            .expect_err("repeated core churn must exhaust the bounded retry");
+        assert_eq!(churn_attempts, 2);
+        assert!(error.to_string().contains("publication_changed"));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_build = Arc::clone(&cancelled);
+        let mut built = false;
+        let error = reader
+            .public_operation
+            .run_observational_with_cancel("affected", cancelled, || {
+                built = true;
+                cancelled_for_build.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })
+            .expect_err("cancellation during observational construction must discard the value");
+        assert_eq!(error.code, "cancelled");
+        assert!(built);
     }
 
     #[test]

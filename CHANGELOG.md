@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make `affected` validate one bounded MCP path input before activation, resolve paths by native identity, classify excluded and stale paths from one complete workspace inventory, preserve rename/delete evidence, propagate result caps into completeness, and recommend refresh only when a requested path has exact stale evidence.
+
 ### Changed
 
 - Affected analysis now resolves native workspace path identities once per
