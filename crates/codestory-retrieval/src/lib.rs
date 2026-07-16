@@ -52,6 +52,8 @@ pub use config::{
 pub use config::{
     active_test_cache_root, enable_automatic_test_cache_root_for_process, with_test_cache_root,
 };
+#[cfg(feature = "test-support")]
+pub use embeddings::TEST_EMBEDDING_UNAVAILABLE_MARKER;
 pub use embeddings::{
     CODERANK_EMBED_Q8_GGUF, CODERANK_QUERY_PREFIX_DEFAULT, EmbeddingAcceleratorSmoke,
     EmbeddingDeviceReadiness, EmbeddingRuntimeProbe, InProcessEmbeddingClient,
@@ -78,7 +80,9 @@ pub use in_process_embedding::{
 };
 pub use index::{
     FinalizeIndexOutcome, finalize_index, finalize_index_for_runtime,
-    finalize_index_for_runtime_with_progress, project_id_for_root, sidecar_project_id_for_root,
+    finalize_index_for_runtime_with_cancel, finalize_index_for_runtime_with_progress,
+    finalize_index_for_runtime_with_progress_and_cancel, project_id_for_root,
+    sidecar_project_id_for_root,
 };
 pub use inventory::{
     SidecarGcReport, SidecarInventoryReport, sidecar_gc_apply_with_storage,
@@ -93,10 +97,11 @@ pub use process_identity::{
     ProcessOwnerState, ProcessStartProbe, probe_process_start_identity, process_owner_state,
 };
 pub use query::{
-    QueryBatchItem, QueryBatchRequest, QueryRequest, execute_retrieval_query,
+    PinnedQuerySession, QueryBatchItem, QueryBatchRequest, QueryRequest,
+    RETRIEVAL_PUBLICATION_CHANGED_CODE, RetrievalPublicationChanged, execute_retrieval_query,
     execute_retrieval_query_with_cache, execute_retrieval_query_with_cache_for_runtime,
     execute_strict_retrieval_query_batch_with_cache,
-    execute_strict_retrieval_query_batch_with_cache_for_runtime,
+    execute_strict_retrieval_query_batch_with_cache_for_runtime, is_retrieval_publication_changed,
     retrieval_publication_identity_from_storage,
 };
 pub use query_features::{QueryFeatures, QueryShape, classify_query};

@@ -14,6 +14,14 @@ impl CancellationToken {
         }
     }
 
+    /// Use an existing shared flag as this token's cancellation source.
+    ///
+    /// Runtime adapters use this to bridge host-owned request cancellation
+    /// without exposing indexer types to the host or CLI layer.
+    pub fn from_shared_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+
     /// Signal cancellation.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);

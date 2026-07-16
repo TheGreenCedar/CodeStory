@@ -5080,6 +5080,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "packet-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8067,6 +8068,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "generic-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8276,6 +8278,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "exec-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8359,6 +8362,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "source-definition-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8433,6 +8437,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "indexing-storage-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8636,6 +8641,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "indexing-storage-production-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8709,6 +8715,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "vscode-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8776,6 +8783,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "payload-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8826,6 +8834,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "payload-rank-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8873,6 +8882,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8922,6 +8932,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-test-symbols".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8973,6 +8984,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-roles".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -9009,6 +9021,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "rank-docs".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -10395,6 +10408,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
                 request_id: "packet-fixture".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,

@@ -5,24 +5,25 @@ use crate::agent::packet_evidence::decorate_search_hit_evidence;
 use crate::{AppController, HybridSearchScoredHit};
 use anyhow::Error as AnyhowError;
 use codestory_contracts::api::{
-    ApiError, PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
+    AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto,
+    PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
     RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStageTimingDto, SearchHit,
+    RetrievalStageTimingDto, SearchHit, SearchResultsDto,
 };
 use codestory_contracts::graph::{NodeId as CoreNodeId, NodeKind};
 #[cfg(test)]
 use codestory_retrieval::SidecarRuntimeConfig;
 use codestory_retrieval::{
-    CandidateHit, CandidateSource, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionLock,
-    QueryBatchItem, QueryBatchRequest, QueryRequest, QueryResult, QueryTrace,
-    RetrievalPublicationIdentity, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
-    execute_strict_retrieval_query_batch_with_cache_for_runtime, global_generation_gc_state_file,
-    is_phantom_sidecar_hit, retrieval_publication_identity_from_storage,
-    sidecar_project_id_for_root, strict_sidecar_status_for_runtime,
+    CandidateHit, CandidateSource, PinnedQuerySession, QueryBatchItem, QueryRequest, QueryResult,
+    QueryTrace, SidecarProfile, execute_retrieval_query_with_cache_for_runtime,
+    is_phantom_sidecar_hit, is_retrieval_publication_changed, sidecar_project_id_for_root,
+    strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 const DEFAULT_SIDECAR_BUDGET_MS: u64 = 1_500;
@@ -37,83 +38,123 @@ const RETRIEVAL_ENV: &str = "CODESTORY_RETRIEVAL";
 const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
 
 struct PinnedRetrievalRead {
-    storage: Store,
+    session: PinnedQuerySession,
     project_root: PathBuf,
-    storage_path: PathBuf,
-    project_id: String,
-    identity: RetrievalPublicationIdentity,
     node_names: HashMap<CoreNodeId, String>,
-    _global_generation_lease: GenerationRetentionLock,
-    _project_generation_lease: GenerationRetentionLock,
+}
+
+thread_local! {
+    /// The complete public operation owns one pin. Lower-level query adapters borrow it so packet
+    /// subqueries cannot silently open a different retrieval generation during the same response.
+    static ACTIVE_PINNED_RETRIEVAL_READ: RefCell<Option<(usize, Rc<PinnedRetrievalRead>)>> =
+        const { RefCell::new(None) };
+}
+
+fn controller_identity(controller: &AppController) -> usize {
+    std::ptr::from_ref(controller).addr()
+}
+
+fn active_pinned_retrieval_read(controller: &AppController) -> Option<Rc<PinnedRetrievalRead>> {
+    let controller_identity = controller_identity(controller);
+    ACTIVE_PINNED_RETRIEVAL_READ.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .filter(|(active_controller, _)| *active_controller == controller_identity)
+            .map(|(_, pinned)| Rc::clone(pinned))
+    })
+}
+
+struct ActivePinnedRetrievalReadGuard {
+    previous: Option<(usize, Rc<PinnedRetrievalRead>)>,
+}
+
+impl Drop for ActivePinnedRetrievalReadGuard {
+    fn drop(&mut self) {
+        ACTIVE_PINNED_RETRIEVAL_READ.with(|active| {
+            active.replace(self.previous.take());
+        });
+    }
+}
+
+fn with_active_pinned_retrieval_read<T>(
+    controller: &AppController,
+    pinned: Rc<PinnedRetrievalRead>,
+    build: impl FnOnce() -> T,
+) -> T {
+    let previous = ACTIVE_PINNED_RETRIEVAL_READ
+        .with(|active| active.replace(Some((controller_identity(controller), pinned))));
+    let _guard = ActivePinnedRetrievalReadGuard { previous };
+    build()
+}
+
+pub(crate) trait RetrievalPublicationResponse {
+    fn attach_retrieval_publication(&mut self, publication: EmbeddingVectorPublicationIdentityDto);
+}
+
+impl RetrievalPublicationResponse for SearchResultsDto {
+    fn attach_retrieval_publication(&mut self, publication: EmbeddingVectorPublicationIdentityDto) {
+        self.retrieval_publication = Some(publication);
+    }
+}
+
+impl RetrievalPublicationResponse for AgentAnswerDto {
+    fn attach_retrieval_publication(&mut self, publication: EmbeddingVectorPublicationIdentityDto) {
+        self.retrieval_trace.retrieval_publication = Some(publication);
+    }
+}
+
+impl RetrievalPublicationResponse for AgentPacketDto {
+    fn attach_retrieval_publication(&mut self, publication: EmbeddingVectorPublicationIdentityDto) {
+        self.answer.retrieval_trace.retrieval_publication = Some(publication.clone());
+        self.retrieval_trace_summary
+            .retrieval_trace
+            .retrieval_publication = Some(publication);
+    }
+}
+
+fn publication_dto(pinned: &PinnedRetrievalRead) -> EmbeddingVectorPublicationIdentityDto {
+    let publication = pinned.session.publication_identity();
+    EmbeddingVectorPublicationIdentityDto {
+        core_generation_id: publication.core_generation_id.clone(),
+        core_run_id: publication.core_run_id.clone(),
+        retrieval_generation: publication.sidecar_generation.clone(),
+        retrieval_input_hash: publication.sidecar_input_hash.clone(),
+        semantic_generation: publication.semantic_generation.clone(),
+    }
 }
 
 impl PinnedRetrievalRead {
     fn begin(controller: &AppController) -> Result<Self, ApiError> {
         let project_root = controller.require_project_root()?;
         let storage_path = controller.require_storage_path()?;
-        let project_id = sidecar_project_id_for_root(&project_root);
-        let global_generation_lease = GenerationRetentionLock::acquire_shared(
-            &global_generation_gc_state_file(&controller.runtime_config),
-            GLOBAL_GENERATION_GC_LOCK_SCOPE,
-        )
-        .map_err(|error| ApiError::new("cache_busy", format!("pin sidecar generation: {error}")))?;
-        let project_generation_lease = GenerationRetentionLock::acquire_shared(
-            &controller.runtime_config.layout.state_file,
-            &project_id,
-        )
-        .map_err(|error| {
-            ApiError::new(
-                "cache_busy",
-                format!("pin project sidecar generation: {error}"),
-            )
-        })?;
-        let storage = Store::open_read_only(&storage_path).map_err(|error| {
-            ApiError::internal(format!("open pinned retrieval storage: {error}"))
-        })?;
-        storage
-            .get_connection()
-            .execute_batch("BEGIN DEFERRED TRANSACTION")
-            .map_err(|error| {
-                ApiError::new(
-                    "cache_busy",
-                    format!("pin core retrieval snapshot: {error}"),
-                )
-            })?;
-        let identity = retrieval_publication_identity_from_storage(&storage, &project_id).map_err(
-            |error| ApiError::new("cache_busy", format!("pin retrieval publication: {error}")),
-        )?;
-        let node_names = crate::load_search_symbol_projection(&storage, 10_000)?.0;
+        let session =
+            PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
+                .map_err(map_pinned_query_error)?;
+        let node_names = crate::load_search_symbol_projection(session.storage(), 10_000)?.0;
         Ok(Self {
-            storage,
+            session,
             project_root,
-            storage_path,
-            project_id,
-            identity,
             node_names,
-            _global_generation_lease: global_generation_lease,
-            _project_generation_lease: project_generation_lease,
         })
     }
 
-    fn matches_query(&self, query: &QueryResult) -> bool {
-        query.publication_identity.as_ref() == Some(&self.identity)
+    fn ensure_query_identity(&self, query: &QueryResult, operation: &str) -> Result<(), ApiError> {
+        self.session
+            .ensure_result_identity(query, operation)
+            .map_err(map_pinned_query_error)
     }
 
     fn revalidate(&self) -> Result<(), ApiError> {
-        let identity = read_retrieval_publication_identity(&self.storage_path, &self.project_id)?;
-        if identity != self.identity {
-            return Err(ApiError::new(
-                "cache_busy",
-                "retrieval publication changed while resolving candidates; retry",
-            ));
-        }
-        Ok(())
+        self.session.revalidate().map_err(map_pinned_query_error)
     }
 }
 
-impl Drop for PinnedRetrievalRead {
-    fn drop(&mut self) {
-        let _ = self.storage.get_connection().execute_batch("ROLLBACK");
+fn map_pinned_query_error(error: AnyhowError) -> ApiError {
+    if is_retrieval_publication_changed(&error) {
+        ApiError::new("publication_changed", error.to_string())
+    } else {
+        ApiError::new("cache_busy", error.to_string())
     }
 }
 
@@ -121,51 +162,16 @@ fn with_pinned_retrieval_read<T>(
     controller: &AppController,
     read: impl FnOnce(&PinnedRetrievalRead) -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
+    if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        return read(&pinned);
+    }
     let pinned = PinnedRetrievalRead::begin(controller)?;
     let value = read(&pinned)?;
     pinned.revalidate()?;
     Ok(value)
 }
 
-fn read_retrieval_publication_identity(
-    storage_path: &Path,
-    project_id: &str,
-) -> Result<RetrievalPublicationIdentity, ApiError> {
-    let storage = Store::open_read_only(storage_path).map_err(|error| {
-        ApiError::new("cache_busy", format!("open retrieval publication: {error}"))
-    })?;
-    let snapshot = storage.read_snapshot().map_err(|error| {
-        ApiError::new(
-            "cache_busy",
-            format!("pin retrieval publication identity: {error}"),
-        )
-    })?;
-    let identity = retrieval_publication_identity_from_storage(snapshot.storage(), project_id)
-        .map_err(|error| {
-            ApiError::new(
-                "cache_busy",
-                format!("read retrieval publication identity: {error}"),
-            )
-        })?;
-    snapshot.finish().map_err(|error| {
-        ApiError::new(
-            "cache_busy",
-            format!("finish retrieval publication identity: {error}"),
-        )
-    })?;
-    Ok(identity)
-}
-
-pub(crate) fn current_retrieval_publication_identity(
-    controller: &AppController,
-) -> Result<RetrievalPublicationIdentity, ApiError> {
-    let project_root = controller.require_project_root()?;
-    let storage_path = controller.require_storage_path()?;
-    let project_id = sidecar_project_id_for_root(&project_root);
-    read_retrieval_publication_identity(&storage_path, &project_id)
-}
-
-pub(crate) fn with_stable_retrieval_publication<T>(
+pub(crate) fn with_stable_retrieval_publication<T: RetrievalPublicationResponse>(
     controller: &AppController,
     operation: &str,
     mut build: impl FnMut() -> Result<T, ApiError>,
@@ -173,21 +179,37 @@ pub(crate) fn with_stable_retrieval_publication<T>(
     if !sidecar_retrieval_primary_enabled(controller) {
         return build();
     }
+    if active_pinned_retrieval_read(controller).is_some() {
+        return build();
+    }
+    with_stable_retrieval_publication_inner(controller, operation, build, |_| Ok(()))
+}
+
+fn with_stable_retrieval_publication_inner<T: RetrievalPublicationResponse>(
+    controller: &AppController,
+    operation: &str,
+    mut build: impl FnMut() -> Result<T, ApiError>,
+    mut after_retry: impl FnMut(usize) -> Result<(), ApiError>,
+) -> Result<T, ApiError> {
     for attempt in 0..RETRIEVAL_PUBLICATION_ATTEMPTS {
-        let result = (|| {
-            let before = current_retrieval_publication_identity(controller)?;
-            let output = build()?;
-            if before != current_retrieval_publication_identity(controller)? {
-                return Err(ApiError::new(
-                    "cache_busy",
-                    format!("retrieval publication changed while building {operation}; retry"),
-                ));
-            }
-            Ok(output)
-        })();
+        let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
+        let publication = publication_dto(&pinned);
+        let result = with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
+            build().and_then(|mut response| {
+                response.attach_retrieval_publication(publication.clone());
+                pinned.revalidate()?;
+                Ok(response)
+            })
+        });
         match result {
             Err(error)
-                if error.code == "cache_busy" && attempt + 1 < RETRIEVAL_PUBLICATION_ATTEMPTS => {}
+                if error.code == "publication_changed"
+                    && attempt + 1 < RETRIEVAL_PUBLICATION_ATTEMPTS =>
+            {
+                tracing::debug!(operation, "retrying complete pinned retrieval operation");
+                drop(pinned);
+                after_retry(attempt + 1)?;
+            }
             result => return result,
         }
     }
@@ -552,53 +574,19 @@ pub(crate) fn run_and_resolve_sidecar_query(
     latency_budget_ms: Option<u32>,
 ) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
     with_pinned_retrieval_read(controller, |pinned| {
-        let query_result =
-            run_sidecar_query(controller, query, latency_budget_ms).map_err(|error| {
-                sidecar_retrieval_unavailable_error(
-                    controller,
-                    format!("sidecar retrieval query failed: {error}"),
-                )
-            })?;
-        if !pinned.matches_query(&query_result) {
-            return Err(ApiError::new(
-                "cache_busy",
-                "sidecar query and core publications differ",
-            ));
-        }
+        let query_result = with_detached_sidecar_query_cache(controller, |cache| {
+            pinned.session.execute_with_cache(
+                query,
+                Some(sidecar_budget_ms(latency_budget_ms)),
+                None,
+                cache,
+            )
+        })
+        .map_err(map_pinned_query_error)?;
+        pinned.ensure_query_identity(&query_result, "resolving sidecar candidates")?;
         let resolution =
             resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)?;
         Ok((query_result, resolution))
-    })
-}
-
-pub(crate) fn run_sidecar_query_batch(
-    controller: &AppController,
-    queries: &[(String, u64)],
-) -> Result<Vec<QueryResult>, AnyhowError> {
-    let project_root = controller
-        .require_project_root()
-        .map_err(|error| anyhow::anyhow!("project root required: {}", error.message))?;
-    let storage_path = controller
-        .require_storage_path()
-        .map_err(|error| anyhow::anyhow!("storage path required: {}", error.message))?;
-    let batch_items = queries
-        .iter()
-        .map(|(query, budget_ms)| QueryBatchItem {
-            query,
-            budget_ms: Some(*budget_ms),
-        })
-        .collect::<Vec<_>>();
-    with_detached_sidecar_query_cache(controller, |cache| {
-        execute_strict_retrieval_query_batch_with_cache_for_runtime(
-            QueryBatchRequest {
-                project_root: &project_root,
-                storage_path: &storage_path,
-                queries: &batch_items,
-                cancelled: None,
-            },
-            cache,
-            &controller.runtime_config,
-        )
     })
 }
 
@@ -654,6 +642,16 @@ pub(crate) enum SidecarPrimarySearchOutcome {
     },
 }
 
+fn sidecar_primary_error_outcome(error: ApiError) -> SidecarPrimarySearchOutcome {
+    if matches!(error.code.as_str(), "cache_busy" | "publication_changed") {
+        SidecarPrimarySearchOutcome::Retryable { error }
+    } else {
+        SidecarPrimarySearchOutcome::Unavailable {
+            reason: format!("retrieval unavailable: {}", error.message),
+        }
+    }
+}
+
 pub(crate) fn try_sidecar_primary_search(
     controller: &AppController,
     prompt: &str,
@@ -670,12 +668,7 @@ pub(crate) fn try_sidecar_primary_search(
             query_result,
             resolution,
         )),
-        Err(error) if error.code == "cache_busy" => {
-            Some(SidecarPrimarySearchOutcome::Retryable { error })
-        }
-        Err(error) => Some(SidecarPrimarySearchOutcome::Unavailable {
-            reason: format!("retrieval unavailable: {}", error.message),
-        }),
+        Err(error) => Some(sidecar_primary_error_outcome(error)),
     }
 }
 
@@ -829,21 +822,21 @@ fn search_sidecar_packet_batch_inner(
         .collect::<Vec<_>>();
     with_pinned_retrieval_read(controller, |pinned| {
         let batch_started_at = Instant::now();
-        let query_results =
-            run_sidecar_query_batch(controller, &batch_queries).map_err(|error| {
-                sidecar_retrieval_unavailable_error(
-                    controller,
-                    format!("sidecar retrieval batch query failed: {error}"),
-                )
-            })?;
-        if query_results
+        let batch_items = batch_queries
             .iter()
-            .any(|result| !pinned.matches_query(result))
-        {
-            return Err(ApiError::new(
-                "cache_busy",
-                "sidecar retrieval batch and core publications differ",
-            ));
+            .map(|(query, budget_ms)| QueryBatchItem {
+                query,
+                budget_ms: Some(*budget_ms),
+            })
+            .collect::<Vec<_>>();
+        let query_results = with_detached_sidecar_query_cache(controller, |cache| {
+            pinned
+                .session
+                .execute_batch_with_cache(&batch_items, None, cache)
+        })
+        .map_err(map_pinned_query_error)?;
+        for result in &query_results {
+            pinned.ensure_query_identity(result, "resolving sidecar packet batch")?;
         }
         build_sidecar_packet_batch_outcome(
             controller,
@@ -1711,7 +1704,7 @@ fn resolve_sidecar_candidates_in_read(
     max_results: usize,
 ) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
     resolve_sidecar_candidates_in_storage(
-        &pinned.storage,
+        pinned.session.storage(),
         &pinned.node_names,
         &pinned.project_root,
         candidates,
@@ -1864,8 +1857,71 @@ mod tests {
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalCacheKey, RetrievalStageKind, StageTrace,
         classify_query, project_id_for_root, rank_candidates,
-        test_support::retrieval_manifest_fixture,
+        test_support::{publish_zero_dense_pinned_query_fixture, retrieval_manifest_fixture},
     };
+
+    #[derive(Debug, Default)]
+    struct TestPublicationResponse {
+        publication: Option<EmbeddingVectorPublicationIdentityDto>,
+    }
+
+    impl RetrievalPublicationResponse for TestPublicationResponse {
+        fn attach_retrieval_publication(
+            &mut self,
+            publication: EmbeddingVectorPublicationIdentityDto,
+        ) {
+            self.publication = Some(publication);
+        }
+    }
+
+    struct PinnedOperationFixture {
+        _project: tempfile::TempDir,
+        _storage: tempfile::TempDir,
+        _retrieval_cache: tempfile::TempDir,
+        storage_path: PathBuf,
+        controller: AppController,
+    }
+
+    fn pinned_operation_fixture() -> PinnedOperationFixture {
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
+        let storage_path = storage.path().join("codestory.db");
+        let store = Store::open(&storage_path).expect("open storage");
+        store
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "run-one".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("publish initial core generation");
+        drop(store);
+        let runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                codestory_retrieval::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish strict retrieval fixture");
+        let controller = AppController::new_with_config(runtime);
+        {
+            let mut state = controller.state.lock();
+            state.project_root = Some(project.path().to_path_buf());
+            state.storage_path = Some(storage_path.clone());
+        }
+        PinnedOperationFixture {
+            _project: project,
+            _storage: storage,
+            _retrieval_cache: retrieval_cache,
+            storage_path,
+            controller,
+        }
+    }
 
     fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::process_env_test_lock()
@@ -1918,6 +1974,116 @@ mod tests {
         assert!(!env_flag_enabled("0"));
         assert!(env_flag_disabled("off"));
         assert!(!env_flag_disabled("yes"));
+    }
+
+    #[test]
+    fn complete_operation_retries_drift_and_traces_the_retried_publication() {
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+
+        let fixture = pinned_operation_fixture();
+        let mut build_calls = 0usize;
+        let mut retry_calls = 0usize;
+        let response = with_stable_retrieval_publication_inner(
+            &fixture.controller,
+            "test response",
+            || {
+                build_calls += 1;
+                assert!(
+                    active_pinned_retrieval_read(&fixture.controller).is_some(),
+                    "response assembly must retain the operation pin"
+                );
+                if build_calls == 1 {
+                    let writer = Store::open(&fixture.storage_path).expect("open drift writer");
+                    writer
+                        .put_index_publication(&IndexPublicationRecord {
+                            generation: 2,
+                            generation_id: "22222222-2222-4222-8222-222222222222".into(),
+                            run_id: "run-two".into(),
+                            mode: IndexPublicationMode::Full,
+                            published_at_epoch_ms: 2,
+                        })
+                        .expect("publish concurrent core generation");
+                }
+                Ok(TestPublicationResponse::default())
+            },
+            |_| {
+                retry_calls += 1;
+                publish_zero_dense_pinned_query_fixture(
+                    fixture.controller.require_project_root()?.as_path(),
+                    &fixture.storage_path,
+                    &fixture.controller.runtime_config,
+                )
+                .map(|_| ())
+                .map_err(|error| ApiError::internal(format!("repair retry fixture: {error}")))
+            },
+        )
+        .expect("second complete attempt should succeed");
+
+        assert_eq!(build_calls, 2);
+        assert_eq!(retry_calls, 1);
+        let publication = response.publication.expect("response publication metadata");
+        assert_eq!(
+            publication.core_generation_id,
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert_eq!(publication.core_run_id, "run-two");
+        assert!(!publication.retrieval_generation.is_empty());
+        assert!(!publication.retrieval_input_hash.is_empty());
+        assert!(!publication.semantic_generation.is_empty());
+        assert!(active_pinned_retrieval_read(&fixture.controller).is_none());
+    }
+
+    #[test]
+    fn cancelled_complete_operation_releases_active_and_retention_pins() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let fixture = pinned_operation_fixture();
+        let error = with_stable_retrieval_publication_inner(
+            &fixture.controller,
+            "cancelled response",
+            || Err::<TestPublicationResponse, _>(ApiError::new("cancelled", "request cancelled")),
+            |_| Ok(()),
+        )
+        .expect_err("cancellation must leave the operation");
+        assert_eq!(error.code, "cancelled");
+        assert!(active_pinned_retrieval_read(&fixture.controller).is_none());
+
+        let project_id = sidecar_project_id_for_root(
+            fixture
+                .controller
+                .require_project_root()
+                .expect("project root")
+                .as_path(),
+        );
+        let state_file = fixture.controller.runtime_config.layout.state_file.clone();
+        let (sender, receiver) = mpsc::channel();
+        let probe = std::thread::spawn(move || {
+            let result =
+                codestory_retrieval::GenerationRetentionLock::acquire(&state_file, &project_id)
+                    .map(drop)
+                    .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancelled response must release the query generation lease")
+            .expect("acquire exclusive generation lease after cancellation");
+        probe.join().expect("retention probe thread");
+    }
+
+    #[test]
+    fn agent_adapter_preserves_publication_changed_for_operation_retry() {
+        match sidecar_primary_error_outcome(ApiError::new(
+            "publication_changed",
+            "generation drift",
+        )) {
+            SidecarPrimarySearchOutcome::Retryable { error } => {
+                assert_eq!(error.code, "publication_changed");
+                assert_eq!(error.message, "generation drift");
+            }
+            _ => panic!("publication drift must remain retryable"),
+        }
     }
 
     #[test]
@@ -2848,9 +3014,9 @@ mod tests {
         std::fs::create_dir_all(source_path.parent().expect("source parent"))
             .expect("create source parent");
         std::fs::write(&source_path, "fn original() {}\n").expect("write source");
-        let storage_path = project.path().join("cache/codestory.db");
-        std::fs::create_dir_all(storage_path.parent().expect("storage parent"))
-            .expect("create storage parent");
+        let storage_dir = tempfile::tempdir().expect("storage");
+        let retrieval_cache = tempfile::tempdir().expect("retrieval cache");
+        let storage_path = storage_dir.path().join("codestory.db");
         let project_id = sidecar_project_id_for_root(project.path());
 
         let mut storage = Store::open(&storage_path).expect("open storage");
@@ -2896,13 +3062,18 @@ mod tests {
                 published_at_epoch_ms: 1,
             })
             .expect("publish first identity");
-        let first_manifest = retrieval_manifest_fixture(&project_id, "first");
-        storage
-            .upsert_retrieval_index_manifest(&first_manifest)
-            .expect("publish first manifest");
         drop(storage);
 
-        let controller = AppController::new();
+        let runtime = codestory_retrieval::with_test_cache_root(retrieval_cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                codestory_retrieval::SidecarProfile::Local,
+            )
+        });
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("publish strict first retrieval generation");
+
+        let controller = AppController::new_with_config(runtime);
         {
             let mut state = controller.state.lock();
             state.project_root = Some(project.path().to_path_buf());
@@ -2951,7 +3122,7 @@ mod tests {
         let error = pinned
             .revalidate()
             .expect_err("publication drift must reject the result");
-        assert_eq!(error.code, "cache_busy");
+        assert_eq!(error.code, "publication_changed");
     }
 
     fn git_project() -> Option<tempfile::TempDir> {

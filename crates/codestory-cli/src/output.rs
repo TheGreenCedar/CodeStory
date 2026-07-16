@@ -4172,6 +4172,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "request-1".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 15,
@@ -4505,6 +4506,7 @@ mod tests {
             graphs: Vec::new(),
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "request-low".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Investigate,
                 policy_mode: AgentRetrievalPolicyModeDto::CompletenessFirst,
                 total_latency_ms: 650,

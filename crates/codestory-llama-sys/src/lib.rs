@@ -26,7 +26,69 @@ use thiserror::Error;
 include!(concat!(env!("OUT_DIR"), "/embedded_model.rs"));
 include!(concat!(env!("OUT_DIR"), "/model_contract.rs"));
 
-const EMBEDDING_DIM: usize = 768;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingPooling {
+    Cls,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddingNormalization {
+    L2,
+}
+
+/// Vector semantics enforced by the linked product embedding engine.
+///
+/// Retrieval evidence consumes this same contract so a pooling, dimension, or
+/// normalization change cannot leave persisted compatibility identity behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductEmbeddingVectorSemantics {
+    dimension: usize,
+    pooling: EmbeddingPooling,
+    normalization: EmbeddingNormalization,
+}
+
+impl ProductEmbeddingVectorSemantics {
+    /// Width of every product embedding vector.
+    pub const fn dimension(self) -> usize {
+        self.dimension
+    }
+
+    /// Stable pooling identifier recorded in persisted producer evidence.
+    pub const fn pooling_id(self) -> &'static str {
+        match self.pooling {
+            EmbeddingPooling::Cls => "cls",
+        }
+    }
+
+    /// Stable normalization identifier recorded in persisted producer evidence.
+    pub const fn normalization_id(self) -> &'static str {
+        match self.normalization {
+            EmbeddingNormalization::L2 => "l2",
+        }
+    }
+
+    fn llama_pooling_type(self) -> LlamaPoolingType {
+        match self.pooling {
+            EmbeddingPooling::Cls => LlamaPoolingType::Cls,
+        }
+    }
+
+    fn normalize(self, vector: &mut [f32]) {
+        match self.normalization {
+            EmbeddingNormalization::L2 => l2_normalize(vector),
+        }
+    }
+}
+
+/// Canonical vector semantics for the linked product embedding engine.
+pub const PRODUCT_EMBEDDING_VECTOR_SEMANTICS: ProductEmbeddingVectorSemantics =
+    ProductEmbeddingVectorSemantics {
+        dimension: 768,
+        pooling: EmbeddingPooling::Cls,
+        normalization: EmbeddingNormalization::L2,
+    };
+
+const EMBEDDING_DIM: usize = PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension();
 const MODEL_CONTEXT_TOKENS: usize = 512;
 const LOGICAL_BATCH_TOKENS: usize = 1024;
 const MAX_BATCH_SEQUENCES: usize = 6;
@@ -530,7 +592,7 @@ fn run_resident_generation(
             .with_n_ubatch(LOGICAL_BATCH_TOKENS as u32)
             .with_n_seq_max(MAX_BATCH_SEQUENCES as u32)
             .with_attention_type(LlamaAttentionType::NonCausal)
-            .with_pooling_type(LlamaPoolingType::Cls)
+            .with_pooling_type(PRODUCT_EMBEDDING_VECTOR_SEMANTICS.llama_pooling_type())
             .with_embeddings(true);
         let mut context = model
             .new_context(&backend, context_params)
@@ -869,7 +931,7 @@ fn embed_token_batch(
                 actual: vector.len(),
             });
         }
-        l2_normalize(&mut vector);
+        PRODUCT_EMBEDDING_VECTOR_SEMANTICS.normalize(&mut vector);
         output.push(vector);
     }
     Ok(())
@@ -1121,6 +1183,23 @@ fn cache_error(error: impl std::fmt::Display) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_semantics_drive_engine_pooling_and_normalization() {
+        let semantics = PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
+        assert_eq!(semantics.dimension(), 768);
+        assert_eq!(semantics.pooling_id(), "cls");
+        assert_eq!(semantics.normalization_id(), "l2");
+        assert!(matches!(
+            semantics.llama_pooling_type(),
+            LlamaPoolingType::Cls
+        ));
+
+        let mut vector = [3.0_f32, 4.0];
+        semantics.normalize(&mut vector);
+        assert!((vector[0] - 0.6).abs() < f32::EPSILON);
+        assert!((vector[1] - 0.8).abs() < f32::EPSILON);
+    }
 
     #[test]
     fn software_adapters_are_rejected_by_name_or_description() {

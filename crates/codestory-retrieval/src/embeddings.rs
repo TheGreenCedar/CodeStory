@@ -10,7 +10,7 @@ use crate::in_process_embedding::{
     process_embedding_identity, process_embedding_identity_if_initialized,
 };
 use anyhow::{Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{
     Arc,
@@ -20,10 +20,13 @@ use std::sync::{
 use std::time::Instant;
 
 /// CodeRankEmbed vector width shared by stored and query vectors.
-pub const RETRIEVAL_EMBEDDING_DIM: usize = 768;
+pub const RETRIEVAL_EMBEDDING_DIM: usize =
+    codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension();
 pub const CODERANK_EMBED_Q8_GGUF: &str = codestory_llama_sys::MODEL_FILE_NAME;
 pub const CODERANK_QUERY_PREFIX_DEFAULT: &str =
     "Represent this query for searching relevant code: ";
+#[cfg(feature = "test-support")]
+pub const TEST_EMBEDDING_UNAVAILABLE_MARKER: &str = ".codestory-test-embedding-unavailable";
 
 /// Manifest producer identity. Changing the model or linked ggml source makes
 /// existing semantic generations stale and causes one transparent rebuild.
@@ -118,6 +121,7 @@ impl InProcessEmbeddingClient {
     }
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        ensure_test_embedding_available(&self.cache_root)?;
         if text.trim().is_empty() {
             bail!("cannot embed an empty query");
         }
@@ -130,6 +134,7 @@ impl InProcessEmbeddingClient {
     }
 
     pub fn embed_prepared_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        ensure_test_embedding_available(&self.cache_root)?;
         if texts.iter().any(|text| text.trim().is_empty()) {
             bail!("cannot embed empty text");
         }
@@ -186,7 +191,7 @@ pub fn ensure_product_embedding_backend() -> Result<()> {
 pub fn ensure_product_embedding_backend_for_runtime(runtime: &SidecarRuntimeConfig) -> Result<()> {
     #[cfg(feature = "test-support")]
     {
-        let _ = runtime;
+        ensure_test_embedding_available(&runtime.cache_root)?;
         Ok(())
     }
     #[cfg(not(feature = "test-support"))]
@@ -202,7 +207,7 @@ pub fn acquire_product_embedding_residency_for_runtime(
 ) -> Result<ProductEmbeddingResidencyLease> {
     #[cfg(feature = "test-support")]
     {
-        let _ = runtime;
+        ensure_test_embedding_available(&runtime.cache_root)?;
         Ok(ProductEmbeddingResidencyLease {
             identity: None,
             #[cfg(test)]
@@ -240,7 +245,9 @@ pub fn embedding_engine_snapshot_for_runtime(
 ) -> EmbeddingEngineSnapshot {
     #[cfg(feature = "test-support")]
     {
-        let _ = runtime;
+        if let Some(reason) = test_embedding_unavailable_reason(&runtime.cache_root) {
+            return unavailable_engine_snapshot(runtime, Some(0), reason, None);
+        }
         let allow_cpu = runtime.embedding.allow_cpu;
         EmbeddingEngineSnapshot {
             probe: EmbeddingRuntimeProbe {
@@ -309,7 +316,6 @@ fn observed_engine_snapshot(
     }
 }
 
-#[cfg(any(not(feature = "test-support"), test))]
 fn unavailable_engine_snapshot(
     runtime: &SidecarRuntimeConfig,
     elapsed_ms: Option<u64>,
@@ -342,6 +348,7 @@ pub fn ensure_embedding_accelerator_smoke_for_runtime(
 ) -> Result<Option<EmbeddingAcceleratorSmoke>> {
     #[cfg(feature = "test-support")]
     {
+        ensure_test_embedding_available(&runtime.cache_root)?;
         let device = embedding_device_readiness_for_runtime(runtime);
         Ok(
             (!runtime.embedding.allow_cpu).then_some(EmbeddingAcceleratorSmoke {
@@ -450,7 +457,6 @@ fn readiness_from_identity(
     }
 }
 
-#[cfg(any(not(feature = "test-support"), test))]
 fn unavailable_readiness(allow_cpu: bool, reason: &str) -> EmbeddingDeviceReadiness {
     EmbeddingDeviceReadiness {
         requested_policy: requested_policy(allow_cpu),
@@ -465,6 +471,26 @@ fn unavailable_readiness(allow_cpu: bool, reason: &str) -> EmbeddingDeviceReadin
         full_retrieval_allowed: false,
         degraded_reason: Some(reason.to_string()),
     }
+}
+
+fn ensure_test_embedding_available(cache_root: &Path) -> Result<()> {
+    if let Some(reason) = test_embedding_unavailable_reason(cache_root) {
+        bail!(reason);
+    }
+    Ok(())
+}
+
+fn test_embedding_unavailable_reason(cache_root: &Path) -> Option<String> {
+    #[cfg(feature = "test-support")]
+    if cache_root.join(TEST_EMBEDDING_UNAVAILABLE_MARKER).is_file() {
+        return Some(format!(
+            "embedding backend unavailable by test marker in {}",
+            cache_root.display()
+        ));
+    }
+    #[cfg(not(feature = "test-support"))]
+    let _ = cache_root;
+    None
 }
 
 fn requested_policy(allow_cpu: bool) -> &'static str {

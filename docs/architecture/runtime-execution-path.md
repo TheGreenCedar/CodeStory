@@ -83,11 +83,12 @@ sequenceDiagram
     end
 ```
 
-Query execution and candidate resolution use separately pinned reads tied by
-one publication identity; they are not one indefinitely held database
-snapshot. Numeric node IDs are accepted only through the matching core
-publication. A concurrent publish returns `cache_busy` to the bounded retry
-instead of resolving an old candidate against a new graph.
+Query execution and candidate resolution use one retrieval-owned pinned session
+holding the matching core read transaction, immutable generation leases,
+manifest/evidence identity, and engine residency. Numeric node IDs are accepted
+only through that session. A concurrent publish returns typed
+`publication_changed` to the whole-operation bounded retry instead of resolving
+an old candidate against a new graph.
 
 `retrieval_mode=full` records the artifact classification. Serving additionally
 requires a current manifest, matching producer identity, live embedded engine,

@@ -33,7 +33,7 @@ sequenceDiagram
     Indexer->>Store: run post-flush resolution updates
     Runtime->>Store: finalize staged snapshot or refresh live snapshots
     Runtime->>Search: rebuild lexical projection, symbol docs, component reports, and dense anchors
-    Search->>Store: reuse unchanged dense embeddings or upsert selected anchor docs
+    Search->>Store: reuse unchanged anchor metadata or upsert selected embedding-free inputs
     Runtime-->>CLI: indexing summary and phase timings
 ```
 
@@ -43,8 +43,9 @@ sequenceDiagram
 - `codestory-runtime` chooses full versus incremental flow and staged versus live store behavior.
 - `codestory-workspace` discovers source files and computes the refresh plan.
 - `codestory-indexer` turns the plan into projection writes and post-flush resolution.
-- `codestory-store` persists rows, invalidates or refreshes snapshots, publishes staged builds, and stores symbol docs plus dense-anchor docs.
-- `codestory-runtime` owns the runtime search engine, symbol doc and dense-anchor sync, retrieval readiness, and timing surface.
+- `codestory-store` persists rows, invalidates or refreshes snapshots, publishes staged builds, and stores symbol docs plus embedding-free dense-anchor inputs.
+- `codestory-runtime` owns the runtime search engine, deterministic symbol/dense input construction, retrieval readiness, and timing surface.
+- `codestory-retrieval` owns model execution, immutable vector generations, producer evidence, validation, and query generation leases.
 
 That split is intentional: the runtime orchestrates the run, the indexer performs indexing work, and the store owns persistence mechanics.
 
@@ -54,7 +55,7 @@ That split is intentional: the runtime orchestrates the run, the indexer perform
 flowchart LR
     Files["source inventory"] --> CoreBuild["index and resolve graph"]
     CoreBuild --> Core["publish codestory.db"]
-    Core --> Inputs["symbol docs, reports, reusable dense rows"]
+    Core --> Inputs["symbol docs, reports, reusable dense inputs"]
     Files --> RetrievalBuild["build immutable retrieval generation"]
     Inputs --> RetrievalBuild
     Engine["process-wide embedding engine"] --> RetrievalBuild
@@ -256,13 +257,13 @@ Semantic sync does these pieces of work:
 - build deterministic generated text for durable AST symbols and store it in `symbol_search_doc`
 - build deterministic component/community report docs with extracted provenance
 - classify each symbol under `graph_first_v1`
-- reuse existing dense embeddings when doc version, generated text hash, embedding profile/backend/model/dimension, document prefix, and semantic policy version still match
-- embed only selected dense anchors and upsert them back into SQLite
-- prune stale symbol docs or dense docs that no longer correspond to the refreshed graph and policy
+- reuse unchanged dense-anchor input metadata when generated text hash, selection reason, and policy version still match
+- publish selected anchor text, source provenance, source range, content hash, policy, and exact core generation/run identity without loading the embedding engine
+- prune stale symbol docs or dense inputs that no longer correspond to the refreshed graph and policy
 
-Full refresh has an extra copy-forward path: if a previous live database exists, unchanged symbol docs, retrieval artifact nodes, and dense-anchor docs are copied into the staged database before publish. The later semantic sync can then reuse those rows instead of re-embedding them.
+Full refresh has an extra copy-forward path: if a previous live database exists, unchanged symbol docs, retrieval artifact nodes, and dense-anchor inputs are copied into the staged database before publish. The later sync can retain content-level reuse while rebinding every selected input to the candidate core publication.
 
-Incremental refresh scopes symbol-doc and dense-anchor invalidation by touched file. Untouched files keep their existing docs; new, changed, or removed symbols in touched files are written, embedded if policy-selected, skipped with reason counts, or pruned.
+Incremental refresh scopes symbol-doc and dense-anchor invalidation to changed or removed files plus files connected to them through the graph before or after the refresh. Related-symbol text, edge digests, centrality, and component reports can change at either endpoint, so those graph-dependent files are rebuilt even when their source bytes did not change. Unrelated untouched files keep their existing inputs. Vector reuse and rebuild happen only when retrieval finalizes the next immutable generation.
 
 The default symbol-doc scope is durable symbols: classes, structs, interfaces, annotations, unions, enums, typedefs, functions, methods, macros, global variables, constants, and enum constants. Lower-signal module, namespace, package, field, local variable, and type-parameter docs stay out of dense retrieval by default while remaining present in graph and lexical search. Set `CODESTORY_SEMANTIC_DOC_SCOPE=all` only for investigations.
 
@@ -313,12 +314,15 @@ leaves the prior retrieval publication active if source or core identity drifts.
 
 ### How symbol docs and dense anchors are kept fast
 
-Symbol docs are deterministic graph artifacts persisted in SQLite with generated-text metadata and extracted provenance. Dense anchors are persisted separately in SQLite with vector metadata. Reuse is keyed by schema version, generated text hash, embedding profile/backend/model/dimension, document prefix, and semantic policy version. On full refresh, runtime copies prior retrieval artifact nodes, symbol docs, and dense docs forward into the staged database before semantic sync checks them. On incremental refresh, runtime passes a touched-file scope so only docs belonging to changed files are rebuilt, embedded, skipped, or pruned.
+Symbol docs are deterministic graph artifacts persisted in SQLite with generated-text metadata and extracted provenance. Dense anchors are persisted separately as embedding-free inputs. Core reuse is keyed by generated text hash, selection reason, and semantic policy version; the stored source identity still changes to the exact candidate core generation/run before publication. Core publishes the complete anchor count, content digest, policy, migration state, and source identity as one manifest with the graph generation. On full refresh, runtime copies prior retrieval artifact nodes, symbol docs, and dense inputs forward into the staged database before checking them. On incremental refresh, runtime rebuilds inputs for changed and removed files plus files connected to them through the previous or refreshed graph, then rebinds the complete carried-forward set before publication.
 
-Cold start embeds only dense anchors that have no reusable row. The cold path is
-kept under control by using graph-native symbol docs for code recall, the
-`graph_first_v1` dense policy, length-bucketed batches, full retrieval readiness,
-and stored vector quantization.
+Retrieval fingerprints content, provenance, the complete core generation/run,
+and the stable model/engine/device compatibility identity before selecting a
+generation. Core can reuse unchanged embedding-free anchor inputs, but each
+core or producer-compatibility publication receives a distinct immutable vector
+generation and producer-evidence identity. Retrieval embeds the selected inputs
+in bounded batches, validates exact anchor/hash coverage and vector properties,
+and publishes the attested generation. Core indexing never loads the model.
 
 ### What timing output means
 
@@ -329,15 +333,15 @@ The index summary reports graph and semantic work separately:
 - `cache_ms.search_index`: runtime search index construction for symbol names
 - `cache_ms.runtime_publish`: publishing the rebuilt search state into the live runtime
 - `semantic_ms.doc_build`: generated semantic text and hashes
-- `semantic_ms.embedding`: embedding runtime work for pending docs
-- `semantic_ms.db_upsert`: SQLite writes for embedded docs
-- `semantic_ms.reload`: loading persisted semantic docs into the runtime search engine when needed
-- `semantic_ms.prune`: removing stale semantic docs after the refreshed symbol set is known
+- `semantic_ms.embedding`: always zero for core indexing; retained as a compatibility field
+- `semantic_ms.db_upsert`: SQLite writes for symbol docs and embedding-free dense inputs
+- `semantic_ms.reload`: compatibility timing for the core search state
+- `semantic_ms.prune`: removing stale dense inputs after the refreshed symbol set is known
 - `symbol_search_docs_written`: graph-native symbol docs and component reports written for lexical/graph recall
-- `semantic_docs.reused`: existing dense-anchor docs accepted without embedding
-- `semantic_docs.embedded`: dense-anchor docs newly embedded in this run
-- `semantic_docs.pending`: dense-anchor docs that needed embedding after reuse checks
-- `semantic_docs.stale`: persisted dense-anchor docs pruned because they no longer match the refreshed symbol set
+- `semantic_docs.reused`: dense-anchor inputs whose content/policy metadata was reusable
+- `semantic_docs.embedded`: always zero for core indexing; vector production is retrieval-owned
+- `semantic_docs.pending`: changed dense-anchor inputs that require the next retrieval-generation decision
+- `semantic_docs.stale`: persisted dense-anchor inputs pruned because they no longer match the refreshed symbol set
 - `semantic_dense_docs_skipped` and `semantic_dense_*`: policy skip and dense-reason counters for `graph_first_v1`
 
 Use these fields before changing parser, graph, or SQLite code for a slow

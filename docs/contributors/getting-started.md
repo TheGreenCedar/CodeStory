@@ -170,11 +170,12 @@ codestory-cli cache rehydrate \
   --project <child-worktree>
 ```
 
-Rehydrate copies and rebases compatible SQLite graph/search/document rows and
-portable artifact-cache entries. It invalidates retrieval manifests because the
-project identity changed. Run the printed `doctor` command, then publish a fresh
-retrieval generation before using packet/search. If rehydrate reports
-`skipped`, use its normal rebuild commands.
+Rehydrate copies and rebases compatible SQLite graph/search/document and dense
+input rows plus portable artifact-cache entries. It invalidates the copied core
+dense publication and retrieval manifests because the project identity changed.
+Run the printed `doctor`, incremental core index, and full retrieval index
+commands in order before using packet/search. If rehydrate reports `skipped`,
+use its normal rebuild commands.
 
 Cache rules:
 

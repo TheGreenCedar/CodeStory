@@ -1,5 +1,10 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
-use crate::embedded_vector::{EmbeddedVectorIndex, SemanticPoint};
+use crate::embedded_vector::{
+    AttestedSemanticPoint, EmbeddedVectorIndex, ExpectedVectorAnchor, SemanticPoint,
+    VectorEvidenceContract, VectorGenerationManifest, build_vector_producer_evidence,
+    producer_evidence_mismatches, vector_compatibility_identity,
+    vector_producer_compatibility_identity,
+};
 use crate::generation::{
     SIDECAR_SCHEMA_VERSION, manifest_has_current_sidecar_contract,
     manifest_unavailable_reason_for_runtime, sidecar_generation_id,
@@ -12,9 +17,8 @@ use crate::lexical_index::{
 use crate::retention::{
     FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
     GenerationRetentionLock, GenerationRetentionMarker, GenerationRetentionPlan,
-    VerifiedRollbackManifest, apply_generation_retention, global_generation_gc_state_file,
-    plan_generation_retention, read_retention_marker, scan_retention_protection,
-    write_retention_marker,
+    apply_generation_retention, global_generation_gc_state_file, plan_generation_retention,
+    scan_retention_protection, write_retention_marker,
 };
 use crate::scip_index::{
     SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
@@ -22,10 +26,17 @@ use crate::scip_index::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use codestory_store::{FileRole, LlmSymbolDoc, RetrievalIndexManifest, Store, SymbolSearchDoc};
+use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
+#[cfg(test)]
+use codestory_store::LlmSymbolDoc;
+use codestory_store::{
+    DenseAnchorInput, FileRole, RetrievalIndexManifest, RetrievalIndexRollbackRecord, Store,
+    SymbolSearchDoc,
+};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -55,6 +66,7 @@ pub(crate) struct SidecarInputFingerprint {
 struct SidecarEmbeddingContract<'a> {
     backend: &'a str,
     dimension: i32,
+    producer_compatibility_identity: &'a str,
 }
 
 struct SemanticGeneration<'a> {
@@ -83,9 +95,24 @@ struct GenerationRetentionContext<'a> {
     previous_manifest: Option<&'a RetrievalIndexManifest>,
     embedding_device: &'a crate::embeddings::EmbeddingDeviceReadiness,
     embedding_residency: crate::embeddings::ProductEmbeddingResidencyLease,
+    producer_compatibility_identity: String,
+}
+
+struct PreparedGenerationRetention {
+    verified_previous: Option<RetrievalIndexRollbackRecord>,
 }
 
 const SIDECAR_INPUT_BATCH_SIZE: usize = 4096;
+
+fn ensure_retrieval_index_not_cancelled(
+    cancelled: &AtomicBool,
+    boundary: &'static str,
+) -> Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        bail!("retrieval index cancelled before {boundary}");
+    }
+    Ok(())
+}
 
 pub fn project_id_for_root(project_root: &Path) -> String {
     codestory_workspace::workspace_id_v3_for_root(project_root)
@@ -117,12 +144,45 @@ pub fn finalize_index_for_runtime(
     finalize_index_for_runtime_with_progress(project_root, storage_path, runtime, |_| {})
 }
 
+pub fn finalize_index_for_runtime_with_cancel(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
+) -> Result<FinalizeIndexOutcome> {
+    finalize_index_for_runtime_with_progress_and_cancel(
+        project_root,
+        storage_path,
+        runtime,
+        cancelled,
+        |_| {},
+    )
+}
+
 pub fn finalize_index_for_runtime_with_progress(
     project_root: &Path,
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
+    progress: impl FnMut(&'static str),
+) -> Result<FinalizeIndexOutcome> {
+    let cancelled = AtomicBool::new(false);
+    finalize_index_for_runtime_with_progress_and_cancel(
+        project_root,
+        storage_path,
+        runtime,
+        &cancelled,
+        progress,
+    )
+}
+
+pub fn finalize_index_for_runtime_with_progress_and_cancel(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(&'static str),
 ) -> Result<FinalizeIndexOutcome> {
+    ensure_retrieval_index_not_cancelled(cancelled, "preflight")?;
     let layout = runtime.layout.clone();
     let project_identity = runtime.validated_project_identity(project_root)?;
     let project_id = project_identity.artifact_scope_id;
@@ -147,6 +207,11 @@ pub fn finalize_index_for_runtime_with_progress(
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
     crate::embeddings::ensure_product_embedding_backend_for_runtime(runtime)?;
     let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let producer_compatibility_identity = vector_producer_compatibility_identity(
+        &embedding_device,
+        embedding_residency.identity(),
+        u32::try_from(embedding_dim).context("negative embedding dimension")?,
+    )?;
 
     let mut storage =
         Store::open(storage_path).context("open storage for retrieval sidecar input")?;
@@ -158,6 +223,7 @@ pub fn finalize_index_for_runtime_with_progress(
     let embedding_contract = SidecarEmbeddingContract {
         backend: &embedding_backend,
         dimension: embedding_dim,
+        producer_compatibility_identity: &producer_compatibility_identity,
     };
     let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
         input_snapshot.storage(),
@@ -172,9 +238,40 @@ pub fn finalize_index_for_runtime_with_progress(
     let previous_manifest = storage
         .get_retrieval_index_manifest(&project_id)
         .context("load previous retrieval_index_manifest")?;
-    let previous_manifest_unavailable_reason = previous_manifest.as_ref().and_then(|manifest| {
-        manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
-    });
+    let mut previous_manifest_unavailable_reason =
+        previous_manifest.as_ref().and_then(|manifest| {
+            manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
+        });
+    if previous_manifest_unavailable_reason.is_none()
+        && let Some(manifest) = previous_manifest.as_ref()
+        && manifest_matches_sidecar_input(
+            manifest,
+            &sidecar_input,
+            &embedding_backend,
+            embedding_dim,
+        )
+    {
+        let validation = storage
+            .get_complete_index_publication()
+            .context("load complete core publication for retrieval reuse")?
+            .context("retrieval reuse requires a complete core publication")
+            .and_then(|publication| {
+                crate::embedded_vector::validate_generation_evidence_for_publication(
+                    &layout,
+                    &storage,
+                    manifest,
+                    &publication,
+                    runtime,
+                    &embedding_device,
+                    embedding_residency.identity(),
+                )
+                .context("deep-validate reusable retrieval generation")
+            });
+        if let Err(error) = validation {
+            previous_manifest_unavailable_reason =
+                Some(format!("retrieval_generation_evidence_invalid: {error:#}"));
+        }
+    }
     drop(storage);
     let retention_context = GenerationRetentionContext {
         runtime,
@@ -183,6 +280,7 @@ pub fn finalize_index_for_runtime_with_progress(
         previous_manifest: previous_manifest.as_ref(),
         embedding_device: &embedding_device,
         embedding_residency,
+        producer_compatibility_identity,
     };
 
     if let Some(previous) = previous_manifest.as_ref() {
@@ -224,6 +322,7 @@ pub fn finalize_index_for_runtime_with_progress(
                             project_root,
                             storage_path,
                             &retention_context,
+                            cancelled,
                             &sidecar_input,
                             project_id,
                             manifest,
@@ -244,6 +343,7 @@ pub fn finalize_index_for_runtime_with_progress(
                     project_root,
                     storage_path,
                     &retention_context,
+                    cancelled,
                     &sidecar_input,
                     project_id,
                     previous.clone(),
@@ -305,36 +405,6 @@ pub fn finalize_index_for_runtime_with_progress(
     };
     let scip_ready = existing_status.scip.capabilities.graph;
 
-    if lexical_ready && semantic_ready_points.is_some() && scip_ready {
-        update_precise_semantic_import_status(&scip_dir, &mut manifest)?;
-        manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
-        let status = probe_sidecar_health_for_runtime(
-            &layout,
-            &project_id,
-            Some(manifest.clone()),
-            &embedding_device,
-            runtime,
-        );
-        if status.retrieval_mode == "full" {
-            info!(
-                project_id = %project_id,
-                sidecar_generation = %generation,
-                semantic_point_count = semantic_ready_points.unwrap_or_default(),
-                "current generated sidecars already healthy; persisted manifest without rebuild"
-            );
-            return persist_finalized_manifest(
-                project_root,
-                storage_path,
-                &retention_context,
-                &sidecar_input,
-                project_id,
-                manifest,
-                degraded_modes,
-                SidecarStubFlags { scip_stubbed },
-            );
-        }
-    }
-
     let lexical_outcome = with_finalize_progress(&mut progress, "lexical sidecar", || {
         ensure_lexical_generation(
             project_root,
@@ -353,10 +423,11 @@ pub fn finalize_index_for_runtime_with_progress(
 
     let _semantic_point_count = ensure_semantic_index(
         storage_path,
-        project_root,
         &project_id,
         &semantic_generation,
         semantic_ready_points,
+        &retention_context,
+        cancelled,
         &mut progress,
     )?;
 
@@ -381,6 +452,7 @@ pub fn finalize_index_for_runtime_with_progress(
             project_root,
             storage_path,
             &retention_context,
+            cancelled,
             &sidecar_input,
             project_id,
             manifest,
@@ -446,40 +518,218 @@ fn ensure_lexical_generation(
 
 fn ensure_semantic_index(
     storage_path: &Path,
-    project_root: &Path,
     project_id: &str,
     semantic: &SemanticGeneration<'_>,
     semantic_ready_points: Option<u64>,
+    retention: &GenerationRetentionContext<'_>,
+    cancelled: &AtomicBool,
     progress: &mut impl FnMut(&'static str),
 ) -> Result<u64> {
-    if semantic.expected_points == 0 {
-        info!(
-            project_id = %project_id,
-            collection = %semantic.collection,
-            "dense vector index skipped because graph_first_v1 selected zero dense anchors"
-        );
-        return Ok(0);
+    ensure_retrieval_index_not_cancelled(cancelled, "pinning dense anchor inputs")?;
+    let storage = Store::open(storage_path).context("open core storage for dense anchors")?;
+    let snapshot = storage
+        .read_snapshot()
+        .context("pin dense anchor input generation")?;
+    let publication = snapshot
+        .storage()
+        .get_complete_index_publication()
+        .context("read pinned core publication for vector generation")?
+        .context("dense anchor inputs require a complete core publication")?;
+    let expected_source_identity =
+        format!("core:{}:{}", publication.generation_id, publication.run_id);
+    let mut anchors = Vec::<DenseAnchorInput>::new();
+    let mut after = None;
+    loop {
+        let batch = snapshot
+            .storage()
+            .get_dense_anchor_inputs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
+            .context("load pinned dense anchor inputs")?;
+        if batch.is_empty() {
+            break;
+        }
+        after = batch.last().map(|anchor| anchor.node_id);
+        for anchor in batch {
+            if anchor.source_identity != expected_source_identity {
+                bail!(
+                    "dense anchor {} belongs to source identity {}, expected {}",
+                    anchor.node_id.0,
+                    anchor.source_identity,
+                    expected_source_identity
+                );
+            }
+            anchors.push(anchor);
+        }
     }
-    if let Some(point_count) = semantic_ready_points {
+    if i64::try_from(anchors.len()).unwrap_or(i64::MAX) != semantic.expected_points {
+        bail!(
+            "pinned dense anchor generation count changed: expected {}, found {}",
+            semantic.expected_points,
+            anchors.len()
+        );
+    }
+    let evidence = build_vector_producer_evidence(
+        retention.embedding_device,
+        retention.embedding_residency.identity(),
+        u32::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
+        EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            retrieval_generation: semantic.generation.to_string(),
+            retrieval_input_hash: semantic.input_hash.to_string(),
+            semantic_generation: semantic.collection.to_string(),
+        },
+    );
+    let compatibility_identity = vector_compatibility_identity(&evidence)?;
+    let dimension =
+        usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?;
+    let contract = VectorEvidenceContract::new(
+        semantic.embedding_backend,
+        dimension,
+        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+        &compatibility_identity,
+    );
+    let expected_anchors = anchors
+        .iter()
+        .map(|anchor| ExpectedVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let reusable_point_count = semantic_ready_points.and_then(|point_count| {
+        let validation = (|| {
+            let manifest = EmbeddedVectorIndex::load_generation_manifest(
+                semantic.layout,
+                semantic.collection,
+            )?;
+            let mismatches = producer_evidence_mismatches(&evidence, &manifest.evidence);
+            if !mismatches.is_empty() {
+                bail!(
+                    "stored vector producer evidence is incompatible: {}",
+                    mismatches.join(", ")
+                );
+            }
+            EmbeddedVectorIndex::validate_published_attestation(
+                semantic.layout,
+                semantic.collection,
+                semantic.generation,
+                semantic.input_hash,
+                &contract,
+                &expected_anchors,
+                &manifest.vectors,
+            )
+        })();
+        match validation {
+            Ok(_) => Some(point_count),
+            Err(error) => {
+                warn!(
+                    project_id = %project_id,
+                    sidecar_generation = %semantic.generation,
+                    error = %format!("{error:#}"),
+                    "existing vector candidate is incomplete or incompatible; rebuilding"
+                );
+                None
+            }
+        }
+    });
+
+    let point_count = if let Some(point_count) = reusable_point_count {
         info!(
             project_id = %project_id,
             sidecar_generation = %semantic.generation,
             point_count,
-            "embedded vector generation reused"
+            "attested vector generation reused"
         );
-        return Ok(point_count);
-    }
-    let point_count = with_finalize_progress(progress, "embedded vectors", || {
-        EmbeddedVectorIndex::build_with_points(
+        point_count
+    } else {
+        let attestation = with_finalize_progress(progress, "embedded vectors", || {
+            EmbeddedVectorIndex::build_attested_with_points_with_cancel(
+                crate::embedded_vector::AttestedVectorPublication {
+                    layout: semantic.layout,
+                    collection: semantic.collection,
+                    generation: semantic.generation,
+                    input_hash: semantic.input_hash,
+                    contract: &contract,
+                    expected_anchors: &expected_anchors,
+                },
+                || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
+                |visit| {
+                    let client =
+                        crate::embeddings::InProcessEmbeddingClient::new(retention.runtime);
+                    for batch in
+                        anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
+                    {
+                        ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
+                        let texts = batch
+                            .iter()
+                            .map(|anchor| anchor.text.clone())
+                            .collect::<Vec<_>>();
+                        let vectors = client
+                            .embed_documents(&texts)
+                            .context("embed pinned dense anchor batch")?;
+                        ensure_retrieval_index_not_cancelled(
+                            cancelled,
+                            "persisting an embedding batch",
+                        )?;
+                        if vectors.len() != batch.len() {
+                            bail!(
+                                "embedding engine returned {} vectors for {} anchors",
+                                vectors.len(),
+                                batch.len()
+                            );
+                        }
+                        for (anchor, vector) in batch.iter().zip(vectors) {
+                            ensure_retrieval_index_not_cancelled(
+                                cancelled,
+                                "persisting an embedded vector",
+                            )?;
+                            visit(AttestedSemanticPoint {
+                                point: SemanticPoint {
+                                    display_name: anchor
+                                        .qualified_name
+                                        .clone()
+                                        .unwrap_or_else(|| anchor.display_name.clone()),
+                                    node_id: anchor.node_id.0.to_string(),
+                                    file_path: anchor.file_path.clone(),
+                                    file_role: Some(anchor.file_role),
+                                    dense_reason: Some(anchor.selection_reason.clone()),
+                                    vector: normalize_vector(vector)?,
+                                },
+                                document_hash: anchor.document_hash.clone(),
+                            })?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+        })?;
+        let point_count = attestation.point_count;
+        let generation_manifest = VectorGenerationManifest::new(evidence, attestation.clone())?;
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            semantic.layout,
+            semantic.collection,
+            &generation_manifest,
+            || {
+                ensure_retrieval_index_not_cancelled(
+                    cancelled,
+                    "producer-evidence manifest publication",
+                )
+            },
+        )?;
+        EmbeddedVectorIndex::validate_published_attestation(
             semantic.layout,
             semantic.collection,
             semantic.generation,
             semantic.input_hash,
-            semantic.embedding_backend,
-            usize::try_from(semantic.embedding_dim).context("negative embedding dimension")?,
-            |visit| visit_semantic_points_from_store(storage_path, project_root, visit),
-        )
-    })?;
+            &contract,
+            &expected_anchors,
+            &attestation,
+        )?;
+        point_count
+    };
+    snapshot
+        .finish()
+        .context("finish pinned dense anchor input generation")?;
     if point_count != u64::try_from(semantic.expected_points).unwrap_or(u64::MAX) {
         bail!(
             "embedded vector generation incomplete for {project_id}: expected {} points, found {point_count}",
@@ -493,6 +743,24 @@ fn ensure_semantic_index(
         "embedded SQLite vector generation published"
     );
     Ok(point_count)
+}
+
+fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
+    if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+        bail!("embedding engine returned an empty or non-finite vector");
+    }
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm <= f64::EPSILON {
+        bail!("embedding engine returned a zero vector");
+    }
+    for value in &mut vector {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+    Ok(vector)
 }
 
 fn ensure_scip_artifacts(
@@ -642,9 +910,6 @@ fn sidecar_disk_bytes(
 
 fn semantic_ready_point_count(semantic: &SemanticGeneration<'_>) -> Option<u64> {
     let expected = u64::try_from(semantic.expected_points).ok()?;
-    if expected == 0 {
-        return Some(0);
-    }
     let health = EmbeddedVectorIndex::health(
         semantic.layout,
         semantic.collection,
@@ -672,6 +937,7 @@ fn persist_finalized_manifest(
     project_root: &Path,
     storage_path: &Path,
     retention_context: &GenerationRetentionContext<'_>,
+    cancelled: &AtomicBool,
     sidecar_input: &SidecarInputFingerprint,
     project_id: String,
     mut manifest: RetrievalIndexManifest,
@@ -686,50 +952,75 @@ fn persist_finalized_manifest(
         crate::embeddings::embedding_runtime_id_for_runtime(retention_context.runtime);
     let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
         .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
-    with_embedding_publication_residency(&retention_context.embedding_residency, || {
-        promote_retrieval_manifest(
-            &mut storage,
-            sidecar_input,
-            &manifest,
-            |storage| {
-                let lexical_source = lexical_source_input(project_root)
-                    .context("rescan lexical source at publication fence")?;
-                let embedding_contract = SidecarEmbeddingContract {
-                    backend: &embedding_backend,
-                    dimension: embedding_dim,
-                };
-                let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
-                    storage,
-                    project_root,
-                    &project_id,
-                    &embedding_contract,
-                    lexical_source,
-                )?;
-                if let Some(reason) = manifest_unavailable_reason_for_runtime(
-                    &project_id,
-                    storage,
-                    &manifest,
-                    retention_context.runtime,
-                ) {
-                    bail!(
-                        "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
-                    );
-                }
-                Ok(current_input)
-            },
-            || {
-                validate_candidate_generation(
-                    &project_id,
-                    sidecar_input,
-                    &manifest,
-                    retention_context,
-                )
-            },
-        )
-    })?;
+    let _prepared_retention = with_embedding_publication_residency(
+        &retention_context.embedding_residency,
+        || {
+            promote_retrieval_manifest_with_cancel(
+                &mut storage,
+                sidecar_input,
+                &manifest,
+                |storage| {
+                    let lexical_source = lexical_source_input(project_root)
+                        .context("rescan lexical source at publication fence")?;
+                    let embedding_contract = SidecarEmbeddingContract {
+                        backend: &embedding_backend,
+                        dimension: embedding_dim,
+                        producer_compatibility_identity: &retention_context
+                            .producer_compatibility_identity,
+                    };
+                    let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
+                        storage,
+                        project_root,
+                        &project_id,
+                        &embedding_contract,
+                        lexical_source,
+                    )?;
+                    if let Some(reason) = manifest_unavailable_reason_for_runtime(
+                        &project_id,
+                        storage,
+                        &manifest,
+                        retention_context.runtime,
+                    ) {
+                        bail!(
+                            "mandatory retrieval sidecar manifest would be unavailable immediately for {project_id}: {reason}"
+                        );
+                    }
+                    Ok(current_input)
+                },
+                |storage| {
+                    validate_candidate_generation(
+                        &project_id,
+                        sidecar_input,
+                        &manifest,
+                        retention_context,
+                        storage,
+                    )
+                },
+                |storage| {
+                    prepare_generation_retention(retention_context, &project_id, &manifest, storage)
+                },
+                |prepared| Ok(prepared.verified_previous.clone()),
+                || ensure_retrieval_index_not_cancelled(cancelled, "retrieval publication commit"),
+            )
+        },
+    )?;
+
+    let marker_error = match publish_derived_retention_marker(
+        &storage,
+        retention_context.layout,
+        retention_context.workspace_id,
+        &project_id,
+    ) {
+        Ok(()) => None,
+        Err(error) => {
+            let error = format!("publish derived generation retention marker: {error:#}");
+            warn!(project_id = %project_id, error = %error, "retention marker update failed after SQLite publication");
+            Some(error)
+        }
+    };
 
     let (generation_retention_plan, generation_retention) =
-        retain_published_generations(storage_path, retention_context, &project_id, &manifest)?;
+        retain_published_generations(storage_path, retention_context, &project_id, marker_error)?;
 
     info!(
         project_id = %project_id,
@@ -760,26 +1051,80 @@ fn ensure_sidecar_input_unchanged(
     Ok(())
 }
 
-fn promote_retrieval_manifest(
+#[cfg(test)]
+fn promote_retrieval_manifest<T>(
     storage: &mut Store,
     expected: &SidecarInputFingerprint,
     manifest: &RetrievalIndexManifest,
     current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
-    validate_candidate: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    validate_candidate()?;
+    validate_candidate: impl FnOnce(&Store) -> Result<()>,
+    prepare_publication: impl FnOnce(&Store) -> Result<T>,
+    publication_rollback: impl FnOnce(&T) -> Result<Option<RetrievalIndexRollbackRecord>>,
+) -> Result<T> {
+    promote_retrieval_manifest_with_cancel(
+        storage,
+        expected,
+        manifest,
+        current_input,
+        validate_candidate,
+        prepare_publication,
+        publication_rollback,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn promote_retrieval_manifest_with_cancel<T>(
+    storage: &mut Store,
+    expected: &SidecarInputFingerprint,
+    manifest: &RetrievalIndexManifest,
+    current_input: impl FnOnce(&Store) -> Result<SidecarInputFingerprint>,
+    validate_candidate: impl FnOnce(&Store) -> Result<()>,
+    prepare_publication: impl FnOnce(&Store) -> Result<T>,
+    publication_rollback: impl FnOnce(&T) -> Result<Option<RetrievalIndexRollbackRecord>>,
+    mut ensure_not_cancelled: impl FnMut() -> Result<()>,
+) -> Result<T> {
+    ensure_not_cancelled()?;
+    validate_candidate(storage)?;
+    let prepared = prepare_publication(storage)?;
     let mut publication = storage
         .write_transaction()
         .context("lock sidecar input and manifest publication")?;
     let current = current_input(publication.storage())?;
     ensure_sidecar_input_unchanged(expected, &current)?;
+    let rollback = publication_rollback(&prepared)?;
+    ensure_not_cancelled()?;
     publication
         .storage_mut()
-        .upsert_retrieval_index_manifest(manifest)
-        .context("persist retrieval_index_manifest")?;
+        .publish_retrieval_index_publication(manifest, rollback.as_ref())
+        .context("persist atomic retrieval current and rollback pointers")?;
+    ensure_not_cancelled()?;
     publication
         .finish()
-        .context("commit retrieval manifest publication")
+        .context("commit retrieval manifest publication")?;
+    Ok(prepared)
+}
+
+fn publish_derived_retention_marker(
+    storage: &Store,
+    layout: &SidecarLayout,
+    workspace_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    let (active, rollback) = storage
+        .get_retrieval_index_publication(project_id)
+        .context("read committed retrieval publication for retention marker")?
+        .context("committed retrieval publication is missing")?;
+    let marker = GenerationRetentionMarker::next(
+        workspace_id,
+        active,
+        rollback,
+        Utc::now().timestamp_millis(),
+    )
+    .context("derive generation retention marker from SQLite publication")?;
+    write_retention_marker(&layout.state_file, &marker)
+        .context("write derived generation retention marker")?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -830,7 +1175,7 @@ fn validate_candidate_generation_evidence(
         && sidecar_input.semantic_policy_version.as_deref()
             == Some(crate::generation::SEMANTIC_POLICY_VERSION);
     let semantic_valid = if zero_dense_candidate {
-        evidence.semantic_points.is_none()
+        evidence.semantic_points == Some(0)
             && evidence.semantic_ready
             && evidence.semantic_zero_dense_policy
     } else {
@@ -910,6 +1255,7 @@ fn validate_candidate_generation(
     sidecar_input: &SidecarInputFingerprint,
     manifest: &RetrievalIndexManifest,
     context: &GenerationRetentionContext<'_>,
+    storage: &Store,
 ) -> Result<()> {
     let generation = manifest
         .sidecar_generation
@@ -973,9 +1319,7 @@ fn validate_candidate_generation(
         ),
         scip_revision: read_scip_revision(&scip_dir),
         scip_graph: status.scip.capabilities.graph,
-        semantic_points: (sidecar_input.projection_count > 0)
-            .then_some(semantic_points)
-            .flatten(),
+        semantic_points,
         semantic_ready: status.semantic.capabilities.semantic,
         semantic_zero_dense_policy: sidecar_input.projection_count == 0
             && sidecar_input.dense_projection_count == 0
@@ -996,35 +1340,44 @@ fn validate_candidate_generation(
         manifest,
         context.runtime,
         &evidence,
+    )?;
+    let core_publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication at retrieval publication fence")?
+        .context("retrieval publication requires a complete core publication")?;
+    crate::embedded_vector::validate_generation_evidence_for_publication(
+        context.layout,
+        storage,
+        manifest,
+        &core_publication,
+        context.runtime,
+        &evidence.embedding_device,
+        Some(&evidence.embedding_identity_after),
     )
+    .context("deep-validate vector generation at retrieval publication fence")?;
+    Ok(())
 }
 
-fn retain_published_generations(
-    storage_path: &Path,
+fn prepare_generation_retention(
     context: &GenerationRetentionContext<'_>,
     project_id: &str,
     active: &RetrievalIndexManifest,
-) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
+    storage: &Store,
+) -> Result<PreparedGenerationRetention> {
     let now = Utc::now().timestamp_millis();
-    let mut errors = Vec::new();
-    let existing_marker =
-        match read_retention_marker(&context.layout.state_file, context.workspace_id) {
-            Ok(marker) => marker,
-            Err(error) => {
-                errors.push(format!("read generation retention marker: {error:#}"));
-                None
-            }
-        };
     let active_generation = active.sidecar_generation.as_deref();
     let mut candidates = Vec::new();
     if let Some(previous) = context.previous_manifest {
         candidates.push(previous.clone());
     }
-    if let Some(marker) = existing_marker.as_ref() {
-        candidates.push(marker.active.clone());
-        if let Some(rollback) = marker.rollback.as_ref() {
-            candidates.push(rollback.manifest.clone());
-        }
+    match storage.get_retrieval_index_publication(project_id) {
+        Ok(Some((_, Some(rollback)))) => candidates.push(rollback.manifest),
+        Ok(_) => {}
+        Err(error) => warn!(
+            project_id = %project_id,
+            error = %error,
+            "stored rollback pointer is unreadable and will not be retained as authoritative"
+        ),
     }
     candidates.retain(|candidate| {
         candidate.project_id == project_id
@@ -1033,47 +1386,74 @@ fn retain_published_generations(
     });
     candidates.sort_by_key(|candidate| candidate.built_at_epoch_ms);
     candidates.dedup_by(|left, right| left.sidecar_generation == right.sidecar_generation);
-    let verified_previous = candidates.into_iter().rev().find_map(|candidate| {
-        let status = probe_sidecar_health_for_runtime(
-            context.layout,
-            project_id,
-            Some(candidate.clone()),
-            context.embedding_device,
-            context.runtime,
-        );
-        (status.retrieval_mode == "full").then_some(VerifiedRollbackManifest {
-            manifest: candidate,
-            verified_at_epoch_ms: now,
+
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication for rollback validation")?;
+    let verified_previous = publication.and_then(|publication| {
+        candidates.into_iter().rev().find_map(|candidate| {
+            let validation = crate::embedded_vector::validate_generation_evidence_for_publication(
+                context.layout,
+                storage,
+                &candidate,
+                &publication,
+                context.runtime,
+                context.embedding_device,
+                context.embedding_residency.identity(),
+            )
+            .context("validate rollback vector bytes, producer evidence, and anchor coverage")
+            .and_then(|_| {
+                let status = probe_sidecar_health_for_runtime(
+                    context.layout,
+                    project_id,
+                    Some(candidate.clone()),
+                    context.embedding_device,
+                    context.runtime,
+                );
+                if status.retrieval_mode != "full" {
+                    bail!(
+                        "rollback generation is not full: {} {:?}",
+                        status.retrieval_mode,
+                        status.degraded_reason
+                    );
+                }
+                Ok(())
+            });
+            match validation {
+                Ok(()) => Some(RetrievalIndexRollbackRecord {
+                    manifest: candidate,
+                    verified_at_epoch_ms: now,
+                }),
+                Err(error) => {
+                    warn!(
+                        project_id = %project_id,
+                        sidecar_generation = ?candidate.sidecar_generation,
+                        error = %format!("{error:#}"),
+                        "retrieval rollback candidate failed deep validation"
+                    );
+                    None
+                }
+            }
         })
     });
 
-    let marker = GenerationRetentionMarker::next(
-        context.workspace_id,
-        active.clone(),
-        verified_previous.clone(),
-        now,
-    );
-    match marker {
-        Ok(marker) => {
-            if let Err(error) = write_retention_marker(&context.layout.state_file, &marker) {
-                errors.push(format!("write generation retention marker: {error:#}"));
-            }
-        }
-        Err(error) => errors.push(format!("build generation retention marker: {error:#}")),
-    }
+    Ok(PreparedGenerationRetention { verified_previous })
+}
 
+fn retain_published_generations(
+    storage_path: &Path,
+    context: &GenerationRetentionContext<'_>,
+    project_id: &str,
+    marker_error: Option<String>,
+) -> Result<(GenerationRetentionPlan, GenerationRetentionApplyReport)> {
     let mut protection = scan_retention_protection(
         &crate::config::user_cache_root(),
         Some(storage_path),
         &context.layout.state_file,
     );
-    if let Some(rollback) = verified_previous {
-        protection
-            .authoritative_rollback
-            .push(rollback.manifest.clone());
-        protection.rollback.push(rollback.manifest);
+    if let Some(error) = marker_error {
+        protection.errors.push(error);
     }
-    protection.errors.extend(errors);
     let plan = plan_generation_retention(context.layout, project_id, &protection);
     let mut remover = FsGenerationRemover::new(context.layout)?;
     let apply = apply_generation_retention(&plan, &mut remover);
@@ -1086,11 +1466,13 @@ pub(crate) fn compute_sidecar_input_fingerprint(
     project_id: &str,
     embedding_backend: &str,
     embedding_dim: i32,
+    producer_compatibility_identity: &str,
 ) -> Result<SidecarInputFingerprint> {
     let lexical_source = lexical_source_input(project_root).context("hash lexical source input")?;
     let embedding_contract = SidecarEmbeddingContract {
         backend: embedding_backend,
         dimension: embedding_dim,
+        producer_compatibility_identity,
     };
     compute_sidecar_input_fingerprint_with_lexical_source(
         storage,
@@ -1112,16 +1494,34 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
         .context("hash lexical symbol input")?;
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
-    hash_part(&mut hasher, "codestory-sidecar-input-v7");
+    hash_part(&mut hasher, "codestory-sidecar-input-v10");
     hash_part(&mut graph_hasher, "codestory-symbol-search-docs-v1");
     hash_part(&mut hasher, project_id);
+    let core_publication = storage
+        .get_complete_index_publication()
+        .context("load complete core publication for sidecar hash")?;
+    hash_part(
+        &mut hasher,
+        core_publication
+            .as_ref()
+            .map_or("<missing>", |publication| {
+                publication.generation_id.as_str()
+            }),
+    );
+    hash_part(
+        &mut hasher,
+        core_publication
+            .as_ref()
+            .map_or("<missing>", |publication| publication.run_id.as_str()),
+    );
     hash_part(&mut hasher, &SIDECAR_SCHEMA_VERSION.to_string());
     hash_part(&mut hasher, LEXICAL_INDEX_VERSION);
     hash_part(&mut hasher, &lexical.file_count.to_string());
     hash_part(&mut hasher, &lexical.hash);
     hash_part(&mut hasher, embedding.backend);
     hash_part(&mut hasher, &embedding.dimension.to_string());
-    hash_part(&mut hasher, "semantic-vectors-v2");
+    hash_part(&mut hasher, embedding.producer_compatibility_identity);
+    hash_part(&mut hasher, "dense-anchor-inputs-v1");
     hash_part(&mut hasher, "scip-symbols-json-v1");
 
     let mut symbol_doc_count = 0_i64;
@@ -1150,22 +1550,18 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
     let mut after = None;
     loop {
         let batch = storage
-            .get_llm_symbol_docs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
-            .context("load stored semantic docs for sidecar hash")?;
+            .get_dense_anchor_inputs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
+            .context("load dense anchor inputs for sidecar hash")?;
         if batch.is_empty() {
             break;
         }
         after = batch.last().map(|doc| doc.node_id);
-        let batch = batch
-            .into_iter()
-            .filter(semantic_doc_row)
-            .collect::<Vec<_>>();
         dense_projection_count += i64::try_from(batch.len()).unwrap_or(i64::MAX);
         for doc in batch {
-            observe_policy_version(&mut policy_versions, doc.semantic_policy_version.as_deref());
-            let reason = doc.dense_reason.as_deref().unwrap_or("unknown").to_string();
+            observe_policy_version(&mut policy_versions, Some(doc.policy_version.as_str()));
+            let reason = doc.selection_reason.clone();
             *dense_reason_counts.entry(reason).or_insert(0) += 1;
-            hash_semantic_doc_detail(&mut hasher, project_root, &doc);
+            hash_dense_anchor_input(&mut hasher, project_root, &doc);
         }
     }
     let dense_reason_counts_json =
@@ -1242,7 +1638,7 @@ fn hash_symbol_search_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: 
     hash_part(hasher, &doc.source_provenance);
 }
 
-fn hash_semantic_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &LlmSymbolDoc) {
+fn hash_dense_anchor_input(hasher: &mut Sha256, project_root: &Path, doc: &DenseAnchorInput) {
     let file_path = doc
         .file_path
         .as_deref()
@@ -1265,17 +1661,18 @@ fn hash_semantic_doc_detail(hasher: &mut Sha256, project_root: &Path, doc: &LlmS
             .map(|line| line.to_string())
             .unwrap_or_default(),
     );
-    hash_part(hasher, &doc.doc_version.to_string());
-    hash_part(hasher, &doc.doc_hash);
-    hash_part(hasher, doc.semantic_policy_version.as_deref().unwrap_or(""));
-    hash_part(hasher, doc.dense_reason.as_deref().unwrap_or(""));
-    hash_part(hasher, doc.embedding_profile.as_deref().unwrap_or(""));
-    hash_part(hasher, &doc.embedding_model);
-    hash_part(hasher, doc.embedding_backend.as_deref().unwrap_or(""));
-    hash_part(hasher, &doc.embedding_dim.to_string());
-    hash_part(hasher, doc.doc_shape.as_deref().unwrap_or(""));
-    hash_part(hasher, &doc.embedding.len().to_string());
-    hash_embedding_vector(hasher, &doc.embedding);
+    hash_part(
+        hasher,
+        &doc.end_line
+            .map(|line| line.to_string())
+            .unwrap_or_default(),
+    );
+    hash_part(hasher, doc.file_role.as_str());
+    hash_part(hasher, &doc.source_provenance);
+    hash_part(hasher, &doc.text);
+    hash_part(hasher, &doc.document_hash);
+    hash_part(hasher, &doc.selection_reason);
+    hash_part(hasher, &doc.policy_version);
 }
 
 #[cfg(test)]
@@ -1290,82 +1687,9 @@ fn semantic_projection_row(row: &codestory_store::SearchSymbolProjectionDetail) 
     crate::generation::sidecar_semantic_node_kind(kind)
 }
 
-fn semantic_doc_row(doc: &LlmSymbolDoc) -> bool {
-    crate::generation::sidecar_semantic_doc_is_product_eligible(doc)
-}
-
 fn hash_part(hasher: &mut Sha256, value: &str) {
     hasher.update(value.len().to_le_bytes());
     hasher.update(value.as_bytes());
-}
-
-fn hash_embedding_vector(hasher: &mut Sha256, embedding: &[f32]) {
-    hasher.update(embedding.len().to_le_bytes());
-    for value in embedding {
-        hasher.update(value.to_bits().to_le_bytes());
-    }
-}
-
-fn visit_semantic_points_from_store(
-    storage_path: &Path,
-    project_root: &Path,
-    visit: &mut dyn FnMut(SemanticPoint) -> Result<()>,
-) -> Result<()> {
-    let mut storage = Store::open(storage_path).context("open storage for semantic vectors")?;
-    ensure_search_symbol_projection(&mut storage)?;
-    let file_roles = storage
-        .get_files()
-        .map(|files| sidecar_file_role_map(files, project_root))
-        .unwrap_or_default();
-    let mut after = None;
-    loop {
-        let batch = storage
-            .get_llm_symbol_docs_batch_after(after, SIDECAR_INPUT_BATCH_SIZE)
-            .context("load stored semantic docs for vector indexing")?;
-        if batch.is_empty() {
-            break;
-        }
-        after = batch.last().map(|doc| doc.node_id);
-        for doc in batch.into_iter().filter(semantic_doc_row) {
-            let display_name = doc.qualified_name.clone().unwrap_or(doc.display_name);
-            let file_path = doc
-                .file_path
-                .as_deref()
-                .and_then(|path| normalize_sidecar_file_path(path, project_root).ok());
-            let file_role = file_path
-                .as_deref()
-                .and_then(|path| file_roles.get(path).copied())
-                .or_else(|| {
-                    file_path
-                        .as_deref()
-                        .map(|path| FileRole::classify_path(Path::new(path)))
-                });
-            visit(SemanticPoint {
-                display_name,
-                node_id: doc.node_id.0.to_string(),
-                file_path,
-                file_role,
-                dense_reason: doc.dense_reason.clone(),
-                vector: doc.embedding,
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn sidecar_file_role_map(
-    files: Vec<codestory_store::FileInfo>,
-    project_root: &Path,
-) -> HashMap<String, FileRole> {
-    files
-        .into_iter()
-        .filter_map(|file| {
-            let path = file.path.to_string_lossy().to_string();
-            normalize_sidecar_file_path(&path, project_root)
-                .ok()
-                .map(|path| (path, file.file_role))
-        })
-        .collect()
 }
 
 fn normalize_sidecar_file_path(path: &str, project_root: &Path) -> Result<String> {
@@ -1382,6 +1706,7 @@ fn normalize_sidecar_file_path(path: &str, project_root: &Path) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retention::read_retention_marker;
     use codestory_contracts::graph::{Node, NodeId, NodeKind};
     use codestory_store::SearchSymbolProjectionDetail;
     use std::path::PathBuf;
@@ -1443,9 +1768,30 @@ mod tests {
         assert!(
             message.contains("mandatory")
                 || message.contains("embedding_device_unverified")
-                || message.contains("without its embedded embedding model"),
+                || message.contains("without its embedded embedding model")
+                || message.contains("complete core publication"),
             "expected a pre-publication retrieval trust-gate error, got {error:#}"
         );
+    }
+
+    #[test]
+    fn pre_cancelled_finalize_stops_before_runtime_or_artifact_mutation() {
+        let project = TempDir::new().expect("project dir");
+        let storage_dir = TempDir::new().expect("storage dir");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let runtime = SidecarRuntimeConfig::local();
+        let cancelled = AtomicBool::new(true);
+
+        let error = finalize_index_for_runtime_with_cancel(
+            project.path(),
+            &storage_path,
+            &runtime,
+            &cancelled,
+        )
+        .expect_err("pre-cancelled finalize must fail before opening storage");
+
+        assert!(error.to_string().contains("cancelled before preflight"));
+        assert!(!storage_path.exists());
     }
 
     #[test]
@@ -1548,6 +1894,364 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_sqlite_commit_preserves_current_and_rollback_pointers() {
+        let storage_dir = TempDir::new().expect("storage dir");
+        let mut storage = Store::open(storage_dir.path().join("codestory.db"))
+            .expect("open retrieval publication store");
+        let input = |hash: &str| SidecarInputFingerprint {
+            hash: hash.into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: format!("graph-{hash}"),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: format!("lexical-{hash}"),
+            lexical_coverage: Default::default(),
+        };
+        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
+            let mut manifest = retrieval_manifest_for_sidecar(
+                "proj",
+                &sidecar_generation_id("proj", &input.hash),
+                &crate::generation::sidecar_vector_generation("proj", &input.hash),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                input,
+            );
+            manifest.built_at_epoch_ms = built_at_epoch_ms;
+            manifest
+        };
+        let rollback_input = input("11111111111111111111111111111111");
+        let current_input = input("22222222222222222222222222222222");
+        let candidate_input = input("33333333333333333333333333333333");
+        let rollback_manifest = manifest(&rollback_input, 1);
+        let current_manifest = manifest(&current_input, 2);
+        let candidate_manifest = manifest(&candidate_input, 3);
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: rollback_manifest,
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
+            .expect("seed current and rollback pointers");
+        let prior = storage
+            .get_retrieval_index_publication("proj")
+            .expect("read prior publication");
+        let checks = std::cell::Cell::new(0_u8);
+
+        let error = promote_retrieval_manifest_with_cancel(
+            &mut storage,
+            &candidate_input,
+            &candidate_manifest,
+            |_| Ok(candidate_input.clone()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| {
+                Ok(Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest.clone(),
+                    verified_at_epoch_ms: 3,
+                }))
+            },
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if next == 3 {
+                    bail!("simulated cancellation before SQLite commit");
+                }
+                Ok(())
+            },
+        )
+        .expect_err("cancellation before commit must reject publication");
+
+        assert!(error.to_string().contains("simulated cancellation"));
+        assert_eq!(
+            checks.get(),
+            3,
+            "cancellation did not reach the commit fence"
+        );
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read publication after cancellation"),
+            prior,
+            "cancelled transaction changed current or rollback pointers"
+        );
+    }
+
+    #[test]
+    fn partial_zero_dense_vector_candidate_repairs_then_promotes_without_weakening_prior() {
+        let _env = crate::test_support::env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let publication = codestory_store::IndexPublicationRecord {
+            generation: 1,
+            generation_id: "11111111-1111-4111-8111-111111111111".into(),
+            run_id: "run-one".into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        let mut storage = Store::open(&storage_path).expect("open storage");
+        storage
+            .put_index_publication(&publication)
+            .expect("publish core identity");
+        storage
+            .publish_dense_anchor_generation(
+                &publication,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .expect("publish empty dense-anchor generation");
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        let (residency, _active) = crate::embeddings::ProductEmbeddingResidencyLease::test_lease(
+            test_embedding_identity("accelerated"),
+        );
+        let device = crate::embeddings::EmbeddingDeviceReadiness {
+            requested_policy: "accelerator_required",
+            observed_state: "accelerated",
+            observation_source: "inprocess_engine",
+            detected_provider: Some("metal".into()),
+            detected_gpu: Some("test accelerator".into()),
+            accelerator_requested: true,
+            accelerator_request_provider: Some("metal".into()),
+            accelerator_request_device: Some("test accelerator".into()),
+            cpu_allowed: false,
+            full_retrieval_allowed: true,
+            degraded_reason: None,
+        };
+        let producer_compatibility_identity = vector_producer_compatibility_identity(
+            &device,
+            residency.identity(),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+        )
+        .expect("producer compatibility identity");
+        let input = |hash: &str| SidecarInputFingerprint {
+            hash: hash.into(),
+            symbol_doc_count: 0,
+            projection_count: 0,
+            dense_projection_count: 0,
+            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+            graph_artifact_hash: format!("graph-{hash}"),
+            dense_reason_counts_json: "{}".into(),
+            lexical_file_count: 0,
+            lexical_hash: format!("lexical-{hash}"),
+            lexical_coverage: Default::default(),
+        };
+        let manifest = |input: &SidecarInputFingerprint, built_at_epoch_ms: i64| {
+            let mut manifest = retrieval_manifest_for_sidecar(
+                "proj",
+                &sidecar_generation_id("proj", &input.hash),
+                &crate::generation::sidecar_vector_generation("proj", &input.hash),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+                input,
+            );
+            manifest.built_at_epoch_ms = built_at_epoch_ms;
+            manifest
+        };
+        let rollback_input = input(&"a".repeat(64));
+        let current_input = input(&"b".repeat(64));
+        let candidate_input = input(&"c".repeat(64));
+        let rollback_manifest = manifest(&rollback_input, 1);
+        let current_manifest = manifest(&current_input, 2);
+        let candidate_manifest = manifest(&candidate_input, 3);
+        let publish_empty_vectors = |manifest: &RetrievalIndexManifest,
+                                     publish_manifest: bool|
+         -> VectorGenerationManifest {
+            let evidence = build_vector_producer_evidence(
+                &device,
+                residency.identity(),
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+                EmbeddingVectorPublicationIdentityDto {
+                    core_generation_id: publication.generation_id.clone(),
+                    core_run_id: publication.run_id.clone(),
+                    retrieval_generation: manifest
+                        .sidecar_generation
+                        .clone()
+                        .expect("retrieval generation"),
+                    retrieval_input_hash: manifest
+                        .sidecar_input_hash
+                        .clone()
+                        .expect("retrieval input hash"),
+                    semantic_generation: manifest.semantic_generation.clone(),
+                },
+            );
+            let contract = VectorEvidenceContract::new(
+                manifest
+                    .embedding_backend
+                    .clone()
+                    .expect("embedding backend"),
+                usize::try_from(manifest.embedding_dim.expect("embedding dimension"))
+                    .expect("positive embedding dimension"),
+                crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+                vector_compatibility_identity(&evidence).expect("compatibility identity"),
+            );
+            let attestation = EmbeddedVectorIndex::build_attested_with_points(
+                &runtime.layout,
+                &manifest.semantic_generation,
+                manifest
+                    .sidecar_generation
+                    .as_deref()
+                    .expect("retrieval generation"),
+                manifest
+                    .sidecar_input_hash
+                    .as_deref()
+                    .expect("retrieval input hash"),
+                &contract,
+                &[],
+                |_visit| Ok(()),
+            )
+            .expect("publish empty vector database");
+            let generation = VectorGenerationManifest::new(evidence, attestation)
+                .expect("build vector generation manifest");
+            if publish_manifest {
+                EmbeddedVectorIndex::publish_generation_manifest(
+                    &runtime.layout,
+                    &manifest.semantic_generation,
+                    &generation,
+                )
+                .expect("publish vector generation manifest");
+            }
+            generation
+        };
+        publish_empty_vectors(&rollback_manifest, true);
+        publish_empty_vectors(&current_manifest, true);
+        let rollback = RetrievalIndexRollbackRecord {
+            manifest: rollback_manifest.clone(),
+            verified_at_epoch_ms: 2,
+        };
+        storage
+            .publish_retrieval_index_publication(&current_manifest, Some(&rollback))
+            .expect("seed current and rollback pointers");
+        let prior = storage
+            .get_retrieval_index_publication("proj")
+            .expect("read prior publication");
+
+        let candidate_generation = publish_empty_vectors(&candidate_manifest, false);
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            &runtime.layout,
+            &candidate_manifest.semantic_generation,
+            &candidate_generation,
+            || bail!("simulated cancellation after vector database publication"),
+        )
+        .expect_err("evidence publication must be cancelled");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read publication after evidence cancellation"),
+            prior,
+            "partial candidate changed current or rollback pointers"
+        );
+        for prior_manifest in [&current_manifest, &rollback_manifest] {
+            crate::embedded_vector::validate_generation_evidence_for_publication(
+                &runtime.layout,
+                &storage,
+                prior_manifest,
+                &publication,
+                &runtime,
+                &device,
+                residency.identity(),
+            )
+            .expect("prior generation remains deeply usable");
+        }
+        let semantic = SemanticGeneration {
+            layout: &runtime.layout,
+            collection: &candidate_manifest.semantic_generation,
+            generation: candidate_manifest
+                .sidecar_generation
+                .as_deref()
+                .expect("candidate generation"),
+            input_hash: candidate_manifest
+                .sidecar_input_hash
+                .as_deref()
+                .expect("candidate input hash"),
+            embedding_backend: candidate_manifest
+                .embedding_backend
+                .as_deref()
+                .expect("candidate embedding backend"),
+            embedding_dim: candidate_manifest
+                .embedding_dim
+                .expect("candidate embedding dimension"),
+            expected_points: 0,
+        };
+        let context = GenerationRetentionContext {
+            runtime: &runtime,
+            layout: &runtime.layout,
+            workspace_id: "workspace",
+            previous_manifest: Some(&current_manifest),
+            embedding_device: &device,
+            embedding_residency: residency,
+            producer_compatibility_identity,
+        };
+        let cancelled = AtomicBool::new(false);
+        ensure_semantic_index(
+            &storage_path,
+            "proj",
+            &semantic,
+            Some(0),
+            &context,
+            &cancelled,
+            &mut |_| {},
+        )
+        .expect("retry repairs the partial zero-dense candidate");
+        crate::embedded_vector::validate_generation_evidence_for_publication(
+            &runtime.layout,
+            &storage,
+            &candidate_manifest,
+            &publication,
+            &runtime,
+            &device,
+            context.embedding_residency.identity(),
+        )
+        .expect("repaired candidate deep-validates");
+
+        promote_retrieval_manifest(
+            &mut storage,
+            &candidate_input,
+            &candidate_manifest,
+            |_| Ok(candidate_input.clone()),
+            |storage| {
+                crate::embedded_vector::validate_generation_evidence_for_publication(
+                    &runtime.layout,
+                    storage,
+                    &candidate_manifest,
+                    &publication,
+                    &runtime,
+                    &device,
+                    context.embedding_residency.identity(),
+                )
+                .map(|_| ())
+            },
+            |_| Ok(()),
+            |_| {
+                Ok(Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest.clone(),
+                    verified_at_epoch_ms: 3,
+                }))
+            },
+        )
+        .expect("promote repaired candidate");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("read repaired publication"),
+            Some((
+                candidate_manifest,
+                Some(RetrievalIndexRollbackRecord {
+                    manifest: current_manifest,
+                    verified_at_epoch_ms: 3,
+                }),
+            ))
+        );
+    }
+
+    #[test]
     fn semantic_projection_excludes_low_value_local_symbols() {
         let row = |kind: NodeKind| SearchSymbolProjectionDetail {
             node_id: codestory_contracts::graph::NodeId(1),
@@ -1563,57 +2267,6 @@ mod tests {
         assert!(!semantic_projection_row(&row(NodeKind::VARIABLE)));
         assert!(!semantic_projection_row(&row(NodeKind::FIELD)));
         assert!(!semantic_projection_row(&row(NodeKind::UNKNOWN)));
-    }
-
-    #[test]
-    fn semantic_doc_requires_product_stored_embedding() {
-        let doc = |kind: NodeKind, backend: Option<&str>, dim: u32| LlmSymbolDoc {
-            node_id: codestory_contracts::graph::NodeId(1),
-            file_node_id: None,
-            kind,
-            display_name: "do_work".into(),
-            qualified_name: Some("pkg::do_work".into()),
-            file_path: Some("src/lib.rs".into()),
-            start_line: Some(1),
-            doc_text: "semantic doc".into(),
-            doc_version: 4,
-            doc_hash: "hash".into(),
-            embedding_profile: Some("coderank-embed".into()),
-            embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
-            embedding_backend: backend.map(str::to_string),
-            embedding_dim: dim,
-            doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            dense_reason: Some("public_api".into()),
-            embedding: vec![0.01; dim as usize],
-            updated_at_epoch_ms: 123,
-        };
-
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::FUNCTION,
-            Some("other"),
-            768
-        )));
-        assert!(semantic_doc_row(&doc(
-            NodeKind::METHOD,
-            Some("inprocess"),
-            768
-        )));
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::VARIABLE,
-            Some("other"),
-            768
-        )));
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::FUNCTION,
-            Some("hash"),
-            768
-        )));
-        assert!(!semantic_doc_row(&doc(
-            NodeKind::FUNCTION,
-            Some("other"),
-            384
-        )));
     }
 
     #[test]
@@ -1647,6 +2300,7 @@ mod tests {
             &first_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("first input");
         let second_input = compute_sidecar_input_fingerprint(
@@ -1655,6 +2309,7 @@ mod tests {
             &second_project_id,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("second input");
 
@@ -1662,6 +2317,52 @@ mod tests {
         assert_eq!(
             sidecar_generation_id(&first_project_id, &first_input.hash),
             sidecar_generation_id(&second_project_id, &second_input.hash)
+        );
+    }
+
+    #[test]
+    fn producer_compatibility_change_selects_a_distinct_immutable_generation() {
+        let project = TempDir::new().expect("project");
+        std::fs::write(project.path().join("lib.rs"), "pub fn stable() {}\n").expect("source");
+        let storage = Store::new_in_memory().expect("storage");
+        storage
+            .put_index_publication(&codestory_store::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "core-generation".into(),
+                run_id: "core-run".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("core publication");
+        let project_id = "project";
+        let package_a = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "package-runtime-sidecar-evidence-a",
+        )
+        .expect("package A input");
+        let package_b = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            project_id,
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "package-runtime-sidecar-evidence-b",
+        )
+        .expect("package B input");
+
+        assert_ne!(package_a.hash, package_b.hash);
+        assert_ne!(
+            sidecar_generation_id(project_id, &package_a.hash),
+            sidecar_generation_id(project_id, &package_b.hash),
+            "a package/runtime producer change must not overwrite the prior sidecar generation"
+        );
+        assert_ne!(
+            crate::generation::sidecar_vector_generation(project_id, &package_a.hash),
+            crate::generation::sidecar_vector_generation(project_id, &package_b.hash)
         );
     }
 
@@ -1691,6 +2392,7 @@ mod tests {
         let embedding_contract = SidecarEmbeddingContract {
             backend: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             dimension: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            producer_compatibility_identity: "producer-compatibility-v1",
         };
         storage
             .insert_nodes_batch(&[Node {
@@ -1700,7 +2402,7 @@ mod tests {
                 ..Default::default()
             }])
             .expect("node");
-        let mut doc = LlmSymbolDoc {
+        let mut doc = DenseAnchorInput {
             node_id: NodeId(1),
             file_node_id: None,
             kind: NodeKind::FUNCTION,
@@ -1708,30 +2410,63 @@ mod tests {
             qualified_name: Some("pkg::do_work".into()),
             file_path: Some("lib.rs".into()),
             start_line: Some(1),
-            doc_text: "semantic doc".into(),
-            doc_version: 4,
-            doc_hash: "hash".into(),
-            embedding_profile: Some("coderank-embed".into()),
-            embedding_model: crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into(),
-            embedding_backend: Some("inprocess".into()),
-            embedding_dim: crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
-            doc_shape: Some("semantic_doc_version=4;scope=durable_symbols".into()),
-            semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
-            dense_reason: Some("public_api".into()),
-            embedding: vec![0.01; crate::embeddings::RETRIEVAL_EMBEDDING_DIM],
+            end_line: Some(2),
+            file_role: FileRole::Source,
+            source_provenance: "parser".into(),
+            text: "semantic doc".into(),
+            document_hash: "hash-one".into(),
+            selection_reason: "public_api".into(),
+            policy_version: crate::generation::SEMANTIC_POLICY_VERSION.into(),
+            source_identity: "core:g1:r1".into(),
             updated_at_epoch_ms: 123,
         };
         storage
-            .upsert_llm_symbol_docs_batch(&[doc.clone()])
+            .upsert_dense_anchor_inputs_batch(&[doc.clone()])
             .expect("first doc");
+        storage
+            .put_index_publication(&codestory_store::IndexPublicationRecord {
+                generation: 1,
+                generation_id: "g1".into(),
+                run_id: "r1".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("first core publication");
         let first = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("first fingerprint");
+        doc.source_identity = "core:g2:r2".into();
+        storage
+            .upsert_dense_anchor_inputs_batch(&[doc.clone()])
+            .expect("rebind unchanged doc");
+        storage
+            .put_index_publication(&codestory_store::IndexPublicationRecord {
+                generation: 2,
+                generation_id: "g2".into(),
+                run_id: "r2".into(),
+                mode: codestory_store::IndexPublicationMode::Full,
+                published_at_epoch_ms: 2,
+            })
+            .expect("second core publication");
+        let rebound = compute_sidecar_input_fingerprint(
+            &storage,
+            project.path(),
+            "proj",
+            crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
+        )
+        .expect("rebound fingerprint");
+        assert_ne!(
+            first.hash, rebound.hash,
+            "publication-bound vector evidence requires a fresh immutable generation"
+        );
         let old_manifest = retrieval_manifest_for_sidecar(
             "proj",
             &sidecar_generation_id("proj", &first.hash),
@@ -1743,10 +2478,11 @@ mod tests {
         storage
             .upsert_retrieval_index_manifest(&old_manifest)
             .expect("old manifest");
-        doc.embedding[0] = 0.02;
+        doc.text = "changed semantic doc".into();
+        doc.document_hash = "hash-two".into();
         let mut concurrent = Store::open(&storage_path).expect("concurrent store");
         concurrent
-            .upsert_llm_symbol_docs_batch(&[doc])
+            .upsert_dense_anchor_inputs_batch(&[doc])
             .expect("second doc");
         drop(concurrent);
         let second = compute_sidecar_input_fingerprint(
@@ -1755,6 +2491,7 @@ mod tests {
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("second fingerprint");
 
@@ -1787,7 +2524,9 @@ mod tests {
                     lexical_source,
                 )
             },
-            || Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(None),
         );
         assert!(rejected.is_err());
         assert_eq!(
@@ -1848,7 +2587,7 @@ mod tests {
         zero_dense_manifest.scip_revision = Some("graph-test".into());
         let mut zero_dense_evidence = passing.clone();
         zero_dense_evidence.scip_revision = zero_dense_manifest.scip_revision.clone();
-        zero_dense_evidence.semantic_points = None;
+        zero_dense_evidence.semantic_points = Some(0);
         zero_dense_evidence.semantic_zero_dense_policy = true;
         validate_candidate_generation_evidence(
             "proj",
@@ -1857,7 +2596,16 @@ mod tests {
             &runtime,
             &zero_dense_evidence,
         )
-        .expect("zero-dense policy accepts an intentionally absent vector generation");
+        .expect("zero-dense policy requires an attested empty vector generation");
+        zero_dense_evidence.semantic_points = None;
+        validate_candidate_generation_evidence(
+            "proj",
+            &zero_dense_input,
+            &zero_dense_manifest,
+            &runtime,
+            &zero_dense_evidence,
+        )
+        .expect_err("a missing zero-dense vector generation must reject promotion");
 
         let mut missing_nonzero_collection = passing.clone();
         missing_nonzero_collection.semantic_points = None;
@@ -1878,6 +2626,7 @@ mod tests {
             "proj",
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32,
+            "producer-compatibility-v1",
         )
         .expect("cpu-policy fingerprint");
         let mut cpu_manifest = retrieval_manifest_for_sidecar(
@@ -1926,7 +2675,7 @@ mod tests {
         let marker = GenerationRetentionMarker::next(
             "workspace",
             old_manifest.clone(),
-            Some(VerifiedRollbackManifest {
+            Some(RetrievalIndexRollbackRecord {
                 manifest: rollback_manifest,
                 verified_at_epoch_ms: 123,
             }),
@@ -1962,7 +2711,7 @@ mod tests {
                 &candidate_input,
                 &new_manifest,
                 |_| Ok(candidate_input.clone()),
-                || {
+                |_| {
                     validate_candidate_generation_evidence(
                         "proj",
                         &candidate_input,
@@ -1971,6 +2720,8 @@ mod tests {
                         &failing,
                     )
                 },
+                |_| Ok(()),
+                |_| Ok(None),
             )
             .expect_err("component failure must reject promotion");
             assert!(
@@ -1999,7 +2750,7 @@ mod tests {
                 &second,
                 &new_manifest,
                 |_| Ok(second.clone()),
-                || {
+                |_| {
                     validate_candidate_generation_evidence(
                         "proj",
                         &second,
@@ -2009,6 +2760,8 @@ mod tests {
                     )?;
                     panic!("simulated crash before candidate promotion")
                 },
+                |_| Ok(()),
+                |_| Ok(None),
             );
         }));
         assert!(crashed.is_err());
@@ -2041,7 +2794,7 @@ mod tests {
                     lexical_source,
                 )
             },
-            || {
+            |_| {
                 validate_candidate_generation_evidence(
                     "proj",
                     &second,
@@ -2052,6 +2805,8 @@ mod tests {
                 std::fs::write(&source_path, "pub fn changed_during_validation() {}\n")?;
                 Ok(())
             },
+            |_| Ok(()),
+            |_| Ok(None),
         )
         .expect_err("source drift during validation must reject publication");
         assert!(drifted.to_string().contains("input changed"));
@@ -2063,6 +2818,57 @@ mod tests {
         );
         std::fs::write(&source_path, "pub fn do_work() {}\n").expect("restore source");
 
+        let pointer_fault = promote_retrieval_manifest(
+            &mut storage,
+            &second,
+            &new_manifest,
+            |snapshot| {
+                let lexical_source =
+                    lexical_source_input(project.path()).expect("fresh lexical source");
+                compute_sidecar_input_fingerprint_with_lexical_source(
+                    snapshot,
+                    project.path(),
+                    "proj",
+                    &embedding_contract,
+                    lexical_source,
+                )
+            },
+            |_| {
+                validate_candidate_generation_evidence(
+                    "proj",
+                    &second,
+                    &new_manifest,
+                    &runtime,
+                    &passing,
+                )
+            },
+            |_| Ok(()),
+            |_| bail!("simulated SQLite rollback pointer failure"),
+        )
+        .expect_err("SQLite rollback pointer failure must reject publication");
+        assert!(
+            pointer_fault
+                .to_string()
+                .contains("SQLite rollback pointer")
+        );
+        assert_eq!(
+            storage
+                .get_retrieval_index_manifest("proj")
+                .expect("current manifest after retention pointer fault"),
+            Some(old_manifest.clone())
+        );
+        assert_eq!(
+            read_retention_marker(&state_file, "workspace")
+                .expect("read marker")
+                .expect("marker exists"),
+            marker_before,
+            "retention pointer failure changed rollback state"
+        );
+
+        let rollback_record = RetrievalIndexRollbackRecord {
+            manifest: old_manifest.clone(),
+            verified_at_epoch_ms: 456,
+        };
         promote_retrieval_manifest(
             &mut storage,
             &second,
@@ -2078,7 +2884,7 @@ mod tests {
                     lexical_source,
                 )
             },
-            || {
+            |_| {
                 validate_candidate_generation_evidence(
                     "proj",
                     &second,
@@ -2087,13 +2893,156 @@ mod tests {
                     &passing,
                 )
             },
+            |_| Ok(()),
+            |_| Ok(Some(rollback_record.clone())),
         )
         .expect("unchanged input promotes manifest");
         assert_eq!(
             storage
-                .get_retrieval_index_manifest("proj")
-                .expect("current manifest"),
-            Some(new_manifest)
+                .get_retrieval_index_publication("proj")
+                .expect("current publication"),
+            Some((new_manifest.clone(), Some(rollback_record.clone())))
+        );
+
+        let marker_blocker = storage_dir.path().join("marker-blocker");
+        std::fs::write(&marker_blocker, b"not a directory").expect("marker blocker");
+        let mut blocked_layout = runtime.layout.clone();
+        blocked_layout.state_file = marker_blocker.join("retrieval.state");
+        publish_derived_retention_marker(&storage, &blocked_layout, "workspace", "proj")
+            .expect_err("derived marker failure happens after SQLite commit");
+        assert_eq!(
+            storage
+                .get_retrieval_index_publication("proj")
+                .expect("publication survives marker failure"),
+            Some((new_manifest, Some(rollback_record.clone())))
+        );
+        let mut protection = scan_retention_protection(
+            storage_dir.path(),
+            Some(&storage_path),
+            &blocked_layout.state_file,
+        );
+        protection
+            .errors
+            .push("derived marker publication failed".into());
+        assert!(
+            protection
+                .authoritative_rollback
+                .contains(&rollback_record.manifest),
+            "restart scans must recover rollback authority from SQLite without a marker"
+        );
+        assert!(
+            plan_generation_retention(&runtime.layout, "proj", &protection).pruning_suppressed,
+            "marker failure must conservatively suppress pruning"
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn rollback_selection_rejects_corrupt_vector_evidence_and_anchor_publication() {
+        use crate::test_support::{env_lock, publish_zero_dense_pinned_query_fixture};
+        use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
+        use std::io::Write as _;
+
+        let _env = env_lock();
+        let project = TempDir::new().expect("project");
+        let storage_dir = TempDir::new().expect("storage");
+        let cache = TempDir::new().expect("cache");
+        let storage_path = storage_dir.path().join("codestory.db");
+        let store = Store::open(&storage_path).expect("open storage");
+        store
+            .put_index_publication(&IndexPublicationRecord {
+                generation: 1,
+                generation_id: "11111111-1111-4111-8111-111111111111".into(),
+                run_id: "run-one".into(),
+                mode: IndexPublicationMode::Full,
+                published_at_epoch_ms: 1,
+            })
+            .expect("publish core identity");
+        drop(store);
+        let runtime = crate::config::with_test_cache_root(cache.path(), || {
+            SidecarRuntimeConfig::for_project_profile(
+                Some(project.path()),
+                crate::SidecarProfile::Local,
+            )
+        });
+        let previous =
+            publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+                .expect("publish rollback candidate");
+        let active_hash = "b".repeat(64);
+        let active =
+            crate::test_support::retrieval_manifest_fixture(&previous.project_id, &active_hash);
+        let select = |storage: &Store| {
+            let residency =
+                crate::embeddings::acquire_product_embedding_residency_for_runtime(&runtime)
+                    .expect("acquire test residency");
+            let device = crate::embeddings::embedding_device_readiness_for_runtime(&runtime);
+            let producer_compatibility_identity = vector_producer_compatibility_identity(
+                &device,
+                residency.identity(),
+                crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            )
+            .expect("producer compatibility identity");
+            let context = GenerationRetentionContext {
+                runtime: &runtime,
+                layout: &runtime.layout,
+                workspace_id: "workspace",
+                previous_manifest: Some(&previous),
+                embedding_device: &device,
+                embedding_residency: residency,
+                producer_compatibility_identity,
+            };
+            prepare_generation_retention(&context, &previous.project_id, &active, storage)
+                .expect("prepare retention")
+                .verified_previous
+        };
+
+        let storage = Store::open(&storage_path).expect("open candidate storage");
+        assert!(
+            select(&storage).is_some(),
+            "complete rollback must be selected"
+        );
+        let vector_path =
+            crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&vector_path)
+            .expect("open vector database")
+            .write_all(b"corrupt")
+            .expect("corrupt vector bytes");
+        assert!(
+            select(&storage).is_none(),
+            "exact vector-byte corruption must disqualify rollback"
+        );
+        drop(storage);
+
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("repair vector fixture");
+        let evidence_path =
+            crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation)
+                .parent()
+                .expect("vector collection directory")
+                .join("vector-generation-manifest.json");
+        std::fs::write(&evidence_path, b"{}\n").expect("corrupt producer evidence");
+        let storage = Store::open(&storage_path).expect("open evidence-corrupt storage");
+        assert!(
+            select(&storage).is_none(),
+            "producer-evidence corruption must disqualify rollback"
+        );
+        drop(storage);
+
+        publish_zero_dense_pinned_query_fixture(project.path(), &storage_path, &runtime)
+            .expect("repair evidence fixture");
+        let storage = Store::open(&storage_path).expect("open anchor-corrupt storage");
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE dense_anchor_publication SET anchor_digest = ?1 WHERE id = 1",
+                rusqlite::params!["c".repeat(64)],
+            )
+            .expect("corrupt anchor publication");
+        assert!(
+            select(&storage).is_none(),
+            "anchor-publication corruption must disqualify rollback"
         );
     }
 

@@ -17,13 +17,15 @@ pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
 };
 pub use storage_impl::{
-    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, DenseReasonCounts, FileContentHash,
-    FileInfo, FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,
+    CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DenseAnchorInput, DenseAnchorInputReuseMetadata,
+    DenseAnchorPublicationManifest, DenseReasonCounts, FileContentHash, FileInfo,
+    FileProjectionRemovalSummary, FileRole, GroundingEdgeKindCount, GroundingFileSummary,
     GroundingNodeRecord, GroundingSnapshotMetadata, GroundingSnapshotState, IndexPublicationMode,
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
-    ProjectionFlushBreakdown, RetrievalIndexManifest, SearchSymbolProjection,
-    SearchSymbolProjectionDetail, Storage as Store, StorageError, StorageOpenMode, StorageStats,
-    SymbolSearchDoc, SymbolSummaryRecord,
+    ProjectionFlushBreakdown, RetrievalIndexManifest, RetrievalIndexRollbackRecord,
+    SearchSymbolProjection, SearchSymbolProjectionDetail, Storage as Store, StorageError,
+    StorageOpenMode, StorageStats, SymbolSearchDoc, SymbolSummaryRecord,
 };
 
 impl Store {

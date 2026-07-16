@@ -11,6 +11,7 @@ members = [
     "crates/codestory-cli",
     "crates/codestory-bench",
 ]
+exclude = ["vendor/tree-sitter-graph"]
 
 [workspace.dependencies]
 # Internal crates
@@ -23,9 +24,9 @@ codestory-retrieval = { path = "crates/codestory-retrieval" }
 codestory-runtime = { path = "crates/codestory-runtime" }
 codestory-bench = { path = "crates/codestory-bench" }
 
-# Parsing (tree-sitter) - Aligning to 0.24 for tree-sitter-graph 0.12
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23.3"
+# Parsing (tree-sitter)
+tree-sitter = "0.25.10"
+tree-sitter-rust = "0.24.2"
 tree-sitter-python = "0.23.6"
 tree-sitter-java = "0.23"
 tree-sitter-cpp = "0.23"
@@ -42,7 +43,7 @@ tree-sitter-dart-orchard = "0.3.2"
 tree-sitter-bash = "0.23.3"
 
 # Semantic Analysis
-tree-sitter-graph = "0.12"
+tree-sitter-graph = { path = "vendor/tree-sitter-graph" }
 streaming-iterator = "0.1"
 
 # Storage

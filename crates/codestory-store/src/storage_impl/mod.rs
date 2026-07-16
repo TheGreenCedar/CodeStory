@@ -10,6 +10,7 @@ use rusqlite::{
     types::Value,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -31,7 +32,7 @@ use helpers::{
     numbered_placeholders, question_placeholders, serialize_candidate_targets,
 };
 
-const SCHEMA_VERSION: u32 = 22;
+const SCHEMA_VERSION: u32 = 25;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -1487,6 +1488,111 @@ pub struct DenseReasonCounts {
     pub unstructured_doc: u32,
 }
 
+/// Graph-derived input for dense retrieval, published without an embedding.
+///
+/// `document_hash`, `policy_version`, and `source_identity` are the stable
+/// reuse boundary. Vector producers add their own versioned evidence later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorInput {
+    pub node_id: NodeId,
+    pub file_node_id: Option<NodeId>,
+    pub kind: NodeKind,
+    pub display_name: String,
+    pub qualified_name: Option<String>,
+    pub file_path: Option<String>,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    pub file_role: FileRole,
+    pub source_provenance: String,
+    pub text: String,
+    pub document_hash: String,
+    pub selection_reason: String,
+    pub policy_version: String,
+    pub source_identity: String,
+    pub updated_at_epoch_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorInputReuseMetadata {
+    pub node_id: NodeId,
+    pub document_hash: String,
+    pub selection_reason: String,
+    pub policy_version: String,
+    pub source_identity: String,
+}
+
+pub const DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+pub const DENSE_ANCHOR_MIGRATION_STATE_NATIVE: &str = "native_v1";
+const DENSE_ANCHOR_DIGEST_DOMAIN: &[u8] = b"codestory-dense-anchor-publication-v1\0";
+
+/// Complete dense-anchor input publication bound to one core generation.
+///
+/// Absence is meaningful: migrated databases remain unpublished until core
+/// indexing has deterministically rebuilt or adopted the complete anchor set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenseAnchorPublicationManifest {
+    pub schema_version: u32,
+    pub complete: bool,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    pub anchor_count: u64,
+    pub anchor_digest: String,
+    pub policy_version: String,
+    pub migration_state: String,
+    pub published_at_epoch_ms: i64,
+}
+
+fn hash_dense_anchor_part(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn dense_anchor_content_summary(
+    conn: &Connection,
+) -> Result<(u64, String, HashSet<String>), StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT node_id, file_node_id, kind, display_name, qualified_name,
+                file_path, start_line, end_line, file_role, source_provenance,
+                document_text, document_hash, selection_reason, policy_version
+         FROM dense_anchor_input ORDER BY node_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut hasher = Sha256::new();
+    hasher.update(DENSE_ANCHOR_DIGEST_DOMAIN);
+    let mut count = 0_u64;
+    let mut policies = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let values = [
+            row.get::<_, i64>(0)?.to_string(),
+            row.get::<_, Option<i64>>(1)?
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.get::<_, i64>(2)?.to_string(),
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            row.get::<_, Option<i64>>(6)?
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.get::<_, Option<i64>>(7)?
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, String>(12)?,
+            row.get::<_, String>(13)?,
+        ];
+        policies.insert(values[13].clone());
+        for value in values {
+            hash_dense_anchor_part(&mut hasher, value.as_bytes());
+        }
+        count = count.saturating_add(1);
+    }
+    Ok((count, format!("{:x}", hasher.finalize()), policies))
+}
+
 /// Graph-native symbol-search document used by retrieval sidecars.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolSearchDoc {
@@ -2485,6 +2591,8 @@ impl Storage {
         tx.execute("DELETE FROM occurrence", [])?;
         tx.execute("DELETE FROM edge", [])?;
         tx.execute("DELETE FROM llm_symbol_doc", [])?;
+        tx.execute("DELETE FROM dense_anchor_input", [])?;
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
         tx.execute("DELETE FROM symbol_search_doc", [])?;
         tx.execute("DELETE FROM symbol_summary", [])?;
         tx.execute("DELETE FROM search_symbol_projection", [])?;
@@ -2602,6 +2710,18 @@ impl Storage {
                 OR instr(COALESCE(file_path, ''), ?1) > 0
                 OR instr(doc_text, ?1) > 0
                 OR instr(source_provenance, ?1) > 0",
+            "UPDATE dense_anchor_input
+             SET
+                display_name = replace(display_name, ?1, ?2),
+                qualified_name = replace(qualified_name, ?1, ?2),
+                file_path = replace(file_path, ?1, ?2),
+                source_provenance = replace(source_provenance, ?1, ?2),
+                document_text = replace(document_text, ?1, ?2)
+             WHERE instr(display_name, ?1) > 0
+                OR instr(COALESCE(qualified_name, ''), ?1) > 0
+                OR instr(COALESCE(file_path, ''), ?1) > 0
+                OR instr(source_provenance, ?1) > 0
+                OR instr(document_text, ?1) > 0",
             "UPDATE search_symbol_projection
              SET display_name = replace(display_name, ?1, ?2)
              WHERE instr(display_name, ?1) > 0",
@@ -2624,6 +2744,10 @@ impl Storage {
             updated =
                 updated.saturating_add(tx.execute(statement, params![source_root, target_root])?);
         }
+        // Dense anchor rows have been rebound to a different project identity. Keep them
+        // available as incremental inputs, but require core indexing to publish a new,
+        // internally consistent manifest before retrieval can consume them.
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
         tx.commit()?;
         Ok(updated)
     }
@@ -2674,6 +2798,7 @@ impl Storage {
             "SELECT COUNT(*) FROM error WHERE message LIKE ?1",
             "SELECT COUNT(*) FROM llm_symbol_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1",
             "SELECT COUNT(*) FROM symbol_search_doc WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR doc_text LIKE ?1 OR source_provenance LIKE ?1",
+            "SELECT COUNT(*) FROM dense_anchor_input WHERE display_name LIKE ?1 OR qualified_name LIKE ?1 OR file_path LIKE ?1 OR source_provenance LIKE ?1 OR document_text LIKE ?1",
             "SELECT COUNT(*) FROM search_symbol_projection WHERE display_name LIKE ?1",
             "SELECT COUNT(*) FROM grounding_file_snapshot WHERE path LIKE ?1",
             "SELECT COUNT(*) FROM grounding_node_snapshot WHERE serialized_name LIKE ?1 OR qualified_name LIKE ?1 OR canonical_id LIKE ?1 OR display_name LIKE ?1 OR file_path LIKE ?1",
@@ -3112,6 +3237,7 @@ impl Storage {
                 Self::insert_node_with_stmt(&mut stmt, node)?;
             }
         }
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
         tx.commit()?;
 
         // Update cache
@@ -3233,6 +3359,22 @@ impl Storage {
                )",
             [],
         )?;
+        let removed_anchor_inputs = tx.execute(
+            "DELETE FROM dense_anchor_input
+             WHERE node_id IN (
+                 SELECT id FROM node
+                 WHERE serialized_name LIKE 'component_report:%'
+                    OR canonical_id LIKE 'codestory:component_report:%'
+             )
+               AND NOT EXISTS (
+                   SELECT 1 FROM temp.retrieval_artifact_dense_keep keep
+                   WHERE keep.node_id = dense_anchor_input.node_id
+               )",
+            [],
+        )?;
+        if removed_anchor_inputs > 0 {
+            tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        }
         let removed_symbol = tx.execute(
             "DELETE FROM symbol_search_doc
              WHERE node_id IN (SELECT node_id FROM temp.retrieval_artifact_stale)",
@@ -3269,7 +3411,9 @@ impl Storage {
         }
         drop(cache);
         self.invalidate_grounding_snapshots()?;
-        Ok(removed_dense.saturating_add(removed_symbol))
+        Ok(removed_dense
+            .saturating_add(removed_anchor_inputs)
+            .saturating_add(removed_symbol))
     }
 
     pub fn copy_retrieval_artifact_nodes_from(
@@ -4101,6 +4245,412 @@ impl Storage {
                     row.get::<_, i64>(0)
                 })?;
         Ok(clamp_i64_to_u32(count))
+    }
+
+    pub fn upsert_dense_anchor_inputs_batch(
+        &mut self,
+        inputs: &[DenseAnchorInput],
+    ) -> Result<(), StorageError> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO dense_anchor_input (
+                    node_id, file_node_id, kind, display_name, qualified_name,
+                    file_path, start_line, end_line, file_role, source_provenance,
+                    document_text, document_hash, selection_reason, policy_version,
+                    source_identity, updated_at_epoch_ms
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16
+                 )
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    file_node_id = excluded.file_node_id,
+                    kind = excluded.kind,
+                    display_name = excluded.display_name,
+                    qualified_name = excluded.qualified_name,
+                    file_path = excluded.file_path,
+                    start_line = excluded.start_line,
+                    end_line = excluded.end_line,
+                    file_role = excluded.file_role,
+                    source_provenance = excluded.source_provenance,
+                    document_text = excluded.document_text,
+                    document_hash = excluded.document_hash,
+                    selection_reason = excluded.selection_reason,
+                    policy_version = excluded.policy_version,
+                    source_identity = excluded.source_identity,
+                    updated_at_epoch_ms = excluded.updated_at_epoch_ms",
+            )?;
+            for input in inputs {
+                stmt.execute(params![
+                    input.node_id.0,
+                    input.file_node_id.map(|id| id.0),
+                    input.kind as i32,
+                    input.display_name,
+                    input.qualified_name,
+                    input.file_path,
+                    input.start_line,
+                    input.end_line,
+                    input.file_role.as_str(),
+                    input.source_provenance,
+                    input.text,
+                    input.document_hash,
+                    input.selection_reason,
+                    input.policy_version,
+                    input.source_identity,
+                    input.updated_at_epoch_ms,
+                ])?;
+            }
+        }
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_dense_anchor_inputs_batch_after(
+        &self,
+        after_node_id: Option<NodeId>,
+        limit: usize,
+    ) -> Result<Vec<DenseAnchorInput>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, file_node_id, kind, display_name, qualified_name,
+                    file_path, start_line, end_line, file_role, source_provenance,
+                    document_text, document_hash, selection_reason, policy_version,
+                    source_identity, updated_at_epoch_ms
+             FROM dense_anchor_input
+             WHERE (?1 IS NULL OR node_id > ?1)
+             ORDER BY node_id ASC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![
+            after_node_id.map(|id| id.0),
+            limit.min(i64::MAX as usize) as i64
+        ])?;
+        let mut inputs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: i32 = row.get(2)?;
+            let file_role: String = row.get(8)?;
+            inputs.push(DenseAnchorInput {
+                node_id: NodeId(row.get(0)?),
+                file_node_id: row.get::<_, Option<i64>>(1)?.map(NodeId),
+                kind: NodeKind::try_from(kind)?,
+                display_name: row.get(3)?,
+                qualified_name: row.get(4)?,
+                file_path: row.get(5)?,
+                start_line: row.get(6)?,
+                end_line: row.get(7)?,
+                file_role: FileRole::from_db_value(&file_role),
+                source_provenance: row.get(9)?,
+                text: row.get(10)?,
+                document_hash: row.get(11)?,
+                selection_reason: row.get(12)?,
+                policy_version: row.get(13)?,
+                source_identity: row.get(14)?,
+                updated_at_epoch_ms: row.get(15)?,
+            });
+        }
+        Ok(inputs)
+    }
+
+    pub fn get_dense_anchor_input_reuse_metadata(
+        &self,
+    ) -> Result<Vec<DenseAnchorInputReuseMetadata>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, document_hash, selection_reason, policy_version, source_identity
+             FROM dense_anchor_input ORDER BY node_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DenseAnchorInputReuseMetadata {
+                node_id: NodeId(row.get(0)?),
+                document_hash: row.get(1)?,
+                selection_reason: row.get(2)?,
+                policy_version: row.get(3)?,
+                source_identity: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_dense_anchor_publication_manifest(
+        &self,
+    ) -> Result<Option<DenseAnchorPublicationManifest>, StorageError> {
+        self.conn
+            .query_row(
+                "SELECT schema_version, complete, core_generation_id, core_run_id,
+                        anchor_count, anchor_digest, policy_version, migration_state,
+                        published_at_epoch_ms
+                 FROM dense_anchor_publication WHERE id = 1",
+                [],
+                |row| {
+                    let schema_version = row.get::<_, i64>(0)?;
+                    let anchor_count = row.get::<_, i64>(4)?;
+                    Ok(DenseAnchorPublicationManifest {
+                        schema_version: schema_version.max(0).min(u32::MAX as i64) as u32,
+                        complete: row.get::<_, i64>(1)? == 1,
+                        core_generation_id: row.get(2)?,
+                        core_run_id: row.get(3)?,
+                        anchor_count: anchor_count.max(0) as u64,
+                        anchor_digest: row.get(5)?,
+                        policy_version: row.get(6)?,
+                        migration_state: row.get(7)?,
+                        published_at_epoch_ms: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Rebind every carried-forward row and atomically publish its complete manifest.
+    pub fn publish_dense_anchor_generation(
+        &mut self,
+        publication: &IndexPublicationRecord,
+        policy_version: &str,
+    ) -> Result<DenseAnchorPublicationManifest, StorageError> {
+        if publication.generation_id.trim().is_empty()
+            || publication.run_id.trim().is_empty()
+            || policy_version.trim().is_empty()
+        {
+            return Err(StorageError::Other(
+                "dense anchor publication identity and policy must be non-empty".into(),
+            ));
+        }
+        let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE dense_anchor_input SET source_identity = ?1",
+            params![source_identity],
+        )?;
+        let (anchor_count, anchor_digest, policies) = dense_anchor_content_summary(&tx)?;
+        if policies.iter().any(|policy| policy != policy_version)
+            || (anchor_count > 0 && policies.len() != 1)
+        {
+            return Err(StorageError::Other(format!(
+                "dense anchor publication contains policies {:?}, expected {policy_version}",
+                policies
+            )));
+        }
+        let manifest = DenseAnchorPublicationManifest {
+            schema_version: DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION,
+            complete: true,
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            anchor_count,
+            anchor_digest,
+            policy_version: policy_version.to_string(),
+            migration_state: DENSE_ANCHOR_MIGRATION_STATE_NATIVE.to_string(),
+            published_at_epoch_ms: publication.published_at_epoch_ms,
+        };
+        tx.execute(
+            "INSERT INTO dense_anchor_publication (
+                id, schema_version, complete, core_generation_id, core_run_id,
+                anchor_count, anchor_digest, policy_version, migration_state,
+                published_at_epoch_ms
+             ) VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                complete = excluded.complete,
+                core_generation_id = excluded.core_generation_id,
+                core_run_id = excluded.core_run_id,
+                anchor_count = excluded.anchor_count,
+                anchor_digest = excluded.anchor_digest,
+                policy_version = excluded.policy_version,
+                migration_state = excluded.migration_state,
+                published_at_epoch_ms = excluded.published_at_epoch_ms",
+            params![
+                manifest.schema_version as i64,
+                &manifest.core_generation_id,
+                &manifest.core_run_id,
+                manifest.anchor_count.min(i64::MAX as u64) as i64,
+                &manifest.anchor_digest,
+                &manifest.policy_version,
+                &manifest.migration_state,
+                manifest.published_at_epoch_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(manifest)
+    }
+
+    /// Validate the manifest against both the pinned publication and current rows.
+    pub fn validate_dense_anchor_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<DenseAnchorPublicationManifest, StorageError> {
+        let manifest = self
+            .get_dense_anchor_publication_manifest()?
+            .ok_or_else(|| StorageError::Other("dense anchor publication is missing".into()))?;
+        if manifest.schema_version != DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION
+            || !manifest.complete
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.migration_state != DENSE_ANCHOR_MIGRATION_STATE_NATIVE
+            || manifest.policy_version.trim().is_empty()
+        {
+            return Err(StorageError::Other(
+                "dense anchor publication does not match the complete core publication".into(),
+            ));
+        }
+        let (anchor_count, anchor_digest, policies) = dense_anchor_content_summary(&self.conn)?;
+        if manifest.anchor_count != anchor_count
+            || manifest.anchor_digest != anchor_digest
+            || policies
+                .iter()
+                .any(|policy| policy != &manifest.policy_version)
+            || (anchor_count > 0 && policies.len() != 1)
+        {
+            return Err(StorageError::Other(
+                "dense anchor publication rows do not match their manifest".into(),
+            ));
+        }
+        let expected_source = format!("core:{}:{}", publication.generation_id, publication.run_id);
+        let mismatched_sources = self.conn.query_row(
+            "SELECT COUNT(*) FROM dense_anchor_input WHERE source_identity <> ?1",
+            params![expected_source],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if mismatched_sources != 0 {
+            return Err(StorageError::Other(
+                "dense anchor publication contains stale source identities".into(),
+            ));
+        }
+        Ok(manifest)
+    }
+
+    pub fn clear_dense_anchor_inputs(&mut self) -> Result<usize, StorageError> {
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute("DELETE FROM dense_anchor_input", [])?;
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn copy_dense_anchor_inputs_from(
+        &mut self,
+        source_path: &Path,
+    ) -> Result<usize, StorageError> {
+        if !source_path.exists() {
+            return Ok(0);
+        }
+        drop(Storage::open(source_path)?);
+        let source = source_path.to_string_lossy().to_string();
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS dense_anchor_source", params![source])?;
+        let copy_result = self.conn.execute(
+            "INSERT OR REPLACE INTO dense_anchor_input
+             SELECT source.* FROM dense_anchor_source.dense_anchor_input source
+             WHERE EXISTS (SELECT 1 FROM node WHERE node.id = source.node_id)
+               AND (source.file_node_id IS NULL OR EXISTS (
+                    SELECT 1 FROM node WHERE node.id = source.file_node_id
+               ))",
+            [],
+        );
+        if copy_result.is_ok() {
+            self.conn
+                .execute("DELETE FROM dense_anchor_publication", [])?;
+        }
+        let detach_result = self.conn.execute("DETACH DATABASE dense_anchor_source", []);
+        let copied = copy_result?;
+        detach_result?;
+        Ok(copied)
+    }
+
+    pub fn prune_dense_anchor_inputs_to_node_ids(
+        &mut self,
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if keep_node_ids.is_empty() {
+            return self.clear_dense_anchor_inputs();
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS dense_anchor_input_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.dense_anchor_input_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.dense_anchor_input_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM dense_anchor_input
+             WHERE NOT EXISTS (
+                SELECT 1 FROM temp.dense_anchor_input_keep keep
+                WHERE keep.node_id = dense_anchor_input.node_id
+             )",
+            [],
+        )?;
+        if removed > 0 {
+            tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        }
+        tx.execute("DROP TABLE temp.dense_anchor_input_keep", [])?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    pub fn delete_dense_anchor_inputs_for_files_except_node_ids(
+        &mut self,
+        file_node_ids: &[NodeId],
+        keep_node_ids: &[NodeId],
+    ) -> Result<usize, StorageError> {
+        if file_node_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS dense_anchor_input_scope (
+                file_node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS dense_anchor_input_keep (
+                node_id INTEGER PRIMARY KEY
+             )",
+            [],
+        )?;
+        tx.execute("DELETE FROM temp.dense_anchor_input_scope", [])?;
+        tx.execute("DELETE FROM temp.dense_anchor_input_keep", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.dense_anchor_input_scope (file_node_id) VALUES (?1)",
+            )?;
+            for file_node_id in file_node_ids {
+                stmt.execute(params![file_node_id.0])?;
+            }
+        }
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO temp.dense_anchor_input_keep (node_id) VALUES (?1)",
+            )?;
+            for node_id in keep_node_ids {
+                stmt.execute(params![node_id.0])?;
+            }
+        }
+        let removed = tx.execute(
+            "DELETE FROM dense_anchor_input
+             WHERE file_node_id IN (SELECT file_node_id FROM temp.dense_anchor_input_scope)
+               AND NOT EXISTS (
+                    SELECT 1 FROM temp.dense_anchor_input_keep keep
+                    WHERE keep.node_id = dense_anchor_input.node_id
+               )",
+            [],
+        )?;
+        if removed > 0 {
+            tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        }
+        tx.execute("DROP TABLE temp.dense_anchor_input_scope", [])?;
+        tx.execute("DROP TABLE temp.dense_anchor_input_keep", [])?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     pub fn upsert_symbol_search_docs_batch(
@@ -6398,6 +6948,15 @@ impl Storage {
         )?;
         tx.execute(
             &format!(
+                "DELETE FROM dense_anchor_input
+                 WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                 OR file_node_id = ?1"
+            ),
+            params![file_node_id],
+        )?;
+        tx.execute("DELETE FROM dense_anchor_publication", [])?;
+        tx.execute(
+            &format!(
                 "DELETE FROM symbol_search_doc
                  WHERE node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR file_node_id = ?1"
@@ -7008,7 +7567,7 @@ mod grounding_snapshot_fast_path_tests {
     }
 }
 
-pub use retrieval_manifest::RetrievalIndexManifest;
+pub use retrieval_manifest::{RetrievalIndexManifest, RetrievalIndexRollbackRecord};
 
 #[cfg(test)]
 mod tests;

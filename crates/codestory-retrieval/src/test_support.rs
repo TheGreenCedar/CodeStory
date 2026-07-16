@@ -1,4 +1,7 @@
-use codestory_store::RetrievalIndexManifest;
+use anyhow::{Context, Result, bail};
+use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
+use codestory_store::{RetrievalIndexManifest, Store};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -46,4 +49,118 @@ pub fn retrieval_manifest_fixture(
         precise_semantic_import_revision: None,
         precise_semantic_import_producer: None,
     }
+}
+
+/// Publish a strict, zero-dense query fixture with the same vector-generation evidence required
+/// by product `PinnedQuerySession` reads.
+pub fn publish_zero_dense_pinned_query_fixture(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &crate::SidecarRuntimeConfig,
+) -> Result<RetrievalIndexManifest> {
+    let project_id = crate::index::sidecar_project_id_for_runtime(project_root, runtime)?;
+    let embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
+    let embedding_dim = i32::try_from(crate::embeddings::semantic_vector_dim())
+        .unwrap_or(crate::embeddings::RETRIEVAL_EMBEDDING_DIM as i32);
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let producer_compatibility_identity =
+        crate::embedded_vector::vector_producer_compatibility_identity(
+            &embedding_device,
+            None,
+            u32::try_from(embedding_dim).context("negative embedding dimension")?,
+        )?;
+    let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
+    let publication = storage
+        .get_complete_index_publication()
+        .context("load pinned query fixture publication")?
+        .context("pinned query fixture requires a complete core publication")?;
+    storage
+        .publish_dense_anchor_generation(&publication, crate::generation::SEMANTIC_POLICY_VERSION)
+        .context("publish pinned query fixture dense-anchor manifest")?;
+    let input = crate::index::compute_sidecar_input_fingerprint(
+        &storage,
+        project_root,
+        &project_id,
+        &embedding_backend,
+        embedding_dim,
+        &producer_compatibility_identity,
+    )?;
+    if input.dense_projection_count != 0 {
+        bail!("zero-dense pinned query fixture received dense anchors");
+    }
+    let mut manifest = retrieval_manifest_fixture(&project_id, &input.hash);
+    manifest.built_at_epoch_ms = chrono::Utc::now().timestamp_millis();
+    manifest.projection_count = Some(input.projection_count);
+    manifest.symbol_doc_count = Some(input.symbol_doc_count);
+    manifest.dense_projection_count = Some(input.dense_projection_count);
+    manifest.semantic_policy_version = input.semantic_policy_version;
+    manifest.graph_artifact_hash = Some(input.graph_artifact_hash);
+    manifest.dense_reason_counts_json = Some(input.dense_reason_counts_json);
+    storage
+        .upsert_retrieval_index_manifest(&manifest)
+        .context("publish pinned query fixture manifest")?;
+    drop(storage);
+
+    publish_zero_dense_vector_evidence(runtime, &manifest, &publication)?;
+    Ok(manifest)
+}
+
+fn publish_zero_dense_vector_evidence(
+    runtime: &crate::SidecarRuntimeConfig,
+    manifest: &RetrievalIndexManifest,
+    publication: &codestory_store::IndexPublicationRecord,
+) -> Result<()> {
+    let retrieval_generation = manifest
+        .sidecar_generation
+        .as_deref()
+        .context("fixture sidecar generation")?;
+    let retrieval_input_hash = manifest
+        .sidecar_input_hash
+        .as_deref()
+        .context("fixture sidecar input hash")?;
+    let embedding_backend = manifest
+        .embedding_backend
+        .as_deref()
+        .context("fixture embedding backend")?;
+    let embedding_dim = usize::try_from(
+        manifest
+            .embedding_dim
+            .context("fixture embedding dimension")?,
+    )
+    .context("negative fixture embedding dimension")?;
+    let embedding_device = crate::embeddings::embedding_device_readiness_for_runtime(runtime);
+    let evidence = crate::embedded_vector::build_vector_producer_evidence(
+        &embedding_device,
+        None,
+        u32::try_from(embedding_dim).context("fixture vector dimension overflow")?,
+        EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: publication.generation_id.clone(),
+            core_run_id: publication.run_id.clone(),
+            retrieval_generation: retrieval_generation.to_string(),
+            retrieval_input_hash: retrieval_input_hash.to_string(),
+            semantic_generation: manifest.semantic_generation.clone(),
+        },
+    );
+    let compatibility = crate::embedded_vector::vector_compatibility_identity(&evidence)?;
+    let contract = crate::embedded_vector::VectorEvidenceContract::new(
+        embedding_backend,
+        embedding_dim,
+        crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
+        compatibility,
+    );
+    let attestation = crate::embedded_vector::EmbeddedVectorIndex::build_attested_with_points(
+        &runtime.layout,
+        &manifest.semantic_generation,
+        retrieval_generation,
+        retrieval_input_hash,
+        &contract,
+        &[],
+        |_visit| Ok(()),
+    )?;
+    let generation = crate::embedded_vector::VectorGenerationManifest::new(evidence, attestation)?;
+    crate::embedded_vector::EmbeddedVectorIndex::publish_generation_manifest(
+        &runtime.layout,
+        &manifest.semantic_generation,
+        &generation,
+    )
 }

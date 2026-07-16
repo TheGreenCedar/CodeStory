@@ -121,6 +121,38 @@ const TABLE_STATEMENTS: &[&str] = &[
         FOREIGN KEY(node_id) REFERENCES node(id),
         FOREIGN KEY(file_node_id) REFERENCES node(id)
     )",
+    "CREATE TABLE IF NOT EXISTS dense_anchor_input (
+        node_id INTEGER PRIMARY KEY,
+        file_node_id INTEGER,
+        kind INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        qualified_name TEXT,
+        file_path TEXT,
+        start_line INTEGER,
+        end_line INTEGER,
+        file_role TEXT NOT NULL,
+        source_provenance TEXT NOT NULL,
+        document_text TEXT NOT NULL,
+        document_hash TEXT NOT NULL CHECK(length(document_hash) > 0),
+        selection_reason TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        source_identity TEXT NOT NULL CHECK(length(source_identity) > 0),
+        updated_at_epoch_ms INTEGER NOT NULL,
+        FOREIGN KEY(node_id) REFERENCES node(id),
+        FOREIGN KEY(file_node_id) REFERENCES node(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS dense_anchor_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        schema_version INTEGER NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
+        anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+        migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+    )",
     "CREATE TABLE IF NOT EXISTS symbol_search_doc (
         node_id INTEGER PRIMARY KEY,
         file_node_id INTEGER,
@@ -261,7 +293,8 @@ const TABLE_STATEMENTS: &[&str] = &[
         precise_semantic_import_status TEXT,
         precise_semantic_import_reason TEXT,
         precise_semantic_import_revision TEXT,
-        precise_semantic_import_producer TEXT
+        precise_semantic_import_producer TEXT,
+        rollback_record_json TEXT
     )",
 ];
 
@@ -299,6 +332,12 @@ const SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_updated_at ON llm_symbol_doc(updated_at_epoch_ms)",
     "CREATE INDEX IF NOT EXISTS idx_llm_symbol_doc_policy_reason
      ON llm_symbol_doc(semantic_policy_version, dense_reason)",
+    "CREATE INDEX IF NOT EXISTS idx_dense_anchor_input_file_node
+     ON dense_anchor_input(file_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_dense_anchor_input_reuse
+     ON dense_anchor_input(policy_version, document_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_dense_anchor_input_source
+     ON dense_anchor_input(source_identity)",
     "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_file_node ON symbol_search_doc(file_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_kind ON symbol_search_doc(kind)",
     "CREATE INDEX IF NOT EXISTS idx_symbol_search_doc_policy ON symbol_search_doc(policy_version)",
@@ -465,6 +504,18 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v22_retrieval_manifest_semantic_generation(&storage.conn)?;
     if stored_version < 22 {
         storage.set_schema_version(22)?;
+    }
+    migrate_v23_dense_anchor_input(&storage.conn)?;
+    if stored_version < 23 {
+        storage.set_schema_version(23)?;
+    }
+    migrate_v24_dense_anchor_publication(&storage.conn)?;
+    if stored_version < 24 {
+        storage.set_schema_version(24)?;
+    }
+    migrate_v25_retrieval_rollback(&storage.conn)?;
+    if stored_version < 25 {
+        storage.set_schema_version(25)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -742,6 +793,60 @@ pub(super) fn migrate_v22_retrieval_manifest_semantic_generation(
             "retrieval_index_manifest is missing semantic_generation".into(),
         )),
     }
+}
+
+pub(super) fn migrate_v23_dense_anchor_input(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dense_anchor_input (
+            node_id INTEGER PRIMARY KEY,
+            file_node_id INTEGER,
+            kind INTEGER NOT NULL,
+            display_name TEXT NOT NULL,
+            qualified_name TEXT,
+            file_path TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            file_role TEXT NOT NULL,
+            source_provenance TEXT NOT NULL,
+            document_text TEXT NOT NULL,
+            document_hash TEXT NOT NULL CHECK(length(document_hash) > 0),
+            selection_reason TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            source_identity TEXT NOT NULL CHECK(length(source_identity) > 0),
+            updated_at_epoch_ms INTEGER NOT NULL,
+            FOREIGN KEY(node_id) REFERENCES node(id),
+            FOREIGN KEY(file_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v24_dense_anchor_publication(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dense_anchor_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            schema_version INTEGER NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
+            anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+            policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
+            migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+pub(super) fn migrate_v25_retrieval_rollback(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "retrieval_index_manifest",
+        "rollback_record_json TEXT",
+    )
 }
 
 fn create_symbol_summary_indexes(conn: &Connection) -> Result<(), StorageError> {

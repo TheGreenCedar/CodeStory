@@ -55,8 +55,10 @@ generations:
   identities.
 
 The core database also retains graph-native symbol documents, component reports,
-and reusable dense-anchor rows. Those rows are inputs to retrieval publication,
-not a replacement for the published vector generation.
+and reusable embedding-free dense-anchor rows. Each row carries its content
+hash, selection policy, source provenance, and exact core generation/run
+identity. Those rows are inputs to retrieval publication, not a replacement for
+the published vector generation.
 
 ```mermaid
 flowchart LR
@@ -80,10 +82,15 @@ and retention remain project-owned.
 - semantic generation.
 
 The manifest additionally records lexical/source fingerprints, graph artifact
-identity, counts, schema and policy versions, and the embedding producer
-identity. Producer identity covers the model digest, ggml build, backend policy,
-prefix/pooling/normalization contract, and vector format. A changed producer
-causes one transparent generation rebuild; it does not select a legacy engine.
+identity, counts, schema and policy versions, and a versioned embedding producer
+evidence contract. That evidence binds model bytes and tokenizer/config
+digests, dimensions and query/document semantics, engine build/backend/device,
+live execution eligibility, and the exact core/retrieval/vector publication.
+A digest of the stable compatibility fields participates in the sidecar input
+fingerprint before generation selection. A changed model, engine, device, or
+execution-proof identity therefore selects a distinct immutable generation and
+causes one transparent rebuild; it does not overwrite the previous generation,
+select a legacy engine, or reuse ambiguous rows.
 
 Some stable DTOs and internal types still use `sidecar` or
 `sidecar_generation` names. These are compatibility vocabulary for the
@@ -123,19 +130,21 @@ candidate never weakens the last known-good publication.
 
 ## Reader protocol
 
-1. Cheaply validate immutable manifest and generation metadata.
-2. Execute lexical, vector, SCIP, and graph candidate work against the recorded
-   publication identity.
-3. Return hits with that identity.
-4. Open a matching core SQLite read transaction and retain the referenced
-   generation leases while resolving files, roles, and node IDs.
+1. Open one matching core SQLite read transaction.
+2. Validate the immutable manifest, exact vector database bytes and canonical
+   row digest, anchor coverage, producer evidence, and live engine identity.
+3. Retain the referenced lexical/vector/SCIP generations and engine residency.
+4. Execute candidate work and resolve files, roles, and node IDs through that
+   same session.
 5. Revalidate current core, retrieval, and engine identities before returning.
 
-Query and resolution are identity-coherent across separately pinned reads.
-They do not reopen “whatever is current” for numeric candidate resolution. A
-publication change yields `cache_busy` and permits one bounded runtime retry.
-Deep corpus validation belongs at build, promotion, readiness, or explicit
-health boundaries, not on every query.
+Query and resolution share one pinned session; they never reopen “whatever is
+current” for numeric candidate resolution. A publication change yields the
+typed `publication_changed` error and permits one whole-operation runtime retry.
+One pinned retrieval session covers sidecar query execution and numeric
+candidate resolution. Higher-level graph, source, packet, agent, CLI, and MCP
+assembly is not yet part of that proof boundary and must not describe the
+session identity as a complete-operation pin.
 
 ## Readiness
 

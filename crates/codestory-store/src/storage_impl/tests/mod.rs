@@ -274,6 +274,11 @@ fn interrupted_v19_run_migrates_manifest_column_without_clearing_fence() -> Resu
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     assert!(columns.iter().any(|column| column == "lexical_version"));
+    assert!(
+        columns
+            .iter()
+            .any(|column| column == "rollback_record_json")
+    );
     assert!(!columns.iter().any(|column| column == "zoekt_version"));
     storage.finish_incremental_run()?;
     assert_eq!(Storage::database_schema_version(&path)?, SCHEMA_VERSION);
@@ -809,6 +814,185 @@ fn test_symbol_search_doc_version_mismatch_detection() -> Result<(), StorageErro
 
     assert!(!storage.has_symbol_search_doc_version_mismatch(6)?);
     assert!(storage.has_symbol_search_doc_version_mismatch(5)?);
+    Ok(())
+}
+
+fn dense_anchor(node_id: i64, file_node_id: Option<i64>, source: &str) -> DenseAnchorInput {
+    DenseAnchorInput {
+        node_id: NodeId(node_id),
+        file_node_id: file_node_id.map(NodeId),
+        kind: NodeKind::FUNCTION,
+        display_name: format!("function_{node_id}"),
+        qualified_name: Some(format!("pkg::function_{node_id}")),
+        file_path: Some("src/lib.rs".to_string()),
+        start_line: Some(node_id as u32),
+        end_line: Some(node_id as u32 + 2),
+        file_role: FileRole::Source,
+        source_provenance: "parser".to_string(),
+        text: format!("function function_{node_id}"),
+        document_hash: format!("hash-{node_id}"),
+        selection_reason: "public_symbol".to_string(),
+        policy_version: "dense-anchor-v1".to_string(),
+        source_identity: source.to_string(),
+        updated_at_epoch_ms: 123,
+    }
+}
+
+#[test]
+fn dense_anchor_inputs_round_trip_prune_and_copy_with_node_ownership() -> Result<(), StorageError> {
+    let source_path = unique_temp_db_path("dense-anchor-source");
+    let destination_path = unique_temp_db_path("dense-anchor-destination");
+    {
+        let mut source = Storage::open(&source_path)?;
+        source.insert_nodes_batch(&[
+            file_node(700, "src/lib.rs"),
+            Node {
+                id: NodeId(701),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "function_701".to_string(),
+                file_node_id: Some(NodeId(700)),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(702),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "function_702".to_string(),
+                file_node_id: Some(NodeId(700)),
+                ..Default::default()
+            },
+        ])?;
+        source.upsert_dense_anchor_inputs_batch(&[
+            dense_anchor(701, Some(700), "core:g1:r1"),
+            dense_anchor(702, Some(700), "core:g1:r1"),
+        ])?;
+
+        let rows = source.get_dense_anchor_inputs_batch_after(None, 10)?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], dense_anchor(701, Some(700), "core:g1:r1"));
+        assert_eq!(
+            source.prune_dense_anchor_inputs_to_node_ids(&[NodeId(702)])?,
+            1
+        );
+        assert_eq!(source.get_dense_anchor_input_reuse_metadata()?.len(), 1);
+    }
+
+    {
+        let mut destination = Storage::open(&destination_path)?;
+        destination.insert_nodes_batch(&[
+            file_node(700, "src/lib.rs"),
+            Node {
+                id: NodeId(702),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "function_702".to_string(),
+                file_node_id: Some(NodeId(700)),
+                ..Default::default()
+            },
+        ])?;
+        assert_eq!(destination.copy_dense_anchor_inputs_from(&source_path)?, 1);
+        assert_eq!(
+            destination.get_dense_anchor_inputs_batch_after(None, 10)?,
+            vec![dense_anchor(702, Some(700), "core:g1:r1")]
+        );
+    }
+
+    let _ = cleanup_sqlite_sidecars(&source_path);
+    let _ = cleanup_sqlite_sidecars(&destination_path);
+    Ok(())
+}
+
+#[test]
+fn dense_anchor_manifest_rebinds_carry_forward_and_detects_mutation() -> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(&[
+        file_node(700, "src/lib.rs"),
+        Node {
+            id: NodeId(701),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "function_701".to_string(),
+            file_node_id: Some(NodeId(700)),
+            ..Default::default()
+        },
+    ])?;
+    storage.upsert_dense_anchor_inputs_batch(&[dense_anchor(
+        701,
+        Some(700),
+        "core:previous:run",
+    )])?;
+    let first_publication = IndexPublicationRecord {
+        generation: 1,
+        generation_id: "generation-1".into(),
+        run_id: "run-1".into(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 1,
+    };
+    let first = storage.publish_dense_anchor_generation(&first_publication, "dense-anchor-v1")?;
+    storage.put_index_publication(&first_publication)?;
+    assert_eq!(
+        storage.validate_dense_anchor_publication(&first_publication)?,
+        first
+    );
+    assert_eq!(first.anchor_count, 1);
+    assert_eq!(first.anchor_digest.len(), 64);
+    assert_eq!(
+        storage.get_dense_anchor_inputs_batch_after(None, 10)?[0].source_identity,
+        "core:generation-1:run-1"
+    );
+
+    let second_publication = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "generation-2".into(),
+        run_id: "run-2".into(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 2,
+    };
+    let second = storage.publish_dense_anchor_generation(&second_publication, "dense-anchor-v1")?;
+    assert_eq!(second.anchor_digest, first.anchor_digest);
+    assert_eq!(
+        storage.get_dense_anchor_inputs_batch_after(None, 10)?[0].source_identity,
+        "core:generation-2:run-2"
+    );
+
+    let mut changed = storage.get_dense_anchor_inputs_batch_after(None, 10)?;
+    changed[0].text.push_str(" changed");
+    storage.upsert_dense_anchor_inputs_batch(&changed)?;
+    assert!(storage.get_dense_anchor_publication_manifest()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn schema_22_migrates_to_dense_anchor_inputs_without_synthesizing_rows() -> Result<(), StorageError>
+{
+    let path = unique_temp_db_path("dense-anchor-v23-migration");
+    {
+        let storage = Storage::open(&path)?;
+        storage.get_connection().execute_batch(
+            "DROP TABLE dense_anchor_publication;
+                 DROP TABLE dense_anchor_input;",
+        )?;
+        storage.set_schema_version(22)?;
+    }
+
+    let storage = Storage::open(&path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert!(
+        storage
+            .get_dense_anchor_inputs_batch_after(None, 10)?
+            .is_empty()
+    );
+    assert!(storage.get_dense_anchor_publication_manifest()?.is_none());
+    let indexes = storage
+        .get_connection()
+        .prepare("PRAGMA index_list(dense_anchor_input)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "idx_dense_anchor_input_reuse")
+    );
+
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&path);
     Ok(())
 }
 
@@ -1898,6 +2082,55 @@ fn current_schema_uses_only_lexical_manifest_column() -> Result<(), StorageError
 
     drop(storage);
     let _ = std::fs::remove_file(&db_path);
+    Ok(())
+}
+
+#[test]
+fn schema_24_adds_atomic_retrieval_rollback_without_losing_current() -> Result<(), StorageError> {
+    let db_path = unique_temp_db_path("v24-retrieval-rollback-migration");
+    let _ = std::fs::remove_file(&db_path);
+    let current = RetrievalIndexManifest {
+        project_id: "proj".into(),
+        lexical_version: "v1".into(),
+        semantic_generation: "codestory_proj_aaaaaaaaaaaaaaaa".into(),
+        scip_revision: Some("graph".into()),
+        built_at_epoch_ms: 1,
+        disk_bytes: None,
+        degraded_modes_json: "[]".into(),
+        embedding_backend: Some("backend".into()),
+        embedding_dim: Some(768),
+        sidecar_schema_version: Some(5),
+        sidecar_input_hash: Some("a".repeat(64)),
+        sidecar_generation: Some("proj-aaaaaaaaaaaaaaaa".into()),
+        projection_count: Some(0),
+        symbol_doc_count: Some(0),
+        dense_projection_count: Some(0),
+        semantic_policy_version: Some("graph_first_v1".into()),
+        graph_artifact_hash: Some("graph".into()),
+        dense_reason_counts_json: Some("{}".into()),
+        precise_semantic_import_status: None,
+        precise_semantic_import_reason: None,
+        precise_semantic_import_revision: None,
+        precise_semantic_import_producer: None,
+    };
+    {
+        let mut storage = Storage::open(&db_path)?;
+        storage.upsert_retrieval_index_manifest(&current)?;
+        storage.conn.execute(
+            "ALTER TABLE retrieval_index_manifest DROP COLUMN rollback_record_json",
+            [],
+        )?;
+        storage.set_schema_version(24)?;
+    }
+
+    let storage = Storage::open(&db_path)?;
+    assert_eq!(storage.schema_version()?, SCHEMA_VERSION);
+    assert_eq!(
+        storage.get_retrieval_index_publication("proj")?,
+        Some((current, None))
+    );
+    drop(storage);
+    let _ = cleanup_sqlite_sidecars(&db_path);
     Ok(())
 }
 

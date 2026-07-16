@@ -118,8 +118,12 @@ fidelity coverage land.
 
 Workspace parser policy:
 
-- `tree-sitter = "0.24"`
-- `tree-sitter-graph = "0.12"`
+- `tree-sitter = "0.25.10"`
+- `tree-sitter-rust = "0.24.2"`
+- `tree-sitter-graph = "0.12.0"`, vendored from upstream commit
+  `b930fb59c2177a90b3a6a68e1feeca6918ceb58b` with only the Tree-sitter 0.25
+  compatibility and current lint adjustments recorded in
+  `vendor/tree-sitter-graph/UPSTREAM.md`
 
 Validation: each listed candidate passed an isolated `cargo check` probe with
 the policy pins; wired parser rows also passed a parse smoke. HTML, CSS, SQL,

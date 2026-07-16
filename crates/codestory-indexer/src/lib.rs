@@ -1033,35 +1033,48 @@ impl WorkspaceIndexer {
             }
 
             for mut local_storage in chunk_results {
-                if let Some(file_info) = local_storage.files.first()
+                if let Some((file_id, file_complete)) = local_storage
+                    .files
+                    .first()
+                    .map(|file_info| (file_info.id, file_info.complete))
                     && plan.mode == codestory_workspace::BuildMode::Incremental
-                    && existing_projection_file_ids.contains(&file_info.id)
-                    && replaced_projection_ids.insert(file_info.id)
+                    && existing_projection_file_ids.contains(&file_id)
+                    && replaced_projection_ids.insert(file_id)
                 {
-                    let existing_states = storage
-                        .get_callable_projection_states_for_file(file_info.id)
-                        .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
-                    let cleanup_started = Instant::now();
-                    let update_mode = classify_projection_update(
-                        &existing_states,
-                        &local_storage.callable_projection_states,
-                    );
-                    match update_mode {
-                        ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {}
-                        ProjectionUpdateMode::Delta { changed_callers } => {
-                            storage
-                                .delete_projection_for_callers(file_info.id, &changed_callers)
-                                .map_err(|e| anyhow!("Storage delta cleanup error: {:?}", e))?;
+                    if !file_complete {
+                        // An unreadable, drifting, oversized, or parser-partial source is retry
+                        // evidence, not proof that its previous symbols disappeared. Preserve the
+                        // last verified projection and update only the file/error rows below.
+                        local_storage
+                            .nodes
+                            .retain(|node| node.id != NodeId(file_id));
+                    } else {
+                        let existing_states = storage
+                            .get_callable_projection_states_for_file(file_id)
+                            .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
+                        let cleanup_started = Instant::now();
+                        let update_mode = classify_projection_update(
+                            &existing_states,
+                            &local_storage.callable_projection_states,
+                        );
+                        match update_mode {
+                            ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {
+                            }
+                            ProjectionUpdateMode::Delta { changed_callers } => {
+                                storage
+                                    .delete_projection_for_callers(file_id, &changed_callers)
+                                    .map_err(|e| anyhow!("Storage delta cleanup error: {:?}", e))?;
+                            }
+                            ProjectionUpdateMode::FullReplace => {
+                                storage
+                                    .delete_file_projection(file_id)
+                                    .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
+                            }
                         }
-                        ProjectionUpdateMode::FullReplace => {
-                            storage
-                                .delete_file_projection(file_info.id)
-                                .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
-                        }
+                        stats.cleanup_ms = stats
+                            .cleanup_ms
+                            .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
                     }
-                    stats.cleanup_ms = stats
-                        .cleanup_ms
-                        .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
                 }
                 pending_error_file_ids.extend(local_storage.files.iter().map(|file| file.id));
                 for error in local_storage.errors.drain(..) {
@@ -20209,6 +20222,42 @@ public:
     }
 
     #[test]
+    fn test_rust_2024_constructs_are_complete() -> Result<()> {
+        let language_config = get_language_for_ext("rs").unwrap();
+        let result = index_file(
+            Path::new("rust_2024.rs"),
+            r#"
+unsafe extern "C" {
+    fn foreign(value: i32) -> i32;
+}
+
+fn checked_foreign(value: Option<i32>) -> Option<i32> {
+    let Some(value) = value else {
+        return None;
+    };
+    if let Some(next) = value.checked_add(1)
+        && next > 0
+    {
+        Some(unsafe { foreign(next) })
+    } else {
+        None
+    }
+}
+"#,
+            &language_config,
+            None,
+            None,
+        )?;
+
+        assert_eq!(result.files.len(), 1);
+        assert!(
+            result.files[0].complete,
+            "valid Rust 2024 source should be parser-complete"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_incremental_indexing() -> Result<()> {
         use codestory_store::Store as Storage;
         use codestory_workspace::RefreshInfo;
@@ -20277,6 +20326,64 @@ public:
         assert!(saw_started, "expected IndexingStarted event");
         assert!(saw_complete, "expected IndexingComplete event");
 
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_incomplete_result_preserves_previous_projection() -> Result<()> {
+        use codestory_workspace::RefreshInfo;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("preserved.rs");
+        std::fs::write(&path, "pub fn preserved_symbol() -> i32 { 7 }\n")?;
+        let refresh = RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        };
+        let mut storage = Storage::new_in_memory()?;
+        let bus = EventBus::new();
+
+        WorkspaceIndexer::new(dir.path().to_path_buf()).run_incremental(
+            &mut storage,
+            &refresh,
+            &bus,
+            None,
+        )?;
+        let preserved_id = storage
+            .get_nodes()?
+            .into_iter()
+            .find(|node| node.serialized_name == "preserved_symbol")
+            .map(|node| node.id)
+            .expect("initial verified projection");
+
+        std::fs::write(
+            &path,
+            "pub fn preserved_symbol() -> i32 { 8 }\n// force an oversized retry\n",
+        )?;
+        WorkspaceIndexer::new(dir.path().to_path_buf())
+            .with_source_file_byte_cap(1)
+            .run_incremental(&mut storage, &refresh, &bus, None)?;
+
+        assert!(
+            storage
+                .get_nodes()?
+                .iter()
+                .any(|node| node.id == preserved_id),
+            "an incomplete retry must retain the last verified graph projection"
+        );
+        let file = storage
+            .get_file_by_path(&path)?
+            .expect("incomplete file metadata");
+        assert!(
+            !file.complete,
+            "the retained projection must still request retry"
+        );
+        assert!(storage.get_errors(None)?.iter().any(|error| {
+            error.file_id == Some(NodeId(file.id))
+                && error.message.contains("Skipped oversized source file")
+        }));
         Ok(())
     }
 

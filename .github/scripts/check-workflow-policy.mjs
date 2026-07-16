@@ -300,11 +300,19 @@ export function managedPluginViolations(job, archiveFragment) {
     step?.["continue-on-error"] === undefined,
     "managed plugin proof step must not continue on error",
   );
+  add(
+    violations,
+    object(step?.env).CODESTORY_EMBED_ALLOW_CPU === "1",
+    "managed plugin proof step must explicitly allow CPU evidence",
+  );
   const run = executableRunText(typeof step?.run === "string" ? step.run : "");
   for (const fragment of [
     "python .github/scripts/check-packaged-agent-proof.py",
     archiveFragment,
     "--plugin-handoff",
+    "--engine-policy cpu_explicit",
+    "--expected-backend CPU",
+    "--offline",
   ]) {
     add(violations, run.includes(fragment), `managed plugin proof step must run ${fragment}`);
   }

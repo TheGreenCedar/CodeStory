@@ -8447,6 +8447,7 @@ mod tests {
             graphs: vec![graph],
             retrieval_trace: AgentRetrievalTraceDto {
                 request_id: "context-test".to_string(),
+                retrieval_publication: None,
                 resolved_profile: AgentRetrievalPresetDto::Architecture,
                 policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                 total_latency_ms: 1,
@@ -8500,6 +8501,7 @@ mod tests {
                 graphs: Vec::new(),
                 retrieval_trace: AgentRetrievalTraceDto {
                     request_id: "trace-task-brief".to_string(),
+                    retrieval_publication: None,
                     resolved_profile: AgentRetrievalPresetDto::Architecture,
                     policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                     total_latency_ms: 1,
@@ -8556,6 +8558,7 @@ mod tests {
             retrieval_trace_summary: PacketRetrievalTraceSummaryDto {
                 retrieval_trace: AgentRetrievalTraceDto {
                     request_id: "trace-task-brief".to_string(),
+                    retrieval_publication: None,
                     resolved_profile: AgentRetrievalPresetDto::Architecture,
                     policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
                     total_latency_ms: 1,
