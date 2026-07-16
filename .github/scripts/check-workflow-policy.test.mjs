@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   basicWorkflowViolations,
   draftSourcePolicyViolations,
+  draftWorkflowPolicyViolations,
   loadWorkflows,
   macosCliDistributionViolations,
   managedPluginViolations,
@@ -15,6 +16,7 @@ import {
   releaseEvidenceApprovalViolations,
   releaseEvidenceWorkflowRef,
   releaseWorkflowContractViolations,
+  validateWorkflows,
 } from "./check-workflow-policy.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
@@ -22,6 +24,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
 
 function draftSourceJob() {
   return structuredClone(loadWorkflows().get("rust-ci.yml").jobs["linux-draft"]);
+}
+
+function draftSourceWorkflow() {
+  return structuredClone(loadWorkflows().get("rust-ci.yml"));
 }
 
 function retrievalSourceJob() {
@@ -265,6 +271,19 @@ test("draft source cache reuse preserves exact serial proof structure", async (t
       assert.notDeepEqual(draftSourcePolicyViolations(draftSourceJob(), candidate), []);
     });
   }
+});
+
+test("draft source workflow rejects cloned top-level jobs", () => {
+  const workflows = loadWorkflows();
+  const workflow = draftSourceWorkflow();
+  assert.deepEqual(draftWorkflowPolicyViolations(workflow), []);
+
+  workflow.jobs["extra-draft-lane"] = structuredClone(workflow.jobs["linux-draft"]);
+  workflows.set("rust-ci.yml", workflow);
+  assert.match(
+    validateWorkflows(workflows).join("\n"),
+    /must contain exactly the linux-draft job/u,
+  );
 });
 
 test("managed proof rejects structural bypasses and decoy commands", () => {

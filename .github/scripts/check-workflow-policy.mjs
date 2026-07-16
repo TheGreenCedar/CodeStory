@@ -169,6 +169,13 @@ function sameStrings(actual, expected) {
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
+export function draftWorkflowPolicyViolations(workflowValue) {
+  const jobs = Object.keys(object(object(workflowValue).jobs));
+  return sameStrings(jobs, ["linux-draft"])
+    ? []
+    : ["draft source workflow must contain exactly the linux-draft job"];
+}
+
 export function draftSourcePolicyViolations(jobValue, retrievalJobValue) {
   const violations = [];
   const job = object(jobValue);
@@ -646,6 +653,9 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
   if (!rust) {
     violations.push(`${rustFile} must exist`);
   } else {
+    for (const violation of draftWorkflowPolicyViolations(rust)) {
+      violations.push(`${rustFile} ${violation}`);
+    }
     add(violations, trigger(rust, "push") === undefined, `${rustFile} draft checks must not run on push`);
     add(violations, includesAll(at(rust, "on", "pull_request", "paths"), [
       "Cargo.lock",
