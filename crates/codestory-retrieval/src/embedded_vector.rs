@@ -1856,10 +1856,16 @@ mod tests {
         let layout = layout(root.path());
         let device = accelerated_device();
         let identity = accelerated_identity();
+        let dimension = crate::embeddings::RETRIEVAL_EMBEDDING_DIM;
+        let unit_vector = |axis: usize| {
+            let mut vector = vec![0.0_f32; dimension];
+            vector[axis] = 1.0;
+            vector
+        };
         let evidence = build_vector_producer_evidence(
             &device,
             Some(&identity),
-            2,
+            dimension as u32,
             EmbeddingVectorPublicationIdentityDto {
                 core_generation_id: "core-generation-v1".into(),
                 core_run_id: "core-run-v1".into(),
@@ -1870,7 +1876,7 @@ mod tests {
         );
         let contract = VectorEvidenceContract::new(
             "backend",
-            2,
+            dimension,
             "producer-v1",
             vector_compatibility_identity(&evidence).expect("compatibility identity"),
         );
@@ -1883,8 +1889,8 @@ mod tests {
             &contract,
             &expected,
             |visit| {
-                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
-                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+                visit(attested_point("1", "document-1", unit_vector(0)))?;
+                visit(attested_point("2", "document-2", unit_vector(1)))
             },
         )
         .expect("publish initial vectors");
@@ -1913,8 +1919,8 @@ mod tests {
             },
             || bail!("simulated cancellation before vector database publication"),
             |visit| {
-                visit(attested_point("1", "document-1", vec![0.0, 1.0]))?;
-                visit(attested_point("2", "document-2", vec![1.0, 0.0]))
+                visit(attested_point("1", "document-1", unit_vector(1)))?;
+                visit(attested_point("2", "document-2", unit_vector(0)))
             },
         )
         .expect_err("cancelled vector publication must fail");
