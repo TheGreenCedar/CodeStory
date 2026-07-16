@@ -18,7 +18,10 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const DEFAULT_ACTIVATION_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
+const ACTIVATION_WAIT_SLICE: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -153,13 +156,35 @@ impl ActivationService {
         storage_path: &Path,
         cancelled: Arc<AtomicBool>,
     ) -> Result<ActivationRun, ApiError> {
+        self.activate_project_with_foreground_budget(
+            project_root,
+            storage_path,
+            cancelled,
+            DEFAULT_ACTIVATION_FOREGROUND_BUDGET,
+        )
+    }
+
+    pub fn activate_project_with_foreground_budget(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        request_cancelled: Arc<AtomicBool>,
+        foreground_budget: Duration,
+    ) -> Result<ActivationRun, ApiError> {
+        if request_cancelled.load(Ordering::Acquire) {
+            return Err(ApiError::new(
+                "cancelled",
+                "request cancelled before project activation",
+            ));
+        }
         let target = ActivationTarget::new(project_root, storage_path);
         let mut state = self
             .coordinator
             .state
             .lock()
             .expect("activation coordinator poisoned");
-        if state.running {
+        let joined = state.running;
+        let operation_id = if joined {
             if !state
                 .target
                 .as_ref()
@@ -170,100 +195,159 @@ impl ActivationService {
                     "a different logical project is already activating in this runtime context",
                 ));
             }
-            while state.running {
-                if cancelled.load(Ordering::Acquire) {
-                    return Err(ApiError::new(
-                        "cancelled",
-                        "request cancelled while joining project activation",
-                    ));
-                }
-                state = self
-                    .coordinator
-                    .changed
-                    .wait_timeout(state, Duration::from_millis(25))
-                    .expect("activation coordinator poisoned")
-                    .0;
+            let operation_id = state
+                .current
+                .as_ref()
+                .expect("running activation has a snapshot")
+                .operation_id
+                .clone();
+            drop(state);
+            operation_id
+        } else {
+            if !state
+                .target
+                .as_ref()
+                .is_some_and(|current| current.matches(&target))
+            {
+                state.target = Some(target.clone());
+                state.current = None;
             }
-            if cancelled.load(Ordering::Acquire) {
+
+            let operation_id = if let Some(snapshot) = state
+                .current
+                .as_mut()
+                .filter(|snapshot| snapshot.state == ActivationState::Retryable)
+            {
+                snapshot.attempt += 1;
+                snapshot.failure = None;
+                snapshot.retry_after_ms = Some(250);
+                snapshot.state = ActivationState::Preparing;
+                snapshot.stage = ActivationStage::Discovery;
+                snapshot.operation_id.clone()
+            } else {
+                let operation_id = format!(
+                    "activation-{}",
+                    self.coordinator.next_id.fetch_add(1, Ordering::Relaxed) + 1
+                );
+                state.current = Some(ActivationSnapshot {
+                    operation_id: operation_id.clone(),
+                    state: ActivationState::Preparing,
+                    stage: ActivationStage::Discovery,
+                    attempt: 1,
+                    retry_after_ms: Some(250),
+                    failure: None,
+                    capabilities: ActivationCapabilities {
+                        local_navigation: ActivationCapabilityState::Unavailable,
+                        broad_search: ActivationCapabilityState::Unavailable,
+                    },
+                });
+                operation_id
+            };
+            let activation_cancelled = Arc::new(AtomicBool::new(false));
+            state.running = true;
+            state.current_cancel = Some(Arc::clone(&activation_cancelled));
+            drop(state);
+
+            let operation = ActivationOperation {
+                service: self.clone(),
+                operation_id: operation_id.clone(),
+                cancelled: activation_cancelled,
+            };
+            let worker_operation = operation.clone();
+            let worker_service = self.clone();
+            let worker_project_root = project_root.to_path_buf();
+            let worker_storage_path = storage_path.to_path_buf();
+            if let Err(error) = std::thread::Builder::new()
+                .name(format!("codestory-{operation_id}"))
+                .spawn(move || {
+                    let result = worker_service
+                        .activate_once(&worker_operation, worker_project_root, worker_storage_path)
+                        .map_err(classify_activation_api_error);
+                    worker_operation.finish(result.as_ref().err());
+                })
+            {
+                let error = ApiError::new(
+                    "project_unavailable",
+                    format!("failed to start project activation worker: {error}"),
+                );
+                operation.finish(Some(&error));
+                return Err(error);
+            }
+            operation_id
+        };
+
+        self.wait_for_activation(
+            &target,
+            &operation_id,
+            joined,
+            request_cancelled.as_ref(),
+            foreground_budget,
+        )
+    }
+
+    fn wait_for_activation(
+        &self,
+        target: &ActivationTarget,
+        operation_id: &str,
+        joined: bool,
+        request_cancelled: &AtomicBool,
+        foreground_budget: Duration,
+    ) -> Result<ActivationRun, ApiError> {
+        let deadline = Instant::now()
+            .checked_add(foreground_budget)
+            .unwrap_or_else(Instant::now);
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        loop {
+            if request_cancelled.load(Ordering::Acquire) {
                 return Err(ApiError::new(
                     "cancelled",
-                    "request cancelled while joining project activation",
+                    "request cancelled while waiting for shared project activation",
+                ));
+            }
+            if !state
+                .target
+                .as_ref()
+                .is_some_and(|current| current.matches(target))
+            {
+                return Err(ApiError::new(
+                    "project_unavailable",
+                    "the project activation target changed while the request was waiting",
                 ));
             }
             let snapshot = state
                 .current
                 .clone()
-                .expect("joined activation has terminal snapshot");
-            return if snapshot_allows(&snapshot) {
-                Ok(ActivationRun {
-                    snapshot,
-                    joined: true,
-                })
-            } else {
-                Err(snapshot_error(&snapshot))
-            };
+                .filter(|snapshot| snapshot.operation_id == operation_id)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        "project_unavailable",
+                        "the shared project activation operation changed while the request was waiting",
+                    )
+                })?;
+            if !state.running {
+                return if snapshot_allows(&snapshot) {
+                    Ok(ActivationRun { snapshot, joined })
+                } else {
+                    Err(snapshot_error(&snapshot))
+                };
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(activation_preparing_error(&snapshot));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            state = self
+                .coordinator
+                .changed
+                .wait_timeout(state, remaining.min(ACTIVATION_WAIT_SLICE))
+                .expect("activation coordinator poisoned")
+                .0;
         }
-
-        if !state
-            .target
-            .as_ref()
-            .is_some_and(|current| current.matches(&target))
-        {
-            state.target = Some(target);
-            state.current = None;
-        }
-
-        let operation_id = if let Some(snapshot) = state
-            .current
-            .as_mut()
-            .filter(|snapshot| snapshot.state == ActivationState::Retryable)
-        {
-            snapshot.attempt += 1;
-            snapshot.failure = None;
-            snapshot.retry_after_ms = Some(250);
-            snapshot.state = ActivationState::Preparing;
-            snapshot.stage = ActivationStage::Discovery;
-            snapshot.operation_id.clone()
-        } else {
-            let operation_id = format!(
-                "activation-{}",
-                self.coordinator.next_id.fetch_add(1, Ordering::Relaxed) + 1
-            );
-            state.current = Some(ActivationSnapshot {
-                operation_id: operation_id.clone(),
-                state: ActivationState::Preparing,
-                stage: ActivationStage::Discovery,
-                attempt: 1,
-                retry_after_ms: Some(250),
-                failure: None,
-                capabilities: ActivationCapabilities {
-                    local_navigation: ActivationCapabilityState::Unavailable,
-                    broad_search: ActivationCapabilityState::Unavailable,
-                },
-            });
-            operation_id
-        };
-        state.running = true;
-        state.current_cancel = Some(Arc::clone(&cancelled));
-        drop(state);
-
-        let operation = ActivationOperation {
-            service: self.clone(),
-            operation_id,
-            cancelled,
-        };
-        let result = self
-            .activate_once(
-                &operation,
-                project_root.to_path_buf(),
-                storage_path.to_path_buf(),
-            )
-            .map_err(classify_activation_api_error);
-        let snapshot = operation.finish(result.as_ref().err());
-        result.map(|()| ActivationRun {
-            snapshot,
-            joined: false,
-        })
     }
 
     pub fn cancel_and_wait(&self) {
@@ -390,12 +474,28 @@ fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
     )
 }
 
+fn activation_preparing_error(snapshot: &ActivationSnapshot) -> ApiError {
+    ApiError::new(
+        "activation_preparing",
+        format!(
+            "project activation {} is still {:?} at {:?}; retry after {}ms",
+            snapshot.operation_id,
+            snapshot.state,
+            snapshot.stage,
+            snapshot.retry_after_ms.unwrap_or(250)
+        ),
+    )
+}
+
 fn map_activation_error(error: anyhow::Error) -> ApiError {
     classify_activation_api_error(ApiError::new("project_unavailable", error.to_string()))
 }
 
 fn classify_activation_api_error(error: ApiError) -> ApiError {
-    if matches!(error.code.as_str(), "cancelled" | "activation_retryable") {
+    if matches!(
+        error.code.as_str(),
+        "cancelled" | "activation_preparing" | "activation_retryable"
+    ) {
         return error;
     }
     let normalized = error.message.to_ascii_lowercase();
@@ -418,6 +518,7 @@ fn classify_activation_api_error(error: ApiError) -> ApiError {
     }
 }
 
+#[derive(Clone)]
 pub struct ActivationOperation {
     service: ActivationService,
     operation_id: String,
@@ -1088,7 +1189,7 @@ mod activation_tests {
     }
 
     #[test]
-    fn cancelled_activation_is_never_reported_ready() {
+    fn pre_cancelled_activation_does_not_start_shared_work() {
         let project = tempfile::tempdir().expect("project");
         let storage_path = project.path().join("cache").join("codestory.db");
         let runtime = Runtime::new();
@@ -1098,14 +1199,55 @@ mod activation_tests {
             .activation_service()
             .activate_project(project.path(), &storage_path, cancelled)
             .expect_err("pre-cancelled activation must fail");
-        let snapshot = runtime.activation_service().snapshot().expect("snapshot");
 
         assert_eq!(error.code, "cancelled");
-        assert_eq!(snapshot.state, ActivationState::Cancelled);
-        assert_eq!(
-            snapshot.capabilities.local_navigation,
-            ActivationCapabilityState::Cancelled
-        );
+        assert!(runtime.activation_service().snapshot().is_none());
+        assert!(!storage_path.exists());
+    }
+
+    #[test]
+    fn foreground_budget_returns_progress_while_one_shared_activation_continues() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        fs::write(
+            project.path().join("fixture.rs"),
+            "pub fn foreground_activation_fixture() {}\n",
+        )
+        .expect("write fixture");
+        let service = Runtime::new().activation_service();
+
+        let first = service
+            .activate_project_with_foreground_budget(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+            )
+            .expect_err("zero foreground budget must return typed progress");
+        assert_eq!(first.code, "activation_preparing");
+        let first_snapshot = service.snapshot().expect("running snapshot");
+        assert!(matches!(
+            first_snapshot.state,
+            ActivationState::Preparing | ActivationState::Updating
+        ));
+        assert_eq!(first_snapshot.attempt, 1);
+
+        let second = service
+            .activate_project_with_foreground_budget(
+                project.path(),
+                &storage_path,
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
+            )
+            .expect_err("joining caller must observe the same running operation");
+        assert_eq!(second.code, "activation_preparing");
+        let joined_snapshot = service.snapshot().expect("joined snapshot");
+        assert_eq!(joined_snapshot.operation_id, first_snapshot.operation_id);
+        assert_eq!(joined_snapshot.attempt, 1);
+
+        service.cancel_and_wait();
+        let terminal = service.snapshot().expect("terminal snapshot");
+        assert_ne!(terminal.state, ActivationState::Ready);
     }
 
     #[test]
@@ -1133,37 +1275,36 @@ mod activation_tests {
     fn activation_state_is_not_reused_across_project_targets() {
         let project_a = tempfile::tempdir().expect("project a");
         let project_b = tempfile::tempdir().expect("project b");
-        let runtime = Runtime::new();
+        let service = Runtime::new().activation_service();
 
-        runtime
-            .activation_service()
-            .activate_project(
+        service
+            .activate_project_with_foreground_budget(
                 project_a.path(),
                 &project_a.path().join("codestory.db"),
-                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
             )
-            .expect_err("cancel project a");
-        let first = runtime
-            .activation_service()
-            .snapshot()
-            .expect("first state");
+            .expect_err("project a should continue outside the foreground budget");
+        let first = service.snapshot().expect("first state");
+        service.cancel_and_wait();
 
-        runtime
-            .activation_service()
-            .activate_project(
+        service
+            .activate_project_with_foreground_budget(
                 project_b.path(),
                 &project_b.path().join("codestory.db"),
-                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Duration::ZERO,
             )
-            .expect_err("cancel project b");
-        let second = runtime
-            .activation_service()
-            .snapshot()
-            .expect("second state");
+            .expect_err("project b should continue outside the foreground budget");
+        let second = service.snapshot().expect("second state");
+        service.cancel_and_wait();
 
         assert_ne!(first.operation_id, second.operation_id);
         assert_eq!(second.attempt, 1);
-        assert_eq!(second.state, ActivationState::Cancelled);
+        assert!(matches!(
+            second.state,
+            ActivationState::Preparing | ActivationState::Updating
+        ));
     }
 
     #[test]
