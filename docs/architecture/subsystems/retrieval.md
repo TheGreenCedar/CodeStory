@@ -27,7 +27,9 @@ dense-anchor inputs, and the immutable process embedding policy. Outputs are:
 - `query.rs`, `executor.rs`, `candidate.rs`, and `ranker.rs`: coherent query
   execution and result identity
 - `health.rs` and `mode.rs`: artifact classification and live readiness
-- `in_process_embedding.rs`: process-wide engine selection and reuse
+- `embedding_contract.rs`: model, prefix, pooling, normalization, dimension,
+  batching, backend, and explicit CPU/accelerator policy
+- `in_process_embedding.rs`: process-wide engine initialization and reuse
 - `retention.rs`: generation leases and owned cleanup
 - `config.rs`: frozen process defaults and per-project runtime config
 
@@ -59,7 +61,8 @@ fence and is not persisted as vector compatibility.
   them;
 - keep packet sufficiency, evidence assembly, and bounded product retry in
   `codestory-runtime`;
-- keep model execution mechanics in `codestory-llama-sys`;
+- keep model execution mechanics and capability reporting in
+  `codestory-llama-sys`, while keeping product model/vector/backend policy here;
 - preserve stable `sidecar_*` DTO fields only as compatibility vocabulary, not
   as an external-service abstraction.
 

@@ -20,11 +20,11 @@ use std::sync::{
 use std::time::Instant;
 
 /// CodeRankEmbed vector width shared by stored and query vectors.
-pub const RETRIEVAL_EMBEDDING_DIM: usize =
-    codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension();
+pub const RETRIEVAL_EMBEDDING_DIM: usize = crate::embedding_contract::RETRIEVAL_EMBEDDING_DIM;
 pub const CODERANK_EMBED_Q8_GGUF: &str = codestory_llama_sys::MODEL_FILE_NAME;
-pub const CODERANK_QUERY_PREFIX_DEFAULT: &str = codestory_llama_sys::EMBEDDING_QUERY_PREFIX;
-pub const CODERANK_DOCUMENT_PREFIX_DEFAULT: &str = codestory_llama_sys::EMBEDDING_DOCUMENT_PREFIX;
+pub const CODERANK_QUERY_PREFIX_DEFAULT: &str = crate::embedding_contract::CODERANK_QUERY_PREFIX;
+pub const CODERANK_DOCUMENT_PREFIX_DEFAULT: &str =
+    crate::embedding_contract::CODERANK_DOCUMENT_PREFIX;
 #[cfg(feature = "test-support")]
 pub const TEST_EMBEDDING_UNAVAILABLE_MARKER: &str = ".codestory-test-embedding-unavailable";
 

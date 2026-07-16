@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow, bail};
 #[cfg(not(feature = "test-support"))]
 use codestory_llama_sys::EmbeddingResidencyLease;
-use codestory_llama_sys::{EmbeddingEngine, EngineLifecycleSnapshot, ExecutionPolicy};
+use codestory_llama_sys::{
+    EmbeddingEngine, EngineError, EngineLifecycleSnapshot, NativeDeviceClass,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -66,7 +68,7 @@ pub fn process_embedding_identity(
 ) -> Result<ProcessEmbeddingIdentity> {
     let process = process_engine(cache_root, allow_cpu)?;
     let snapshot = process.engine.ensure_resident()?;
-    Ok(identity_from_snapshot(&process, &snapshot))
+    identity_from_snapshot(&process, &snapshot)
 }
 
 /// Observes the process engine without starting it. Status and doctor surfaces
@@ -86,7 +88,7 @@ pub fn process_embedding_identity_if_initialized(
     };
     validate_process_selection(process, cache_root, allow_cpu)?;
     let snapshot = process.engine.snapshot()?;
-    Ok(Some(identity_from_snapshot(process, &snapshot)))
+    Ok(Some(identity_from_snapshot(process, &snapshot)?))
 }
 
 #[cfg(not(feature = "test-support"))]
@@ -96,7 +98,7 @@ pub fn acquire_process_embedding_residency(
 ) -> Result<ProcessEmbeddingResidencyLease> {
     let process = process_engine(cache_root, allow_cpu)?;
     let lease = process.engine.acquire_residency_lease()?;
-    let identity = identity_from_snapshot(&process, lease.snapshot());
+    let identity = identity_from_snapshot(&process, lease.snapshot())?;
     Ok(ProcessEmbeddingResidencyLease {
         _process: process,
         _lease: lease,
@@ -109,10 +111,11 @@ pub fn embed_prepared_in_process(
     allow_cpu: bool,
     inputs: &[String],
 ) -> Result<Vec<Vec<f32>>> {
-    process_engine(cache_root, allow_cpu)?
+    let vectors = process_engine(cache_root, allow_cpu)?
         .engine
         .embed_prepared(inputs)
-        .map_err(Into::into)
+        .map_err(native_engine_error)?;
+    crate::embedding_contract::normalize_and_validate_vectors(vectors)
 }
 
 pub fn embed_prepared_query_in_process(
@@ -120,10 +123,13 @@ pub fn embed_prepared_query_in_process(
     allow_cpu: bool,
     input: String,
 ) -> Result<Vec<f32>> {
-    process_engine(cache_root, allow_cpu)?
+    let vector = process_engine(cache_root, allow_cpu)?
         .engine
         .embed_query_prepared(input)
-        .map_err(Into::into)
+        .map_err(native_engine_error)?;
+    crate::embedding_contract::normalize_and_validate_vectors(vec![vector])?
+        .pop()
+        .ok_or_else(|| anyhow!("embedding_vector_missing: native engine returned no query vector"))
 }
 
 /// Stops the process-wide engine while Rust thread state is still live.
@@ -144,7 +150,9 @@ fn process_engine(cache_root: &Path, allow_cpu: bool) -> Result<Arc<ProcessEmbed
         .lock()
         .map_err(|_| anyhow!("embedding engine state mutex was poisoned"))?;
     if state.is_none() {
-        let engine = EmbeddingEngine::initialize(cache_root, allow_cpu)?;
+        let config = crate::embedding_contract::native_engine_config(allow_cpu)?;
+        let engine =
+            EmbeddingEngine::initialize(cache_root, config).map_err(native_engine_error)?;
         // Register only after llama.cpp has initialized its backend globals.
         // atexit callbacks run in reverse order, so this drops the live model
         // and context before ggml releases the selected Metal/Vulkan device.
@@ -194,9 +202,18 @@ fn validate_process_selection(
 fn identity_from_snapshot(
     process: &ProcessEmbeddingEngine,
     snapshot: &EngineLifecycleSnapshot,
-) -> ProcessEmbeddingIdentity {
+) -> Result<ProcessEmbeddingIdentity> {
     let identity = &snapshot.identity;
-    ProcessEmbeddingIdentity {
+    let policy = match identity.selected_device_class {
+        NativeDeviceClass::Cpu => "cpu_explicit",
+        NativeDeviceClass::Accelerator => "accelerated",
+        NativeDeviceClass::Unknown => {
+            bail!(
+                "embedding_backend_device_class_unknown: native engine selected an unknown device class"
+            )
+        }
+    };
+    Ok(ProcessEmbeddingIdentity {
         instance_id: process.instance_id.clone(),
         load_generation: snapshot.load_generation,
         model_load_count: snapshot.model_load_count,
@@ -208,7 +225,7 @@ fn identity_from_snapshot(
         backend: identity.backend.clone(),
         adapter_name: identity.adapter_name.clone(),
         adapter_description: identity.adapter_description.clone(),
-        policy: identity.policy.as_str(),
+        policy,
         embedded_model: identity.embedded_model,
         materialized_path: identity.materialized_path.clone(),
         materialized_reused: identity.materialized_reused,
@@ -222,7 +239,7 @@ fn identity_from_snapshot(
         model_layer_count: identity.model_layer_count,
         offloaded_layer_count: identity.offloaded_layer_count,
         accelerator_execution_verified: identity.accelerator_execution_verified,
-    }
+    })
 }
 
 fn ensure_process_exit_hook() -> Result<()> {
@@ -266,10 +283,14 @@ unsafe extern "C" {
 
 fn policy_name(allow_cpu: bool) -> &'static str {
     if allow_cpu {
-        ExecutionPolicy::CpuExplicit.as_str()
+        "cpu_explicit"
     } else {
-        ExecutionPolicy::Accelerated.as_str()
+        "accelerated"
     }
+}
+
+fn native_engine_error(error: EngineError) -> anyhow::Error {
+    anyhow!("{}: {error}", error.reason_code())
 }
 
 fn duration_ms(duration: std::time::Duration) -> u64 {

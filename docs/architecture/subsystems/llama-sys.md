@@ -6,11 +6,11 @@ CodeStory release executable. It has no public product or network surface.
 
 ## Build identity
 
-`model-contract.json` is the checked-in source of truth for acquisition,
-embedding dimension and prefixes, pooling and normalization, vector format,
-tokenizer/config identity, producer identity, license provenance, llama source
-revision, and ggml build identity. The explicit preparation script consumes
-that contract and publishes a verified workspace build asset. `build.rs`
+`model-contract.json` is the checked-in compatibility descriptor for acquisition,
+embedding semantics, vector format, tokenizer/config identity, producer
+identity, license provenance, and the llama source revision. Retrieval owns
+how those declared semantics are applied. The explicit preparation script
+consumes the descriptor and publishes a verified workspace build asset. `build.rs`
 consumes the same contract, never starts a process or performs network access,
 and requires `CODESTORY_EMBED_MODEL_SOURCE` for release builds. It accepts only
 an explicit regular file, copies into a create-new temporary file, closes and
@@ -24,34 +24,42 @@ the vector compatibility digest, so changing either implementation identity or
 version makes an older vector generation ineligible for reuse and requires a
 complete rebuild.
 
-Native features select Metal on macOS and Vulkan on Windows/Linux. CPU
-execution remains available only through the caller's explicit
-`CODESTORY_EMBED_ALLOW_CPU=1` policy.
+The build also embeds a parseable `codestory-native-engine-v1` marker with the
+target triple, native binary architecture, static or dynamic linkage,
+compiled backend set, llama crate/source identity, exact model digest, a stable
+digest of the model/vector/tokenizer contract, model presence, and producer
+version. Release packaging accepts only the exact static contract for its asset
+target and copies that evidence into `codestory-native-manifest.json`.
 
 ## Runtime contract
 
 `src/lib.rs` owns:
 
 - verified content-addressed model materialization for mmap;
-- physical backend and adapter selection, including software-adapter rejection;
+- compiled and runtime backend capability reporting;
+- exact execution of the caller's backend/device-class request, including
+  optional software-adapter rejection and no implicit fallback;
 - one model worker with bounded query and bulk queues;
 - owner-thread residency with a 60-second idle unload and automatic wake;
 - RAII residency leases for operations that must retain one load generation;
 - query priority between bulk batches;
-- the CodeRank query prefix (`Represent this query for searching relevant code: `),
-  no document prefix, batching, CLS pooling, and L2 normalization;
 - timed smoke, initialization, offload, adapter, and model-load diagnostics.
 
-The crate returns embeddings and engine diagnostics. It does not select a
-project, publish a retrieval generation, or decide whether packet/search may
-serve.
+The caller supplies the exact model ID/digest, dimension, pooling, token and
+batch limits, smoke input, backend, and device class. The crate validates those
+requests against the compiled descriptor and returns raw vectors plus engine
+diagnostics. Model selection, prefixes, normalization, batching policy, and
+CPU/accelerator policy live in `codestory-retrieval`. The binding does not
+select a project, publish a retrieval generation, or decide whether
+packet/search may serve.
 
 ## Extension rules
 
 A model, tokenizer, pooling, normalization, vector-dimension, backend, or ggml
 change creates a new producer identity and requires retrieval rebuild and
-same-run performance/quality evidence. Production must never respond to
-accelerator failure by silently selecting CPU.
+same-run performance/quality evidence. Add capability reporting here; add
+product selection and fallback policy in retrieval. Production must never
+respond to accelerator failure by silently selecting CPU.
 
 ## Failure signatures
 

@@ -33,19 +33,35 @@ struct ModelContract {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CODESTORY_EMBED_MODEL_SOURCE");
+    println!("cargo:rerun-if-env-changed=LLAMA_BUILD_SHARED_LIBS");
     println!("cargo:rerun-if-changed={MODEL_CONTRACT_FILE}");
     println!("cargo:rerun-if-changed=model_staging.rs");
 
     let contract = load_model_contract();
     let target = env::var("TARGET").expect("Cargo sets TARGET");
-    let backend = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
-        Ok("macos") => "metal",
-        Ok("windows" | "linux") => "vulkan",
-        _ => "cpu",
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo sets CARGO_CFG_TARGET_OS");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo sets CARGO_CFG_TARGET_ARCH");
+    let compiled_backends: &[&str] = match target_os.as_str() {
+        "macos" => &["cpu", "metal"],
+        "windows" | "linux" => &["cpu", "vulkan"],
+        _ => &["cpu"],
     };
+    let engine_linkage = if env::var("LLAMA_BUILD_SHARED_LIBS").as_deref() == Ok("1") {
+        "dynamic"
+    } else {
+        "static"
+    };
+    let model_source = resolve_model_source();
+    let model_embedded = model_source.is_some();
+    let embedding_contract_sha256 = embedding_contract_digest(&contract);
     let ggml_build_identity = format!(
-        "llama-cpp-sys-2@{}+llama.cpp@{}+{backend}+{target}",
-        contract.llama_cpp_crate_version, contract.llama_cpp_source_commit
+        "codestory-native-engine-v1|target={target}|os={target_os}|arch={target_arch}|linkage={engine_linkage}|backends={}|llama_cpp_crate={}|llama_cpp_commit={}|model_sha256={}|embedding_contract_sha256={embedding_contract_sha256}|model_embedded={model_embedded}|producer={}@{}|end",
+        compiled_backends.join(","),
+        contract.llama_cpp_crate_version,
+        contract.llama_cpp_source_commit,
+        contract.sha256,
+        contract.producer_name,
+        contract.producer_version,
     );
     let product_embedding_runtime_id = format!(
         "{}:sha256-{}:llama.cpp-{}:producer-{}@{}",
@@ -78,6 +94,13 @@ fn main() {
              pub const MODEL_PRODUCER_VERSION: &str = {:?};\n\
              pub const MODEL_LICENSE_SPDX_ID: &str = {:?};\n\
              pub const MODEL_LICENSE_SOURCE_URL: &str = {:?};\n\
+             pub const NATIVE_ENGINE_BUILD_CONTRACT_SCHEMA_VERSION: u32 = 1;\n\
+             pub const NATIVE_ENGINE_TARGET_TRIPLE: &str = {target:?};\n\
+             pub const NATIVE_ENGINE_TARGET_OS: &str = {target_os:?};\n\
+             pub const NATIVE_ENGINE_TARGET_ARCH: &str = {target_arch:?};\n\
+             pub const NATIVE_ENGINE_LINKAGE: &str = {engine_linkage:?};\n\
+             pub const NATIVE_ENGINE_COMPILED_BACKENDS: &[&str] = &{compiled_backends:?};\n\
+             pub const NATIVE_ENGINE_EMBEDDING_CONTRACT_SHA256: &str = {embedding_contract_sha256:?};\n\
              pub const GGML_BUILD_IDENTITY: &str = {ggml_build_identity:?};\n\
              pub const PRODUCT_EMBEDDING_RUNTIME_ID: &str = {product_embedding_runtime_id:?};\n",
             contract.file_name,
@@ -103,7 +126,7 @@ fn main() {
     .expect("write embedding model contract");
 
     let generated = out_dir.join("embedded_model.rs");
-    match resolve_model_source() {
+    match model_source {
         Some(source) => {
             println!("cargo:rerun-if-changed={}", source.display());
             let expected_model = ExpectedModel {
@@ -303,8 +326,38 @@ fn required_u64(value: &Value, name: &str) -> u64 {
 }
 
 fn contract_digest(domain: &str, value: &str) -> String {
+    ordered_contract_digest(domain, &[value])
+}
+
+fn embedding_contract_digest(contract: &ModelContract) -> String {
+    let model_size = contract.size.to_string();
+    let dimension = contract.dimension.to_string();
+    let vector_schema_version = contract.vector_schema_version.to_string();
+    ordered_contract_digest(
+        "codestory-native-embedding-contract-v1",
+        &[
+            &contract.file_name,
+            &model_size,
+            &contract.sha256,
+            &contract.embedding_family,
+            &dimension,
+            &contract.query_prefix,
+            &contract.document_prefix,
+            &contract.pooling,
+            &contract.normalization,
+            &contract.element_type,
+            &vector_schema_version,
+            "gguf",
+            &contract.tokenizer_sha256,
+            &contract.config_sha256,
+        ],
+    )
+}
+
+fn ordered_contract_digest(domain: &str, values: &[&str]) -> String {
     let mut hasher = Sha256::new();
-    for bytes in [domain.as_bytes(), value.as_bytes()] {
+    for bytes in std::iter::once(domain).chain(values.iter().copied()) {
+        let bytes = bytes.as_bytes();
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     }

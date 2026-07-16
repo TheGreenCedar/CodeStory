@@ -36,10 +36,10 @@ enum EmbeddingNormalization {
     L2,
 }
 
-/// Vector semantics enforced by the linked product embedding engine.
+/// Vector compatibility descriptor compiled beside the embedded model.
 ///
-/// Retrieval evidence consumes this same contract so a pooling, dimension, or
-/// normalization change cannot leave persisted compatibility identity behind.
+/// Retrieval consumes this descriptor when it records persisted evidence. The
+/// native boundary does not choose or apply pooling or normalization policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProductEmbeddingVectorSemantics {
     dimension: usize,
@@ -66,21 +66,9 @@ impl ProductEmbeddingVectorSemantics {
             EmbeddingNormalization::L2 => "l2",
         }
     }
-
-    fn llama_pooling_type(self) -> LlamaPoolingType {
-        match self.pooling {
-            EmbeddingPooling::Cls => LlamaPoolingType::Cls,
-        }
-    }
-
-    fn normalize(self, vector: &mut [f32]) {
-        match self.normalization {
-            EmbeddingNormalization::L2 => l2_normalize(vector),
-        }
-    }
 }
 
-/// Canonical vector semantics for the linked product embedding engine.
+/// Compatibility semantics declared by the compiled model contract.
 pub const PRODUCT_EMBEDDING_VECTOR_SEMANTICS: ProductEmbeddingVectorSemantics =
     ProductEmbeddingVectorSemantics {
         dimension: EMBEDDING_DIMENSION,
@@ -88,10 +76,6 @@ pub const PRODUCT_EMBEDDING_VECTOR_SEMANTICS: ProductEmbeddingVectorSemantics =
         normalization: EmbeddingNormalization::L2,
     };
 
-const EMBEDDING_DIM: usize = PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension();
-const MODEL_CONTEXT_TOKENS: usize = 512;
-const LOGICAL_BATCH_TOKENS: usize = 1024;
-const MAX_BATCH_SEQUENCES: usize = 6;
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const ENGINE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -103,11 +87,17 @@ pub enum EngineError {
     ModelNotEmbedded,
     #[error("embedding model cache error: {0}")]
     ModelCache(String),
+    #[error("requested model `{requested}` does not match compiled model `{compiled}`")]
+    ModelRequestMismatch { requested: String, compiled: String },
+    #[error("native engine configuration is invalid: {reason}")]
+    InvalidConfiguration { reason: &'static str },
     #[error(
-        "no supported {expected} accelerator was found; set CODESTORY_EMBED_ALLOW_CPU=1 only for intentional CPU execution"
+        "requested backend `{requested}` is not compiled into this binary; compiled backends: {compiled}"
     )]
-    AcceleratorUnavailable { expected: &'static str },
-    #[error("software adapter `{0}` is not allowed for production embeddings")]
+    BackendNotCompiled { requested: String, compiled: String },
+    #[error("requested backend `{requested}` is not available in the loaded native runtime")]
+    BackendUnavailable { requested: String },
+    #[error("software adapter `{0}` was rejected by the native backend request")]
     SoftwareAdapter(String),
     #[error("the loaded model did not prove execution on `{0}`")]
     AcceleratorExecutionUnverified(String),
@@ -123,19 +113,123 @@ pub enum EngineError {
     Dimension { expected: usize, actual: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionPolicy {
-    Accelerated,
-    CpuExplicit,
-}
-
-impl ExecutionPolicy {
-    pub const fn as_str(self) -> &'static str {
+impl EngineError {
+    /// Stable machine-readable reason for fail-closed native boundary errors.
+    pub const fn reason_code(&self) -> &'static str {
         match self {
-            Self::Accelerated => "accelerated",
-            Self::CpuExplicit => "cpu_explicit",
+            Self::ModelNotEmbedded => "native_model_not_embedded",
+            Self::ModelCache(_) => "native_model_cache_error",
+            Self::ModelRequestMismatch { .. } => "native_model_request_mismatch",
+            Self::InvalidConfiguration { .. } => "native_engine_config_invalid",
+            Self::BackendNotCompiled { .. } => "native_backend_not_compiled",
+            Self::BackendUnavailable { .. } => "native_backend_unavailable",
+            Self::SoftwareAdapter(_) => "native_software_adapter_rejected",
+            Self::AcceleratorExecutionUnverified(_) => "native_accelerator_execution_unverified",
+            Self::Llama(_) => "native_engine_initialization_failed",
+            Self::EmptyInput => "native_embedding_input_empty",
+            Self::InputTooLong { .. } => "native_embedding_input_too_long",
+            Self::WorkerUnavailable(_) => "native_engine_worker_unavailable",
+            Self::Dimension { .. } => "native_embedding_dimension_mismatch",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeDeviceClass {
+    Cpu,
+    Accelerator,
+    Unknown,
+}
+
+impl NativeDeviceClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Accelerator => "accelerator",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Build-time ABI and backend capabilities compiled into this native boundary.
+///
+/// This is descriptive evidence. Product policy chooses one explicit request
+/// in `codestory-retrieval`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledEngineCapabilities {
+    pub schema_version: u32,
+    pub target_triple: &'static str,
+    pub target_os: &'static str,
+    pub target_arch: &'static str,
+    pub linkage: &'static str,
+    pub backends: &'static [&'static str],
+    pub build_identity: &'static str,
+}
+
+pub const fn compiled_engine_capabilities() -> CompiledEngineCapabilities {
+    CompiledEngineCapabilities {
+        schema_version: NATIVE_ENGINE_BUILD_CONTRACT_SCHEMA_VERSION,
+        target_triple: NATIVE_ENGINE_TARGET_TRIPLE,
+        target_os: NATIVE_ENGINE_TARGET_OS,
+        target_arch: NATIVE_ENGINE_TARGET_ARCH,
+        linkage: NATIVE_ENGINE_LINKAGE,
+        backends: NATIVE_ENGINE_COMPILED_BACKENDS,
+        build_identity: GGML_BUILD_IDENTITY,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeBackendRequest {
+    pub backend: String,
+    pub device_class: NativeDeviceClass,
+    pub reject_software_adapters: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeEmbeddingPooling {
+    Mean,
+    Cls,
+    Last,
+    Rank,
+}
+
+impl NativeEmbeddingPooling {
+    fn llama_pooling_type(self) -> LlamaPoolingType {
+        match self {
+            Self::Mean => LlamaPoolingType::Mean,
+            Self::Cls => LlamaPoolingType::Cls,
+            Self::Last => LlamaPoolingType::Last,
+            Self::Rank => LlamaPoolingType::Rank,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEmbeddingRequest {
+    pub model_id: String,
+    pub model_sha256: String,
+    pub dimension: usize,
+    pub pooling: NativeEmbeddingPooling,
+    pub context_tokens: u32,
+    pub max_input_tokens: usize,
+    pub batch_tokens: u32,
+    pub max_batch_sequences: u32,
+    pub smoke_input: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingEngineConfig {
+    pub backend: NativeBackendRequest,
+    pub embedding: NativeEmbeddingRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeBackendCapability {
+    pub backend: String,
+    pub adapter_name: String,
+    pub adapter_description: String,
+    pub device_class: NativeDeviceClass,
+    pub software_adapter: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -145,7 +239,8 @@ pub struct EngineIdentity {
     pub backend: String,
     pub adapter_name: String,
     pub adapter_description: String,
-    pub policy: ExecutionPolicy,
+    pub selected_device_class: NativeDeviceClass,
+    pub runtime_capabilities: Vec<RuntimeBackendCapability>,
     pub embedded_model: bool,
     pub materialized_path: PathBuf,
     pub materialized_reused: bool,
@@ -281,7 +376,11 @@ enum RequestPriority {
 }
 
 impl EmbeddingEngine {
-    pub fn initialize(cache_root: &Path, allow_cpu: bool) -> Result<Self, EngineError> {
+    pub fn initialize(
+        cache_root: &Path,
+        config: EmbeddingEngineConfig,
+    ) -> Result<Self, EngineError> {
+        validate_engine_config(&config)?;
         let (query_sender, query_receiver) = bounded(REQUEST_QUEUE_CAPACITY);
         let (bulk_sender, bulk_receiver) = bounded(REQUEST_QUEUE_CAPACITY);
         let (control_sender, control_receiver) = unbounded();
@@ -294,7 +393,7 @@ impl EmbeddingEngine {
             .spawn(move || {
                 if let Err(error) = run_engine_owner(
                     &cache_root,
-                    allow_cpu,
+                    &config,
                     &startup_sender,
                     &query_receiver,
                     &bulk_receiver,
@@ -416,7 +515,7 @@ impl EmbeddingEngine {
 
 fn run_engine_owner(
     cache_root: &Path,
-    allow_cpu: bool,
+    config: &EmbeddingEngineConfig,
     startup: &Sender<Result<EngineLifecycleSnapshot, EngineError>>,
     query_receiver: &Receiver<EmbeddingRequest>,
     bulk_receiver: &Receiver<EmbeddingRequest>,
@@ -429,7 +528,7 @@ fn run_engine_owner(
     loop {
         let result = run_resident_generation(
             cache_root,
-            allow_cpu,
+            config,
             wake,
             load_generation + 1,
             startup,
@@ -548,7 +647,7 @@ impl ResidencyTracker {
 #[allow(clippy::too_many_arguments)]
 fn run_resident_generation(
     cache_root: &Path,
-    allow_cpu: bool,
+    config: &EmbeddingEngineConfig,
     wake: WakeReason,
     load_generation: u64,
     startup: &Sender<Result<EngineLifecycleSnapshot, EngineError>>,
@@ -564,11 +663,12 @@ fn run_resident_generation(
         send_logs_to_tracing(LogOptions::default().with_logs_enabled(false));
         let backend = LlamaBackend::init().map_err(llama_error)?;
         let devices = list_llama_ggml_backend_devices();
-        let (device, policy) = select_device(&devices, allow_cpu)?;
+        let runtime_capabilities = runtime_backend_capabilities(&devices);
+        let device = select_device(&devices, &config.backend)?;
         let free_before = device.memory_free;
 
         let mut model_params = LlamaModelParams::default().with_use_mmap(true);
-        if policy == ExecutionPolicy::Accelerated {
+        if config.backend.device_class == NativeDeviceClass::Accelerator {
             model_params = model_params
                 .with_devices(&[device.index])
                 .map_err(llama_error)?
@@ -578,21 +678,21 @@ fn run_resident_generation(
         }
         let model = LlamaModel::load_from_file(&backend, &materialized.path, &model_params)
             .map_err(llama_error)?;
-        if model.n_embd() as usize != EMBEDDING_DIM {
+        if model.n_embd() as usize != config.embedding.dimension {
             return Err(EngineError::Dimension {
-                expected: EMBEDDING_DIM,
+                expected: config.embedding.dimension,
                 actual: model.n_embd() as usize,
             });
         }
         let model_layer_count = model.n_layer() + 1;
 
         let context_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(4096))
-            .with_n_batch(LOGICAL_BATCH_TOKENS as u32)
-            .with_n_ubatch(LOGICAL_BATCH_TOKENS as u32)
-            .with_n_seq_max(MAX_BATCH_SEQUENCES as u32)
+            .with_n_ctx(NonZeroU32::new(config.embedding.context_tokens))
+            .with_n_batch(config.embedding.batch_tokens)
+            .with_n_ubatch(config.embedding.batch_tokens)
+            .with_n_seq_max(config.embedding.max_batch_sequences)
             .with_attention_type(LlamaAttentionType::NonCausal)
-            .with_pooling_type(PRODUCT_EMBEDDING_VECTOR_SEMANTICS.llama_pooling_type())
+            .with_pooling_type(config.embedding.pooling.llama_pooling_type())
             .with_embeddings(true);
         let mut context = model
             .new_context(&backend, context_params)
@@ -601,9 +701,13 @@ fn run_resident_generation(
             .into_iter()
             .find(|candidate| candidate.index == device.index)
             .map_or(device.memory_free, |candidate| candidate.memory_free);
-        let accelerator_execution_verified =
-            policy == ExecutionPolicy::Accelerated && free_before > free_after && free_after > 0;
-        if policy == ExecutionPolicy::Accelerated && !accelerator_execution_verified {
+        let accelerator_execution_verified = config.backend.device_class
+            == NativeDeviceClass::Accelerator
+            && free_before > free_after
+            && free_after > 0;
+        if config.backend.device_class == NativeDeviceClass::Accelerator
+            && !accelerator_execution_verified
+        {
             return Err(EngineError::AcceleratorExecutionUnverified(format!(
                 "{} ({})",
                 device.name, device.description
@@ -619,19 +723,17 @@ fn run_resident_generation(
         let smoke = embed_inputs(
             &model,
             &mut context,
-            &[
-                "Represent this query for searching relevant code: codestory embedding smoke"
-                    .to_string(),
-            ],
+            std::slice::from_ref(&config.embedding.smoke_input),
             RequestPriority::Query,
             query_receiver,
+            &config.embedding,
         )?;
         if smoke
             .first()
-            .is_none_or(|vector| vector.len() != EMBEDDING_DIM)
+            .is_none_or(|vector| vector.len() != config.embedding.dimension)
         {
             return Err(EngineError::Dimension {
-                expected: EMBEDDING_DIM,
+                expected: config.embedding.dimension,
                 actual: smoke.first().map_or(0, Vec::len),
             });
         }
@@ -641,7 +743,8 @@ fn run_resident_generation(
             backend: device.backend.clone(),
             adapter_name: device.name.clone(),
             adapter_description: device.description.clone(),
-            policy,
+            selected_device_class: config.backend.device_class,
+            runtime_capabilities,
             embedded_model: EMBEDDED_MODEL_COMPILED,
             materialized_path: materialized.path,
             materialized_reused: materialized.reused,
@@ -683,7 +786,14 @@ fn run_resident_generation(
             &channels,
             ENGINE_IDLE_TIMEOUT,
             |request, priority| {
-                handle_request(request, priority, &model, &mut context, query_receiver);
+                handle_request(
+                    request,
+                    priority,
+                    &model,
+                    &mut context,
+                    query_receiver,
+                    &config.embedding,
+                );
             },
         ))
     })();
@@ -849,8 +959,16 @@ fn handle_request(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
     query_receiver: &Receiver<EmbeddingRequest>,
+    config: &NativeEmbeddingRequest,
 ) {
-    let result = embed_inputs(model, context, &request.inputs, priority, query_receiver);
+    let result = embed_inputs(
+        model,
+        context,
+        &request.inputs,
+        priority,
+        query_receiver,
+        config,
+    );
     let _ = request.response.send(result);
 }
 
@@ -860,6 +978,7 @@ fn embed_inputs(
     inputs: &[String],
     priority: RequestPriority,
     query_receiver: &Receiver<EmbeddingRequest>,
+    config: &NativeEmbeddingRequest,
 ) -> Result<Vec<Vec<f32>>, EngineError> {
     if inputs.is_empty() {
         return Ok(Vec::new());
@@ -869,7 +988,7 @@ fn embed_inputs(
     }
     let tokenized = inputs
         .iter()
-        .map(|input| tokenize(model, input))
+        .map(|input| tokenize(model, input, config.max_input_tokens))
         .collect::<Result<Vec<_>, _>>()?;
     let mut output = Vec::with_capacity(inputs.len());
     let mut offset = 0;
@@ -882,22 +1001,38 @@ fn embed_inputs(
                     model,
                     context,
                     query_receiver,
+                    config,
                 );
             }
         }
-        let end = batch_end(&tokenized, offset);
-        embed_token_batch(context, &tokenized[offset..end], &mut output)?;
+        let end = batch_end(
+            &tokenized,
+            offset,
+            config.max_batch_sequences as usize,
+            config.batch_tokens as usize,
+        );
+        embed_token_batch(
+            context,
+            &tokenized[offset..end],
+            &mut output,
+            config.dimension,
+        )?;
         offset = end;
     }
     Ok(output)
 }
 
-fn batch_end(tokenized: &[Vec<llama_cpp_2::token::LlamaToken>], offset: usize) -> usize {
+fn batch_end(
+    tokenized: &[Vec<llama_cpp_2::token::LlamaToken>],
+    offset: usize,
+    max_batch_sequences: usize,
+    batch_tokens: usize,
+) -> usize {
     let mut end = offset;
     let mut tokens = 0;
-    while end < tokenized.len() && end - offset < MAX_BATCH_SEQUENCES {
+    while end < tokenized.len() && end - offset < max_batch_sequences {
         let next = tokenized[end].len();
-        if end > offset && tokens + next > LOGICAL_BATCH_TOKENS {
+        if end > offset && tokens + next > batch_tokens {
             break;
         }
         tokens += next;
@@ -910,6 +1045,7 @@ fn embed_token_batch(
     context: &mut LlamaContext<'_>,
     sequences: &[Vec<llama_cpp_2::token::LlamaToken>],
     output: &mut Vec<Vec<f32>>,
+    expected_dimension: usize,
 ) -> Result<(), EngineError> {
     let total_tokens = sequences.iter().map(Vec::len).sum();
     let mut batch = LlamaBatch::new(total_tokens, sequences.len() as i32);
@@ -921,17 +1057,16 @@ fn embed_token_batch(
     context.clear_kv_cache();
     context.encode(&mut batch).map_err(llama_error)?;
     for sequence_id in 0..sequences.len() {
-        let mut vector = context
+        let vector = context
             .embeddings_seq_ith(sequence_id as i32)
             .map_err(llama_error)?
             .to_vec();
-        if vector.len() != EMBEDDING_DIM {
+        if vector.len() != expected_dimension {
             return Err(EngineError::Dimension {
-                expected: EMBEDDING_DIM,
+                expected: expected_dimension,
                 actual: vector.len(),
             });
         }
-        PRODUCT_EMBEDDING_VECTOR_SEMANTICS.normalize(&mut vector);
         output.push(vector);
     }
     Ok(())
@@ -1026,40 +1161,105 @@ fn materialize_embedded_model_locked(directory: &Path) -> Result<bool, EngineErr
     Ok(false)
 }
 
-fn select_device(
-    devices: &[LlamaBackendDevice],
-    allow_cpu: bool,
-) -> Result<(LlamaBackendDevice, ExecutionPolicy), EngineError> {
-    if allow_cpu {
-        let device = devices
-            .iter()
-            .find(|device| device.device_type == LlamaBackendDeviceType::Cpu)
-            .cloned()
-            .ok_or_else(|| EngineError::Llama("llama.cpp exposed no CPU device".into()))?;
-        return Ok((device, ExecutionPolicy::CpuExplicit));
+fn validate_engine_config(config: &EmbeddingEngineConfig) -> Result<(), EngineError> {
+    if config.embedding.model_id != MODEL_FILE_NAME || config.embedding.model_sha256 != MODEL_SHA256
+    {
+        return Err(EngineError::ModelRequestMismatch {
+            requested: format!(
+                "{}@{}",
+                config.embedding.model_id, config.embedding.model_sha256
+            ),
+            compiled: format!("{MODEL_FILE_NAME}@{MODEL_SHA256}"),
+        });
+    }
+    if config.embedding.dimension == 0 {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "embedding_dimension_zero",
+        });
+    }
+    if config.embedding.context_tokens == 0 {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "context_tokens_zero",
+        });
+    }
+    if config.embedding.max_input_tokens == 0 {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "max_input_tokens_zero",
+        });
+    }
+    if config.embedding.batch_tokens == 0 {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "batch_tokens_zero",
+        });
+    }
+    if config.embedding.max_batch_sequences == 0
+        || config.embedding.max_batch_sequences > i32::MAX as u32
+    {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "max_batch_sequences_out_of_range",
+        });
+    }
+    if config.embedding.max_input_tokens > config.embedding.batch_tokens as usize {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "max_input_tokens_exceed_batch_tokens",
+        });
+    }
+    if config.embedding.batch_tokens > config.embedding.context_tokens {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "batch_tokens_exceed_context_tokens",
+        });
+    }
+    if config.embedding.smoke_input.trim().is_empty() {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "smoke_input_empty",
+        });
     }
 
-    let expected = expected_accelerator_backend();
+    let requested = normalize_backend_name(&config.backend.backend);
+    let class_matches_backend = match config.backend.device_class {
+        NativeDeviceClass::Cpu => requested == "cpu",
+        NativeDeviceClass::Accelerator => requested != "cpu",
+        NativeDeviceClass::Unknown => false,
+    };
+    if !class_matches_backend {
+        return Err(EngineError::InvalidConfiguration {
+            reason: "backend_device_class_mismatch",
+        });
+    }
+    let compiled = compiled_engine_capabilities();
+    if !compiled
+        .backends
+        .iter()
+        .any(|backend| *backend == requested)
+    {
+        return Err(EngineError::BackendNotCompiled {
+            requested,
+            compiled: compiled.backends.join(","),
+        });
+    }
+    Ok(())
+}
+
+fn select_device(
+    devices: &[LlamaBackendDevice],
+    request: &NativeBackendRequest,
+) -> Result<LlamaBackendDevice, EngineError> {
+    let requested = normalize_backend_name(&request.backend);
     let matching = devices
         .iter()
         .filter(|device| {
-            backend_matches_expected(&device.backend, expected)
-                && matches!(
-                    device.device_type,
-                    LlamaBackendDeviceType::Gpu
-                        | LlamaBackendDeviceType::IntegratedGpu
-                        | LlamaBackendDeviceType::Accelerator
-                )
+            backend_matches_requested(&device.backend, &requested)
+                && device_class(device) == request.device_class
         })
         .collect::<Vec<_>>();
     if let Some(device) = matching
         .iter()
         .copied()
-        .find(|device| !is_software_adapter(device))
+        .find(|device| !request.reject_software_adapters || !is_software_adapter(device))
     {
-        return Ok((device.clone(), ExecutionPolicy::Accelerated));
+        return Ok(device.clone());
     }
-    if !matching.is_empty() {
+    if request.reject_software_adapters && !matching.is_empty() {
         return Err(EngineError::SoftwareAdapter(
             matching
                 .iter()
@@ -1068,23 +1268,46 @@ fn select_device(
                 .join(", "),
         ));
     }
-    Err(EngineError::AcceleratorUnavailable { expected })
+    Err(EngineError::BackendUnavailable { requested })
 }
 
-fn backend_matches_expected(actual: &str, expected: &str) -> bool {
-    let actual = actual.trim().to_ascii_lowercase();
-    match expected {
-        "Metal" => actual == "metal" || actual == "mtl",
-        "Vulkan" => actual == "vulkan" || actual.starts_with("vulkan"),
-        _ => actual.eq_ignore_ascii_case(expected),
+fn runtime_backend_capabilities(devices: &[LlamaBackendDevice]) -> Vec<RuntimeBackendCapability> {
+    devices
+        .iter()
+        .map(|device| RuntimeBackendCapability {
+            backend: normalize_backend_name(&device.backend),
+            adapter_name: device.name.clone(),
+            adapter_description: device.description.clone(),
+            device_class: device_class(device),
+            software_adapter: is_software_adapter(device),
+        })
+        .collect()
+}
+
+fn device_class(device: &LlamaBackendDevice) -> NativeDeviceClass {
+    match device.device_type {
+        LlamaBackendDeviceType::Cpu => NativeDeviceClass::Cpu,
+        LlamaBackendDeviceType::Accelerator
+        | LlamaBackendDeviceType::Gpu
+        | LlamaBackendDeviceType::IntegratedGpu => NativeDeviceClass::Accelerator,
+        LlamaBackendDeviceType::Unknown => NativeDeviceClass::Unknown,
     }
 }
 
-fn expected_accelerator_backend() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Metal"
-    } else {
-        "Vulkan"
+fn backend_matches_requested(actual: &str, requested: &str) -> bool {
+    let actual = actual.trim().to_ascii_lowercase();
+    match requested {
+        "metal" => actual == "metal" || actual == "mtl",
+        "vulkan" => actual == "vulkan" || actual.starts_with("vulkan"),
+        _ => actual == requested,
+    }
+}
+
+fn normalize_backend_name(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mtl" => "metal".to_string(),
+        value if value.starts_with("vulkan") => "vulkan".to_string(),
+        value => value.to_string(),
     }
 }
 
@@ -1106,32 +1329,18 @@ fn is_software_adapter(device: &LlamaBackendDevice) -> bool {
 fn tokenize(
     model: &LlamaModel,
     input: &str,
+    max_input_tokens: usize,
 ) -> Result<Vec<llama_cpp_2::token::LlamaToken>, EngineError> {
     let tokens = model
         .str_to_token(input, AddBos::Always)
         .map_err(llama_error)?;
-    if tokens.len() > MODEL_CONTEXT_TOKENS {
+    if tokens.len() > max_input_tokens {
         return Err(EngineError::InputTooLong {
             actual: tokens.len(),
-            maximum: MODEL_CONTEXT_TOKENS,
+            maximum: max_input_tokens,
         });
     }
     Ok(tokens)
-}
-
-fn l2_normalize(vector: &mut [f32]) {
-    let norm = vector
-        .iter()
-        .map(|value| f64::from(*value) * f64::from(*value))
-        .sum::<f64>()
-        .sqrt();
-    if norm <= f64::EPSILON {
-        return;
-    }
-    let scale = (1.0 / norm) as f32;
-    for value in vector {
-        *value *= scale;
-    }
 }
 
 fn verified_model_file(path: &Path) -> Result<bool, EngineError> {
@@ -1185,20 +1394,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vector_semantics_drive_engine_pooling_and_normalization() {
+    fn compiled_model_descriptor_and_native_build_contract_are_inspectable() {
         let semantics = PRODUCT_EMBEDDING_VECTOR_SEMANTICS;
         assert_eq!(semantics.dimension(), EMBEDDING_DIMENSION);
         assert_eq!(semantics.pooling_id(), EMBEDDING_POOLING_ID);
         assert_eq!(semantics.normalization_id(), EMBEDDING_NORMALIZATION_ID);
-        assert!(matches!(
-            semantics.llama_pooling_type(),
-            LlamaPoolingType::Cls
-        ));
-
-        let mut vector = [3.0_f32, 4.0];
-        semantics.normalize(&mut vector);
-        assert!((vector[0] - 0.6).abs() < f32::EPSILON);
-        assert!((vector[1] - 0.8).abs() < f32::EPSILON);
         assert_eq!(MODEL_PRODUCER_NAME, env!("CARGO_PKG_NAME"));
         assert_eq!(MODEL_PRODUCER_VERSION, env!("CARGO_PKG_VERSION"));
         assert!(PRODUCT_EMBEDDING_RUNTIME_ID.contains(&format!(
@@ -1206,6 +1406,85 @@ mod tests {
         )));
         assert_eq!(MODEL_LICENSE_SPDX_ID, "MIT");
         assert!(MODEL_LICENSE_SOURCE_URL.starts_with("https://"));
+
+        let capabilities = compiled_engine_capabilities();
+        assert_eq!(capabilities.schema_version, 1);
+        assert!(capabilities.backends.contains(&"cpu"));
+        assert!(matches!(capabilities.linkage, "static" | "dynamic"));
+        for fragment in [
+            format!("target={}", capabilities.target_triple),
+            format!("os={}", capabilities.target_os),
+            format!("arch={}", capabilities.target_arch),
+            format!("linkage={}", capabilities.linkage),
+            format!("backends={}", capabilities.backends.join(",")),
+            format!("model_sha256={MODEL_SHA256}"),
+            format!("embedding_contract_sha256={NATIVE_ENGINE_EMBEDDING_CONTRACT_SHA256}"),
+        ] {
+            assert!(
+                capabilities.build_identity.contains(&fragment),
+                "{fragment}"
+            );
+        }
+        assert!(
+            capabilities
+                .build_identity
+                .starts_with("codestory-native-engine-v1|")
+        );
+        assert!(capabilities.build_identity.ends_with("|end"));
+    }
+
+    #[test]
+    fn hostile_model_backend_and_class_requests_fail_with_stable_reasons() {
+        let mut config = valid_config();
+        config.embedding.model_sha256 = "0".repeat(64);
+        let error = validate_engine_config(&config).expect_err("model drift must fail");
+        assert_eq!(error.reason_code(), "native_model_request_mismatch");
+
+        let mut config = valid_config();
+        config.backend.backend = "cuda".into();
+        config.backend.device_class = NativeDeviceClass::Accelerator;
+        let error = validate_engine_config(&config).expect_err("uncompiled backend must fail");
+        assert_eq!(error.reason_code(), "native_backend_not_compiled");
+
+        let mut config = valid_config();
+        config.backend.device_class = NativeDeviceClass::Accelerator;
+        let error = validate_engine_config(&config).expect_err("CPU class drift must fail");
+        assert_eq!(error.reason_code(), "native_engine_config_invalid");
+    }
+
+    #[test]
+    fn runtime_selection_honors_the_explicit_request_without_fallback() {
+        let devices = vec![
+            test_device("CPU", "cpu", LlamaBackendDeviceType::Cpu),
+            test_device("Apple GPU", "Metal", LlamaBackendDeviceType::Gpu),
+        ];
+        let metal = NativeBackendRequest {
+            backend: "metal".into(),
+            device_class: NativeDeviceClass::Accelerator,
+            reject_software_adapters: true,
+        };
+        assert_eq!(
+            select_device(&devices, &metal)
+                .expect("explicit Metal request")
+                .name,
+            "Apple GPU"
+        );
+
+        let vulkan = NativeBackendRequest {
+            backend: "vulkan".into(),
+            device_class: NativeDeviceClass::Accelerator,
+            reject_software_adapters: true,
+        };
+        let error = select_device(&devices, &vulkan).expect_err("must not fall back to CPU");
+        assert_eq!(error.reason_code(), "native_backend_unavailable");
+
+        let unknown = vec![test_device(
+            "Unclassified Metal device",
+            "Metal",
+            LlamaBackendDeviceType::Unknown,
+        )];
+        let error = select_device(&unknown, &metal).expect_err("unknown device must fail closed");
+        assert_eq!(error.reason_code(), "native_backend_unavailable");
     }
 
     #[test]
@@ -1227,6 +1506,43 @@ mod tests {
                 device_type: LlamaBackendDeviceType::Gpu,
             };
             assert!(is_software_adapter(&device));
+        }
+    }
+
+    fn valid_config() -> EmbeddingEngineConfig {
+        EmbeddingEngineConfig {
+            backend: NativeBackendRequest {
+                backend: "cpu".into(),
+                device_class: NativeDeviceClass::Cpu,
+                reject_software_adapters: true,
+            },
+            embedding: NativeEmbeddingRequest {
+                model_id: MODEL_FILE_NAME.into(),
+                model_sha256: MODEL_SHA256.into(),
+                dimension: EMBEDDING_DIMENSION,
+                pooling: NativeEmbeddingPooling::Cls,
+                context_tokens: 4096,
+                max_input_tokens: 512,
+                batch_tokens: 1024,
+                max_batch_sequences: 6,
+                smoke_input: "native boundary smoke".into(),
+            },
+        }
+    }
+
+    fn test_device(
+        name: &str,
+        backend: &str,
+        device_type: LlamaBackendDeviceType,
+    ) -> LlamaBackendDevice {
+        LlamaBackendDevice {
+            index: 0,
+            name: name.into(),
+            description: name.into(),
+            backend: backend.into(),
+            memory_total: 1,
+            memory_free: 1,
+            device_type,
         }
     }
 
@@ -1345,7 +1661,8 @@ mod tests {
                 backend: "test".into(),
                 adapter_name: "test".into(),
                 adapter_description: "test".into(),
-                policy: ExecutionPolicy::CpuExplicit,
+                selected_device_class: NativeDeviceClass::Cpu,
+                runtime_capabilities: Vec::new(),
                 embedded_model: true,
                 materialized_path: PathBuf::from("test.gguf"),
                 materialized_reused: true,

@@ -17,6 +17,10 @@ const canonicalContract = resolve(
 );
 const llamaSource = resolve(repositoryRoot, "crates/codestory-llama-sys/src/lib.rs");
 const retrievalEmbeddings = resolve(repositoryRoot, "crates/codestory-retrieval/src/embeddings.rs");
+const retrievalEmbeddingContract = resolve(
+  repositoryRoot,
+  "crates/codestory-retrieval/src/embedding_contract.rs",
+);
 const embeddedVector = resolve(repositoryRoot, "crates/codestory-retrieval/src/embedded_vector.rs");
 
 function sha256(value) {
@@ -181,14 +185,16 @@ test("Cargo's build boundary is process-free and release input is explicit", asy
 });
 
 test("acquisition, build, and Rust evidence consume the checked-in contract", async () => {
-  const [acquisition, build, contract, llama, embeddings, vectors] = await Promise.all([
-    readFile(script, "utf8"),
-    readFile(buildScript, "utf8"),
-    readFile(canonicalContract, "utf8"),
-    readFile(llamaSource, "utf8"),
-    readFile(retrievalEmbeddings, "utf8"),
-    readFile(embeddedVector, "utf8"),
-  ]);
+  const [acquisition, build, contract, llama, embeddings, embeddingContract, vectors] =
+    await Promise.all([
+      readFile(script, "utf8"),
+      readFile(buildScript, "utf8"),
+      readFile(canonicalContract, "utf8"),
+      readFile(llamaSource, "utf8"),
+      readFile(retrievalEmbeddings, "utf8"),
+      readFile(retrievalEmbeddingContract, "utf8"),
+      readFile(embeddedVector, "utf8"),
+    ]);
   const parsed = JSON.parse(contract);
 
   assert.equal(parsed.schema_version, 1);
@@ -202,7 +208,10 @@ test("acquisition, build, and Rust evidence consume the checked-in contract", as
   assert.doesNotMatch(acquisition, new RegExp(parsed.model.sha256, "u"));
   assert.doesNotMatch(build, new RegExp(parsed.model.sha256, "u"));
   assert.match(llama, /dimension: EMBEDDING_DIMENSION/u);
-  assert.match(embeddings, /codestory_llama_sys::EMBEDDING_QUERY_PREFIX/u);
+  assert.match(embeddings, /crate::embedding_contract::CODERANK_QUERY_PREFIX/u);
+  assert.match(embeddingContract, /codestory_llama_sys::EMBEDDING_QUERY_PREFIX/u);
+  assert.match(embeddingContract, /normalize_and_validate_vectors/u);
+  assert.match(embeddingContract, /NativeBackendRequest/u);
   assert.match(vectors, /codestory_llama_sys::MODEL_TOKENIZER_SHA256/u);
   assert.match(vectors, /codestory_llama_sys::MODEL_CONFIG_SHA256/u);
   assert.match(vectors, /codestory_llama_sys::EMBEDDING_ELEMENT_TYPE/u);
