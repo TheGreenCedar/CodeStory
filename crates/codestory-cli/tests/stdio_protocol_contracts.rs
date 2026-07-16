@@ -2223,6 +2223,75 @@ fn affected_tool_maps_explicit_changed_paths_without_sidecars() {
 }
 
 #[test]
+fn affected_tool_matches_existing_alias_by_native_file_identity() {
+    let fixture = indexed_fixture();
+    let alias_dir = fixture.workspace.path().join("target");
+    fs::create_dir_all(&alias_dir).expect("create excluded alias dir");
+    fs::hard_link(
+        fixture.workspace.path().join("src/runtime.rs"),
+        alias_dir.join("runtime-alias.rs"),
+    )
+    .expect("create hard-link alias");
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-native-alias",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "changed_paths": ["target/runtime-alias.rs"],
+                    "depth": 1
+                }
+            }
+        }),
+    );
+
+    let result = assert_tool_success(&response, json!("affected-native-alias"));
+    assert_eq!(
+        result["matched_file_count"],
+        json!(1),
+        "an excluded alias should match the indexed file by native identity: {result}"
+    );
+    assert_eq!(result["matched_files"][0]["path"], json!("src/runtime.rs"));
+}
+
+#[test]
+fn affected_tool_matches_rename_by_previous_path_identity() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "affected-rename-previous",
+            "method": "tools/call",
+            "params": {
+                "name": "affected",
+                "arguments": {
+                    "change_records": [{
+                        "path": "src/runtime-renamed.rs",
+                        "previous_path": "src/runtime.rs",
+                        "kind": "renamed",
+                        "status": "R"
+                    }],
+                    "depth": 1
+                }
+            }
+        }),
+    );
+
+    let result = assert_tool_success(&response, json!("affected-rename-previous"));
+    assert_eq!(result["matched_file_count"], json!(1));
+    assert_eq!(result["matched_files"][0]["path"], json!("src/runtime.rs"));
+    assert_eq!(result["matched_files"][0]["change_kind"], json!("renamed"));
+}
+
+#[test]
 fn affected_tool_rejects_invalid_arguments_without_transport_crash() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);

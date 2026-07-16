@@ -102,6 +102,10 @@ jobs:
             target
           key: ${{ runner.os }}-release-${{ env.RELEASE_RUST_TOOLCHAIN }}-${{ steps.rust-cache-key.outputs.version }}-${{ matrix.rust_target }}-codestory-cli-default-features-${{ hashFiles('Cargo.lock') }}
 
+      - name: Prove native workspace path identity
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p codestory-workspace repository_identity
+
       - name: Prepare checksum-pinned embedded model
         run: node scripts/prepare-embedded-model.mjs
 

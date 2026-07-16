@@ -1172,6 +1172,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cache_override_is_normalized_without_workspace_hashing() {
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let process_cache_root = temp.path().join("process-cache");
+        let override_dir = temp.path().join("explicit-cache");
+        let expected_override =
+            canonicalize_configuration_path(&override_dir).expect("explicit cache identity");
+        let default_cache = canonicalize_configuration_path(
+            &process_cache_root.join(codestory_workspace::workspace_id_v3_for_root(&project)),
+        )
+        .expect("default cache identity");
+
+        let actual = cache_root_for_project_in(&project, Some(&override_dir), &process_cache_root)
+            .expect("explicit cache root");
+
+        assert_eq!(actual, expected_override);
+        assert_ne!(actual, default_cache);
+    }
+
+    #[test]
     fn missing_configuration_path_identity_is_stable_after_creation() {
         let temp = tempdir().expect("temp dir");
         let missing = temp.path().join("cache").join("nested");
