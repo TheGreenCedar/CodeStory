@@ -2162,7 +2162,6 @@ fn stdio_storage_modified(
     let paths = [
         storage_path.to_path_buf(),
         storage_path.with_extension("db-wal"),
-        storage_path.with_extension("db-shm"),
     ];
     let mut newest: Option<std::time::SystemTime> = None;
     for path in paths {
@@ -4818,6 +4817,30 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+
+    #[test]
+    fn storage_freshness_uses_durable_db_and_wal_but_ignores_shm() {
+        let temp = tempfile::tempdir().expect("storage tempdir");
+        let storage = temp.path().join("codestory.db");
+        std::fs::write(&storage, b"database").expect("write database");
+
+        std::thread::sleep(Duration::from_millis(25));
+        let wal = storage.with_extension("db-wal");
+        std::fs::write(&wal, b"committed wal").expect("write WAL");
+        let wal_modified = std::fs::metadata(&wal)
+            .and_then(|metadata| metadata.modified())
+            .expect("WAL modified time");
+
+        std::thread::sleep(Duration::from_millis(25));
+        std::fs::write(storage.with_extension("db-shm"), b"reader coordination")
+            .expect("write SHM");
+
+        assert_eq!(
+            stdio_storage_modified(&storage).expect("durable storage modified time"),
+            wal_modified,
+            "reader-owned SHM metadata must not make the durable index look newer"
+        );
+    }
 
     #[test]
     fn query_resolved_graph_tools_use_the_complete_retrieval_operation() {

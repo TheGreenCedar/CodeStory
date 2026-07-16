@@ -20,7 +20,8 @@
   cache/storage identity is normalized before context or activation reuse.
 - Cold status and MCP resources are observational: they no longer create cache
   directories or databases, migrate stores, initialize engines, or activate a
-  project.
+  project. Dirty-marker freshness compares only committed database and WAL
+  state, so reader-owned SHM metadata cannot falsely clear a stale marker.
 - Fail-open MCP advertises only the diagnostic resources and methods it can
   serve while the native runtime is provisioning or unavailable.
 - Skill command syntax is generated from Clap help instead of being maintained
