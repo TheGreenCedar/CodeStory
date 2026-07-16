@@ -6,10 +6,15 @@ gates belong on an accepted exact head, not every draft commit.
 
 ## Prerequisites
 
-Install the Rust toolchain, Node.js 18 or later, Git, and Python 3. On macOS,
-CodeStory development supports macOS 15 or later and requires the Xcode Command
-Line Tools. Apple Silicon is the protected Metal cell; Intel Mac development
-uses explicit CPU operation and never claims Metal.
+Install the Rust toolchain, Node.js 18 or later, Git, Python 3, CMake, and
+LLVM/libclang. On Windows, set `LIBCLANG_PATH` to the LLVM `bin` directory when
+bindgen cannot find `libclang.dll`, and install the Vulkan SDK used by the
+default native backend. Run native Windows builds from a Visual Studio
+developer shell, use `CMAKE_GENERATOR=Ninja` when the nested Vulkan shader build
+selects MSBuild, and keep the worktree path short enough for CMake's object-path
+limit. On macOS, CodeStory development supports macOS 15 or later and requires
+the Xcode Command Line Tools. Apple Silicon is the protected Metal cell; Intel
+Mac development uses explicit CPU operation and never claims Metal.
 
 Debug Rust builds compile without embedding the release model. A release build
 automatically reuses or prepares the exact pinned model at build time:

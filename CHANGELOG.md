@@ -12,6 +12,8 @@
 
 ### Search quality and reliability
 
+- Tree-sitter and every wired language grammar now use their current compatible crate releases, including the vendored graph runtime's Tree-sitter 0.26 compatibility pin.
+- Windows contributor setup now names the LLVM/libclang, Vulkan, developer-shell, Ninja, and short-path requirements used by source builds.
 - Rust 2024 sources, including `unsafe extern` blocks and let-chains, now remain parser-complete. CodeStory uses the current Rust grammar and a compatible Tree-sitter runtime instead of rejecting valid modern Rust files and withholding a full publication.
 - Windows x64 and arm64 package builders now install and verify the architecture-matched, checksum-pinned LunarG Vulkan SDK instead of depending on mutable runner-image contents. The pinned glibc 2.31 Linux build also imports the Vulkan video headers that accompany its newer compile-time header set, and generic hosted managed-plugin checks use explicit offline CPU evidence instead of implying an unavailable accelerator claim.
 - Core publication now preserves the last verified generation when a scheduled source cannot be read completely: incremental refresh retains the affected projection, while full refresh discards its incomplete staged candidate. Incremental refresh also updates dense inputs for graph-dependent files as edges change and republishes path-bound dense inputs before retrieval after cache rehydrate.
