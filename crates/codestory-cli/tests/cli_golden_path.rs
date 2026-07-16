@@ -1207,6 +1207,44 @@ fn assert_product_search_fails_closed_without_full_sidecars(
     assert_retrieval_failure_output(output);
 }
 
+fn assert_product_search_fails_closed_on_stale_core(
+    workspace: &Path,
+    cache_dir: &Path,
+    query: &str,
+) {
+    let output = run_cli(
+        workspace,
+        cache_dir,
+        &[
+            "search",
+            "--query",
+            query,
+            "--repo-text",
+            "off",
+            "--limit",
+            "5",
+            "--refresh",
+            "none",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "product search should fail closed on a stale core publication"
+    );
+    let failure: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("parse stale-core failure: {error}; output={output:#?}"));
+    assert_eq!(
+        failure["error"]["code"], "project_unavailable",
+        "{failure:#}"
+    );
+    assert_eq!(
+        failure["error"]["message"], "search requires a fresh complete core publication",
+        "{failure:#}"
+    );
+}
+
 fn assert_retrieval_failure_output(output: std::process::Output) {
     let failure = format!(
         "{}{}",
@@ -1766,11 +1804,17 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             && affected_markdown.contains("): "),
         "affected markdown should summarize impact:\n{affected_markdown}"
     );
+}
 
-    run_git(workspace, &["init"]);
-    run_git(workspace, &["add", "."]);
+#[test]
+fn affected_git_fallback_refreshes_stale_core_explicitly() {
+    let workspace = tempdir().expect("workspace dir");
+    let cache_dir = tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    run_git(workspace.path(), &["init"]);
+    run_git(workspace.path(), &["add", "."]);
     run_git(
-        workspace,
+        workspace.path(),
         &[
             "-c",
             "user.email=codestory@example.test",
@@ -1783,8 +1827,13 @@ fn assert_files_and_affected_read_existing_cache(workspace: &Path, cache_dir: &P
             "fixture",
         ],
     );
+    run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["index", "--refresh", "full", "--format", "json"],
+    );
     fs::write(
-        workspace.join("src/runtime.rs"),
+        workspace.path().join("src/runtime.rs"),
         r#"pub fn normalize_project(project_name: &str) -> String {
     format!("workspace:{project_name}")
 }
@@ -1799,19 +1848,22 @@ pub fn changed_after_index() -> bool {
 "#,
     )
     .expect("modify runtime fixture for git diff fallback");
-    let affected_git = run_cli_json(
-        workspace,
-        cache_dir,
-        &["affected", "--refresh", "none", "--format", "json"],
+
+    let affected = run_cli_json(
+        workspace.path(),
+        cache_dir.path(),
+        &["affected", "--refresh", "incremental", "--format", "json"],
     );
+
     assert!(
-        affected_git["changed_paths"]
+        affected["changed_paths"]
             .as_array()
             .expect("changed paths")
             .iter()
             .any(|path| path == "src/runtime.rs"),
-        "affected should default to git diff --name-only HEAD: {affected_git:#}"
+        "affected should default to git diff --name-only HEAD: {affected:#}"
     );
+    assert_eq!(affected["matched_file_count"], 1, "{affected:#}");
 }
 
 fn run_git(workspace: &Path, args: &[&str]) {
@@ -2157,7 +2209,7 @@ fn read_commands_report_stale_index_freshness_without_refreshing_cache() {
     fs::remove_file(workspace.path().join("src").join("removed_after_index.rs"))
         .expect("remove indexed file after indexing");
 
-    assert_product_search_fails_closed_without_full_sidecars(
+    assert_product_search_fails_closed_on_stale_core(
         workspace.path(),
         cache_dir.path(),
         "AppController",
