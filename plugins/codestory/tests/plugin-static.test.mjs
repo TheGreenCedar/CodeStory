@@ -2815,6 +2815,36 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(status.project_root_source, "request_argument");
     assert.equal(status.degraded_reason, "managed_cli_provisioning");
     assert.equal(status.runtime.state, "preparing");
+    const coldResources = await request({
+      jsonrpc: "2.0",
+      id: "cold-resources",
+      method: "resources/list",
+    });
+    assert.deepEqual(
+      coldResources.result.resources.map(({ uri }) => uri),
+      ["codestory://status", "codestory://agent-guide"],
+    );
+    const coldGuideResponse = await request({
+      jsonrpc: "2.0",
+      id: "cold-guide",
+      method: "resources/read",
+      params: { uri: "codestory://agent-guide", project: repoRoot },
+    });
+    const coldGuide = JSON.parse(coldGuideResponse.result.contents[0].text);
+    assert.equal(coldGuide.project, repoRoot);
+    assert.equal(coldGuide.diagnostics_uri, "codestory://status");
+    const coldTemplates = await request({
+      jsonrpc: "2.0",
+      id: "cold-templates",
+      method: "resources/templates/list",
+    });
+    assert.deepEqual(coldTemplates.result.resourceTemplates, []);
+    const coldPrompts = await request({
+      jsonrpc: "2.0",
+      id: "cold-prompts",
+      method: "prompts/list",
+    });
+    assert.deepEqual(coldPrompts.result.prompts, []);
     const coldTools = await request({
       jsonrpc: "2.0",
       id: "cold-tools",

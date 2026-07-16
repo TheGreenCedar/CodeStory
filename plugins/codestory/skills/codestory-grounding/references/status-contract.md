@@ -45,6 +45,7 @@ The most useful fields are:
 | `runtime_truth` | Compact references to the canonical readiness and runtime fields. |
 | `index_publication` | Complete core database generation currently being served. |
 | `local_refresh` | Local map state and the complete publication retained during refresh. |
+| `state`, `capabilities`, `current_operation`, `retry_after_ms`, `failure` | Uncached activation progress layered onto the observational status read, including one stable operation id, stage, attempt, retry delay, and terminal failure. |
 | `retrieval_mode` | Persisted broad-search classification; `full` is required for trustworthy broad results. |
 | `readiness_lanes.agent_packet_search` | Current broad-search capability state. |
 | `runtime_update` | Non-blocking installed-runtime update advisory. |

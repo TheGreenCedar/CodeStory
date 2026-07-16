@@ -180,6 +180,17 @@ impl ActivationService {
             .clone()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_snapshot_for_test(&self, snapshot: Option<ActivationSnapshot>) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        state.current = snapshot;
+    }
+
     pub fn activate_project(
         &self,
         project_root: &Path,
@@ -604,6 +615,13 @@ impl PublicOperationService {
             core_publication,
             retrieval_publication,
         })
+    }
+
+    /// Read the project summary from the core snapshot pinned by the current
+    /// public operation. This deliberately rejects calls outside a pin so a
+    /// response cannot mix a pre-operation summary with pinned graph reads.
+    pub fn active_project_summary(&self) -> Result<ProjectSummary, ApiError> {
+        self.controller.active_project_summary()
     }
 
     /// Run one complete public response under the runtime's retrieval pin and

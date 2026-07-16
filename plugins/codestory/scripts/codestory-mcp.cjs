@@ -2278,8 +2278,11 @@ function runFailOpenMcp(status, options = {}) {
   const tools = failOpenToolCatalog();
   const resources = (canonicalMcpCatalog.resources || []).filter(({ uri }) =>
     uri === 'codestory://status' || uri === 'codestory://agent-guide');
-  const resourceTemplates = canonicalMcpCatalog.resourceTemplates || [];
-  const prompts = canonicalMcpCatalog.prompts || [];
+  // Fail-open serves only the static diagnostic resources below. Do not
+  // advertise generated templates or prompts until the native runtime owns
+  // their read/get handlers.
+  const resourceTemplates = [];
+  const prompts = [];
   const guide = (project) => {
     return {
       message: project

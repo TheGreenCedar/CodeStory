@@ -8,17 +8,21 @@
   workspace identity and immutable configuration, so A/B/A routing preserves
   isolated per-project state without rereading process defaults.
 - Project tool calls join one runtime-owned staged activation operation;
-  compact status exposes its stable operation snapshot and broad responses
-  report the complete retrieval publication served by the runtime-owned retry.
-- Ordinary CLI and stdio public responses now share the runtime-owned complete
-  core/retrieval publication pin across packet, search, context, drill, and
-  query-resolved graph work, including nested response publication metadata.
+  compact status and `codestory://status` expose its stable stage, retry, and
+  failure snapshot without caching live progress, and broad responses report
+  the complete retrieval publication served by the runtime-owned retry.
+- Ordinary CLI, HTTP, and stdio public JSON responses now share the
+  runtime-owned complete core/retrieval publication pin and one canonical
+  metadata envelope across packet, search, context, drill, and every
+  query-resolved graph surface; markdown and graph text remain unchanged.
 - Multi-project and fallback MCP routing now requires an explicit absolute,
   available project root; projectless status reports `no_project`, and native
   cache/storage identity is normalized before context or activation reuse.
 - Cold status and MCP resources are observational: they no longer create cache
   directories or databases, migrate stores, initialize engines, or activate a
   project.
+- Fail-open MCP advertises only the diagnostic resources and methods it can
+  serve while the native runtime is provisioning or unavailable.
 - Skill command syntax is generated from Clap help instead of being maintained
   as a second option source.
 

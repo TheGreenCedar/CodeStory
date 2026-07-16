@@ -13,14 +13,16 @@ Use `<codestory-cli> <command> --help` for the complete option set.
 
 1. Run `cache rehydrate --from-project <parent> --project <child>` before the
    first child-thread index.
-2. If status is `rehydrated`, run the printed `doctor` command to inspect index
-   freshness under the child worktree path.
-3. Run the printed `retrieval index --refresh full` command before using
-   packet/search as agent-facing retrieval evidence. Retrieval manifests are
-   invalidated because retrieval generation ids are currently project-root
-   derived. Portable v2 index artifact cache rows are preserved; older artifact
-   rows are invalidated because they predate the portable-key contract.
-4. If status is `skipped`, use the printed normal rebuild commands.
+2. If status is `rehydrated`, call the intended `packet`, `search`, or `context`
+   tool next. That call owns activation, validates the rebased core publication,
+   and prepares a compatible retrieval publication when needed. If it reports
+   `preparing`, wait `retry_after_ms` and retry the same call.
+3. Rehydration invalidates root-bound retrieval generations while preserving
+   portable v2 index artifact rows. The next broad tool call must publish and
+   pin a retrieval generation for the child before its evidence is usable.
+4. If status is `skipped`, use the printed rebuild guidance. `doctor` and manual
+   index commands are maintainer diagnosis or proof surfaces after automatic
+   activation stops converging.
 
 ## Safety Contract
 

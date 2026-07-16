@@ -137,9 +137,11 @@ pub(crate) fn handle_http_request(
                     .symbol_context(target.selected.node_id.clone())
                     .map_err(map_api_error)
             }) {
-                Ok(operation) => {
-                    write_http_json(&mut stream, 200, &http_public_operation_value(operation)?)
-                }
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
                 Err(error) => write_http_target_error(&mut stream, runtime, error),
             }
         }
@@ -158,9 +160,11 @@ pub(crate) fn handle_http_request(
                     "symbol": context,
                 }))
             }) {
-                Ok(operation) => {
-                    write_http_json(&mut stream, 200, &http_public_operation_value(operation)?)
-                }
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
                 Err(error) => write_http_target_error(&mut stream, runtime, error),
             }
         }
@@ -178,9 +182,11 @@ pub(crate) fn handle_http_request(
                     "references": context,
                 }))
             }) {
-                Ok(operation) => {
-                    write_http_json(&mut stream, 200, &http_public_operation_value(operation)?)
-                }
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
                 Err(error) => write_http_target_error(&mut stream, runtime, error),
             }
         }
@@ -220,9 +226,11 @@ pub(crate) fn handle_http_request(
                     ))
                     .map_err(map_api_error)
             }) {
-                Ok(operation) => {
-                    write_http_json(&mut stream, 200, &http_public_operation_value(operation)?)
-                }
+                Ok(operation) => write_http_json(
+                    &mut stream,
+                    200,
+                    &runtime::public_operation_json_value(&operation, &operation.value)?,
+                ),
                 Err(error) => write_http_target_error(&mut stream, runtime, error),
             }
         }
@@ -346,36 +354,6 @@ fn http_target_public_operation(selection: &args::TargetSelection) -> &'static s
         args::TargetSelection::Query { .. } => "graph_assisted",
         args::TargetSelection::Id(_) => "graph",
     }
-}
-
-fn http_public_operation_value<T: serde::Serialize>(
-    operation: codestory_runtime::PublicOperation<T>,
-) -> Result<serde_json::Value> {
-    let mut value = serde_json::to_value(operation.value)?;
-    if !value.is_object() {
-        value = serde_json::json!({"result": value});
-    }
-    let core_publication = operation.core_publication;
-    let retrieval_publication = operation.retrieval_publication;
-    value
-        .as_object_mut()
-        .expect("HTTP public operation payload is an object")
-        .insert(
-            "_meta".to_string(),
-            serde_json::json!({
-                "codestory_publication": {
-                    "served_from": "complete_publication",
-                    "publication": &core_publication,
-                    "core_publication": &core_publication,
-                    "retrieval_publication": &retrieval_publication,
-                    "operation": {
-                        "operation_id": operation.operation_id,
-                        "attempt": operation.attempt,
-                    }
-                }
-            }),
-        );
-    Ok(value)
 }
 
 pub(crate) fn browser_references_config(root_id: NodeId) -> TrailConfigDto {

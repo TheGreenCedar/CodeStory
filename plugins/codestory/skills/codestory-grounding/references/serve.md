@@ -1,6 +1,10 @@
 # `serve` - Local Agent Integration Surface
 
-Serves the indexed project over either a small HTTP JSON API or an MCP-style JSON-lines stdio protocol. It is for local browser/editor integrations after the cache is ready. MCP runtime fields and surface gating: [status-contract.md](status-contract.md).
+Serves a project over either a small HTTP JSON API or an MCP-style JSON-lines
+stdio protocol. MCP product tools own project activation and managed
+preparation; the server does not require a separate doctor or manual retrieval
+index step first. MCP runtime fields and surface gating:
+[status-contract.md](status-contract.md).
 
 For direct MCP-style clients:
 
@@ -44,5 +48,11 @@ Stdio MCP status fields and allowed-surface rules: [status-contract.md](status-c
 
 - `serve` is local by default on `127.0.0.1`; non-loopback HTTP binds and non-loopback `Host`/`Origin` headers fail unless `--allow-non-loopback` is set. Do not bind wider unless the user explicitly needs remote access and the network boundary is intentional.
 - HTTP only accepts GET requests for the documented routes.
-- Start it after a successful index or with an intentional refresh mode.
-- In one `serve --stdio` process, identical successful `packet` and search-fragment requests are cached with small LRUs keyed by request arguments, the current SQLite/WAL fingerprint, and a mandatory retrieval-readiness fingerprint. The fingerprint binds engine identity, retrieval mode, degraded reason, manifest generation/input hash/backend/dimension, and status errors. This is for repeated agent calls only; changed index files, engine replacement, publication drift, and stale/unavailable readiness bypass the cache.
+- HTTP callers may start from an existing core publication or use an intentional
+  refresh mode. MCP callers should call the intended project-scoped tool and
+  follow its reported retry contract.
+- In one `serve --stdio` process, identical successful `packet` and
+  search-fragment requests use small LRUs keyed by request arguments plus the
+  exact pinned core and retrieval publication identities. Cache hits therefore
+  stay inside one evidence boundary; publication changes, engine replacement,
+  or unavailable readiness bypass the cached response.

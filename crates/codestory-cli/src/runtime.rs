@@ -13,6 +13,7 @@ use codestory_runtime::{
     ActivationService, BookmarkService, GroundingService, IndexService, ProjectService,
     PublicOperation, PublicOperationService, ReadOnlyBrowserService, Runtime, TargetResolution,
 };
+use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -289,15 +290,6 @@ impl RuntimeContext {
     /// Keep all reads that contribute to one CLI response under the runtime's
     /// complete core/retrieval publication pin. Output writes stay outside the
     /// closure so the runtime's single bounded retry cannot duplicate them.
-    pub(crate) fn run_public_response<T>(
-        &self,
-        operation: &str,
-        build: impl FnMut() -> Result<T>,
-    ) -> Result<T> {
-        self.run_public_operation(operation, build)
-            .map(|operation| operation.value)
-    }
-
     pub(crate) fn run_public_operation<T>(
         &self,
         operation: &str,
@@ -323,6 +315,66 @@ impl RuntimeContext {
             }
             Err(error) => Err(map_api_error_for_project(error, &self.project_root)),
         }
+    }
+
+    pub(crate) fn active_project_summary(&self) -> Result<ProjectSummary> {
+        self.public_operation
+            .active_project_summary()
+            .map_err(|error| map_api_error_for_project(error, &self.project_root))
+    }
+}
+
+/// Serialize one publication-backed response with the canonical adapter
+/// metadata envelope. HTTP and ordinary CLI JSON use this exact helper so the
+/// shape cannot drift between transports.
+pub(crate) fn public_operation_json_value<T, V: Serialize>(
+    operation: &PublicOperation<T>,
+    response: &V,
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(response)?;
+    if !value.is_object() {
+        value = serde_json::json!({"result": value});
+    }
+    let core_publication = &operation.core_publication;
+    let retrieval_publication = &operation.retrieval_publication;
+    let object = value
+        .as_object_mut()
+        .expect("public operation payload is an object");
+    let metadata = object
+        .entry("_meta")
+        .or_insert_with(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+    metadata
+        .as_object_mut()
+        .expect("public operation metadata is an object")
+        .insert(
+            "codestory_publication".to_string(),
+            serde_json::json!({
+                "served_from": "complete_publication",
+                "publication": core_publication,
+                "core_publication": core_publication,
+                "retrieval_publication": retrieval_publication,
+                "operation": {
+                    "operation_id": &operation.operation_id,
+                    "attempt": operation.attempt,
+                }
+            }),
+        );
+    Ok(value)
+}
+
+pub(crate) fn map_public_operation<T, U>(
+    operation: PublicOperation<T>,
+    map: impl FnOnce(T) -> U,
+) -> PublicOperation<U> {
+    PublicOperation {
+        value: map(operation.value),
+        core_publication: operation.core_publication,
+        retrieval_publication: operation.retrieval_publication,
+        operation_id: operation.operation_id,
+        attempt: operation.attempt,
     }
 }
 
@@ -769,6 +821,45 @@ mod tests {
         values: Vec<(&'static str, Option<OsString>)>,
     }
 
+    #[test]
+    fn public_operation_metadata_preserves_existing_meta_fields() {
+        let operation = PublicOperation {
+            value: (),
+            core_publication: None,
+            retrieval_publication: None,
+            operation_id: "public-7".to_string(),
+            attempt: 2,
+        };
+        let response = serde_json::json!({
+            "result": "ok",
+            "_meta": {
+                "request_id": "request-1",
+                "codestory_publication": {"stale": true}
+            }
+        });
+
+        let value = public_operation_json_value(&operation, &response)
+            .expect("attach canonical publication metadata");
+
+        assert_eq!(
+            value.pointer("/_meta/request_id"),
+            Some(&serde_json::json!("request-1"))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/served_from"),
+            Some(&serde_json::json!("complete_publication"))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/operation/operation_id"),
+            Some(&serde_json::json!("public-7"))
+        );
+        assert_eq!(
+            value.pointer("/_meta/codestory_publication/operation/attempt"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(value.pointer("/_meta/codestory_publication/stale"), None);
+    }
+
     impl EnvSnapshot {
         fn clear(names: &'static [&'static str]) -> Self {
             let values = names
@@ -1047,7 +1138,7 @@ mod tests {
 
         let mut attempts = 0_u32;
         let served_generation = reader
-            .run_public_response("graph", || {
+            .run_public_operation("graph", || {
                 attempts += 1;
                 let pinned = reader
                     .public_operation
@@ -1064,7 +1155,8 @@ mod tests {
                 }
                 Ok(pinned)
             })
-            .expect("whole ordinary CLI response should retry once");
+            .expect("whole ordinary CLI response should retry once")
+            .value;
         let current_generation = publisher
             .project
             .complete_index_publication_at(&publisher.storage_path)
@@ -1077,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_pin_mismatch_retries_before_building_the_public_response() {
+    fn hostile_drill_pin_change_retries_before_building_the_active_summary() {
         let _env_lock = crate::config::config_env_test_lock();
         let _managed_env = EnvSnapshot::clear(MANAGED_ENV_VARS);
         let _home_env = EnvSnapshot::clear(HOME_ENV_VARS);
@@ -1147,12 +1239,14 @@ mod tests {
 
         let mut builds = 0_u32;
         let operation = reader
-            .run_public_operation("graph_assisted", || {
+            .run_public_operation("drill", || {
                 builds += 1;
-                reader
+                let publication = reader
                     .public_operation
                     .active_publication()
-                    .context("public response has active publications")
+                    .context("drill response has active publications")?;
+                let summary = reader.active_project_summary()?;
+                Ok((publication, summary))
             })
             .expect("mismatched first pins should retry the complete operation");
         let served_core = operation
@@ -1185,16 +1279,39 @@ mod tests {
         );
         assert_eq!(served_retrieval.core_run_id, served_core.run_id);
         assert_eq!(
-            operation.value.core_publication.generation_id,
+            operation.value.0.core_publication.generation_id,
             served_core.generation_id
         );
         assert_eq!(
             operation
                 .value
+                .0
                 .retrieval_publication
+                .as_ref()
                 .expect("active retrieval publication")
                 .core_generation_id,
             served_core.generation_id
+        );
+        let summary_publication = operation
+            .value
+            .1
+            .publication
+            .as_ref()
+            .expect("drill active summary publication");
+        assert_eq!(summary_publication.generation_id, served_core.generation_id);
+        assert_eq!(summary_publication.run_id, served_core.run_id);
+        let json = public_operation_json_value(
+            &operation,
+            &serde_json::json!({"body_publication": summary_publication}),
+        )
+        .expect("serialize hostile drill response metadata");
+        assert_eq!(
+            json.pointer("/body_publication/generation_id"),
+            json.pointer("/_meta/codestory_publication/core_publication/generation_id")
+        );
+        assert_eq!(
+            json.pointer("/body_publication/run_id"),
+            json.pointer("/_meta/codestory_publication/core_publication/run_id")
         );
     }
 

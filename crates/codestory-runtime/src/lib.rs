@@ -8242,6 +8242,18 @@ impl AppController {
         })
     }
 
+    fn active_project_summary(&self) -> Result<ProjectSummary, ApiError> {
+        if self.active_core_publication().is_none() {
+            return Err(ApiError::internal(
+                "Active project summary requires a pinned public operation",
+            ));
+        }
+        let root = self.require_project_root()?;
+        let storage_path = self.require_storage_path()?;
+        let storage = self.open_storage_read_only()?;
+        self.project_summary_from_storage(&root, &storage_path, &storage)
+    }
+
     fn with_complete_core_snapshot<T>(
         &self,
         build: impl FnOnce(&IndexPublicationRecord) -> Result<T, ApiError>,

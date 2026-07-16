@@ -941,63 +941,15 @@ fn stdio_jsonrpc_from_legacy(
 }
 
 fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) -> serde_json::Value {
-    let allowed = |surface: &str| {
-        status
-            .pointer(&format!("/allowed_surfaces/{surface}/allowed"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    };
-    let local_allowed = allowed("ground");
-    let broad_allowed = allowed("packet");
-    let local_updating = status
-        .pointer("/local_refresh/state")
-        .and_then(serde_json::Value::as_str)
-        == Some("refreshing");
-    let local_state = if local_updating {
-        "updating"
-    } else if !local_allowed {
-        "unavailable"
-    } else {
-        "ready"
-    };
-    let broad_state = if broad_allowed {
-        "ready"
-    } else {
-        "unavailable"
-    };
-    let activation = runtime.activation.snapshot();
-    let activation_running = activation.as_ref().is_some_and(|snapshot| {
-        matches!(
-            snapshot.state,
-            codestory_runtime::ActivationState::Preparing
-                | codestory_runtime::ActivationState::Updating
-        )
-    });
-    let (state, next_action) = if activation_running {
-        ("updating", "retry_intended_tool")
-    } else if broad_allowed {
-        ("ready", "call_intended_tool")
-    } else if local_updating {
-        ("updating", "retry_intended_tool")
-    } else if local_allowed {
-        ("working_locally", "continue_with_local_navigation")
-    } else {
-        ("unavailable", "use_source_inspection")
-    };
+    let _ = runtime;
     serde_json::json!({
         "project": status.get("project_root"),
-        "state": state,
-        "capabilities": {
-            "local_navigation": local_state,
-            "broad_search": broad_state
-        },
-        "current_operation": activation
-            .filter(|snapshot| snapshot.state != codestory_runtime::ActivationState::Ready),
-        "next_action": next_action,
-        "retry_after_ms": match state {
-            "updating" => Some(500),
-            _ => None
-        },
+        "state": status.get("state"),
+        "capabilities": status.get("capabilities"),
+        "current_operation": status.get("current_operation"),
+        "next_action": status.get("next_action"),
+        "retry_after_ms": status.get("retry_after_ms"),
+        "failure": status.get("failure"),
         "diagnostics_uri": "codestory://status"
     })
 }
@@ -3046,6 +2998,14 @@ fn read_stdio_status_resource_cached(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
 ) -> Result<serde_json::Value> {
+    let value = read_stdio_status_resource_base_cached(runtime, state)?;
+    Ok(stdio_status_with_activation(runtime, value))
+}
+
+fn read_stdio_status_resource_base_cached(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+) -> Result<serde_json::Value> {
     if let Some(mismatch) = stdio_workspace_mismatch(runtime) {
         state.status_cache = None;
         return Ok(stdio_workspace_mismatch_status(&mismatch));
@@ -3116,6 +3076,101 @@ fn read_stdio_status_resource_cached(
         thread::sleep(Duration::from_millis(5));
     }
     unreachable!("status publication attempt loop always returns or errors")
+}
+
+fn stdio_status_with_activation(
+    runtime: &RuntimeContext,
+    mut status: serde_json::Value,
+) -> serde_json::Value {
+    let allowed = |surface: &str| {
+        status
+            .pointer(&format!("/allowed_surfaces/{surface}/allowed"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let local_allowed = allowed("ground");
+    let broad_allowed = allowed("packet");
+    let local_updating = status
+        .pointer("/local_refresh/state")
+        .and_then(serde_json::Value::as_str)
+        == Some("refreshing");
+    let activation = runtime.activation.snapshot();
+    let active = activation
+        .as_ref()
+        .filter(|snapshot| snapshot.state != codestory_runtime::ActivationState::Ready);
+    let (state, next_action) = match active.map(|snapshot| snapshot.state) {
+        Some(codestory_runtime::ActivationState::Preparing) => ("preparing", "retry_intended_tool"),
+        Some(codestory_runtime::ActivationState::Updating) => ("updating", "retry_intended_tool"),
+        Some(codestory_runtime::ActivationState::Retryable) => ("preparing", "retry_intended_tool"),
+        Some(
+            codestory_runtime::ActivationState::Unavailable
+            | codestory_runtime::ActivationState::Cancelled,
+        ) => ("unavailable", "use_source_inspection"),
+        Some(codestory_runtime::ActivationState::Ready) => unreachable!("ready was filtered"),
+        None if broad_allowed => ("ready", "call_intended_tool"),
+        None if local_updating => ("updating", "retry_intended_tool"),
+        None if local_allowed => ("working_locally", "continue_with_local_navigation"),
+        None => ("unavailable", "use_source_inspection"),
+    };
+    let capability_label = |capability| match capability {
+        codestory_runtime::ActivationCapabilityState::Ready => "ready",
+        codestory_runtime::ActivationCapabilityState::Retryable => "retryable",
+        codestory_runtime::ActivationCapabilityState::Unavailable => "unavailable",
+        codestory_runtime::ActivationCapabilityState::Cancelled => "cancelled",
+    };
+    let local_state = active.map_or_else(
+        || {
+            if local_updating {
+                "updating"
+            } else if local_allowed {
+                "ready"
+            } else {
+                "unavailable"
+            }
+        },
+        |snapshot| capability_label(snapshot.capabilities.local_navigation),
+    );
+    let broad_state = active.map_or_else(
+        || {
+            if broad_allowed {
+                "ready"
+            } else {
+                "unavailable"
+            }
+        },
+        |snapshot| capability_label(snapshot.capabilities.broad_search),
+    );
+    let object = status
+        .as_object_mut()
+        .expect("status resource payload is an object");
+    object.insert("state".to_string(), serde_json::json!(state));
+    object.insert(
+        "capabilities".to_string(),
+        serde_json::json!({
+            "local_navigation": local_state,
+            "broad_search": broad_state,
+        }),
+    );
+    object.insert(
+        "current_operation".to_string(),
+        active
+            .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+            .unwrap_or(serde_json::Value::Null),
+    );
+    object.insert("next_action".to_string(), serde_json::json!(next_action));
+    object.insert(
+        "retry_after_ms".to_string(),
+        active
+            .and_then(|snapshot| snapshot.retry_after_ms)
+            .map_or(serde_json::Value::Null, serde_json::Value::from),
+    );
+    object.insert(
+        "failure".to_string(),
+        active
+            .and_then(|snapshot| snapshot.failure.clone())
+            .map_or(serde_json::Value::Null, serde_json::Value::from),
+    );
+    status
 }
 
 fn stdio_status_matches_publication(
@@ -6073,6 +6128,94 @@ version = "0.11.20"
         assert!(
             !cold_cache_root.exists(),
             "cold project resource must not create project cache storage"
+        );
+    }
+
+    #[test]
+    fn status_resource_reports_live_activation_without_caching_progress() {
+        let project = tempfile::tempdir().expect("project");
+        let cache_parent = tempfile::tempdir().expect("cache parent");
+        let cache = cache_parent.path().join("cold-cache");
+        let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.clone()),
+        })
+        .expect("runtime context");
+        let mut state = StdioServerState::default();
+
+        let cold = read_stdio_status_resource_cached(&runtime, &mut state)
+            .expect("read cold status resource");
+        assert_eq!(
+            cold.get("current_operation"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(cold.get("retry_after_ms"), Some(&serde_json::Value::Null));
+        assert!(!cache.exists(), "cold status must remain observational");
+
+        runtime
+            .activation
+            .set_snapshot_for_test(Some(codestory_runtime::ActivationSnapshot {
+                operation_id: "activation-live".to_string(),
+                state: codestory_runtime::ActivationState::Preparing,
+                stage: codestory_runtime::ActivationStage::DensePreparation,
+                attempt: 1,
+                retry_after_ms: Some(375),
+                failure: None,
+                capabilities: codestory_runtime::ActivationCapabilities {
+                    local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
+                    broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
+                },
+            }));
+        let live = read_stdio_status_resource_cached(&runtime, &mut state)
+            .expect("read live status resource from cached base");
+        assert_eq!(live.get("state"), Some(&serde_json::json!("preparing")));
+        assert_eq!(
+            live.pointer("/current_operation/operation_id"),
+            Some(&serde_json::json!("activation-live"))
+        );
+        assert_eq!(live.get("retry_after_ms"), Some(&serde_json::json!(375)));
+        assert_eq!(live.get("failure"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            live.pointer("/capabilities/local_navigation"),
+            Some(&serde_json::json!("ready"))
+        );
+        assert_eq!(
+            live.pointer("/capabilities/broad_search"),
+            Some(&serde_json::json!("retryable"))
+        );
+
+        runtime
+            .activation
+            .set_snapshot_for_test(Some(codestory_runtime::ActivationSnapshot {
+                operation_id: "activation-live".to_string(),
+                state: codestory_runtime::ActivationState::Retryable,
+                stage: codestory_runtime::ActivationStage::Validation,
+                attempt: 2,
+                retry_after_ms: Some(250),
+                failure: Some("publication changed".to_string()),
+                capabilities: codestory_runtime::ActivationCapabilities {
+                    local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
+                    broad_search: codestory_runtime::ActivationCapabilityState::Retryable,
+                },
+            }));
+        let retry = read_stdio_status_resource_cached(&runtime, &mut state)
+            .expect("read retry status resource from cached base");
+        assert_eq!(
+            retry.pointer("/current_operation/stage"),
+            Some(&serde_json::json!("validation"))
+        );
+        assert_eq!(
+            retry.pointer("/current_operation/attempt"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(retry.get("retry_after_ms"), Some(&serde_json::json!(250)));
+        assert_eq!(
+            retry.get("failure"),
+            Some(&serde_json::json!("publication changed"))
+        );
+        assert!(
+            !cache.exists(),
+            "activation reporting must remain observational"
         );
     }
 
