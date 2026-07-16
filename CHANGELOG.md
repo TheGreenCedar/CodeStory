@@ -9,8 +9,9 @@
   isolated per-project state without rereading process defaults.
 - Project tool calls join one runtime-owned staged activation operation;
   compact status and `codestory://status` expose its stable stage, retry, and
-  failure snapshot without caching live progress, and broad responses report
-  the complete retrieval publication served by the runtime-owned retry.
+  failure snapshot without caching live progress, keep local navigation visible
+  while broad retrieval prepares or fails, and broad responses report the
+  complete retrieval publication served by the runtime-owned retry.
 - Ordinary CLI, HTTP, and stdio public JSON responses now share the
   runtime-owned complete core/retrieval publication pin and one canonical
   metadata envelope across packet, search, context, drill, and every

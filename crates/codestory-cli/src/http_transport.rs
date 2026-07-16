@@ -107,25 +107,34 @@ pub(crate) fn handle_http_request(
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(10)
                 .clamp(1, 100);
-            let results = match runtime.browser.search_results(SearchRequest {
-                query,
-                repo_text,
-                limit_per_source,
-                expand_search_plan: false,
-                hybrid_weights: None,
-                hybrid_limits: None,
+            let operation = match runtime.run_public_operation("search", || {
+                runtime
+                    .browser
+                    .search_results(SearchRequest {
+                        query: query.clone(),
+                        repo_text,
+                        limit_per_source,
+                        expand_search_plan: false,
+                        hybrid_weights: None,
+                        hybrid_limits: None,
+                    })
+                    .map_err(map_api_error)
             }) {
-                Ok(results) => results,
+                Ok(operation) => operation,
                 Err(error) => {
                     return write_http_error_json(
                         &mut stream,
                         400,
                         "search_unavailable",
-                        map_api_error(error).to_string(),
+                        error.to_string(),
                     );
                 }
             };
-            write_http_json(&mut stream, 200, &results)
+            write_http_json(
+                &mut stream,
+                200,
+                &runtime::public_operation_json_value(&operation, &operation.value)?,
+            )
         }
         "/symbol" => {
             let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {
@@ -192,21 +201,30 @@ pub(crate) fn handle_http_request(
         }
         "/symbols" => {
             let limit = browser_symbols_limit(params.get("limit").map(String::as_str));
-            if let Some(parent_id) = params.get("parent_id").filter(|value| !value.is_empty()) {
-                let symbols = runtime
-                    .browser
-                    .list_children_symbols(ListChildrenSymbolsRequest {
-                        parent_id: NodeId(parent_id.clone()),
-                    })
-                    .map_err(map_api_error)?;
-                write_http_json(&mut stream, 200, &symbols)
-            } else {
-                let symbols = runtime
-                    .browser
-                    .list_root_symbols(ListRootSymbolsRequest { limit })
-                    .map_err(map_api_error)?;
-                write_http_json(&mut stream, 200, &symbols)
-            }
+            let parent_id = params
+                .get("parent_id")
+                .filter(|value| !value.is_empty())
+                .cloned();
+            let operation = runtime.run_public_operation("graph", || {
+                if let Some(parent_id) = parent_id.as_ref() {
+                    runtime
+                        .browser
+                        .list_children_symbols(ListChildrenSymbolsRequest {
+                            parent_id: NodeId(parent_id.clone()),
+                        })
+                        .map_err(map_api_error)
+                } else {
+                    runtime
+                        .browser
+                        .list_root_symbols(ListRootSymbolsRequest { limit })
+                        .map_err(map_api_error)
+                }
+            })?;
+            write_http_json(
+                &mut stream,
+                200,
+                &runtime::public_operation_json_value(&operation, &operation.value)?,
+            )
         }
         "/trail" => {
             let Some(selection) = http_target_selection_or_error(&mut stream, &params)? else {

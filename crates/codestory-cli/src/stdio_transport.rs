@@ -3097,7 +3097,14 @@ fn stdio_status_with_activation(
     let active = activation
         .as_ref()
         .filter(|snapshot| snapshot.state != codestory_runtime::ActivationState::Ready);
+    let working_locally = active.is_some_and(|snapshot| {
+        snapshot.capabilities.local_navigation
+            == codestory_runtime::ActivationCapabilityState::Ready
+            && snapshot.capabilities.broad_search
+                != codestory_runtime::ActivationCapabilityState::Ready
+    });
     let (state, next_action) = match active.map(|snapshot| snapshot.state) {
+        Some(_) if working_locally => ("working_locally", "continue_with_local_navigation"),
         Some(codestory_runtime::ActivationState::Preparing) => ("preparing", "retry_intended_tool"),
         Some(codestory_runtime::ActivationState::Updating) => ("updating", "retry_intended_tool"),
         Some(codestory_runtime::ActivationState::Retryable) => ("preparing", "retry_intended_tool"),
@@ -6191,7 +6198,14 @@ version = "0.11.20"
             }));
         let live = read_stdio_status_resource_cached(&runtime, &mut state)
             .expect("read live status resource from cached base");
-        assert_eq!(live.get("state"), Some(&serde_json::json!("preparing")));
+        assert_eq!(
+            live.get("state"),
+            Some(&serde_json::json!("working_locally"))
+        );
+        assert_eq!(
+            live.get("next_action"),
+            Some(&serde_json::json!("continue_with_local_navigation"))
+        );
         assert_eq!(
             live.pointer("/current_operation/operation_id"),
             Some(&serde_json::json!("activation-live"))
@@ -6235,6 +6249,55 @@ version = "0.11.20"
         assert_eq!(
             retry.get("failure"),
             Some(&serde_json::json!("publication changed"))
+        );
+        assert_eq!(
+            retry.get("state"),
+            Some(&serde_json::json!("working_locally"))
+        );
+        assert_eq!(
+            retry.get("next_action"),
+            Some(&serde_json::json!("continue_with_local_navigation"))
+        );
+
+        runtime
+            .activation
+            .set_snapshot_for_test(Some(codestory_runtime::ActivationSnapshot {
+                operation_id: "activation-live".to_string(),
+                state: codestory_runtime::ActivationState::Unavailable,
+                stage: codestory_runtime::ActivationStage::Validation,
+                attempt: 3,
+                retry_after_ms: None,
+                failure: Some("managed retrieval unavailable".to_string()),
+                capabilities: codestory_runtime::ActivationCapabilities {
+                    local_navigation: codestory_runtime::ActivationCapabilityState::Ready,
+                    broad_search: codestory_runtime::ActivationCapabilityState::Unavailable,
+                },
+            }));
+        let unavailable = read_stdio_status_resource_cached(&runtime, &mut state)
+            .expect("read locally usable terminal activation status from cached base");
+        assert_eq!(
+            unavailable.get("state"),
+            Some(&serde_json::json!("working_locally"))
+        );
+        assert_eq!(
+            unavailable.get("next_action"),
+            Some(&serde_json::json!("continue_with_local_navigation"))
+        );
+        assert_eq!(
+            unavailable.get("retry_after_ms"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            unavailable.get("failure"),
+            Some(&serde_json::json!("managed retrieval unavailable"))
+        );
+        assert_eq!(
+            unavailable.pointer("/capabilities/local_navigation"),
+            Some(&serde_json::json!("ready"))
+        );
+        assert_eq!(
+            unavailable.pointer("/capabilities/broad_search"),
+            Some(&serde_json::json!("unavailable"))
         );
         assert!(
             !cache.exists(),
