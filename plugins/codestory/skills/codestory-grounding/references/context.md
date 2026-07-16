@@ -2,27 +2,10 @@
 
 Builds target context around one concrete retrieval target (`--query` must name a symbol, file, literal, API path, module, or behavior term — not a broad question). Runs through the Investigate agent path and fails closed unless full retrieval is full. For broad questions use `packet`; for discovery use `search`; for repeatable reports use `drill`.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> context [OPTIONS] (--id <NODE_ID> | --query <QUERY> | --bookmark <BOOKMARK_ID>)
-```
-
-## Key Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Repository root to query. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Reuse or isolate a specific cache. |
-| `--id <node_id>` | none | Build context around an exact node returned by `search`, `symbol`, `trail`, or `explore`. |
-| `--query <target>` | none | Resolve a concrete symbol, file, literal, API path, module, or behavior term, then build context around the resolved target. |
-| `--bookmark <bookmark_id>` | none | Build context around a saved investigation bookmark. |
-| `--max-results <n>` | `8` | Secondary retrieval cap, clamped to 1-25. |
-| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
-| `--format <markdown|json>` | `markdown` | Human or structured output. |
-| `--output-file <path>` | none | Write output to a file. |
-| `--bundle <dir>` | none | Write `context.md`, `context.json`, generated graph artifacts, and a bundle manifest. |
-| `--no-evidence` | off | Omit citation edge ids and score breakdowns. Avoid this for grounded claims. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Paths
 

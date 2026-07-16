@@ -4,22 +4,10 @@ Checks whether a parent worktree cache is compatible with a child worktree,
 snapshots the SQLite cache, and rebases path-bound SQLite graph/search/doc rows
 so the child can use them under its own worktree path.
 
-## Usage
+## Syntax
 
-```text
-<codestory-cli> cache rehydrate --from-project <parent-worktree> --project <child-worktree>
-```
-
-## Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Target child worktree. |
-| `--cache-dir <path>` | auto | Target cache directory. Must be empty. |
-| `--from-project <path>` | required | Source worktree with an existing CodeStory cache. |
-| `--from-cache-dir <path>` | auto | Source cache directory when it is not the default for `--from-project`. |
-| `--dry-run` | off | Report whether the cache rehydrate is safe without copying. |
-| `--format <markdown|json>` | `markdown` | Human or automation output. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Path
 

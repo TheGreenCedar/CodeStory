@@ -5,20 +5,10 @@ for maintainer/debug transcripts after a normal tool call fails unexpectedly.
 For agent MCP runtime truth and surface gating, see
 [status-contract.md](status-contract.md).
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> doctor [OPTIONS]
-```
-
-## Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Repository root to inspect. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Inspect a specific cache directory. |
-| `--format <markdown|json>` | `markdown` | Human or automation output. |
-| `--output-file <path>` | stdout | Write the report to an existing parent directory. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Paths
 

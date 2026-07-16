@@ -10,10 +10,12 @@ use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexMode, IndexingPhaseTimings, ProjectSummary, SearchHit,
 };
 use codestory_runtime::{
-    BookmarkService, GroundingService, IndexService, ProjectService, ReadOnlyBrowserService,
-    Runtime, TargetResolution,
+    ActivationService, BookmarkService, GroundingService, IndexService, ProjectService,
+    PublicOperationService, ReadOnlyBrowserService, Runtime, TargetResolution,
 };
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::args::{ProjectArgs, QuerySelectorOutput, RefreshMode, TargetSelection};
 use crate::display::{clean_path_string, quote_command_path};
@@ -38,6 +40,8 @@ pub(crate) struct OpenedProject {
 /// artifact paths. Product surfaces initialize the shared embedded engine when
 /// they need semantic work; inspect-only surfaces remain observational.
 pub(crate) struct RuntimeContext {
+    pub(crate) activation: ActivationService,
+    pub(crate) public_operation: PublicOperationService,
     pub(crate) project: ProjectService,
     pub(crate) index: IndexService,
     pub(crate) grounding: GroundingService,
@@ -49,9 +53,19 @@ pub(crate) struct RuntimeContext {
     /// project context is opened. These identities must never be reconstructed
     /// from a later path spelling or environment read.
     pub(crate) project_identity: codestory_workspace::ProjectIdentityV3,
+    /// Native project identity plus the immutable runtime configuration used
+    /// to build this context. Multi-project transports use this key instead
+    /// of a path spelling or mutable process environment.
+    pub(crate) context_key: ProjectContextKey,
     pub(crate) cache_root: PathBuf,
     pub(crate) storage_path: PathBuf,
     pub(crate) sidecar: codestory_retrieval::SidecarRuntimeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ProjectContextKey {
+    pub(crate) workspace_id: String,
+    pub(crate) configuration_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -138,12 +152,16 @@ impl RuntimeContext {
             context
                 .sidecar
                 .with_profile_and_run_id(Some(&context.project_root), selected, run_id);
+        context.context_key.configuration_id =
+            runtime_configuration_id(&context.cache_root, &context.sidecar);
         let runtime = Runtime::new_with_config(context.sidecar.clone());
         context.project = runtime.project_service();
         context.index = runtime.index_service();
         context.grounding = runtime.grounding_service();
         context.bookmarks = runtime.bookmark_service();
         context.browser = runtime.browser_service();
+        context.activation = runtime.activation_service();
+        context.public_operation = runtime.public_operation_service();
         context.events = runtime.events();
         Ok(context)
     }
@@ -169,27 +187,33 @@ impl RuntimeContext {
         let project_identity = codestory_workspace::project_identity_v3(&project_root);
         let config = crate::config::load_config_with_startup(&project_root, startup)?;
         let cache_override = args.cache_dir.clone().or_else(|| config.cache_dir.clone());
-        let process_cache_root = startup
-            .stdio_cache_root
-            .as_deref()
-            .unwrap_or_else(|| startup.sidecar_defaults.cache_root());
+        let process_cache_root = canonicalize_configuration_path(
+            startup
+                .stdio_cache_root
+                .as_deref()
+                .unwrap_or_else(|| startup.sidecar_defaults.cache_root()),
+        )?;
         let cache_root = cache_root_for_project_in(
             &project_root,
             cache_override.as_deref(),
-            process_cache_root,
+            &process_cache_root,
         )?;
-        let storage_path = cache_root.join("codestory.db");
-        let sidecar_defaults = startup
-            .sidecar_defaults
-            .with_cache_root(process_cache_root.to_path_buf());
+        let storage_path = canonicalize_configuration_path(&cache_root.join("codestory.db"))?;
+        let sidecar_defaults = startup.sidecar_defaults.with_cache_root(process_cache_root);
         let sidecar = crate::sidecar_runtime::for_project_auto_with_process_defaults(
             &project_root,
             &sidecar_defaults,
             &config.runtime_overrides(),
         );
+        let context_key = ProjectContextKey {
+            workspace_id: project_identity.workspace_id.clone(),
+            configuration_id: runtime_configuration_id(&cache_root, &sidecar),
+        };
         let runtime = Runtime::new_with_config(sidecar.clone());
         let events = runtime.events();
         Ok(Self {
+            activation: runtime.activation_service(),
+            public_operation: runtime.public_operation_service(),
             project: runtime.project_service(),
             index: runtime.index_service(),
             grounding: runtime.grounding_service(),
@@ -198,6 +222,7 @@ impl RuntimeContext {
             events,
             project_root,
             project_identity,
+            context_key,
             cache_root,
             storage_path,
             sidecar,
@@ -253,6 +278,82 @@ impl RuntimeContext {
             )
             .map_err(|error| map_api_error_for_project(error, &self.project_root))
     }
+
+    pub(crate) fn inspect_project_summary(&self) -> Result<Option<ProjectSummary>> {
+        self.project
+            .inspect_project_summary_with_storage_path(
+                self.project_root.clone(),
+                self.storage_path.clone(),
+            )
+            .map_err(|error| map_api_error_for_project(error, &self.project_root))
+    }
+
+    /// Keep all reads that contribute to one CLI response under the runtime's
+    /// complete core/retrieval publication pin. Output writes stay outside the
+    /// closure so the runtime's single bounded retry cannot duplicate them.
+    pub(crate) fn run_public_response<T>(
+        &self,
+        operation: &str,
+        mut build: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        let mut build_error = None;
+        let result = self.public_operation.run_with_cancel(
+            operation,
+            Arc::new(AtomicBool::new(false)),
+            || match build() {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    let message = error.to_string();
+                    build_error = Some(error);
+                    Err(ApiError::new("cli_public_operation_failed", message))
+                }
+            },
+        );
+        match result {
+            Ok(operation) => Ok(operation.value),
+            Err(error) if error.code == "cli_public_operation_failed" => {
+                Err(build_error.expect("CLI operation error was retained"))
+            }
+            Err(error) => Err(map_api_error_for_project(error, &self.project_root)),
+        }
+    }
+}
+
+fn runtime_configuration_id(
+    cache_root: &Path,
+    sidecar: &codestory_retrieval::SidecarRuntimeConfig,
+) -> String {
+    // Do not hash credentials. Their presence participates in the immutable
+    // configuration boundary, while secret material remains outside logs and
+    // diagnostic identifiers.
+    let mut identity = format!(
+        "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        clean_path_string(&cache_root.to_string_lossy()),
+        sidecar.profile,
+        sidecar.namespace,
+        sidecar.embedding.allow_cpu,
+        sidecar.retrieval.hybrid_enabled,
+        sidecar.retrieval.semantic_doc_scope,
+        sidecar.retrieval.semantic_doc_alias_mode,
+        sidecar.retrieval.semantic_doc_max_tokens,
+        sidecar.retrieval.llm_doc_embed_batch_size,
+        sidecar.retrieval.stream_pending_docs,
+        sidecar.retrieval.stream_sort_window_batches,
+        sidecar.summary.endpoint.as_deref().unwrap_or(""),
+        sidecar.summary.api_key.is_some(),
+    );
+    identity.push_str(&format!(
+        "\0{}\0{:?}\0{:?}\0{}\0{}\0{}\0{}\0{}",
+        sidecar.summary.model,
+        sidecar.summary.max_tokens,
+        sidecar.summary.timeout,
+        sidecar.run_id.as_deref().unwrap_or(""),
+        clean_path_string(&sidecar.layout.lexical_data_dir.to_string_lossy()),
+        clean_path_string(&sidecar.layout.semantic_data_dir.to_string_lossy()),
+        clean_path_string(&sidecar.layout.scip_artifacts_root.to_string_lossy()),
+        clean_path_string(&sidecar.layout.state_file.to_string_lossy()),
+    ));
+    fnv1a_hex(identity.as_bytes())
 }
 
 /// Resolve a CLI target selector into one graph-backed search hit.
@@ -305,8 +406,8 @@ pub(crate) fn canonicalize_project_root(project: &Path) -> Result<PathBuf> {
 
 /// Return the cache directory used for one project.
 ///
-/// Explicit overrides are returned unchanged; otherwise the cache root is a
-/// stable native-filesystem workspace identity under the process cache root.
+/// Explicit overrides are normalized by native filesystem identity; otherwise
+/// the cache root is a stable workspace identity under the process cache root.
 #[cfg(test)]
 pub(crate) fn cache_root_for_project(
     project_root: &Path,
@@ -324,16 +425,99 @@ fn cache_root_for_project_in(
     override_dir: Option<&Path>,
     process_cache_root: &Path,
 ) -> Result<PathBuf> {
-    match override_dir {
-        Some(path) => Ok(path.to_path_buf()),
-        None => Ok(
+    let path = match override_dir {
+        Some(path) => path.to_path_buf(),
+        None => {
             process_cache_root.join(codestory_workspace::workspace_id_v3_for_root(project_root))
-        ),
+        }
+    };
+    canonicalize_configuration_path(&path)
+}
+
+/// Resolve existing configuration roots through native filesystem identity.
+/// Missing suffixes retain lexical path rules beneath the nearest existing
+/// ancestor so a cache has the same identity before and after creation.
+fn canonicalize_configuration_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("Failed to resolve current working directory")?
+            .join(path)
+    };
+    let mut lexical = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                lexical.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                lexical.push(component.as_os_str());
+            }
+        }
     }
+    if lexical.exists() {
+        return lexical
+            .canonicalize()
+            .map(normalize_canonical_configuration_path)
+            .with_context(|| {
+                format!(
+                    "Failed to resolve configuration path `{}`",
+                    clean_path_string(&lexical.to_string_lossy())
+                )
+            });
+    }
+
+    let mut missing = Vec::new();
+    let mut ancestor = lexical.as_path();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    let mut resolved = if ancestor.exists() {
+        ancestor
+            .canonicalize()
+            .map(normalize_canonical_configuration_path)
+            .with_context(|| {
+                format!(
+                    "Failed to resolve configuration ancestor `{}`",
+                    clean_path_string(&ancestor.to_string_lossy())
+                )
+            })?
+    } else {
+        ancestor.to_path_buf()
+    };
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn normalize_canonical_configuration_path(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(unc) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    value
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(path)
+}
+
+#[cfg(not(windows))]
+fn normalize_canonical_configuration_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 /// Small stable hash used for path-derived cache directory names.
-#[cfg(test)]
 pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
@@ -669,6 +853,53 @@ mod tests {
         assert!(second.storage_path.starts_with(&second_cache));
         assert!(first.sidecar.layout.state_file.starts_with(&first_cache));
         assert!(second.sidecar.layout.state_file.starts_with(&second_cache));
+    }
+
+    #[test]
+    fn existing_cache_aliases_share_one_configuration_identity() {
+        let temp = tempdir().expect("temp dir");
+        let project = temp.path().join("project");
+        let cache = temp.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        fs::create_dir_all(&cache).expect("create cache");
+        let startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: true,
+            stdio_cache_root: Some(temp.path().join("process-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                temp.path().join("process-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+        let open = |cache_dir: PathBuf| {
+            RuntimeContext::new_agent_sidecar_with_startup(
+                &ProjectArgs {
+                    project: project.clone(),
+                    cache_dir: Some(cache_dir),
+                },
+                &startup,
+            )
+            .expect("runtime context")
+        };
+
+        let canonical = open(cache.clone());
+        let dotted = open(cache.join("..").join("cache"));
+
+        assert_eq!(canonical.cache_root, dotted.cache_root);
+        assert_eq!(canonical.storage_path, dotted.storage_path);
+        assert_eq!(canonical.context_key, dotted.context_key);
+    }
+
+    #[test]
+    fn missing_configuration_path_identity_is_stable_after_creation() {
+        let temp = tempdir().expect("temp dir");
+        let missing = temp.path().join("cache").join("nested");
+
+        let before = canonicalize_configuration_path(&missing).expect("missing path identity");
+        fs::create_dir_all(&missing).expect("create configuration path");
+        let after = canonicalize_configuration_path(&missing).expect("existing path identity");
+
+        assert_eq!(before, after);
     }
 
     #[cfg(unix)]

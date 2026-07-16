@@ -1,8 +1,9 @@
 use codestory_contracts::api::{
     AffectedAnalysisDto, AffectedAnalysisRequest, AgentAnswerDto, AgentAskRequest,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, ApiError, BookmarkCategoryDto,
-    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest, GroundingBudgetDto,
-    GroundingSnapshotDto, IndexDryRunDto, IndexMode, IndexPublicationDto, IndexedFilesDto,
+    BookmarkDto, CreateBookmarkCategoryRequest, CreateBookmarkRequest,
+    EmbeddingVectorPublicationIdentityDto, GroundingBudgetDto, GroundingSnapshotDto,
+    IndexDryRunDto, IndexFreshnessStatusDto, IndexMode, IndexPublicationDto, IndexedFilesDto,
     IndexedFilesRequest, IndexingPhaseTimings, ListChildrenSymbolsRequest, ListRootSymbolsRequest,
     NodeDetailsDto, NodeDetailsRequest, NodeId, OpenDefinitionRequest, OpenProjectRequest,
     ProjectSummary, RetrievalStateDto, SearchHit, SearchRequest, SearchResultsDto,
@@ -13,8 +14,712 @@ use codestory_contracts::api::{
 use crate::AppController;
 use codestory_indexer::CancellationToken;
 use codestory_store::IndexPublicationRecord;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationStage {
+    Discovery,
+    CoreFreshness,
+    DensePreparation,
+    Validation,
+    Publication,
+    Ready,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationState {
+    Preparing,
+    Updating,
+    Ready,
+    Retryable,
+    Unavailable,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationCapabilityState {
+    Ready,
+    Retryable,
+    Unavailable,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActivationCapabilities {
+    pub local_navigation: ActivationCapabilityState,
+    pub broad_search: ActivationCapabilityState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActivationSnapshot {
+    pub operation_id: String,
+    pub state: ActivationState,
+    pub stage: ActivationStage,
+    pub attempt: u32,
+    pub retry_after_ms: Option<u64>,
+    pub failure: Option<String>,
+    pub capabilities: ActivationCapabilities,
+}
+
+impl ActivationSnapshot {
+    pub fn allows_operation(&self, operation: &str) -> bool {
+        if operation_requires_retrieval(operation) {
+            self.capabilities.broad_search == ActivationCapabilityState::Ready
+        } else {
+            self.capabilities.local_navigation == ActivationCapabilityState::Ready
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivationRun {
+    pub snapshot: ActivationSnapshot,
+    pub joined: bool,
+}
+
+#[derive(Default)]
+struct ActivationCoordinatorState {
+    target: Option<ActivationTarget>,
+    current: Option<ActivationSnapshot>,
+    running: bool,
+    current_cancel: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActivationTarget {
+    project: codestory_workspace::ProjectIdentityV3,
+    storage_path: PathBuf,
+}
+
+impl ActivationTarget {
+    fn new(project_root: &Path, storage_path: &Path) -> Self {
+        Self {
+            project: codestory_workspace::project_identity_v3(project_root),
+            storage_path: storage_path
+                .canonicalize()
+                .unwrap_or_else(|_| storage_path.to_path_buf()),
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.project == other.project
+            && codestory_workspace::same_workspace_path(&self.storage_path, &other.storage_path)
+    }
+}
+
+#[derive(Default)]
+struct ActivationCoordinator {
+    state: Mutex<ActivationCoordinatorState>,
+    changed: Condvar,
+    next_id: AtomicU64,
+}
+
+/// Runtime-owned single-flight activation for one logical project, core store,
+/// and immutable runtime configuration. The configuration is fixed by the
+/// controller owned by this service.
+#[derive(Clone)]
+pub struct ActivationService {
+    coordinator: Arc<ActivationCoordinator>,
+    controller: AppController,
+}
+
+impl ActivationService {
+    pub(crate) fn new(controller: AppController) -> Self {
+        Self {
+            coordinator: Arc::new(ActivationCoordinator::default()),
+            controller,
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<ActivationSnapshot> {
+        self.coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned")
+            .current
+            .clone()
+    }
+
+    pub fn activate_project(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<ActivationRun, ApiError> {
+        let target = ActivationTarget::new(project_root, storage_path);
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if state.running {
+            if !state
+                .target
+                .as_ref()
+                .is_some_and(|current| current.matches(&target))
+            {
+                return Err(ApiError::new(
+                    "project_unavailable",
+                    "a different logical project is already activating in this runtime context",
+                ));
+            }
+            while state.running {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(ApiError::new(
+                        "cancelled",
+                        "request cancelled while joining project activation",
+                    ));
+                }
+                state = self
+                    .coordinator
+                    .changed
+                    .wait_timeout(state, Duration::from_millis(25))
+                    .expect("activation coordinator poisoned")
+                    .0;
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ApiError::new(
+                    "cancelled",
+                    "request cancelled while joining project activation",
+                ));
+            }
+            let snapshot = state
+                .current
+                .clone()
+                .expect("joined activation has terminal snapshot");
+            return if snapshot_allows(&snapshot) {
+                Ok(ActivationRun {
+                    snapshot,
+                    joined: true,
+                })
+            } else {
+                Err(snapshot_error(&snapshot))
+            };
+        }
+
+        if !state
+            .target
+            .as_ref()
+            .is_some_and(|current| current.matches(&target))
+        {
+            state.target = Some(target);
+            state.current = None;
+        }
+
+        let operation_id = if let Some(snapshot) = state
+            .current
+            .as_mut()
+            .filter(|snapshot| snapshot.state == ActivationState::Retryable)
+        {
+            snapshot.attempt += 1;
+            snapshot.failure = None;
+            snapshot.retry_after_ms = Some(250);
+            snapshot.state = ActivationState::Preparing;
+            snapshot.stage = ActivationStage::Discovery;
+            snapshot.operation_id.clone()
+        } else {
+            let operation_id = format!(
+                "activation-{}",
+                self.coordinator.next_id.fetch_add(1, Ordering::Relaxed) + 1
+            );
+            state.current = Some(ActivationSnapshot {
+                operation_id: operation_id.clone(),
+                state: ActivationState::Preparing,
+                stage: ActivationStage::Discovery,
+                attempt: 1,
+                retry_after_ms: Some(250),
+                failure: None,
+                capabilities: ActivationCapabilities {
+                    local_navigation: ActivationCapabilityState::Unavailable,
+                    broad_search: ActivationCapabilityState::Unavailable,
+                },
+            });
+            operation_id
+        };
+        state.running = true;
+        state.current_cancel = Some(Arc::clone(&cancelled));
+        drop(state);
+
+        let operation = ActivationOperation {
+            service: self.clone(),
+            operation_id,
+            cancelled,
+        };
+        let result = self
+            .activate_once(
+                &operation,
+                project_root.to_path_buf(),
+                storage_path.to_path_buf(),
+            )
+            .map_err(classify_activation_api_error);
+        let snapshot = operation.finish(result.as_ref().err());
+        result.map(|()| ActivationRun {
+            snapshot,
+            joined: false,
+        })
+    }
+
+    pub fn cancel_and_wait(&self) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if let Some(cancelled) = state.current_cancel.as_ref() {
+            cancelled.store(true, Ordering::Release);
+        }
+        while state.running {
+            state = self
+                .coordinator
+                .changed
+                .wait(state)
+                .expect("activation coordinator poisoned");
+        }
+    }
+
+    fn activate_once(
+        &self,
+        operation: &ActivationOperation,
+        project_root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<(), ApiError> {
+        operation.ensure_not_cancelled("project discovery")?;
+        let mut summary = self
+            .controller
+            .open_project_with_storage_path(project_root.clone(), storage_path.clone())?;
+
+        operation.set_stage(ActivationStage::CoreFreshness);
+        let core_stale = summary.publication.is_none()
+            || summary.stats.node_count == 0
+            || summary
+                .freshness
+                .as_ref()
+                .is_none_or(|freshness| freshness.status != IndexFreshnessStatusDto::Fresh);
+        if core_stale {
+            let mode = if summary.publication.is_none() || summary.stats.node_count == 0 {
+                IndexMode::Full
+            } else {
+                IndexMode::Incremental
+            };
+            let token = CancellationToken::from_shared_flag(Arc::clone(&operation.cancelled));
+            self.controller
+                .run_indexing_blocking_with_cancel(mode, &token)?;
+            operation.ensure_not_cancelled("core publication validation")?;
+            summary = self
+                .controller
+                .open_project_with_storage_path(project_root.clone(), storage_path.clone())?;
+        }
+        let local_ready = summary.publication.is_some()
+            && summary.stats.node_count > 0
+            && summary.stats.fatal_error_count == 0
+            && summary
+                .freshness
+                .as_ref()
+                .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Fresh);
+        if !local_ready {
+            return Err(ApiError::new(
+                "project_unavailable",
+                "activation did not produce a fresh complete core publication",
+            ));
+        }
+        operation.set_capability(false, ActivationCapabilityState::Ready);
+
+        operation.ensure_not_cancelled("dense preparation")?;
+        operation.set_stage(ActivationStage::DensePreparation);
+        codestory_retrieval::ensure_product_embedding_backend_for_runtime(
+            &self.controller.runtime_config,
+        )
+        .map_err(map_activation_error)?;
+        operation.ensure_not_cancelled("retrieval publication")?;
+        operation.set_stage(ActivationStage::Publication);
+        codestory_retrieval::finalize_index_for_runtime_with_cancel(
+            &project_root,
+            &storage_path,
+            &self.controller.runtime_config,
+            operation.cancelled.as_ref(),
+        )
+        .map_err(map_activation_error)?;
+        operation.ensure_not_cancelled("retrieval validation")?;
+        operation.set_stage(ActivationStage::Validation);
+        let status = codestory_retrieval::strict_sidecar_status_for_runtime(
+            &project_root,
+            Some(&storage_path),
+            self.controller.runtime_config.as_ref().clone(),
+        )
+        .map_err(map_activation_error)?;
+        if !status.is_live_ready() {
+            return Err(ApiError::new(
+                "project_unavailable",
+                "retrieval publication is not live-ready after activation",
+            ));
+        }
+        operation.set_capability(true, ActivationCapabilityState::Ready);
+        Ok(())
+    }
+}
+
+fn operation_requires_retrieval(operation: &str) -> bool {
+    matches!(
+        operation,
+        "packet" | "search" | "context" | "drill" | "resolution" | "graph_assisted"
+    )
+}
+
+fn snapshot_allows(snapshot: &ActivationSnapshot) -> bool {
+    snapshot.allows_operation("packet")
+}
+
+fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
+    let code = match snapshot.state {
+        ActivationState::Cancelled => "cancelled",
+        ActivationState::Retryable => "activation_retryable",
+        _ => "project_unavailable",
+    };
+    ApiError::new(
+        code,
+        snapshot.failure.clone().unwrap_or_else(|| {
+            "project activation did not provide the requested capability".into()
+        }),
+    )
+}
+
+fn map_activation_error(error: anyhow::Error) -> ApiError {
+    classify_activation_api_error(ApiError::new("project_unavailable", error.to_string()))
+}
+
+fn classify_activation_api_error(error: ApiError) -> ApiError {
+    if matches!(error.code.as_str(), "cancelled" | "activation_retryable") {
+        return error;
+    }
+    let normalized = error.message.to_ascii_lowercase();
+    if normalized.contains("cancel") {
+        ApiError::new("cancelled", error.message)
+    } else if [
+        "cache_busy",
+        "database is locked",
+        "database table is locked",
+        "writer lock",
+        "publication changed",
+        "input changed",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+    {
+        ApiError::new("activation_retryable", error.message)
+    } else {
+        ApiError::new("project_unavailable", error.message)
+    }
+}
+
+pub struct ActivationOperation {
+    service: ActivationService,
+    operation_id: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublicOperation<T> {
+    pub value: T,
+    pub core_publication: Option<IndexPublicationDto>,
+    pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
+    pub operation_id: String,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePublicOperationPublication {
+    pub core_publication: IndexPublicationDto,
+    pub retrieval_publication: Option<EmbeddingVectorPublicationIdentityDto>,
+}
+
+#[derive(Clone)]
+pub struct PublicOperationService {
+    controller: AppController,
+    next_id: Arc<AtomicU64>,
+}
+
+impl PublicOperationService {
+    pub(crate) fn new(controller: AppController) -> Self {
+        Self {
+            controller,
+            next_id: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Return the exact publications pinned by the currently executing public
+    /// operation. Product caches use this inside the response builder instead
+    /// of inferring identity from file metadata or partial sidecar status.
+    pub fn active_publication(&self) -> Option<ActivePublicOperationPublication> {
+        let core_publication = self
+            .controller
+            .active_core_publication()
+            .map(crate::index_publication_dto)?;
+        let retrieval_publication =
+            crate::agent::retrieval_primary::active_pinned_retrieval_publication(&self.controller);
+        Some(ActivePublicOperationPublication {
+            core_publication,
+            retrieval_publication,
+        })
+    }
+
+    /// Run one complete public response under the runtime's retrieval pin and
+    /// single bounded publication retry. Host cancellation is checked before
+    /// and after every attempt, so adapters do not add a second retry loop.
+    pub fn run_with_cancel<T>(
+        &self,
+        operation: &str,
+        cancelled: Arc<AtomicBool>,
+        mut build: impl FnMut() -> Result<T, ApiError>,
+    ) -> Result<PublicOperation<T>, ApiError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ApiError::new(
+                "cancelled",
+                format!("request cancelled before {operation}"),
+            ));
+        }
+        let operation_id = format!(
+            "public-{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        for attempt in 1..=2 {
+            let result = self.controller.with_complete_core_snapshot(|publication| {
+                let freshness = self.controller.index_freshness_uncached()?;
+                if freshness.status != IndexFreshnessStatusDto::Fresh {
+                    return Err(ApiError::new(
+                        "project_unavailable",
+                        format!("{operation} requires a fresh complete core publication"),
+                    ));
+                }
+                let mut run = || {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            "cancelled",
+                            format!("request cancelled before {operation}"),
+                        ));
+                    }
+                    let value = build()?;
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            "cancelled",
+                            format!("request cancelled during {operation}"),
+                        ));
+                    }
+                    let after = self.controller.index_freshness_uncached()?;
+                    if after.status != IndexFreshnessStatusDto::Fresh {
+                        return Err(ApiError::new(
+                            "publication_changed",
+                            format!("source inputs changed while running {operation}"),
+                        ));
+                    }
+                    Ok(value)
+                };
+                let (value, retrieval_publication) = if operation_requires_retrieval(operation) {
+                    crate::agent::retrieval_primary::with_pinned_retrieval_publication_value(
+                        &self.controller,
+                        run,
+                    )?
+                } else {
+                    (run()?, None)
+                };
+                Ok((
+                    value,
+                    crate::index_publication_dto(publication.clone()),
+                    retrieval_publication,
+                ))
+            });
+            match result {
+                Ok((value, core_publication, retrieval_publication)) => {
+                    return Ok(PublicOperation {
+                        value,
+                        core_publication: Some(core_publication),
+                        retrieval_publication,
+                        operation_id,
+                        attempt,
+                    });
+                }
+                Err(error)
+                    if attempt == 1
+                        && matches!(error.code.as_str(), "publication_changed" | "cache_busy") =>
+                {
+                    tracing::debug!(operation, "retrying pinned public operation");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded public operation attempts always return")
+    }
+
+    pub fn run_observational_with_cancel<T>(
+        &self,
+        operation: &str,
+        cancelled: Arc<AtomicBool>,
+        mut build: impl FnMut() -> Result<T, ApiError>,
+    ) -> Result<PublicOperation<T>, ApiError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ApiError::new(
+                "cancelled",
+                format!("request cancelled before {operation}"),
+            ));
+        }
+        let operation_id = format!(
+            "resource-{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        for attempt in 1..=2 {
+            let result = self.controller.with_complete_core_snapshot(|publication| {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(ApiError::new(
+                        "cancelled",
+                        format!("request cancelled before {operation}"),
+                    ));
+                }
+                let mut run = || {
+                    let value = build()?;
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(ApiError::new(
+                            "cancelled",
+                            format!("request cancelled during {operation}"),
+                        ));
+                    }
+                    Ok(value)
+                };
+                let (value, retrieval_publication) = if operation_requires_retrieval(operation) {
+                    crate::agent::retrieval_primary::with_pinned_retrieval_publication_value(
+                        &self.controller,
+                        run,
+                    )?
+                } else {
+                    (run()?, None)
+                };
+                Ok((
+                    value,
+                    crate::index_publication_dto(publication.clone()),
+                    retrieval_publication,
+                ))
+            });
+            match result {
+                Ok((value, core_publication, retrieval_publication)) => {
+                    return Ok(PublicOperation {
+                        value,
+                        core_publication: Some(core_publication),
+                        retrieval_publication,
+                        operation_id,
+                        attempt,
+                    });
+                }
+                Err(error) if attempt == 1 && error.code == "publication_changed" => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded observational operation attempts always return")
+    }
+}
+
+impl ActivationOperation {
+    pub fn ensure_not_cancelled(&self, boundary: &str) -> Result<(), ApiError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(ApiError::new(
+                "cancelled",
+                format!("request cancelled before {boundary}"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn set_stage(&self, stage: ActivationStage) {
+        let mut state = self
+            .service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if let Some(snapshot) = state
+            .current
+            .as_mut()
+            .filter(|snapshot| snapshot.operation_id == self.operation_id)
+        {
+            snapshot.stage = stage;
+            snapshot.state = ActivationState::Updating;
+        }
+        self.service.coordinator.changed.notify_all();
+    }
+
+    fn set_capability(&self, broad: bool, capability: ActivationCapabilityState) {
+        let mut state = self
+            .service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        if let Some(snapshot) = state
+            .current
+            .as_mut()
+            .filter(|snapshot| snapshot.operation_id == self.operation_id)
+        {
+            if broad {
+                snapshot.capabilities.broad_search = capability;
+            } else {
+                snapshot.capabilities.local_navigation = capability;
+            }
+        }
+        self.service.coordinator.changed.notify_all();
+    }
+
+    fn finish(&self, error: Option<&ApiError>) -> ActivationSnapshot {
+        let mut state = self
+            .service
+            .coordinator
+            .state
+            .lock()
+            .expect("activation coordinator poisoned");
+        let snapshot = state
+            .current
+            .as_mut()
+            .filter(|snapshot| snapshot.operation_id == self.operation_id)
+            .expect("activation operation owns current snapshot");
+        if let Some(error) = error {
+            let capability = match error.code.as_str() {
+                "cancelled" => ActivationCapabilityState::Cancelled,
+                "activation_retryable" | "cache_busy" | "publication_changed" => {
+                    ActivationCapabilityState::Retryable
+                }
+                _ => ActivationCapabilityState::Unavailable,
+            };
+            if snapshot.capabilities.local_navigation != ActivationCapabilityState::Ready {
+                snapshot.capabilities.local_navigation = capability;
+            }
+            if snapshot.capabilities.broad_search != ActivationCapabilityState::Ready {
+                snapshot.capabilities.broad_search = capability;
+            }
+            snapshot.state = match capability {
+                ActivationCapabilityState::Retryable => ActivationState::Retryable,
+                ActivationCapabilityState::Unavailable => ActivationState::Unavailable,
+                ActivationCapabilityState::Cancelled => ActivationState::Cancelled,
+                ActivationCapabilityState::Ready => ActivationState::Ready,
+            };
+            snapshot.retry_after_ms =
+                (capability == ActivationCapabilityState::Retryable).then_some(250);
+            snapshot.failure = Some(error.message.clone());
+        } else {
+            snapshot.state = ActivationState::Ready;
+            snapshot.stage = ActivationStage::Ready;
+            snapshot.retry_after_ms = None;
+            snapshot.failure = None;
+        }
+        let snapshot = snapshot.clone();
+        state.running = false;
+        state.current_cancel = None;
+        self.service.coordinator.changed.notify_all();
+        snapshot
+    }
+}
 
 #[derive(Clone)]
 pub struct ProjectService {
@@ -46,6 +751,17 @@ impl ProjectService {
     ) -> Result<ProjectSummary, ApiError> {
         self.controller
             .open_project_summary_with_storage_path(root, storage_path)
+    }
+
+    /// Observe an existing project store without creating directories,
+    /// initializing a database, migrating schema, or binding controller state.
+    pub fn inspect_project_summary_with_storage_path(
+        &self,
+        root: std::path::PathBuf,
+        storage_path: std::path::PathBuf,
+    ) -> Result<Option<ProjectSummary>, ApiError> {
+        self.controller
+            .inspect_project_summary_with_storage_path(root, storage_path)
     }
 
     pub fn complete_index_publication_at(
@@ -336,5 +1052,173 @@ impl BookmarkService {
 
     pub fn delete_bookmark(&self, id: i64) -> Result<(), ApiError> {
         self.controller.delete_bookmark(id)
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use super::*;
+    use crate::Runtime;
+    use std::fs;
+
+    #[test]
+    fn activation_target_matches_existing_storage_by_native_identity() {
+        let project = tempfile::tempdir().expect("project");
+        let storage = project.path().join("codestory.db");
+        let alias = project.path().join("codestory-alias.db");
+        fs::write(&storage, b"storage").expect("write storage");
+        fs::hard_link(&storage, &alias).expect("create storage hard link");
+
+        let target = ActivationTarget::new(project.path(), &storage);
+        let aliased = ActivationTarget::new(project.path(), &alias);
+
+        assert!(target.matches(&aliased));
+    }
+
+    #[test]
+    fn activation_target_uses_lexical_identity_for_missing_storage() {
+        let project = tempfile::tempdir().expect("project");
+        let storage = project.path().join("cache").join("codestory.db");
+        let dotted = project.path().join("cache").join(".").join("codestory.db");
+
+        let target = ActivationTarget::new(project.path(), &storage);
+        let aliased = ActivationTarget::new(project.path(), &dotted);
+
+        assert!(target.matches(&aliased));
+    }
+
+    #[test]
+    fn cancelled_activation_is_never_reported_ready() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let runtime = Runtime::new();
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let error = runtime
+            .activation_service()
+            .activate_project(project.path(), &storage_path, cancelled)
+            .expect_err("pre-cancelled activation must fail");
+        let snapshot = runtime.activation_service().snapshot().expect("snapshot");
+
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(snapshot.state, ActivationState::Cancelled);
+        assert_eq!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Cancelled
+        );
+    }
+
+    #[test]
+    fn activation_error_is_unavailable_instead_of_ready() {
+        let project = tempfile::tempdir().expect("project");
+        let missing = project.path().join("missing");
+        let storage_path = project.path().join("cache").join("codestory.db");
+        let runtime = Runtime::new();
+
+        let error = runtime
+            .activation_service()
+            .activate_project(&missing, &storage_path, Arc::new(AtomicBool::new(false)))
+            .expect_err("missing project must fail");
+        let snapshot = runtime.activation_service().snapshot().expect("snapshot");
+
+        assert_eq!(error.code, "project_unavailable");
+        assert_eq!(snapshot.state, ActivationState::Unavailable);
+        assert_ne!(
+            snapshot.capabilities.local_navigation,
+            ActivationCapabilityState::Ready
+        );
+    }
+
+    #[test]
+    fn activation_state_is_not_reused_across_project_targets() {
+        let project_a = tempfile::tempdir().expect("project a");
+        let project_b = tempfile::tempdir().expect("project b");
+        let runtime = Runtime::new();
+
+        runtime
+            .activation_service()
+            .activate_project(
+                project_a.path(),
+                &project_a.path().join("codestory.db"),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect_err("cancel project a");
+        let first = runtime
+            .activation_service()
+            .snapshot()
+            .expect("first state");
+
+        runtime
+            .activation_service()
+            .activate_project(
+                project_b.path(),
+                &project_b.path().join("codestory.db"),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .expect_err("cancel project b");
+        let second = runtime
+            .activation_service()
+            .snapshot()
+            .expect("second state");
+
+        assert_ne!(first.operation_id, second.operation_id);
+        assert_eq!(second.attempt, 1);
+        assert_eq!(second.state, ActivationState::Cancelled);
+    }
+
+    #[test]
+    fn observational_summary_does_not_create_storage_parent() {
+        let project = tempfile::tempdir().expect("project");
+        let storage_path = project.path().join("cold-cache").join("codestory.db");
+        let runtime = Runtime::new();
+
+        let summary = runtime
+            .project_service()
+            .inspect_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .expect("cold observation");
+
+        assert!(summary.is_none());
+        assert!(!storage_path.parent().expect("storage parent").exists());
+    }
+
+    #[test]
+    fn cancelled_public_operation_never_enters_response_builder() {
+        let runtime = Runtime::new();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let mut entered = false;
+
+        let error = runtime
+            .public_operation_service()
+            .run_observational_with_cancel("cancelled test", cancelled, || {
+                entered = true;
+                Ok(())
+            })
+            .expect_err("pre-cancelled operation must fail");
+
+        assert_eq!(error.code, "cancelled");
+        assert!(!entered);
+    }
+
+    #[test]
+    fn failed_broad_activation_never_becomes_ready_but_can_preserve_local_capability() {
+        let snapshot = ActivationSnapshot {
+            operation_id: "activation-1".into(),
+            state: ActivationState::Unavailable,
+            stage: ActivationStage::Validation,
+            attempt: 1,
+            retry_after_ms: None,
+            failure: Some("embedding backend unavailable".into()),
+            capabilities: ActivationCapabilities {
+                local_navigation: ActivationCapabilityState::Ready,
+                broad_search: ActivationCapabilityState::Unavailable,
+            },
+        };
+
+        assert!(snapshot.allows_operation("ground"));
+        assert!(!snapshot.allows_operation("packet"));
+        assert_ne!(snapshot.state, ActivationState::Ready);
     }
 }

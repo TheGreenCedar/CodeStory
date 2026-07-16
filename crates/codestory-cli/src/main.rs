@@ -1195,40 +1195,44 @@ fn run_context(cmd: ContextCommand) -> Result<()> {
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "context")?;
 
-    let resolved = resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
-    let target_prompt = context_target_prompt(&resolved);
-    let request = AgentAskRequest {
-        prompt: target_prompt,
-        retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
-            preset: AgentRetrievalPresetDto::Investigate,
-        },
-        focus_node_id: Some(resolved.target.selected.node_id.clone()),
-        max_results: Some(cmd.max_results.clamp(1, 25)),
-        response_mode: AgentResponseModeDto::Markdown,
-        latency_budget_ms: None,
-        include_evidence: !cmd.no_evidence,
-        hybrid_weights: None,
-    };
+    let (answer, output, markdown) = runtime.run_public_response("context", || {
+        let resolved =
+            resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
+        let target_prompt = context_target_prompt(&resolved);
+        let request = AgentAskRequest {
+            prompt: target_prompt,
+            retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
+                preset: AgentRetrievalPresetDto::Investigate,
+            },
+            focus_node_id: Some(resolved.target.selected.node_id.clone()),
+            max_results: Some(cmd.max_results.clamp(1, 25)),
+            response_mode: AgentResponseModeDto::Markdown,
+            latency_budget_ms: None,
+            include_evidence: !cmd.no_evidence,
+            hybrid_weights: None,
+        };
 
-    let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
-    answer
-        .retrieval_trace
-        .annotations
-        .push("mode=db_first".to_string());
-    annotate_answer_with_context_target(&mut answer, &resolved);
-    let markdown = render_context_markdown(&runtime.project_root, &answer);
-    let output = ContextJsonOutput {
-        target: ContextTargetOutput {
-            selector: resolved.selector,
-            requested: resolved.requested,
-            bookmark_id: resolved
-                .bookmark
-                .as_ref()
-                .map(|bookmark| bookmark.id.clone()),
-        },
-        resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
-        context: context_packet_json(&answer),
-    };
+        let mut answer = runtime.browser.ask(request).map_err(map_api_error)?;
+        answer
+            .retrieval_trace
+            .annotations
+            .push("mode=db_first".to_string());
+        annotate_answer_with_context_target(&mut answer, &resolved);
+        let markdown = render_context_markdown(&runtime.project_root, &answer);
+        let output = ContextJsonOutput {
+            target: ContextTargetOutput {
+                selector: resolved.selector,
+                requested: resolved.requested,
+                bookmark_id: resolved
+                    .bookmark
+                    .as_ref()
+                    .map(|bookmark| bookmark.id.clone()),
+            },
+            resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
+            context: context_packet_json(&answer),
+        };
+        Ok((answer, output, markdown))
+    })?;
     if let Some(bundle_dir) = cmd.bundle.as_deref() {
         write_context_bundle(bundle_dir, &output, &answer.graphs, &markdown)?;
     }
@@ -1246,17 +1250,19 @@ fn run_packet(cmd: PacketCommand) -> Result<()> {
         "packet",
     )?;
 
-    let packet = runtime
-        .browser
-        .packet(AgentPacketRequestDto {
-            question: cmd.question,
-            budget: cmd.budget.into(),
-            task_class: cmd.task_class.map(Into::into),
-            extra_probes: cmd.extra_probes,
-            include_evidence: !cmd.no_evidence,
-            latency_budget_ms: cmd.latency_budget_ms,
-        })
-        .map_err(map_api_error)?;
+    let packet = runtime.run_public_response("packet", || {
+        runtime
+            .browser
+            .packet(AgentPacketRequestDto {
+                question: cmd.question.clone(),
+                budget: cmd.budget.into(),
+                task_class: cmd.task_class.map(Into::into),
+                extra_probes: cmd.extra_probes.clone(),
+                include_evidence: !cmd.no_evidence,
+                latency_budget_ms: cmd.latency_budget_ms,
+            })
+            .map_err(map_api_error)
+    })?;
     if let Some(path) = &cmd.step_trace_out {
         let trace = codestory_runtime::packet_step_trace_json(&packet.answer);
         std::fs::write(path, serde_json::to_string_pretty(&trace)?)?;
@@ -1277,17 +1283,19 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
-    let packet = runtime
-        .browser
-        .packet(AgentPacketRequestDto {
-            question: cmd.prompt,
-            budget: cmd.budget.into(),
-            task_class: Some(PacketTaskClassDto::EditPlanning),
-            extra_probes: cmd.extra_probes,
-            include_evidence: !cmd.no_evidence,
-            latency_budget_ms: cmd.latency_budget_ms,
-        })
-        .map_err(map_api_error)?;
+    let packet = runtime.run_public_response("packet", || {
+        runtime
+            .browser
+            .packet(AgentPacketRequestDto {
+                question: cmd.prompt.clone(),
+                budget: cmd.budget.into(),
+                task_class: Some(PacketTaskClassDto::EditPlanning),
+                extra_probes: cmd.extra_probes.clone(),
+                include_evidence: !cmd.no_evidence,
+                latency_budget_ms: cmd.latency_budget_ms,
+            })
+            .map_err(map_api_error)
+    })?;
     let brief = build_task_brief_output(&runtime.project_root, &packet);
     let markdown = render_task_brief_markdown(&brief);
     emit(cmd.format, &brief, markdown, cmd.output_file.as_deref())
@@ -2671,12 +2679,15 @@ fn run_search(cmd: SearchCommand) -> Result<()> {
         cmd.refresh,
         "search",
     )?;
-    let search_results = runtime
-        .browser
-        .search_results(search_request_from_command(&cmd))
-        .map_err(map_api_error)?;
-    let output = search_output_from_results(&runtime, &search_results, cmd.why);
-    let markdown = render_search_markdown(&runtime.project_root, &output);
+    let (output, markdown) = runtime.run_public_response("search", || {
+        let search_results = runtime
+            .browser
+            .search_results(search_request_from_command(&cmd))
+            .map_err(map_api_error)?;
+        let output = search_output_from_results(&runtime, &search_results, cmd.why);
+        let markdown = render_search_markdown(&runtime.project_root, &output);
+        Ok((output, markdown))
+    })?;
     emit(cmd.format, &output, markdown, cmd.output_file.as_deref())
 }
 
@@ -2743,75 +2754,79 @@ fn execute_drill(cmd: &DrillCommand) -> Result<DrillOutput> {
         include_evidence: true,
         latency_budget_ms: None,
     };
-    let evidence_packet =
-        execute_drill_packet(packet_request, |request| runtime.browser.packet(request))?;
-    let question_search_ms = elapsed_ms(packet_timer);
-    let evidence_assembly_timer = Instant::now();
-    let citations = drill_packet_citations(&evidence_packet);
-    let anchor_outputs = drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
-    let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
-    let mut all_verification_targets =
-        drill_packet_verification_targets(&runtime.project_root, &citations);
-    dedupe_verification_targets(&mut all_verification_targets);
-    let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
-    let question_search = Some(DrillCommandStatusOutput {
-        command: "packet".to_string(),
-        status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
-        duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
-        artifact: None,
-        error: None,
-    });
-    let evidence_assembly_ms = elapsed_ms(evidence_assembly_timer);
-    let drill_timings = DrillRuntimeTimingsOutput {
-        total_ms: elapsed_ms(total_timer),
-        setup_ms,
-        question_search_ms,
-        anchor_resolution_ms: 0,
-        supplemental_search_ms: 0,
-        bridge_evidence_ms: 0,
-        evidence_assembly_ms,
-    };
-
-    Ok(DrillOutput {
-        project: display::clean_path_string(&opened.summary.root),
-        label: cmd.label.clone(),
-        question: cmd.question.clone(),
-        output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
-        mechanical: DrillMechanicalOutput {
-            before_files: before.stats.file_count,
-            before_nodes: before.stats.node_count,
-            before_edges: before.stats.edge_count,
-            before_errors: before.stats.error_count,
-            after_files: opened.summary.stats.file_count,
-            after_nodes: opened.summary.stats.node_count,
-            after_edges: opened.summary.stats.edge_count,
-            after_errors: opened.summary.stats.error_count,
-            refresh,
-            retrieval: opened.summary.retrieval.clone(),
-            sidecar_retrieval_mode,
-            freshness: opened.summary.freshness.clone(),
-            phase_timings: opened.phase_timings.clone(),
-            drill_timings,
-        },
-        question_search,
-        question_supplemental_searches: Vec::new(),
-        anchors: anchor_outputs,
-        bridges: bridge_outputs,
-        execution_boundaries: vec![DrillExecutionBoundaryOutput {
+    runtime.run_public_response("drill", || {
+        let evidence_packet = execute_drill_packet(packet_request.clone(), |request| {
+            runtime.browser.packet(request)
+        })?;
+        let question_search_ms = elapsed_ms(packet_timer);
+        let evidence_assembly_timer = Instant::now();
+        let citations = drill_packet_citations(&evidence_packet);
+        let anchor_outputs =
+            drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
+        let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
+        let mut all_verification_targets =
+            drill_packet_verification_targets(&runtime.project_root, &citations);
+        dedupe_verification_targets(&mut all_verification_targets);
+        let next_commands = evidence_packet.sufficiency.follow_up_commands.clone();
+        let question_search = Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
-            flow: vec![
-                "plan question and explicit anchor probes".to_string(),
-                "execute one bounded batch retrieval".to_string(),
-                "adapt citations and sufficiency into drill reports".to_string(),
-            ],
-            source_files: vec![
-                "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
-                "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
-            ],
-        }],
-        verification_targets: all_verification_targets,
-        evidence_packet,
-        next_commands,
+            status: packet_sufficiency_label(evidence_packet.sufficiency.status).to_string(),
+            duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
+            artifact: None,
+            error: None,
+        });
+        let evidence_assembly_ms = elapsed_ms(evidence_assembly_timer);
+        let drill_timings = DrillRuntimeTimingsOutput {
+            total_ms: elapsed_ms(total_timer),
+            setup_ms,
+            question_search_ms,
+            anchor_resolution_ms: 0,
+            supplemental_search_ms: 0,
+            bridge_evidence_ms: 0,
+            evidence_assembly_ms,
+        };
+
+        Ok(DrillOutput {
+            project: display::clean_path_string(&opened.summary.root),
+            label: cmd.label.clone(),
+            question: cmd.question.clone(),
+            output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
+            mechanical: DrillMechanicalOutput {
+                before_files: before.stats.file_count,
+                before_nodes: before.stats.node_count,
+                before_edges: before.stats.edge_count,
+                before_errors: before.stats.error_count,
+                after_files: opened.summary.stats.file_count,
+                after_nodes: opened.summary.stats.node_count,
+                after_edges: opened.summary.stats.edge_count,
+                after_errors: opened.summary.stats.error_count,
+                refresh: refresh.clone(),
+                retrieval: opened.summary.retrieval.clone(),
+                sidecar_retrieval_mode: sidecar_retrieval_mode.clone(),
+                freshness: opened.summary.freshness.clone(),
+                phase_timings: opened.phase_timings.clone(),
+                drill_timings,
+            },
+            question_search,
+            question_supplemental_searches: Vec::new(),
+            anchors: anchor_outputs,
+            bridges: bridge_outputs,
+            execution_boundaries: vec![DrillExecutionBoundaryOutput {
+                command: "packet".to_string(),
+                flow: vec![
+                    "plan question and explicit anchor probes".to_string(),
+                    "execute one bounded batch retrieval".to_string(),
+                    "adapt citations and sufficiency into drill reports".to_string(),
+                ],
+                source_files: vec![
+                    "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
+                    "crates/codestory-runtime/src/agent/packet_batch.rs".to_string(),
+                ],
+            }],
+            verification_targets: all_verification_targets,
+            evidence_packet,
+            next_commands,
+        })
     })
 }
 
@@ -4588,21 +4603,29 @@ fn run_symbol(cmd: SymbolCommand) -> Result<()> {
     ensure_index_ready(&opened, "symbol")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let context = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
+    };
+    let (target, context, resolution) = runtime.run_public_response(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let context = runtime
+            .browser
+            .symbol_context(target.selected.node_id.clone())
+            .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        Ok((target, context, resolution))
+    })?;
     if cmd.mermaid {
         return emit_text(render_symbol_mermaid(&context), cmd.output_file.as_deref());
     }
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
     let verification_targets = resolution.resolved.verification_targets.clone();
     let markdown = render_symbol_markdown(
         &runtime.project_root,
@@ -4833,18 +4856,27 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
     ensure_index_ready(&opened, "trail")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let request = build_trail_request(&target.selected.node_id, &cmd);
-    let context = runtime
-        .browser
-        .trail_context(request)
-        .map_err(map_api_error)?;
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
+    };
+    let (target, context, resolution) = runtime.run_public_response(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let request = build_trail_request(&target.selected.node_id, &cmd);
+        let context = runtime
+            .browser
+            .trail_context(request)
+            .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        Ok((target, context, resolution))
+    })?;
     if cmd.mermaid {
         return emit_text(render_trail_mermaid(&context), cmd.output_file.as_deref());
     }
@@ -4855,7 +4887,6 @@ fn run_trail(cmd: TrailCommand) -> Result<()> {
         );
     }
     let notes = trail_guidance_notes(&context);
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
     let mut markdown = if let Some(story) = context.story.as_ref() {
         render_trail_story_markdown(&runtime.project_root, &target, &context, &cmd, story)
     } else {
@@ -4987,32 +5018,40 @@ fn run_snippet(cmd: SnippetCommand) -> Result<()> {
     ensure_index_ready(&opened, "snippet")?;
 
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let target = if cmd.function_body {
-        prefer_function_body_target(&runtime.project_root, target)
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
     } else {
-        target
+        "graph"
     };
-    let context = if cmd.function_body {
-        runtime
-            .browser
-            .snippet_function_body_context(target.selected.node_id.clone(), cmd.context)
-    } else {
-        runtime
-            .browser
-            .snippet_context(target.selected.node_id.clone(), cmd.context)
-    }
-    .map_err(map_api_error)?;
+    let (target, context, resolution) = runtime.run_public_response(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let target = if cmd.function_body {
+            prefer_function_body_target(&runtime.project_root, target)
+        } else {
+            target
+        };
+        let context = if cmd.function_body {
+            runtime
+                .browser
+                .snippet_function_body_context(target.selected.node_id.clone(), cmd.context)
+        } else {
+            runtime
+                .browser
+                .snippet_context(target.selected.node_id.clone(), cmd.context)
+        }
+        .map_err(map_api_error)?;
+        let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
+        Ok((target, context, resolution))
+    })?;
     let colorize = cmd.format == args::OutputFormat::Markdown
         && cmd.output_file.is_none()
         && std::io::stdout().is_terminal();
-    let resolution = build_query_resolution_output_with_runtime(&runtime, &target);
     let verification_targets = resolution.resolved.verification_targets.clone();
     let markdown = render_snippet_markdown(
         &runtime.project_root,
@@ -5746,10 +5785,10 @@ async fn run_serve(cmd: ServeCommand) -> Result<()> {
         return stdio_transport::run_stdio_server(None, cmd.refresh).await;
     }
     let runtime = new_agent_surface_runtime(&cmd.project, None, None)?;
-    let opened = runtime.ensure_open(cmd.refresh)?;
     if cmd.stdio {
         return stdio_transport::run_stdio_server(Some(runtime), cmd.refresh).await;
     }
+    let opened = runtime.ensure_open(cmd.refresh)?;
     ensure_index_ready(&opened, "serve")?;
     let listener = TcpListener::bind(&cmd.addr)
         .with_context(|| format!("Failed to bind server to {}", cmd.addr))?;
@@ -10094,13 +10133,13 @@ mod tests {
     }
 
     #[test]
-    fn default_cache_root_uses_project_hash() {
+    fn default_cache_root_uses_workspace_identity() {
         let root = Path::new("C:/repo");
         let cache_root = cache_root_for_project(root, None).expect("cache root");
         let cache_root = cache_root.to_string_lossy();
         assert!(
-            cache_root.ends_with(&fnv1a_hex(b"C:/repo")),
-            "default cache root should end with the project hash"
+            cache_root.ends_with(&codestory_workspace::workspace_id_v3_for_root(root)),
+            "default cache root should end with the workspace identity"
         );
     }
 

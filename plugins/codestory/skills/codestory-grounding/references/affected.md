@@ -4,26 +4,10 @@ Maps changed files to indexed symbols, bounded dependent graph walks, and likely
 test files. Use it to choose focused regression checks before running broader
 repo gates.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> affected [PATH ...] [OPTIONS]
-```
-
-## Key Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `PATH ...` | none | Changed repo-relative paths. If omitted, CodeStory reads `git diff --name-status HEAD`. |
-| `--stdin` | off | Read changed paths or name-status rows from stdin and combine them with path args. |
-| `--stdin-format <path|name-status>` | `path` | Interpret stdin as path-only lines or `git diff --name-status` rows. |
-| `--changes <head|staged|unstaged|untracked>` | `head` | Select the default git source when no paths/stdin are supplied. |
-| `--depth <n>` | `2` | Dependent graph walk depth, clamped by the runtime. |
-| `--filter <text>` | none | Keep impacted symbols whose display name or path contains the text. |
-| `--project <path>` | `.` | Repository root to query. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Reuse or isolate a specific cache. |
-| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
-| `--format <markdown|json>` | `markdown` | Human or structured output. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Paths
 

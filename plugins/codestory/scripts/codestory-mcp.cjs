@@ -66,6 +66,8 @@ function readJson(file) {
   }
 }
 
+const canonicalMcpCatalog = readJson(path.join(pluginRoot, 'generated-mcp-catalog.json'));
+
 function fileSha256(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
@@ -1849,7 +1851,7 @@ function pluginRuntimeForResolved(resolved) {
 }
 
 function fallbackDiagnostic(resolved, probe, reason, options = {}) {
-  const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : launchCwd;
+  const projectRoot = Object.hasOwn(options, 'projectRoot') ? options.projectRoot : null;
   const preparing = reason === 'managed_cli_provisioning';
   const plugin = pluginRuntimeForResolved({ ...resolved, warnings: [...resolved.warnings, reason] });
   const readiness = {
@@ -2009,93 +2011,84 @@ function resourceContents(uri, value) {
   };
 }
 
-const FAIL_OPEN_TOOL_ARGUMENTS = {
-  project: { type: 'string', description: 'Absolute repository root for this request.' },
-  question: { type: 'string', description: 'Broad repository question.' },
-  query: { type: 'string', description: 'Symbol or search query.' },
-  id: { type: 'string', description: 'Stable CodeStory node id.' },
-  bookmark: { type: 'string', description: 'Stable bookmark id.' },
-  parent_id: { type: 'string', description: 'Parent node id.' },
-  from_id: { type: 'string', description: 'Path start node id.' },
-  to_id: { type: 'string', description: 'Path end node id.' },
-  changed_paths: { type: 'array', items: { type: 'string' }, description: 'Changed repository-relative paths.' },
-  change_records: { type: 'array', items: { type: 'object' }, description: 'Structured changed-file records.' },
-};
-
-const FAIL_OPEN_TOOL_SPECS = [
-  ['status', 'Inspect compact CodeStory capability state when diagnostics are needed.', [], []],
-  ['ground', 'Orient in a repository with a compact local map.', [], []],
-  ['packet', 'Answer a broad structural question with repository evidence.', ['question'], ['question']],
-  ['search', 'Find bounded symbol and repository candidates.', ['query'], ['query']],
-  ['files', 'List bounded indexed files and coverage.', [], []],
-  ['affected', 'Analyze explicit changed paths against the local graph.', ['changed_paths', 'change_records'], []],
-  ['symbol', 'Resolve one symbol by query or id.', ['query', 'id'], []],
-  ['definition', 'Return definition evidence for one symbol.', ['query', 'id'], []],
-  ['snippet', 'Return a focused source snippet for one symbol.', ['query', 'id'], []],
-  ['callers', 'Return bounded incoming callers for one symbol.', ['query', 'id'], []],
-  ['callees', 'Return bounded outgoing callees for one symbol.', ['query', 'id'], []],
-  ['trace', 'Return a readable bounded trace for one symbol.', ['query', 'id'], []],
-  ['trail', 'Return a bounded graph trail for one symbol.', ['query', 'id'], []],
-  ['get_node', 'Return one stable graph node.', ['query', 'id'], []],
-  ['neighbors', 'Return a bounded graph neighborhood.', ['query', 'id'], []],
-  ['shortest_path', 'Return a bounded path between two node ids.', ['from_id', 'to_id'], ['from_id', 'to_id']],
-  ['query_subgraph', 'Return a bounded subgraph around one node.', ['query', 'id'], []],
-  ['references', 'Return incoming references for one symbol.', ['query', 'id'], []],
-  ['symbols', 'Browse root symbols or children.', ['parent_id'], []],
-  ['context', 'Build focused evidence for one target.', ['query', 'id', 'bookmark'], []],
-];
-
-function failOpenToolSafety(name) {
-  const activatesManagedState = name !== 'status';
-  return {
-    safety: {
-      effect: activatesManagedState ? 'managed_activation' : 'read_only',
-      readOnly: !activatesManagedState,
-      sideEffects: activatesManagedState,
-      activatesProject: activatesManagedState,
-      writesRepository: false,
-      destructive: false,
-      idempotent: true,
-      requiresConfirmation: false,
-      localOnly: !activatesManagedState,
-      openWorld: activatesManagedState,
-    },
-    annotations: {
-      readOnlyHint: !activatesManagedState,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: activatesManagedState,
-    },
-  };
+function failOpenToolCatalog() {
+  if (!Array.isArray(canonicalMcpCatalog?.tools)) {
+    throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
+  }
+  return JSON.parse(JSON.stringify(canonicalMcpCatalog.tools));
 }
 
-function failOpenToolCatalog() {
-  return FAIL_OPEN_TOOL_SPECS.map(([name, description, argumentNames, required]) => ({
-    name,
-    description,
-    inputSchema: {
-      type: 'object',
-      properties: Object.fromEntries([
-        ['project', FAIL_OPEN_TOOL_ARGUMENTS.project],
-        ...argumentNames.map((argument) => [argument, FAIL_OPEN_TOOL_ARGUMENTS[argument]]),
-      ]),
-      required: ['project', ...required],
-      additionalProperties: true,
-    },
-    outputSchema: { type: 'object', additionalProperties: true },
-    ...failOpenToolSafety(name),
-  }));
+function selectExplicitProject(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    return {
+      ok: false,
+      code: 'project_required',
+      message: 'Pass the caller\'s absolute repository root in the `project` argument.',
+      project: null,
+    };
+  }
+  if (!path.isAbsolute(value)) {
+    return {
+      ok: false,
+      code: 'project_required',
+      message: '`project` must be an absolute repository root.',
+      project: null,
+    };
+  }
+  const project = path.resolve(value);
+  try {
+    if (!fs.statSync(project).isDirectory()) {
+      throw Object.assign(new Error('project is not a directory'), { code: 'ENOTDIR' });
+    }
+    return { ok: true, project: fs.realpathSync(project) };
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'project_unavailable',
+      message: `Project root is unavailable: ${project} (${error.code || error.message})`,
+      project,
+    };
+  }
 }
 
 function failOpenToolResult(tool, status, argumentsValue = {}) {
   const preparing = status.managed_retrieval?.state === 'preparing';
-  const project = typeof argumentsValue.project === 'string' ? argumentsValue.project : null;
+  const selection = selectExplicitProject(argumentsValue.project);
+  if (!selection.ok) {
+    const structuredContent = {
+      code: selection.code,
+      message: selection.message,
+      tool,
+      project: selection.project,
+      state: selection.code === 'project_required' ? 'no_project' : 'unavailable',
+      diagnostics_uri: 'codestory://status',
+    };
+    if (tool === 'status' && selection.code === 'project_required') {
+      return {
+        content: [{ type: 'text', text: 'state: no_project\nresult: structured\n' }],
+        structuredContent,
+      };
+    }
+    return {
+      content: [{ type: 'text', text: structuredContent.message }],
+      structuredContent,
+      isError: true,
+    };
+  }
+  const project = selection.project;
   if (tool === 'status') {
     const structuredContent = {
       project,
       state: preparing ? 'preparing' : 'unavailable',
       capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
-      current_operation: preparing ? { id: 'managed-runtime-provisioning', state: 'preparing' } : null,
+      current_operation: preparing ? {
+        operation_id: 'managed-runtime-provisioning',
+        state: 'preparing',
+        stage: 'dense_preparation',
+        attempt: 1,
+        retry_after_ms: 1500,
+        failure: null,
+      } : null,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
       retry_after_ms: preparing ? 1500 : null,
       diagnostics_uri: 'codestory://status',
@@ -2113,7 +2106,14 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     state: 'preparing',
     retry_tool: tool,
     retry_after_ms: 1500,
-    operation: { id: 'managed-runtime-provisioning', state: 'preparing' },
+    operation: {
+      operation_id: 'managed-runtime-provisioning',
+      state: 'preparing',
+      stage: 'dense_preparation',
+      attempt: 1,
+      retry_after_ms: 1500,
+      failure: null,
+    },
     diagnostics_uri: 'codestory://status',
   } : {
     code: 'codestory_unavailable',
@@ -2224,14 +2224,17 @@ function runFailOpenMcp(status, options = {}) {
     return handoff;
   };
   const tools = failOpenToolCatalog();
-  const resources = [
-    { uri: 'codestory://status', name: 'CodeStory runtime status', mimeType: 'application/json' },
-    { uri: 'codestory://agent-guide', name: 'CodeStory agent guide', mimeType: 'application/json' },
-  ];
-  const guide = () => {
+  const resources = (canonicalMcpCatalog.resources || []).filter(({ uri }) =>
+    uri === 'codestory://status' || uri === 'codestory://agent-guide');
+  const resourceTemplates = canonicalMcpCatalog.resourceTemplates || [];
+  const prompts = canonicalMcpCatalog.prompts || [];
+  const guide = (project) => {
     return {
-      message: 'Call the tool that matches the task. If it reports preparing, retry that same tool after its delay.',
+      message: project
+        ? 'Call the tool that matches the task. If it reports preparing, retry that same tool after its delay.'
+        : 'Pass the caller\'s absolute repository root as `project` before using CodeStory.',
       diagnostics_uri: 'codestory://status',
+      project,
     };
   };
   let buffer = '';
@@ -2284,14 +2287,34 @@ function runFailOpenMcp(status, options = {}) {
         response = jsonrpcResult(request.id, { tools });
       } else if (request.method === 'resources/list') {
         response = jsonrpcResult(request.id, { resources });
+      } else if (request.method === 'resources/templates/list') {
+        response = jsonrpcResult(request.id, { resourceTemplates });
       } else if (request.method === 'prompts/list') {
-        response = jsonrpcResult(request.id, { prompts: [] });
+        response = jsonrpcResult(request.id, { prompts });
       } else if (request.method === 'resources/read') {
         const uri = request.params?.uri;
+        const selection = selectExplicitProject(request.params?.project);
+        const project = selection.ok ? selection.project : null;
         if (uri === 'codestory://status') {
-          response = jsonrpcResult(request.id, resourceContents(uri, currentStatus()));
+          const statusValue = { ...currentStatus() };
+          if (selection.ok) {
+            statusValue.project_root = project;
+            statusValue.project_root_source = 'request_argument';
+          } else if (selection.code === 'project_required') {
+            statusValue.project_root = null;
+            statusValue.project_root_source = 'request_argument';
+            statusValue.project_state = 'no_project';
+            statusValue.degraded_reason = 'project_required';
+          } else {
+            response = jsonrpcError(request.id, -32602, selection.message);
+          }
+          if (!response) {
+            response = jsonrpcResult(request.id, resourceContents(uri, statusValue));
+          }
         } else if (uri === 'codestory://agent-guide') {
-          response = jsonrpcResult(request.id, resourceContents(uri, guide()));
+          response = selection.ok || selection.code === 'project_required'
+            ? jsonrpcResult(request.id, resourceContents(uri, guide(project)))
+            : jsonrpcError(request.id, -32602, selection.message);
         } else {
           response = jsonrpcError(request.id, -32602, `unknown resource: ${uri || '<missing>'}`);
         }
@@ -2518,6 +2541,7 @@ if (require.main === module) {
       compareManagedCliVersions,
       downloadFile,
       extractArchive,
+      failOpenToolCatalog,
       acquireManagedCliLock,
       managedCliLockWaitMs,
       releaseAssetRetryBudgetMs,

@@ -15,6 +15,11 @@ across repositories.
 | `working_locally` | Local graph navigation is available while broad search prepares. | Continue with local tools and retry the original broad tool later. |
 | `unavailable` | CodeStory could not converge within the managed path. | Use focused source inspection and state the evidence gap. |
 
+`current_operation` is the runtime-owned activation snapshot. When present it
+contains one stable `operation_id`, `state`, `stage`, `attempt`, retry delay,
+and failure. Concurrent calls for the same native project/configuration key
+join that operation; they do not start another refresh or repair flow.
+
 When no complete publication exists yet, `ground`, `packet`, `search`, and
 `context` return `codestory_preparing` with `retry_tool` and
 `retry_after_ms`. Broad tools use the same response while managed search is
@@ -49,6 +54,11 @@ its references instead of treating duplicated nested payloads as separate
 truths.
 
 ## Evidence boundary
+
+Successful broad MCP responses include `_meta.codestory_publication` with the
+complete core and retrieval publication identities used by the runtime-owned
+operation. Treat that metadata as the response's evidence boundary rather than
+re-reading status around the call.
 
 Local navigation is useful while broad search prepares, but it is not full
 retrieval proof. Trust a broad result only when the requested tool succeeds

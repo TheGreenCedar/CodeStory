@@ -37,69 +37,101 @@ pub(crate) fn run_explore(cmd: ExploreCommand) -> Result<()> {
     ensure_index_ready(&opened, "explore")?;
     let profile = resolve_explore_profile(cmd.profile, cmd.depth, cmd.max_nodes);
     let file_filter = cmd.target.file_filter();
-    let target = resolve_target_or_emit_ambiguity(
-        &runtime,
-        cmd.target.selection()?,
-        file_filter.as_deref(),
-        cmd.format,
-        cmd.output_file.as_deref(),
-    )?;
-    let symbol = runtime
-        .browser
-        .symbol_context(target.selected.node_id.clone())
-        .map_err(map_api_error)?;
-    let trail = runtime
-        .browser
-        .trail_context(TrailConfigDto {
-            root_id: target.selected.node_id.clone(),
-            mode: TrailMode::Neighborhood,
-            target_id: None,
-            depth: profile.output.depth,
-            direction: TrailDirection::Both,
-            caller_scope: profile.caller_scope,
-            edge_filter: Vec::new(),
-            show_utility_calls: false,
-            hide_speculative: false,
-            story: false,
-            node_filter: Vec::new(),
-            max_nodes: profile.output.max_nodes.clamp(1, 120),
-            layout_direction: LayoutDirection::Horizontal,
-        })
-        .map_err(map_api_error)?;
-    let snippet_result = runtime
-        .browser
-        .snippet_context(target.selected.node_id.clone(), 4);
-    let (snippet, snippet_layer_note) = match snippet_result {
-        Ok(snippet) => (Some(snippet), "snippet_context: available".to_string()),
-        Err(error) => (
-            None,
-            format!(
-                "snippet_context: unavailable: {}: {}",
-                error.code, error.message
-            ),
-        ),
+    let operation = if cmd.target.query.is_some() {
+        "graph_assisted"
+    } else {
+        "graph"
     };
-    let status = build_explore_status_output(
-        &runtime,
-        &opened,
-        &target,
-        cmd.refresh,
-        cmd.output_file.as_deref(),
-        &snippet_layer_note,
-    );
-    let search = build_explore_search_output(&runtime.project_root, &target);
-    let navigation = build_navigation_output(&runtime.project_root, &target, &trail);
-    let relationship_evidence =
-        build_explore_relationship_evidence(&profile.output, &trail, &navigation);
-    let route_context = symbol.node.route_endpoint.clone();
-    let source_packet = build_explore_source_packet(
-        &runtime,
-        &opened,
-        &symbol,
-        &trail,
-        &snippet,
-        &profile.output,
-    );
+    let (
+        target,
+        symbol,
+        trail,
+        snippet,
+        snippet_layer_note,
+        status,
+        search,
+        navigation,
+        relationship_evidence,
+        route_context,
+        source_packet,
+    ) = runtime.run_public_response(operation, || {
+        let target = resolve_target_or_emit_ambiguity(
+            &runtime,
+            cmd.target.selection()?,
+            file_filter.as_deref(),
+            cmd.format,
+            cmd.output_file.as_deref(),
+        )?;
+        let symbol = runtime
+            .browser
+            .symbol_context(target.selected.node_id.clone())
+            .map_err(map_api_error)?;
+        let trail = runtime
+            .browser
+            .trail_context(TrailConfigDto {
+                root_id: target.selected.node_id.clone(),
+                mode: TrailMode::Neighborhood,
+                target_id: None,
+                depth: profile.output.depth,
+                direction: TrailDirection::Both,
+                caller_scope: profile.caller_scope,
+                edge_filter: Vec::new(),
+                show_utility_calls: false,
+                hide_speculative: false,
+                story: false,
+                node_filter: Vec::new(),
+                max_nodes: profile.output.max_nodes.clamp(1, 120),
+                layout_direction: LayoutDirection::Horizontal,
+            })
+            .map_err(map_api_error)?;
+        let snippet_result = runtime
+            .browser
+            .snippet_context(target.selected.node_id.clone(), 4);
+        let (snippet, snippet_layer_note) = match snippet_result {
+            Ok(snippet) => (Some(snippet), "snippet_context: available".to_string()),
+            Err(error) => (
+                None,
+                format!(
+                    "snippet_context: unavailable: {}: {}",
+                    error.code, error.message
+                ),
+            ),
+        };
+        let status = build_explore_status_output(
+            &runtime,
+            &opened,
+            &target,
+            cmd.refresh,
+            cmd.output_file.as_deref(),
+            &snippet_layer_note,
+        );
+        let search = build_explore_search_output(&runtime.project_root, &target);
+        let navigation = build_navigation_output(&runtime.project_root, &target, &trail);
+        let relationship_evidence =
+            build_explore_relationship_evidence(&profile.output, &trail, &navigation);
+        let route_context = symbol.node.route_endpoint.clone();
+        let source_packet = build_explore_source_packet(
+            &runtime,
+            &opened,
+            &symbol,
+            &trail,
+            &snippet,
+            &profile.output,
+        );
+        Ok((
+            target,
+            symbol,
+            trail,
+            snippet,
+            snippet_layer_note,
+            status,
+            search,
+            navigation,
+            relationship_evidence,
+            route_context,
+            source_packet,
+        ))
+    })?;
     let output = ExploreOutput {
         profile: profile.output.clone(),
         status,

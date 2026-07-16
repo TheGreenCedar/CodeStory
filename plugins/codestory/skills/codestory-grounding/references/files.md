@@ -4,24 +4,10 @@ Lists files known to the persisted CodeStory index. Use it to inspect coverage,
 language mix, inferred roles, and partial-index markers before making broad
 claims about what the graph can see.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> files [OPTIONS]
-```
-
-## Key Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Repository root to query. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Reuse or isolate a specific cache. |
-| `--path <fragment>` | none | Only list files whose indexed path contains the fragment. |
-| `--language <name>` | none | Only list files for one indexed language. |
-| `--role <source|test|generated|vendor|unknown>` | none | Filter by inferred role. |
-| `--limit <n>` | `500` | Cap file rows. |
-| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
-| `--format <markdown|json>` | `markdown` | Human or structured output. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Agent Paths
 

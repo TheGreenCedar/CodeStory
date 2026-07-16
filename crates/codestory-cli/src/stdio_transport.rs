@@ -9,13 +9,13 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::{
     AffectedAnalysisRequest, AffectedChangeKindDto, AffectedChangeRecordDto, AgentAskRequest,
     AgentPacketRequestDto, AgentResponseModeDto, AgentRetrievalPresetDto,
-    AgentRetrievalProfileSelectionDto, ApiError, GraphResponse, GroundingBudgetDto,
-    IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessSampleDto,
-    IndexFreshnessStatusDto, IndexMode, IndexPublicationDto, IndexedFileRoleDto,
+    AgentRetrievalProfileSelectionDto, ApiError, EmbeddingVectorPublicationIdentityDto,
+    GraphResponse, GroundingBudgetDto, IndexFreshnessChangeKindDto, IndexFreshnessDto,
+    IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
     IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, PacketBudgetModeDto, PacketTaskClassDto, ProjectSummary,
     ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto, SearchRepoTextMode, SearchRequest,
-    TrailCallerScope, TrailDirection, TrailMode,
+    StorageStatsDto, TrailCallerScope, TrailDirection, TrailMode,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::SystemTime;
@@ -52,6 +51,7 @@ use crate::{
 use std::time::{Duration, Instant};
 
 const STDIO_PACKET_CACHE_CAPACITY: usize = 8;
+const STDIO_PROJECT_CONTEXT_CAPACITY: usize = 4;
 const STDIO_AFFECTED_INPUT_PATH_LIMIT: usize = 200;
 const STDIO_AFFECTED_PATH_OUTPUT_LIMIT: usize = 50;
 const STDIO_AFFECTED_SYMBOL_OUTPUT_LIMIT: usize = 50;
@@ -63,8 +63,6 @@ const STDIO_TEXT_ITEM_LIMIT: usize = 8;
 const STDIO_TEXT_MAX_BYTES: usize = 4 * 1024;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
-const STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET: Duration = Duration::from_secs(5);
-const STDIO_PREPARING_RETRY_AFTER_MS: u64 = 1_500;
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
 const STDIO_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
@@ -377,12 +375,6 @@ struct StdioServerState {
     recent_local_refresh: Option<crate::readiness::LocalRefreshOutput>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StdioActivationOutcome {
-    CheckReadiness,
-    RetrievalPreparing,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StdioResource {
     Status,
@@ -427,15 +419,17 @@ impl StdioResource {
         Ok(resource)
     }
 
-    fn activates_project(&self) -> bool {
-        !matches!(
+    fn reads_publication(&self) -> bool {
+        matches!(
             self,
-            Self::Status | Self::RetrievalEngineDiagnostics | Self::AgentGuide
+            Self::Project
+                | Self::Grounding
+                | Self::RootSymbols
+                | Self::Symbol(_)
+                | Self::References(_)
+                | Self::Snippet(_)
+                | Self::Trail(_)
         )
-    }
-
-    fn requires_retrieval(&self) -> bool {
-        matches!(self, Self::Grounding)
     }
 
     fn uri(&self) -> String {
@@ -454,9 +448,14 @@ impl StdioResource {
     }
 }
 
-struct StdioServerSession {
-    runtime: Option<RuntimeContext>,
+struct StdioProjectSession {
+    runtime: RuntimeContext,
     state: StdioServerState,
+}
+
+struct StdioServerSession {
+    active_project: Option<StdioProjectSession>,
+    retained_projects: VecDeque<StdioProjectSession>,
     project_required: bool,
     startup: crate::config::CliStartupConfig,
 }
@@ -465,10 +464,21 @@ impl StdioServerSession {
     fn new(runtime: Option<RuntimeContext>) -> Self {
         Self {
             project_required: runtime.is_none(),
-            runtime,
-            state: StdioServerState::default(),
+            active_project: runtime.map(|runtime| StdioProjectSession {
+                runtime,
+                state: StdioServerState::default(),
+            }),
+            retained_projects: VecDeque::new(),
             startup: crate::config::process_startup_config(),
         }
+    }
+
+    fn active_project_mut(&mut self) -> (&RuntimeContext, &mut StdioServerState) {
+        let active = self
+            .active_project
+            .as_mut()
+            .expect("stdio project selected");
+        (&active.runtime, &mut active.state)
     }
 
     fn select_tool_project(&mut self, request: &serde_json::Value) -> Result<()> {
@@ -496,34 +506,75 @@ impl StdioServerSession {
             }
             return Ok(());
         };
+        if !Path::new(project).is_absolute() {
+            bail!("project_required: `project` must be the caller's absolute repository root");
+        }
         let project_root = crate::runtime::canonicalize_project_root(Path::new(project))?;
         let workspace_id = codestory_workspace::workspace_id_v3_for_root(&project_root);
-        if self.runtime.as_ref().is_some_and(|runtime| {
-            runtime.project_identity.workspace_id == workspace_id
-                && codestory_workspace::same_workspace_path(&runtime.project_root, &project_root)
-        }) {
-            return Ok(());
-        }
-
         let cache_dir = self
             .startup
             .stdio_cache_root
             .as_ref()
             .cloned()
             .map(|root| root.join(&workspace_id));
-        let runtime = RuntimeContext::new_agent_sidecar_with_startup(
+        let candidate = RuntimeContext::new_agent_sidecar_with_startup(
             &args::ProjectArgs {
-                project: project_root,
+                project: project_root.clone(),
                 cache_dir,
             },
             &self.startup,
         )?;
-        runtime.ensure_open(args::RefreshMode::None)?;
-        self.runtime = Some(runtime);
-        // ponytail: stdio is serialized, so retain only the active project's small caches;
-        // add a bounded per-project LRU only if project switching becomes measurably hot.
-        self.state = StdioServerState::default();
+        if self.active_project.as_ref().is_some_and(|active| {
+            active.runtime.context_key == candidate.context_key
+                && active.runtime.project_identity == candidate.project_identity
+                && codestory_workspace::same_workspace_path(
+                    &active.runtime.project_root,
+                    &project_root,
+                )
+        }) {
+            return Ok(());
+        }
+        if let Some(position) = self.retained_projects.iter().position(|retained| {
+            retained.runtime.context_key == candidate.context_key
+                && retained.runtime.project_identity == candidate.project_identity
+                && codestory_workspace::same_workspace_path(
+                    &retained.runtime.project_root,
+                    &project_root,
+                )
+        }) {
+            let retained = self
+                .retained_projects
+                .remove(position)
+                .expect("retained position exists");
+            if let Some(active) = self.active_project.replace(retained) {
+                self.retained_projects.push_front(active);
+            }
+            return Ok(());
+        }
+
+        if let Some(active) = self.active_project.replace(StdioProjectSession {
+            runtime: candidate,
+            state: StdioServerState::default(),
+        }) {
+            self.retained_projects.push_front(active);
+        }
+        while self.retained_projects.len() >= STDIO_PROJECT_CONTEXT_CAPACITY {
+            if let Some(evicted) = self.retained_projects.pop_back() {
+                evicted.runtime.activation.cancel_and_wait();
+            }
+        }
         Ok(())
+    }
+}
+
+impl Drop for StdioServerSession {
+    fn drop(&mut self) {
+        if let Some(active) = self.active_project.as_ref() {
+            active.runtime.activation.cancel_and_wait();
+        }
+        for retained in &self.retained_projects {
+            retained.runtime.activation.cancel_and_wait();
+        }
     }
 }
 
@@ -645,18 +696,31 @@ fn handle_stdio_message(
             if let Err(error) = session.select_resource_project(&request) {
                 return Some(stdio_jsonrpc_error(id, -32602, error.to_string()));
             }
-            let runtime = session.runtime.as_ref().expect("stdio project selected");
-            if resource.activates_project()
-                && let Err(error) = activate_stdio_project(
-                    runtime,
-                    &mut session.state,
-                    resource.requires_retrieval(),
-                    cancelled,
-                )
-            {
-                serde_json::json!({"error": format!("Unable to activate CodeStory before reading `{uri}`: {error}")})
+            let (runtime, state) = session.active_project_mut();
+            if resource.reads_publication() {
+                if let Err(error) = runtime.inspect_project_summary().and_then(|summary| {
+                    summary.context(
+                        "project_unavailable: no complete project publication is available",
+                    )
+                }) {
+                    return Some(stdio_jsonrpc_error(id, -32000, error.to_string()));
+                }
+                match runtime.public_operation.run_observational_with_cancel(
+                    &format!("resource:{uri}"),
+                    Arc::clone(cancelled),
+                    || Ok(read_stdio_resource(runtime, state, &resource)),
+                ) {
+                    Ok(operation) => operation.value,
+                    Err(error) => serde_json::json!({
+                        "error": {
+                            "code": error.code,
+                            "message": error.message,
+                            "resource": uri,
+                        }
+                    }),
+                }
             } else {
-                read_stdio_resource(runtime, &mut session.state, &resource)
+                read_stdio_resource(runtime, state, &resource)
             }
         }
         "tools/call" => {
@@ -701,114 +765,110 @@ fn handle_stdio_message(
                 });
                 return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
             }
-            let runtime = session.runtime.as_ref().expect("stdio project selected");
-            let activation = if stdio_tool_reads_publication(name) {
-                match activate_stdio_project(
-                    runtime,
-                    &mut session.state,
-                    matches!(name, "ground" | "packet" | "search" | "context"),
-                    cancelled,
-                ) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        let error = serde_json::json!({
-                            "code": "project_activation_failed",
-                            "message": format!("Unable to activate CodeStory before running `{name}`: {error}"),
-                            "tool": name
-                        });
-                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-                    }
-                }
-            } else {
-                StdioActivationOutcome::CheckReadiness
-            };
-            if activation == StdioActivationOutcome::RetrievalPreparing
-                && matches!(name, "packet" | "search" | "context")
-            {
-                let error = stdio_tool_preparing_error(runtime, name);
-                return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-            }
-            if name != "status" {
-                match stdio_tool_blocked_error(runtime, &mut session.state, name) {
-                    Ok(Some(error)) => {
-                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let error = serde_json::json!({
-                            "code": "readiness_unavailable",
-                            "message": format!("Unable to evaluate CodeStory readiness before running `{name}`: {error}"),
-                            "tool": name
-                        });
-                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-                    }
-                }
-            }
-            let publication_before = if stdio_tool_reads_publication(name) {
-                match runtime
-                    .project
-                    .complete_index_publication_at(&runtime.storage_path)
-                {
-                    Ok(publication) => publication,
-                    Err(error) => {
-                        let error = serde_json::json!({
-                            "code": error.code,
-                            "message": error.message,
-                            "tool": name
-                        });
-                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-                    }
-                }
-            } else {
-                None
-            };
-            let mut response = handle_stdio_tool_call(runtime, &mut session.state, &request);
-            let mut served_publication = publication_before;
+            let (runtime, state) = session.active_project_mut();
             if stdio_tool_reads_publication(name) {
-                let publication_after = match runtime
-                    .project
-                    .complete_index_publication_at(&runtime.storage_path)
-                {
-                    Ok(publication) => publication,
-                    Err(error) => {
+                if let Some(mismatch) = stdio_workspace_mismatch(runtime) {
+                    let error = serde_json::json!({
+                        "code": "project_unavailable",
+                        "message": format!(
+                            "CodeStory is serving {}, but the host is active in {}",
+                            mismatch.served_root.display(),
+                            mismatch.active_root.display()
+                        ),
+                        "tool": name,
+                    });
+                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                }
+                if let Err(error) = runtime.activation.activate_project(
+                    &runtime.project_root,
+                    &runtime.storage_path,
+                    Arc::clone(cancelled),
+                ) {
+                    state.status_cache = None;
+                    let operation = runtime.activation.snapshot();
+                    let allowed = operation
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.allows_operation(name));
+                    if error.code == "cancelled" || !allowed {
+                        let preparing = matches!(
+                            error.code.as_str(),
+                            "activation_retryable" | "cache_busy" | "publication_changed"
+                        );
                         let error = serde_json::json!({
-                            "code": error.code,
+                            "code": if error.code == "cancelled" {
+                                "cancelled"
+                            } else if preparing {
+                                "codestory_preparing"
+                            } else {
+                                "codestory_unavailable"
+                            },
                             "message": error.message,
-                            "tool": name
+                            "tool": name,
+                            "state": if error.code == "cancelled" {
+                                "cancelled"
+                            } else if preparing {
+                                "preparing"
+                            } else {
+                                "unavailable"
+                            },
+                            "retry_tool": preparing.then_some(name),
+                            "retry_after_ms": operation
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.retry_after_ms),
+                            "operation": operation,
+                            "diagnostics_uri": "codestory://status",
                         });
                         return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
                     }
-                };
-                if served_publication != publication_after {
-                    response = handle_stdio_tool_call(runtime, &mut session.state, &request);
-                    let publication_after_retry = runtime
-                        .project
-                        .complete_index_publication_at(&runtime.storage_path);
-                    match publication_after_retry {
-                        Ok(publication) if publication == publication_after => {
-                            served_publication = publication_after;
-                        }
-                        Ok(_) => {
-                            let error = serde_json::json!({
-                                "code": "cache_busy",
-                                "message": "The index publication changed twice while the tool was reading. Retry against the stable publication.",
-                                "tool": name
-                            });
-                            return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-                        }
+                }
+                state.status_cache = None;
+            }
+            // Public-operation retry belongs to codestory-runtime's pinned
+            // retrieval wrapper. The transport executes one logical operation
+            // and only renders the identity attached by that owner.
+            let (response, core_publication, retrieval_publication, operation_id, attempt) =
+                if stdio_tool_reads_publication(name) {
+                    match runtime.public_operation.run_with_cancel(
+                        name,
+                        Arc::clone(cancelled),
+                        || Ok(handle_stdio_tool_call(runtime, state, &request)),
+                    ) {
+                        Ok(operation) => (
+                            operation.value,
+                            operation.core_publication,
+                            operation
+                                .retrieval_publication
+                                .and_then(|publication| serde_json::to_value(publication).ok()),
+                            Some(operation.operation_id),
+                            Some(operation.attempt),
+                        ),
                         Err(error) => {
                             let error = serde_json::json!({
                                 "code": error.code,
                                 "message": error.message,
-                                "tool": name
+                                "tool": name,
                             });
                             return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
                         }
                     }
-                }
-            }
-            let publication_meta =
-                stdio_served_publication_meta(&session.state, served_publication.as_ref());
+                } else {
+                    (
+                        handle_stdio_tool_call(runtime, state, &request),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                };
+            let publication_meta = stdio_served_publication_meta(
+                state,
+                core_publication.as_ref(),
+                retrieval_publication
+                    .as_ref()
+                    .or_else(|| stdio_response_retrieval_publication(&response)),
+                operation_id.as_deref(),
+                attempt,
+            );
             return Some(stdio_jsonrpc_tool_call_from_legacy(
                 id,
                 response,
@@ -876,86 +936,7 @@ fn stdio_jsonrpc_from_legacy(
     stdio_jsonrpc_success(id, response)
 }
 
-fn stdio_tool_blocked_error(
-    runtime: &RuntimeContext,
-    state: &mut StdioServerState,
-    name: &str,
-) -> Result<Option<serde_json::Value>> {
-    let status = read_stdio_status_resource_cached(runtime, state)?;
-    let Some(surface) = status.pointer(&format!("/allowed_surfaces/{name}")) else {
-        return Ok(None);
-    };
-    let updating = status
-        .pointer("/local_refresh/state")
-        .and_then(serde_json::Value::as_str)
-        == Some("refreshing");
-    let has_complete_publication = status
-        .get("index_publication")
-        .is_some_and(|publication| !publication.is_null());
-    if updating && !has_complete_publication && stdio_tool_reads_publication(name) {
-        return Ok(Some(stdio_tool_preparing_error(runtime, name)));
-    }
-    if surface
-        .get("allowed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(None);
-    }
-    if matches!(name, "packet" | "search" | "context") {
-        if updating {
-            return Ok(Some(stdio_tool_preparing_error(runtime, name)));
-        }
-        return Ok(Some(serde_json::json!({
-            "code": "codestory_unavailable",
-            "message": "CodeStory could not prepare broad repository search automatically. Continue with local navigation or inspect diagnostics.",
-            "tool": name,
-            "state": "unavailable",
-            "project": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-            "diagnostics_uri": "codestory://status"
-        })));
-    }
-    let (code, message, state_name, retry_after_ms) = if updating {
-        (
-            "codestory_updating",
-            "CodeStory is updating the repository map. Retry the same tool shortly.",
-            "updating",
-            Some(500),
-        )
-    } else {
-        (
-            "codestory_unavailable",
-            "CodeStory local navigation is unavailable. Continue with focused source inspection.",
-            "unavailable",
-            None,
-        )
-    };
-    Ok(Some(serde_json::json!({
-        "code": code,
-        "message": message,
-        "tool": name,
-        "state": state_name,
-        "retry_tool": retry_after_ms.map(|_| name),
-        "retry_after_ms": retry_after_ms,
-        "project": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-        "diagnostics_uri": "codestory://status"
-    })))
-}
-
-fn stdio_tool_preparing_error(runtime: &RuntimeContext, name: &str) -> serde_json::Value {
-    serde_json::json!({
-        "code": "codestory_preparing",
-        "message": "CodeStory is preparing this repository. Retry the same tool shortly.",
-        "tool": name,
-        "state": "preparing",
-        "retry_tool": name,
-        "retry_after_ms": STDIO_PREPARING_RETRY_AFTER_MS,
-        "project": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
-        "diagnostics_uri": "codestory://status"
-    })
-}
-
-fn compact_stdio_status(status: &serde_json::Value) -> serde_json::Value {
+fn compact_stdio_status(runtime: &RuntimeContext, status: &serde_json::Value) -> serde_json::Value {
     let allowed = |surface: &str| {
         status
             .pointer(&format!("/allowed_surfaces/{surface}/allowed"))
@@ -980,7 +961,17 @@ fn compact_stdio_status(status: &serde_json::Value) -> serde_json::Value {
     } else {
         "unavailable"
     };
-    let (state, next_action) = if broad_allowed {
+    let activation = runtime.activation.snapshot();
+    let activation_running = activation.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.state,
+            codestory_runtime::ActivationState::Preparing
+                | codestory_runtime::ActivationState::Updating
+        )
+    });
+    let (state, next_action) = if activation_running {
+        ("updating", "retry_intended_tool")
+    } else if broad_allowed {
         ("ready", "call_intended_tool")
     } else if local_updating {
         ("updating", "retry_intended_tool")
@@ -996,7 +987,8 @@ fn compact_stdio_status(status: &serde_json::Value) -> serde_json::Value {
             "local_navigation": local_state,
             "broad_search": broad_state
         },
-        "current_operation": serde_json::Value::Null,
+        "current_operation": activation
+            .filter(|snapshot| snapshot.state != codestory_runtime::ActivationState::Ready),
         "next_action": next_action,
         "retry_after_ms": match state {
             "updating" => Some(500),
@@ -1004,135 +996,6 @@ fn compact_stdio_status(status: &serde_json::Value) -> serde_json::Value {
         },
         "diagnostics_uri": "codestory://status"
     })
-}
-
-fn activate_stdio_project(
-    runtime: &RuntimeContext,
-    state: &mut StdioServerState,
-    requires_retrieval: bool,
-    cancelled: &Arc<AtomicBool>,
-) -> Result<StdioActivationOutcome> {
-    ensure_stdio_activation_not_cancelled(cancelled, "activation preflight")?;
-    if stdio_workspace_mismatch(runtime).is_some() {
-        return Ok(StdioActivationOutcome::CheckReadiness);
-    }
-    let project = stdio_project_args(runtime);
-    let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
-    let summary = inspect_runtime.open_project_summary()?;
-    ensure_stdio_activation_not_cancelled(cancelled, "embedding readiness")?;
-    let agent_sidecar = stdio_agent_sidecar_for_runtime(runtime);
-    let embedding_ready = !requires_retrieval
-        || codestory_retrieval::ensure_product_embedding_backend_for_runtime(&agent_sidecar)
-            .is_ok();
-    if crate::local_freshness_needs_refresh(&summary) {
-        let (_, refresh) = wait_for_stdio_local_freshness(&project, &summary)?;
-        let refresh_is_live = refresh.as_ref().is_some_and(|refresh| {
-            refresh.state == crate::readiness::LocalRefreshState::Refreshing
-        });
-        state.recent_local_refresh = refresh;
-        state.status_cache = None;
-        ensure_stdio_activation_not_cancelled(cancelled, "local freshness refresh")?;
-        if refresh_is_live {
-            return Ok(if requires_retrieval {
-                StdioActivationOutcome::RetrievalPreparing
-            } else {
-                StdioActivationOutcome::CheckReadiness
-            });
-        }
-    }
-
-    if !requires_retrieval || !embedding_ready {
-        return Ok(StdioActivationOutcome::CheckReadiness);
-    }
-    let ready = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        agent_sidecar.clone(),
-    )
-    .is_ok_and(|status| status.is_live_ready());
-    if !ready {
-        match crate::retrieval::finalize_retrieval_index_for_sidecar_runtime_with_cancel(
-            runtime,
-            &agent_sidecar,
-            cancelled,
-        ) {
-            Ok(_) => {}
-            Err(error)
-                if stdio_activation_outcome_for_error(&error)
-                    == StdioActivationOutcome::RetrievalPreparing =>
-            {
-                return Ok(StdioActivationOutcome::RetrievalPreparing);
-            }
-            Err(_) => {
-                ensure_stdio_activation_not_cancelled(cancelled, "core refresh")?;
-                if let Err(error) = runtime
-                    .index
-                    .run_indexing_blocking_with_cancel_flag(IndexMode::Full, Arc::clone(cancelled))
-                    .map_err(map_api_error)
-                {
-                    return Ok(stdio_activation_outcome_for_error(&error));
-                }
-                ensure_stdio_activation_not_cancelled(cancelled, "retrieval finalization")?;
-                if let Err(error) =
-                    crate::retrieval::finalize_retrieval_index_for_sidecar_runtime_with_cancel(
-                        runtime,
-                        &agent_sidecar,
-                        cancelled,
-                    )
-                {
-                    return Ok(stdio_activation_outcome_for_error(&error));
-                }
-            }
-        }
-        ensure_stdio_activation_not_cancelled(cancelled, "readiness verification")?;
-        let status = match codestory_retrieval::strict_sidecar_status_for_runtime(
-            &runtime.project_root,
-            Some(&runtime.storage_path),
-            agent_sidecar,
-        ) {
-            Ok(status) => status,
-            Err(error) => return Ok(stdio_activation_outcome_for_error(&error)),
-        };
-        if !status.is_live_ready() {
-            return Ok(StdioActivationOutcome::CheckReadiness);
-        }
-    }
-    state.status_cache = None;
-    Ok(StdioActivationOutcome::CheckReadiness)
-}
-
-fn ensure_stdio_activation_not_cancelled(
-    cancelled: &AtomicBool,
-    boundary: &'static str,
-) -> Result<()> {
-    if cancelled.load(Ordering::Acquire) {
-        bail!("request cancelled before {boundary}");
-    }
-    Ok(())
-}
-
-fn stdio_activation_outcome_for_error(error: &anyhow::Error) -> StdioActivationOutcome {
-    const RETRYABLE_MARKERS: &[&str] = &[
-        "cache_busy",
-        "database is locked",
-        "database table is locked",
-        "another indexing run owns the writer lock",
-        "sidecar generation input changed before manifest publication",
-        "publication changed",
-    ];
-    if error
-        .chain()
-        .map(|cause| cause.to_string().to_ascii_lowercase())
-        .any(|message| {
-            RETRYABLE_MARKERS
-                .iter()
-                .any(|marker| message.contains(marker))
-        })
-    {
-        StdioActivationOutcome::RetrievalPreparing
-    } else {
-        StdioActivationOutcome::CheckReadiness
-    }
 }
 
 fn stdio_jsonrpc_tool_call_from_legacy(
@@ -1168,8 +1031,13 @@ fn stdio_tool_reads_publication(name: &str) -> bool {
 fn stdio_served_publication_meta(
     state: &StdioServerState,
     publication: Option<&IndexPublicationDto>,
+    retrieval_publication: Option<&serde_json::Value>,
+    operation_id: Option<&str>,
+    attempt: Option<u32>,
 ) -> Option<serde_json::Value> {
-    let publication = publication?;
+    if publication.is_none() && retrieval_publication.is_none() {
+        return None;
+    }
     let status = state.status_cache.as_ref().map(|cached| &cached.value);
     let refreshing = status
         .and_then(|status| status.pointer("/local_refresh/state"))
@@ -1178,6 +1046,12 @@ fn stdio_served_publication_meta(
     let mut meta = serde_json::json!({
         "served_from": if refreshing { "last_complete_publication" } else { "complete_publication" },
         "publication": publication,
+        "core_publication": publication,
+        "retrieval_publication": retrieval_publication,
+        "operation": {
+            "operation_id": operation_id,
+            "attempt": attempt,
+        },
     });
     if refreshing {
         meta["refresh"] = serde_json::json!({
@@ -1188,6 +1062,20 @@ fn stdio_served_publication_meta(
         });
     }
     Some(meta)
+}
+
+fn stdio_response_retrieval_publication(
+    response: &serde_json::Value,
+) -> Option<&serde_json::Value> {
+    [
+        "/result/retrieval_publication",
+        "/result/retrieval_trace/retrieval_publication",
+        "/result/answer/retrieval_trace/retrieval_publication",
+        "/result/retrieval_trace_summary/retrieval_trace/retrieval_publication",
+    ]
+    .into_iter()
+    .find_map(|pointer| response.pointer(pointer))
+    .filter(|value| !value.is_null())
 }
 
 fn stdio_tool_call_success(
@@ -1717,7 +1605,7 @@ fn handle_stdio_tool_call(
         .to_string();
     match name {
         "status" => read_stdio_status_resource_cached(runtime, state)
-            .map(|status| serde_json::json!({"result": compact_stdio_status(&status)}))
+            .map(|status| serde_json::json!({"result": compact_stdio_status(runtime, &status)}))
             .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()})),
         "packet" => handle_stdio_packet(runtime, state, request),
         "search" => handle_stdio_search(runtime, state, request, query),
@@ -2068,20 +1956,26 @@ fn handle_stdio_packet(
         .pointer("/params/arguments/include_evidence")
         .and_then(|value| value.as_bool())
         .unwrap_or(true);
-    let cache_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
-        storage_fingerprint: stdio_storage_fingerprint(&runtime.storage_path),
-        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(runtime),
-        question,
-        budget,
-        task_class,
-        extra_probes: &extra_probes,
-        include_evidence,
-        latency_budget_ms,
+    let publication = stdio_active_product_publication(runtime);
+    let cache_key = publication.clone().map(|publication| {
+        stdio_packet_cache_key(StdioPacketCacheKeyInput {
+            publication,
+            question,
+            budget,
+            task_class,
+            extra_probes: &extra_probes,
+            include_evidence,
+            latency_budget_ms,
+        })
     });
-    if let Some(cached) = state.packet_cache.get(&cache_key) {
+    if let (Some(cache_key), Some(publication)) = (cache_key.as_ref(), publication.as_ref())
+        && let Some(cached) = state.packet_cache.get(cache_key)
+        && let Some(cached) =
+            stdio_bind_cached_publication(cached, StdioCachedProduct::Packet, publication)
+    {
         return cached;
     }
-    let response = runtime
+    let mut response = runtime
         .browser
         .packet(AgentPacketRequestDto {
             question: question.to_string(),
@@ -2093,16 +1987,78 @@ fn handle_stdio_packet(
         })
         .map(|packet| serde_json::json!({"result": packet}))
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}));
-    if response.get("result").is_some() {
+    if response.get("result").is_some()
+        && let (Some(cache_key), Some(publication)) = (cache_key, publication.as_ref())
+        && let Some(bound) =
+            stdio_bind_cached_publication(response.clone(), StdioCachedProduct::Packet, publication)
+    {
+        response = bound;
         state.packet_cache.insert(cache_key, response.clone());
     }
     response
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct StdioProductPublicationKey {
+    core_generation: u64,
+    core_generation_id: String,
+    core_run_id: String,
+    retrieval: EmbeddingVectorPublicationIdentityDto,
+}
+
+fn stdio_active_product_publication(
+    runtime: &RuntimeContext,
+) -> Option<StdioProductPublicationKey> {
+    let publication = runtime.public_operation.active_publication()?;
+    let retrieval = publication.retrieval_publication?;
+    if retrieval.core_generation_id != publication.core_publication.generation_id
+        || retrieval.core_run_id != publication.core_publication.run_id
+    {
+        return None;
+    }
+    Some(StdioProductPublicationKey {
+        core_generation: publication.core_publication.generation,
+        core_generation_id: publication.core_publication.generation_id,
+        core_run_id: publication.core_publication.run_id,
+        retrieval,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StdioCachedProduct {
+    Packet,
+    Search,
+}
+
+fn stdio_bind_cached_publication(
+    mut response: serde_json::Value,
+    product: StdioCachedProduct,
+    publication: &StdioProductPublicationKey,
+) -> Option<serde_json::Value> {
+    let parents = match product {
+        StdioCachedProduct::Packet => &[
+            "/result/answer/retrieval_trace",
+            "/result/retrieval_trace_summary/retrieval_trace",
+        ][..],
+        StdioCachedProduct::Search => &["/result"][..],
+    };
+    let expected = serde_json::to_value(&publication.retrieval).ok()?;
+    for parent in parents {
+        let object = response.pointer_mut(parent)?.as_object_mut()?;
+        if object
+            .get("retrieval_publication")
+            .is_some_and(|existing| !existing.is_null() && existing != &expected)
+        {
+            return None;
+        }
+        object.insert("retrieval_publication".to_string(), expected.clone());
+    }
+    Some(response)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StdioPacketCacheKey {
-    storage_fingerprint: String,
-    sidecar_fingerprint: String,
+    publication: StdioProductPublicationKey,
     question: String,
     budget: &'static str,
     task_class: Option<&'static str>,
@@ -2173,8 +2129,7 @@ impl StdioPacketCache {
 }
 
 struct StdioPacketCacheKeyInput<'a> {
-    storage_fingerprint: String,
-    sidecar_fingerprint: String,
+    publication: StdioProductPublicationKey,
     question: &'a str,
     budget: PacketBudgetModeDto,
     task_class: Option<PacketTaskClassDto>,
@@ -2185,8 +2140,7 @@ struct StdioPacketCacheKeyInput<'a> {
 
 fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCacheKey {
     StdioPacketCacheKey {
-        storage_fingerprint: input.storage_fingerprint,
-        sidecar_fingerprint: input.sidecar_fingerprint,
+        publication: input.publication,
         question: input.question.to_string(),
         budget: stdio_packet_budget_label(input.budget),
         task_class: input.task_class.map(stdio_packet_task_class_label),
@@ -2217,17 +2171,6 @@ fn stdio_packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str
     }
 }
 
-fn stdio_storage_fingerprint(storage_path: &std::path::Path) -> String {
-    let mut parts = vec![stdio_path_fingerprint(storage_path)];
-    parts.push(stdio_path_fingerprint(
-        &storage_path.with_extension("db-wal"),
-    ));
-    parts.push(stdio_path_fingerprint(
-        &storage_path.with_extension("db-shm"),
-    ));
-    parts.join("|")
-}
-
 fn stdio_storage_modified(
     storage_path: &std::path::Path,
 ) -> std::io::Result<std::time::SystemTime> {
@@ -2244,140 +2187,6 @@ fn stdio_storage_modified(
         newest = Some(newest.map_or(modified, |current| current.max(modified)));
     }
     newest.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "storage state missing"))
-}
-
-fn stdio_mandatory_sidecar_fingerprint(runtime: &RuntimeContext) -> String {
-    let status = codestory_retrieval::strict_sidecar_status_for_runtime(
-        &runtime.project_root,
-        Some(&runtime.storage_path),
-        runtime.sidecar.clone(),
-    )
-    .map(|report| StdioSidecarStatusFingerprint {
-        retrieval_mode: report.retrieval_mode,
-        degraded_reason: report.degraded_reason,
-        embedding_device_policy: report.embedding_device_policy,
-        embedding_device_state: report.embedding_device_state,
-        embedding_device_observation_source: report.embedding_device_observation_source,
-        embedding_detected_provider: report.embedding_detected_provider,
-        embedding_detected_gpu: report.embedding_detected_gpu,
-        embedding_accelerator_requested: report.embedding_accelerator_requested,
-        embedding_accelerator_request_provider: report.embedding_accelerator_request_provider,
-        embedding_accelerator_request_device: report.embedding_accelerator_request_device,
-        embedding_cpu_allowed: report.embedding_cpu_allowed,
-        manifest: report.manifest,
-    });
-    stdio_mandatory_sidecar_fingerprint_from_status(
-        codestory_retrieval::embedding_runtime_id_for_runtime(&runtime.sidecar),
-        stdio_path_fingerprint(&runtime.sidecar.layout.state_file),
-        status,
-    )
-}
-
-struct StdioSidecarStatusFingerprint {
-    retrieval_mode: String,
-    degraded_reason: Option<String>,
-    embedding_device_policy: String,
-    embedding_device_state: String,
-    embedding_device_observation_source: String,
-    embedding_detected_provider: Option<String>,
-    embedding_detected_gpu: Option<String>,
-    embedding_accelerator_requested: bool,
-    embedding_accelerator_request_provider: Option<String>,
-    embedding_accelerator_request_device: Option<String>,
-    embedding_cpu_allowed: bool,
-    manifest: Option<codestory_retrieval::RetrievalIndexManifest>,
-}
-
-fn stdio_mandatory_sidecar_fingerprint_from_status(
-    active_embedding_backend: impl AsRef<str>,
-    sidecar_state_fingerprint: impl AsRef<str>,
-    status: std::result::Result<StdioSidecarStatusFingerprint, anyhow::Error>,
-) -> String {
-    let mut parts = vec![
-        format!(
-            "active_embedding_backend:{}",
-            active_embedding_backend.as_ref()
-        ),
-        format!("sidecar_state:{}", sidecar_state_fingerprint.as_ref()),
-    ];
-
-    match status {
-        Ok(report) => {
-            parts.push(format!("retrieval_mode:{}", report.retrieval_mode));
-            parts.push(format!(
-                "degraded_reason:{}",
-                report.degraded_reason.unwrap_or_default()
-            ));
-            parts.push(format!(
-                "embedding_device_policy:{}",
-                report.embedding_device_policy
-            ));
-            parts.push(format!(
-                "embedding_device_state:{}",
-                report.embedding_device_state
-            ));
-            parts.push(format!(
-                "embedding_device_observation_source:{}",
-                report.embedding_device_observation_source
-            ));
-            parts.push(format!(
-                "embedding_detected_provider:{}",
-                report.embedding_detected_provider.unwrap_or_default()
-            ));
-            parts.push(format!(
-                "embedding_detected_gpu:{}",
-                report.embedding_detected_gpu.unwrap_or_default()
-            ));
-            parts.push(format!(
-                "embedding_accelerator_requested:{}",
-                report.embedding_accelerator_requested
-            ));
-            parts.push(format!(
-                "embedding_accelerator_request_provider:{}",
-                report
-                    .embedding_accelerator_request_provider
-                    .unwrap_or_default()
-            ));
-            parts.push(format!(
-                "embedding_accelerator_request_device:{}",
-                report
-                    .embedding_accelerator_request_device
-                    .unwrap_or_default()
-            ));
-            parts.push(format!(
-                "embedding_cpu_allowed:{}",
-                report.embedding_cpu_allowed
-            ));
-            if let Some(manifest) = report.manifest {
-                parts.push(format!(
-                    "manifest_generation:{}",
-                    manifest.sidecar_generation.unwrap_or_default()
-                ));
-                parts.push(format!(
-                    "manifest_input_hash:{}",
-                    manifest.sidecar_input_hash.unwrap_or_default()
-                ));
-                parts.push(format!(
-                    "manifest_embedding_backend:{}",
-                    manifest.embedding_backend.unwrap_or_default()
-                ));
-                parts.push(format!(
-                    "manifest_embedding_dim:{}",
-                    manifest
-                        .embedding_dim
-                        .map(|value| value.to_string())
-                        .unwrap_or_default()
-                ));
-            } else {
-                parts.push("manifest:<missing>".to_string());
-            }
-        }
-        Err(error) => {
-            parts.push(format!("status_error:{error}"));
-        }
-    }
-
-    parts.join("|")
 }
 
 fn stdio_path_fingerprint(path: &std::path::Path) -> String {
@@ -2514,22 +2323,28 @@ fn handle_stdio_search(
         .and_then(|value| value.as_u64())
         .map(|value| value.clamp(1, 50) as u32)
         .unwrap_or(10);
-    let cache_key = StdioSearchFragmentCacheKey {
-        storage_fingerprint: stdio_storage_fingerprint(&runtime.storage_path),
-        sidecar_fingerprint: stdio_mandatory_sidecar_fingerprint(runtime),
-        query: query.trim().to_ascii_lowercase(),
-        repo_text: match repo_text {
-            SearchRepoTextMode::On => "on",
-            SearchRepoTextMode::Off => "off",
-            SearchRepoTextMode::Auto => "auto",
-        }
-        .to_string(),
-        limit_per_source,
-    };
-    if let Some(cached) = state.search_cache.get(&cache_key) {
+    let publication = stdio_active_product_publication(runtime);
+    let cache_key = publication
+        .clone()
+        .map(|publication| StdioSearchFragmentCacheKey {
+            publication,
+            query: query.trim().to_ascii_lowercase(),
+            repo_text: match repo_text {
+                SearchRepoTextMode::On => "on",
+                SearchRepoTextMode::Off => "off",
+                SearchRepoTextMode::Auto => "auto",
+            }
+            .to_string(),
+            limit_per_source,
+        });
+    if let (Some(cache_key), Some(publication)) = (cache_key.as_ref(), publication.as_ref())
+        && let Some(cached) = state.search_cache.get(cache_key)
+        && let Some(cached) =
+            stdio_bind_cached_publication(cached, StdioCachedProduct::Search, publication)
+    {
         return cached;
     }
-    let response = runtime
+    let mut response = runtime
         .browser
         .search_results(SearchRequest {
             query: query.clone(),
@@ -2541,7 +2356,12 @@ fn handle_stdio_search(
         })
         .map(|result| serde_json::json!({"result": enrich_stdio_search_result(result)}))
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}));
-    if response.get("result").is_some() {
+    if response.get("result").is_some()
+        && let (Some(cache_key), Some(publication)) = (cache_key, publication.as_ref())
+        && let Some(bound) =
+            stdio_bind_cached_publication(response.clone(), StdioCachedProduct::Search, publication)
+    {
+        response = bound;
         state.search_cache.insert(cache_key, response.clone());
     }
     response
@@ -2551,8 +2371,7 @@ const STDIO_SEARCH_FRAGMENT_CACHE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StdioSearchFragmentCacheKey {
-    storage_fingerprint: String,
-    sidecar_fingerprint: String,
+    publication: StdioProductPublicationKey,
     query: String,
     repo_text: String,
     limit_per_source: u32,
@@ -3142,30 +2961,7 @@ fn read_stdio_resource(
             read_stdio_retrieval_engine_diagnostics(runtime)
         }
         StdioResource::AgentGuide => Ok(read_stdio_agent_guide_resource(&runtime.project_root)),
-        _ => runtime
-            .project
-            .complete_index_publication_at(&runtime.storage_path)
-            .map_err(map_api_error)
-            .and_then(|publication_before| {
-                let mut value = read_stdio_publication_resource(runtime, resource)?;
-                let publication_after = runtime
-                    .project
-                    .complete_index_publication_at(&runtime.storage_path)
-                    .map_err(map_api_error)?;
-                if publication_before != publication_after {
-                    value = read_stdio_publication_resource(runtime, resource)?;
-                    let publication_after_retry = runtime
-                        .project
-                        .complete_index_publication_at(&runtime.storage_path)
-                        .map_err(map_api_error)?;
-                    if publication_after != publication_after_retry {
-                        bail!(
-                            "cache_busy: the index publication changed twice while reading {uri}; retry against the stable publication"
-                        );
-                    }
-                }
-                Ok(value)
-            }),
+        _ => read_stdio_publication_resource(runtime, resource),
     };
     result
         .map(|value| serde_json::json!({"result": {"contents": [{"uri": uri, "mimeType": "application/json", "text": value.to_string()}]}}))
@@ -3192,7 +2988,10 @@ fn read_stdio_publication_resource(
 ) -> Result<serde_json::Value> {
     match resource {
         StdioResource::Project => runtime
-            .open_project_summary()
+            .inspect_project_summary()
+            .and_then(|summary| {
+                summary.context("project_unavailable: no complete project publication is available")
+            })
             .map(|summary| serde_json::json!(summary)),
         StdioResource::Grounding => runtime
             .grounding
@@ -3307,9 +3106,22 @@ fn read_stdio_status_resource_uncached(
     runtime: &RuntimeContext,
     state: &mut StdioServerState,
 ) -> Result<serde_json::Value> {
-    let project = stdio_project_args(runtime);
-    let inspect_runtime = RuntimeContext::new_inspect_only(&project)?;
-    let summary = inspect_runtime.open_project_summary()?;
+    let summary = runtime
+        .inspect_project_summary()?
+        .unwrap_or_else(|| ProjectSummary {
+            root: crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
+            stats: StorageStatsDto {
+                node_count: 0,
+                edge_count: 0,
+                file_count: 0,
+                error_count: 0,
+                fatal_error_count: 0,
+            },
+            members: Vec::new(),
+            retrieval: None,
+            freshness: None,
+            publication: None,
+        });
     let recent_local_refresh = state.recent_local_refresh.take();
     let local_refresh = crate::local_refresh_status::active_local_refresh_status(
         &runtime.cache_root,
@@ -3334,76 +3146,6 @@ fn read_stdio_status_resource_uncached(
         .and_then(|publication| serde_json::to_value(publication).ok())
         .unwrap_or(serde_json::Value::Null);
     read_stdio_status_resource(runtime, summary, local_refresh, index_publication)
-}
-
-fn wait_for_stdio_local_freshness(
-    project: &args::ProjectArgs,
-    summary: &ProjectSummary,
-) -> Result<(ProjectSummary, Option<crate::readiness::LocalRefreshOutput>)> {
-    let (tx, rx) = mpsc::channel();
-    let worker_project = project.clone();
-    thread::spawn(move || {
-        let result =
-            RuntimeContext::new_inspect_only(&worker_project).and_then(|inspect_runtime| {
-                crate::wait_for_local_freshness(&worker_project, &inspect_runtime)
-            });
-        let _ = tx.send(result);
-    });
-
-    let budget = stdio_local_refresh_foreground_budget();
-    if budget.is_zero() {
-        return Ok((
-            summary.clone(),
-            Some(stdio_local_refresh_timeout_output(summary)),
-        ));
-    }
-
-    match rx.recv_timeout(budget) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => Ok((
-            summary.clone(),
-            Some(stdio_local_refresh_timeout_output(summary)),
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            let mut output = crate::local_refresh_output_from_summary(summary);
-            output.state = crate::readiness::LocalRefreshState::Failed;
-            output.blocks_local_surfaces = true;
-            output.readiness_status = ReadinessStatusDto::RepairIndex;
-            output.reason = Some("refresh_worker_disconnected".to_string());
-            output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
-            crate::attach_complete_publication(&mut output, summary);
-            Ok((summary.clone(), Some(output)))
-        }
-    }
-}
-
-fn stdio_local_refresh_timeout_output(
-    summary: &ProjectSummary,
-) -> crate::readiness::LocalRefreshOutput {
-    let mut output = crate::local_refresh_output_from_summary(summary);
-    output.state = crate::readiness::LocalRefreshState::Refreshing;
-    output.blocks_local_surfaces = true;
-    output.readiness_status = ReadinessStatusDto::RepairIndex;
-    output.reason = Some("refresh_timeout".to_string());
-    output.phase = Some("incremental_index".to_string());
-    output.updated_at_epoch_ms = Some(crate::local_refresh_status::now_epoch_ms());
-    crate::attach_complete_publication(&mut output, summary);
-    output
-}
-
-fn stdio_local_refresh_foreground_budget() -> Duration {
-    std::env::var("CODESTORY_STDIO_LOCAL_REFRESH_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(STDIO_LOCAL_REFRESH_FOREGROUND_BUDGET)
-}
-
-fn stdio_project_args(runtime: &RuntimeContext) -> args::ProjectArgs {
-    args::ProjectArgs {
-        project: runtime.project_root.clone(),
-        cache_dir: Some(runtime.cache_root.clone()),
-    }
 }
 
 fn stdio_complete_publication_fingerprint(runtime: &RuntimeContext) -> String {
@@ -3441,6 +3183,10 @@ fn stdio_status_cache_key(runtime: &RuntimeContext) -> String {
 fn stdio_status_cache_key_with_publication(runtime: &RuntimeContext, publication: &str) -> String {
     let marker_path = stdio_dirty_marker_env_path(&runtime.project_root);
     [
+        format!(
+            "context:{}:{}",
+            runtime.context_key.workspace_id, runtime.context_key.configuration_id
+        ),
         format!("project:{}", runtime.project_root.display()),
         format!("storage:{}", runtime.storage_path.display()),
         format!("complete_publication:{publication}"),
@@ -4551,16 +4297,6 @@ fn stdio_plugin_runtime_status() -> serde_json::Value {
     })
 }
 
-fn stdio_agent_sidecar_for_runtime(
-    runtime: &RuntimeContext,
-) -> codestory_retrieval::SidecarRuntimeConfig {
-    runtime.sidecar.with_profile_and_run_id(
-        Some(&runtime.project_root),
-        codestory_retrieval::SidecarProfile::Agent,
-        Some(codestory_retrieval::DEFAULT_AGENT_RUN_ID),
-    )
-}
-
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -5045,10 +4781,26 @@ mod tests {
         ));
     }
 
+    fn product_publication(generation: u64) -> StdioProductPublicationKey {
+        let core_generation_id = format!("core-generation-{generation}");
+        let core_run_id = format!("core-run-{generation}");
+        StdioProductPublicationKey {
+            core_generation: generation,
+            core_generation_id: core_generation_id.clone(),
+            core_run_id: core_run_id.clone(),
+            retrieval: EmbeddingVectorPublicationIdentityDto {
+                core_generation_id,
+                core_run_id,
+                retrieval_generation: format!("retrieval-generation-{generation}"),
+                retrieval_input_hash: format!("retrieval-input-{generation}"),
+                semantic_generation: format!("semantic-generation-{generation}"),
+            },
+        }
+    }
+
     fn base_packet_cache_key_input(question: &str) -> StdioPacketCacheKeyInput<'_> {
         StdioPacketCacheKeyInput {
-            storage_fingerprint: "snapshot-a".to_string(),
-            sidecar_fingerprint: "sidecar-full".to_string(),
+            publication: product_publication(1),
             question,
             budget: PacketBudgetModeDto::Compact,
             task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
@@ -5058,9 +4810,9 @@ mod tests {
         }
     }
 
-    fn packet_key(question: &str, storage_fingerprint: &str) -> StdioPacketCacheKey {
+    fn packet_key(question: &str, generation: u64) -> StdioPacketCacheKey {
         stdio_packet_cache_key(StdioPacketCacheKeyInput {
-            storage_fingerprint: storage_fingerprint.to_string(),
+            publication: product_publication(generation),
             ..base_packet_cache_key_input(question)
         })
     }
@@ -5123,11 +4875,12 @@ mod tests {
         .expect("inspect runtime");
         let cancelled = Arc::new(AtomicBool::new(true));
 
-        let error =
-            activate_stdio_project(&runtime, &mut StdioServerState::default(), true, &cancelled)
-                .expect_err("cancelled activation must stop before preparation");
+        let error = runtime
+            .activation
+            .activate_project(&runtime.project_root, &runtime.storage_path, cancelled)
+            .expect_err("cancelled activation must stop before preparation");
 
-        assert!(error.to_string().contains("request cancelled"));
+        assert_eq!(error.code, "cancelled");
         assert!(!runtime.storage_path.exists());
     }
 
@@ -5466,22 +5219,7 @@ version = "0.11.20"
     }
 
     #[test]
-    fn stdio_installed_host_migration_contracts_stay_retryable_and_compact() {
-        for message in [
-            "cache_busy: publication changed",
-            "sidecar generation input changed before manifest publication",
-            "database is locked",
-        ] {
-            assert_eq!(
-                stdio_activation_outcome_for_error(&anyhow::anyhow!(message)),
-                StdioActivationOutcome::RetrievalPreparing
-            );
-        }
-        assert_eq!(
-            stdio_activation_outcome_for_error(&anyhow::anyhow!("accelerator unavailable")),
-            StdioActivationOutcome::CheckReadiness
-        );
-
+    fn stdio_installed_host_results_stay_compact() {
         let mut search = json!({"retrieval": {"fallback_reason": "missing_semantic_docs"}});
         compact_stdio_ready_search_retrieval(&mut search);
         assert_eq!(search["retrieval"], json!({"state": "ready"}));
@@ -5630,8 +5368,7 @@ version = "0.11.20"
     fn stdio_search_fragment_cache_reuses_matching_queries() {
         let mut cache = StdioSearchFragmentCache::default();
         let key = StdioSearchFragmentCacheKey {
-            storage_fingerprint: "snapshot-a".to_string(),
-            sidecar_fingerprint: "sidecar-full".to_string(),
+            publication: product_publication(1),
             query: "run_index".to_string(),
             repo_text: "auto".to_string(),
             limit_per_source: 10,
@@ -5652,8 +5389,7 @@ version = "0.11.20"
     fn stdio_search_fragment_cache_evicts_least_recently_used_entry() {
         let mut cache = StdioSearchFragmentCache::default();
         let first = StdioSearchFragmentCacheKey {
-            storage_fingerprint: "snapshot-a".to_string(),
-            sidecar_fingerprint: "sidecar-full".to_string(),
+            publication: product_publication(1),
             query: "first".to_string(),
             repo_text: "auto".to_string(),
             limit_per_source: 10,
@@ -5684,14 +5420,14 @@ version = "0.11.20"
     #[test]
     fn stdio_packet_cache_reuses_successful_packets_by_lru_key() {
         let mut cache = StdioPacketCache::default();
-        let key = packet_key("Explain packet caching.", "snapshot-a");
+        let key = packet_key("Explain packet caching.", 1);
         let response = json!({"result": {"packet_id": "packet-1"}});
 
         cache.insert(key.clone(), response.clone());
 
         assert_eq!(cache.get(&key), Some(response));
         assert_eq!(
-            cache.get(&packet_key("Explain a different packet.", "snapshot-a")),
+            cache.get(&packet_key("Explain a different packet.", 1)),
             None
         );
     }
@@ -5699,8 +5435,8 @@ version = "0.11.20"
     #[test]
     fn stdio_packet_cache_evicts_least_recently_used_entry() {
         let mut cache = StdioPacketCache::default();
-        let first = packet_key("first", "snapshot-a");
-        let second = packet_key("second", "snapshot-a");
+        let first = packet_key("first", 1);
+        let second = packet_key("second", 1);
 
         cache.insert(first.clone(), json!({"result": {"packet_id": "first"}}));
         cache.insert(second.clone(), json!({"result": {"packet_id": "second"}}));
@@ -5708,7 +5444,7 @@ version = "0.11.20"
 
         for index in 0..(STDIO_PACKET_CACHE_CAPACITY - 1) {
             cache.insert(
-                packet_key(&format!("extra-{index}"), "snapshot-a"),
+                packet_key(&format!("extra-{index}"), 1),
                 json!({"result": {"packet_id": format!("extra-{index}")}}),
             );
         }
@@ -5724,7 +5460,7 @@ version = "0.11.20"
         assert_ne!(
             base,
             stdio_packet_cache_key(StdioPacketCacheKeyInput {
-                storage_fingerprint: "snapshot-b".to_string(),
+                publication: product_publication(2),
                 ..base_packet_cache_key_input("Explain packet caching.")
             })
         );
@@ -5767,169 +5503,78 @@ version = "0.11.20"
     }
 
     #[test]
-    fn stdio_cache_keys_track_sidecar_fingerprint_without_sqlite_change() {
-        let storage_fingerprint = "snapshot-a".to_string();
-        let full_sidecar =
-            "retrieval_mode:full|manifest_generation:project-a|manifest_input_hash:hash-a";
-        let stale_sidecar = "retrieval_mode:unavailable|degraded_reason:retrieval_manifest_stale";
+    fn stdio_product_cache_keys_use_exact_pinned_publications() {
+        let packet_first = packet_key("Explain packet caching.", 1);
+        let packet_second = packet_key("Explain packet caching.", 2);
+        assert_ne!(packet_first, packet_second);
 
-        let packet_full = stdio_packet_cache_key(StdioPacketCacheKeyInput {
-            storage_fingerprint: storage_fingerprint.clone(),
-            sidecar_fingerprint: full_sidecar.to_string(),
-            ..base_packet_cache_key_input("Explain packet caching.")
-        });
-        let packet_stale = stdio_packet_cache_key(StdioPacketCacheKeyInput {
-            storage_fingerprint: storage_fingerprint.clone(),
-            sidecar_fingerprint: stale_sidecar.to_string(),
-            ..base_packet_cache_key_input("Explain packet caching.")
-        });
-        assert_ne!(packet_full, packet_stale);
-
-        let search_full = StdioSearchFragmentCacheKey {
-            storage_fingerprint: storage_fingerprint.clone(),
-            sidecar_fingerprint: full_sidecar.to_string(),
+        let search_first = StdioSearchFragmentCacheKey {
+            publication: product_publication(1),
             query: "handler".to_string(),
             repo_text: "auto".to_string(),
             limit_per_source: 10,
         };
-        let search_stale = StdioSearchFragmentCacheKey {
-            sidecar_fingerprint: stale_sidecar.to_string(),
-            ..search_full.clone()
+        let search_second = StdioSearchFragmentCacheKey {
+            publication: product_publication(2),
+            ..search_first.clone()
         };
-        assert_ne!(search_full, search_stale);
-        assert_eq!(
-            search_full.storage_fingerprint, search_stale.storage_fingerprint,
-            "regression must cover sidecar status drift without SQLite fingerprint changes"
+        assert_ne!(search_first, search_second);
+    }
+
+    #[test]
+    fn stdio_cached_packet_publication_collision_is_rejected() {
+        let active = product_publication(2);
+        let stale = product_publication(1);
+        let cached = json!({
+            "result": {
+                "answer": {"retrieval_trace": {"retrieval_publication": stale.retrieval}},
+                "retrieval_trace_summary": {
+                    "retrieval_trace": {"retrieval_publication": product_publication(1).retrieval}
+                }
+            }
+        });
+
+        assert!(
+            stdio_bind_cached_publication(cached, StdioCachedProduct::Packet, &active).is_none(),
+            "a colliding cached payload from another publication must be a cache miss"
         );
     }
 
     #[test]
-    fn stdio_product_cache_key_uses_strict_sidecar_readiness() {
-        let storage_fingerprint = "sqlite-and-wal-stable".to_string();
-        let manifest = codestory_retrieval::RetrievalIndexManifest {
-            project_id: "project-a".into(),
-            lexical_version: codestory_retrieval::LEXICAL_INDEX_VERSION.into(),
-            semantic_generation: "codestory_project_a_hash_a".into(),
-            scip_revision: Some("graph-test".into()),
-            built_at_epoch_ms: 1,
-            disk_bytes: None,
-            degraded_modes_json: "[]".into(),
-            embedding_backend: Some(crate::sidecar_runtime::embedding_runtime_id()),
-            embedding_dim: Some(codestory_retrieval::RETRIEVAL_EMBEDDING_DIM as i32),
-            sidecar_schema_version: Some(codestory_retrieval::SIDECAR_SCHEMA_VERSION),
-            sidecar_input_hash: Some("hash-a".into()),
-            sidecar_generation: Some("project-a-hash-a".into()),
-            projection_count: Some(12),
-            symbol_doc_count: Some(120),
-            dense_projection_count: Some(12),
-            semantic_policy_version: Some("graph_first_v1".into()),
-            graph_artifact_hash: Some("graph-hash-a".into()),
-            dense_reason_counts_json: Some(r#"{"public_api":12}"#.into()),
-            precise_semantic_import_status: None,
-            precise_semantic_import_reason: None,
-            precise_semantic_import_revision: None,
-            precise_semantic_import_producer: None,
+    fn stdio_cached_search_publication_matches_active_meta() {
+        let active = product_publication(2);
+        let cached = json!({"result": {"hits": [], "retrieval_publication": null}});
+        let bound = stdio_bind_cached_publication(cached, StdioCachedProduct::Search, &active)
+            .expect("missing cached publication is rebound from its exact cache key");
+        let core = IndexPublicationDto {
+            generation: active.core_generation,
+            generation_id: active.core_generation_id.clone(),
+            run_id: active.core_run_id.clone(),
+            mode: codestory_contracts::api::IndexPublicationModeDto::Full,
+            published_at_epoch_ms: 2,
         };
-        let before_stale = stdio_mandatory_sidecar_fingerprint_from_status(
-            crate::sidecar_runtime::embedding_runtime_id(),
-            "state-file-stable",
-            Ok(StdioSidecarStatusFingerprint {
-                retrieval_mode: "full".into(),
-                degraded_reason: None,
-                embedding_device_policy: "accelerator_required".into(),
-                embedding_device_state: "accelerated".into(),
-                embedding_device_observation_source: "manual_env".into(),
-                embedding_detected_provider: None,
-                embedding_detected_gpu: None,
-                embedding_accelerator_requested: false,
-                embedding_accelerator_request_provider: None,
-                embedding_accelerator_request_device: None,
-                embedding_cpu_allowed: false,
-                manifest: Some(manifest.clone()),
-            }),
+        let retrieval = serde_json::to_value(&active.retrieval).expect("retrieval publication");
+        let meta = stdio_served_publication_meta(
+            &StdioServerState::default(),
+            Some(&core),
+            Some(&retrieval),
+            Some("public-2"),
+            Some(1),
         );
-        let successful_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
-            storage_fingerprint: storage_fingerprint.clone(),
-            sidecar_fingerprint: before_stale.clone(),
-            question: "Explain strict readiness.",
-            task_class: None,
-            latency_budget_ms: None,
-            ..base_packet_cache_key_input("Explain strict readiness.")
-        });
-        let mut cache = StdioPacketCache::default();
-        cache.insert(
-            successful_key.clone(),
-            json!({"result": {"packet_id": "cached"}}),
-        );
+        let response = stdio_jsonrpc_tool_call_from_legacy(json!(1), bound, meta, "search");
 
-        let after_stale = stdio_mandatory_sidecar_fingerprint_from_status(
-            crate::sidecar_runtime::embedding_runtime_id(),
-            "state-file-stable",
-            Ok(StdioSidecarStatusFingerprint {
-                retrieval_mode: "unavailable".into(),
-                degraded_reason: Some(
-                    "retrieval_manifest_stale: indexable_file_added_or_changed_after_retrieval_manifest: src/new_module.rs"
-                        .into(),
-                ),
-                embedding_device_policy: "accelerator_required".into(),
-                embedding_device_state: "accelerated".into(),
-                embedding_device_observation_source: "manual_env".into(),
-                embedding_detected_provider: None,
-                embedding_detected_gpu: None,
-                embedding_accelerator_requested: false,
-                embedding_accelerator_request_provider: None,
-                embedding_accelerator_request_device: None,
-                embedding_cpu_allowed: false,
-                manifest: Some(manifest),
-            }),
-        );
-        let stale_key = stdio_packet_cache_key(StdioPacketCacheKeyInput {
-            storage_fingerprint: storage_fingerprint.clone(),
-            sidecar_fingerprint: after_stale.clone(),
-            question: "Explain strict readiness.",
-            task_class: None,
-            latency_budget_ms: None,
-            ..base_packet_cache_key_input("Explain strict readiness.")
-        });
-
-        assert_ne!(before_stale, after_stale);
-        assert!(
-            before_stale.contains("retrieval_mode:full"),
-            "the successful key must be tied to full strict sidecar readiness: {before_stale}"
-        );
-        assert!(
-            after_stale.contains("retrieval_manifest_stale"),
-            "stdio product cache key must encode strict stale status: {after_stale}"
+        assert_eq!(
+            response.pointer("/result/structuredContent/retrieval_publication"),
+            Some(&retrieval)
         );
         assert_eq!(
-            successful_key.storage_fingerprint, stale_key.storage_fingerprint,
-            "the regression must cover sidecar drift without SQLite fingerprint changes"
-        );
-        assert!(
-            cache.get(&successful_key).is_some(),
-            "the full strict-readiness key should represent a successful warm cache entry"
+            response.pointer("/result/_meta/codestory_publication/retrieval_publication"),
+            Some(&retrieval)
         );
         assert_eq!(
-            cache.get(&stale_key),
-            None,
-            "same-server cached product result must not be returned once strict status is stale"
+            response.pointer("/result/_meta/codestory_publication/core_publication/generation_id"),
+            Some(&json!(active.core_generation_id))
         );
-    }
-
-    #[test]
-    fn stdio_storage_fingerprint_tracks_db_and_wal_changes() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let db_path = temp.path().join("codestory.db");
-        std::fs::write(&db_path, b"one").expect("write db");
-        let initial = stdio_storage_fingerprint(&db_path);
-
-        std::fs::write(&db_path, b"one-two").expect("rewrite db");
-        let rewritten = stdio_storage_fingerprint(&db_path);
-        assert_ne!(initial, rewritten);
-
-        std::fs::write(temp.path().join("codestory.db-wal"), b"wal").expect("write wal");
-        let with_wal = stdio_storage_fingerprint(&db_path);
-        assert_ne!(rewritten, with_wal);
     }
 
     #[test]
@@ -5997,8 +5642,227 @@ version = "0.11.20"
         .expect("invalid resource response");
 
         assert_eq!(response.pointer("/error/code"), Some(&json!(-32602)));
-        assert!(session.runtime.is_none(), "invalid URI selected a runtime");
-        assert!(session.state.status_cache.is_none());
-        assert!(session.state.recent_local_refresh.is_none());
+        assert!(
+            session.active_project.is_none(),
+            "invalid URI selected a runtime"
+        );
+        assert!(session.retained_projects.is_empty());
+    }
+
+    #[test]
+    fn multi_project_session_reuses_native_identity_and_bounded_state() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project_a = tempfile::tempdir().expect("project a");
+        let project_b = tempfile::tempdir().expect("project b");
+        let project_c = tempfile::tempdir().expect("project c");
+        let project_d = tempfile::tempdir().expect("project d");
+        let project_e = tempfile::tempdir().expect("project e");
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+
+        session
+            .select_project(project_a.path().to_str())
+            .expect("select a");
+        let a_key = session
+            .active_project
+            .as_ref()
+            .expect("active a")
+            .runtime
+            .context_key
+            .clone();
+        session
+            .active_project
+            .as_mut()
+            .expect("active a")
+            .state
+            .status_cache = Some(StdioStatusCacheEntry {
+            key: "a".to_string(),
+            value: json!({"project": "a"}),
+            cached_at: Instant::now(),
+        });
+
+        session
+            .select_project(project_b.path().to_str())
+            .expect("select b");
+        session
+            .select_project(project_a.path().join(".").to_str())
+            .expect("reselect a through equivalent spelling");
+
+        let active = session.active_project.as_ref().expect("active a again");
+        assert_eq!(active.runtime.context_key, a_key);
+        assert_eq!(
+            active
+                .state
+                .status_cache
+                .as_ref()
+                .map(|cached| cached.key.as_str()),
+            Some("a")
+        );
+        assert_eq!(session.retained_projects.len(), 1);
+
+        for project in [&project_c, &project_d, &project_e] {
+            session
+                .select_project(project.path().to_str())
+                .expect("select additional project");
+        }
+        assert_eq!(
+            session.retained_projects.len(),
+            STDIO_PROJECT_CONTEXT_CAPACITY - 1
+        );
+        let b_workspace = codestory_workspace::workspace_id_v3_for_root(project_b.path());
+        assert!(
+            session.retained_projects.iter().all(|retained| retained
+                .runtime
+                .context_key
+                .workspace_id
+                != b_workspace),
+            "least-recently used inactive context must be evicted"
+        );
+        assert!(
+            session
+                .retained_projects
+                .iter()
+                .any(|retained| retained.runtime.context_key == a_key),
+            "recently reused native project identity must stay retained"
+        );
+    }
+
+    #[test]
+    fn multi_project_session_keys_same_path_by_runtime_configuration() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        let config_path = project.path().join(".codestory.toml");
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().to_path_buf()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().to_path_buf(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+
+        session
+            .select_project(project.path().to_str())
+            .expect("select default config");
+        let default_key = session
+            .active_project
+            .as_ref()
+            .expect("default active")
+            .runtime
+            .context_key
+            .clone();
+
+        std::fs::write(&config_path, "semantic_doc_scope = \"all\"\n")
+            .expect("write changed config");
+        session
+            .select_project(project.path().to_str())
+            .expect("select changed config");
+        let changed_key = session
+            .active_project
+            .as_ref()
+            .expect("changed active")
+            .runtime
+            .context_key
+            .clone();
+        assert_ne!(default_key, changed_key);
+        assert!(
+            session
+                .retained_projects
+                .iter()
+                .any(|retained| retained.runtime.context_key == default_key)
+        );
+
+        std::fs::remove_file(config_path).expect("restore default config");
+        session
+            .select_project(project.path().to_str())
+            .expect("reselect default config");
+        assert_eq!(
+            session
+                .active_project
+                .as_ref()
+                .expect("default active again")
+                .runtime
+                .context_key,
+            default_key
+        );
+    }
+
+    #[test]
+    fn cold_status_is_observational_for_project_storage() {
+        let project = tempfile::tempdir().expect("project");
+        let parent = tempfile::tempdir().expect("cache parent");
+        let cold_cache_root = parent.path().join("not-created");
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cold_cache_root.clone()),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cold_cache_root.clone(),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+        };
+
+        let response = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "status",
+                    "arguments": { "project": project.path() }
+                }
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("status response");
+
+        assert_eq!(response.pointer("/result/isError"), None);
+        assert!(
+            !cold_cache_root.exists(),
+            "cold status must not create project cache storage"
+        );
+
+        let resource_response = handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {
+                    "uri": "codestory://project",
+                    "project": project.path()
+                }
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("project resource response");
+        assert_eq!(
+            resource_response.pointer("/error/code"),
+            Some(&json!(-32000))
+        );
+        assert!(
+            resource_response
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|message| message.contains("project_unavailable"))
+        );
+        assert!(
+            !cold_cache_root.exists(),
+            "cold project resource must not create project cache storage"
+        );
     }
 }

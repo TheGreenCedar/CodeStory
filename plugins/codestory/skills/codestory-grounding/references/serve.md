@@ -13,23 +13,10 @@ CLI when needed, and keeps diagnostic MCP available if startup fails. Once MCP
 is live, call the intended repository tool directly and pass the same absolute
 `project` path to every call.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> serve [OPTIONS]
-```
-
-## Options
-
-| Option | Default | Use |
-|--------|---------|-----|
-| `--project <path>` | `.` | Repository root to serve. Always pass it explicitly. |
-| `--cache-dir <path>` | auto | Serve a specific cache directory. |
-| `--addr <host:port>` | `127.0.0.1:3917` | HTTP bind address. |
-| `--allow-non-loopback` | off | Required before HTTP serve can bind or answer wildcard/remote-facing addresses. Use only behind an intentional network boundary; HTTP routes do not require request authentication. |
-| `--stdio` | off | Use JSON-lines stdio instead of HTTP. |
-| `--multi-project` | off | In stdio mode, require each tool request to carry its own `project` instead of binding the server to `--project`. |
-| `--refresh <auto|full|incremental|none>` | `none` | Read an existing cache unless you intentionally refresh. |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## HTTP Routes
 

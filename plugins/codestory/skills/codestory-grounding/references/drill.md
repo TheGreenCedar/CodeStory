@@ -2,25 +2,10 @@
 
 Runs a deterministic evidence collection pass for a realistic codebase question. The command does not answer the question; it writes the artifacts an agent should use before drafting and verifying an answer.
 
-## Usage
+## Syntax
 
-```
-<codestory-cli> drill [OPTIONS]
-```
-
-## Arguments
-
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--project` | path | `.` | Project root directory (alias: `--path`) |
-| `--cache-dir` | path | *auto* | Override the cache directory |
-| `--anchors` | string list | **required** | Concrete anchors to investigate; comma-separated and repeatable |
-| `--question` | string | *none* | Natural-language architecture question to search with repo text; stored in the report |
-| `--label` | string | *none* | Human label for the run |
-| `--output-dir` | path | **required** | Directory for the drill report and artifacts; created if missing |
-| `--refresh` | enum | `full` | Refresh strategy: `auto`, `full`, `incremental`, `none` |
-| `--format` | enum | `markdown` | Primary output format: `markdown` or `json` |
-| `--jobs` | integer | `1` | Read-only anchor and bridge evidence workers for `--refresh none`; capped automatically |
+See [generated CLI syntax](generated-cli-syntax.md) for the current command usage.
+Use `<codestory-cli> <command> --help` for the complete option set.
 
 ## Output
 

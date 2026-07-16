@@ -992,6 +992,22 @@ fn multi_project_stdio_routes_interleaved_requests_by_explicit_project() {
         assert_tool_error(&missing, json!("multi-missing-project"))["code"],
         json!("project_required")
     );
+    let relative = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "multi-relative-project",
+            "method": "tools/call",
+            "params": {
+                "name": "ground",
+                "arguments": {"project": ".", "budget": "strict"}
+            }
+        }),
+    );
+    assert_eq!(
+        assert_tool_error(&relative, json!("multi-relative-project"))["code"],
+        json!("project_required")
+    );
     let unavailable = send_json(
         &mut server,
         json!({
@@ -3067,7 +3083,7 @@ fn status_observes_staleness_and_ground_activates_bounded_local_refresh() {
     };
     assert_fresh_freshness_counts(&refreshed_status, "codestory://status after mutation");
     assert_eq!(
-        refreshed_status["local_refresh"]["reason"],
+        refreshed_status["local_refresh"]["state"],
         json!("refreshed"),
         "ground activation must invalidate the cached warm freshness result: {refreshed_status}"
     );
@@ -3232,6 +3248,21 @@ fn ground_tool_serves_complete_publication_when_refresh_budget_expires() {
             .is_some(),
         "served response should identify its durable publication: {response}"
     );
+    assert!(
+        result
+            .pointer("/_meta/codestory_publication/core_publication/generation")
+            .and_then(Value::as_u64)
+            .is_some()
+            && result
+                .pointer("/_meta/codestory_publication/operation/operation_id")
+                .and_then(Value::as_str)
+                .is_some()
+            && result
+                .pointer("/_meta/codestory_publication/operation/attempt")
+                .and_then(Value::as_u64)
+                .is_some(),
+        "served response should preserve legacy publication metadata and add operation identity: {response}"
+    );
     if served_from == Some("last_complete_publication") {
         assert_eq!(
             result
@@ -3293,10 +3324,11 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
     let ground = assert_tool_success(&ground_response, json!("concurrent-ground"));
     assert_eq!(ground["stats"]["file_count"], json!(5));
     let ground_result = assert_success_envelope(&ground_response, json!("concurrent-ground"));
-    assert_eq!(
-        ground_result["_meta"]["codestory_publication"]["publication"]["generation"],
-        json!(generation)
-    );
+    let served_generation =
+        ground_result["_meta"]["codestory_publication"]["publication"]["generation"]
+            .as_u64()
+            .expect("ground serving generation");
+    assert!(served_generation >= generation);
 
     let symbol_response = send_json(
         &mut ground_client,
@@ -3312,7 +3344,7 @@ fn independent_clients_serve_one_complete_generation_while_refresh_is_owned() {
     let symbol_result = assert_success_envelope(&symbol_response, json!("concurrent-symbol"));
     assert_eq!(
         symbol_result["_meta"]["codestory_publication"]["publication"]["generation"],
-        json!(generation)
+        json!(served_generation)
     );
 
     let root_symbols_response = send_json(
@@ -3894,44 +3926,44 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
 }
 
 #[test]
-fn cold_ground_and_search_retry_while_first_publication_is_owned() {
+fn cold_ground_uses_local_capability_while_search_stays_unavailable() {
     let fixture = unindexed_fixture();
     write_live_local_refresh(&fixture);
     let mut server = spawn_stdio_server(&fixture);
 
-    for (name, arguments) in [
-        ("ground", json!({"budget": "strict"})),
-        ("search", json!({"query": "AppController"})),
-    ] {
-        let request_id = format!("cold-{name}-preparing");
-        let response = send_json(
-            &mut server,
-            json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments}
-            }),
-        );
-        let error = assert_tool_error(&response, json!(request_id));
-        assert_eq!(error["code"], json!("codestory_preparing"));
-        assert_eq!(error["tool"], json!(name));
-        assert_eq!(error["state"], json!("preparing"));
-        assert_eq!(error["retry_tool"], json!(name));
-        assert!(
-            error["retry_after_ms"]
-                .as_u64()
-                .is_some_and(|delay| delay > 0)
-        );
-        assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
-        let serialized = error.to_string();
-        for hidden_detail in ["sidecar", "repair", "pid", "port", "model", "operation"] {
-            assert!(
-                !serialized.contains(hidden_detail),
-                "preparation response should hide lifecycle detail `{hidden_detail}`: {response}"
-            );
-        }
-    }
+    let ground = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "cold-ground-local",
+            "method": "tools/call",
+            "params": {"name": "ground", "arguments": {"budget": "strict"}}
+        }),
+    );
+    assert_tool_success(&ground, json!("cold-ground-local"));
+
+    let search = send_json(
+        &mut server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "cold-search-unavailable",
+            "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "AppController"}}
+        }),
+    );
+    let error = assert_tool_error(&search, json!("cold-search-unavailable"));
+    assert_eq!(error["code"], json!("codestory_unavailable"));
+    assert_eq!(error["state"], json!("unavailable"));
+    assert_eq!(error["tool"], json!("search"));
+    assert_eq!(error["diagnostics_uri"], json!("codestory://status"));
+    assert_eq!(
+        error["operation"]["capabilities"]["local_navigation"],
+        json!("ready")
+    );
+    assert_eq!(
+        error["operation"]["capabilities"]["broad_search"],
+        json!("unavailable")
+    );
 
     let fixture = indexed_fixture();
     write_live_local_refresh(&fixture);
@@ -3949,6 +3981,6 @@ fn cold_ground_and_search_retry_while_first_publication_is_owned() {
         }),
     );
     let error = assert_tool_error(&response, json!("migration-search-preparing"));
-    assert_eq!(error["code"], json!("codestory_preparing"));
-    assert_eq!(error["retry_tool"], json!("search"));
+    assert_eq!(error["code"], json!("codestory_unavailable"));
+    assert_eq!(error["state"], json!("unavailable"));
 }

@@ -24,6 +24,11 @@ const {
   uninstallDirtyHooks,
   writeDirtyMarker,
 } = require(join(pluginRoot, "hooks", "codestory-runtime.cjs"));
+
+test("fail-open tool schemas are the generated canonical MCP catalog", async () => {
+  const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
+  assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
+});
 function threadActiveStatePath(dataDir, threadId) {
   const key = createHash("sha256").update(String(threadId)).digest("hex").slice(0, 16);
   return join(dataDir, `.codestory-active-thread-${key}.json`);
@@ -1505,7 +1510,7 @@ test("multi-project stdio ignores mutable active-workspace state", async () => {
   assert.match(launcher, /\['serve', '--stdio', '--multi-project', '--refresh', 'none'\]/u);
   assert.match(transport, /fn stdio_workspace_mismatch\(runtime: &RuntimeContext\)/u);
   assert.match(transport, /CODESTORY_PLUGIN_MULTI_PROJECT/u);
-  assert.match(transport, /project_required: pass the caller's repository root/u);
+  assert.match(transport, /project_required: `project` must be the caller's absolute repository root/u);
 });
 
 test("mcp launcher fails open when delegated stdio runtime exits", async () => {
@@ -2235,6 +2240,10 @@ test("mcp launcher infers Codex managed data from installed cache without env", 
       await readFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), "utf8"),
       "utf8",
     );
+    await copyFile(
+      join(pluginRoot, "generated-mcp-catalog.json"),
+      join(installRoot, "generated-mcp-catalog.json"),
+    );
     await writeFile(
       join(installRoot, "hooks", "codestory-runtime.cjs"),
       await readFile(join(pluginRoot, "hooks", "codestory-runtime.cjs"), "utf8"),
@@ -2304,6 +2313,9 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: "codestory://status" } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
     JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "status", arguments: { project: repoRoot } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "ground", arguments: { project: "." } } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "ground", arguments: { project: join(dataDir, "missing") } } }),
   ].join("\n") + "\n";
 
   try {
@@ -2324,8 +2336,11 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
 
     assert.equal(result.status, 0, result.stderr);
     const responses = result.stdout.trim().split(/\r?\n/u).map((line) => JSON.parse(line));
-    assert.equal(responses.length, 4, result.stdout);
+    assert.equal(responses.length, 7, result.stdout);
     const status = JSON.parse(responses[1].result.contents[0].text);
+    assert.equal(status.project_root, null);
+    assert.equal(status.project_state, "no_project");
+    assert.equal(status.degraded_reason, "project_required");
     assert.equal(status.plugin_runtime.plugin_version, version);
     assert.equal(status.plugin_runtime.plugin_root, pluginRoot);
     assert.equal(status.plugin_runtime.cli_source, "managed_unavailable");
@@ -2357,10 +2372,15 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
     assert.equal(coldGroundTool.annotations.readOnlyHint, false);
     assert.equal(coldGroundTool.annotations.openWorldHint, true);
     assert.equal(responses[3].result.isError, true);
-    assert.equal(responses[3].result.structuredContent.code, "codestory_unavailable");
+    assert.equal(responses[3].result.structuredContent.code, "project_required");
     assert.equal(responses[3].result.structuredContent.tool, "ground");
     assert.equal(responses[3].result.structuredContent.retry_tool, undefined);
-    assert.match(responses[3].result.structuredContent.message, /focused source inspection/u);
+    assert.match(responses[3].result.structuredContent.message, /absolute repository root/u);
+    assert.equal(responses[4].result.structuredContent.current_operation, null);
+    assert.equal(responses[5].result.isError, true);
+    assert.equal(responses[5].result.structuredContent.code, "project_required");
+    assert.equal(responses[6].result.isError, true);
+    assert.equal(responses[6].result.structuredContent.code, "project_unavailable");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -2732,9 +2752,11 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       jsonrpc: "2.0",
       id: 2,
       method: "resources/read",
-      params: { uri: "codestory://status" },
+      params: { uri: "codestory://status", project: repoRoot },
     });
     const status = JSON.parse(statusResponse.result.contents[0].text);
+    assert.equal(status.project_root, repoRoot);
+    assert.equal(status.project_root_source, "request_argument");
     assert.equal(status.degraded_reason, "managed_cli_provisioning");
     assert.equal(status.runtime.state, "preparing");
     const coldTools = await request({
@@ -2754,7 +2776,14 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     assert.equal(coldGround.result.structuredContent.code, "codestory_preparing");
     assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
     assert.equal(coldGround.result.structuredContent.project, repoRoot);
-    assert.equal(coldGround.result.structuredContent.operation.id, "managed-runtime-provisioning");
+    assert.deepEqual(coldGround.result.structuredContent.operation, {
+      operation_id: "managed-runtime-provisioning",
+      state: "preparing",
+      stage: "dense_preparation",
+      attempt: 1,
+      retry_after_ms: 1500,
+      failure: null,
+    });
     assert.doesNotMatch(coldGround.result.structuredContent.message, /status/u);
 
     releaseAssets();
@@ -2766,7 +2795,8 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       if (metadata.source === "managed") break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    assert.equal(JSON.parse(await readFile(runtimeMetadata, "utf8")).source, "managed");
+    const publishedRuntime = JSON.parse(await readFile(runtimeMetadata, "utf8"));
+    assert.equal(publishedRuntime.source, "managed", JSON.stringify(publishedRuntime));
     assert.equal(
       responses.some((response) => response.method === "notifications/tools/list_changed"),
       false,
