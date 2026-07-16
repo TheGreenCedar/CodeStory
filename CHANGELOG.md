@@ -23,6 +23,9 @@
   directories or databases, migrate stores, initialize engines, or activate a
   project. Dirty-marker freshness compares only committed database and WAL
   state, so reader-owned SHM metadata cannot falsely clear a stale marker.
+- Index freshness now reports a durably fenced incomplete core database as
+  stale without repairing it or exposing it through ordinary read,
+  publication, or retrieval surfaces.
 - Fail-open MCP advertises only the diagnostic resources and methods it can
   serve while the native runtime is provisioning or unavailable.
 - Skill command syntax is generated from Clap help instead of being maintained
