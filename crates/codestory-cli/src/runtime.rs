@@ -725,34 +725,59 @@ pub(crate) fn map_api_error_for_project(error: ApiError, project: &Path) -> anyh
     map_api_error_with_project(error, Some(project))
 }
 
+#[derive(Debug)]
+struct CliApiError {
+    error: ApiError,
+    message: String,
+}
+
+impl std::fmt::Display for CliApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliApiError {}
+
+/// Return the typed runtime error retained by the CLI adapter, including when
+/// command-specific context has been attached above it.
+pub(crate) fn api_error_in_chain(error: &anyhow::Error) -> Option<&ApiError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CliApiError>())
+        .map(|error| &error.error)
+}
+
 fn map_api_error_with_project(error: ApiError, project: Option<&Path>) -> anyhow::Error {
-    if api_error_is_cache_busy(&error) {
-        return anyhow!(cache_busy_message(project));
-    }
-    let mut message = format!("{}: {}", error.code, error.message);
-    if let Some((minimum_next, full_repair)) = api_error_repair_groups(&error) {
-        if !minimum_next.is_empty() {
-            message.push_str("\n\nMinimum next:");
-            for command in minimum_next {
+    let message = if api_error_is_cache_busy(&error) {
+        cache_busy_message(project)
+    } else {
+        let mut message = format!("{}: {}", error.code, error.message);
+        if let Some((minimum_next, full_repair)) = api_error_repair_groups(&error) {
+            if !minimum_next.is_empty() {
+                message.push_str("\n\nMinimum next:");
+                for command in minimum_next {
+                    message.push_str("\n  ");
+                    message.push_str(command);
+                }
+            }
+            if !full_repair.is_empty() && full_repair != minimum_next {
+                message.push_str("\n\nAdditional checks:");
+                for command in full_repair {
+                    message.push_str("\n  ");
+                    message.push_str(command);
+                }
+            }
+        } else if let Some(next_commands) = api_error_next_commands(&error) {
+            message.push_str("\n\nNext commands:");
+            for command in next_commands {
                 message.push_str("\n  ");
-                message.push_str(command);
+                message.push_str(&command);
             }
         }
-        if !full_repair.is_empty() && full_repair != minimum_next {
-            message.push_str("\n\nAdditional checks:");
-            for command in full_repair {
-                message.push_str("\n  ");
-                message.push_str(command);
-            }
-        }
-    } else if let Some(next_commands) = api_error_next_commands(&error) {
-        message.push_str("\n\nNext commands:");
-        for command in next_commands {
-            message.push_str("\n  ");
-            message.push_str(&command);
-        }
-    }
-    anyhow!(message)
+        message
+    };
+    anyhow::Error::new(CliApiError { error, message })
 }
 
 /// Rewrite cache-busy errors from non-API paths into the standard CLI message.
@@ -819,6 +844,40 @@ mod tests {
 
     struct EnvSnapshot {
         values: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    #[test]
+    fn api_error_mapping_retains_typed_details_through_outer_context() {
+        let expected = ApiError::retrieval_unavailable(
+            "retrieval is unavailable",
+            "/tmp/project",
+            vec!["codestory-cli retrieval index --project /tmp/project".to_string()],
+        );
+        let mapped = map_api_error(expected.clone()).context("packet activation");
+
+        assert_eq!(api_error_in_chain(&mapped), Some(&expected));
+        assert_eq!(mapped.to_string(), "packet activation");
+        let human = format!("{mapped:#}");
+        assert!(human.contains("retrieval_unavailable: retrieval is unavailable"));
+        assert!(human.contains("Minimum next:"));
+        assert!(human.contains("codestory-cli retrieval index --project /tmp/project"));
+    }
+
+    #[test]
+    fn cache_busy_api_error_keeps_type_and_cli_recovery_rendering() {
+        let expected = ApiError::new("project_unavailable", "sqlite_busy while opening cache");
+        let project = Path::new("/tmp/project");
+        let mapped = map_api_error_for_project(expected.clone(), project);
+
+        assert_eq!(api_error_in_chain(&mapped), Some(&expected));
+        let human = mapped.to_string();
+        let project = quote_command_path(project);
+        assert!(human.starts_with("cache_busy: CodeStory cache is busy or locked."));
+        assert!(human.contains("Minimum next:"));
+        assert!(human.contains(&format!(
+            "codestory-cli ready --project {project} --goal agent"
+        )));
+        assert!(human.contains(&format!("codestory-cli doctor --project {project}")));
     }
 
     #[test]

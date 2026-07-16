@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Direct CLI JSON failures now retain runtime API error codes and details across
+  packet, search, activation, and retrieval indexing instead of collapsing
+  typed failures into a generic `command_failed` envelope.
 - Stdio/MCP now retains a bounded set of project contexts keyed by native
   workspace identity and immutable configuration, so A/B/A routing preserves
   isolated per-project state without rereading process defaults.
