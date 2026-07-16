@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Affected analysis now resolves native workspace path identities once per
+  bounded operation, preserving Unix device/inode and Windows volume/file
+  identity without pairwise metadata scans or long-lived path caches.
 - Direct CLI JSON failures now retain runtime API error codes and details across
   packet, search, activation, and retrieval indexing instead of collapsing
   typed failures into a generic `command_failed` envelope.

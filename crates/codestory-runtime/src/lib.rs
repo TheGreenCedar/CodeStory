@@ -52,6 +52,7 @@ use codestory_store::{
 use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use codestory_workspace::{
     RefreshExecutionPlan, RefreshInputs, WorkspaceInventoryOutcome, WorkspaceManifest,
+    WorkspacePathIdentity,
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use fs4::fs_std::FileExt;
@@ -78,6 +79,7 @@ mod graph_builders;
 mod graph_canonical;
 mod grounding;
 mod mermaid;
+mod path_identity;
 mod path_resolution;
 mod query_language;
 mod repository_identity;
@@ -96,6 +98,7 @@ pub use browser::{BrowserQueryItem, ReadOnlyBrowserService};
 pub use cache_rehydrate::{CacheRehydrateOutput, CacheRehydrateRequest, rehydrate_cache};
 pub use codestory_contracts as contracts;
 pub(crate) use mermaid::{fallback_mermaid, mermaid_flowchart, mermaid_gantt, mermaid_sequence};
+use path_identity::OperationPathIdentityResolver;
 pub use query_language::{GraphQueryParseError, parse_graph_query};
 pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
@@ -383,21 +386,138 @@ fn normalized_affected_change_records(
         .collect()
 }
 
-fn affected_change_record_keys(record: &AffectedChangeRecordDto) -> Vec<String> {
-    let mut keys = Vec::new();
-    let path = normalize_path_key(&record.path);
-    if !path.is_empty() {
-        keys.push(path);
-    }
-    if let Some(previous_path) = record.previous_path.as_deref() {
-        let previous = normalize_path_key(previous_path);
-        if !previous.is_empty() {
-            keys.push(previous);
+fn affected_change_record_paths(root: &Path, record: &AffectedChangeRecordDto) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for raw in std::iter::once(record.path.as_str()).chain(record.previous_path.as_deref()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let requested = Path::new(raw);
+        let path = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        };
+        if !paths.contains(&path) {
+            paths.push(path);
         }
     }
-    keys.sort();
-    keys.dedup();
-    keys
+    paths
+}
+
+struct AffectedIdentityMatches {
+    matched_file_ids: HashSet<GraphNodeId>,
+    matched_record_indexes: HashSet<usize>,
+    matched_record_index_by_file_id: HashMap<GraphNodeId, usize>,
+    unavailable_changed_identity_count: usize,
+    unavailable_changed_identity_sample: Option<String>,
+    unavailable_indexed_identity_count: usize,
+    unavailable_indexed_identity_sample: Option<String>,
+    #[cfg(test)]
+    record_bucket_visits: usize,
+    #[cfg(test)]
+    record_index_visits: usize,
+}
+
+fn match_affected_file_identities<'a, I, R>(
+    root: &Path,
+    change_records: &[AffectedChangeRecordDto],
+    indexed_files: I,
+    path_identities: &mut OperationPathIdentityResolver<R>,
+) -> AffectedIdentityMatches
+where
+    I: IntoIterator<Item = (GraphNodeId, &'a Path)>,
+    R: FnMut(&Path) -> io::Result<WorkspacePathIdentity>,
+{
+    let mut record_indexes_by_identity = HashMap::<WorkspacePathIdentity, Vec<usize>>::new();
+    let mut unavailable_changed_identity_count = 0_usize;
+    let mut unavailable_changed_identity_sample = None;
+    for (record_index, record) in change_records.iter().enumerate() {
+        let paths = affected_change_record_paths(root, record);
+        let mut record_identities = HashSet::with_capacity(paths.len());
+        let mut identity_unavailable = false;
+        for path in paths {
+            match path_identities.resolve(&path) {
+                Ok(identity) => {
+                    record_identities.insert(identity);
+                }
+                Err(error) => {
+                    identity_unavailable = true;
+                    unavailable_changed_identity_sample.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        if identity_unavailable {
+            unavailable_changed_identity_count += 1;
+        }
+        for identity in record_identities {
+            record_indexes_by_identity
+                .entry(identity)
+                .or_default()
+                .push(record_index);
+        }
+    }
+
+    let mut matched_file_ids = HashSet::new();
+    let mut matched_record_index_by_file_id = HashMap::new();
+    let mut matched_identities = HashSet::new();
+    let mut unavailable_indexed_identity_count = 0_usize;
+    let mut unavailable_indexed_identity_sample = None;
+    for (file_id, path) in indexed_files {
+        let indexed_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let identity = match path_identities.resolve(&indexed_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                unavailable_indexed_identity_count += 1;
+                unavailable_indexed_identity_sample.get_or_insert_with(|| error.to_string());
+                continue;
+            }
+        };
+        let Some(record_index) = record_indexes_by_identity
+            .get(&identity)
+            .and_then(|indexes| indexes.first())
+        else {
+            continue;
+        };
+        matched_file_ids.insert(file_id);
+        matched_record_index_by_file_id.insert(file_id, *record_index);
+        matched_identities.insert(identity);
+    }
+
+    let mut matched_record_indexes = HashSet::new();
+    #[cfg(test)]
+    let mut record_bucket_visits = 0_usize;
+    #[cfg(test)]
+    let mut record_index_visits = 0_usize;
+    for identity in matched_identities {
+        let Some(record_indexes) = record_indexes_by_identity.get(&identity) else {
+            continue;
+        };
+        #[cfg(test)]
+        {
+            record_bucket_visits += 1;
+            record_index_visits += record_indexes.len();
+        }
+        matched_record_indexes.extend(record_indexes.iter().copied());
+    }
+
+    AffectedIdentityMatches {
+        matched_file_ids,
+        matched_record_indexes,
+        matched_record_index_by_file_id,
+        unavailable_changed_identity_count,
+        unavailable_changed_identity_sample,
+        unavailable_indexed_identity_count,
+        unavailable_indexed_identity_sample,
+        #[cfg(test)]
+        record_bucket_visits,
+        #[cfg(test)]
+        record_index_visits,
+    }
 }
 
 fn affected_unmatched_reason(record: &AffectedChangeRecordDto) -> String {
@@ -10400,48 +10520,36 @@ impl AppController {
         }
 
         let change_records = normalized_affected_change_records(&req);
-        let mut matched_file_ids = HashSet::<GraphNodeId>::new();
-        let mut matched_changed_keys = HashSet::<String>::new();
-        let mut matched_record_by_file_id = HashMap::<GraphNodeId, AffectedChangeRecordDto>::new();
-        for file in &files {
-            let relative_key = normalize_path_key(&runtime_relative_path(&root, &file.path));
-            let absolute_key = normalize_path_key(&file.path.to_string_lossy());
-            let mut matched_records = Vec::new();
-            let matched_keys = change_records
-                .iter()
-                .flat_map(|record| {
-                    affected_change_record_keys(record)
-                        .into_iter()
-                        .map(move |key| (record, key))
-                })
-                .filter_map(|(record, changed)| {
-                    let changed = changed.as_str();
-                    let matched = relative_key == changed
-                        || relative_key.ends_with(changed)
-                        || changed.ends_with(&relative_key)
-                        || absolute_key == changed
-                        || absolute_key.ends_with(changed);
-                    matched.then_some((record, changed.to_string()))
-                })
-                .collect::<Vec<_>>();
-            if !matched_keys.is_empty() {
-                let file_id = codestory_contracts::graph::NodeId(file.id);
-                matched_file_ids.insert(file_id);
-                for (record, key) in matched_keys {
-                    matched_changed_keys.insert(key);
-                    matched_records.push(record.clone());
-                }
-                if let Some(record) = matched_records.first() {
-                    matched_record_by_file_id.insert(file_id, record.clone());
-                }
-            }
-        }
+        let mut path_identities = OperationPathIdentityResolver::native();
+        let identity_matches = match_affected_file_identities(
+            &root,
+            &change_records,
+            files.iter().map(|file| {
+                (
+                    codestory_contracts::graph::NodeId(file.id),
+                    file.path.as_path(),
+                )
+            }),
+            &mut path_identities,
+        );
+        let AffectedIdentityMatches {
+            matched_file_ids,
+            matched_record_indexes,
+            matched_record_index_by_file_id,
+            unavailable_changed_identity_count,
+            unavailable_changed_identity_sample,
+            unavailable_indexed_identity_count,
+            unavailable_indexed_identity_sample,
+            ..
+        } = identity_matches;
         let mut matched_files = files
             .iter()
             .filter(|file| matched_file_ids.contains(&codestory_contracts::graph::NodeId(file.id)))
             .map(|file| {
                 let file_id = codestory_contracts::graph::NodeId(file.id);
-                let record = matched_record_by_file_id.get(&file_id);
+                let record = matched_record_index_by_file_id
+                    .get(&file_id)
+                    .map(|record_index| &change_records[*record_index]);
                 AffectedMatchedFileDto {
                     path: runtime_relative_path(&root, &file.path),
                     role: indexed_file_role(&file.path),
@@ -10457,12 +10565,9 @@ impl AppController {
         matched_files.sort_by(|left, right| left.path.cmp(&right.path));
         let unmatched_paths = change_records
             .iter()
-            .filter(|record| {
-                affected_change_record_keys(record)
-                    .iter()
-                    .all(|key| !matched_changed_keys.contains(key))
-            })
-            .map(|record| AffectedUnmatchedPathDto {
+            .enumerate()
+            .filter(|(record_index, _)| !matched_record_indexes.contains(record_index))
+            .map(|(_, record)| AffectedUnmatchedPathDto {
                 path: record.path.clone(),
                 reason: affected_unmatched_reason(record),
                 change_kind: Some(record.kind.clone()),
@@ -10734,6 +10839,22 @@ impl AppController {
             blind_spots.push(format!(
                 "{} changed paths were unmatched and excluded from graph traversal",
                 unmatched_paths.len()
+            ));
+        }
+        if unavailable_changed_identity_count > 0 {
+            let detail = unavailable_changed_identity_sample
+                .as_deref()
+                .unwrap_or("no identity error sample available");
+            blind_spots.push(format!(
+                "native path identity was unavailable for {unavailable_changed_identity_count} changed records; completeness was downgraded ({detail})"
+            ));
+        }
+        if unavailable_indexed_identity_count > 0 {
+            let detail = unavailable_indexed_identity_sample
+                .as_deref()
+                .unwrap_or("no identity error sample available");
+            blind_spots.push(format!(
+                "native path identity was unavailable for {unavailable_indexed_identity_count} indexed files; completeness was downgraded ({detail})"
             ));
         }
         if matched_files
@@ -13177,6 +13298,107 @@ mod tests {
     use std::sync::MutexGuard as StdMutexGuard;
     use tempfile::tempdir;
 
+    #[test]
+    fn affected_identity_matching_visits_one_bucket_for_all_same_identity_aliases() {
+        let root = tempdir().expect("project");
+        let seed = root.path().join("identity-seed.rs");
+        fs::write(&seed, "pub fn seed() {}\n").expect("write identity seed");
+        let shared_identity =
+            codestory_workspace::workspace_path_identity(&seed).expect("shared native identity");
+        let change_records = (0..200)
+            .map(|index| AffectedChangeRecordDto {
+                path: format!("changed-alias-{index}.rs"),
+                kind: AffectedChangeKindDto::Modified,
+                status: "M".to_string(),
+                previous_path: None,
+            })
+            .collect::<Vec<_>>();
+        let indexed_files = (0..25_000)
+            .map(|index| {
+                (
+                    CoreNodeId(index + 1),
+                    root.path().join(format!("indexed-alias-{index}.rs")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let resolver_calls = std::cell::Cell::new(0_usize);
+        let mut path_identities = OperationPathIdentityResolver::with_resolver(|_: &Path| {
+            resolver_calls.set(resolver_calls.get() + 1);
+            Ok(shared_identity.clone())
+        });
+
+        // The injected identity models 25,000 indexed hardlink spellings and
+        // 200 changed aliases of the same native file without using wall time.
+        let matches = match_affected_file_identities(
+            root.path(),
+            &change_records,
+            indexed_files
+                .iter()
+                .map(|(file_id, path)| (*file_id, path.as_path())),
+            &mut path_identities,
+        );
+
+        assert_eq!(resolver_calls.get(), 25_200);
+        assert_eq!(matches.matched_file_ids.len(), 25_000);
+        assert_eq!(matches.matched_record_indexes.len(), 200);
+        assert_eq!(matches.matched_record_index_by_file_id.len(), 25_000);
+        assert!(
+            matches
+                .matched_record_index_by_file_id
+                .values()
+                .all(|record_index| *record_index == 0)
+        );
+        assert_eq!(matches.record_bucket_visits, 1);
+        assert_eq!(matches.record_index_visits, 200);
+        assert_eq!(matches.unavailable_changed_identity_count, 0);
+        assert_eq!(matches.unavailable_indexed_identity_count, 0);
+    }
+
+    #[test]
+    fn affected_identity_matching_reports_unavailable_observations() {
+        let root = tempdir().expect("project");
+        let change_records = vec![AffectedChangeRecordDto {
+            path: "identity-unavailable.rs".to_string(),
+            kind: AffectedChangeKindDto::Modified,
+            status: "M".to_string(),
+            previous_path: None,
+        }];
+        let indexed_path = PathBuf::from("identity-unavailable.rs");
+        let resolver_calls = std::cell::Cell::new(0_usize);
+        let mut path_identities = OperationPathIdentityResolver::with_resolver(|_: &Path| {
+            resolver_calls.set(resolver_calls.get() + 1);
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected identity failure",
+            ))
+        });
+
+        let matches = match_affected_file_identities(
+            root.path(),
+            &change_records,
+            std::iter::once((CoreNodeId(1), indexed_path.as_path())),
+            &mut path_identities,
+        );
+
+        assert_eq!(resolver_calls.get(), 1);
+        assert!(matches.matched_file_ids.is_empty());
+        assert!(matches.matched_record_indexes.is_empty());
+        assert_eq!(matches.unavailable_changed_identity_count, 1);
+        assert_eq!(matches.unavailable_indexed_identity_count, 1);
+        assert!(
+            matches
+                .unavailable_changed_identity_sample
+                .as_deref()
+                .is_some_and(|sample| sample.contains("injected identity failure"))
+        );
+        assert!(
+            matches
+                .unavailable_indexed_identity_sample
+                .as_deref()
+                .is_some_and(|sample| sample.contains("injected identity failure"))
+        );
+    }
+
     struct EnvGuard {
         key: &'static str,
         previous: Option<String>,
@@ -13254,6 +13476,72 @@ mod tests {
             !indexable_source_path(Path::new("target/run-output.log")),
             "runtime freshness should not count unsupported output artifacts"
         );
+    }
+
+    fn insert_current_indexed_file(storage: &Storage, id: i64, path: &Path) {
+        let modification_time = fs::metadata(path)
+            .expect("source metadata")
+            .modified()
+            .expect("source mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime since epoch")
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        storage
+            .insert_file(&FileInfo {
+                id,
+                path: path.to_path_buf(),
+                language: "rust".into(),
+                modification_time,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: codestory_store::FileRole::Source,
+            })
+            .expect("insert current indexed file");
+    }
+
+    #[test]
+    fn newly_discovered_hardlink_alias_remains_new_for_freshness() {
+        let project = tempdir().expect("project");
+        let indexed = project.path().join("lib.rs");
+        let alias = project.path().join("alias.rs");
+        fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+        fs::hard_link(&indexed, &alias).expect("create source hardlink alias");
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        insert_current_indexed_file(&storage, 1, &indexed);
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Stale);
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 1);
+        assert_eq!(freshness.removed_file_count, 0);
+        assert!(freshness.samples.iter().any(|sample| {
+            sample.kind == IndexFreshnessChangeKindDto::New && sample.path == "alias.rs"
+        }));
+    }
+
+    #[test]
+    fn unsupported_extension_hardlink_alias_stays_outside_freshness() {
+        let project = tempdir().expect("project");
+        let indexed = project.path().join("lib.rs");
+        let alias = project.path().join("source-alias.unsupported-binary");
+        fs::write(&indexed, "pub fn indexed() {}\n").expect("write indexed source");
+        fs::hard_link(&indexed, &alias).expect("create unsupported hardlink alias");
+        assert!(!indexable_source_path(&alias));
+        let workspace = WorkspaceManifest::open(project.path().to_path_buf()).expect("workspace");
+        let storage = Storage::new_in_memory().expect("storage");
+        insert_current_indexed_file(&storage, 1, &indexed);
+
+        let freshness = index_freshness_from_storage(project.path(), &workspace, &storage);
+
+        assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(freshness.changed_file_count, 0);
+        assert_eq!(freshness.new_file_count, 0);
+        assert_eq!(freshness.removed_file_count, 0);
+        assert!(freshness.samples.is_empty());
     }
 
     #[test]

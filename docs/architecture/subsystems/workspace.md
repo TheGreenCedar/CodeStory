@@ -10,6 +10,10 @@ uses the strongest available repository/native filesystem identity and applies
 platform lexical comparison only to missing paths: case-sensitive on Unix,
 Windows-native case and verbatim-path rules on Windows.
 
+`workspace_path_identity` exposes that same native rule as a fallible hash key
+for bounded operation-local maps. Callers must treat an unavailable identity as
+incomplete evidence and must not retain the key across file replacement.
+
 `codestory_project.json` defines source groups. An optional
 `codestory_workspace.json` can name monorepo members; without either file the
 crate creates a synthetic single-root manifest.
