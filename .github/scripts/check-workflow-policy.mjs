@@ -7,9 +7,12 @@ import { LineCounter, parseDocument } from "yaml";
 import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
+const retrievalFile = "retrieval-engine-smoke.yml";
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
+
+export { retrievalFile };
 
 function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -878,9 +881,9 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "scripts/generate-codestory-skill-syntax.mjs",
     ]), `${rustFile} must cover workspace source and generated catalog changes`);
     const job = requireJob(violations, rustFile, rust, "linux-draft");
-    const retrievalWorkflow = workflows.get("retrieval-engine-smoke.yml");
+    const retrievalWorkflow = workflows.get(retrievalFile);
     for (const violation of retrievalProducerTriggerPolicyViolations(retrievalWorkflow)) {
-      violations.push(`retrieval-engine-smoke.yml ${violation}`);
+      violations.push(`${retrievalFile} ${violation}`);
     }
     const retrievalJob = object(at(
       retrievalWorkflow,
@@ -1283,7 +1286,6 @@ function validateRemainingWorkflows(workflows, violations) {
     requireStepUses(violations, statsFile, job, "Upload repo-scale stats output", "actions/upload-artifact@v7.0.1");
   }
 
-  const retrievalFile = "retrieval-engine-smoke.yml";
   const retrieval = workflows.get(retrievalFile);
   if (!retrieval) {
     violations.push(`${retrievalFile} must exist`);

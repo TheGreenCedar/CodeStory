@@ -16,6 +16,7 @@ import {
   releaseEvidenceApprovalViolations,
   releaseEvidenceWorkflowRef,
   releaseWorkflowContractViolations,
+  retrievalFile,
   retrievalProducerTriggerPolicyViolations,
   validateWorkflows,
 } from "./check-workflow-policy.mjs";
@@ -34,11 +35,11 @@ function draftSourceWorkflow() {
 }
 
 function retrievalSourceJob() {
-  return structuredClone(loadWorkflows().get("retrieval-engine-smoke.yml").jobs["linux-contracts"]);
+  return structuredClone(loadWorkflows().get(retrievalFile).jobs["linux-contracts"]);
 }
 
 function retrievalSourceWorkflow() {
-  return structuredClone(loadWorkflows().get("retrieval-engine-smoke.yml"));
+  return structuredClone(loadWorkflows().get(retrievalFile));
 }
 
 function draftStep(job, name) {
@@ -351,7 +352,7 @@ test("retrieval cache producer triggers cover every draft manifest consumer", as
           .filter(triggerPath => triggerPath !== requiredPath);
         assert.notDeepEqual(retrievalProducerTriggerPolicyViolations(candidate), []);
         const workflows = loadWorkflows();
-        workflows.set("retrieval-engine-smoke.yml", candidate);
+        workflows.set(retrievalFile, candidate);
         assert.match(
           validateWorkflows(workflows).join("\n"),
           /retrieval cache producer .* paths must cover/u,
@@ -366,7 +367,7 @@ test("retrieval cache producer triggers cover every draft manifest consumer", as
       .filter(branch => branch !== "dev/codestory-next");
     assert.notDeepEqual(retrievalProducerTriggerPolicyViolations(candidate), []);
     const workflows = loadWorkflows();
-    workflows.set("retrieval-engine-smoke.yml", candidate);
+    workflows.set(retrievalFile, candidate);
     assert.match(
       validateWorkflows(workflows).join("\n"),
       /retrieval cache producer must run on dev\/codestory-next pushes/u,
