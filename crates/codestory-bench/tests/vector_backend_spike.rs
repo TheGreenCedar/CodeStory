@@ -1158,7 +1158,9 @@ fn fixture_source_attestation(
 struct ValidatedFixtureOutput {
     requested_parent: PathBuf,
     destination: PathBuf,
+    destination_name: std::ffi::OsString,
     parent_identity: PathBuf,
+    publication_root: codestory_workspace::owned_publication::OwnedFilePublicationRoot,
     source_generation_path: PathBuf,
     source_generation_identity: PathBuf,
     cache_root_path: PathBuf,
@@ -1167,7 +1169,7 @@ struct ValidatedFixtureOutput {
 
 #[cfg(feature = "fixture-generator")]
 impl ValidatedFixtureOutput {
-    fn revalidate_destination(&self) -> Result<&Path> {
+    fn revalidate_destination(&self) -> Result<()> {
         let parent = self.requested_parent.canonicalize().with_context(|| {
             format!(
                 "revalidate fixture output parent {}",
@@ -1206,7 +1208,7 @@ impl ValidatedFixtureOutput {
             ))?,
             "fixture output must be a new path"
         );
-        Ok(&self.destination)
+        Ok(())
     }
 }
 
@@ -1229,8 +1231,9 @@ fn validate_fixture_output_path(
         .with_context(|| format!("resolve fixture output parent {}", output_parent.display()))?;
     let file_name = output
         .file_name()
-        .context("fixture output has no file name")?;
-    let destination = parent_identity.join(file_name);
+        .context("fixture output has no file name")?
+        .to_owned();
+    let destination = parent_identity.join(&file_name);
     let source_generation_identity = source_generation
         .canonicalize()
         .with_context(|| format!("resolve source generation {}", source_generation.display()))?;
@@ -1242,10 +1245,15 @@ fn validate_fixture_output_path(
         &source_generation_identity,
         &cache_root_identity,
     )?;
+    let publication_root =
+        codestory_workspace::owned_publication::OwnedFilePublicationRoot::open(&parent_identity)
+            .with_context(|| format!("pin fixture output parent {}", parent_identity.display()))?;
     let validated = ValidatedFixtureOutput {
         requested_parent: output_parent.to_path_buf(),
         destination,
+        destination_name: file_name,
         parent_identity,
+        publication_root,
         source_generation_path: source_generation.to_path_buf(),
         source_generation_identity,
         cache_root_path: cache_root.to_path_buf(),
@@ -1274,34 +1282,21 @@ fn validate_fixture_destination_roots(
 
 #[cfg(feature = "fixture-generator")]
 fn write_fixture_no_replace(output: &ValidatedFixtureOutput, bytes: &[u8]) -> Result<()> {
-    let path = output.revalidate_destination()?;
-    let (temp_path, mut file) =
-        codestory_workspace::atomic_file::create_unique_temp_file(path, "vector-backend-fixture")?;
-    let write_result = (|| -> Result<()> {
-        file.write_all(bytes)
-            .context("write fixture temporary file")?;
-        file.sync_all().context("sync fixture temporary file")
-    })();
-    drop(file);
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    let result = (|| -> Result<()> {
-        ensure!(
-            fs::read(&temp_path)? == bytes,
-            "fixture temporary file validation failed"
-        );
-        let path = output.revalidate_destination()?;
-        fs::hard_link(&temp_path, path)
-            .with_context(|| format!("publish new fixture {}", path.display()))?;
-        let _ = fs::remove_file(&temp_path);
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
+    write_fixture_no_replace_with_hook(output, bytes, || Ok(()))
+}
+
+#[cfg(feature = "fixture-generator")]
+fn write_fixture_no_replace_with_hook(
+    output: &ValidatedFixtureOutput,
+    bytes: &[u8],
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    output.revalidate_destination()?;
+    before_publish()?;
+    output
+        .publication_root
+        .publish_new_bytes(&output.destination_name, "vector-backend-fixture", bytes)
+        .with_context(|| format!("publish new fixture {}", output.destination.display()))
 }
 
 #[cfg(feature = "fixture-generator")]
@@ -1491,6 +1486,36 @@ fn fixture_publication_rejects_changed_parent_identity() -> Result<()> {
     assert!(error.to_string().contains("parent identity changed"));
     assert!(!safe_parent.join("fixture.json").exists());
     assert!(!cache_root.join("fixture.json").exists());
+    Ok(())
+}
+
+#[cfg(all(feature = "fixture-generator", any(windows, unix)))]
+#[test]
+fn fixture_publication_cannot_be_redirected_after_revalidation() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let cache_root = temp.path().join("cache");
+    let source_generation = cache_root.join("source-generation");
+    let safe_parent = temp.path().join("safe-parent");
+    let parent_link = temp.path().join("parent-link");
+    fs::create_dir_all(&source_generation)?;
+    fs::create_dir_all(&safe_parent)?;
+    let source_sqlite = source_generation.join("vectors.sqlite3");
+    File::create(&source_sqlite)?;
+    create_directory_link(&safe_parent, &parent_link)?;
+
+    let output_path = parent_link.join("fixture.json");
+    let output = validate_fixture_output_path(&output_path, &source_sqlite, &cache_root)?;
+    write_fixture_no_replace_with_hook(&output, b"pinned", || {
+        remove_directory_link(&parent_link)?;
+        create_directory_link(&cache_root, &parent_link)?;
+        Ok(())
+    })?;
+
+    assert_eq!(fs::read(safe_parent.join("fixture.json"))?, b"pinned");
+    assert!(
+        !cache_root.join("fixture.json").exists(),
+        "handle-bound publication must not follow the replacement parent"
+    );
     Ok(())
 }
 

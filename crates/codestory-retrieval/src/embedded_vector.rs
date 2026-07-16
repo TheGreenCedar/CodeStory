@@ -2052,10 +2052,11 @@ mod tests {
         let generation_dir = root.path().join("fixture-generation");
         std::fs::create_dir_all(&generation_dir).expect("create fixture generation");
         let path = generation_dir.join(VECTOR_INDEX_FILE);
+        let embedding_dim = crate::embeddings::RETRIEVAL_EMBEDDING_DIM;
         let evidence = build_vector_producer_evidence(
             &accelerated_device(),
             Some(&accelerated_identity()),
-            2,
+            u32::try_from(embedding_dim).expect("canonical embedding dimension fits u32"),
             EmbeddingVectorPublicationIdentityDto {
                 core_generation_id: "fixture-core".into(),
                 core_run_id: "fixture-run".into(),
@@ -2066,7 +2067,7 @@ mod tests {
         );
         let contract = VectorEvidenceContract::new(
             crate::embeddings::embedding_backend_label(),
-            2,
+            embedding_dim,
             crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID,
             vector_compatibility_identity(&evidence).expect("compatibility identity"),
         );
@@ -2081,8 +2082,12 @@ mod tests {
             &contract,
             Some(&expected),
             |visit| {
-                visit(attested_point("node-b", "document-b", vec![0.0, 1.0]))?;
-                visit(attested_point("node-a", "document-a", vec![1.0, 0.0]))
+                let mut node_b = vec![0.0; embedding_dim];
+                node_b[1] = 1.0;
+                visit(attested_point("node-b", "document-b", node_b))?;
+                let mut node_a = vec![0.0; embedding_dim];
+                node_a[0] = 1.0;
+                visit(attested_point("node-a", "document-a", node_a))
             },
         )
         .expect("write fixture source");
