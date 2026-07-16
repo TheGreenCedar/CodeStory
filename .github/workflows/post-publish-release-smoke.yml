@@ -219,3 +219,4 @@ jobs:
             target/post-publish-intel-policy-proof
             target/post-publish-macos-signing/${{ matrix.asset_target }}
           if-no-files-found: warn
+          retention-days: 30

@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   basicWorkflowViolations,
+  loadWorkflows,
   macosCliDistributionViolations,
   managedPluginViolations,
   notaryStepViolations,
@@ -9,9 +13,11 @@ import {
   parseWorkflow,
   releaseEvidenceApprovalViolations,
   releaseEvidenceWorkflowRef,
+  releaseWorkflowContractViolations,
 } from "./check-workflow-policy.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 function managedJob() {
   return {
@@ -237,5 +243,34 @@ test("bare macOS CLI proof uses quarantine execution instead of app assessment",
     const candidate = { assessment: structuredClone(assessment), execution: structuredClone(execution) };
     mutate(candidate);
     assert.notDeepEqual(macosCliDistributionViolations(candidate.assessment, candidate.execution, "codestory-cli"), []);
+  }
+});
+
+test("controlled semantic workflow fixtures emit class-prefixed diagnostics", async (t) => {
+  const fixture = JSON.parse(readFileSync(path.join(
+    root,
+    ".github/scripts/fixtures/workflow-policy-invalid.json",
+  ), "utf8"));
+  assert.deepEqual(releaseWorkflowContractViolations(loadWorkflows()), []);
+  for (const fixtureCase of fixture.cases) {
+    await t.test(fixtureCase.id, () => {
+      const workflows = loadWorkflows();
+      const workflow = workflows.get(fixtureCase.workflow);
+      let target = fixtureCase.job ? workflow.jobs[fixtureCase.job] : workflow;
+      if (fixtureCase.step) {
+        target = target.steps.find(({ name }) => name === fixtureCase.step);
+        assert.ok(target, `missing step ${fixtureCase.step}`);
+      }
+      const field = [...fixtureCase.field];
+      const key = field.pop();
+      for (const segment of field) target = target[segment];
+      if (fixtureCase.op === "delete") delete target[key];
+      else target[key] = structuredClone(fixtureCase.value);
+      const violations = releaseWorkflowContractViolations(workflows);
+      assert.ok(
+        violations.some((message) => message.startsWith(fixtureCase.class_prefix)),
+        violations.join("\n"),
+      );
+    });
   }
 });

@@ -14,7 +14,7 @@ const baseline = path.join(root, "benchmarks/release-evidence/approved-baselines
 const candidateSha = "2222222222222222222222222222222222222222";
 
 function run(command, extra = []) {
-  return spawnSync(process.execPath, [script, command, "--baseline", baseline, "--expected-sha", candidateSha, "--mode", "contract", "--repo", root, ...extra], { encoding: "utf8" });
+  return spawnSync(process.execPath, [script, command, "--baseline", baseline, "--expected-sha", candidateSha, "--release-key", "ci-contract-v1", "--mode", "contract", "--repo", root, ...extra], { encoding: "utf8" });
 }
 function workspace() {
   const dir = mkdtempSync(path.join(tmpdir(), "codestory-release-evidence-"));
@@ -165,7 +165,7 @@ test("artifact mutation, identity drift, and short SHA are rejected", () => {
   let result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--out", path.join(dir, "report.json")]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /artifact attestation changed/);
-  result = spawnSync(process.execPath, [script, "evaluate", "--baseline", baseline, "--candidate", path.join(fixture, "candidate.json"), "--out", path.join(dir, "report.json"), "--expected-sha", candidateSha.slice(0, 8), "--mode", "contract", "--repo", root], { encoding: "utf8" });
+  result = spawnSync(process.execPath, [script, "evaluate", "--baseline", baseline, "--candidate", path.join(fixture, "candidate.json"), "--out", path.join(dir, "report.json"), "--expected-sha", candidateSha.slice(0, 8), "--release-key", "ci-contract-v1", "--mode", "contract", "--repo", root], { encoding: "utf8" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /full 40-character Git SHA/);
   const stats = JSON.parse(readFileSync(path.join(fixture, "candidate-stats.json")));
@@ -178,12 +178,12 @@ test("artifact mutation, identity drift, and short SHA are rejected", () => {
   stats.commit = "1111111111111111111111111111111111111111";
   stats.evidence_identity.cache_id = "cold-full-retrieval-v1";
   writeFileSync(path.join(dir, "stats.json"), JSON.stringify(stats));
-  result = spawnSync(process.execPath, [script, "produce", "--baseline", baseline, "--profile", "ci-contract-v1", "--stats", path.join(dir, "stats.json"), "--packet", path.join(fixture, "candidate-packet.json"), "--out", path.join(dir, "candidate-3.json"), "--expected-sha", stats.commit, "--mode", "contract", "--repo", root], { encoding: "utf8" });
+  result = spawnSync(process.execPath, [script, "produce", "--baseline", baseline, "--profile", "ci-contract-v1", "--stats", path.join(dir, "stats.json"), "--packet", path.join(fixture, "candidate-packet.json"), "--out", path.join(dir, "candidate-3.json"), "--expected-sha", stats.commit, "--release-key", "ci-contract-v1", "--mode", "contract", "--repo", root], { encoding: "utf8" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /identical/);
 });
 
-test("regression approval is bound to candidate hash, value, threshold, baseline, profile, and expiry", () => {
+test("current full-product regressions are non-waivable and release-bound", () => {
   const dir = workspace();
   const stats = JSON.parse(readFileSync(path.join(dir, "stats.json")));
   stats.retrieval_status_seconds = 2;
@@ -193,9 +193,16 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
   let result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--out", reportPath]);
   assert.equal(result.status, 1, result.stderr);
   const report = JSON.parse(readFileSync(reportPath));
+  assert.equal(report.release_claim_evaluation.status, "fail");
+  assert.ok(report.release_claim_evaluation.failures.some(({ class: failureClass, claim }) => failureClass === "failed_evidence" && claim === "performance"));
   const row = report.metrics.find(({ metric }) => metric === "status_seconds");
+  const candidate = JSON.parse(readFileSync(path.join(dir, "candidate.json")));
+  const answerQuality = candidate.release_claims.evidence.find(({ type }) => type === "answer_quality");
+  const approvedAt = new Date().toISOString().slice(0, 10);
+  const expiresAt = new Date(`${approvedAt}T00:00:00.000Z`);
+  expiresAt.setUTCDate(expiresAt.getUTCDate() + 14);
   const approval = {
-    schema_version: 2,
+    schema_version: 3,
     metrics: {
       status_seconds: {
         candidate_sha256: report.candidate_sha256,
@@ -204,36 +211,51 @@ test("regression approval is bound to candidate hash, value, threshold, baseline
         baseline_id: report.baseline_id,
         baseline_sha256: report.baseline_sha256,
         metric: row.metric,
+        regression_class: "model_microbenchmark",
+        baseline_value: row.reference,
         measured_value: row.measured_value,
         threshold: row.threshold,
+        regression_percent: 100,
+        direction: "max",
+        repeats: 3,
+        release_key: candidate.release_key,
         owner: "release owner",
-        approved_at: "2026-07-11",
-        expires_at: "2099-07-11",
-        rationale: "Bound contract exception"
+        approved_at: approvedAt,
+        expires_at: expiresAt.toISOString().slice(0, 10),
+        rationale: "Attempted full-product exception",
+        rollback_evidence: "Revert the candidate and restore the accepted baseline",
+        full_product_benefit: {
+          evidence_id: answerQuality.id,
+          artifact_sha256: candidate.artifacts.packet.sha256,
+          observed_at: answerQuality.observed_at,
+          metric: "packet_quality_score",
+          baseline_value: 0.5,
+          measured_value: 0.6,
+          direction: "increase",
+          improvement_percent: 20
+        }
       }
     }
   };
   const approvalPath = path.join(dir, "approval.json");
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
-  assert.equal(result.status, 0, result.stderr);
-  approval.metrics.status_seconds.expires_at = "2026-07-12";
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /status_seconds is a non-waivable full-product gate/u);
+
+  approval.schema_version = 2;
   writeFileSync(approvalPath, JSON.stringify(approval));
   result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /approval is expired/);
-  approval.metrics.status_seconds.expires_at = "2099-07-11";
-  approval.metrics.status_seconds.measured_value = 1.9;
-  writeFileSync(approvalPath, JSON.stringify(approval));
-  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
+  assert.match(result.stderr, /approval schema_version must be 3/u);
+
+  result = run("evaluate", [
+    "--candidate", path.join(dir, "candidate.json"),
+    "--out", reportPath,
+    "--release-key", "next-release",
+  ]);
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /does not match measured evidence/);
-  approval.metrics.status_seconds.measured_value = row.measured_value;
-  approval.metrics.status_seconds.approved_at = "2026-02-31";
-  writeFileSync(approvalPath, JSON.stringify(approval));
-  result = run("evaluate", ["--candidate", path.join(dir, "candidate.json"), "--approval", approvalPath, "--out", reportPath]);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /valid ISO date/);
+  assert.match(result.stderr, /candidate release_key does not match/u);
 });
 
 test("evaluation independently rejects reattested raw commit and packet provenance drift", () => {
@@ -288,6 +310,56 @@ test("failed packet quality and non-full stats cannot produce or evaluate a pass
   result = run("evaluate", ["--candidate", path.join(dir2, "candidate.json"), "--out", path.join(dir2, "report.json")]);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /full-retrieval readiness contract/);
+});
+
+test("release evidence independently enforces the versioned claim graph", () => {
+  const dir = workspace();
+  produce(dir);
+  const candidatePath = path.join(dir, "candidate.json");
+  const reportPath = path.join(dir, "report.json");
+  let candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.requested_claims = candidate.release_claims.requested_claims
+    .filter(({ id }) => id === "retrieval_readiness");
+  candidate.release_claims.evidence = candidate.release_claims.evidence
+    .filter(({ type }) => type === "retrieval_readiness");
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  let result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /must exactly match the trusted release-evidence claim profile/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "answer_quality").tier = "live_behavior";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence[0].graph_sha256 = "0".repeat(64);
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /stale_evidence/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "performance")
+    .identity.baseline_id = "fabricated@baseline";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
+
+  produce(dir);
+  candidate = JSON.parse(readFileSync(candidatePath));
+  candidate.release_claims.evidence.find(({ type }) => type === "answer_quality")
+    .identity.evaluation_contract = "fabricated/v9";
+  writeFileSync(candidatePath, JSON.stringify(candidate));
+  result = run("evaluate", ["--candidate", candidatePath, "--out", reportPath]);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /incompatible_tier_identity/u);
 });
 
 test("forged provenance, duplicate repeats, and omitted repeat budgets fail", () => {

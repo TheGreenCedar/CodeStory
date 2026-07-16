@@ -10,10 +10,20 @@ import {
   cacheProvenanceBlockers,
   repoProvenanceBlockers,
 } from "./codestory-evidence-provenance.mjs";
+import {
+  evaluateReleaseClaims,
+  loadReleaseClaimGraph,
+  releaseClaimGraphDigest,
+} from "./codestory-release-claims.mjs";
 
 const METRICS = [
   "status_seconds", "local_grounding_seconds", "convergence_seconds",
   "packet_seconds", "search_seconds", "indexing_seconds", "storage_growth_ratio",
+];
+const RELEASE_EVIDENCE_CLAIM_IDS = [
+  "retrieval_readiness",
+  "performance",
+  "answer_quality",
 ];
 const SHA = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -73,6 +83,195 @@ function git(args, cwd) {
   const result = spawnSync("git", args, { cwd, encoding: "utf8" });
   if (result.status !== 0) fail(`git ${args.join(" ")} failed: ${result.stderr.trim()}`);
   return result.stdout.trim();
+}
+function repositoryIdentity(repoRoot) {
+  const remote = git(["config", "--get", "remote.origin.url"], repoRoot);
+  const match = remote.match(/github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?$/u);
+  if (!match) fail(`cannot derive GitHub repository identity from origin ${remote}`);
+  return match[1];
+}
+function sourceTreeIdentity(commit, mode, repoRoot) {
+  return mode === "release"
+    ? git(["rev-parse", `${commit}^{tree}`], repoRoot)
+    : createHash("sha1").update(`contract-fixture:${commit}`).digest("hex");
+}
+function releaseClaimObservedAt() {
+  const observedAt = process.env.CODESTORY_RELEASE_EVIDENCE_OBSERVED_AT?.trim() ?? new Date().toISOString();
+  const parsed = Date.parse(observedAt);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== observedAt) {
+    fail("CODESTORY_RELEASE_EVIDENCE_OBSERVED_AT must be a canonical ISO timestamp");
+  }
+  return observedAt;
+}
+function releaseEvidenceClaimProfile(graph) {
+  const nonWaivableMetrics = [...graph.exception_policy.non_waivable_metrics].sort();
+  if (JSON.stringify(nonWaivableMetrics) !== JSON.stringify([...METRICS].sort())) {
+    fail("release claim graph must mark every release-gate metric as non-waivable");
+  }
+  const claims = new Map(graph.claims.map((claim) => [claim.id, claim]));
+  const evidenceTypes = new Map(graph.evidence_types.map((evidenceType) => [evidenceType.id, evidenceType]));
+  return RELEASE_EVIDENCE_CLAIM_IDS.map((id) => {
+    const claim = claims.get(id);
+    const evidenceType = evidenceTypes.get(id);
+    if (!claim || !evidenceType || JSON.stringify(claim.required_evidence) !== JSON.stringify([id])) {
+      fail(`release evidence claim profile requires one ${id} evidence type`);
+    }
+    return {
+      id,
+      accepted_risks: [...claim.accepted_risks].sort(),
+      tier: evidenceType.tier,
+    };
+  });
+}
+function releaseClaimDocument({
+  repoRoot,
+  mode,
+  commit,
+  profileName,
+  identity,
+  baselineId,
+  baselineSha256,
+  releaseKey,
+  packetSha256,
+  observedAt = releaseClaimObservedAt(),
+}) {
+  const graph = loadReleaseClaimGraph(repoRoot);
+  const graphSha256 = releaseClaimGraphDigest(graph);
+  const parsedObservedAt = Date.parse(observedAt);
+  if (!Number.isFinite(parsedObservedAt) || new Date(parsedObservedAt).toISOString() !== observedAt) {
+    fail("release claim observed_at must be a canonical ISO timestamp");
+  }
+  const expiresAt = new Date(Date.parse(observedAt) + 24 * 60 * 60 * 1000).toISOString();
+  const claimProfile = releaseEvidenceClaimProfile(graph);
+  const common = {
+    repository: repositoryIdentity(repoRoot),
+    commit,
+    source_tree: sourceTreeIdentity(commit, mode, repoRoot),
+    profile: profileName,
+    corpus_id: identity.corpus_id,
+    cache_id: identity.cache_id,
+    machine_fingerprint: identity.machine_fingerprint,
+    release_key: releaseKey,
+  };
+  const row = (type, tier, extra = {}, status = "pass") => ({
+    id: `${type}-${commit.slice(0, 12)}`,
+    type,
+    tier,
+    status,
+    graph_sha256: graphSha256,
+    observed_at: observedAt,
+    expires_at: expiresAt,
+    identity: { ...common, ...extra },
+  });
+  return {
+    graph_schema: graph.schema,
+    graph_sha256: graphSha256,
+    observed_at: observedAt,
+    expires_at: expiresAt,
+    requested_claims: claimProfile.map(({ id, accepted_risks: acceptedRisks }) => ({
+      id,
+      accepted_risks: acceptedRisks,
+    })),
+    evidence: claimProfile.map(({ id, tier }) => {
+      if (id === "performance") {
+        return row(id, tier, { baseline_id: baselineId, baseline_sha256: baselineSha256 }, "measured");
+      }
+      if (id === "answer_quality") {
+        const evaluationContract = graph.evidence_types.find(({ id: type }) => type === id)
+          .identity_constraints.evaluation_contract;
+        return row(id, tier, {
+          artifact_sha256: packetSha256,
+          evaluation_contract: evaluationContract,
+        });
+      }
+      return row(id, tier);
+    }),
+  };
+}
+function requireExactReleaseClaimDocument({
+  document,
+  repoRoot,
+  mode,
+  commit,
+  profileName,
+  identity,
+  baselineId,
+  baselineSha256,
+  releaseKey,
+  packetSha256,
+}) {
+  object(document, "candidate.release_claims");
+  const expected = releaseClaimDocument({
+    repoRoot,
+    mode,
+    commit,
+    profileName,
+    identity,
+    baselineId,
+    baselineSha256,
+    releaseKey,
+    packetSha256,
+    observedAt: text(document.observed_at, "candidate.release_claims.observed_at"),
+  });
+  const requestedClaimsMatch = JSON.stringify(canonical(document.requested_claims))
+    === JSON.stringify(canonical(expected.requested_claims));
+  const actualEvidenceProfile = Array.isArray(document.evidence)
+    ? document.evidence.map(({ id, type }) => ({ id, type }))
+    : null;
+  const expectedEvidenceProfile = expected.evidence.map(({ id, type }) => ({ id, type }));
+  const evidenceProfileMatches = JSON.stringify(canonical(actualEvidenceProfile))
+    === JSON.stringify(canonical(expectedEvidenceProfile));
+  if (!requestedClaimsMatch || !evidenceProfileMatches) {
+    fail(
+      "candidate.release_claims must exactly match the trusted release-evidence claim profile, including retrieval_readiness, performance, and answer_quality with one evidence row each",
+    );
+  }
+  return document;
+}
+function evaluateClaimDocument({
+  document,
+  repoRoot,
+  mode,
+  commit,
+  profileName,
+  identity,
+  baselineId,
+  baselineSha256,
+  releaseKey,
+  packetSha256,
+  candidateSha256,
+  expectedExceptions,
+}) {
+  const graph = loadReleaseClaimGraph(repoRoot);
+  if (document.graph_schema !== graph.schema || document.graph_sha256 !== releaseClaimGraphDigest(graph)) {
+    fail("release claim evaluation failed: stale_evidence graph schema or digest mismatch");
+  }
+  const evaluation = evaluateReleaseClaims({
+    graph,
+    requested_claims: document.requested_claims,
+    evidence: document.evidence,
+    expected: {
+      commit,
+      evaluated_at: mode === "release" ? new Date().toISOString() : document.observed_at,
+      identity: {
+        repository: repositoryIdentity(repoRoot),
+        source_tree: sourceTreeIdentity(commit, mode, repoRoot),
+        profile: profileName,
+        corpus_id: identity.corpus_id,
+        cache_id: identity.cache_id,
+        machine_fingerprint: identity.machine_fingerprint,
+        baseline_id: baselineId,
+        baseline_sha256: baselineSha256,
+        candidate_sha256: candidateSha256,
+        release_key: releaseKey,
+        artifact_sha256: packetSha256,
+        evaluation_contract: graph.evidence_types.find(({ id }) => id === "answer_quality")
+          .identity_constraints.evaluation_contract,
+      },
+      exceptions: expectedExceptions,
+    },
+  });
+  return evaluation;
 }
 function machineFingerprint() {
   const provisioningPath = process.env.CODESTORY_RELEASE_EVIDENCE_PROVISIONING?.trim();
@@ -283,9 +482,10 @@ function validateRawProvenance(stats, packet, commit, profileName, identity, sta
   if (JSON.stringify(rowModes) !== JSON.stringify(packetRuntimeModes(packet.modes))) fail("raw packet row modes do not match top-level modes");
 }
 
-export function produceCandidate({ baselineDocument, baselineDir, profileName, statsPath, packetPath, outPath, expectedSha, mode, repoRoot }) {
+export function produceCandidate({ baselineDocument, baselineDir, profileName, statsPath, packetPath, outPath, expectedSha, mode, repoRoot, releaseKey }) {
   const profile = profileFrom(baselineDocument, profileName, mode, baselineDir);
   const commit = candidateCommit(expectedSha, mode, repoRoot);
+  const selectedReleaseKey = text(releaseKey, "release key");
   if (commit === profile.commit) fail("candidate and baseline commits are identical");
   const statsAbsolute = path.resolve(repoRoot, statsPath);
   const packetAbsolute = path.resolve(repoRoot, packetPath);
@@ -299,55 +499,54 @@ export function produceCandidate({ baselineDocument, baselineDir, profileName, s
   validateRawProvenance(stats, packet, commit, profileName, identity, statsContract);
   const baseDir = path.dirname(path.resolve(outPath));
   const measured = metricsFrom(stats, packet, profile);
+  const baselineSha256 = sha256(Buffer.from(JSON.stringify(profile)));
+  const artifacts = {
+    stats: fileAttestation(statsAbsolute, baseDir),
+    packet: fileAttestation(packetAbsolute, baseDir),
+  };
+  const releaseClaims = releaseClaimDocument({
+    repoRoot,
+    mode,
+    commit,
+    profileName,
+    identity,
+    baselineId: profile.baseline_id,
+    baselineSha256,
+    releaseKey: selectedReleaseKey,
+    packetSha256: artifacts.packet.sha256,
+  });
   const candidate = {
-    schema_version: 2,
+    schema_version: 3,
     baseline_id: profile.baseline_id,
-    baseline_sha256: sha256(Buffer.from(JSON.stringify(profile))),
+    baseline_sha256: baselineSha256,
     commit,
     git_state: "clean",
     profile: profileName,
+    release_key: selectedReleaseKey,
     identity,
-    artifacts: {
-      stats: fileAttestation(statsAbsolute, baseDir),
-      packet: fileAttestation(packetAbsolute, baseDir),
-    },
+    artifacts,
     metrics: Object.fromEntries(METRICS.map((metric) => [metric, {
       value: measured[metric],
       unit: profile.metrics[metric].unit,
       aggregation: profile.metrics[metric].aggregation,
     }])),
+    release_claims: releaseClaims,
   };
   mkdirSync(baseDir, { recursive: true });
   writeFileSync(outPath, `${JSON.stringify(candidate, null, 2)}\n`);
   return candidate;
 }
 
-function strictDate(value, label) {
-  const parsed = new Date(`${value}T00:00:00Z`);
-  if (!DATE.test(text(value, label)) || Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== value) fail(`${label} must be a valid ISO date`);
-  return value;
-}
-function exceptionFor(approval, context) {
-  if (!approval) return null;
-  for (const [key, expected] of Object.entries(context.bindings)) {
-    if (approval[key] !== expected) fail(`approval ${key} does not match measured evidence`);
-  }
-  strictDate(approval.approved_at, "approval.approved_at");
-  strictDate(approval.expires_at, "approval.expires_at");
-  if (approval.expires_at < approval.approved_at || approval.expires_at < new Date().toISOString().slice(0, 10)) fail("approval is expired or expires before approval date");
-  text(approval.owner, "approval.owner");
-  text(approval.rationale, "approval.rationale");
-  return approval;
-}
-
-export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath, approvalDocument = null, outPath, expectedSha, mode, repoRoot }) {
+export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath, approvalDocument = null, outPath, expectedSha, mode, repoRoot, releaseKey }) {
   const bytes = readFileSync(candidatePath);
   const candidateHash = sha256(bytes);
   const candidate = JSON.parse(bytes);
-  if (candidate.schema_version !== 2) fail("candidate schema_version must be 2");
+  if (candidate.schema_version !== 3) fail("candidate schema_version must be 3");
   const profile = profileFrom(baselineDocument, candidate.profile, mode, baselineDir);
   const commit = candidateCommit(expectedSha, mode, repoRoot);
+  const selectedReleaseKey = text(releaseKey, "release key");
   if (candidate.commit !== commit || candidate.git_state !== "clean") fail("candidate is not bound to the clean expected commit");
+  if (candidate.release_key !== selectedReleaseKey) fail("candidate release_key does not match the selected release");
   if (candidate.commit === profile.commit) fail("candidate and baseline commits are identical");
   const baselineHash = sha256(Buffer.from(JSON.stringify(profile)));
   if (candidate.baseline_id !== profile.baseline_id || candidate.baseline_sha256 !== baselineHash) fail("candidate baseline identity/hash does not match");
@@ -364,30 +563,77 @@ export function evaluateCandidate({ baselineDocument, baselineDir, candidatePath
   const statsContract = statsContractFrom(repoRoot);
   validateRawProvenance(stats, packet, commit, candidate.profile, profile.identity, statsContract);
   const measured = metricsFrom(stats, packet, profile);
-  if (approvalDocument && approvalDocument.schema_version !== 2) fail("approval schema_version must be 2");
-  const approvals = approvalDocument?.metrics ?? {};
+  if (approvalDocument && approvalDocument.schema_version !== 3) fail("approval schema_version must be 3");
+  const approvals = object(approvalDocument?.metrics ?? {}, "approval.metrics");
+  for (const metric of Object.keys(approvals)) {
+    if (METRICS.includes(metric)) {
+      fail(`release metric ${metric} is a non-waivable full-product gate`);
+    }
+    fail(`approval metric ${metric} is not a supported model microbenchmark`);
+  }
   const rows = METRICS.map((metric) => {
     const recorded = object(candidate.metrics[metric], `candidate metric ${metric}`);
     const budget = profile.metrics[metric];
     if (recorded.value !== measured[metric] || recorded.unit !== budget.unit || recorded.aggregation !== budget.aggregation) fail(`candidate metric ${metric} is not derived with the approved unit/aggregation`);
     const passed = measured[metric] <= budget.threshold;
-    const bindings = {
-      candidate_sha256: candidateHash, commit, profile: candidate.profile,
-      baseline_id: profile.baseline_id, baseline_sha256: baselineHash, metric,
-      measured_value: measured[metric], threshold: budget.threshold,
-    };
-    const exception = passed ? null : exceptionFor(approvals[metric], { bindings });
-    return { status: passed ? "pass" : exception ? "approved_exception" : "fail", metric,
-      decision: passed ? "accept" : exception ? "accept_with_rationale" : "reject",
+    return { status: passed ? "pass" : "fail", metric,
+      decision: passed ? "accept" : "reject",
       measured_value: measured[metric], reference: budget.reference, threshold: budget.threshold,
-      unit: budget.unit, aggregation: budget.aggregation, source: budget.source,
-      ...(exception ? { approval: exception } : {}) };
+      unit: budget.unit, aggregation: budget.aggregation, source: budget.source };
   });
-  const rejected = rows.some((row) => row.decision === "reject");
-  const report = { schema_version: 2, status: rejected ? "fail" : "pass", decision: rejected ? "reject_release" : mode === "release" ? "accept_release" : "accept_contract",
+  const claimDocument = structuredClone(requireExactReleaseClaimDocument({
+    document: candidate.release_claims,
+    repoRoot,
+    mode,
+    commit,
+    profileName: candidate.profile,
+    identity: profile.identity,
+    baselineId: profile.baseline_id,
+    baselineSha256: baselineHash,
+    releaseKey: selectedReleaseKey,
+    packetSha256: candidate.artifacts.packet.sha256,
+  }));
+  const expectedExceptions = {};
+  for (const evidence of claimDocument.evidence ?? []) {
+    if (evidence.type === "retrieval_readiness" || evidence.type === "answer_quality") {
+      evidence.status = "pass";
+      delete evidence.exception;
+    }
+    if (evidence.type === "performance") {
+      if (rows.some((row) => row.decision === "reject")) {
+        evidence.status = "fail";
+        delete evidence.exception;
+      } else {
+        evidence.status = "pass";
+        delete evidence.exception;
+      }
+    }
+  }
+  const claimEvaluation = evaluateClaimDocument({
+    document: claimDocument,
+    repoRoot,
+    mode,
+    commit,
+    profileName: candidate.profile,
+    identity: profile.identity,
+    baselineId: profile.baseline_id,
+    baselineSha256: baselineHash,
+    releaseKey: selectedReleaseKey,
+    packetSha256: candidate.artifacts.packet.sha256,
+    candidateSha256: candidateHash,
+    expectedExceptions,
+  });
+  const rejected = rows.some((row) => row.decision === "reject") || claimEvaluation.status === "fail";
+  const acceptedWithException = !rejected && claimEvaluation.status === "pass_with_exception";
+  const reportStatus = rejected ? "fail" : acceptedWithException ? "pass_with_exception" : "pass";
+  const acceptedDecision = mode === "release" ? "accept_release" : "accept_contract";
+  const decision = rejected
+    ? "reject_release"
+    : acceptedWithException ? `${acceptedDecision}_with_exception` : acceptedDecision;
+  const report = { schema_version: 3, status: reportStatus, decision,
     commit, profile: candidate.profile, baseline_id: profile.baseline_id, baseline_sha256: baselineHash,
     candidate_path: path.relative(repoRoot, path.resolve(candidatePath)).replaceAll(path.sep, "/"), candidate_sha256: candidateHash,
-    artifact_paths: Object.values(candidate.artifacts), metrics: rows };
+    artifact_paths: Object.values(candidate.artifacts), release_claim_evaluation: claimEvaluation, metrics: rows };
   mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
   writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`);
   return report;
@@ -418,9 +664,12 @@ function main() {
   const baselineDocument = readJson(values.baseline, "baseline");
   const baselineDir = path.dirname(path.resolve(values.baseline));
   const mode = values.mode ?? "contract";
-  if (command === "produce") produceCandidate({ baselineDocument, baselineDir, profileName: values.profile, statsPath: values.stats, packetPath: values.packet, outPath: values.out, expectedSha: values["expected-sha"], mode, repoRoot });
+  if (command === "produce") produceCandidate({ baselineDocument, baselineDir, profileName: values.profile, statsPath: values.stats, packetPath: values.packet, outPath: values.out, expectedSha: values["expected-sha"], mode, repoRoot, releaseKey: values["release-key"] });
   else if (command === "evaluate") {
-    const report = evaluateCandidate({ baselineDocument, baselineDir, candidatePath: values.candidate, approvalDocument: values.approval ? readJson(values.approval, "approval") : null, outPath: values.out, expectedSha: values["expected-sha"], mode, repoRoot });
+    const report = evaluateCandidate({ baselineDocument, baselineDir, candidatePath: values.candidate, approvalDocument: values.approval ? readJson(values.approval, "approval") : null, outPath: values.out, expectedSha: values["expected-sha"], mode, repoRoot, releaseKey: values["release-key"] });
+    if (report.release_claim_evaluation.failures.length > 0) {
+      console.error(`Release claim failures: ${JSON.stringify(report.release_claim_evaluation.failures)}`);
+    }
     if (!report.decision.startsWith("accept_")) process.exitCode = 1;
   } else fail("command must be fingerprint, validate-source-run, produce, or evaluate");
 }

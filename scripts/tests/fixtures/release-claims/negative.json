@@ -1,0 +1,145 @@
+{
+  "cases": [
+    {
+      "id": "missing",
+      "expected_class": "missing",
+      "operations": [
+        {
+          "op": "remove",
+          "path": "/evidence/0"
+        }
+      ]
+    },
+    {
+      "id": "stale-sha",
+      "expected_class": "stale_sha",
+      "operations": [
+        {
+          "op": "replace",
+          "path": "/evidence/0/identity/commit",
+          "value": "3333333333333333333333333333333333333333"
+        }
+      ]
+    },
+    {
+      "id": "stale-source-tree",
+      "expected_class": "stale_sha",
+      "operations": [
+        {
+          "op": "replace",
+          "path": "/evidence/0/identity/source_tree",
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ]
+    },
+    {
+      "id": "stale-evidence",
+      "expected_class": "stale_evidence",
+      "operations": [
+        {
+          "op": "replace",
+          "path": "/evidence/0/expires_at",
+          "value": "2026-07-16T12:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "id": "incompatible-tier-identity",
+      "expected_class": "incompatible_tier_identity",
+      "operations": [
+        {
+          "op": "replace",
+          "path": "/evidence/0/tier",
+          "value": "package"
+        }
+      ]
+    },
+    {
+      "id": "failed-evidence",
+      "expected_class": "failed_evidence",
+      "operations": [
+        {
+          "op": "replace",
+          "path": "/evidence/0/status",
+          "value": "fail"
+        }
+      ]
+    },
+    {
+      "id": "unsupported-claim",
+      "expected_class": "unsupported_claim",
+      "operations": [
+        {
+          "op": "replace",
+          "path": "/requested_claims/0/id",
+          "value": "imaginary_release_claim"
+        }
+      ]
+    },
+    {
+      "id": "unaccepted-risk",
+      "expected_class": "accepted_risk",
+      "operations": [
+        {
+          "op": "replace",
+          "path": "/requested_claims/0/id",
+          "value": "retrieval_readiness"
+        },
+        {
+          "op": "replace",
+          "path": "/evidence/0/id",
+          "value": "retrieval-proof-2222222"
+        },
+        {
+          "op": "replace",
+          "path": "/evidence/0/type",
+          "value": "retrieval_readiness"
+        },
+        {
+          "op": "replace",
+          "path": "/evidence/0/tier",
+          "value": "live_behavior"
+        },
+        {
+          "op": "add",
+          "path": "/evidence/0/identity/profile",
+          "value": "ci-contract-v1"
+        },
+        {
+          "op": "add",
+          "path": "/evidence/0/identity/corpus_id",
+          "value": "codestory-fixture"
+        },
+        {
+          "op": "add",
+          "path": "/evidence/0/identity/cache_id",
+          "value": "cold-full-retrieval-v1"
+        },
+        {
+          "op": "add",
+          "path": "/evidence/0/identity/machine_fingerprint",
+          "value": "fixture-machine"
+        }
+      ]
+    },
+    {
+      "id": "historical-row-cannot-mask",
+      "expected_class": "stale_sha",
+      "operations": [
+        {
+          "op": "append_clone",
+          "path": "/evidence",
+          "source": "/evidence/0",
+          "patch": {
+            "id": "source-proof-historical",
+            "identity": {
+              "repository": "TheGreenCedar/CodeStory",
+              "commit": "3333333333333333333333333333333333333333",
+              "source_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -122,22 +122,32 @@ node scripts/codestory-release-evidence-gate.mjs produce \
   --stats target/release-evidence/stats.json \
   --packet target/release-evidence/packet/packet-runtime-summary.json \
   --out target/release-evidence/candidate.json \
-  --expected-sha <full-40-character-sha> --mode release --repo .
+  --expected-sha <full-40-character-sha> \
+  --release-key release-<version> --mode release --repo .
 node scripts/codestory-release-evidence-gate.mjs evaluate \
   --baseline benchmarks/release-evidence/approved-baselines.json \
   --candidate target/release-evidence/candidate.json \
   --out target/release-evidence/decision.json \
-  --expected-sha <full-40-character-sha> --mode release --repo .
+  --expected-sha <full-40-character-sha> \
+  --release-key release-<version> --mode release --repo .
 ```
 
 Production and evaluation both reject missing, empty, changed, or all-zero raw
 artifacts; short or dirty Git identities; self-baselining; identity drift; and
 unit or aggregation changes. The normalized report records the candidate and
 baseline hashes, full commits, artifact hashes and sizes, and every metric's
-status and decision. A regression exits nonzero. Each exception is bound to the
-exact candidate hash, baseline id/hash, full commit, profile, metric, measured
-value, threshold, owner, ISO approval date, rationale, and unexpired date.
-Approval never updates the pinned baseline.
+status and decision. A regression exits nonzero. Every metric in this
+full-product release gate, including status, grounding, convergence, packet,
+search, indexing, and storage growth, is non-waivable.
+
+The claim evaluator reserves `pass_with_exception` for a separate, trusted
+model-microbenchmark record: the regression must be repeatable across at least
+three runs and exceed 5%, bind the exact candidate artifact and release key,
+cite passing same-run full-product answer-quality evidence, name an owner,
+rationale, and rollback, and expire within 14 days. A later release key rejects
+the approval even inside that window. Model exceptions remain visible in the
+evidence row, claim, evaluation, and report; they never update a baseline or
+convert a regression to plain pass.
 
 Packet provenance is finalized only after publishable blockers are calculated.
 The evaluator does not trust its status label: it requires an empty blocker

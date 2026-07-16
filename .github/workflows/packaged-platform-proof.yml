@@ -419,6 +419,7 @@ jobs:
           name: linux-glibc-2.31-baseline-proof
           path: target/linux-glibc-baseline
           if-no-files-found: error
+          retention-days: 30
 
       - name: Smoke packaged release asset
         if: runner.os != 'Windows'
@@ -454,6 +455,7 @@ jobs:
           name: packaged-agent-proof-${{ matrix.asset_target }}
           path: target/packaged-agent-proof
           if-no-files-found: warn
+          retention-days: 30
 
       - name: Package release asset on Windows
         if: runner.os == 'Windows'
@@ -499,6 +501,7 @@ jobs:
           name: packaged-intel-policy-proof-${{ matrix.asset_target }}
           path: target/packaged-intel-policy-proof
           if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload packaged version proof
         if: always()
@@ -507,6 +510,7 @@ jobs:
           name: packaged-version-proof-${{ matrix.asset_target }}
           path: target/packaged-version-smoke/${{ matrix.asset_target }}
           if-no-files-found: warn
+          retention-days: 30
 
       - name: Run Windows installer ownership self-test
         if: matrix.asset_target == 'windows-x64'
@@ -536,6 +540,7 @@ jobs:
           name: packaged-managed-proof-${{ matrix.asset_target }}
           path: target/packaged-managed-proof
           if-no-files-found: warn
+          retention-days: 30
 
       - name: Upload release asset
         uses: actions/upload-artifact@v7.0.1
@@ -547,6 +552,7 @@ jobs:
             target/release-dist/*.sha256
             target/release-dist/SHA256SUMS.txt
           if-no-files-found: error
+          retention-days: 30
 
       - name: Upload macOS notarization proof
         if: always() && runner.os == 'macOS' && inputs.sign_macos
@@ -555,6 +561,7 @@ jobs:
           name: macos-notarization-proof-${{ matrix.asset_target }}
           path: target/notarization-proof/${{ matrix.asset_target }}
           if-no-files-found: error
+          retention-days: 30
 
       - name: Remove temporary macOS signing material
         if: always() && runner.os == 'macOS' && inputs.sign_macos

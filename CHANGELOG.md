@@ -12,6 +12,7 @@
 
 ### Search quality and reliability
 
+- Updated `serde_with` to 3.21.0, removing the affected `KeyValueMap` panic advisory while preserving CodeStory's existing double-option DTO encoding.
 - Tree-sitter and every wired language grammar now use their current compatible crate releases, including the vendored graph runtime's Tree-sitter 0.26 compatibility pin.
 - Windows contributor setup now names the LLVM/libclang, Vulkan, developer-shell, Ninja, and short-path requirements used by source builds.
 - Rust 2024 sources, including `unsafe extern` blocks and let-chains, now remain parser-complete. CodeStory uses the current Rust grammar and a compatible Tree-sitter runtime instead of rejecting valid modern Rust files and withholding a full publication.
@@ -60,6 +61,8 @@ Install the updated plugin package and start a fresh host session. The first bro
 - Linux x64 requires glibc 2.31 or newer. Both Linux architectures receive packaged execution checks; accelerator and full-retrieval claims still require live sidecar evidence for the selected host.
 - Repository-controlled network endpoints remain disabled by default. Setting `CODESTORY_ALLOW_PROJECT_NETWORK_CONFIG` is an explicit trust decision that permits the repository to choose summary and embedding egress endpoints.
 - Release proof is staged by maturity: focused checks run during development, while exact-head platform, protected hardware, signing, installation, and live-runtime evidence run at their promotion or publication boundaries.
+- Release claims now come from one versioned declarative graph. The release-evidence gate derives repository, commit, and tree identity from Git; requires its exact retrieval-readiness, performance, and answer-quality claim profile; binds evidence to the selected release key; rejects expired or incompatible proof; and carries explicit non-claims and accepted risks into its report. Current full-product metrics and user-facing SLOs are non-waivable. Only separately trusted model-microbenchmark regressions over 5% across at least three repeats may remain `pass_with_exception`, with exact-artifact and same-run full-product-benefit evidence, owner, rationale, rollback, release binding, and an expiry within 14 days. The same graph supplies package targets, protected runners, proof dependencies, exact-SHA promotion, and artifact-retention policy to workflow validation.
+- Workflow syntax now has a separate actionlint v1.7.12 gate over every workflow, using checksum-pinned official archives on supported host architectures and a controlled-invalid syntax probe. Wrapper tests cover platform selection, checksums, and cached binary provenance. Semantic fixtures keep runner, environment, effective permission, reusable-workflow secret forwarding, retention, exact-SHA, proof-chain, target-matrix, and persistent-label failures machine-classified.
 
 ### Release boundary
 

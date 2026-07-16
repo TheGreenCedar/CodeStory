@@ -2,5 +2,6 @@ self-hosted-runner:
   labels:
     - codestory-metal
     - codestory-release-evidence
+    - codestory-vulkan
 
 config-variables: null

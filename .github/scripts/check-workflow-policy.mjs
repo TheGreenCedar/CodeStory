@@ -3,8 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { LineCounter, parseDocument } from "yaml";
+import { loadReleaseClaimGraph } from "../../scripts/codestory-release-claims.mjs";
 
 const workflowRoot = path.join(".github", "workflows");
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const trustedActionOwners = new Set(["actions", "github"]);
 const fullSha = /^[0-9a-f]{40}$/iu;
 
@@ -199,7 +201,7 @@ export function parseWorkflow(source, file = "workflow") {
   return parsed;
 }
 
-function loadWorkflows(root = workflowRoot) {
+export function loadWorkflows(root = workflowRoot) {
   const loaded = new Map();
   for (const file of fs.readdirSync(root).filter(name => /\.ya?ml$/u.test(name)).sort()) {
     const source = fs.readFileSync(path.join(root, file), "utf8");
@@ -452,6 +454,19 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
       "plugins/codestory/**",
       ".github/scripts/check-workflow-policy.mjs",
       ".github/scripts/check-workflow-policy.test.mjs",
+      ".github/scripts/fixtures/workflow-policy-invalid.json",
+      ".github/scripts/fixtures/actionlint-invalid.yml",
+      ".github/scripts/run-actionlint.mjs",
+      ".github/scripts/run-actionlint.test.mjs",
+      ".github/actionlint.yaml",
+      "release-claims.json",
+      "scripts/codestory-release-claims.mjs",
+      "scripts/codestory-release-evidence-gate.mjs",
+      "scripts/tests/codestory-release-claims.test.mjs",
+      "scripts/tests/codestory-release-evidence-gate.test.mjs",
+      "scripts/tests/fixtures/release-claims/**",
+      "benchmarks/release-evidence/**",
+      ".github/workflows/**",
       ".github/workflows/release.yml",
       ".github/workflows/packaged-platform-pr.yml",
       ".github/workflows/packaged-platform-proof.yml",
@@ -484,6 +499,14 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
     ]);
     requireStepRun(violations, pluginFile, job, "Check plugin static wiring", ["node --test plugins/codestory/tests/plugin-static.test.mjs"]);
     requireStepRun(violations, pluginFile, job, "Check embedded model preparation", ["node --test scripts/tests/prepare-embedded-model.test.mjs"]);
+    requireStepRun(violations, pluginFile, job, "Check workflow syntax", [
+      "node --test .github/scripts/run-actionlint.test.mjs",
+      "node .github/scripts/run-actionlint.mjs",
+    ]);
+    requireStepRun(violations, pluginFile, job, "Check release claim and evidence contracts", [
+      "scripts/tests/codestory-release-claims.test.mjs",
+      "scripts/tests/codestory-release-evidence-gate.test.mjs",
+    ]);
     requireStepRun(violations, pluginFile, job, "Check CI proof routing fixtures", ["node .github/scripts/route-ci-proof.mjs --self-test"]);
     requireStepRun(violations, pluginFile, job, "Check packaged proof harness", ["python .github/scripts/check-packaged-agent-proof.py --self-test"]);
   }
@@ -526,7 +549,8 @@ function validatePluginAndDraftWorkflows(workflows, violations) {
   }
 }
 
-function validateReleaseCoordinator(workflows, violations) {
+function validateReleaseCoordinator(workflows, violations, graph) {
+  const releaseChain = graph.workflow_policy.release_chain;
   const releaseFile = "release.yml";
   const release = workflows.get(releaseFile);
   if (!release) {
@@ -540,29 +564,37 @@ function validateReleaseCoordinator(workflows, violations) {
   }
   const policy = requireJob(violations, releaseFile, release, "workflow-policy");
   requireStepRun(violations, releaseFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
+  requireStepRun(violations, releaseFile, policy, "Check workflow syntax", [
+    "node --test .github/scripts/run-actionlint.test.mjs",
+    "node .github/scripts/run-actionlint.mjs",
+  ]);
+  requireStepRun(violations, releaseFile, policy, "Check release claim and evidence contracts", [
+    "scripts/tests/codestory-release-claims.test.mjs",
+    "scripts/tests/codestory-release-evidence-gate.test.mjs",
+  ]);
   requireStepRun(violations, releaseFile, policy, "Enforce workflow policy", ["node .github/scripts/check-workflow-policy.mjs"]);
 
   const preflight = requireJob(violations, releaseFile, release, "preflight");
-  add(violations, sameMembers(needs(preflight), ["workflow-policy"]), `${releaseFile} preflight must need workflow-policy`);
+  add(violations, sameMembers(needs(preflight), releaseChain.dependencies.preflight), `${releaseFile} preflight dependencies must match the release claim graph`);
   requireStepRun(violations, releaseFile, preflight, "Validate versioned changelog notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     '--version "$VERSION"',
   ]);
 
   const evidence = requireJob(violations, releaseFile, release, "release-evidence");
-  add(violations, sameMembers(needs(evidence), ["preflight"]), `${releaseFile} release-evidence must need preflight`);
+  add(violations, sameMembers(needs(evidence), releaseChain.dependencies["release-evidence"]), `${releaseFile} release-evidence dependencies must match the release claim graph`);
   for (const [key, value] of Object.entries({
-    ref: "${{ github.sha }}",
+    ref: graph.workflow_policy.promotion.exact_sha_expression,
     proof_key: "release-${{ needs.preflight.outputs.version }}",
-    profile: "codestory-release-evidence-linux-arm64-v2",
-    drill_manifest: "/srv/codestory-release-evidence/drills/real-repo-drill-cases.json",
+    profile: releaseChain.evidence_profile,
+    drill_manifest: releaseChain.drill_manifest,
   })) {
     add(violations, object(evidence.with)[key] === value, `${releaseFile} release-evidence with.${key} must equal ${value}`);
   }
 
   const packaged = requireJob(violations, releaseFile, release, "packaged-proof");
   add(violations, packaged.uses === "./.github/workflows/packaged-platform-proof.yml", `${releaseFile} packaged-proof must call the package workflow`);
-  add(violations, sameMembers(needs(packaged), ["preflight", "release-evidence"]), `${releaseFile} packaged-proof must wait for preflight and release evidence`);
+  add(violations, sameMembers(needs(packaged), releaseChain.dependencies["packaged-proof"]), `${releaseFile} packaged-proof dependencies must match the release claim graph`);
   add(violations, object(packaged.with).sign_macos === true, `${releaseFile} packaged-proof must sign Mac assets`);
   const expectedSecrets = [
     "APPLE_DEVELOPER_ID_P12_BASE64",
@@ -576,16 +608,16 @@ function validateReleaseCoordinator(workflows, violations) {
 
   const metal = requireJob(violations, releaseFile, release, "macos-metal-proof");
   add(violations, metal.uses === "./.github/workflows/macos-metal-proof.yml", `${releaseFile} must call protected Metal proof`);
-  add(violations, sameMembers(needs(metal), ["preflight", "packaged-proof"]), `${releaseFile} Metal proof must wait for packaged proof`);
+  add(violations, sameMembers(needs(metal), releaseChain.dependencies["macos-metal-proof"]), `${releaseFile} Metal proof dependencies must match the release claim graph`);
   add(violations, object(metal.with).use_packaged_cli_artifact === true, `${releaseFile} Metal proof must use the packaged CLI`);
 
   const vulkan = requireJob(violations, releaseFile, release, "windows-vulkan-proof");
   add(violations, vulkan.uses === "./.github/workflows/windows-vulkan-proof.yml", `${releaseFile} must call protected Vulkan proof`);
-  add(violations, sameMembers(needs(vulkan), ["preflight", "packaged-proof"]), `${releaseFile} Vulkan proof must wait for packaged proof`);
+  add(violations, sameMembers(needs(vulkan), releaseChain.dependencies["windows-vulkan-proof"]), `${releaseFile} Vulkan proof dependencies must match the release claim graph`);
   add(violations, object(vulkan.with).use_packaged_cli_artifact === true, `${releaseFile} Vulkan proof must use the packaged CLI`);
 
   const publish = requireJob(violations, releaseFile, release, "publish");
-  add(violations, sameMembers(needs(publish), ["preflight", "packaged-proof", "macos-metal-proof", "windows-vulkan-proof"]), `${releaseFile} publish must wait for all release proofs`);
+  add(violations, sameMembers(needs(publish), releaseChain.dependencies.publish), `${releaseFile} publish dependencies must match the release claim graph`);
   requireStepRun(violations, releaseFile, publish, "Compose versioned GitHub release notes", [
     "node .github/scripts/extract-codestory-release-notes.mjs",
     "--output target/release-assets/release-notes.md",
@@ -598,21 +630,14 @@ function validateReleaseCoordinator(workflows, violations) {
 
   const post = requireJob(violations, releaseFile, release, "post-publish-smoke");
   add(violations, post.uses === "./.github/workflows/post-publish-release-smoke.yml", `${releaseFile} must call post-publish smoke`);
-  add(violations, sameMembers(needs(post), ["preflight", "publish"]), `${releaseFile} post-publish smoke must wait for publish`);
+  add(violations, sameMembers(needs(post), releaseChain.dependencies["post-publish-smoke"]), `${releaseFile} post-publish dependencies must match the release claim graph`);
 }
 
-function expectedPackageRows() {
-  return [
-    { os: "ubuntu-latest", rust_target: "x86_64-unknown-linux-gnu", asset_target: "linux-x64", exe_suffix: "", extension: "tar.gz" },
-    { os: "ubuntu-24.04-arm", rust_target: "aarch64-unknown-linux-gnu", asset_target: "linux-arm64", exe_suffix: "", extension: "tar.gz" },
-    { os: "windows-latest", rust_target: "x86_64-pc-windows-msvc", asset_target: "windows-x64", exe_suffix: ".exe", extension: "zip" },
-    { os: "windows-11-arm", rust_target: "aarch64-pc-windows-msvc", asset_target: "windows-arm64", exe_suffix: ".exe", extension: "zip" },
-    { os: "macos-15-intel", rust_target: "x86_64-apple-darwin", asset_target: "macos-x64", exe_suffix: "", extension: "tar.gz" },
-    { os: "macos-15", rust_target: "aarch64-apple-darwin", asset_target: "macos-arm64", exe_suffix: "", extension: "tar.gz" },
-  ];
+function expectedPackageRows(graph) {
+  return graph.workflow_policy.package_matrix;
 }
 
-function validatePackageMatrixExpression(violations, expression) {
+function validatePackageMatrixExpression(violations, expression, graph) {
   const match = typeof expression === "string" && expression.match(
     /fromJSON\(inputs\.scope == 'windows' && '([^']+)' \|\| inputs\.scope == 'macos' && '([^']+)' \|\| '([^']+)'\)/u,
   );
@@ -620,7 +645,7 @@ function validatePackageMatrixExpression(violations, expression) {
     violations.push("packaged-platform-proof.yml matrix must select structural JSON by scope");
     return;
   }
-  const full = expectedPackageRows();
+  const full = expectedPackageRows(graph);
   const expected = [
     { include: full.filter(row => row.asset_target === "windows-x64") },
     { include: full.filter(row => row.asset_target.startsWith("macos-")) },
@@ -635,7 +660,7 @@ function validatePackageMatrixExpression(violations, expression) {
   }
 }
 
-function validatePackagedProof(workflows, violations) {
+function validatePackagedProof(workflows, violations, graph) {
   const file = "packaged-platform-proof.yml";
   const workflow = workflows.get(file);
   if (!workflow) {
@@ -657,7 +682,7 @@ function validatePackagedProof(workflows, violations) {
     `${file} must pin the glslc build image`,
   );
   const job = requireJob(violations, file, workflow, "build");
-  validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"));
+  validatePackageMatrixExpression(violations, at(job, "strategy", "matrix"), graph);
   add(violations, String(job.environment ?? "").includes("macos-release-signing"), `${file} signed Mac cells must use the protected signing environment`);
   requireStepRun(violations, file, job, "Prepare checksum-pinned embedded model", [
     "node scripts/prepare-embedded-model.mjs",
@@ -724,7 +749,7 @@ function validatePackagedProof(workflows, violations) {
   requireStepUses(violations, file, job, "Upload macOS notarization proof", "actions/upload-artifact@v7.0.1");
 }
 
-function validatePostPublish(workflows, violations) {
+function validatePostPublish(workflows, violations, graph) {
   const file = "post-publish-release-smoke.yml";
   const workflow = workflows.get(file);
   if (!workflow) {
@@ -733,7 +758,7 @@ function validatePostPublish(workflows, violations) {
   }
   add(violations, trigger(workflow, "workflow_call") !== undefined, `${file} must be reusable`);
   const job = requireJob(violations, file, workflow, "smoke");
-  const expected = expectedPackageRows().map(({ os, asset_target, extension }) => ({ os, asset_target, extension }));
+  const expected = expectedPackageRows(graph).map(({ os, asset_target, extension }) => ({ os, asset_target, extension }));
   add(violations, JSON.stringify(at(job, "strategy", "matrix", "include")) === JSON.stringify(expected), `${file} must smoke all six native assets`);
   violations.push(...managedPluginViolations(
     job,
@@ -799,9 +824,25 @@ function validateRemainingWorkflows(workflows, violations) {
     violations.push(`${autoFile} must exist`);
   } else {
     add(violations, includesAll(at(auto, "on", "push", "branches"), ["main"]), `${autoFile} must run on main`);
-    add(violations, includesAll(at(auto, "on", "push", "paths"), ["package.json", "package-lock.json"]), `${autoFile} must observe policy dependency changes`);
+    add(violations, includesAll(at(auto, "on", "push", "paths"), [
+      "package.json",
+      "package-lock.json",
+      "release-claims.json",
+      ".github/actionlint.yaml",
+      ".github/workflows/**",
+      "scripts/codestory-release-*.mjs",
+      "scripts/tests/codestory-release-*.test.mjs",
+    ]), `${autoFile} must observe policy dependency and release-claim changes`);
     const policy = requireJob(violations, autoFile, auto, "workflow-policy");
     requireStepRun(violations, autoFile, policy, "Install workflow policy dependencies", ["npm ci --ignore-scripts"]);
+    requireStepRun(violations, autoFile, policy, "Check workflow syntax", [
+      "node --test .github/scripts/run-actionlint.test.mjs",
+      "node .github/scripts/run-actionlint.mjs",
+    ]);
+    requireStepRun(violations, autoFile, policy, "Check release claim and evidence contracts", [
+      "scripts/tests/codestory-release-claims.test.mjs",
+      "scripts/tests/codestory-release-evidence-gate.test.mjs",
+    ]);
     requireStepRun(violations, autoFile, policy, "Enforce workflow policy", ["node .github/scripts/check-workflow-policy.mjs"]);
     const release = requireJob(violations, autoFile, auto, "release");
     add(violations, release.uses === "./.github/workflows/release.yml", `${autoFile} must call the release workflow`);
@@ -897,7 +938,162 @@ function validateRemainingWorkflows(workflows, violations) {
   }
 }
 
-export function validateWorkflows(workflows) {
+function permissionMapMatches(actualValue, expectedValue) {
+  const actual = object(actualValue);
+  const expected = object(expectedValue);
+  return sameMembers(Object.keys(actual), Object.keys(expected))
+    && Object.entries(expected).every(([key, value]) => actual[key] === value);
+}
+
+function findNamedStep(workflow, name) {
+  for (const job of Object.values(object(workflow.jobs))) {
+    const found = namedStep(job, name);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+export function releaseWorkflowContractViolations(
+  workflows,
+  graph = loadReleaseClaimGraph(repositoryRoot),
+) {
+  const violations = [];
+  const policy = graph.workflow_policy;
+  for (const contract of policy.protected_jobs) {
+    const workflow = workflows.get(contract.workflow);
+    const job = object(at(workflow, "jobs", contract.job));
+    const effectivePermissions = job.permissions === undefined ? workflow?.permissions : job.permissions;
+    add(
+      violations,
+      JSON.stringify(job["runs-on"]) === JSON.stringify(contract.runner),
+      `[runner_labels] ${contract.workflow} job ${contract.job} must use ${JSON.stringify(contract.runner)}`,
+    );
+    add(
+      violations,
+      job.environment === contract.environment,
+      `[protected_environment] ${contract.workflow} job ${contract.job} must use ${contract.environment}`,
+    );
+    add(
+      violations,
+      permissionMapMatches(effectivePermissions, contract.permissions),
+      `[permissions_secrets] ${contract.workflow} job ${contract.job} effective permissions must exactly match the release claim graph`,
+    );
+    add(
+      violations,
+      sameMembers(Object.keys(object(at(workflow, "on", "workflow_call", "secrets"))), contract.secrets),
+      `[permissions_secrets] ${contract.workflow} callable secrets must exactly match the release claim graph`,
+    );
+    const reusableRef = `./.github/workflows/${contract.workflow}`;
+    for (const [callerFile, callerWorkflow] of workflows) {
+      for (const [callerJobName, callerJobValue] of Object.entries(object(callerWorkflow.jobs))) {
+        const callerJob = object(callerJobValue);
+        if (callerJob.uses !== reusableRef) continue;
+        add(
+          violations,
+          callerJob.secrets !== "inherit",
+          `[permissions_secrets] ${callerFile} job ${callerJobName} must not use secrets: inherit for ${contract.workflow}`,
+        );
+        if (callerJob.secrets !== undefined && callerJob.secrets !== "inherit") {
+          const forwarded = Object.keys(object(callerJob.secrets));
+          const undeclared = forwarded.filter((secret) => !contract.secrets.includes(secret));
+          add(
+            violations,
+            undeclared.length === 0,
+            `[permissions_secrets] ${callerFile} job ${callerJobName} forwards undeclared secrets to ${contract.workflow}: ${undeclared.join(", ")}`,
+          );
+        }
+      }
+    }
+  }
+
+  for (const file of policy.artifact_workflows) {
+    const workflow = workflows.get(file);
+    let uploadCount = 0;
+    for (const [jobName, job] of Object.entries(object(workflow?.jobs))) {
+      for (const [index, step] of list(job?.steps).entries()) {
+        if (step?.uses !== "actions/upload-artifact@v7.0.1") continue;
+        uploadCount += 1;
+        add(
+          violations,
+          object(step.with)["retention-days"] === policy.artifact_retention_days,
+          `[artifact_retention] ${file} jobs.${jobName}.steps.${index} must retain release evidence for ${policy.artifact_retention_days} days`,
+        );
+      }
+    }
+    add(violations, uploadCount > 0, `[artifact_retention] ${file} must upload its release-significant evidence`);
+  }
+
+  const release = workflows.get("release.yml");
+  for (const jobName of policy.release_chain.exact_sha_jobs) {
+    add(
+      violations,
+      object(at(release, "jobs", jobName, "with")).ref === policy.promotion.exact_sha_expression,
+      `[exact_sha] release.yml job ${jobName} must receive ${policy.promotion.exact_sha_expression}`,
+    );
+  }
+  for (const [jobName, expectedNeeds] of Object.entries(policy.release_chain.dependencies)) {
+    add(
+      violations,
+      sameMembers(needs(at(release, "jobs", jobName)), expectedNeeds),
+      `[promotion_boundary] release.yml job ${jobName} dependencies must match the release claim graph`,
+    );
+  }
+  const sourceGuard = workflows.get("main-branch-source-guard.yml");
+  const sourceGuardRun = executableRunText(String(findNamedStep(sourceGuard, "Require dev/codestory-next source branch")?.run ?? ""));
+  add(
+    violations,
+    includesAll(at(sourceGuard, "on", "pull_request", "branches"), [policy.promotion.release_branch])
+      && sourceGuardRun.includes(policy.promotion.source_branch),
+    `[promotion_boundary] main-branch source guard must require ${policy.promotion.source_branch} into ${policy.promotion.release_branch}`,
+  );
+  add(
+    violations,
+    includesAll(at(workflows.get("auto-release.yml"), "on", "push", "branches"), [policy.promotion.release_branch]),
+    `[promotion_boundary] auto-release.yml must run from ${policy.promotion.release_branch}`,
+  );
+  const releaseEvidence = object(at(release, "jobs", "release-evidence"));
+  add(
+    violations,
+    releaseEvidence.uses === policy.release_chain.evidence_workflow,
+    `[proof_contract] release.yml must call ${policy.release_chain.evidence_workflow}`,
+  );
+  add(
+    violations,
+    object(releaseEvidence.with).profile === policy.release_chain.evidence_profile
+      && object(releaseEvidence.with).drill_manifest === policy.release_chain.drill_manifest,
+    "[proof_contract] release.yml evidence profile and drill must match the release claim graph",
+  );
+
+  const matrixViolations = [];
+  validatePackageMatrixExpression(
+    matrixViolations,
+    at(workflows.get("packaged-platform-proof.yml"), "jobs", "build", "strategy", "matrix"),
+    graph,
+  );
+  const smokeMatrix = at(workflows.get("post-publish-release-smoke.yml"), "jobs", "smoke", "strategy", "matrix", "include");
+  const expectedSmoke = expectedPackageRows(graph).map(({ os, asset_target, extension }) => ({ os, asset_target, extension }));
+  add(matrixViolations, JSON.stringify(smokeMatrix) === JSON.stringify(expectedSmoke), "post-publish package target matrix changed");
+  violations.push(...matrixViolations.map((message) => `[target_matrix] ${message}`));
+
+  for (const file of policy.promotion.label_routed_workflows) {
+    const workflow = workflows.get(file);
+    add(
+      violations,
+      sameMembers(at(workflow, "on", "pull_request", "types"), policy.promotion.required_events),
+      `[persistent_label] ${file} must re-evaluate labels on ${policy.promotion.required_events.join(" and ")}`,
+    );
+    const resolver = findNamedStep(workflow, "Resolve trusted exact head");
+    const run = executableRunText(String(resolver?.run ?? ""));
+    add(
+      violations,
+      run.includes("current_head") && (run.includes("EVENT_HEAD_SHA") || run.includes("expected_head")),
+      `[persistent_label] ${file} must resolve the current head and compare its exact SHA before executing labeled work`,
+    );
+  }
+  return violations;
+}
+
+export function validateWorkflows(workflows, graph = loadReleaseClaimGraph(repositoryRoot)) {
   const violations = [];
   for (const [file, workflow] of workflows) {
     violations.push(...basicWorkflowViolations(file, workflow));
@@ -905,11 +1101,12 @@ export function validateWorkflows(workflows) {
   validateLockedSetupSurfaces(violations);
   validateIssueWorkflows(workflows, violations);
   validatePluginAndDraftWorkflows(workflows, violations);
-  validateReleaseCoordinator(workflows, violations);
-  validatePackagedProof(workflows, violations);
-  validatePostPublish(workflows, violations);
+  validateReleaseCoordinator(workflows, violations, graph);
+  validatePackagedProof(workflows, violations, graph);
+  validatePostPublish(workflows, violations, graph);
   validatePackagedCoordinator(workflows, violations);
   validateRemainingWorkflows(workflows, violations);
+  violations.push(...releaseWorkflowContractViolations(workflows, graph));
   return violations;
 }
 

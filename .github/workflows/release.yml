@@ -44,8 +44,21 @@ jobs:
       - name: Install workflow policy dependencies
         run: npm ci --ignore-scripts
 
+      - name: Check workflow syntax
+        run: |
+          node --test .github/scripts/run-actionlint.test.mjs
+          node .github/scripts/run-actionlint.mjs
+
+      - name: Check release claim and evidence contracts
+        run: >-
+          node --test
+          scripts/tests/codestory-release-claims.test.mjs
+          scripts/tests/codestory-release-evidence-gate.test.mjs
+
       - name: Enforce workflow policy
-        run: node .github/scripts/check-workflow-policy.mjs
+        run: |
+          node .github/scripts/check-workflow-policy.mjs
+          node --test .github/scripts/check-workflow-policy.test.mjs
 
   preflight:
     name: Release preflight

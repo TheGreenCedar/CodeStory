@@ -65,3 +65,4 @@ jobs:
           name: repo-scale-stats-${{ inputs.proof_key }}
           path: target/repo-scale-stats
           if-no-files-found: error
+          retention-days: 30

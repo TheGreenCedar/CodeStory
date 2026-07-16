@@ -2799,6 +2799,34 @@ mod packet_tests {
             SearchPlanBridgeEvidenceKindDto::GraphPath
         );
     }
+
+    #[test]
+    fn update_bookmark_preserves_omitted_null_and_present_comments() {
+        let omitted: UpdateBookmarkRequest =
+            serde_json::from_str(r#"{}"#).expect("deserialize omitted comment");
+        let cleared: UpdateBookmarkRequest =
+            serde_json::from_str(r#"{"comment":null}"#).expect("deserialize null comment");
+        let updated: UpdateBookmarkRequest =
+            serde_json::from_str(r#"{"comment":"note"}"#).expect("deserialize present comment");
+
+        assert_eq!(omitted.comment, None);
+        assert_eq!(cleared.comment, Some(None));
+        assert_eq!(
+            updated
+                .comment
+                .as_ref()
+                .and_then(|comment| comment.as_deref()),
+            Some("note")
+        );
+        assert_eq!(
+            serde_json::to_value(cleared).expect("serialize cleared comment")["comment"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(updated).expect("serialize updated comment")["comment"],
+            "note"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
