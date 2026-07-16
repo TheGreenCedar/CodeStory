@@ -5376,9 +5376,19 @@ version = "0.11.20"
 
     #[test]
     fn stdio_installed_host_results_stay_compact() {
-        let mut search = json!({"retrieval": {"fallback_reason": "missing_semantic_docs"}});
+        let projection: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/stdio_installed_host_search_retrieval.json"
+        ))
+        .expect("installed search projection fixture");
+        let mut search = json!({
+            "query": "scripted-search",
+            "hits": [],
+            "retrieval": projection["input"].clone()
+        });
         compact_stdio_ready_search_retrieval(&mut search);
-        assert_eq!(search["retrieval"], json!({"state": "ready"}));
+        assert_eq!(search["retrieval"], projection["projected"]);
+        assert_eq!(search["query"], json!("scripted-search"));
+        assert_eq!(search["hits"], json!([]));
 
         let snapshot = json!({
             "retrieval": {"mode": "symbolic"},

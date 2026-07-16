@@ -748,10 +748,15 @@ function validatePackagedProof(workflows, violations, graph) {
     '"$work_dir/codestory-cli-quarantined"',
   ).map(message => `${file} ${message}`));
   requireStepRun(violations, file, job, "Run Windows installer ownership self-test", ["scripts/install-codestory.ps1 -SelfTest"]);
+  const linuxBaseline = namedStep(job, "Prove Linux x64 glibc 2.31 baseline");
   requireStepRun(violations, file, job, "Prove Linux x64 glibc 2.31 baseline", [
-    "libvulkan1=1.2.131.2-1",
     "bash .github/scripts/check-linux-glibc-baseline.sh",
   ]);
+  add(
+    violations,
+    !executableRunText(String(linuxBaseline?.run ?? "")).includes("libvulkan"),
+    `${file} Linux glibc baseline must not install a Vulkan loader`,
+  );
   violations.push(...managedPluginViolations(
     job,
     '--archive "target/release-dist/codestory-cli-v${{ inputs.version }}-${{ matrix.asset_target }}.${{ matrix.extension }}"',

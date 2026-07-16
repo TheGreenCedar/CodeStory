@@ -74,7 +74,9 @@ Focused proof covers:
 - linked ggml build identity;
 - explicit `accelerated` or `cpu_explicit` policy;
 - prohibited silent CPU fallback and software-adapter rejection;
-- live embedding smoke and layer-offload evidence;
+- live embedding smoke plus post-encode backend observations for execution
+  device/backend, layer placement, resident tensor count/bytes, execution nodes,
+  and an advancing successful-encode counter;
 - one engine/model load shared across repositories;
 - owner-thread idle unload, observational sleeping status, and automatic wake;
 - publication leases that retain one load generation through commit;
@@ -116,9 +118,24 @@ They must report `cpu_explicit` and make no acceleration claim.
 ### Packaged proof
 
 `.github/scripts/check-packaged-agent-proof.py` verifies a checksum-pinned
-archive in an isolated offline environment. It requires one native executable,
-version/help, full retrieval, plugin packet/search, multi-repository engine
-reuse, restart/materialization reuse, and no helper-process lifecycle state.
+archive in an isolated offline environment. Packaging first inspects the
+executable format, architecture, and actual PE imports, ELF `DT_NEEDED`, or
+Mach-O load commands. It requires the target-specific linkage/loading contract,
+rejects a mandatory Vulkan-loader dependency in the base Windows/Linux
+executable, and verifies every packaged core/CPU/Vulkan module and native
+dependency against the engine marker, embedded model contract, compiled
+backends, llama source, and producer version. The resulting
+`codestory-native-manifest.json` records compiled capability without claiming
+runtime accelerator execution. Packaged proof binds that manifest to the exact
+binary digest, live model/build/backend identity, process restart, version/help,
+full retrieval, plugin packet/search, multi-repository engine reuse,
+an encode counter that advances across real retrieval requests,
+restart/materialization reuse, and absence of helper-process lifecycle state.
+
+macOS packages keep the selected backend built in. Windows and Linux packages
+ship runtime-loaded native modules beside the executable. Hosted Linux proof
+does not install a Vulkan loader before help, stdio initialization, or explicit
+CPU execution, and it makes no Linux acceleration claim.
 
 Protected hardware proof also passes `--idle-residency-proof`. It records an
 uninitialized process-memory baseline, verifies the owner becomes `sleeping`

@@ -27,7 +27,9 @@ dense-anchor inputs, and the immutable process embedding policy. Outputs are:
 - `query.rs`, `executor.rs`, `candidate.rs`, and `ranker.rs`: coherent query
   execution and result identity
 - `health.rs` and `mode.rs`: artifact classification and live readiness
-- `in_process_embedding.rs`: process-wide engine selection and reuse
+- `embedding_contract.rs`: model, prefix, pooling, normalization, dimension,
+  batching, backend, and explicit CPU/accelerator policy
+- `in_process_embedding.rs`: process-wide engine initialization and reuse
 - `retention.rs`: generation leases and owned cleanup
 - `config.rs`: frozen process defaults and per-project runtime config
 
@@ -46,12 +48,16 @@ query execution then stays pinned to those verified files.
 
 The embedding engine is process-wide, while manifests and artifacts are
 project-local. An incompatible cache-root or CPU-policy request fails rather
-than replacing an already initialized engine.
+than replacing an already initialized engine. Policy disagreement reports the
+stable `embedding_backend_policy_mismatch` reason code in either direction.
 
 Retrieval finalization holds an embedding residency lease across candidate
 build, validation, and publication. Manifest compatibility uses the stable
-producer contract; the lease's owner/load generation is a live publication
-fence and is not persisted as vector compatibility.
+producer contract assembled from retrieval-owned model, pooling, normalization,
+dimension, batching, fallback, and vector-schema choices. The native binding
+contributes model compatibility and execution observations; it is not the
+authority for persisted vector semantics. The lease's owner/load generation is
+a live publication fence and is not persisted as vector compatibility.
 
 ## Extension rules
 
@@ -59,7 +65,8 @@ fence and is not persisted as vector compatibility.
   them;
 - keep packet sufficiency, evidence assembly, and bounded product retry in
   `codestory-runtime`;
-- keep model execution mechanics in `codestory-llama-sys`;
+- keep model execution mechanics and capability reporting in
+  `codestory-llama-sys`, while keeping product model/vector/backend policy here;
 - preserve stable `sidecar_*` DTO fields only as compatibility vocabulary, not
   as an external-service abstraction.
 

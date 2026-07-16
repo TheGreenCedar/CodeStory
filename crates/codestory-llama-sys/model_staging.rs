@@ -261,7 +261,7 @@ mod tests {
             &source,
             &destination,
             expected(&digest),
-            |input, output| io::copy(input, output),
+            io::copy,
             |_, destination| fs::write(destination, competing_bytes),
         )
         .expect_err("competing destination must fail");

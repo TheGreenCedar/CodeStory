@@ -43,7 +43,8 @@ grep -Eiq 'usage:' "$out_dir/help.stdout.txt"
 
 initialize='{"jsonrpc":"2.0","id":"initialize","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"glibc-baseline-proof","version":"1.0.0"}}}'
 set +e
-printf '%s\n' "$initialize" | CODESTORY_CACHE_ROOT="$out_dir/cache" timeout 30s \
+printf '%s\n' "$initialize" | CODESTORY_CACHE_ROOT="$out_dir/cache" \
+  CODESTORY_EMBED_ALLOW_CPU=1 timeout 30s \
   "$cli" serve --stdio --refresh none --project /workspace \
   > "$out_dir/stdio-initialize.stdout.txt" 2> "$out_dir/stdio-initialize.stderr.txt"
 stdio_status=${PIPESTATUS[1]}

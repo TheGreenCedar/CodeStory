@@ -14,6 +14,7 @@ mod candidate;
 mod capabilities;
 mod config;
 mod embedded_vector;
+mod embedding_contract;
 mod embeddings;
 mod executor;
 mod generation;

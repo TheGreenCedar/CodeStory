@@ -20,11 +20,11 @@ use std::sync::{
 use std::time::Instant;
 
 /// CodeRankEmbed vector width shared by stored and query vectors.
-pub const RETRIEVAL_EMBEDDING_DIM: usize =
-    codestory_llama_sys::PRODUCT_EMBEDDING_VECTOR_SEMANTICS.dimension();
+pub const RETRIEVAL_EMBEDDING_DIM: usize = crate::embedding_contract::RETRIEVAL_EMBEDDING_DIM;
 pub const CODERANK_EMBED_Q8_GGUF: &str = codestory_llama_sys::MODEL_FILE_NAME;
-pub const CODERANK_QUERY_PREFIX_DEFAULT: &str = codestory_llama_sys::EMBEDDING_QUERY_PREFIX;
-pub const CODERANK_DOCUMENT_PREFIX_DEFAULT: &str = codestory_llama_sys::EMBEDDING_DOCUMENT_PREFIX;
+pub const CODERANK_QUERY_PREFIX_DEFAULT: &str = crate::embedding_contract::CODERANK_QUERY_PREFIX;
+pub const CODERANK_DOCUMENT_PREFIX_DEFAULT: &str =
+    crate::embedding_contract::CODERANK_DOCUMENT_PREFIX;
 #[cfg(feature = "test-support")]
 pub const TEST_EMBEDDING_UNAVAILABLE_MARKER: &str = ".codestory-test-embedding-unavailable";
 
@@ -422,15 +422,26 @@ fn validate_identity(identity: &ProcessEmbeddingIdentity, allow_cpu: bool) -> Re
     }
     if identity.policy != "accelerated"
         || !identity.accelerator_execution_verified
+        || identity.execution_observation_source != "ggml_eval_callback"
+        || identity.encode_count == 0
+        || identity.execution_node_count == 0
         || identity.execution_device_names.is_empty()
+        || identity.execution_backend_names.is_empty()
         || identity.offloaded_layer_count != identity.model_layer_count
+        || identity.resident_accelerator_tensor_count == 0
+        || identity.resident_accelerator_tensor_bytes == 0
     {
         bail!(
-            "accelerated embedding execution is unverified: backend={} adapter={} offloaded_layers={}/{}",
+            "accelerated embedding execution is unverified: source={} backend={} adapter={} observed_layers={}/{} tensors={} bytes={} nodes={} encodes={}",
+            identity.execution_observation_source,
             identity.backend,
             identity.adapter_name,
             identity.offloaded_layer_count,
-            identity.model_layer_count
+            identity.model_layer_count,
+            identity.resident_accelerator_tensor_count,
+            identity.resident_accelerator_tensor_bytes,
+            identity.execution_node_count,
+            identity.encode_count,
         );
     }
     Ok(())
@@ -553,6 +564,16 @@ mod tests {
             } else {
                 Vec::new()
             },
+            execution_backend_names: if policy == "accelerated" {
+                vec!["Metal".into()]
+            } else {
+                Vec::new()
+            },
+            execution_observation_source: "ggml_eval_callback",
+            encode_count: 1,
+            execution_node_count: usize::from(policy == "accelerated") as u64,
+            resident_accelerator_tensor_count: usize::from(policy == "accelerated") as u64,
+            resident_accelerator_tensor_bytes: usize::from(policy == "accelerated") as u64,
             model_layer_count: 13,
             offloaded_layer_count: if policy == "accelerated" { 13 } else { 0 },
             accelerator_execution_verified: policy == "accelerated",
@@ -561,10 +582,20 @@ mod tests {
 
     #[test]
     fn accelerated_identity_requires_full_offload_proof() {
-        let mut identity = identity("accelerated");
-        assert!(validate_identity(&identity, false).is_ok());
-        identity.offloaded_layer_count -= 1;
-        assert!(validate_identity(&identity, false).is_err());
+        let mut partial = identity("accelerated");
+        assert!(validate_identity(&partial, false).is_ok());
+        partial.offloaded_layer_count -= 1;
+        assert!(validate_identity(&partial, false).is_err());
+
+        let mut inferred = identity("accelerated");
+        inferred.execution_observation_source = "inferred_from_request";
+        assert!(validate_identity(&inferred, false).is_err());
+        let mut no_encode = identity("accelerated");
+        no_encode.encode_count = 0;
+        assert!(validate_identity(&no_encode, false).is_err());
+        let mut no_resident_tensors = identity("accelerated");
+        no_resident_tensors.resident_accelerator_tensor_count = 0;
+        assert!(validate_identity(&no_resident_tensors, false).is_err());
     }
 
     #[test]
